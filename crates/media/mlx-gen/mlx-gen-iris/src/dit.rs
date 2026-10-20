@@ -384,10 +384,13 @@ pub(crate) mod quanta {
     pub const EMBED: &str = "Iris patch/timestep embed";
     pub const TEXT_LAYER_BLOCK: &str = "Iris text adapter layer block";
     pub const TEXT_POOL: &str = "Iris text adapter pool";
+    pub const TEXT_MASK: &str = "Iris text key mask";
     pub const TEXT_REFINER_BLOCK: &str = "Iris text refiner block";
     pub const TEXT_OUTPUT: &str = "Iris text adapter output";
     pub const TRUNK_BLOCK: &str = "Iris trunk block";
+    pub const TRUNK_POSITIONS: &str = "Iris trunk positions";
     pub const PIXEL_EMBED: &str = "Iris pixel embed";
+    pub const PIXEL_POSITIONS: &str = "Iris pixel positions";
     pub const PIXEL_BLOCK: &str = "Iris pixel block";
     pub const OUTPUT: &str = "Iris output projection";
     /// A streamed backbone's window read (rung 4): the window's blocks read, cast and built.
@@ -395,14 +398,17 @@ pub(crate) mod quanta {
     /// The per-row PiT stage's output rows concatenated back into the batch (rung 3).
     pub const OUTPUT_ROWS: &str = "Iris output rows";
     /// Every label above, for the phase attribution's coverage test.
-    pub const ALL: [&str; 11] = [
+    pub const ALL: [&str; 14] = [
         EMBED,
         TEXT_LAYER_BLOCK,
         TEXT_POOL,
+        TEXT_MASK,
         TEXT_REFINER_BLOCK,
         TEXT_OUTPUT,
+        TRUNK_POSITIONS,
         TRUNK_BLOCK,
         PIXEL_EMBED,
+        PIXEL_POSITIONS,
         PIXEL_BLOCK,
         OUTPUT,
         BLOCK_READ,
@@ -833,6 +839,8 @@ struct TextAdapter {
 pub struct IrisDiT {
     cfg: ModelConfig,
     compute: Dtype,
+    /// Actual attached payload facts, keyed identically to header-only pricing.
+    adapter_facts: crate::adapters::ProjectionAdapterFacts,
     /// Channels of `x` (`model.in_channels`, plus the depth task's extra zero channel).
     input_channels: usize,
     s_embedder: Linear,
@@ -945,6 +953,9 @@ impl IrisDiT {
         quant: Option<BackboneQuant>,
         stream: Option<BlockStream>,
     ) -> Result<Self> {
+        let adapter_facts = adapted
+            .map(AdaptedLinears::adapter_facts)
+            .unwrap_or_default();
         let l = Loader {
             weights: w,
             compute,
@@ -991,6 +1002,7 @@ impl IrisDiT {
         let dit = Self {
             cfg: cfg.clone(),
             compute,
+            adapter_facts,
             input_channels,
             s_embedder: l.linear("s_embedder.proj", true)?,
             t_mlp0: l.linear("t_embedder.mlp.0", true)?,
@@ -1200,6 +1212,35 @@ impl IrisDiT {
         self.stream.is_some()
     }
 
+    /// Inspect owned stacks, not a selection label: a resident endpoint owns every block and no
+    /// window source; a streamed endpoint owns the skeleton and a window source, not the stacks.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn assert_endpoint_ownership(&self, streamed: bool) {
+        assert_eq!(self.is_streamed(), streamed, "backbone stream source");
+        for (stack, owned) in [
+            (Stack::Layer, self.y_embedder.layer_blocks.len()),
+            (Stack::Refiner, self.y_embedder.blocks.len()),
+            (Stack::Trunk, self.blocks.len()),
+            (Stack::Pixel, self.pixel_blocks.len()),
+        ] {
+            assert_eq!(
+                owned,
+                if streamed { 0 } else { stack.depth(&self.cfg) },
+                "{stack:?}: endpoint owns the wrong number of blocks"
+            );
+        }
+        assert!(
+            self.resident_weight_bytes() > 0,
+            "the endpoint owns no skeleton/weights"
+        );
+        let _addresses = self.endpoint_parameter_addresses();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_parameter_addresses(&self) -> Vec<usize> {
+        crate::anchor_tests::materialized_addresses(self.arrays())
+    }
+
     /// The streamed backbone's window source (test builds: the read proofs build blocks from it).
     #[cfg(test)]
     pub(crate) fn block_stream(&self) -> Option<&BlockStream> {
@@ -1274,23 +1315,35 @@ impl IrisDiT {
             down_pad,
             img_stream_bytes: if i == 0 { self.compute_bytes() } else { 4 },
         };
+        let prefix = format!("blocks.{i}");
         match block {
-            Block::Dual(_) => Self::dual_block_bytes(&g, crate::retention::unfused()),
-            Block::Single(_) => Self::single_block_bytes(&g, crate::retention::unfused()),
+            Block::Dual(_) => Self::dual_block_bytes_with_adapters(
+                &g,
+                crate::retention::unfused(),
+                &self.adapter_facts,
+                &prefix,
+            ),
+            Block::Single(_) => Self::single_block_bytes_with_adapters(
+                &g,
+                crate::retention::unfused(),
+                &self.adapter_facts,
+                &prefix,
+            ),
         }
     }
 
     /// One grouped-query (or fused) q / k / v projection of `rows` tokens from an f32 input,
     /// each output held.
-    fn project_qkv(r: &mut Retention, g: &TrunkGeometry, rows: u64) {
+    fn project_qkv(r: &mut Retention, g: &TrunkGeometry, rows: u64, stem: &str, side: &str) {
         let (d, kvw) = (g.dim, g.dim / g.heads.max(1) * g.kv_heads);
         let narrow = r.narrow();
+        let path = |role| format!("{stem}{role}{side}");
         if g.split_qkv {
-            r.linear(rows, d, d, narrow, 0, Kind::Named)
-                .linear(rows, d, kvw, narrow, 0, Kind::Named)
-                .linear(rows, d, kvw, narrow, 0, Kind::Named);
+            r.linear_at(&path("q_proj"), rows, d, d, narrow, 0, Kind::Named)
+                .linear_at(&path("k_proj"), rows, d, kvw, narrow, 0, Kind::Named)
+                .linear_at(&path("v_proj"), rows, d, kvw, narrow, 0, Kind::Named);
         } else {
-            r.linear(rows, d, d + 2 * kvw, narrow, 0, Kind::Named);
+            r.linear_at(&path("qkv"), rows, d, d + 2 * kvw, narrow, 0, Kind::Named);
         }
     }
 
@@ -1306,12 +1359,13 @@ impl IrisDiT {
         pad: u64,
         post_norm: bool,
         bound: bool,
+        path: &str,
     ) {
         let narrow = r.narrow();
         let out_kind = if bound { Kind::Named } else { Kind::Temp };
-        r.linear(rows, d, ff, narrow, 0, Kind::Temp)
-            .linear(rows, d, ff, narrow, 0, Kind::Temp)
-            .linear(rows, ff, d, false, pad, out_kind);
+        r.linear_at(&format!("{path}.w1"), rows, d, ff, narrow, 0, Kind::Temp)
+            .linear_at(&format!("{path}.w3"), rows, d, ff, narrow, 0, Kind::Temp)
+            .linear_at(&format!("{path}.w2"), rows, ff, d, false, pad, out_kind);
         if post_norm {
             let input = match (narrow, bound) {
                 (true, _) => NormInput::Cast,
@@ -1351,8 +1405,18 @@ impl IrisDiT {
     /// product donate), the output projection and its post-norm, the gated residual. Phase 3: the
     /// modulated norm, the SwiGLU and its post-norm (the residual sum donates). Every bound handle
     /// is held to the end.
+    #[cfg(test)]
     pub(crate) fn single_block_bytes(g: &TrunkGeometry, unfused: bool) -> u64 {
-        let mut r = Retention::on(g.compute_bytes, unfused);
+        Self::single_block_bytes_with_adapters(g, unfused, &Default::default(), "")
+    }
+
+    pub(crate) fn single_block_bytes_with_adapters(
+        g: &TrunkGeometry,
+        unfused: bool,
+        facts: &crate::adapters::ProjectionAdapterFacts,
+        prefix: &str,
+    ) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused).with_adapters(facts, prefix);
         let narrow = r.narrow();
         let (b, d) = (g.batch, g.dim);
         let kvw = d / g.heads.max(1) * g.kv_heads;
@@ -1372,7 +1436,7 @@ impl IrisDiT {
             .named(4, h)
             .norm(h, rows, NormInput::Held, Kind::Named)
             .temp(4, b * d);
-        Self::project_qkv(&mut r, g, rows);
+        Self::project_qkv(&mut r, g, rows, "", "");
         r.norm(h, rows * g.heads, qk_in, Kind::Named)
             .norm(kv, rows * g.kv_heads, qk_in, Kind::Named)
             .rope(b * g.txt_tokens * d, Kind::Temp)
@@ -1396,8 +1460,8 @@ impl IrisDiT {
         } else {
             NormInput::Donor
         };
-        r.linear(rows_o, d, d, narrow, 0, Kind::Named)
-            .linear(rows_o, d, d, false, 0, proj_kind)
+        r.linear_at("attn_gate", rows_o, d, d, narrow, 0, Kind::Named)
+            .linear_at("attn_proj", rows_o, d, d, false, 0, proj_kind)
             .norm(h_o, rows_o, post_in, Kind::Named)
             .named(4, h_o)
             .barrier();
@@ -1408,7 +1472,7 @@ impl IrisDiT {
             .hold(4, h_o)
             .norm(h_o, rows_o, NormInput::Held, Kind::Temp)
             .temp(4, b * d);
-        Self::swiglu(&mut r, rows_o, d, g.ff, g.down_pad, true, true);
+        Self::swiglu(&mut r, rows_o, d, g.ff, g.down_pad, true, true, "mlp");
         r.price()
     }
 
@@ -1417,8 +1481,18 @@ impl IrisDiT {
     /// applications, the q / k / v concatenations. Phase 2: the attention and the image half's gate,
     /// output projection, post-norm and residual. Phase 3: the image MLP. Phases 4 and 5: the text
     /// half's, when the block has a text path. Every bound handle is held to the end.
+    #[cfg(test)]
     pub(crate) fn dual_block_bytes(g: &TrunkGeometry, unfused: bool) -> u64 {
-        let mut r = Retention::on(g.compute_bytes, unfused);
+        Self::dual_block_bytes_with_adapters(g, unfused, &Default::default(), "")
+    }
+
+    pub(crate) fn dual_block_bytes_with_adapters(
+        g: &TrunkGeometry,
+        unfused: bool,
+        facts: &crate::adapters::ProjectionAdapterFacts,
+        prefix: &str,
+    ) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused).with_adapters(facts, prefix);
         let narrow = r.narrow();
         let (b, d) = (g.batch, g.dim);
         let kvw = d / g.heads.max(1) * g.kv_heads;
@@ -1433,7 +1507,7 @@ impl IrisDiT {
         let img_narrow = g.img_stream_bytes < 4;
         // Phase 1.
         r.named(4, b * 6 * d).named(4, b * 6 * d);
-        for (stream, narrow_in) in [(rows_x, img_narrow), (rows_y, false)] {
+        for (stream, narrow_in, side) in [(rows_x, img_narrow, "_x"), (rows_y, false, "_y")] {
             let input = if narrow_in {
                 NormInput::Cast
             } else {
@@ -1441,7 +1515,7 @@ impl IrisDiT {
             };
             r.norm(stream * d, stream, input, Kind::Named)
                 .temp(4, b * d);
-            Self::project_qkv(&mut r, g, stream);
+            Self::project_qkv(&mut r, g, stream, "attn.", side);
         }
         for stream in [rows_x, rows_y] {
             r.norm(stream * d, stream * g.heads, qk_in, Kind::Temp)
@@ -1462,9 +1536,26 @@ impl IrisDiT {
                 // Phase 4: the text half's post-attention.
                 r.barrier();
             }
-            r.linear(stream, d, d, narrow, 0, Kind::Named)
-                .linear(stream, d, d, false, 0, Kind::Named)
-                .norm(stream * d, stream, post_in, Kind::Named);
+            let side = if k == 0 { "x" } else { "y" };
+            r.linear_at(
+                &format!("attn_gate_{side}"),
+                stream,
+                d,
+                d,
+                narrow,
+                0,
+                Kind::Named,
+            )
+            .linear_at(
+                &format!("attn.proj_{side}"),
+                stream,
+                d,
+                d,
+                false,
+                0,
+                Kind::Named,
+            )
+            .norm(stream * d, stream, post_in, Kind::Named);
             if k == 0 && img_narrow {
                 // The compute-width image stream's f32 cast for the residual sum.
                 r.temp(4, stream * d);
@@ -1483,7 +1574,16 @@ impl IrisDiT {
             }
             r.norm(stream * d, stream, NormInput::Held, Kind::Named)
                 .temp(4, b * d);
-            Self::swiglu(&mut r, stream, d, g.ff, g.down_pad, true, false);
+            Self::swiglu(
+                &mut r,
+                stream,
+                d,
+                g.ff,
+                g.down_pad,
+                true,
+                false,
+                &format!("mlp_{side}"),
+            );
         }
         r.price()
     }
@@ -1497,18 +1597,19 @@ impl IrisDiT {
         n_patches: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        self.pixel_block_scratch_of(&self.pixel_blocks[i], batch, n_patches, plan)
+        self.pixel_block_scratch_of(&self.pixel_blocks[i], i, batch, n_patches, plan)
     }
 
     fn pixel_block_scratch_of(
         &self,
         blk: &PitBlock,
+        i: usize,
         batch: i32,
         n_patches: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
         let heads = blk.attn.heads;
-        Self::pixel_block_bytes(
+        Self::pixel_block_bytes_with_adapters(
             PixelBlockGeometry {
                 compute_bytes: self.compute_bytes(),
                 batch: batch.max(0) as u64,
@@ -1524,6 +1625,8 @@ impl IrisDiT {
                 eval_per_chunk: plan.budget.eval_per_chunk(),
             },
             crate::retention::unfused(),
+            &self.adapter_facts,
+            &format!("pixel_blocks.{i}"),
         )
     }
 
@@ -1533,8 +1636,13 @@ impl IrisDiT {
     /// attention). Phase 2 (to the residual barrier): the attention, its projection, the expanded
     /// plane (held) and the modulated residual. Phase 3: the norm, `fc1` (GELU donates; bf16: its
     /// result is f32, which `fc2` casts back), `fc2` (held) and the modulated residual.
-    pub(crate) fn pixel_block_bytes(g: PixelBlockGeometry, unfused: bool) -> u64 {
-        let mut r = Retention::on(g.compute_bytes, unfused);
+    pub(crate) fn pixel_block_bytes_with_adapters(
+        g: PixelBlockGeometry,
+        unfused: bool,
+        facts: &crate::adapters::ProjectionAdapterFacts,
+        prefix: &str,
+    ) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused).with_adapters(facts, prefix);
         let narrow = r.narrow();
         let cw = g.compute_bytes;
         let rows = g.batch * g.patches;
@@ -1546,7 +1654,8 @@ impl IrisDiT {
             NormInput::Held
         };
         // Phase 1.
-        r.linear(
+        r.linear_at(
+            "adaln",
             rows,
             g.condition_width,
             g.modulation_width,
@@ -1555,7 +1664,8 @@ impl IrisDiT {
             Kind::Named,
         )
         .norm(plane, rows * g.patch_pixels, plane_in, Kind::Temp)
-        .linear(
+        .linear_at(
+            "compress",
             rows,
             g.patch_pixels * g.pixel_width,
             g.compact_width,
@@ -1563,7 +1673,8 @@ impl IrisDiT {
             0,
             Kind::Named,
         )
-        .linear(
+        .linear_at(
+            "attn.qkv",
             rows,
             g.compact_width,
             3 * g.compact_width,
@@ -1592,7 +1703,8 @@ impl IrisDiT {
             mask: None,
             out_kind: Kind::Temp,
         })
-        .linear(
+        .linear_at(
+            "attn.proj",
             rows,
             g.compact_width,
             g.compact_width,
@@ -1600,7 +1712,8 @@ impl IrisDiT {
             0,
             Kind::Named,
         )
-        .linear(
+        .linear_at(
+            "expand",
             rows,
             g.compact_width,
             g.patch_pixels * g.pixel_width,
@@ -1616,13 +1729,29 @@ impl IrisDiT {
             .hold(cw, rows * g.modulation_width)
             .hold(cw, plane)
             .norm(plane, mlp_rows, plane_in, Kind::Temp)
-            .linear(mlp_rows, g.pixel_width, g.fc1_width, narrow, 0, Kind::Temp);
+            .linear_at(
+                "mlp.fc1",
+                mlp_rows,
+                g.pixel_width,
+                g.fc1_width,
+                narrow,
+                0,
+                Kind::Temp,
+            );
         if narrow {
             // MLX's GELU divides by f32 constants: a bf16 input's result is a new f32 buffer.
             r.temp(4, mlp_rows * g.fc1_width);
         }
-        r.linear(mlp_rows, g.fc1_width, g.pixel_width, narrow, 0, Kind::Named)
-            .temp(cw, plane);
+        r.linear_at(
+            "mlp.fc2",
+            mlp_rows,
+            g.fc1_width,
+            g.pixel_width,
+            narrow,
+            0,
+            Kind::Named,
+        )
+        .temp(cw, plane);
         r.price()
     }
 
@@ -1636,17 +1765,18 @@ impl IrisDiT {
         layers: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        self.text_layer_block_scratch_of(&self.y_embedder.layer_blocks[i], rows, layers, plan)
+        self.text_layer_block_scratch_of(&self.y_embedder.layer_blocks[i], i, rows, layers, plan)
     }
 
     fn text_layer_block_scratch_of(
         &self,
         blk: &LayerBlock,
+        i: usize,
         rows: i32,
         layers: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        Self::text_block_bytes(
+        Self::text_block_bytes_with_adapters(
             TextBlockGeometry {
                 compute_bytes: self.compute_bytes(),
                 batch: rows.max(0) as u64,
@@ -1661,6 +1791,8 @@ impl IrisDiT {
                 stream_bytes: 4,
             },
             crate::retention::unfused(),
+            &self.adapter_facts,
+            &format!("y_embedder.layer_blocks.{i}"),
         )
     }
 
@@ -1673,17 +1805,18 @@ impl IrisDiT {
         t: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        self.text_refiner_block_scratch_of(&self.y_embedder.blocks[i], batch, t, plan)
+        self.text_refiner_block_scratch_of(&self.y_embedder.blocks[i], i, batch, t, plan)
     }
 
     fn text_refiner_block_scratch_of(
         &self,
         blk: &AdapterBlock,
+        i: usize,
         batch: i32,
         t: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        Self::text_block_bytes(
+        Self::text_block_bytes_with_adapters(
             TextBlockGeometry {
                 compute_bytes: self.compute_bytes(),
                 batch: batch.max(0) as u64,
@@ -1698,6 +1831,8 @@ impl IrisDiT {
                 stream_bytes: self.compute_bytes(),
             },
             crate::retention::unfused(),
+            &self.adapter_facts,
+            &format!("y_embedder.refiner.blocks.{i}"),
         )
     }
 
@@ -1707,8 +1842,18 @@ impl IrisDiT {
     /// key mask), its projection (bound) and the residual sum (a new buffer at the stream's width:
     /// the projection is bound, or its f32 cast is the sum). Phase 3: the norm, the MLP
     /// (`mlp.0 → SiLU → mlp.2`, or the SwiGLU) and the residual.
+    #[cfg(test)]
     pub(crate) fn text_block_bytes(g: TextBlockGeometry, unfused: bool) -> u64 {
-        let mut r = Retention::on(g.compute_bytes, unfused);
+        Self::text_block_bytes_with_adapters(g, unfused, &Default::default(), "")
+    }
+
+    pub(crate) fn text_block_bytes_with_adapters(
+        g: TextBlockGeometry,
+        unfused: bool,
+        facts: &crate::adapters::ProjectionAdapterFacts,
+        prefix: &str,
+    ) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused).with_adapters(facts, prefix);
         let narrow = r.narrow();
         let rows = g.batch * g.tokens;
         let h = rows * g.dim;
@@ -1727,7 +1872,8 @@ impl IrisDiT {
         } else {
             Kind::Temp
         };
-        r.norm(h, rows, stream_in, input_kind).linear(
+        r.norm(h, rows, stream_in, input_kind).linear_at(
+            "attn.qkv",
             rows,
             g.dim,
             3 * g.dim,
@@ -1756,7 +1902,7 @@ impl IrisDiT {
             mask: g.refiner.then_some((g.batch * g.tokens * g.tokens, narrow)),
             out_kind: Kind::Temp,
         })
-        .linear(rows, g.dim, g.dim, false, 0, Kind::Named)
+        .linear_at("attn.proj", rows, g.dim, g.dim, false, 0, Kind::Named)
         .named(g.stream_bytes, h);
         // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
         // residual stream.
@@ -1765,19 +1911,19 @@ impl IrisDiT {
             .norm(h, rows, stream_in, Kind::Temp);
         if g.refiner {
             // The SwiGLU output is a temporary: the residual sum reuses it.
-            Self::swiglu(&mut r, rows, g.dim, g.ff, g.down_pad, false, false);
+            Self::swiglu(&mut r, rows, g.dim, g.ff, g.down_pad, false, false, "mlp");
         } else {
             // `mlp.2`'s output is bound, so the residual sum is a new buffer (bf16: its operand's
             // f32 cast, which the sum reuses).
-            r.linear(rows, g.dim, g.ff, narrow, 0, Kind::Temp)
-                .linear(rows, g.ff, g.dim, false, g.down_pad, Kind::Named)
+            r.linear_at("mlp.0", rows, g.dim, g.ff, narrow, 0, Kind::Temp)
+                .linear_at("mlp.2", rows, g.ff, g.dim, false, g.down_pad, Kind::Named)
                 .temp(g.stream_bytes, h);
         }
         r.price()
     }
 
-    /// What the first trunk block materializes besides itself: the image and text RoPE tables and
-    /// the text positional add (states, sliced table, sum).
+    /// The positional-construction quantum before the first trunk block: image/text RoPE tables
+    /// and the text positional add. RoPE from_slice allocates immediately, so this guard is early.
     pub(crate) fn trunk_entry_allowance(&self, batch: i32, n_patches: i32, n_txt: i32) -> u64 {
         let cfg = &self.cfg;
         Self::trunk_entry_bytes(
@@ -1803,18 +1949,21 @@ impl IrisDiT {
     pub(crate) fn embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
         let [hidden, patch_in] = self.s_embedder.logical_shape();
         let [_, sinusoid] = self.t_mlp0.logical_shape();
-        Self::embed_bytes(EmbedGeometry {
-            compute_bytes: self.compute_bytes(),
-            batch: batch.max(0) as u64,
-            patches: n_patches.max(0) as u64,
-            patch_in: patch_in as u64,
-            hidden: hidden as u64,
-            sinusoid: sinusoid as u64,
-            t_hidden: self.t_mlp0.out_features(),
-            t_out: self.t_mlp2.out_features(),
-            cores: self.core_img.out_features()
-                + self.core_txt.as_ref().map_or(0, Linear::out_features),
-        })
+        Self::embed_bytes_with_adapters(
+            EmbedGeometry {
+                compute_bytes: self.compute_bytes(),
+                batch: batch.max(0) as u64,
+                patches: n_patches.max(0) as u64,
+                patch_in: patch_in as u64,
+                hidden: hidden as u64,
+                sinusoid: sinusoid as u64,
+                t_hidden: self.t_mlp0.out_features(),
+                t_out: self.t_mlp2.out_features(),
+                cores: self.core_img.out_features()
+                    + self.core_txt.as_ref().map_or(0, Linear::out_features),
+            },
+            &self.adapter_facts,
+        )
     }
 
     /// [`Self::embed_scratch`] from the widths alone (one phase): the patch vectors' re-layout copy
@@ -1822,50 +1971,83 @@ impl IrisDiT {
     /// frequency table, the f32 phase, its cosine and sine and their concatenation, the first
     /// timestep projection (SiLU donates) and the second (held: `t_emb`); the conditioning SiLU of
     /// the held `t_emb`, and both cores' outputs (held).
-    pub(crate) fn embed_bytes(g: EmbedGeometry) -> u64 {
-        let mut r = Retention::on(g.compute_bytes, false);
+    pub(crate) fn embed_bytes_with_adapters(
+        g: EmbedGeometry,
+        facts: &crate::adapters::ProjectionAdapterFacts,
+    ) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, false).with_adapters(facts, "");
         let narrow = r.narrow();
         let (b, freqs) = (g.batch, g.sinusoid / 2);
         r.temp(4, b * g.patches * g.patch_in)
-            .linear(b * g.patches, g.patch_in, g.hidden, narrow, 0, Kind::Named)
+            .linear_at(
+                "s_embedder.proj",
+                b * g.patches,
+                g.patch_in,
+                g.hidden,
+                narrow,
+                0,
+                Kind::Named,
+            )
             .temp(4, freqs)
             .alloc(Kind::Temp, 3, 4, b * freqs)
             .temp(4, b * g.sinusoid)
-            .linear(b, g.sinusoid, g.t_hidden, narrow, 0, Kind::Temp)
-            .linear(b, g.t_hidden, g.t_out, false, 0, Kind::Named)
+            .linear_at(
+                "t_embedder.mlp.0",
+                b,
+                g.sinusoid,
+                g.t_hidden,
+                narrow,
+                0,
+                Kind::Temp,
+            )
+            .linear_at(
+                "t_embedder.mlp.2",
+                b,
+                g.t_hidden,
+                g.t_out,
+                false,
+                0,
+                Kind::Named,
+            )
             .temp(g.compute_bytes, b * g.t_out)
-            .named(g.compute_bytes, b * g.cores);
+            .named(g.compute_bytes, b * g.cores)
+            .adapter_extras_at("modulation_cores.adaln_img", b, false)
+            .adapter_extras_at("modulation_cores.adaln_txt", b, false);
         r.price()
     }
 
     /// The layer pool and the refiner's input projection over `[B·T, layers, Dt]` states.
     pub(crate) fn text_pool_scratch(&self, batch: i32, t: i32, layers: i32, text_dim: i32) -> u64 {
-        Self::text_pool_bytes(
+        Self::text_pool_bytes_with_adapters(
             self.compute_bytes(),
             batch.max(0) as u64,
             t.max(0) as u64,
             layers.max(0) as u64,
             text_dim.max(0) as u64,
             self.y_embedder.proj.out_features(),
+            &self.adapter_facts,
         )
     }
 
     /// [`Self::text_pool_scratch`] from the widths alone (one phase): the pool reads the
     /// layer-transposed states through a row-contiguous copy (bf16: of its compute-width cast, which
     /// keeps the transposed layout), the pooled `[B·T, Dt]` and the projection `[B, T, D]`.
-    pub(crate) fn text_pool_bytes(
+    pub(crate) fn text_pool_bytes_with_adapters(
         cw: u64,
         b: u64,
         t: u64,
         layers: u64,
         text_dim: u64,
         out: u64,
+        facts: &crate::adapters::ProjectionAdapterFacts,
     ) -> u64 {
-        let mut r = Retention::on(cw, false);
+        let mut r = Retention::on(cw, false).with_adapters(facts, "");
         let copies = if r.narrow() { 2 } else { 1 };
         r.alloc(Kind::Temp, copies, cw, b * t * layers * text_dim)
             .temp(cw, b * t * text_dim)
-            .named(cw, b * t * out);
+            .named(cw, b * t * out)
+            .adapter_extras_at("y_embedder.layer_pool", b * t * text_dim, true)
+            .adapter_extras_at("y_embedder.refiner.proj", b * t, false);
         r.price()
     }
 
@@ -1896,7 +2078,7 @@ impl IrisDiT {
     /// The timestep re-fusion and the per-pixel embedding over an `h × w` input.
     pub(crate) fn pixel_embed_scratch(&self, batch: i32, h: i32, w: i32) -> u64 {
         let [pixel_width, channels] = self.pixel_proj.logical_shape();
-        Self::pixel_embed_bytes(
+        Self::pixel_embed_bytes_with_adapters(
             self.compute_bytes(),
             batch.max(0) as u64,
             h.max(0) as u64,
@@ -1905,6 +2087,7 @@ impl IrisDiT {
             self.core_img.logical_shape()[1] as u64,
             pixel_width as u64,
             channels as u64,
+            &self.adapter_facts,
         )
     }
 
@@ -1916,7 +2099,7 @@ impl IrisDiT {
     /// plus its per-call compute-width cast); and the per-patch re-layout copy (held: the pixel
     /// stream).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pixel_embed_bytes(
+    pub(crate) fn pixel_embed_bytes_with_adapters(
         cw: u64,
         b: u64,
         h: u64,
@@ -1925,8 +2108,9 @@ impl IrisDiT {
         hidden: u64,
         pixel_width: u64,
         channels: u64,
+        facts: &crate::adapters::ProjectionAdapterFacts,
     ) -> u64 {
-        let mut r = Retention::on(cw, false);
+        let mut r = Retention::on(cw, false).with_adapters(facts, "");
         let narrow = r.narrow();
         let n = (h / patch.max(1)) * (w / patch.max(1));
         let pixels = b * h * w;
@@ -1940,14 +2124,15 @@ impl IrisDiT {
         if narrow {
             r.temp(cw, h * w * pixel_width);
         }
-        r.named(cw, pixels * pixel_width);
+        r.named(cw, pixels * pixel_width)
+            .adapter_extras_at("pixel_embedder.proj", pixels, true);
         r.price()
     }
 
     /// The final norm, the final projection and the fold back to `[B, C, H, W]` f32.
     pub(crate) fn output_scratch(&self, batch: i32, n_patches: i32) -> u64 {
         let [out, input] = self.final_linear.logical_shape();
-        Self::output_bytes(
+        Self::output_bytes_with_adapters(
             self.compute_bytes(),
             batch.max(0) as u64,
             n_patches.max(0) as u64,
@@ -1955,13 +2140,15 @@ impl IrisDiT {
             input as u64,
             out as u64,
             crate::retention::unfused(),
+            &self.adapter_facts,
         )
     }
 
     /// [`Self::output_scratch`] from the widths alone (one phase): the norm of the compute-width
     /// pixel stream, the projection to `[B·N, p², C]` (bf16: of its compute-width cast), the fold's
     /// re-layout copy and (bf16) its f32 cast, the output.
-    pub(crate) fn output_bytes(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn output_bytes_with_adapters(
         cw: u64,
         b: u64,
         n: u64,
@@ -1969,8 +2156,9 @@ impl IrisDiT {
         input: u64,
         out: u64,
         unfused: bool,
+        facts: &crate::adapters::ProjectionAdapterFacts,
     ) -> u64 {
-        let mut r = Retention::on(cw, unfused);
+        let mut r = Retention::on(cw, unfused).with_adapters(facts, "");
         let narrow = r.narrow();
         let rows = b * n * ppp;
         let input_kind = if narrow {
@@ -1979,7 +2167,15 @@ impl IrisDiT {
             NormInput::Held
         };
         r.norm(rows * input, rows, input_kind, Kind::Temp)
-            .linear(rows, input, out, narrow, 0, Kind::Temp)
+            .linear_at(
+                "final_layer.linear",
+                rows,
+                input,
+                out,
+                narrow,
+                0,
+                Kind::Temp,
+            )
             .named(cw, rows * out);
         if narrow {
             r.named(4, rows * out);
@@ -2011,6 +2207,12 @@ impl IrisDiT {
         )
     }
 
+    /// Host f32 additive mask plus its immediate MLX copy, before either constructor runs.
+    pub(crate) fn text_mask_bytes(batch: u64, tokens: u64) -> u64 {
+        let data = mlx_gen::ios_quantum::tensor_bytes(4, &[batch, tokens, tokens]);
+        data.saturating_add(crate::retention::allocated(data))
+    }
+
     fn text_adapter_exec(&self, text: &TextBatch, exec: &Execution<'_>) -> Result<Array> {
         let plan = exec.plan;
         let sh = text.states.shape();
@@ -2020,7 +2222,7 @@ impl IrisDiT {
                 "iris: text mask must be [{b}, {t}] for states {sh:?}"
             )));
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let y = text
             .states
             .as_dtype(Dtype::Float32)?
@@ -2029,11 +2231,21 @@ impl IrisDiT {
             Stack::Layer,
             exec,
             y,
-            |y, _, block| {
+            |y, index, block| {
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "dit_block",
+                    &[
+                        ("stack", 0),
+                        ("index", index as u64),
+                        ("row", 0),
+                        ("rows", b as u64),
+                    ],
+                );
                 let BlockRef::Layer(blk) = block else {
                     unreachable!("the layerwise stack holds layerwise blocks")
                 };
-                let scratch = self.text_layer_block_scratch_of(blk, b * t, layers, plan);
+                let scratch = self.text_layer_block_scratch_of(blk, index, b * t, layers, plan);
                 mlx_gen::ios_quantum::run(quanta::TEXT_LAYER_BLOCK, scratch, || {
                     Self::text_layer_body_with(blk, self.compute, &y, plan)
                 })
@@ -2047,16 +2259,33 @@ impl IrisDiT {
             || self.text_pool_body(&y, b, t, dt),
         )?;
         // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "allocation_region",
+            &[("role", 0), ("rows", b as u64), ("positions", t as u64)],
+        );
+        mlx_gen::ios_quantum::before(quanta::TEXT_MASK, Self::text_mask_bytes(b as u64, t as u64))?;
         let key_mask = key_padding_mask(text.mask, t as usize);
+        mlx_gen::ios_quantum::finish(quanta::TEXT_MASK, &[&key_mask])?;
         let y = self.run_stack(
             Stack::Refiner,
             exec,
             y,
-            |y, _, block| {
+            |y, index, block| {
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "dit_block",
+                    &[
+                        ("stack", 1),
+                        ("index", index as u64),
+                        ("row", 0),
+                        ("rows", b as u64),
+                    ],
+                );
                 let BlockRef::Refiner(blk) = block else {
                     unreachable!("the refiner stack holds refiner blocks")
                 };
-                let scratch = self.text_refiner_block_scratch_of(blk, b, t, plan);
+                let scratch = self.text_refiner_block_scratch_of(blk, index, b, t, plan);
                 mlx_gen::ios_quantum::run(quanta::TEXT_REFINER_BLOCK, scratch, || {
                     Self::text_refiner_body_with(blk, self.compute, &y, &key_mask, plan)
                 })
@@ -2113,6 +2342,23 @@ impl IrisDiT {
                     }
                 });
                 let reads = &stream.inventory.reads(stack)[range.clone()];
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "dit_window",
+                    &[
+                        (
+                            "stack",
+                            match stack {
+                                Stack::Layer => 0,
+                                Stack::Refiner => 1,
+                                Stack::Trunk => 2,
+                                Stack::Pixel => 3,
+                            },
+                        ),
+                        ("first", range.start as u64),
+                        ("count", range.len() as u64),
+                    ],
+                );
                 mlx_gen::ios_quantum::before(
                     quanta::BLOCK_READ,
                     crate::stream::window_read_bytes(reads),
@@ -2467,6 +2713,8 @@ impl IrisDiT {
         mut hooks: Option<&mut dyn ForwardHooks>,
         exec: Execution<'_>,
     ) -> Result<Array> {
+        #[cfg(all(test, target_os = "macos"))]
+        crate::anchor_tests::observe_generation_forward(x, text.states);
         let cfg = &self.cfg;
         let plan = exec.plan;
         let sh = x.shape();
@@ -2500,7 +2748,7 @@ impl IrisDiT {
             )));
         }
 
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         // The previous step's guidance combine + solver arithmetic is lazy and materializes here.
         mlx_gen::ios_quantum::before(
             quanta::EMBED,
@@ -2517,25 +2765,53 @@ impl IrisDiT {
         embedded.extend(core_txt.as_ref());
         mlx_gen::ios_quantum::finish(quanta::EMBED, &embedded)?;
 
-        let y = self.text_adapter_exec(text, &exec)?;
-        let n_txt = y.shape()[1];
-        let y = self.text_positions(&y)?;
-
+        let text_base = self.text_adapter_exec(text, &exec)?;
+        let n_txt = text_base.shape()[1];
+        // RoPE uses from_slice: it allocates during construction, not at the later block barrier.
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "allocation_region",
+            &[
+                ("role", 1),
+                ("rows", b as u64),
+                ("positions", n_patches as u64),
+            ],
+        );
+        mlx_gen::ios_quantum::before(
+            quanta::TRUNK_POSITIONS,
+            self.trunk_entry_allowance(b, n_patches, n_txt),
+        )?;
+        let y = self.text_positions(&text_base)?;
         let ctx = self.trunk_ctx(hp, wp, n_txt, plan);
-        // The text positional add and both RoPE tables are lazy and materialize inside the FIRST
-        // trunk block's quantum, whose scratch carries them.
-        let entry_extra = self.trunk_entry_allowance(b, n_patches, n_txt);
+        mlx_gen::ios_quantum::finish(
+            quanta::TRUNK_POSITIONS,
+            &[
+                &y,
+                &ctx.rope_img.cos,
+                &ctx.rope_img.sin,
+                &ctx.rope_txt.cos,
+                &ctx.rope_txt.sin,
+            ],
+        )?;
         let (s, _y) = self.run_stack(
             Stack::Trunk,
             &exec,
             (s, y),
             |(s, y), i, block| {
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "dit_block",
+                    &[
+                        ("stack", 2),
+                        ("index", i as u64),
+                        ("row", 0),
+                        ("rows", b as u64),
+                    ],
+                );
                 let BlockRef::Trunk(blk) = block else {
                     unreachable!("the trunk holds trunk blocks")
                 };
-                let scratch = self
-                    .trunk_block_scratch_of(blk, i, b, n_patches, n_txt, plan)
-                    .saturating_add(if i == 0 { entry_extra } else { 0 });
+                let scratch = self.trunk_block_scratch_of(blk, i, b, n_patches, n_txt, plan);
                 mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
                 let (s, y) = match hooks.as_deref_mut() {
                     Some(hooks) => {
@@ -2559,7 +2835,27 @@ impl IrisDiT {
         // before the next is built, on every device), so its activation is one row's.
         let by_row = exec.pixel_rows && b > 1;
         let (row_batch, rows) = if by_row { (1, b) } else { (b, 1) };
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "allocation_region",
+            &[
+                ("role", 2),
+                ("rows", row_batch as u64),
+                ("positions", n_patches as u64),
+            ],
+        );
+        mlx_gen::ios_quantum::before(
+            quanta::PIXEL_POSITIONS,
+            mlx_gen::ios_quantum::rope_table_bytes(
+                n_patches as u64,
+                (cfg.pixel.attn_hidden_size / cfg.pixel.num_heads) as u64,
+            ),
+        )?;
         let pctx = self.pixel_ctx(row_batch, hp, wp, plan);
+        mlx_gen::ios_quantum::finish(
+            quanta::PIXEL_POSITIONS,
+            &[&pctx.rope_pix.cos, &pctx.rope_pix.sin],
+        )?;
         let conds = if by_row {
             s_cond.split(b, 0)?
         } else {
@@ -2578,8 +2874,18 @@ impl IrisDiT {
                 let BlockRef::Pixel(blk) = block else {
                     unreachable!("the PiT stack holds PiT blocks")
                 };
-                let scratch = self.pixel_block_scratch_of(blk, row_batch, n_patches, plan);
-                for (part, cond) in parts.iter_mut().zip(&conds) {
+                let scratch = self.pixel_block_scratch_of(blk, i, row_batch, n_patches, plan);
+                for (row, (part, cond)) in parts.iter_mut().zip(&conds).enumerate() {
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        crate::model::MODEL_ID,
+                        "dit_block",
+                        &[
+                            ("stack", 3),
+                            ("index", i as u64),
+                            ("row", row as u64),
+                            ("rows", row_batch as u64),
+                        ],
+                    );
                     let next = mlx_gen::ios_quantum::run(quanta::PIXEL_BLOCK, scratch, || {
                         match hooks.as_deref_mut() {
                             Some(hooks) => hooks.pixel_block(self, i, &pctx, part, cond),
@@ -2605,6 +2911,11 @@ impl IrisDiT {
             |parts| Ok(eval(parts.iter())?),
         )?;
         if !by_row {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                crate::model::MODEL_ID,
+                "dit_output",
+                &[("row", 0), ("rows", b as u64)],
+            );
             return mlx_gen::ios_quantum::run(
                 quanta::OUTPUT,
                 self.output_scratch(b, n_patches),
@@ -2612,7 +2923,12 @@ impl IrisDiT {
             );
         }
         let mut outs = Vec::with_capacity(rows as usize);
-        for part in &parts {
+        for (row, part) in parts.iter().enumerate() {
+            mlx_gen::ios_quantum::diagnostic_metadata(
+                crate::model::MODEL_ID,
+                "dit_output",
+                &[("row", row as u64), ("rows", 1)],
+            );
             let out = mlx_gen::ios_quantum::run(
                 quanta::OUTPUT,
                 self.output_scratch(1, n_patches),

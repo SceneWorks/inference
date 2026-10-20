@@ -27,6 +27,7 @@ mlx-rs = { workspace = true }
 regex = "1"
 # Parse vocab.json (a flat {token: id} object) without pulling a heavy dep.
 serde_json = { workspace = true }
+serde = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-3045) and save the e2e render for
 # inspection. PNG + JPEG cover the SceneWorks dataset formats; the trainer center-crops + hands the
 # Image to the VAE preprocess.
@@ -40,6 +41,8 @@ default = ["training"]
 training = ["dep:image", "dep:mlx-gen-perceptual"]
 
 [dev-dependencies]
+# Explicit native CPU stream pinning in the Metal-trapped quantum proofs.
+mlx-sys = { workspace = true }
 sha2 = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old

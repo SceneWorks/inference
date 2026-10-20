@@ -14,6 +14,10 @@
 //! of MLX. The FFI entry point returns a report string so the app can display it and an XCTest
 //! can assert on it.
 
+// Keep the complete capture/selection JSON schema; its serde_json expansion exceeds the
+// default macro recursion depth. This is a compile-time macro limit, not a runtime memory cap.
+#![recursion_limit = "256"]
+
 use std::ffi::{c_char, CString};
 use std::path::Path;
 use std::time::Instant;

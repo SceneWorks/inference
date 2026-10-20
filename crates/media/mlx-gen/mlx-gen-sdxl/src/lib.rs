@@ -46,6 +46,8 @@ mod quantum_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod default_path_golden;
 pub mod sampler;
+/// Shared host-only SDXL sampling resolution, replay and logical lifetime facts.
+pub mod sampling;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
 pub(crate) mod test_metal_guard;

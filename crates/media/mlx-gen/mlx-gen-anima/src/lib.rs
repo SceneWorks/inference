@@ -39,6 +39,7 @@ pub mod prompt_weight;
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_tests;
 pub mod rope;
+pub mod sampling;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
 pub(crate) mod test_metal_guard;

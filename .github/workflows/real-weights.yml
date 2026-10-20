@@ -149,6 +149,11 @@ on:
         required: false
         default: full
         options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
+      ios_pricing_compile_binding:
+        description: 'Owner-bound JSON: exact source_sha, manifest_sha256, host second-mac, phase compile-only or compile-host'
+        type: string
+        required: false
+        default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
       profile:
         description: Real-weight profile to run
         type: choice
@@ -156,7 +161,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
+        options: [ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -386,6 +391,43 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
 
 jobs:
+  # Dispatch-only: no schedule/all path, models, provisioning, GPU or test bodies.
+  ios-pricing-compile-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-pricing-compile-only'
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    concurrency:
+      group: ios-pricing-compile-${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
+      cancel-in-progress: false
+    env:
+      SOURCE_SHA: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
+      SOURCE_MANIFEST_SHA256: ${{ fromJSON(inputs.ios_pricing_compile_binding).manifest_sha256 }}
+      COMPILE_HOST: ${{ fromJSON(inputs.ios_pricing_compile_binding).host }}
+      COMPILE_PHASE: ${{ fromJSON(inputs.ios_pricing_compile_binding).phase || 'compile-only' }}
+    steps:
+      - name: Require immutable source and non-dev-Mac placement before checkout/build
+        shell: bash
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$COMPILE_HOST" == second-mac ]]
+          [[ "$RUNNER_NAME" == nax-macos-2 ]]
+          command -v python3.12 >/dev/null || { echo "::error::Preinstalled Python3.12 required; no provisioning"; exit 1; }
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
+          persist-credentials: false
+          clean: false
+      - name: Compile exact three units offline and enumerate; pure HOST only if explicitly admitted
+        shell: bash
+        run: python3.12 -I scripts/ci/ios_pricing_compile_only.py --manifest scripts/ci/ios-pricing-compile-manifest.json --seconds 1800 --phase "$COMPILE_PHASE"
+      - name: Upload compile receipt, logs and source provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-pricing-compile-${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}-${{ fromJSON(inputs.ios_pricing_compile_binding).host }}
+          path: ${{ runner.temp }}/ios-pricing-compile-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+
   # SC-16462: build the complete packed Chroma tier from the exact currently-shipped bf16 source,
   # then prove progressive T5/VAE packed-vs-load-time identity, component quality, T5 residency,
   # and a coherent end-to-end render for base/HD/Flash at q4 and q8. Publication is a separate,

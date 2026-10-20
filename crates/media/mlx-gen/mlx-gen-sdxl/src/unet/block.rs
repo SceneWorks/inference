@@ -90,13 +90,13 @@ impl UNetBlock2D {
         })
     }
 
-    pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        for r in &mut self.resnets {
-            r.quantize(bits)?;
+    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+        for (index, r) in self.resnets.iter_mut().enumerate() {
+            r.quantize_using(&crate::quant::child_path(prefix, &format!("resnets.{index}")), bits, visit)?;
         }
         if let Some(attns) = &mut self.attentions {
-            for a in attns {
-                a.quantize(bits)?;
+            for (index, a) in attns.iter_mut().enumerate() {
+                a.quantize_using(&crate::quant::child_path(prefix, &format!("attentions.{index}")), bits, visit)?;
             }
         }
         Ok(())
@@ -185,13 +185,28 @@ impl UNetBlock2D {
                 })?),
                 None => None,
             };
+            crate::quantum::diagnostic_owned_tensors(
+                "block-local-before-resnet",
+                i as u64,
+                output_states.iter(),
+            );
             x = self.resnets[i].forward_quantum(&x, skip, Some(temb), plan)?;
             if let Some(attns) = &self.attentions {
+                crate::quantum::diagnostic_owned_tensors(
+                    "block-local-before-attention",
+                    i as u64,
+                    output_states.iter().chain(std::iter::once(&x)),
+                );
                 x = attns[i].forward_ip(&x, encoder_x, ip, plan)?;
             }
             output_states.push(x.clone());
         }
         if let Some(c) = &self.downsample {
+            crate::quantum::diagnostic_owned_tensors(
+                "block-local-before-downsample",
+                0,
+                output_states.iter(),
+            );
             let scratch = downsample_scratch(&x, c);
             x = mlx_gen::ios_quantum::run(crate::quantum::UNET_DOWNSAMPLE, scratch, || {
                 conv2d(&x, c.weight(), c.bias(), 2, 1)
@@ -199,6 +214,11 @@ impl UNetBlock2D {
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
+            crate::quantum::diagnostic_owned_tensors(
+                "block-local-before-upsample",
+                0,
+                output_states.iter(),
+            );
             let scratch = upsample_scratch(&x, c);
             x = mlx_gen::ios_quantum::run(crate::quantum::UNET_UPSAMPLE, scratch, || {
                 conv2d(&upsample_nearest(&x, 2)?, c.weight(), c.bias(), 1, 1)
@@ -208,11 +228,7 @@ impl UNetBlock2D {
         Ok((x, output_states))
     }
 
-    /// Header-only pricing of [`Self::forward_ip`] over the shape-only `x`: every quantum it
-    /// checks, in order, with the guards' own formulas (`residuals` is the shape-only skip stack the
-    /// up path pops). Returns the shape-only output and output states.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn price_forward(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,
         encoder_x: &Array,
@@ -221,6 +237,9 @@ impl UNetBlock2D {
         ip: Option<(&Array, f32)>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         out: &mut crate::quantum::Quanta,
+        outer_held: u64,
+        mut owners: Option<&mut Vec<u64>>,
+        effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Array, Vec<Array>)> {
         let mut x = x.clone();
         let mut output_states = Vec::with_capacity(self.resnets.len() + 1);
@@ -232,41 +251,60 @@ impl UNetBlock2D {
                 None => None,
             };
             let resnet = &self.resnets[i];
+            if let Some(owners) = owners.as_deref_mut() {
+                owners.push(
+                    outer_held + output_states.iter().map(crate::quantum::bytes).sum::<u64>(),
+                );
+            }
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch(&x, Some(temb)),
+                resnet.quantum_scratch_with_effects(&x, Some(temb), &effects.child(&format!("resnets.{i}")))?,
             ));
             let input = skip.as_ref().map_or(x.dtype(), |s| {
                 Dtype::from_promoting_types(x.dtype(), s.dtype())
             });
-            let s = x.shape();
-            let cout = resnet.conv_weights().1.shape()[0];
+            let shape = resnet.output_shape_with_effects(x.shape(), skip.as_ref().map(Array::shape),
+                &effects.child(&format!("resnets.{i}")))?;
             x = crate::quantum::shaped(
-                &[s[0], s[1], s[2], cout],
-                resnet.output_dtype(input, Some(temb.dtype())),
+                &shape,
+                resnet.output_dtype_with_effects(input, Some(temb.dtype()), &effects.child(&format!("resnets.{i}")))?,
             )?;
             if let Some(attns) = &self.attentions {
-                x = attns[i].price_forward(&x, encoder_x, ip, plan, out)?;
+                let first = out.len();
+                // The caller's resnet output remains borrowed for the whole attention call;
+                // only PREVIOUS output_states are already in the retained stack at this point.
+                let held = outer_held
+                    + output_states.iter().map(crate::quantum::bytes).sum::<u64>()
+                    + crate::quantum::bytes(&x);
+                x = attns[i].price_forward_with_effects(&x, encoder_x, ip, plan, out, &effects.child(&format!("attentions.{i}")))?;
+                if let Some(owners) = owners.as_deref_mut() {
+                    owners.extend(std::iter::repeat_n(held, out.len() - first));
+                }
             }
             output_states.push(x.clone());
         }
         if let Some(c) = &self.downsample {
-            out.push((crate::quantum::UNET_DOWNSAMPLE, downsample_scratch(&x, c)));
-            let s = x.shape();
-            let half = |n: i32| (n + 2 - 3) / 2 + 1;
-            x = crate::quantum::shaped(
-                &[s[0], half(s[1]), half(s[2]), c.weight().shape()[0]],
-                conv_dtype(&x, c),
-            )?;
+            if let Some(owners) = owners.as_deref_mut() {
+                owners.push(
+                    outer_held + output_states.iter().map(crate::quantum::bytes).sum::<u64>(),
+                );
+            }
+            let conv = effects.conv("downsamplers.0.conv", c);
+            out.push((crate::quantum::UNET_DOWNSAMPLE, sampler_scratch(&x, &conv, false)));
+            x = crate::quantum::shaped(&conv.output_shape(x.shape(), 2, 1)?, conv.output_dtype(x.dtype()))?;
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
-            out.push((crate::quantum::UNET_UPSAMPLE, upsample_scratch(&x, c)));
+            if let Some(owners) = owners.as_deref_mut() {
+                owners.push(
+                    outer_held + output_states.iter().map(crate::quantum::bytes).sum::<u64>(),
+                );
+            }
+            let conv = effects.conv("upsamplers.0.conv", c);
+            out.push((crate::quantum::UNET_UPSAMPLE, sampler_scratch(&x, &conv, true)));
             let s = x.shape();
-            x = crate::quantum::shaped(
-                &[s[0], 2 * s[1], 2 * s[2], c.weight().shape()[0]],
-                conv_dtype(&x, c),
-            )?;
+            let input = [s[0], 2 * s[1], 2 * s[2], s[3]];
+            x = crate::quantum::shaped(&conv.output_shape(&input, 1, 1)?, conv.output_dtype(x.dtype()))?;
             output_states.push(x.clone());
         }
         Ok((x, output_states))
@@ -417,36 +455,31 @@ impl AdaptableHost for UNetBlock2D {
     }
 }
 
-/// iOS scratch of a U-Net / ControlNet stride-2 downsample over `x`: the stride-2 convolution's
-/// output (+ its bias add) and kernel transient.
+/// Shared sampler price from actual OHWI metadata. Native wrappers keep their original trace
+/// operands; selected-world pricing substitutes only the installed weight facts.
+fn sampler_scratch(x: &Array, work: &crate::quantum::ConvWork, up: bool) -> u64 {
+    let mut shape = x.shape().to_vec();
+    if up { shape[1] *= 2; shape[2] *= 2; }
+    let act = crate::quantum::element_bytes(x);
+    let call = work.call(&shape, act, if up { 1 } else { 2 }, 1);
+    crate::quantum::single_conv_bytes(&call, u64::from(up), 0, crate::quantum::backend())
+        .saturating_add(work.bias_bytes(x.dtype(), call.out_bytes() / act))
+}
+
 fn downsample_scratch(x: &Array, c: &AdaptableConv2d) -> u64 {
-    let call = crate::quantum::ConvCall::new(
-        x.shape(),
-        crate::quantum::element_bytes(x),
-        c.weight(),
-        2,
-        1,
-    );
-    crate::quantum::single_conv_bytes(&call, 0, 0, crate::quantum::backend())
+    #[cfg(test)]
+    {
+        crate::quantum::trace_layout(crate::quantum::UNET_DOWNSAMPLE, x);
+        crate::quantum::trace_layout("downsample weight", c.weight());
+    }
+    sampler_scratch(x, &crate::quantum::EffectScope::native().conv("", c), false)
 }
 
-/// iOS scratch of a U-Net nearest-2x upsample + convolution over `x`: the nearest-2x copy (input
-/// width at the doubled extent), the convolution's output (+ its bias add) and kernel transient.
 fn upsample_scratch(x: &Array, c: &AdaptableConv2d) -> u64 {
-    let s = x.shape();
-    let call = crate::quantum::ConvCall::new(
-        &[s[0], 2 * s[1], 2 * s[2], s[3]],
-        crate::quantum::element_bytes(x),
-        c.weight(),
-        1,
-        1,
-    );
-    crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::backend())
-}
-
-/// The dtype a biased convolution over `x` returns.
-fn conv_dtype(x: &Array, c: &AdaptableConv2d) -> Dtype {
-    let mut arrays = vec![c.weight()];
-    arrays.extend(c.bias());
-    crate::quantum::promote_all(x.dtype(), &arrays)
+    #[cfg(test)]
+    {
+        crate::quantum::trace_layout(crate::quantum::UNET_UPSAMPLE, x);
+        crate::quantum::trace_layout("upsample weight", c.weight());
+    }
+    sampler_scratch(x, &crate::quantum::EffectScope::native().conv("", c), true)
 }

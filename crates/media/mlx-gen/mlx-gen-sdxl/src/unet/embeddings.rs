@@ -125,9 +125,9 @@ impl TimestepEmbedding {
         })
     }
 
-    pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        crate::quant::quantize_linear(&mut self.linear1, bits)?;
-        crate::quant::quantize_linear(&mut self.linear2, bits)?;
+    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+        visit(&crate::quant::child_path(prefix, "linear_1"), &mut self.linear1, bits)?;
+        visit(&crate::quant::child_path(prefix, "linear_2"), &mut self.linear2, bits)?;
         Ok(())
     }
 
@@ -150,31 +150,68 @@ impl TimestepEmbedding {
         self.linear2.forward(&x)
     }
 
-    /// The dtype [`Self::forward`] returns for an `x`-typed input (header-only pricing).
-    pub(crate) fn output_dtype(&self, x: Dtype) -> Dtype {
-        [&self.linear1, &self.linear2].iter().fold(x, |d, linear| {
-            Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
-        })
+    pub(crate) fn output_dtype_with_effects(&self, x: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
+        let first = effects.linear("linear_1", &self.linear1)?.output_dtype(x);
+        let first = Dtype::from_promoting_types(x, first);
+        Ok(Dtype::from_promoting_types(first,
+            effects.linear("linear_2", &self.linear2)?.output_dtype(first)))
     }
 
-    /// The output width (`linear_2` rows).
-    pub(crate) fn out_features(&self) -> i32 {
-        crate::quantum::linear_out(&self.linear2) as i32
+    pub(crate) fn projection_scratch(&self, batch: i32, input: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+        let first = effects.linear("linear_1", &self.linear1)?;
+        let second = effects.linear("linear_2", &self.linear2)?;
+        let shape = [batch, *first.base.base_shape.last().unwrap_or(&0)];
+        let hidden = first.output_dtype(input);
+        let intermediate = [batch, first.output_width() as i32];
+        let output = second.output_dtype(hidden);
+        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(
+            crate::quantum::dtype_bytes(dtype), &[batch.max(0) as u64, width]);
+        Ok(first.operand_bytes(&shape, input)
+            .saturating_add(plane(hidden, first.output_width()).saturating_mul(3))
+            .saturating_add(second.operand_bytes(&intermediate, hidden))
+            .saturating_add(plane(output, second.output_width()))
+            .saturating_add(crate::quantum::page_slack(4)))
     }
+
+    pub(crate) fn out_features_with_effects(&self, effects: &crate::quantum::EffectScope<'_>) -> Result<i32> {
+        Ok(effects.linear("linear_2", &self.linear2)?.output_width() as i32)
+    }
+
 }
 
-/// The dtype [`text_time_temb`] returns for a `text_emb_dtype` pooled embedding at the model
-/// `dtype` (header-only pricing).
-pub(crate) fn text_time_temb_dtype(
+/// Pure final projection facts for the existing time/add embedding flow.
+pub(crate) fn text_time_temb_dtype_with_effects(
     time_embedding: &TimestepEmbedding,
     add_embedding: &TimestepEmbedding,
     text_emb_dtype: Dtype,
     dtype: Dtype,
-) -> Dtype {
-    Dtype::from_promoting_types(
-        time_embedding.output_dtype(dtype),
-        add_embedding.output_dtype(Dtype::from_promoting_types(text_emb_dtype, dtype)),
-    )
+    effects: &crate::quantum::EffectScope<'_>,
+) -> Result<Dtype> {
+    Ok(Dtype::from_promoting_types(
+        time_embedding.output_dtype_with_effects(dtype, &effects.child("time_embedding"))?,
+        add_embedding.output_dtype_with_effects(Dtype::from_promoting_types(text_emb_dtype, dtype),
+            &effects.child("add_embedding"))?,
+    ))
+}
+
+/// The actual stem's time/add MLP and optional context projection operands. Shared by the
+/// runtime guard and header overlay; no output graph is built to derive these extents.
+pub(crate) fn stem_projection_scratch(
+    time: &TimestepEmbedding, add: &TimestepEmbedding, encoder: Option<&AdaptableLinear>,
+    batch: i32, dtype: Dtype, text: Dtype, memory: &Array,
+    effects: &crate::quantum::EffectScope<'_>,
+) -> Result<u64> {
+    let mut bytes = time.projection_scratch(batch, dtype, &effects.child("time_embedding"))?
+        .saturating_add(add.projection_scratch(batch, Dtype::from_promoting_types(text, dtype),
+            &effects.child("add_embedding"))?);
+    if let Some(encoder) = encoder {
+        let work = effects.linear("encoder_hid_proj", encoder)?;
+        bytes = bytes.saturating_add(work.operand_bytes(memory.shape(), memory.dtype()))
+            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
+                crate::quantum::dtype_bytes(work.output_dtype(memory.dtype())),
+                &[memory.shape()[0].max(0) as u64, memory.shape()[1].max(0) as u64, work.output_width()]));
+    }
+    Ok(bytes)
 }
 
 /// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by

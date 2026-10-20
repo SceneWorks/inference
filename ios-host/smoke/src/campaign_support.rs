@@ -1,5 +1,16 @@
 use super::*;
 
+/// Output cardinality, NOT the solver's U-Net batch: count is serial and repeats every prompt row.
+pub(super) fn expected_generation_outputs(request: &GenerationRequest) -> Result<usize, String> {
+    if request.count == 0 {
+        return Err("generation count must be positive".into());
+    }
+    usize::try_from(request.count)
+        .map_err(|e| e.to_string())?
+        .checked_mul(request.prompt_batch.len().max(1))
+        .ok_or_else(|| "generation output cardinality overflow".into())
+}
+
 /// Typed refusal kinds straight from runtime-ios; no message is parsed. Failures (inventory,
 /// binding, malformed request, provider errors) stay diagnostic failures.
 pub(super) fn classify(
@@ -115,25 +126,44 @@ pub(super) enum PeakReading {
 
 /// The injected query keeps the exact request count and field decoding testable without calling
 /// an OS or accelerator. `None` only when the call failed or the reply lacks `phys_footprint`.
+pub(super) fn footprint_snapshot(
+    query: impl FnOnce(&mut [u32], &mut u32) -> i32,
+) -> runtime_ios::media::evidence::KernelFootprintSnapshot {
+    use runtime_ios::media::evidence::{KernelFootprintMethod, KernelFootprintSnapshot};
+    let mut words = [0u32; TASK_VM_INFO_COUNT as usize];
+    let mut count = TASK_VM_INFO_COUNT;
+    let status = query(&mut words, &mut count);
+    let current_readable =
+        status == 0 && (TASK_VM_INFO_REV1_COUNT..=TASK_VM_INFO_COUNT).contains(&count);
+    let word64 = |at: usize| u64::from(words[at]) | (u64::from(words[at + 1]) << 32);
+    KernelFootprintSnapshot {
+        method: KernelFootprintMethod::TaskVmInfo,
+        query_status: status,
+        requested_words: TASK_VM_INFO_COUNT,
+        returned_words: count,
+        current_required_words: TASK_VM_INFO_REV1_COUNT,
+        peak_required_words: TASK_VM_INFO_REV3_COUNT,
+        current_bytes: current_readable.then(|| word64(PHYS_FOOTPRINT_WORD)),
+        lifetime_peak_bytes: (current_readable && count >= TASK_VM_INFO_REV3_COUNT)
+            .then(|| word64(LEDGER_PEAK_WORD)),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn read_footprint(
     query: impl FnOnce(&mut [u32], &mut u32) -> i32,
 ) -> Option<(u64, PeakReading)> {
-    let mut words = vec![0u32; TASK_VM_INFO_COUNT as usize];
-    let mut count = TASK_VM_INFO_COUNT;
-    let status = query(&mut words, &mut count);
-    if status != 0 || !(TASK_VM_INFO_REV1_COUNT..=TASK_VM_INFO_COUNT).contains(&count) {
-        return None;
-    }
-    let word64 = |at: usize| u64::from(words[at]) | (u64::from(words[at + 1]) << 32);
-    let current = word64(PHYS_FOOTPRINT_WORD);
-    let peak = if count >= TASK_VM_INFO_REV3_COUNT {
-        PeakReading::Read(word64(LEDGER_PEAK_WORD))
-    } else {
-        PeakReading::Unavailable {
-            returned_words: count,
-        }
-    };
-    Some((current, peak))
+    let snapshot = footprint_snapshot(query);
+    let current = snapshot.current_bytes?;
+    Some((
+        current,
+        snapshot.lifetime_peak_bytes.map_or(
+            PeakReading::Unavailable {
+                returned_words: snapshot.returned_words,
+            },
+            PeakReading::Read,
+        ),
+    ))
 }
 
 pub(super) struct Deadline {
@@ -185,7 +215,10 @@ pub(super) fn persist_images(
         {
             return Err("wrong geometry or constant image".into());
         }
-        let name = format!("campaign-{}-{index}.png", c.key().replace('/', "-"));
+        let name = format!(
+            "campaign-{}-{index}.png",
+            runtime_ios::media::capture_artifact_stem(&c.key())
+        );
         image::save_buffer_with_format(
             docs.join(&name),
             &image.pixels,
@@ -206,6 +239,56 @@ pub(super) fn persist_images(
     Ok(())
 }
 
+pub(super) fn growth_report(
+    growth: &Result<mlx_gen::ios_anchor_law::KernelGrowth, String>,
+) -> Value {
+    use mlx_gen::ios_anchor_law::KernelPeakQuality;
+    match growth {
+        Ok(growth) => json!({"available":true,"growth_upper_bytes":growth.growth_upper,
+            "quality":match growth.quality { KernelPeakQuality::AdvancedDuringRun=>"advanced_during_run",
+                KernelPeakQuality::CurrentAttainedUpper=>"current_attained_upper", KernelPeakQuality::MaskedUpper=>"masked_upper" },
+            "exact_growth_bytes":growth.exact_growth().ok(), "valid_query_count":growth.query_count}),
+        Err(reason) => json!({"available":false,"reason":reason}),
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CaptureMarks {
+    pub marks: Vec<Mark>,
+    pub sampling: runtime_ios::media::evidence::SamplingCoverage,
+    pub quantum: runtime_ios::media::evidence::QuantumCoverage,
+    pub preceding_sampling_mark: Option<u32>,
+    pub quantum_query_gaps: u64,
+    pub model_mark_start: Option<usize>,
+    latest: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u32>>,
+}
+
+impl CaptureMarks {
+    pub fn metadata(&mut self, provider: &str, kind: &str, fields: &[(&str, u64)]) {
+        if provider == "ios_capture" && kind == "before-model-load" {
+            self.model_mark_start = Some(self.marks.len());
+        }
+        self.preceding_sampling_mark = self.sampling.record(provider, kind, fields);
+        if let Some(index) = self.preceding_sampling_mark {
+            self.latest
+                .entry(provider.into())
+                .or_default()
+                .insert(kind.into(), index);
+        } else if let Some(kinds) = self.latest.get_mut(provider) {
+            kinds.remove(kind);
+        }
+    }
+
+    pub fn checked(&mut self, phase: Option<mlx_gen::ios_pricing::IosPhase>, label: &str) {
+        let context = self
+            .latest
+            .values()
+            .flat_map(|kinds| kinds.values().copied())
+            .collect();
+        self.quantum.record(phase, label, context);
+    }
+}
+
 /// One quantum boundary seen by a capture: the phase its label runs in (the provider's own
 /// `ios_quantum_phase`; `None` for a label it does not attribute), whether it OPENS a quantum (a
 /// pre-construction check) or closes one (a synchronization), and the kernel lifetime
@@ -220,6 +303,7 @@ pub(super) struct Mark {
     pub label: String,
     pub scratch: u64,
     pub current: u64,
+    pub preceding_sampling_mark: Option<u32>,
 }
 
 /// One quantum formula as the device saw it: the priced scratch and the observed growth of the
@@ -229,6 +313,7 @@ pub(super) struct Observation {
     pub priced: u64,
     pub observed: u64,
     pub exact: bool,
+    pub preceding_sampling_mark: Option<u32>,
 }
 
 /// The per-quantum DEVICE observations of a capture: for every quantum a check opened, the
@@ -253,6 +338,7 @@ pub(super) fn quantum_observations(
             priced: mark.scratch,
             observed,
             exact,
+            preceding_sampling_mark: mark.preceding_sampling_mark,
         };
         let better = out.get(&mark.label).is_none_or(|existing| {
             (candidate.exact && !existing.exact)

@@ -74,7 +74,7 @@ class CampaignTests(unittest.TestCase):
             elif remote == "launch-memory.txt":
                 local.write_text("launch: increased-memory-limit = " + entitlement, encoding="utf-8")
             elif remote == "renders.txt":
-                local.write_text("campaign-" + row["case"].replace("/", "-") + "-0.png\n", encoding="utf-8")
+                local.write_text("campaign-" + campaign.artifact_stem(row["case"]) + "-0.png\n", encoding="utf-8")
             else:
                 local.write_bytes(b"fixture PNG")
             return subprocess.CompletedProcess([], 0, "", "")
@@ -119,12 +119,69 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(campaign.parser().parse_args(["run", "--max-cases", "50000"]).max_cases, 50000)
 
     def test_invalid_finite_budgets_and_cases(self):
-        for options in (("--case", "p/../q4/512/text/0/base/1"), ("--case", "p/p/q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0/t5.1/1"), ("--case", "p/p/q4/512/text/0/base/101"), ("--timeout-seconds", "0"), ("--timeout-seconds", "20001"), ("--max-cases", "0"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5"), ("--steps", "101"), ("--purpose", "ladder")):
+        for options in (("--case", "p/../q4/512/text/0/base/1"), ("--case", "p/p/q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0/t5.1/1"), ("--case", "p/p/q4/512/text/0/base/4294967296"), ("--timeout-seconds", "0"), ("--timeout-seconds", "20001"), ("--max-cases", "0"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5"), ("--steps", "4294967296"), ("--steps", "-1"), ("--steps", "not-an-integer"), ("--purpose", "ladder")):
             with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.parser().parse_args(["run", *options])
         with self.assertRaises(SystemExit):
             self.main("run", "--device", "fake", "--output", str(self.root / "not-written"))
         self.assertFalse((self.root / "not-written").exists())
+
+    def test_capture_step_transport_preserves_u32_domain_without_enumerated_choices(self):
+        for steps in (0, 1, 101, (1 << 32) - 1):
+            key = f"p/p/q4/512/text/0/base/{steps}"
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parsed = campaign.parser().parse_args(["list", "--steps", str(steps), "--case", key])
+            except SystemExit as error:
+                self.fail(f"legal wire/default step count {steps} was refused by scalar parser: exit={error.code}")
+            self.assertEqual(parsed.steps, steps)
+            self.assertEqual(parsed.case, key)
+        action = next(action for action in campaign.parser()._actions if action.dest == "steps")
+        self.assertIsNone(action.choices, "argparse must not enumerate a step-sized domain even on invalid input")
+        # Zero remains the existing explicit default sentinel, not a request for zero solver steps.
+        self.assertEqual(campaign.step_count("0"), 0)
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        for invalid_count in (0, True, -1, 1 << 32):
+            row["steps"] = invalid_count
+            self.assertIsNone(campaign.capture_of(row), "recorded actual solver steps must be nonzero u32, never the CLI default sentinel")
+        row["steps"] = (1 << 32) - 1
+        self.assertIsNotNone(campaign.capture_of(row))  # Schema only; does not execute a large run.
+        for invalid in ("-1", "4294967296", "not-an-integer"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                campaign.step_count(invalid)
+
+    def test_long_recipe_case_preserves_wire_identity_with_digest_artifact_paths(self):
+        key = "sdxl/sdxl/q4/1024/text/4/base/3/sdxl1-" + "ab" * 1024
+        self.assertEqual(campaign.case_key(key), key)
+        self.assertEqual(campaign.parser().parse_args(["run", "--case", key]).case, key)
+        stem = campaign.artifact_stem(key)
+        self.assertEqual(stem, "recipe-" + campaign.hashlib.sha256(key.encode("utf-8")).hexdigest())
+        self.assertLess(len(stem), 128)
+        self.assertNotEqual(stem, campaign.artifact_stem(key + "ab"))
+        legacy = self.keys[0]
+        self.assertEqual(campaign.artifact_stem(legacy), legacy.replace("/", "-"))
+        session = self.fake_session(self.success(key))
+        result = session.run_case(key)
+        self.assertEqual(result["case"], key)
+        self.assertEqual(result["status"], "successful", result)
+        files = list((self.root / "run.artifacts" / stem).glob("*.png"))
+        self.assertEqual(len(files), 1)
+        self.assertLess(len(files[0].name), 255)
+        for invalid in (key + "/extra", key + "/", key + "."):
+            with self.assertRaises(argparse_error()):
+                campaign.case_key(invalid)
+
+    def test_step_validation_never_pairs_different_sampling_recipes(self):
+        short_key = "sdxl/sdxl/q4/512/text/4/base/3/sdxl1-aa"
+        full_key = "sdxl/sdxl/q4/512/text/4/base/0/sdxl1-bb"
+        short = dict(self.capture_row(short_key, "diagnostic_success"), purpose="optimized")
+        full = dict(self.capture_row(full_key, "diagnostic_success"), purpose="validation_steps")
+        report = campaign.steps_validation([short, full])
+        self.assertEqual(report[0]["problem"], "no completed optimized anchor of the same case")
+        full["case"] = full_key.replace("sdxl1-bb", "sdxl1-aa")
+        matched = campaign.steps_validation([short, full])
+        self.assertIn("ratio", matched[0])
+        self.assertNotIn("problem", matched[0])
 
     def test_install_once_budget_and_all_explicit_status_rows(self):
         output = self.root / "evidence.jsonl"
@@ -275,10 +332,22 @@ class CampaignTests(unittest.TestCase):
 
     def capture_row(self, key, status):
         row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
-                   evidence_key={"machine": "iPhone17,2", "provider": "fake", "execution": key.split("/")[5]}, run_id="fixture-run",
-                   baseline_phys_footprint_bytes=40, steps=int(key.split("/")[7]),
+                   evidence_key={"machine": "iPhone17,2", "provider": "fake", "execution": key.split("/")[5],
+                                 "reference_count": 0, "mask_count": 0, "control_count": 0}, run_id="fixture-run",
+                   baseline_phys_footprint_bytes=40, steps=int(key.split("/")[7]) or 16,  # Synthetic resolved default, not the CLI0 sentinel.
                    anchor_selection={"rung": int(key.split("/")[5])},
                    phase_peaks={"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
+        # Synthetic ABI/transport fixture only, not device evidence or a physical transfer proof.
+        def snapshot(current, highwater):
+            return {"method": "task_vm_info", "query_status": 0, "requested_words": 93, "returned_words": 93,
+                    "current_required_words": 38, "peak_required_words": 84,
+                    "current_bytes": current, "lifetime_peak_bytes": highwater}
+        row.update(before_request_snapshot=snapshot(40, 40), before_model_load_snapshot=snapshot(60, 60),
+                   ending_snapshot=snapshot(100, 150), observed_current_peak_bytes=150,
+                   observed_model_current_peak_bytes=150, valid_kernel_queries=3, valid_model_kernel_queries=2,
+                   sampling_coverage=self.observed_fixture(), quantum_query_gaps=0,
+                   quantum_coverage={"checks": [{"phase": "denoise", "label": "synthetic_kernel", "context": [0], "count": 1}],
+                                     "total_checks": 1, "dropped_checks": 0, "truncated": False})
         if status == "capture_refused":
             row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
         return row
@@ -333,6 +402,156 @@ class CampaignTests(unittest.TestCase):
         artifact = dict(self.success(key), status="admitted_refused", production_success=False, refusal_kind="artifact")
         self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(artifact), key)["status"], "admitted_refused")
 
+    @staticmethod
+    def observed_fixture():
+        # Schema fixture ONLY; it is not a native execution/physical-demand proof.
+        return {"marks": [{"provider": "curated", "kind": "solver_primary", "fields": {"step": 0, "state_dtype": 3}},
+                          {"provider": "curated", "kind": "solve_complete", "fields": {"evaluations": 3}},
+                          {"provider": "ios_capture", "kind": "conditioning-roles", "fields": {"reference_count": 0, "mask_count": 0, "control_count": 0}}],
+                "counts": {"curated": {"solver_primary": 1, "solve_complete": 1}, "ios_capture": {"conditioning-roles": 1}},
+                "total_marks": 3, "dropped_marks": 0, "malformed_marks": 0, "truncated": False}
+
+    def test_anchor_import_preserves_complete_sampling_recipe_and_execution_identity(self):
+        recipe = {"version": 1, "sampler": "euler", "scheduler": "normal", "steps": 3,
+                  "guidance": 7.0, "guidance_method": "cfg", "cfg_batching": "batched",
+                  "strength": None, "reference_strength": None, "use_pid": False, "pid_capture_sigma": None}
+        token = "sdxl1-" + json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode("utf-8").hex()
+        key = "sdxl/sdxl/q4/512/text/4/base/3/" + token
+        rows = []
+        for run in ("a", "b"):
+            row = dict(self.capture_row(key, "diagnostic_success"), purpose="optimized", run_id=run)
+            row["evidence_key"].update(provider="sdxl", sampling_recipe=token, execution="Sequential|DeferredMaterialization|recipe=" + token)
+            row["sampling_recipe"] = recipe
+            row.update(sampling_coverage=self.observed_fixture(), sampling_metadata_required=True, sampling_metadata_missing=False)
+            rows.append(row)
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0]["key"]["sampling_recipe"], token)
+        self.assertEqual(anchors[0]["key"]["execution"], rows[0]["evidence_key"]["execution"])
+        decoded = json.loads(bytes.fromhex(anchors[0]["key"]["sampling_recipe"].removeprefix("sdxl1-")))
+        self.assertEqual(decoded, recipe)
+        self.assertEqual([c["run_id"] for c in anchors[0]["outcome"]["completed"]["captures"]], ["a", "b"])
+
+    def test_capture_preserves_both_real_baseline_ledgers_and_refuses_short_forged_queries(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        capture = campaign.capture_of(row)
+        self.assertEqual(capture["before_request_snapshot"]["current_bytes"], 40)
+        self.assertEqual(capture["before_model_load_snapshot"]["current_bytes"], 60)
+        for boundary in ("before_request_snapshot", "before_model_load_snapshot", "ending_snapshot"):
+            for field, bad in (("query_status", 1), ("returned_words", 83), ("returned_words", 94),
+                               ("current_required_words", 1), ("peak_required_words", 1), ("current_bytes", False)):
+                broken = json.loads(json.dumps(row))
+                broken[boundary][field] = bad
+                self.assertIsNone(campaign.capture_of(broken), (boundary, field, bad))
+            missing = json.loads(json.dumps(row))
+            del missing[boundary]
+            self.assertIsNone(campaign.capture_of(missing), boundary)
+        mismatched_end = json.loads(json.dumps(row))
+        mismatched_end["ending_snapshot"]["lifetime_peak_bytes"] = 160
+        self.assertIsNone(campaign.capture_of(mismatched_end), "raw ending kernel peak must agree with imported upper")
+        masked = json.loads(json.dumps(row))
+        masked["kernel_lifetime_phys_footprint_peak_bytes"] = 200
+        for boundary in ("before_request_snapshot", "before_model_load_snapshot", "ending_snapshot"):
+            masked[boundary]["lifetime_peak_bytes"] = 200
+        masked_capture = campaign.capture_of(masked)
+        self.assertIsNotNone(masked_capture)  # Upper retained, never replaced by sampled current150.
+        self.assertEqual(masked_capture["footprint_bytes"], 200)
+        self.assertEqual(masked_capture["observed_model_current_peak_bytes"], 150)
+
+    def test_quantum_coverage_preserves_actual_context_and_refuses_dangling_or_truncated_transport(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        self.assertEqual(campaign.capture_of(row)["quantum_coverage"], row["quantum_coverage"])
+        mutations = [lambda q: q["checks"][0].update(context=[99]),
+                     lambda q: q["checks"][0].update(count=0),
+                     lambda q: q.update(total_checks=2),
+                     lambda q: q.update(truncated=True, dropped_checks=1, total_checks=2)]
+        for mutate in mutations:
+            broken = json.loads(json.dumps(row))
+            mutate(broken["quantum_coverage"])
+            self.assertIsNone(campaign.capture_of(broken))
+        row["quantum_query_gaps"] = 1
+        self.assertEqual(campaign.capture_of(row)["quantum_query_gaps"], 1)  # Valid whole-run upper, not phase/class authority.
+
+    def test_role_distinct_receipts_do_not_deduplicate_and_role_aliases_keep_repeat_groups(self):
+        # Transport grouping is exact-key only; Python must not invent its own additivity law.
+        rows = []
+        for references in (0, 1):
+            for run, kind in (("a", "pose"), ("b", "canny")):
+                mode = ("reference_" if references else "control_") + kind
+                key = f"fake/fake/q4/512/{mode}/4/s_t256/1"
+                row = dict(self.capture_row(key, "diagnostic_success"), purpose="optimized",
+                           run_id=f"{references}-{run}")
+                # Existing wire reference_count is aggregate: Control + optional true Reference.
+                roles = {"reference_count": references + 1, "mask_count": 0, "control_count": 1}
+                row["evidence_key"].update(mode="control", **roles)
+                row["sampling_coverage"]["marks"][2]["fields"].update(roles)
+                rows.append(row)
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(anchors), 2)
+        self.assertEqual({anchor["key"]["reference_count"] for anchor in anchors}, {1, 2})
+        for anchor in anchors:
+            self.assertEqual(anchor["key"]["control_count"], 1)
+            captures = anchor["outcome"]["completed"]["captures"]
+            self.assertEqual(len(captures), 2)
+            self.assertEqual({capture["run_id"] for capture in captures},
+                             {f"{anchor['key']['reference_count'] - 1}-a", f"{anchor['key']['reference_count'] - 1}-b"})
+
+    def test_actual_conditioning_roles_are_required_and_match_prepared_carrier_witness(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        row["evidence_key"]["sampling_recipe"] = "synthetic-schema-fixture"
+        row.update(sampling_coverage=self.observed_fixture(), sampling_metadata_required=True, sampling_metadata_missing=False)
+        self.assertIsNotNone(campaign.capture_of(row))
+        for field in ("reference_count", "mask_count", "control_count"):
+            for bad in (None, False, True, -1, 1 << 32):
+                broken = json.loads(json.dumps(row))
+                broken["evidence_key"][field] = bad
+                self.assertIsNone(campaign.capture_of(broken), (field, bad))
+            missing = json.loads(json.dumps(row))
+            del missing["evidence_key"][field]
+            self.assertIsNone(campaign.capture_of(missing), field)
+            forged = json.loads(json.dumps(row))
+            forged["sampling_coverage"]["marks"][2]["fields"][field] = 1
+            self.assertIsNone(campaign.capture_of(forged), field)
+
+    def test_observed_metadata_is_bounded_preserved_and_quantum_context_is_validated(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        row["sampling_coverage"] = self.observed_fixture()
+        row["quanta"] = {"q": {"priced_scratch_bytes": 100, "observed_bytes": 80, "exact": True, "preceding_sampling_mark": 0}}
+        captured = campaign.capture_of(row)
+        self.assertEqual(captured["sampling_coverage"], row["sampling_coverage"])
+        self.assertEqual(captured["quanta"]["q"]["preceding_sampling_mark"], 0)
+        def oversized(c):
+            copies = campaign.SAMPLING_MARKS_MAX // len(c["marks"]) + 1
+            c["marks"] *= copies
+            c["counts"] = {"curated": {"solver_primary": copies, "solve_complete": copies}, "ios_capture": {"conditioning-roles": copies}}
+            c["total_marks"] = len(c["marks"])
+        for mutate in (
+            lambda c: c["counts"]["curated"].update(solver_primary=2),
+            lambda c: c.update(total_marks=c["total_marks"] + 1),
+            lambda c: c.update(dropped_marks=1, total_marks=3, truncated=True),
+            lambda c: c["marks"][0]["fields"].update(step=True),
+            lambda c: c["marks"][0].update(provider="x" * (campaign.SAMPLING_NAME_BYTES_MAX + 1)),
+            oversized,
+            lambda c: c["marks"][0].update(fields={f"f{i}": i for i in range(campaign.SAMPLING_FIELDS_MAX + 1)}),
+        ):
+            broken = json.loads(json.dumps(row))
+            mutate(broken["sampling_coverage"])
+            self.assertTrue(campaign.capture_of(broken) is None, "invalid bounded observation data must be rejected")
+        broken = json.loads(json.dumps(row))
+        broken["quanta"]["q"]["preceding_sampling_mark"] = 99
+        self.assertIsNone(campaign.capture_of(broken))
+        required = json.loads(json.dumps(row))
+        required["evidence_key"]["sampling_recipe"] = "fixture-token-not-a-class-claim"
+        required.update(sampling_metadata_required=True, sampling_metadata_missing=False)
+        self.assertIsNotNone(campaign.capture_of(required))
+        for missing in (None, {"marks": [], "counts": {}, "total_marks": 0, "dropped_marks": 0, "malformed_marks": 0, "truncated": False}):
+            broken = json.loads(json.dumps(required))
+            broken["quanta"] = {}
+            broken["sampling_coverage"] = missing
+            self.assertIsNone(campaign.capture_of(broken), "declared recipe/progress alone is not observed metadata")
+
     def test_anchor_rows_come_only_from_completed_captures_and_resident_refusals(self):
         opt, res = self.keys[1], self.keys[0]
         def completed(run, **kw):
@@ -342,6 +561,8 @@ class CampaignTests(unittest.TestCase):
                 # Not captures: no telemetry / no baseline below the peak / not a capture.
                 completed("d", kernel_lifetime_phys_footprint_peak_bytes=None),
                 completed("e", baseline_phys_footprint_bytes=150)]
+        # The valid changed ledger peak is recorded by the same ending kernel query.
+        rows[2]["ending_snapshot"]["lifetime_peak_bytes"] = 170
         anchors, problems = campaign.anchor_rows(rows)
         self.assertEqual(problems, [])
         # A non-capture row under another key is reported, never turned into an anchor.
@@ -355,7 +576,9 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(set(optimized), {"key", "anchor_kind", "selection", "outcome", "evidence_class"})
         captures = optimized["outcome"]["completed"]["captures"]
         self.assertEqual([c["run_id"] for c in captures], ["a", "b", "c"])
-        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds"})
+        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "sampling_coverage", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds",
+                         "before_request_snapshot", "before_model_load_snapshot", "ending_snapshot", "observed_current_peak_bytes", "observed_model_current_peak_bytes",
+                         "valid_kernel_queries", "valid_model_kernel_queries", "quantum_coverage", "quantum_query_gaps"})
         self.assertEqual((captures[2]["footprint_bytes"], captures[2]["baseline_footprint_bytes"]), (170, 40))
         self.assertEqual(captures[0]["phase_peaks"], {"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
         self.assertEqual(captures[0]["steps"], 1)
@@ -386,7 +609,12 @@ class CampaignTests(unittest.TestCase):
     def test_the_per_formula_device_calibration_table(self):
         mib = 1 << 20
         def row(run, quanta):
-            return dict(self.capture_row(self.keys[1], "diagnostic_success"), run_id=run, kernel_lifetime_phys_footprint_peak_bytes=4000 * mib, baseline_phys_footprint_bytes=100 * mib, quanta=quanta)
+            value = dict(self.capture_row(self.keys[1], "diagnostic_success"), run_id=run, kernel_lifetime_phys_footprint_peak_bytes=4000 * mib, baseline_phys_footprint_bytes=100 * mib, quanta=quanta)
+            for name in ("before_request_snapshot", "before_model_load_snapshot"):
+                value[name].update(current_bytes=100 * mib, lifetime_peak_bytes=100 * mib)
+            value["ending_snapshot"].update(current_bytes=150 * mib, lifetime_peak_bytes=4000 * mib)
+            value.update(observed_current_peak_bytes=4000 * mib, observed_model_current_peak_bytes=4000 * mib)
+            return value
         q = lambda p, o, e: {"priced_scratch_bytes": p * mib, "observed_bytes": o * mib, "exact": e}
         rows = [row("a", {"tile": q(400, 200, True), "block": q(100, 95, True)}),
                 row("b", {"tile": q(400, 260, True), "block": q(100, 300, False)}),
@@ -404,6 +632,8 @@ class CampaignTests(unittest.TestCase):
         short = [dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/1", "diagnostic_success"), purpose="optimized", run_id=r) for r in "abc"]
         full = dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/0", "diagnostic_success"), purpose="validation_steps",
                     kernel_lifetime_phys_footprint_peak_bytes=160, phase_peaks={"denoise": {"peak_bytes": 130, "exact": True}})
+        full["ending_snapshot"]["lifetime_peak_bytes"] = 160
+        full["steps"] = 16  # Synthetic provider's actually resolved default; case0 remains the sentinel.
         report = campaign.steps_validation(short + [full])
         self.assertEqual(len(report), 1)
         self.assertEqual((report[0]["full_steps_demand_bytes"], report[0]["short_steps_demand_bytes"]), (120, 110))

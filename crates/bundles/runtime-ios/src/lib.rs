@@ -63,22 +63,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```
 #[cfg(feature = "media")]
 pub mod media {
-    pub use mlx_gen_ios_catalog::admit;
     #[cfg(feature = "device-capture")]
     use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::control_required;
+    pub use mlx_gen_ios_catalog::{admit, admit_with_baseline};
     pub use mlx_gen_ios_catalog::{
         anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
-        build_candidate, capacity_budget, evidence, evidence_key, hex, ios_memory_budget,
-        ios_quantum, pricing, sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound,
-        sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl, zimage, Admission,
-        AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
-        BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
-        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, CONTROL_REQUIRED_ROUTES,
-        IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
-        IRIS_DEPTH_ID, IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
+        build_candidate, capacity_budget, capture_adapters, capture_artifact_stem,
+        configured_load_form, configured_variant_digest, evidence, evidence_key, hex,
+        ios_memory_budget, ios_quantum, pricing, sampling, sana_decode_plan, sana_decode_tile_edge,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
+        work_mode, zimage, Admission, AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth,
+        BoundGenerator, BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal,
+        RefusalKind, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID,
+        CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
+        IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+        SANA_DEVICE_FOOTPRINTS,
     };
+    pub use mlx_gen_ios_catalog::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
 
@@ -184,18 +187,38 @@ pub mod media {
             ));
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        // The captured footprint is an absolute process peak: what this process already holds is
-        // committed (subtracted from the prediction exactly once), and the total is the smaller of
-        // the fixed cap and what the process could reach now.
+        // Actual boundary: caller media carriers already exist; no model load/admission pricing
+        // has run. Keep the same snapshot for baseline, committed budget and capacity rechecks.
+        // Construct fixed provenance before the query so this scaffold is already in the baseline.
+        let baseline_source = String::from(
+            "TASK_VM_INFO.phys_footprint after request construction, before model admission/load",
+        );
         let now = super::process_memory();
+        let baseline = IosMemoryBaseline {
+            domain: IosMemoryDomain::ProcessGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            bytes: now.footprint.filter(|bytes| *bytes > 0).ok_or_else(|| {
+                AdmissionError::Failed(Error::Unsupported(
+                    "iOS admission requires an actual BeforeModelLoad process footprint snapshot"
+                        .into(),
+                ))
+            })?,
+            source: baseline_source,
+        };
         let mut budget = mlx_gen_ios_catalog::capacity_budget(
             u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
-            now.footprint.unwrap_or(0),
+            baseline.bytes,
             now.available,
         );
         // No blanket reserve: the predicted peak is the anchor's demand plus its MEASURED margin.
         budget.reserved_headroom_bytes = 0;
-        let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
+        let admission = admit_with_baseline(
+            &registry,
+            candidates,
+            &super::device_machine(),
+            budget,
+            &baseline,
+        )?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
         incremental_capacity(admission.required_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;

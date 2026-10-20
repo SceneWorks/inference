@@ -56,9 +56,21 @@ impl FeedForward {
         // Packed-detect (sc-8670): the three SwiGLU projections load packed from a pre-quantized
         // snapshot or dense otherwise. No biases.
         Ok(Self {
-            w1: crate::quant::lin(w, &format!("{prefix}.w1"), false)?,
-            w2: crate::quant::lin(w, &format!("{prefix}.w2"), false)?,
-            w3: crate::quant::lin(w, &format!("{prefix}.w3"), false)?,
+            w1: crate::quant::lin(
+                w,
+                &format!("{prefix}.w1"),
+                crate::quant::DIT_FFN_HAS_BIAS,
+            )?,
+            w2: crate::quant::lin(
+                w,
+                &format!("{prefix}.w2"),
+                crate::quant::DIT_FFN_HAS_BIAS,
+            )?,
+            w3: crate::quant::lin(
+                w,
+                &format!("{prefix}.w3"),
+                crate::quant::DIT_FFN_HAS_BIAS,
+            )?,
         })
     }
 
@@ -106,6 +118,8 @@ fn swiglu(h1: &Array, h3: &Array) -> Result<Array> {
     }
 }
 
+pub(crate) const ADAPTER_TARGET_PATHS: &[&str] = &["w1", "w2", "w3"];
+
 impl AdaptableHost for FeedForward {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -117,7 +131,10 @@ impl AdaptableHost for FeedForward {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        ["w1", "w2", "w3"].into_iter().map(String::from).collect()
+        ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect()
     }
 }
 

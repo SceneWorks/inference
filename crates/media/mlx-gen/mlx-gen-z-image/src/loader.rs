@@ -90,12 +90,19 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 }
 
 pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<TextEncoder> {
+    load_text_encoder_from_source_with(source, &ZTextEncoderConfig::z_image())
+}
+
+fn load_text_encoder_from_source_with(
+    source: &WeightsSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
     // iOS: the header-only pre-load floor, checked before any tensor is read.
     crate::quantum::before_load(crate::quantum::TE_LOAD, source, |name| {
         te_load_keeps(false, name)
     })?;
     let w = weights_from_source(source)?;
-    let encoder = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())?;
+    let encoder = TextEncoder::from_weights(&w, "model", cfg)?;
     w.materialize_accessed()?;
     Ok(encoder)
 }
@@ -104,6 +111,15 @@ pub(crate) fn load_validated_text_encoder(
     source: &mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<TextEncoder> {
     source.read_unchanged(load_text_encoder_from_source)
+}
+
+/// The same validated eager loader at an explicit encoder geometry, for weights-free fixtures.
+#[cfg(test)]
+pub(crate) fn load_validated_text_encoder_with(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
+    source.read_unchanged(|weights| load_text_encoder_from_source_with(weights, cfg))
 }
 
 /// The **streamable** encoder for rung 4's text-encoder scope (SC-15794): it records the re-openable
@@ -333,11 +349,68 @@ pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
 pub(crate) fn build_vae(w: &mut Weights) -> Result<Vae> {
     remap_vae_decoder(w)?;
     remap_vae_encoder(w)?;
+    build_remapped_vae(w)
+}
+
+/// The SAME constructor factory, after remapping. Keeping this boundary explicit lets metadata
+/// inventory distinguish remapper reads from module fields without changing native load ordering.
+pub(crate) fn build_remapped_vae(w: &Weights) -> Result<Vae> {
     Vae::from_weights(w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
         w,
         "encoder",
         &VaeEncoderConfig::default_z_image(),
     )
+}
+
+pub(crate) const TRANSFORMER_KEY_ALIASES: [(&str, &str); 3] = [
+    ("t_embedder.mlp.0", "t_embedder.linear1"),
+    ("t_embedder.mlp.2", "t_embedder.linear2"),
+    (
+        "all_final_layer.2-1.adaLN_modulation.1",
+        "all_final_layer.2-1.adaLN_modulation.0",
+    ),
+];
+
+/// Source-key identity of each header after the executable loader's ordered, per-suffix aliases.
+/// A source weight does NOT imply a source bias/scales sibling: a missing source suffix leaves the
+/// authored target suffix intact. Both raw spellings remain dictionary entries, but an overwritten
+/// target names the source's same Array handle in the module view. This is logical correspondence,
+/// not proof that distinct source keys have disjoint native backing or that discarded roots release.
+pub(crate) fn transformer_header_origins(
+    headers: &std::collections::BTreeMap<
+        String,
+        mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+    >,
+) -> std::collections::BTreeMap<String, String> {
+    let mut origins = headers.keys().map(|key| (key.clone(), key.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
+        for suffix in [".weight", ".bias", ".scales", ".biases"] {
+            if let Some(source) = origins.get(&format!("{from}{suffix}")).cloned() {
+                origins.insert(format!("{to}{suffix}"), source);
+            }
+        }
+    }
+    origins
+}
+
+/// The same aliases as the executable loader, applied only to metadata. Aliases are views of one
+/// source tensor, not new source payloads; callers must never sum both names as separate owners.
+pub(crate) fn remap_transformer_header_keys(
+    headers: &mut std::collections::BTreeMap<
+        String,
+        mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+    >,
+) {
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
+        for suffix in [".weight", ".bias", ".scales", ".biases"] {
+            if let Some(source) = headers.get(&format!("{from}{suffix}")).cloned() {
+                let mut alias = source;
+                alias.name = format!("{to}{suffix}");
+                headers.insert(alias.name.clone(), alias);
+            }
+        }
+    }
 }
 
 /// diffusers DiT checkpoint → internal names: the timestep embedder is `t_embedder.mlp.{0,2}` on
@@ -349,14 +422,7 @@ pub fn remap_transformer_keys(w: &mut Weights) {
     // plus the packed `.scales`+`.biases` for the quantized case. `alias` is a no-op when the source
     // key is absent, so a dense snapshot (no `.scales`/`.biases`) and a packed one are both handled
     // by the same list.
-    for (from, to) in [
-        ("t_embedder.mlp.0", "t_embedder.linear1"),
-        ("t_embedder.mlp.2", "t_embedder.linear2"),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1",
-            "all_final_layer.2-1.adaLN_modulation.0",
-        ),
-    ] {
+    for (from, to) in TRANSFORMER_KEY_ALIASES {
         for suffix in [".weight", ".bias", ".scales", ".biases"] {
             w.alias(&format!("{from}{suffix}"), &format!("{to}{suffix}"));
         }
@@ -393,31 +459,79 @@ fn vae_key_target(rest: &str, sampler_substr: &str) -> (String, bool) {
 /// Inserts the remapped keys alongside the originals. `keep_prefix` controls whether `{prefix}` is
 /// retained on the target key — the encoder keeps it, the decoder drops it, and both must coexist in
 /// one `Weights`. Shared by [`remap_vae_decoder`]/[`remap_vae_encoder`] (F-037).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VaeRemapStep {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) transpose: bool,
+}
+
+/// Metadata and native execution share the exact one-key selector. The phase snapshot is
+/// deliberately supplied by the caller: encoder keys do not exist until decoder inserts finish.
+pub(crate) fn vae_remap_step(source: &str, encoder: bool) -> Option<VaeRemapStep> {
+    let (prefix, sampler) = if encoder {
+        ("encoder.", ".downsamplers.0.conv.")
+    } else {
+        ("decoder.", ".upsamplers.0.conv.")
+    };
+    let rest = source.strip_prefix(prefix)?;
+    let (suffix, transpose) = vae_key_target(rest, sampler);
+    Some(VaeRemapStep {
+        source: source.to_owned(),
+        target: if encoder { format!("{prefix}{suffix}") } else { suffix },
+        transpose,
+    })
+}
+
 fn remap_vae_tree(
     w: &mut Weights,
     prefix: &str,
     keep_prefix: bool,
     sampler_substr: &str,
+    trace: Option<&mut Vec<VaeRemapStep>>,
 ) -> Result<()> {
     let keys: Vec<String> = w
         .keys()
         .filter(|k| k.starts_with(prefix))
         .map(String::from)
         .collect();
+    remap_vae_keys(w, prefix, keep_prefix, sampler_substr, keys, trace)
+}
+
+/// `keys` is the native HashMap iteration snapshot, NOT sorted. The private seam also allows a
+/// fixture to exercise both real overwrite orders without changing the public loader's behavior.
+fn remap_vae_keys(
+    w: &mut Weights,
+    prefix: &str,
+    keep_prefix: bool,
+    sampler_substr: &str,
+    keys: Vec<String>,
+    mut trace: Option<&mut Vec<VaeRemapStep>>,
+) -> Result<()> {
     for k in keys {
-        let rest = k.strip_prefix(prefix).unwrap();
-        let (suffix, transpose) = vae_key_target(rest, sampler_substr);
-        let target = if keep_prefix {
-            format!("{prefix}{suffix}")
+        // The wrappers still supply the original unsorted snapshot and native phase order.
+        debug_assert!(k.starts_with(prefix));
+        debug_assert_eq!(sampler_substr, if keep_prefix {
+            ".downsamplers.0.conv."
         } else {
-            suffix
-        };
+            ".upsamplers.0.conv."
+        });
+        let step = vae_remap_step(&k, keep_prefix).expect("phase snapshot key");
+        let transpose = step.transpose;
+        let target = step.target;
         let t = w.require(&k)?.clone();
         let t = if transpose {
             t.transpose_axes(&[0, 2, 3, 1])? // NCHW -> NHWC conv weight
         } else {
             t
         };
+        if let Some(trace) = trace.as_mut() {
+            trace.push(VaeRemapStep {
+                source: k,
+                target: target.clone(),
+                transpose,
+            });
+        }
         w.insert(target, t);
     }
     Ok(())
@@ -427,13 +541,19 @@ fn remap_vae_tree(
 /// NHWC. Drops the `decoder.` prefix (the encoder remap keeps its prefix; both coexist in one
 /// `Weights`). Up path → `upsamplers`.
 pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
-    remap_vae_tree(w, "decoder.", false, ".upsamplers.0.conv.")
+    remap_vae_tree(w, "decoder.", false, ".upsamplers.0.conv.", None)
+}
+
+/// Test-only order seam; the public remapper always snapshots native unsorted `keys()`.
+#[cfg(test)]
+pub(crate) fn remap_vae_decoder_ordered(w: &mut Weights, keys: Vec<String>) -> Result<()> {
+    remap_vae_keys(w, "decoder.", false, ".upsamplers.0.conv.", keys, None)
 }
 
 /// diffusers VAE checkpoint (`encoder.*`) → internal encoder naming, conv weights transposed to
 /// NHWC. Keeps the `encoder.` prefix. Down path → `downsamplers`.
 pub fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
-    remap_vae_tree(w, "encoder.", true, ".downsamplers.0.conv.")
+    remap_vae_tree(w, "encoder.", true, ".downsamplers.0.conv.", None)
 }
 
 #[cfg(test)]

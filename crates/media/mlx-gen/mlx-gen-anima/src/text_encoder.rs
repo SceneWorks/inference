@@ -184,7 +184,7 @@ impl AnimaQwen3 {
     pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         mlx_gen::ios_quantum::before(TE_EMBED_QUANTUM, self.embed_body_bytes(b, s))?;
         let (mut h, cos, sin, mask) = self.embed(input_ids, attention_mask)?;
         mlx_gen::ios_quantum::finish(TE_EMBED_QUANTUM, &[&h, &cos, &sin, &mask])?;

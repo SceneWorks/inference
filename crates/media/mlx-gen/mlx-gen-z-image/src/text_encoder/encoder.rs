@@ -42,6 +42,8 @@ impl ZTextEncoderConfig {
     }
 }
 
+pub(crate) const EMBEDDING_PATH: &str = "embed_tokens";
+
 pub struct TextEncoder {
     embed_tokens: TokenEmbedding,
     layers: Vec<EncoderLayer>,
@@ -65,7 +67,7 @@ impl TextEncoder {
         // Packed-detect (sc-8670): the token embedding loads packed from a pre-quantized snapshot
         // (the table is bf16-native, so the converter's bf16-cast pack is byte-equal to the
         // load-time `quantize(bits, cast_to_bf16=false)`) or dense otherwise.
-        let embed_tokens = crate::quant::embedding(w, &join(prefix, "embed_tokens"))?;
+        let embed_tokens = crate::quant::embedding(w, &join(prefix, EMBEDDING_PATH))?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let lp = join(prefix, &format!("layers.{i}"));
@@ -117,7 +119,7 @@ impl TextEncoder {
         prefix: &str,
         cfg: &ZTextEncoderConfig,
     ) -> Result<Self> {
-        let embed_tokens = crate::quant::embedding(w, &join(prefix, "embed_tokens"))?;
+        let embed_tokens = crate::quant::embedding(w, &join(prefix, EMBEDDING_PATH))?;
         Ok(Self {
             embed_tokens,
             layers: Vec::new(),
@@ -132,6 +134,14 @@ impl TextEncoder {
     /// `true` when this encoder can run the rung-4 text-encoder scope.
     pub fn is_streamable(&self) -> bool {
         self.stream.is_some()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        self.layers
+            .iter()
+            .map(|layer| layer.endpoint_storage_witness())
+            .collect()
     }
 
     /// Quantize the encoder to Q4/Q8 (group_size 64): the token embedding + every layer's Linears
@@ -175,7 +185,7 @@ impl TextEncoder {
         }
         // iOS: the embed and every layer are bounded quanta (checked before construction,
         // materialized before the next); pass-throughs off device.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let (embed, cos, sin, mask) = self.embed_quantum(input_ids, attention_mask)?;
 
         // all_hidden_states = [embed, out(L0), out(L1), ...]; return the second-to-last. Track only
@@ -219,11 +229,23 @@ impl TextEncoder {
     /// their duplicated `[S, head_dim]` angles, cos and sin, f32); the uploaded `[B, 1, S, S]` f32
     /// mask (its host-side fill is heap, see `crate::quantum`).
     pub(crate) fn embed_bytes(&self, batch: i32, tokens: i32) -> u64 {
+        Self::embedding_bytes(&self.embed_tokens, self.dims, batch, tokens)
+    }
+
+    /// The SAME embedding quantum price without constructing a fictitious resident layer stack.
+    /// Streamed pricing uses the production embedding selector and retains future layer metadata
+    /// separately; this helper says nothing about descriptor heap, native backing or physical charge.
+    pub(crate) fn embedding_bytes(
+        embed_tokens: &TokenEmbedding,
+        dims: (i32, i32),
+        batch: i32,
+        tokens: i32,
+    ) -> u64 {
         let (b, s) = (batch.max(0) as u64, tokens.max(0) as u64);
-        let hidden = self.dims.0.max(0) as u64;
-        let head_dim = self.dims.1.max(0) as u64;
+        let hidden = dims.0.max(0) as u64;
+        let head_dim = dims.1.max(0) as u64;
         let ab = crate::quantum::ab;
-        let rows = match &self.embed_tokens {
+        let rows = match embed_tokens {
             mlx_gen::nn::TokenEmbedding::Dense(w) => {
                 let width = w.item_size() as u64;
                 ab(width, &[b, s, hidden]) + if width < 4 { ab(4, &[b, s, hidden]) } else { 0 }
@@ -269,11 +291,32 @@ impl TextEncoder {
                     .to_owned(),
             )
         })?;
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let (embed, cos, sin, mask) = self.embed_quantum(input_ids, attention_mask)?;
         let plan = mlx_gen::block_residency::BlockPlan::new(stream.n_blocks(), window)?;
         super::stream::run_windowed_layers(stream, &plan, cancel, embed, &cos, &sin, &mask)
     }
+}
+
+/// Carried logical payloads at entry to ONE layer in either production loop. At layer zero,
+/// `second_to_last = embed.clone()` and `prev = embed` are two handles of the SAME embedding,
+/// not two payloads. After `mem::replace`, the previous and current layer results are distinct.
+/// The final configured layer still executes `layer_quantum` + finish before its result is dropped;
+/// returning the previous hidden state is not permission to skip that layer or credit a release.
+/// This counts only the loop carry; module/graph roots and the layer's scratch remain separate.
+pub(crate) fn layer_carry_bytes(
+    index: usize,
+    batch: i32,
+    tokens: i32,
+    hidden: i32,
+    head_dim: i32,
+) -> u64 {
+    let b = crate::quantum::u(batch);
+    let s = crate::quantum::u(tokens);
+    let ab = crate::quantum::ab;
+    (1 + u64::from(index != 0)) * ab(4, &[b, s, crate::quantum::u(hidden)])
+        + 2 * ab(4, &[1, s, crate::quantum::u(head_dim)])
+        + ab(4, &[b, 1, s, s])
 }
 
 /// One decoder layer over `prev` as one iOS quantum, priced by
@@ -330,6 +373,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn layer_carry_deduplicates_only_the_initial_hidden_alias() {
+        // Pure HOST arithmetic. All three configured layer entries remain present, including the
+        // final executed layer whose result is not the returned second-to-last hidden state.
+        let ab = crate::quantum::ab;
+        let hidden = ab(4, &[1, 5, 64]);
+        let tables_and_mask = 2 * ab(4, &[1, 5, 32]) + ab(4, &[1, 1, 5, 5]);
+        let entries = (0..3)
+            .map(|i| layer_carry_bytes(i, 1, 5, 64, 32))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                hidden + tables_and_mask,
+                2 * hidden + tables_and_mask,
+                2 * hidden + tables_and_mask,
+            ],
+        );
+    }
+
+    #[test]
     fn mask_is_causal_and_masks_padding() {
         // b=1, s=3, last token padded.
         let am = Array::from_slice(&[1i32, 1, 0], &[1, 3]);
@@ -349,4 +412,24 @@ mod tests {
         assert_eq!(v[7], 0.0);
         assert_eq!(v[8], neg);
     }
+}
+
+/// The exact projections constructed by the native encoder and covered by its quantize walk.
+pub(crate) fn quantization_header_targets(
+    prefix: &str,
+    cfg: &ZTextEncoderConfig,
+) -> Vec<(String, bool)> {
+    let mut targets = vec![(join(prefix, EMBEDDING_PATH), true)];
+    for layer in 0..cfg.n_layers {
+        for leaf in super::attention::QUANTIZATION_LINEAR_PATHS {
+            targets.push((
+                join(prefix, &format!("layers.{layer}.self_attn.{leaf}")),
+                false,
+            ));
+        }
+        for leaf in super::mlp::QUANTIZATION_LINEAR_PATHS {
+            targets.push((join(prefix, &format!("layers.{layer}.mlp.{leaf}")), false));
+        }
+    }
+    targets
 }

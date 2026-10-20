@@ -85,7 +85,14 @@ fn configure(
         .rev()
         .find(|s| component.is_none() || s.parameters.transformer_window_component == component)
         .unwrap();
-    let memory = contract.generation_memory(&chosen).unwrap_or_default();
+    let memory = contract.generation_memory(&chosen).unwrap_or_else(|| {
+        assert_eq!(chosen.strategy, MemoryStrategy::Resident);
+        assert_eq!(
+            contract.resident_request_memory,
+            mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults
+        );
+        GenerationMemory::default()
+    });
     (chosen, memory)
 }
 
@@ -117,14 +124,34 @@ fn priced(
     let spec = (route.spec)(tier, shape);
     let strategy = strategy.unwrap_or_else(|| deepest(route.provider, &spec));
     let (selection, memory) = configure(route.provider, &spec, strategy, component);
+    let geometry = (route.geometry)(edge);
+    // Explicit DEFAULT-sampling header diagnostic, not an inferred production request or fit claim.
+    let generation =
+        (route.provider == crate::model::MODEL_ID).then(|| mlx_gen::GenerationRequest {
+            prompt: "Iris header diagnostic".into(),
+            prompt_batch: if geometry.batch > 1 {
+                vec!["Iris header diagnostic".into(); geometry.batch as usize]
+            } else {
+                Vec::new()
+            },
+            width: geometry.width,
+            height: geometry.height,
+            count: 1,
+            seed: Some(0),
+            memory: (memory != GenerationMemory::default()).then_some(memory),
+            ..Default::default()
+        });
     price(
         &IosPricingRequest {
             provider: route.provider,
             spec: &spec,
             mode: &route.mode,
-            geometry: (route.geometry)(edge),
+            geometry,
             selection: &selection,
             execution: &memory,
+            generation: generation.as_ref(),
+            transform: None,
+            depth: None,
             token_window: 0,
         },
         Pricing {

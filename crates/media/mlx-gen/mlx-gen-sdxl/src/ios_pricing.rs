@@ -2,9 +2,9 @@
 //! the component bytes resident in each phase under the request's regime plus the phase's largest
 //! counted quantum — built from the SAME formulas the `ios_quantum` guards check.
 //!
-//! [`ios_pricing`] constructs every component the request loads LAZILY from its safetensors
-//! (`Weights::from_file` handles, the device's load-time cast rule; never read, never evaluated)
-//! and walks the request's execution with each module's own guard formulas
+//! [`ios_pricing`] constructs CLIP pricing entirely from tensor headers and the load-time cast
+//! policy. The remaining heavy components still use lazy native weight/model graphs
+//! and walk the request's execution with each module's own guard formulas
 //! (`price_forward` / `price_encode` / `price_decode` beside every guarded forward), over
 //! shape-only activations. Load floors and resident bytes are the loaders' header-only floors
 //! (`loader::cast_load_parts`). So the table a device capture is scaled by and the guards the
@@ -21,11 +21,22 @@
 //! remainder whichever rung is selected. Guided requests are priced with classifier-free guidance
 //! on (the larger of the two shapes) at the request's CFG batching.
 //!
+//! Beside the components, each phase's resident bytes carry the request tensors it holds: the input
+//! images while their encode runs (and, staged, from their upload after the last load —
+//! `REQUEST_INPUTS`), and across the whole denoise the f32 init latent (inpaint: its noise and
+//! mask), each ControlNet embedding and the residual stack its forward hands the U-Net, and the IP
+//! tokens. The heavy bundle's load-time Q4/Q8 pack is priced per projection
+//! (`quantum::LOAD_QUANTIZE`), and a packed ControlNet's resident bytes page-rounded as the
+//! allocator holds them.
+//!
 //! Not priced (a typed refusal, never a silent under-price): adapter (LoRA/LoKr/LoHa) installs, the
 //! PiD decoder, a fused single-file (LDM) source, and a sealed geometry decode policy.
 
 use mlx_gen::gen_core::{CfgBatching, GenerationMemory, LoadSpec, MemoryMode, WeightsSource};
-use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+use mlx_gen::ios_pricing::{
+    IosAnchorCandidate, IosAnchorWitness, IosMemoryCoordinate, IosMemoryDomain, IosPhase,
+    IosPricing, IosPricingRequest, IosWindowBound, IosWindowPrice, IosWorkBasis,
+};
 use mlx_gen::{Error, Result};
 use mlx_rs::{Array, Dtype};
 use std::path::{Path, PathBuf};
@@ -33,7 +44,8 @@ use std::path::{Path, PathBuf};
 use crate::config::{ClipTextConfig, UNetConfig, VaeConfig};
 use crate::ip_adapter::{IpImageEncoder, ResamplerConfig};
 use crate::quantum::{self as q, Backend, Quanta};
-use crate::text_encoder::ClipTextEncoder;
+use crate::sampling::{ResolvedSampling, SamplingRecipe, SamplingRoute, SamplingWorkFacts};
+use crate::text_encoder::ClipPrice;
 use crate::unet::{ControlNet, UNet2DConditionModel};
 use crate::vae::Autoencoder;
 use crate::vision_encoder::VisionConfig;
@@ -53,6 +65,7 @@ const PHASES: &[(&str, IosPhase)] = &[
     (q::LDM_HEAVY_LOAD, IosPhase::Load),
     (q::ADAPTER_LOAD, IosPhase::Load),
     (q::ADAPTER_MERGE, IosPhase::Load),
+    (q::LOAD_QUANTIZE, IosPhase::Load),
     (q::CLIP_EMBEDDINGS, IosPhase::Conditioning),
     (q::CLIP_LAYER, IosPhase::Conditioning),
     (q::CLIP_POOLED, IosPhase::Conditioning),
@@ -61,6 +74,8 @@ const PHASES: &[(&str, IosPhase)] = &[
     (q::RESAMPLER_PROJ_IN, IosPhase::Conditioning),
     (q::RESAMPLER_LAYER, IosPhase::Conditioning),
     (q::RESAMPLER_PROJ_OUT, IosPhase::Conditioning),
+    (q::IP_CFG_TOKENS, IosPhase::Conditioning),
+    (REQUEST_INPUTS, IosPhase::Load),
     (q::VAE_ENCODE_IN, IosPhase::Encode),
     (q::VAE_ENCODE_RESNET, IosPhase::Encode),
     (q::VAE_ENCODE_ATTENTION, IosPhase::Encode),
@@ -94,6 +109,24 @@ const PHASES: &[(&str, IosPhase)] = &[
     (q::DECODED_TO_IMAGE, IosPhase::Decode),
 ];
 
+/// The priced item of the request's input tensors (init / control / IP image), created after the
+/// last component load and before the first execution quantum — a capture attributes them to the
+/// load phase when no conditioning quantum runs in between (a staged request). Pricing only: no
+/// guard checks it.
+pub(crate) const REQUEST_INPUTS: &str = "SDXL request inputs";
+
+/// Modes requiring their own iOS anchor at `tier` (`bf16`, `q8`, `q4`).
+/// The CPU additivity proof executes every advertised mode at both endpoints for all three
+/// tiers. This compatibility list is not a physical-transfer certificate: correlated admission
+/// additionally requires the source-owned bounder to cover every actual request window.
+/// Unknown tiers retain the fail-closed exception set; no unmeasured tier is inferred.
+pub fn ios_non_additive_modes(tier: &str) -> &'static [&'static str] {
+    match tier {
+        "bf16" | "q8" | "q4" => &[],
+        _ => &["image_to_image", "edit", "control", "ip_adapter"],
+    }
+}
+
 /// The phase a quantum label of this crate runs in: the longest label constant `label` starts with
 /// (so `SDXL VAE tiled stage` is not read as `SDXL VAE tile`). `None` for a label this crate never
 /// checks (e.g. the shared tiled-convolution core's synchronization).
@@ -105,19 +138,597 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         .map(|(_, phase)| *phase)
 }
 
+/// Path-free configured overlay graph facts from SDXL's actual load selectors. This describes
+/// logical layouts and install branches only; it supplies neither a native backing certificate nor
+/// a ProcessGrowth bridge. No model, GenerationRequest, image, schedule or Array is constructed.
+pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::Value> {
+    use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+    use serde_json::json;
+    if spec.pid.is_some() {
+        return Err(Error::Unsupported(
+            "sdxl ios pricing: the PiD decoder overlay is not priced".into(),
+        ));
+    }
+    if spec.decode_geometry_policy_authoritative {
+        return Err(Error::Unsupported(
+            "sdxl ios pricing: a sealed geometry decode policy is not priced".into(),
+        ));
+    }
+    // This is OVERLAY identity, not a substitute for the caller's base artifact/architecture/
+    // tier validation. SDXL has no intrinsic default overlay. Unknown/named configuration stays
+    // on the normalizer path; any configured adapter/control/IP/VAE overlay still needs real targets.
+    if spec.adapters.is_empty()
+        && spec.control.is_none()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.components.is_empty()
+        && spec.identity.is_none()
+        && spec.text_encoder.is_none()
+        && spec.decode_geometry_policies.is_empty()
+        && spec.decode_quality_runtime_identity.is_none()
+    {
+        return Ok(serde_json::Value::Null);
+    }
+    let (form, unet_headers) = match &spec.weights {
+        WeightsSource::Dir(root) => {
+            if let Some(quant) = spec.quantize {
+                mlx_gen::quant::needs_load_time_quant(
+                    root,
+                    "unet",
+                    quant.bits(),
+                    crate::model::descriptor().id,
+                )?;
+            }
+            let file = crate::loader::resolve_unet_weight_file(root, crate::model::DTYPE)?;
+            (
+                "diffusers",
+                safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))?,
+            )
+        }
+        WeightsSource::File(file) => {
+            // The actual native loader opens the entire fused file before component remapping.
+            for h in safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))? {
+                crate::quant::header_dtype(h.dtype)?;
+            }
+            (
+                "fused_ldm",
+                crate::ldm::component_headers(
+                    file,
+                    mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet,
+                )?,
+            )
+        }
+    };
+    let base_layouts = configured_component_layouts(&unet_headers)?;
+    let adapter_facts = crate::adapters::configured_adapter_semantic_facts(spec, &unet_headers)?;
+    let cfg = UNetConfig::sdxl_base();
+    let mut controls = Vec::new();
+    for source in spec.control.iter().chain(&spec.extra_controls) {
+        let path = match source {
+            WeightsSource::File(p) | WeightsSource::Dir(p) => p,
+        };
+        let headers =
+            safetensors_path_tensor_headers(path).map_err(|e| Error::Msg(e.to_string()))?;
+        let (_, complete, convs) = crate::unet::adapter_target_paths_from_headers(&cfg, &headers);
+        // ControlNet::from_weights uses the SAME down BlockSpec selector, then the same mid
+        // constructors. It has no up stack or conv_out; its own embedding and zero heads are fixed.
+        let linears: Vec<_> = complete
+            .into_iter()
+            .filter(|p| !p.starts_with("up_blocks."))
+            .map(|p| projection_semantic_fact(&headers, &p))
+            .collect::<Result<_>>()?;
+        let convolution_paths: Vec<_> = convs
+            .into_iter()
+            .filter(|p| !p.starts_with("up_blocks.") && p != "conv_out")
+            .collect();
+        controls.push(json!({"constructor":"sdxl_control_encoder_copy","layers_per_block":cfg.layers_per_block,
+            "block_out_channels":cfg.block_out_channels,"heads":cfg.num_attention_heads,
+            "transformer_layers":cfg.transformer_layers_per_block,"down_block_types":cfg.down_block_types,
+            "projection_sources":linears,"convolution_targets":convolution_paths,
+            "load_quantization_after_construction":spec.quantize.map(|q|q.bits()),
+            "loaded_source_layouts":configured_component_layouts(&headers)?}));
+    }
+    let ip = match &spec.ip_adapter {
+        Some(WeightsSource::File(_)) => {
+            return Err(Error::Unsupported(
+                "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
+            ))
+        }
+        Some(WeightsSource::Dir(dir)) => {
+            let (encoder_file, weights_file) = crate::loader::resolve_ip_adapter_files(dir)?;
+            let encoder = safetensors_path_tensor_headers(encoder_file)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let weights = safetensors_path_tensor_headers(weights_file)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let indices =
+                crate::ip_adapter::ip_kv_indices(weights.iter().map(|h| h.name.as_str()))?;
+            let (_, complete, _) =
+                crate::unet::adapter_target_paths_from_headers(&cfg, &unet_headers);
+            let slots: Vec<_> = complete
+                .into_iter()
+                .filter(|p| p.ends_with(".attn2.to_k"))
+                .collect();
+            if indices.len() != slots.len() {
+                return Err(Error::Msg(
+                    "ip_adapter: K/V pair count does not match actual cross-attention walk".into(),
+                ));
+            }
+            let mut pairs = Vec::new();
+            for (index, slot) in indices.into_iter().zip(slots) {
+                let lookup = |role: &str| {
+                    weights
+                        .iter()
+                        .find(|h| h.name == format!("ip_adapter.{index}.to_{role}_ip.weight"))
+                        .ok_or_else(|| {
+                            Error::MissingTensor(format!("ip_adapter.{index}.to_{role}_ip.weight"))
+                        })
+                };
+                let k = lookup("k")?;
+                let v = lookup("v")?;
+                pairs.push(json!({"target":slot,"k_shape":k.shape,"v_shape":v.shape,
+                    "k_dtype":format!("{:?}",crate::quant::loaded_header_dtype(&weights,k)?),
+                    "v_dtype":format!("{:?}",crate::quant::loaded_header_dtype(&weights,v)?),
+                    "installed":"dense_kv_before_unet_quantization"}));
+            }
+            let vision = VisionConfig::vit_h_14();
+            let resampler = ResamplerConfig::plus_sdxl_vit_h();
+            json!({"pairs":pairs,"vision":{"hidden":vision.hidden,"layers":vision.num_layers,"heads":vision.num_heads,
+                "patch":vision.patch,"image_size":vision.image_size,"channels":vision.num_channels,"quick_gelu":vision.quick_gelu},
+                "resampler":{"dim":resampler.dim,"depth":resampler.depth,"heads":resampler.heads,
+                    "head_dim":resampler.dim_head,"queries":resampler.num_queries,"embed_dim":resampler.embed_dim,"output_dim":resampler.output_dim},
+                "encoder_loaded_source_layouts":configured_component_layouts(&encoder)?,
+                "resampler_and_kv_loaded_source_layouts":configured_component_layouts(&weights)?})
+        }
+        None => serde_json::Value::Null,
+    };
+    let vae_overlay=spec.components.get(crate::loader::VAE_FP16_FIX_COMPONENT).map(|source| {
+        let file=crate::loader::resolve_vae_fp16_fix_file(source)?;
+        let headers=safetensors_path_tensor_headers(file).map_err(|e|Error::Msg(e.to_string()))?;
+        Ok::<_,Error>(json!({"installed":"fp16_fix_vae","loaded_source_layouts":configured_component_layouts(&headers)?}))
+    }).transpose()?;
+    Ok(
+        json!({"provider":"sdxl","load_form":form,"load_quantization_after_adapters_and_ip":spec.quantize.map(|q|q.bits()),
+        "base_loaded_source_layouts":base_layouts,"adapter_graph":adapter_facts,"controls":controls,"ip_adapter":ip,"vae_overlay":vae_overlay}),
+    )
+}
+
+fn projection_semantic_fact(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    path: &str,
+) -> Result<serde_json::Value> {
+    let projection = crate::quant::linear_from_headers(headers, path)?;
+    let rows = if path.ends_with(".ff.net.0.proj") {
+        Some(crate::quant::geglu_half_ranges(projection.shape[0])?)
+    } else {
+        None
+    };
+    Ok(
+        serde_json::json!({"target":path,"logical_shape":projection.shape,"source_packed_bits":projection.source_packed_bits,
+        "weight_dtype":format!("{:?}",projection.weight_dtype),"scales_dtype":projection.scales_dtype.map(|d|format!("{d:?}")),
+        "affine_biases_dtype":projection.affine_biases_dtype.map(|d|format!("{d:?}")),"geglu_rows":rows,
+        "codes_shape":projection.packed_codes_shape,"scales_shape":projection.packed_scales_shape,"biases_shape":projection.packed_biases_shape}),
+    )
+}
+
+fn configured_component_layouts(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> Result<serde_json::Value> {
+    let mut layouts = std::collections::BTreeMap::new();
+    for h in headers {
+        layouts.insert(
+            h.name.clone(),
+            serde_json::json!({"shape":h.shape,
+            "loaded_dtype":format!("{:?}",crate::quant::loaded_header_dtype(headers,h)?)}),
+        );
+    }
+    Ok(serde_json::json!(layouts))
+}
+
 /// The request's counted per-phase price on the device (Metal kernel transients), header-only.
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
     ios_pricing_on(req, Backend::Metal)
 }
 
+/// Reprice a captured sampling recipe without constructing a request or its image payloads.
+/// `work` records original conditioning roles, before the provider's init/IP interpretation.
+/// A live generation/transform/depth context is rejected rather than silently overridden.
+/// Like [`ios_pricing`], this is a raw counted ledger, not physical/domain certification.
+pub fn ios_pricing_with_recipe(
+    req: &IosPricingRequest<'_>,
+    recipe: &SamplingRecipe,
+    work: SamplingWorkFacts,
+) -> Result<IosPricing> {
+    let regime = Regime::from_recipe(req, recipe, work)?;
+    price_regime(req, &regime, Backend::Metal)
+}
+
 /// [`ios_pricing`] with `backend`'s kernel transients (the CPU proof fixture prices its own).
 pub(crate) fn ios_pricing_on(req: &IosPricingRequest<'_>, backend: Backend) -> Result<IosPricing> {
     let regime = Regime::from_request(req)?;
-    let inputs = Inputs::from_spec(req.spec, &regime)?;
+    price_regime(req, &regime, backend)
+}
+
+fn price_regime(
+    req: &IosPricingRequest<'_>,
+    regime: &Regime,
+    backend: Backend,
+) -> Result<IosPricing> {
+    let inputs = Inputs::from_spec(req.spec, regime)?;
     q::with_backend(backend, || {
-        let priced = Priced::build(&inputs)?;
-        Ok(priced.price(&regime)?.0)
+        let mut priced = Priced::build_configured(&inputs, req.spec)?;
+        priced.price_configured(req.spec, &inputs.unet, inputs.quant_bits, regime)
     })
+}
+
+/// Source-owned NATIVE-ALLOCATOR matched-window certificates for the correlated anchor law.
+/// The typed domain forbids using these as process-growth authority. The law must check
+/// coverage of ALL requested windows; an unreturned class is not permission to ignore that work.
+/// In particular, a new Encode phase is never certified from a logical VAE scratch sum here.
+pub fn ios_bounder(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> Result<Vec<IosWindowBound>> {
+    let anchor = Regime::from_request(anchor_request)?;
+    let requested = Regime::from_request(request)?;
+    let anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
+    let request_inputs = Inputs::from_spec(request.spec, &requested)?;
+    if anchor_request.execution != request.execution
+        || anchor_request.spec.load_shape != request.spec.load_shape
+        || anchor_request.spec.offload_policy != request.spec.offload_policy
+        || anchor_inputs.unet != request_inputs.unet
+        || anchor_inputs.te1 != request_inputs.te1
+        || anchor_inputs.te2 != request_inputs.te2
+        || anchor_inputs.vae != request_inputs.vae
+        || anchor_inputs.quant_bits != request_inputs.quant_bits
+        || !matches!(anchor_inputs.quant_bits, Some(4 | 8))
+        || anchor_inputs.streamable != request_inputs.streamable
+        || !anchor_inputs.controls.is_empty()
+        || !request_inputs.controls.is_empty()
+        || anchor_inputs.ip.is_some()
+        || request_inputs.ip.is_some()
+    {
+        return Err(Error::Unsupported(
+            "sdxl common-forward transfer needs the same source component graph".into(),
+        ));
+    }
+    q::with_backend(Backend::Metal, || {
+        let expected_anchor = Priced::build(&anchor_inputs)?.price(&anchor)?.0;
+        let expected_request = Priced::build(&request_inputs)?.price(&requested)?.0;
+        let matches_source = |expected: &IosPricing, supplied: &IosPricing| {
+            expected.phases == supplied.phases
+                && expected.windows == supplied.windows
+                && expected.absent_phases == supplied.absent_phases
+        };
+        if !matches_source(&expected_anchor, anchor_pricing)
+            || !matches_source(&expected_request, request_pricing)
+        {
+            return Err(Error::Unsupported(
+                "sdxl transfer pricing is not the source-generated profile".into(),
+            ));
+        }
+        bound_ancestral_forward_windows(
+            &anchor,
+            anchor_pricing,
+            &requested,
+            request_pricing,
+            anchor_inputs.arch.latent_scale,
+        )
+    })
+}
+
+/// The body cancellation is source-specific: forward_eps supplies the SAME F16 input shape to
+/// the SAME packed U-Net operations at the SAME first/steady epoch and CFG half. The separately
+/// owned state/cast/init inputs are backed by the native lifetime proof, not by guard-upper
+/// subtraction. Class strings locate those already-proved points; equality is not proof authority.
+pub(crate) fn bound_ancestral_forward_windows(
+    anchor: &Regime,
+    anchor_pricing: &IosPricing,
+    request: &Regime,
+    request_pricing: &IosPricing,
+    latent_scale: i32,
+) -> Result<Vec<IosWindowBound>> {
+    if anchor.sampling.route() != SamplingRoute::Ancestral
+        || request.sampling.route() != SamplingRoute::Ancestral
+        || !matches!(anchor.route, Route::Text | Route::Reference | Route::Mask)
+        || !matches!(request.route, Route::Text | Route::Reference | Route::Mask)
+        || anchor.width != request.width
+        || anchor.height != request.height
+        || anchor.context_tokens != request.context_tokens
+        || anchor.sampling.allocation_class() != request.sampling.allocation_class()
+        || anchor.staged != request.staged
+        || anchor.count != request.count
+    {
+        return Err(Error::Unsupported(
+            "sdxl forward transfer has no source-matched execution domain".into(),
+        ));
+    }
+    let mut bounds = Vec::new();
+    for requested in request_pricing
+        .windows
+        .iter()
+        .filter(|window| window.owner_domain == "sdxl/ancestral/forward-input-native-v1")
+    {
+        let Some(class) = requested.profile_class() else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        for at_anchor in anchor_pricing.windows.iter().filter(|window| {
+            window.owner_domain == "sdxl/ancestral/forward-input-native-v1"
+                && window.profile_class() == Some(class)
+        }) {
+            // This checks that the generated ledger still describes the identical common body.
+            // It does NOT turn either scratch upper into a physical anchor lower bound.
+            if requested.label != at_anchor.label
+                || requested.basis != at_anchor.basis
+                || requested.scratch_bytes != at_anchor.scratch_bytes
+                || requested.resident_bytes != at_anchor.resident_bytes
+            {
+                continue;
+            }
+            let witnesses =
+                ancestral_forward_witnesses(anchor, anchor_pricing, at_anchor, latent_scale)?;
+            if witnesses.is_empty() {
+                continue;
+            }
+            // The raw window ledger is not an allocation certificate. Price each unique
+            // source-owned backing with the ACTUAL allocator operand before taking its delta.
+            // Keep every observed allocator correspondence: the public law takes MAX, not cheapest.
+            for witness in witnesses {
+                let page = witnessed_cache_zero_page(anchor_pricing, &witness)?;
+                let elements = (anchor.height as u64 / latent_scale as u64)
+                    .checked_mul(anchor.width as u64 / latent_scale as u64)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or_else(|| {
+                        Error::Unsupported("sdxl native input extent overflow".into())
+                    })?;
+                let anchor_owned =
+                    fresh_ancestral_forward_inputs(anchor, at_anchor, elements, page)?;
+                let request_owned =
+                    fresh_ancestral_forward_inputs(request, requested, elements, page)?;
+                candidates.push(IosAnchorCandidate {
+                    anchor_class: class.into(),
+                    delta_growth_upper: i128::from(request_owned) - i128::from(anchor_owned),
+                    physical_anchor_lower_bound: None,
+                    witnesses: vec![witness],
+                });
+            }
+        }
+        if !candidates.is_empty() {
+            bounds.push(IosWindowBound::Transfer {
+                domain: IosMemoryDomain::NativeAllocatorGrowth,
+                coordinate: IosMemoryCoordinate::BeforeModelLoad,
+                request_class: class.into(),
+                anchor_candidates: candidates,
+            });
+        }
+    }
+    Ok(bounds)
+}
+
+fn witnessed_cache_zero_page(pricing: &IosPricing, witness: &IosAnchorWitness) -> Result<u64> {
+    let invalid = || {
+        Error::Unsupported("sdxl native allocation lacks an actual checked cache-zero basis".into())
+    };
+    let capture = pricing
+        .observations
+        .get(witness.capture as usize)
+        .ok_or_else(invalid)?;
+    let check = capture
+        .checks
+        .get(witness.check as usize)
+        .ok_or_else(invalid)?;
+    let fields = check
+        .context
+        .iter()
+        .find_map(|&index| {
+            capture
+                .metadata
+                .get(index as usize)
+                .filter(|mark| mark.provider == "mlx" && mark.kind == "allocation-scope")
+                .map(|mark| &mark.fields)
+        })
+        .ok_or_else(invalid)?;
+    if fields.get("setter_succeeded") != Some(&1)
+        || fields.get("cache_query_succeeded") != Some(&1)
+        || fields.get("cache_limit_requested_bytes") != Some(&0)
+        || fields.get("cache_bytes") != Some(&0)
+        || fields.get("restoring") != Some(&0)
+    {
+        return Err(invalid());
+    }
+    fields
+        .get("page_bytes")
+        .copied()
+        .filter(|page| page.is_power_of_two())
+        .ok_or_else(invalid)
+}
+
+fn fresh_ancestral_forward_inputs(
+    regime: &Regime,
+    window: &IosWindowPrice,
+    elements: u64,
+    page: u64,
+) -> Result<u64> {
+    let invalid = || {
+        Error::Unsupported("sdxl native owner allocation provenance/extent is unverified".into())
+    };
+    let epoch = window
+        .profile_class()
+        .and_then(|class| class.rsplit(':').nth(2))
+        .ok_or_else(invalid)?;
+    let state = match epoch {
+        "first" => regime.initial_state_dtype(),
+        "steady" => Dtype::Float32,
+        _ => return Err(invalid()),
+    };
+    // These sampler states are full-span outputs, not arbitrary caller-provided views. The
+    // generation's outer checked Scope encloses their construction and existing eval barriers.
+    // Init/noise/mask are separate retained owners; never round their combined logical sum.
+    let mut owned = regime
+        .forward_owners(state)
+        .fresh_native_bytes(
+            elements,
+            elements,
+            crate::model::DTYPE,
+            regime.model_rows() as u64,
+            page,
+        )
+        .ok_or_else(invalid)?;
+    let mut add = |bytes| -> Result<()> {
+        owned = owned
+            .checked_add(
+                mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, page)
+                    .ok_or_else(invalid)?,
+            )
+            .ok_or_else(invalid)?;
+        Ok(())
+    };
+    if regime.has_init {
+        add(elements
+            .checked_mul(q::dtype_bytes(crate::model::DTYPE))
+            .ok_or_else(invalid)?)?;
+    }
+    if regime.route == Route::Mask {
+        add(elements
+            .checked_mul(q::dtype_bytes(Dtype::Float32))
+            .ok_or_else(invalid)?)?;
+        add((elements / 4)
+            .checked_mul(q::dtype_bytes(Dtype::Float32))
+            .ok_or_else(invalid)?)?;
+    }
+    Ok(owned)
+}
+
+fn ancestral_forward_witnesses(
+    regime: &Regime,
+    pricing: &IosPricing,
+    window: &IosWindowPrice,
+    latent_scale: i32,
+) -> Result<Vec<IosAnchorWitness>> {
+    let malformed = || Error::Unsupported("sdxl malformed source forward window".into());
+    let mut parts = window.profile_class().ok_or_else(malformed)?.rsplit(':');
+    let ordinal: usize = parts
+        .next()
+        .and_then(|s| s.strip_prefix('q'))
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(malformed)?;
+    let half: u64 = parts
+        .next()
+        .and_then(|s| s.strip_prefix("cfg"))
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(malformed)?;
+    let first = match parts.next() {
+        Some("first") => true,
+        Some("steady") => false,
+        _ => return Err(malformed()),
+    };
+    if latent_scale <= 0 {
+        return Err(malformed());
+    }
+    let expected_steps = regime
+        .sampling
+        .ancestral_window(
+            crate::config::DiffusionConfig::sdxl_base().num_train_steps as f32,
+            regime
+                .sampling
+                .effective_init_strength(regime.has_init, regime.route == Route::Mask),
+        )?
+        .0 as u64;
+    let sequential = regime.sampling.guidance() > 1.0 && !regime.cfg_batching.is_batched();
+    let expected_half = if sequential { half + 1 } else { 0 };
+    let latent_h = u64::try_from(regime.height / latent_scale).map_err(|_| malformed())?;
+    let latent_w = u64::try_from(regime.width / latent_scale).map_err(|_| malformed())?;
+    let expected_elements = (regime.model_rows() as u64)
+        .checked_mul(latent_h)
+        .and_then(|n| n.checked_mul(latent_w))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(malformed)?;
+    let state = if first {
+        regime.initial_state_dtype()
+    } else {
+        Dtype::Float32
+    };
+    let mut witnesses = Vec::new();
+    for (capture_index, capture) in pricing.observations.iter().enumerate() {
+        if capture.domain != IosMemoryDomain::NativeAllocatorGrowth
+            || capture.coordinate != IosMemoryCoordinate::BeforeModelLoad
+        {
+            continue;
+        }
+        let mut ordinals = std::collections::BTreeMap::<u32, usize>::new();
+        for (check_index, check) in capture.checks.iter().enumerate() {
+            if check.phase != Some(IosPhase::Denoise)
+                || check.label == q::SAMPLER_STEP
+                || check.label == mlx_gen::sampler::SAMPLER_STEP_QUANTUM
+            {
+                continue;
+            }
+            let metadata = |kind: &str| {
+                check.context.iter().find_map(|&index| {
+                    capture
+                        .metadata
+                        .get(index as usize)
+                        .filter(|m| m.provider == "sdxl" && m.kind == kind)
+                        .map(|m| (index, &m.fields))
+                })
+            };
+            let (
+                Some((_, epoch)),
+                Some((half_index, cfg_half)),
+                Some((_, input)),
+                Some((cast_index, cast)),
+            ) = (
+                metadata("discrete-epoch"),
+                metadata("forward-cfg-half"),
+                metadata("discrete-state"),
+                metadata("forward-input-after-cast-pending"),
+            )
+            else {
+                continue;
+            };
+            let current = ordinals.entry(half_index).or_default();
+            let current_ordinal = *current;
+            *current += 1;
+            let Some((barrier_index, ready)) = metadata("forward-input-materialized") else {
+                continue;
+            };
+            let Some(&evaluation) = epoch.get("evaluation") else {
+                continue;
+            };
+            if current_ordinal != ordinal
+                || barrier_index <= half_index
+                || barrier_index <= cast_index
+                || ready.get("dtype")
+                    != Some(&mlx_gen::sampler::sampling_dtype_code(crate::model::DTYPE))
+                || ready.get("rows") != Some(&(regime.model_rows() as u64))
+                || ready.get("elements") != Some(&expected_elements)
+                || cast.get("elements") != Some(&expected_elements)
+                || check.label != window.label
+                || (evaluation == 0) != first
+                || evaluation >= expected_steps
+                || epoch.get("steps") != Some(&expected_steps)
+                || cfg_half.get("half") != Some(&expected_half)
+                || input.get("dtype") != Some(&mlx_gen::sampler::sampling_dtype_code(state))
+                || input.get("evaluation") != Some(&evaluation)
+                || cast.get("dtype")
+                    != Some(&mlx_gen::sampler::sampling_dtype_code(crate::model::DTYPE))
+                || cast.get("dim0") != Some(&(regime.model_rows() as u64))
+                || cast.get("dim1") != Some(&((regime.height / latent_scale) as u64))
+                || cast.get("dim2") != Some(&((regime.width / latent_scale) as u64))
+                || cast.get("dim3") != Some(&4)
+                || cast.get("rank") != Some(&4)
+            {
+                continue;
+            }
+            witnesses.push(IosAnchorWitness {
+                capture: u32::try_from(capture_index).map_err(|_| malformed())?,
+                check: u32::try_from(check_index).map_err(|_| malformed())?,
+            });
+        }
+    }
+    Ok(witnesses)
 }
 
 /// The SDXL-family architecture every route loads (`model::load_heavy` and the text loader pin
@@ -172,7 +783,7 @@ pub(crate) enum Route {
 }
 
 impl Route {
-    fn from_mode(mode: &MemoryMode) -> Result<Self> {
+    pub(crate) fn from_mode(mode: &MemoryMode) -> Result<Self> {
         Ok(match mode {
             MemoryMode::TextToImage => Self::Text,
             MemoryMode::ImageToImage => Self::Reference,
@@ -186,16 +797,18 @@ impl Route {
             }
         })
     }
-
-    fn encodes_init(self) -> bool {
-        matches!(self, Self::Reference | Self::Mask)
-    }
 }
 
 /// The execution regime one request runs under.
 #[derive(Clone)]
 pub(crate) struct Regime {
     pub route: Route,
+    /// Actual shared dispatch semantics, resolved from the post-caller-policy request.
+    pub sampling: ResolvedSampling,
+    /// Output images are generated serially; this is NOT the U-Net forward batch.
+    pub count: u32,
+    /// A true VAE init (including ControlNet+reference), not an IP image prompt.
+    pub has_init: bool,
     pub width: i32,
     pub height: i32,
     /// Rung 1: shed the text encoders before the heavy load, the IP image encoder after the
@@ -209,7 +822,133 @@ pub(crate) struct Regime {
 }
 
 impl Regime {
-    fn from_request(req: &IosPricingRequest<'_>) -> Result<Self> {
+    pub(crate) fn from_request(req: &IosPricingRequest<'_>) -> Result<Self> {
+        if req.transform.is_some() || req.depth.is_some() {
+            return Err(Error::Unsupported(
+                "sdxl pricing requires generation context, not transform/depth".into(),
+            ));
+        }
+        let sampling = ResolvedSampling::for_pricing(req.generation)?;
+        let generation = req
+            .generation
+            .expect("shared resolver rejected missing generation");
+        if generation.width != req.geometry.width
+            || generation.height != req.geometry.height
+            || generation.count != req.geometry.batch
+        {
+            return Err(Error::Unsupported(
+                "sdxl pricing generation and admitted geometry/count differ".into(),
+            ));
+        }
+        // The current descriptor's closed carrier set is Reference/Mask/Control. Unknown
+        // carriers must not be silently scored as zero or reinterpreted as an init reference.
+        if generation.conditioning.iter().any(|role| {
+            !matches!(
+                role,
+                mlx_gen::Conditioning::Reference { .. }
+                    | mlx_gen::Conditioning::Mask { .. }
+                    | mlx_gen::Conditioning::Control { .. }
+            )
+        }) {
+            return Err(Error::Unsupported(
+                "sdxl pricing has an unclassified conditioning carrier".into(),
+            ));
+        }
+        let work = SamplingWorkFacts {
+            reference_count: generation
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, mlx_gen::Conditioning::Reference { .. }))
+                .count(),
+            mask_count: generation
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, mlx_gen::Conditioning::Mask { .. }))
+                .count(),
+            control_count: generation
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, mlx_gen::Conditioning::Control { .. }))
+                .count(),
+        };
+        if work
+            .reference_count
+            .checked_add(work.mask_count)
+            .and_then(|count| count.checked_add(work.control_count))
+            != Some(req.geometry.reference_count as usize)
+        {
+            return Err(Error::Unsupported(
+                "sdxl pricing generation and admitted aggregate image counts differ".into(),
+            ));
+        }
+        Self::from_resolved(req, sampling, generation.count, work)
+    }
+
+    pub(crate) fn from_recipe(
+        req: &IosPricingRequest<'_>,
+        recipe: &SamplingRecipe,
+        work: SamplingWorkFacts,
+    ) -> Result<Self> {
+        if req.generation.is_some() || req.transform.is_some() || req.depth.is_some() {
+            return Err(Error::Unsupported(
+                "sdxl captured recipe pricing requires payload-free work context".into(),
+            ));
+        }
+        if work
+            .reference_count
+            .checked_add(work.mask_count)
+            .and_then(|count| count.checked_add(work.control_count))
+            != Some(req.geometry.reference_count as usize)
+        {
+            return Err(Error::Unsupported(
+                "sdxl captured recipe and geometry aggregate image counts differ".into(),
+            ));
+        }
+        let sampling = ResolvedSampling::resolve_recipe(recipe, work)?;
+        Self::from_resolved(req, sampling, req.geometry.batch, work)
+    }
+
+    fn from_resolved(
+        req: &IosPricingRequest<'_>,
+        sampling: ResolvedSampling,
+        count: u32,
+        work: SamplingWorkFacts,
+    ) -> Result<Self> {
+        if count == 0 || count > crate::model::descriptor().capabilities.max_count {
+            return Err(Error::Unsupported(
+                "sdxl pricing count is outside the declared serial-output domain".into(),
+            ));
+        }
+        let has_reference = work.reference_count != 0;
+        let ip = crate::model::uses_ip_reference(
+            req.spec.ip_adapter.is_some(),
+            has_reference,
+            work.mask_count != 0,
+            work.control_count,
+            sampling.route().is_acceleration(),
+        );
+        let route = if work.mask_count != 0 {
+            Route::Mask
+        } else if work.control_count != 0 {
+            Route::Control
+        } else if ip {
+            Route::IpAdapter
+        } else if has_reference && !sampling.route().is_acceleration() {
+            Route::Reference
+        } else {
+            Route::Text
+        };
+        // Catalog/memory mode is not a model::generate dispatch input. Preserve the existing
+        // unknown-mode refusal, but a supported label must not override actual mixed roles.
+        Route::from_mode(req.mode)?;
+        let loaded_controls =
+            usize::from(req.spec.control.is_some()) + req.spec.extra_controls.len();
+        if work.control_count != 0 && work.control_count != loaded_controls {
+            return Err(Error::Unsupported(
+                "sdxl pricing Control conditioning count differs from loaded branches".into(),
+            ));
+        }
+        let has_init = has_reference && !ip && !sampling.route().is_acceleration();
         if !req.geometry.width.is_multiple_of(8) || !req.geometry.height.is_multiple_of(8) {
             return Err(Error::Unsupported(format!(
                 "sdxl ios pricing: {}x{} is not a multiple of the latent stride",
@@ -217,6 +956,12 @@ impl Regime {
             )));
         }
         let memory: &GenerationMemory = req.execution;
+        let cfg_batching = sampling.cfg_batching();
+        if cfg_batching != memory.cfg_batching.unwrap_or(CfgBatching::Batched) {
+            return Err(Error::Unsupported(
+                "sdxl pricing request and selected CFG batching differ".into(),
+            ));
+        }
         let tiling = if memory.tile_vae_decode {
             let (edge, overlap) = crate::memory_strategy::resolve_decode_geometry(
                 false,
@@ -242,14 +987,75 @@ impl Regime {
         }
         let windows = (req.token_window as i32).max(77);
         Ok(Self {
-            route: Route::from_mode(req.mode)?,
+            route,
+            sampling,
+            count,
+            has_init,
             width: req.geometry.width as i32,
             height: req.geometry.height as i32,
             staged: memory.stage_residency,
-            cfg_batching: memory.cfg_batching.unwrap_or(CfgBatching::Batched),
+            cfg_batching,
             tiling,
             context_tokens: windows,
         })
+    }
+
+    pub(crate) fn conditioning_rows(&self) -> i32 {
+        if self.sampling.guidance() > 1.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub(crate) fn model_rows(&self) -> i32 {
+        self.sampling.denoise_rows() as i32
+    }
+
+    pub(crate) fn initial_state_dtype(&self) -> Dtype {
+        if self.sampling.route() == SamplingRoute::Ancestral && !self.has_init {
+            crate::model::DTYPE
+        } else {
+            Dtype::Float32
+        }
+    }
+
+    /// Persistent owners after the real model-input materialization barrier. Lightning's local
+    /// scaled F32 intermediate is a PENDING graph obligation, not zero working set; it is not an
+    /// additional persistent owner after its returned half input has materialized. Curated x_in
+    /// is separately Rust-owned across the callback, even after the half cast materializes.
+    pub(crate) fn forward_owners(&self, state: Dtype) -> q::ForwardInputOwnership {
+        q::ForwardInputOwnership {
+            state,
+            scaled: self
+                .sampling
+                .retains_scaled_input_in_callback()
+                .then_some(Dtype::Float32),
+            cast_before_cfg: self.sampling.route() != SamplingRoute::Ancestral,
+        }
+    }
+
+    pub(crate) fn initial_fixed_inputs(&self, latent_elements: u64) -> u64 {
+        let init = if self.has_init {
+            latent_elements.saturating_mul(q::dtype_bytes(crate::model::DTYPE))
+        } else {
+            0
+        };
+        let inpaint = if self.route == Route::Mask {
+            latent_elements
+                .saturating_mul(q::dtype_bytes(Dtype::Float32))
+                .saturating_add(
+                    (latent_elements / 4).saturating_mul(q::dtype_bytes(Dtype::Float32)),
+                )
+        } else {
+            0
+        };
+        let enclosing_noise = if self.sampling.retains_initial_noise() {
+            latent_elements.saturating_mul(q::dtype_bytes(Dtype::Float32))
+        } else {
+            0
+        };
+        init.saturating_add(inpaint).saturating_add(enclosing_noise)
     }
 }
 
@@ -266,11 +1072,22 @@ pub(crate) struct Inputs {
     /// `(image encoder file, IP weights file)`.
     pub ip: Option<(PathBuf, PathBuf)>,
     pub quant_bits: Option<i32>,
+    /// Actual post-load CLIP pair policy. Production mirrors `spec.quantize`; explicit-config
+    /// legacy TE8 fixtures leave this None because they never exercised a groupable CLIP pack.
+    pub text_quant_bits: Option<i32>,
     /// Whether the load arms the rung-4 block stream ([`crate::memory_strategy::streamable`]).
     pub streamable: bool,
 }
 
 impl Inputs {
+    /// Test access to the SAME served file/policy resolver. Tests may subsequently replace only
+    /// this private pricing architecture with their existing explicit tiny configs; this does not
+    /// inject configuration into Sdxl::generate or bypass its real request/model validation.
+    #[cfg(test)]
+    pub(crate) fn from_spec_for_test(spec: &LoadSpec, regime: &Regime) -> Result<Self> {
+        Self::from_spec(spec, regime)
+    }
+
     fn from_spec(spec: &LoadSpec, regime: &Regime) -> Result<Self> {
         let WeightsSource::Dir(root) = &spec.weights else {
             return Err(Error::Unsupported(
@@ -292,7 +1109,10 @@ impl Inputs {
                 "sdxl ios pricing: a sealed geometry decode policy is not priced".into(),
             ));
         }
-        if regime.route == Route::Control && spec.control.is_none() {
+        if regime.route == Route::Control
+            && spec.control.is_none()
+            && spec.extra_controls.is_empty()
+        {
             return Err(Error::Unsupported(
                 "sdxl ios pricing: a control request needs a loaded ControlNet".into(),
             ));
@@ -324,19 +1144,7 @@ impl Inputs {
             })
             .collect();
         let ip = match &spec.ip_adapter {
-            Some(WeightsSource::Dir(dir)) => Some((
-                dir.join(crate::loader::IP_ADAPTER_IMAGE_ENCODER_FILE),
-                crate::loader::IP_ADAPTER_WEIGHT_FILES
-                    .iter()
-                    .map(|file| dir.join(file))
-                    .find(|path| path.exists())
-                    .ok_or_else(|| {
-                        Error::Msg(format!(
-                            "sdxl ios pricing: no plus/plus-face sdxl_vit-h weights under {}",
-                            dir.display()
-                        ))
-                    })?,
-            )),
+            Some(WeightsSource::Dir(dir)) => Some(crate::loader::resolve_ip_adapter_files(dir)?),
             Some(WeightsSource::File(_)) => {
                 return Err(Error::Unsupported(
                     "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
@@ -353,6 +1161,7 @@ impl Inputs {
             controls,
             ip,
             quant_bits: spec.quantize.map(|quant| quant.bits()),
+            text_quant_bits: spec.quantize.map(|quant| quant.bits()),
             streamable: crate::memory_strategy::streamable(spec),
         })
     }
@@ -365,14 +1174,52 @@ pub(crate) struct Footprint {
     pub floor: u64,
 }
 
-/// Every component of the request, lazily constructed, with its header-only footprints.
+/// One complete source-logical pack point, never a scratch maximum paired with a different
+/// stage's retained maximum. Pre-pack roots remain charged; no physical release is inferred.
+pub(crate) struct LoadPackPoint {
+    pub before_resident: u64,
+    pub scratch: u64,
+}
+
+fn collect_pack_effect(
+    path: &str,
+    linear: &mlx_gen::adapters::AdaptableLinear,
+    bits: i32,
+    retained: &mut u64,
+    outputs: &mut u64,
+    points: &mut Vec<LoadPackPoint>,
+    effects: &mut q::LinearEffects,
+) -> Result<()> {
+    let mut work = q::LinearWork::of(linear);
+    if work.bits.is_none() {
+        let scratch = work.pack(bits)?;
+        points.push(LoadPackPoint { before_resident: *retained, scratch });
+        // Only the base changes. Residual factors/deltas stay in their original owner set.
+        let base_outputs = work.weights.iter().chain(work.bias.iter()).fold(0u64, |n, a|
+            n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(a.bytes())));
+        *retained = retained.saturating_add(base_outputs);
+        *outputs = outputs.saturating_add(base_outputs);
+    }
+    if effects.0.insert(path.to_owned(), work).is_some() {
+        return Err(Error::Msg(format!("sdxl duplicate actual pack-walk target: {path}")));
+    }
+    Ok(())
+}
+
+/// The text pair is pure metadata; remaining components still have native lazy shape models.
+/// All footprints are header-only. The heavy pack collector
+/// below is metadata-only and never quantizes/evaluates those graphs to discover pricing.
 pub(crate) struct Priced {
-    te: (ClipTextEncoder, ClipTextEncoder),
+    te: (ClipPrice, ClipPrice),
     unet: UNet2DConditionModel,
     vae: Autoencoder,
     controls: Vec<ControlNet>,
     ip: Option<IpImageEncoder>,
+    /// Pre-pack read/cast floors and declared owners, including TE1 while TE2 is loaded.
     pub te_bytes: [Footprint; 2],
+    /// Pure-header post-pack declared owners and per-projection coincident raw budgets.
+    /// These are not physical lower/backing certificates; pre-pack/lazy read parents stay above.
+    pub te_pack: [crate::text_encoder::TextPackFacts; 2],
     pub unet_bytes: Footprint,
     pub vae_bytes: Footprint,
     /// Per branch: `(load footprint at the compute dtype, resident after the tier quantization)`.
@@ -384,6 +1231,13 @@ pub(crate) struct Priced {
     pub ip_resampler_bytes: u64,
     /// The installed K/V pairs' resident bytes (quantized with the U-Net at a packed tier).
     pub ip_kv_bytes: u64,
+    /// Each actual heavy projection pack with its coincident declared logical owners. Source/cast
+    /// roots are conservatively retained; these points grant no native backing-release credit.
+    pub load_quantize: Vec<LoadPackPoint>,
+    pub(crate) unet_effects: Option<q::LinearEffects>,
+    pub(crate) control_effects: Vec<Option<q::LinearEffects>>,
+    unet_retained: u64,
+    adapter_load: AdapterLoadLedger,
     arch: Architecture,
 }
 
@@ -392,35 +1246,66 @@ fn footprint(files: &[PathBuf], dtype: Dtype, keep: impl Fn(&str) -> bool) -> Re
     Ok(Footprint { resident, floor })
 }
 
-/// Bytes of a `[out, in]` projection group-quantized at `bits` (u32 codes + one bf16 scale and
-/// bias per 64-group), the pack `AdaptableLinear::quantize` produces.
-fn packed_bytes(elements: u64, bits: i32) -> u64 {
-    let group = crate::quant::GROUP_SIZE as u64;
-    elements
-        .saturating_mul(bits as u64)
-        .div_ceil(8)
-        .saturating_add(elements.div_ceil(group).saturating_mul(4))
+/// The sinusoid tables a ControlNet constructor builds beside its file's tensors (the timestep and
+/// `text_time` tables, `unet::embeddings`), in the small-buffer page they open.
+fn control_tables(cfg: &crate::config::UNetConfig) -> u64 {
+    use crate::unet::SinusoidalPositionalEncoding as Sinusoid;
+    mlx_gen::ios_quantum::PAGE_BYTES
+        + Sinusoid::timestep_table_bytes(cfg.block_out_channels[0])
+        + Sinusoid::timestep_table_bytes(cfg.addition_time_embed_dim.unwrap_or(256))
+}
+
+/// Only the premature heavy metadata pack is deferred. Text finalization, IP construction,
+/// native constructors and all final post-install pack validation keep their actual order.
+pub(crate) fn initial_heavy_pack(
+    configured: Option<&LoadSpec>, pack: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if configured.is_some_and(|spec| !spec.adapters.is_empty()) { Ok(()) } else { pack() }
 }
 
 impl Priced {
     pub(crate) fn build(inputs: &Inputs) -> Result<Self> {
+        Self::build_with_pack_timing(inputs, None)
+    }
+
+    pub(crate) fn build_configured(inputs: &Inputs, spec: &LoadSpec) -> Result<Self> {
+        Self::build_with_pack_timing(inputs, Some(spec))
+    }
+
+    fn build_with_pack_timing(inputs: &Inputs, configured: Option<&LoadSpec>) -> Result<Self> {
         let dtype = crate::model::DTYPE;
         let arch = inputs.arch.clone();
         let one = |p: &Path| vec![p.to_path_buf()];
-        let te1 = ClipTextEncoder::from_weights(
-            &crate::loader::lazy_weights(&one(&inputs.te1), dtype, false)?,
-            "text_model",
-            &arch.te1,
-        )?;
-        let te2 = ClipTextEncoder::from_weights(
-            &crate::loader::lazy_weights(&one(&inputs.te2), dtype, false)?,
-            "text_model",
-            &arch.te2,
-        )?;
+        let headers = |file: &Path| {
+            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
+                .map_err(|e| Error::Msg(e.to_string()))
+        };
+        let te1_headers = headers(&inputs.te1)?;
+        let mut te1 = ClipPrice::from_headers(&te1_headers, "text_model", &arch.te1)?;
+        let te2_headers = headers(&inputs.te2)?;
+        let mut te2 = ClipPrice::from_headers(&te2_headers, "text_model", &arch.te2)?;
         let te_bytes = [
             footprint(&one(&inputs.te1), dtype, |_| true)?,
             footprint(&one(&inputs.te2), dtype, |_| true)?,
         ];
+        let te_pack = [
+            crate::text_encoder::text_pack_facts(
+                &te1_headers,
+                &arch.te1,
+                inputs.text_quant_bits,
+            )?,
+            crate::text_encoder::text_pack_facts(
+                &te2_headers,
+                &arch.te2,
+                inputs.text_quant_bits,
+            )?,
+        ];
+        if let Some(bits) = inputs.text_quant_bits {
+            // Both header constructors precede the actual pair's ordered base-only metadata pack.
+            // No native CLIP/Weights/Array, quantizer interception or readiness query is involved.
+            te1.quantize(bits)?;
+            te2.quantize(bits)?;
+        }
 
         let mut unet = UNet2DConditionModel::from_weights(
             &crate::loader::lazy_weights(&one(&inputs.unet), dtype, false)?,
@@ -442,22 +1327,19 @@ impl Priced {
         )?;
         let vae_bytes = footprint(&one(vae_file), *vae_dtype, |_| true)?;
 
+        // All loads precede the actual ordered heavy pack walk.
+        let mut load_quantize = Vec::new();
         let mut controls = Vec::new();
         let mut control_bytes = Vec::new();
         for file in &inputs.controls {
-            let mut control = ControlNet::from_weights(
+            let control = ControlNet::from_weights(
                 &crate::loader::lazy_weights(&one(file), dtype, false)?,
                 &arch.unet,
             )?;
-            let load = footprint(&one(file), dtype, |_| true)?;
-            let resident = match inputs.quant_bits {
-                Some(bits) => {
-                    crate::quant::with_lazy_quantize(|| control.quantize(bits))?;
-                    crate::memory_strategy::control_resident_bytes(file, Some(bits))
-                        .map_err(|e| Error::Msg(e.to_string()))?
-                }
-                None => load.resident,
-            };
+            // The guard checks the header floor; the constructor's tables stay resident beside it.
+            let mut load = footprint(&one(file), dtype, |_| true)?;
+            load.resident += control_tables(&arch.unet);
+            let resident = load.resident;
             controls.push(control);
             control_bytes.push((load, resident));
         }
@@ -483,21 +1365,42 @@ impl Priced {
             ip_adapter_bytes = footprint(&one(ip_file), dtype, |_| true)?;
             ip_resampler_bytes =
                 footprint(&one(ip_file), dtype, |name| name.starts_with("image_proj."))?.resident;
-            ip_kv_bytes = match inputs.quant_bits {
-                Some(bits) => {
-                    mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(ip_file)
-                        .map_err(|e| Error::Msg(e.to_string()))?
-                        .iter()
-                        .filter(|h| h.name.starts_with("ip_adapter."))
-                        .map(|h| packed_bytes(h.shape.iter().product::<usize>() as u64, bits))
-                        .sum()
-                }
-                None => {
-                    footprint(&one(ip_file), dtype, |name| name.starts_with("ip_adapter."))?
-                        .resident
-                }
-            };
+            // Raw IP source owners remain beside later packed base outputs; no release credit.
+            ip_kv_bytes = footprint(&one(ip_file), dtype,
+                |name| name.starts_with("ip_adapter."))?.resident;
         }
+        let mut unet_effects = None;
+        let mut control_effects = Vec::new();
+        let mut unet_retained = unet_bytes.resident;
+        if let Some(bits) = inputs.quant_bits {
+            initial_heavy_pack(configured, || {
+                let mut retained = unet_bytes.resident.saturating_add(vae_bytes.resident)
+                    .saturating_add(control_bytes.iter().map(|(load, _)| load.resident).sum::<u64>())
+                    .saturating_add(ip_encoder_bytes.resident).saturating_add(ip_adapter_bytes.resident);
+                let mut effects = q::LinearEffects::default();
+                let mut outputs = 0;
+                // This is the ACTUAL ordered module walk, with a pure metadata visitor. The borrowed
+                // native model is left untouched: no quantize_linear, Array creation, eval or read.
+                unet.quantize_using(bits, &mut |path, linear, bits|
+                    collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
+                        &mut load_quantize, &mut effects))?;
+                unet_retained = unet_retained.saturating_add(outputs);
+                unet_effects = Some(effects);
+                for (index, control) in controls.iter_mut().enumerate() {
+                    let mut effects = q::LinearEffects::default();
+                    let mut outputs = 0;
+                    control.quantize_using(bits, &mut |path, linear, bits|
+                        collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
+                            &mut load_quantize, &mut effects))?;
+                    control_bytes[index].1 = control_bytes[index].0.resident.saturating_add(outputs);
+                    control_effects.push(Some(effects));
+                }
+                Ok(())
+            })?;
+        }
+        // A deferred configured walk keeps RAW owners until its selected post-install pack.
+        // Ordinary/no-adapter builds already filled this vector, so resize is a no-op there.
+        control_effects.resize_with(controls.len(), || None);
         if inputs.streamable {
             unet.arm_block_streams(
                 &WeightsSource::File(inputs.unet.clone()),
@@ -512,6 +1415,7 @@ impl Priced {
             controls,
             ip,
             te_bytes,
+            te_pack,
             unet_bytes,
             vae_bytes,
             control_bytes,
@@ -519,8 +1423,166 @@ impl Priced {
             ip_adapter_bytes,
             ip_resampler_bytes,
             ip_kv_bytes,
+            load_quantize,
+            unet_effects,
+            control_effects,
+            unet_retained,
+            adapter_load: AdapterLoadLedger::default(),
             arch,
         })
+    }
+
+    /// Consume a complete selected world at the real adapter boundary. Each world is replayed
+    /// through selected dispatch, the load ledger, actual target storage and the SAME ordered base
+    /// pack walk, then through the whole forward before any envelope is taken. The native pricing
+    /// model is never adapted/packed to discover facts. Legacy shape-only Array construction remains.
+    pub(crate) fn price_configured(
+        &mut self, spec: &LoadSpec, unet_file: &Path, bits: Option<i32>, regime: &Regime,
+    ) -> Result<IosPricing> {
+        self.price_configured_observing(spec, unet_file, bits, regime, |_, _, _, _| Ok(()))
+    }
+
+    /// Borrowed selected-world view at the actual consumer boundary. The observer runs after the
+    /// whole forward price, before state restoration/enveloping, and cannot change target facts or
+    /// retain native owners. Production supplies a no-op; CPU fixtures query native owners apart.
+    pub(crate) fn price_configured_observing(
+        &mut self, spec: &LoadSpec, unet_file: &Path, bits: Option<i32>, regime: &Regime,
+        mut observe: impl FnMut(&crate::adapters::AdapterOutcome<'_>, &Self, &AdapterLoadLedger, &IosPricing) -> Result<()>,
+    ) -> Result<IosPricing> {
+        if spec.adapters.is_empty() { return Ok(self.price(regime)?.0); }
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(unet_file)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        let config = self.arch.unet.clone();
+        let mut envelope: std::collections::BTreeMap<(IosPhase, Option<String>, String, String, usize), IosWindowPrice> =
+            std::collections::BTreeMap::new();
+        let mut accepted = false;
+        let mut first_refusal = None;
+        let mut absent = None;
+        crate::adapters::visit_configured_adapter_outcomes(spec, &headers, &config, |outcome| {
+            let ledger = AdapterLoadLedger::from_work_checked(outcome.work, self.unet_bytes.resident)?;
+            let pricing = if let Some(error) = &outcome.refusal {
+                first_refusal.get_or_insert_with(|| error.clone());
+                // Dir installs precede the VAE/control/IP loads. A source refusal never fabricates
+                // those loads, a successful target result, a post-install pack or a forward branch.
+                let warm = if regime.staged { 0 } else { self.text() };
+                let mut prefix = IosPricing::default();
+                prefix.take(IosPhase::Load, 0, self.te_bytes[0].floor, q::TEXT_ENCODER_1_LOAD);
+                prefix.take(IosPhase::Load, self.te_bytes[0].resident, self.te_bytes[1].floor, q::TEXT_ENCODER_2_LOAD);
+                for (encoder, facts) in self.te_pack.iter().enumerate() {
+                    let other = if encoder == 0 { self.te_bytes[1].resident } else { self.te_pack[0].retained };
+                    for point in &facts.points {
+                        prefix.take(IosPhase::Load, other.saturating_add(point.before_resident), point.scratch, q::LOAD_QUANTIZE);
+                    }
+                }
+                prefix.take(IosPhase::Load, warm, self.unet_bytes.floor, q::UNET_LOAD);
+                for point in ledger.quanta {
+                    prefix.take(point.phase, warm.saturating_add(point.resident), point.scratch, point.label);
+                }
+                prefix
+            } else {
+                let saved_effects = self.unet_effects.take();
+                let saved_controls = std::mem::take(&mut self.control_effects);
+                let saved_packs = std::mem::take(&mut self.load_quantize);
+                let saved_adapter = std::mem::replace(&mut self.adapter_load, ledger);
+                let saved_retained = self.unet_retained;
+                let saved_control_resident: Vec<_> = self.control_bytes.iter().map(|(_, r)| *r).collect();
+                let selected = (|| -> Result<IosPricing> {
+                    use crate::adapters::{AdapterInstallStorage as S, AdapterWork};
+                    use mlx_gen::adapters::AdaptableHost;
+                    let mut effects = q::LinearEffects::default();
+                    self.unet.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                        if effects.0.insert(path.to_owned(), q::LinearWork::of(linear)).is_some() {
+                            return Err(Error::Msg(format!("sdxl duplicate adapter base target: {path}")));
+                        }
+                        Ok(())
+                    })?;
+                    for item in outcome.work {
+                        let AdapterWork::Install(install) = item else { continue; };
+                        let path: Vec<_> = install.target.split('.').collect();
+                        if install.storage == S::DenseConv {
+                            self.unet.adaptable_conv_mut(&path).ok_or_else(|| Error::Msg(
+                                format!("sdxl missing actual selected convolution: {}", install.target)))?;
+                            let weight = install.installed.first().ok_or_else(|| Error::Msg(
+                                "sdxl selected convolution lacks its declared OHWI result".into()))?;
+                            effects.1.insert(install.target.clone(), weight.clone());
+                        } else {
+                            if !effects.0.contains_key(&install.target) {
+                                // Dense shortcut is deliberately absent from the base pack walk.
+                                let native = self.unet.adaptable_mut(&path).ok_or_else(|| Error::Msg(
+                                    format!("sdxl missing actual selected projection: {}", install.target)))?;
+                                effects.0.insert(install.target.clone(), q::LinearWork::of(native));
+                            }
+                            effects.0.get_mut(&install.target).expect("inserted selected target").install(install)?;
+                        }
+                    }
+                    let adapter_retained = self.adapter_load.retained_upper();
+                    self.unet_retained = self.unet_bytes.resident.saturating_add(adapter_retained);
+                    let mut retained = self.unet_retained.saturating_add(self.vae_bytes.resident)
+                        .saturating_add(self.control_bytes.iter().map(|(load, _)| load.resident).sum::<u64>())
+                        .saturating_add(self.ip_encoder_bytes.resident).saturating_add(self.ip_adapter_bytes.resident);
+                    if let Some(bits) = bits {
+                        self.unet.quantize_using(bits, &mut |path, _, bits| {
+                            let projection = effects.0.get_mut(path).ok_or_else(|| Error::Msg(
+                                format!("sdxl selected world missing ordered pack target: {path}")))?;
+                            if projection.bits.is_none() {
+                                let scratch = projection.pack(bits)?;
+                                self.load_quantize.push(LoadPackPoint { before_resident: retained, scratch });
+                                // Whole declared projection, including unchanged residual owners,
+                                // remains an upper. No upper subtraction or backing release credit.
+                                let outputs = projection.declared_bytes();
+                                retained = retained.saturating_add(outputs);
+                                self.unet_retained = self.unet_retained.saturating_add(outputs);
+                            }
+                            Ok(())
+                        })?;
+                        for (index, control) in self.controls.iter_mut().enumerate() {
+                            let mut control_effects = q::LinearEffects::default();
+                            let mut outputs = 0;
+                            control.quantize_using(bits, &mut |path, linear, bits|
+                                collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
+                                    &mut self.load_quantize, &mut control_effects))?;
+                            self.control_bytes[index].1 = self.control_bytes[index].0.resident.saturating_add(outputs);
+                            self.control_effects.push(Some(control_effects));
+                        }
+                    } else { self.control_effects.resize_with(self.controls.len(), || None); }
+                    self.unet_effects = Some(effects);
+                    let candidate = self.price(regime)?.0;
+                    observe(&outcome, self, &self.adapter_load, &candidate)?;
+                    Ok(candidate)
+                })();
+                self.unet_effects = saved_effects;
+                self.control_effects = saved_controls;
+                self.load_quantize = saved_packs;
+                self.adapter_load = saved_adapter;
+                self.unet_retained = saved_retained;
+                for ((_, resident), saved) in self.control_bytes.iter_mut().zip(saved_control_resident) { *resident = saved; }
+                let selected = selected?;
+                accepted = true;
+                absent.get_or_insert_with(|| selected.absent_phases.clone());
+                selected
+            };
+            // Keep a whole coincident candidate, never max(resident) + max(scratch) from different
+            // worlds. Ordinals distinguish repeated same-label epochs without retaining world lists.
+            let mut ordinals = std::collections::BTreeMap::new();
+            for window in pricing.windows {
+                let identity = (window.phase, window.class.clone(), window.label.clone(), window.owner_domain.clone());
+                let ordinal = ordinals.entry(identity.clone()).or_insert(0usize);
+                let key = (identity.0, identity.1, identity.2, identity.3, *ordinal);
+                *ordinal += 1;
+                match envelope.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(window); }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if window.logical_peak_bytes() > entry.get().logical_peak_bytes() { entry.insert(window); }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if !accepted { return Err(Error::Msg(first_refusal.unwrap_or_else(|| "sdxl no complete adapter world".into()))); }
+        let mut pricing = IosPricing::default();
+        for (_, window) in envelope { pricing.take_window(window); }
+        pricing.absent_phases = absent.unwrap_or_default();
+        Ok(pricing)
     }
 
     /// The heavy bundle's resident bytes in the denoise (`shed_ip_encoder`: lever d) and the
@@ -537,11 +1599,19 @@ impl Priced {
         } else {
             0
         };
-        self.unet_bytes.resident + self.vae_bytes.resident + controls + ip
+        self.unet_retained + self.vae_bytes.resident + controls + ip
     }
 
     fn text(&self) -> u64 {
-        self.te_bytes[0].resident + self.te_bytes[1].resident
+        self.te_pack[0].retained + self.te_pack[1].retained
+    }
+
+    /// The actual encoder pair's header-only conditioning flow after its ordered metadata finalize.
+    /// No fixed tier/compute dtype substitutes for packed projection promotion.
+    pub(crate) fn price_text_conditioning(&self, rows: i32, out: &mut Quanta) -> (Dtype, Dtype) {
+        let (h1, _) = self.te.0.price_forward(rows, self.arch.text_tokens, out);
+        let (h2, pooled) = self.te.1.price_forward(rows, self.arch.text_tokens, out);
+        (Dtype::from_promoting_types(h1, h2), pooled)
     }
 
     /// Price `regime`: the per-phase pricing and every `(phase, resident, label, scratch)` quantum.
@@ -573,6 +1643,23 @@ impl Priced {
             self.te_bytes[0].resident,
             vec![(q::TEXT_ENCODER_2_LOAD, self.te_bytes[1].floor)],
         );
+        // Runtime packs only AFTER both CLIP loads. At each point retain the other encoder at
+        // its actual current stage (TE2 still unquantized during TE1, finalized TE1 during TE2).
+        // Do not use pre-pack/final maxima interchangeably: tiny page-rounded packs can grow.
+        for (encoder, facts) in self.te_pack.iter().enumerate() {
+            let other = if encoder == 0 {
+                self.te_bytes[1].resident
+            } else {
+                self.te_pack[0].retained
+            };
+            for point in &facts.points {
+                take(
+                    IosPhase::Load,
+                    other + point.before_resident,
+                    vec![(q::LOAD_QUANTIZE, point.scratch)],
+                );
+            }
+        }
         let mut loaded = warm_text;
         take(
             IosPhase::Load,
@@ -580,6 +1667,11 @@ impl Priced {
             vec![(q::UNET_LOAD, self.unet_bytes.floor)],
         );
         loaded += self.unet_bytes.resident;
+        for point in &self.adapter_load.quanta {
+            take(IosPhase::Load, warm_text.saturating_add(point.resident),
+                vec![(point.label, point.scratch)]);
+        }
+        loaded = loaded.saturating_add(self.adapter_load.retained_upper());
         let vae_label = if self.vae.dtype() == Dtype::Float32 {
             q::VAE_LOAD
         } else {
@@ -613,31 +1705,69 @@ impl Priced {
             );
         }
 
+        for point in &self.load_quantize {
+            take(IosPhase::Load, warm_text.saturating_add(point.before_resident),
+                vec![(q::LOAD_QUANTIZE, point.scratch)]);
+        }
         let heavy = self.heavy(false);
-        // Conditioning: both CLIP towers over the guided pair's two token rows, one window at a
-        // time (each window is its own forward).
-        let rows = 2;
-        let mut text = Quanta::new();
-        let (h1, _) = self
-            .te
-            .0
-            .price_forward(rows, self.arch.text_tokens, &mut text);
-        let (h2, pooled) = self
-            .te
-            .1
-            .price_forward(rows, self.arch.text_tokens, &mut text);
-        let text_resident = self.text() + if staged { 0 } else { heavy };
-        take(IosPhase::Conditioning, text_resident, text);
-        let conditioning_dtype = Dtype::from_promoting_types(h1, h2);
-
         let (h, w) = (regime.height, regime.width);
         let (lh, lw) = (h / self.arch.latent_scale, w / self.arch.latent_scale);
         let (ch, cw) = (lh * self.arch.control_scale, lw * self.arch.control_scale);
+        // The request's input tensors, live from their upload (after the loads) through the quanta
+        // that consume them: the f32 init image of an img2img / inpaint encode; each control image
+        // and its CFG pair (`preprocess_control_image`, then the batched copy the lazy pair keeps
+        // the original for); the IP image prompt's f32 pixels.
+        let f32_bytes = |shape: &[i32]| -> u64 {
+            mlx_gen::ios_quantum::tensor_bytes(
+                4,
+                &shape.iter().map(|d| (*d).max(0) as u64).collect::<Vec<_>>(),
+            )
+        };
+        let init_image = if regime.has_init {
+            f32_bytes(&[1, h, w, 3])
+        } else {
+            0
+        };
+        let control_images = if regime.route == Route::Control {
+            f32_bytes(&[1 + regime.conditioning_rows(), ch, cw, 3])
+        } else {
+            0
+        };
+        let ip_pixels = match (&self.ip, regime.route) {
+            (Some(_), Route::IpAdapter) => {
+                let size = self.arch.vision.image_size;
+                f32_bytes(&[1, size, size, 3])
+            }
+            _ => 0,
+        };
+        let inputs = init_image + control_images + ip_pixels;
+        if inputs > 0 {
+            take(
+                IosPhase::Load,
+                heavy + warm_text + inputs,
+                vec![(REQUEST_INPUTS, 0)],
+            );
+        }
+        // Conditioning: both CLIP towers over the guided pair's two token rows, one window at a
+        // time (each window is its own forward).
+        let rows = regime.conditioning_rows();
+        let mut text = Quanta::new();
+        let (conditioning_dtype, pooled) = self.price_text_conditioning(rows, &mut text);
+        let text_resident = self.text() + if staged { 0 } else { heavy };
+        take(IosPhase::Conditioning, text_resident, text);
+
         let ip_tokens = match (&self.ip, regime.route) {
             (Some(ip), Route::IpAdapter) => {
                 let mut quanta = Quanta::new();
                 let tokens = ip.price_tokens(&mut quanta)?;
-                take(IosPhase::Conditioning, heavy + warm_text, quanta);
+                if rows > 1 {
+                    quanta.push((q::IP_CFG_TOKENS, q::ip_cfg_tokens_bytes(&tokens)));
+                }
+                take(
+                    IosPhase::Conditioning,
+                    heavy + warm_text + ip_pixels,
+                    quanta,
+                );
                 let t = tokens.shape();
                 Some(q::shaped(&[rows, t[1], t[2]], tokens.dtype())?)
             }
@@ -646,7 +1776,7 @@ impl Priced {
 
         // Encode: the img2img / inpaint init latent, or each ControlNet's conditioning embedding.
         let mut cond_embeds = Vec::new();
-        if regime.route.encodes_init() {
+        if regime.has_init {
             let mut quanta = Quanta::new();
             let tile = regime
                 .tiling
@@ -658,7 +1788,7 @@ impl Priced {
                 tile,
                 &mut quanta,
             )?;
-            take(IosPhase::Encode, heavy + warm_text, quanta);
+            take(IosPhase::Encode, heavy + warm_text + init_image, quanta);
         }
         if regime.route == Route::Control {
             let mut quanta = Quanta::new();
@@ -668,18 +1798,69 @@ impl Priced {
                     &mut quanta,
                 )?);
             }
-            take(IosPhase::Encode, heavy + warm_text, quanta);
+            // Conservatively: one branch's control image pair (a branch's images are released once
+            // its embedding exists) and every branch's embedding beside each embedding quantum.
+            let embeds: u64 = cond_embeds.iter().map(q::bytes).sum();
+            take(
+                IosPhase::Encode,
+                heavy + warm_text + control_images + embeds,
+                quanta,
+            );
         }
 
         // Denoise: one guided step (two sequential batch-1 halves, or one batched pair), the
         // ControlNet branches beside the U-Net, the IP tokens in the cross-attention.
-        let latent = if regime.route.encodes_init() {
-            Dtype::Float32
+        // add_noise(_with) uses f32 noise; Euler retains that promoted sampler state.
+        // The per-forward cast in price_step is a different tensor, not a state conversion.
+        let latent = regime.initial_state_dtype();
+        let sequential = regime.sampling.guidance() > 1.0 && !regime.cfg_batching.is_batched();
+        let batch = regime.model_rows();
+        // Bespoke execution has at most two dtype epochs: its first state and the promoted
+        // steady suffix. Resolve their existence without allocating the actual O(steps) schedule.
+        // Other solver histories are not certified by this ancestral ownership profile.
+        let ancestral_steps = if regime.sampling.route() == SamplingRoute::Ancestral {
+            Some(
+                regime
+                    .sampling
+                    .ancestral_window(
+                        crate::config::DiffusionConfig::sdxl_base().num_train_steps as f32,
+                        regime
+                            .sampling
+                            .effective_init_strength(regime.has_init, regime.route == Route::Mask),
+                    )?
+                    .0,
+            )
         } else {
-            crate::model::DTYPE
+            None
         };
-        let sequential = !regime.cfg_batching.is_batched();
-        let batch = if sequential { 1 } else { rows };
+        // Acceleration policies always have one first callback; more than one requested step
+        // also has a steady callback. ORIGINAL_STEPS=50 is LCM/Hyper's origin table, NOT a
+        // requested-step cap: longer requests repeat timestep indices and remain supported.
+        // Their state remains F32, so this projection is bounded independently of requested N;
+        // it does not instantiate Lightning's O(N) coefficient table during header pricing.
+        let acceleration = regime.sampling.route().is_acceleration();
+        let acceleration_families = if acceleration {
+            let cfg = crate::config::DiffusionConfig::sdxl_base();
+            let alpha = mlx_gen::AlphaSchedule::scaled_linear(
+                cfg.num_train_steps,
+                cfg.beta_start,
+                cfg.beta_end,
+            );
+            Some(regime.sampling.bounded_acceleration_families(&alpha)?)
+        } else {
+            None
+        };
+        let discrete_steps =
+            ancestral_steps.or_else(|| acceleration.then_some(regime.sampling.steps()));
+        let profiled_discrete = discrete_steps.is_some();
+        let profiled_curated = regime.sampling.route().is_curated();
+        let unclassified_control_ip = matches!(regime.route, Route::Control | Route::IpAdapter);
+        let epoch_family = if acceleration {
+            "acceleration"
+        } else {
+            "ancestral"
+        };
+        let mut denoise_windows = Vec::new();
         let plan = crate::plan::SdxlForwardPlan::UNBOUNDED
             .with_cfg_batching(regime.cfg_batching)
             .with_cfg_row(sequential.then_some(0));
@@ -693,8 +1874,13 @@ impl Priced {
         // the denoise prices every distinct latent dtype the loop feeds the U-Net.
         let mut quanta = Quanta::new();
         let mut step_dtype = latent;
+        let mut epoch = 0;
         loop {
-            let eps = self.price_step(
+            if discrete_steps == Some(0) {
+                break;
+            }
+            let mut forward = Quanta::new();
+            let (eps, coincident_control) = self.price_step(
                 regime,
                 q::shaped(&[batch, lh, lw, 4], step_dtype)?,
                 &encoder_x,
@@ -702,22 +1888,315 @@ impl Priced {
                 &cond_embeds,
                 ip_tokens.as_ref(),
                 plan,
-                &mut quanta,
+                &mut forward,
             )?;
             let next = Dtype::from_promoting_types(step_dtype, eps);
-            if next == step_dtype {
-                break;
+            if let Some(steps) = discrete_steps.filter(|_| profiled_discrete) {
+                let elements = (lh as u64) * (lw as u64) * 4;
+                let owners = regime.forward_owners(step_dtype).bytes(
+                    elements,
+                    crate::model::DTYPE,
+                    batch as u64,
+                );
+                let fixed = regime.initial_fixed_inputs(elements);
+                let addons = cond_embeds.iter().map(q::bytes).sum::<u64>()
+                    + ip_tokens.as_ref().map_or(0, q::bytes);
+                let completed = elements * q::dtype_bytes(next) * u64::from(regime.count - 1);
+                // Both conditioning tensors and model::generate's f32 [rows,6] time_ids remain
+                // owned in the enclosing generation scope (pipeline::text_time_ids).
+                let conditioning = q::bytes(&encoder_x)
+                    + q::bytes(&text_emb)
+                    + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
+                let halves = if sequential { 2 } else { 1 };
+                let shed_ip = crate::model::sheds_ip_image_encoder(staged)
+                    && regime.route == Route::IpAdapter;
+                let structural = self.heavy(shed_ip) + warm_text;
+                for half in 0..halves {
+                    for (ordinal, &(label, scratch)) in forward.iter().enumerate() {
+                        // Only the stem's guard includes the original model-input tensor. Later
+                        // guards price their local activation, while forward_eps still borrows
+                        // the caller's original input. Do not count that input twice at the stem.
+                        let overlap = if label == q::UNET_STEM || label == q::CONTROL_STEM {
+                            elements * q::dtype_bytes(crate::model::DTYPE) * batch as u64
+                        } else {
+                            0
+                        };
+                        let first_eps = if half == 1 {
+                            elements * q::dtype_bytes(eps)
+                        } else {
+                            0
+                        };
+                        denoise_windows.push(IosWindowPrice {
+                            phase: IosPhase::Denoise,
+                            // Required raw fallback: Control/IP never acquire physical classes
+                            // merely because coincident logical ownership is now explicit.
+                            class: (!unclassified_control_ip).then(|| {
+                                format!(
+                                    "{}:{epoch_family}:{}:cfg{half}:q{ordinal}",
+                                    regime.sampling.allocation_class(),
+                                    if epoch == 0 { "first" } else { "steady" }
+                                )
+                            }),
+                            label: label.into(),
+                            resident_bytes: structural,
+                            held_bytes: owners.saturating_sub(overlap)
+                                + fixed
+                                + addons
+                                + coincident_control[ordinal]
+                                + completed
+                                + conditioning
+                                + first_eps,
+                            scratch_bytes: scratch,
+                            basis: Some(IosWorkBasis {
+                                forward_rows: batch as u64,
+                                token_count: regime.context_tokens as u64,
+                                model_width: regime.width as u32,
+                                model_height: regime.height as u32,
+                                ..IosWorkBasis::default()
+                            }),
+                            owner_domain: if unclassified_control_ip {
+                                "sdxl/control-ip/coincident-owners-logical-v1"
+                            } else if acceleration {
+                                // Lightning's pending scale parent and all acceleration update
+                                // branches still need their own native backing proof.
+                                "sdxl/acceleration/forward-input-logical-v1"
+                            } else if label == q::UNET_STEM {
+                                "sdxl/ancestral/forward-input-pending-v1"
+                            } else {
+                                "sdxl/ancestral/forward-input-native-v1"
+                            }
+                            .into(),
+                        });
+                    }
+                }
+                // denoise_core retains the current latent through the lazy CFG/update/blend
+                // quantum. Per-forward CFG concatenations/casts and ControlNet residuals have
+                // left their Rust scopes; do not carry those independent forward maxima here.
+                // The unchanged guard is a raw scratch upper, never a subtractable physical lower.
+                let update = IosWindowPrice {
+                    phase: IosPhase::Denoise,
+                    class: (!unclassified_control_ip).then(|| {
+                        format!(
+                            "{}:{epoch_family}:{}:sampler-update",
+                            regime.sampling.allocation_class(),
+                            if epoch == 0 { "first" } else { "steady" }
+                        )
+                    }),
+                    label: q::SAMPLER_STEP.into(),
+                    resident_bytes: structural,
+                    held_bytes: elements * q::dtype_bytes(step_dtype)
+                        + fixed
+                        + conditioning
+                        + completed
+                        + cond_embeds.iter().map(q::bytes).sum::<u64>()
+                        + ip_tokens.as_ref().map_or(0, q::bytes),
+                    scratch_bytes: q::sampler_step_bytes(
+                        &q::shaped(&[1, lh, lw, 4], step_dtype)?,
+                        regime.route == Route::Mask,
+                    ),
+                    basis: Some(IosWorkBasis {
+                        forward_rows: 1,
+                        token_count: regime.context_tokens as u64,
+                        model_width: regime.width as u32,
+                        model_height: regime.height as u32,
+                        ..IosWorkBasis::default()
+                    }),
+                    owner_domain: format!("sdxl/{epoch_family}/sampler-update-logical-v1"),
+                };
+                if let Some(families) = &acceleration_families {
+                    let mut represented = false;
+                    for family in families.iter().filter(|f| f.first_step == (epoch == 0)) {
+                        let mut candidate = update.clone();
+                        candidate.class = (!unclassified_control_ip).then(|| {
+                            format!(
+                                "{}:acceleration:{}:sampler-update",
+                                regime.sampling.allocation_class(),
+                                family.family()
+                            )
+                        });
+                        candidate.owner_domain =
+                            "sdxl/acceleration/sampler-update-logical-v2".into();
+                        denoise_windows.push(candidate);
+                        represented = true;
+                    }
+                    if !represented {
+                        return Err(Error::Unsupported(
+                            "sdxl actual acceleration epoch has no bounded mechanism family".into(),
+                        ));
+                    }
+                } else {
+                    denoise_windows.push(update);
+                }
+                // The second epoch is a source-proved fixed dtype suffix, not an enumeration of
+                // the requested schedule. A one/zero-step request must not acquire this suffix.
+                quanta.extend(forward);
+                step_dtype = next;
+                epoch += 1;
+                if epoch == 2 || steps == 1 {
+                    break;
+                }
+            } else {
+                if profiled_curated {
+                    let (solver, cfg_pp) = match regime.sampling.route() {
+                        SamplingRoute::Curated(solver) => (solver, false),
+                        SamplingRoute::CfgPp(solver) => (solver, true),
+                        _ => unreachable!("curated profile uses its resolved factory"),
+                    };
+                    let cfg = crate::config::DiffusionConfig::sdxl_base();
+                    let alpha = mlx_gen::AlphaSchedule::scaled_linear(
+                        cfg.num_train_steps,
+                        cfg.beta_start,
+                        cfg.beta_end,
+                    );
+                    let ms = mlx_gen::DiscreteModelSampling::sdxl(&alpha);
+                    let elements = (lh as u64) * (lw as u64) * 4;
+                    let candidates =
+                        mlx_gen::sampler::solver_memory::solver_callback_windows_for_model(
+                            solver,
+                            cfg_pp,
+                            &ms,
+                            elements,
+                            q::dtype_bytes(step_dtype),
+                            q::dtype_bytes(eps),
+                        )?;
+                    let fixed = regime.initial_fixed_inputs(elements);
+                    let conditioning = q::bytes(&encoder_x)
+                        + q::bytes(&text_emb)
+                        + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
+                    let completed =
+                        elements * q::dtype_bytes(Dtype::Float32) * u64::from(regime.count - 1);
+                    let shed_ip = crate::model::sheds_ip_image_encoder(staged)
+                        && regime.route == Route::IpAdapter;
+                    let structural = self.heavy(shed_ip) + warm_text;
+                    let addons = cond_embeds.iter().map(q::bytes).sum::<u64>()
+                        + ip_tokens.as_ref().map_or(0, q::bytes);
+                    // This is the real VE/CFG++ factory's bounded POSSIBLE family set, not a
+                    // claim that a representative sigma schedule was observed for this request.
+                    // Current x, scaled input, history and secondary-callback outer nodes remain
+                    // separate coincident operands; never subtract their independent maxima.
+                    for candidate in candidates {
+                        let family = candidate.family();
+                        let scaled = if candidate.scaled_input_alias {
+                            0
+                        } else {
+                            candidate.scaled_input_bytes
+                        };
+                        // Curated callbacks cast F32 x_in BEFORE CFG concatenation. The shared
+                        // solver retains x_in across the callback; its F16 boundary is distinct.
+                        let cast = elements * q::dtype_bytes(crate::model::DTYPE);
+                        let cfg_pair = if batch > 1 { cast * batch as u64 } else { 0 };
+                        let owners = candidate.callback_outer_bytes
+                            + candidate.state_bytes
+                            + scaled
+                            + cast
+                            + cfg_pair;
+                        for half in 0..if sequential { 2 } else { 1 } {
+                            for (ordinal, &(label, scratch)) in forward.iter().enumerate() {
+                                let overlap = if label == q::UNET_STEM || label == q::CONTROL_STEM {
+                                    cast * batch as u64
+                                } else {
+                                    0
+                                };
+                                denoise_windows.push(IosWindowPrice {
+                                    phase: IosPhase::Denoise,
+                                    class: (!unclassified_control_ip).then(|| {
+                                        format!(
+                                            "{}:curated:{family}:cfg{half}:q{ordinal}",
+                                            regime.sampling.allocation_class()
+                                        )
+                                    }),
+                                    label: label.into(),
+                                    resident_bytes: structural,
+                                    held_bytes: owners.saturating_sub(overlap)
+                                        + fixed
+                                        + conditioning
+                                        + addons
+                                        + coincident_control[ordinal]
+                                        + completed
+                                        + if half == 1 {
+                                            elements * q::dtype_bytes(eps)
+                                        } else {
+                                            0
+                                        },
+                                    scratch_bytes: scratch,
+                                    basis: Some(IosWorkBasis {
+                                        forward_rows: batch as u64,
+                                        token_count: regime.context_tokens as u64,
+                                        model_width: regime.width as u32,
+                                        model_height: regime.height as u32,
+                                        ..IosWorkBasis::default()
+                                    }),
+                                    owner_domain: if unclassified_control_ip {
+                                        "sdxl/control-ip/coincident-owners-logical-v1"
+                                    } else {
+                                        "sdxl/curated/forward-input-logical-v1"
+                                    }
+                                    .into(),
+                                });
+                            }
+                        }
+                        denoise_windows.push(IosWindowPrice {
+                            phase: IosPhase::Denoise,
+                            class: (!unclassified_control_ip).then(|| {
+                                format!(
+                                    "{}:curated:{family}:sampler-update",
+                                    regime.sampling.allocation_class()
+                                )
+                            }),
+                            label: mlx_gen::sampler::SAMPLER_STEP_QUANTUM.into(),
+                            resident_bytes: structural,
+                            held_bytes: candidate.callback_outer_bytes
+                                + candidate.state_bytes
+                                + fixed
+                                + conditioning
+                                + addons
+                                + completed,
+                            scratch_bytes: mlx_gen::ios_quantum::sampler_step_bytes(elements),
+                            basis: Some(IosWorkBasis {
+                                forward_rows: 1,
+                                token_count: regime.context_tokens as u64,
+                                model_width: regime.width as u32,
+                                model_height: regime.height as u32,
+                                ..IosWorkBasis::default()
+                            }),
+                            owner_domain: "sdxl/curated/sampler-update-logical-v1".into(),
+                        });
+                    }
+                }
+                quanta.extend(forward);
+                if next == step_dtype {
+                    break;
+                }
+                step_dtype = next;
             }
-            step_dtype = next;
         }
         let latents = q::shaped(&[1, lh, lw, 4], step_dtype)?;
-        quanta.push((
-            q::SAMPLER_STEP,
-            q::sampler_step_bytes(&latents, regime.route == Route::Mask),
-        ));
+        if regime.sampling.route().is_curated() {
+            quanta.push((
+                mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
+                mlx_gen::ios_quantum::sampler_step_bytes(latents.size() as u64),
+            ));
+        } else if ancestral_steps != Some(0) {
+            // Acceleration and bespoke ancestral both run the actual SDXL denoise_core guard.
+            quanta.push((
+                q::SAMPLER_STEP,
+                q::sampler_step_bytes(&latents, regime.route == Route::Mask),
+            ));
+        }
         let shed_ip =
             crate::model::sheds_ip_image_encoder(staged) && regime.route == Route::IpAdapter;
-        take(IosPhase::Denoise, self.heavy(shed_ip) + warm_text, quanta);
+        // A real init owner is F16, independently of the F32 noised sampler state. The mask
+        // path additionally retains its F32 noise/mask. ControlNet+reference also owns that init;
+        // an IP image prompt does not. These are owners, not a fitted phase correction.
+        let elements = (lh as u64) * (lw as u64) * 4;
+        let held = regime.initial_fixed_inputs(elements)
+            + cond_embeds.iter().map(q::bytes).sum::<u64>()
+            + ip_tokens.as_ref().map_or(0, q::bytes);
+        take(
+            IosPhase::Denoise,
+            self.heavy(shed_ip) + warm_text + held,
+            quanta,
+        );
 
         // Decode: the staged decode holds the VAE alone; a warm one decodes beside everything.
         let mut quanta = Quanta::new();
@@ -730,17 +2209,56 @@ impl Priced {
         } else {
             heavy + warm_text
         };
-        take(IosPhase::Decode, decode_resident, quanta);
+        // The decode closure retains the caller's sampler latent. to_compute aliases it only
+        // at the same dtype (or for an f32 VAE); otherwise its compute copy is live beside it.
+        let caller = q::bytes(&latents);
+        let cast = self.vae.decode_input_retained_bytes(&latents) - caller;
+        for (label, scratch) in quanta {
+            // The first guard pays the not-yet-materialized cast as scratch. Later decoder
+            // guards see it already resident. VAE return drops it before pixel conversion.
+            let retained_cast = if label == q::VAE_DECODE_IN || label == q::DECODED_TO_IMAGE {
+                0
+            } else {
+                cast
+            };
+            take(
+                IosPhase::Decode,
+                // `finals` owns EVERY completed serial latent throughout the decode loop; the
+                // borrowed/clone caller handle aliases its entry, not a second latent allocation.
+                decode_resident + caller * u64::from(regime.count) + retained_cast,
+                vec![(label, scratch)],
+            );
+        }
 
         let mut pricing = IosPricing::default();
         for item in &items {
+            if (profiled_discrete || profiled_curated) && item.phase == IosPhase::Denoise {
+                // Forward AND update candidates are recorded at their own coincident epochs,
+                // not the largest input owner combined with another epoch's binding operation.
+                // Update/pending windows remain unverified physical domains; their presence is
+                // mandatory coverage, not permission to certify from a raw scratch upper.
+                continue;
+            }
             pricing.take(item.phase, item.resident, item.scratch, item.label);
+        }
+        for window in denoise_windows {
+            pricing.take_window(window);
+        }
+        if ancestral_steps == Some(0) {
+            pricing.phase_not_run(
+                IosPhase::Denoise,
+                "actual ancestral strength schedule has zero steps",
+            );
+        }
+        if !regime.has_init && regime.route != Route::Control {
+            pricing.phase_not_run(IosPhase::Encode, "no init or active ControlNet encode");
         }
         Ok((pricing, items))
     }
 
     /// One guided denoise forward's quanta over the shape-only latent `x` (the ControlNet branches
-    /// beside the U-Net, the IP tokens in the cross-attention). Returns the U-Net output's dtype.
+    /// beside the U-Net, the IP tokens in the cross-attention). Returns the U-Net output's dtype and
+    /// the bytes of the ControlNet residuals the U-Net forward holds.
     #[allow(clippy::too_many_arguments)]
     fn price_step(
         &self,
@@ -752,45 +2270,218 @@ impl Priced {
         ip_tokens: Option<&Array>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         quanta: &mut Quanta,
-    ) -> Result<Dtype> {
+    ) -> Result<(Dtype, Vec<u64>)> {
+        let first_quantum = quanta.len();
+        let x = q::shaped(x.shape(), crate::model::DTYPE)?;
         let batch = x.shape()[0];
         let mut control: Option<(Vec<Array>, Array)> = None;
+        let mut pending_control = q::ControlMergeWork::default();
+        let mut owners = Vec::new();
+        let (mut raw_down, mut raw_mid, mut selected_rows) = (0u64, 0u64, 0u64);
         if regime.route == Route::Control {
-            for (branch, embed) in self.controls.iter().zip(cond_embeds) {
+            for (branch_index, (branch, embed)) in self.controls.iter().zip(cond_embeds).enumerate() {
                 let s = embed.shape();
                 let row = q::shaped(&[batch, s[1], s[2], s[3]], embed.dtype())?;
-                let (down, mid) =
-                    branch.price_forward(&x, &row, encoder_x, text_emb, plan, quanta)?;
+                let selected = if plan.cfg_row.is_some() && s[0] == 2 {
+                    q::bytes(&row)
+                } else {
+                    0
+                };
+                let first_owner = owners.len();
+                let effects = self.control_effects[branch_index].as_ref()
+                    .map_or_else(q::EffectScope::native, q::EffectScope::root);
+                let (down, mid) = branch.price_forward_with_effects(
+                    &x,
+                    &row,
+                    encoder_x,
+                    text_emb,
+                    plan,
+                    quanta,
+                    Some(&mut owners),
+                    &effects,
+                )?;
+                for (index, held) in owners[first_owner..].iter_mut().enumerate() {
+                    // Prior branch payloads are kept by the unevaluated sum DAG. The new branch's
+                    // final residual stack does NOT yet exist at its early-forward quanta.
+                    *held +=
+                        raw_down + raw_mid + selected_rows + if index == 0 { 0 } else { selected };
+                }
+                selected_rows += selected;
+                raw_down += down.iter().map(q::bytes).sum::<u64>();
+                raw_mid += q::bytes(&mid);
                 control = Some(match control {
                     None => (down, mid),
-                    Some((prev_down, prev_mid)) => (
-                        prev_down
+                    Some((prev_down, prev_mid)) => {
+                        if prev_down.len() != down.len() {
+                            return Err(Error::Msg(
+                                "controlnet residual sum: branch down counts differ".into(),
+                            ));
+                        }
+                        let merged_down = prev_down
                             .iter()
                             .zip(&down)
                             .map(|(a, b)| {
-                                q::shaped(
-                                    a.shape(),
-                                    Dtype::from_promoting_types(a.dtype(), b.dtype()),
-                                )
+                                // Let the actual add producer decide broadcast geometry/promotion;
+                                // retain only shape metadata, never evaluate a pricing payload.
+                                let added = mlx_rs::ops::add(a, b)?;
+                                q::shaped(added.shape(), added.dtype())
                             })
-                            .collect::<Result<_>>()?,
-                        q::shaped(
-                            prev_mid.shape(),
-                            Dtype::from_promoting_types(prev_mid.dtype(), mid.dtype()),
-                        )?,
-                    ),
+                            .collect::<Result<Vec<_>>>()?;
+                        let added = mlx_rs::ops::add(&prev_mid, &mid)?;
+                        let merged_mid = q::shaped(added.shape(), added.dtype())?;
+                        pending_control.record_outputs(&merged_down, &merged_mid)?;
+                        (merged_down, merged_mid)
+                    }
                 });
             }
         }
-        self.unet.price_forward(
-            &x,
-            encoder_x,
-            text_emb,
-            control.as_ref(),
-            ip_tokens.map(|t| (t, 1.0)),
-            plan,
-            quanta,
-        )
+        // `pipeline::forward_eps` casts the combined residuals at the iOS U-Net boundary.
+        if let Some((down, mid)) = &mut control {
+            for residual in down {
+                *residual = q::shaped(residual.shape(), crate::model::DTYPE)?;
+            }
+            *mid = q::shaped(mid.shape(), crate::model::DTYPE)?;
+        }
+        let (cast_down, cast_mid) = control.as_ref().map_or((0, 0), |(down, mid)| {
+            (down.iter().map(q::bytes).sum::<u64>(), q::bytes(mid))
+        });
+        let unet_first = quanta.len();
+        let effects = self.unet_effects.as_ref().map_or_else(q::EffectScope::native, q::EffectScope::root);
+        let eps = self.unet.price_forward_with_effects(
+            &x, encoder_x, text_emb, control.as_ref(), ip_tokens.map(|t| (t, 1.0)),
+            plan, pending_control, quanta, &effects,
+        )?;
+        let (mut down_complete, mut mid_complete) = (false, false);
+        for (label, _) in &quanta[unet_first..] {
+            // Only the ACTUAL existing injection finish may replace raw source parents with the
+            // materialized cast's logical owner. This remains unclassified, not backing equality:
+            // inherited storage/cache oversizing and native/process domains are not inferred.
+            owners.push(
+                selected_rows
+                    + if down_complete { cast_down } else { raw_down }
+                    + if mid_complete { cast_mid } else { raw_mid },
+            );
+            if *label == q::CONTROL_DOWN_INJECTION {
+                down_complete = true;
+            }
+            if *label == q::CONTROL_MID_INJECTION {
+                mid_complete = true;
+            }
+        }
+        if owners.len() != quanta.len() - first_quantum {
+            return Err(Error::Unsupported(
+                "sdxl control coincident-owner ledger is incomplete".into(),
+            ));
+        }
+        Ok((eps, owners))
+    }
+}
+
+/// The numeric interpretation of the selected actual install work. Runtime guarding and the
+/// adapter load ledger use this exact budget, not an independent adapter-kind formula.
+pub(crate) fn adapter_install_quantum(
+    work: &crate::adapters::AdapterInstallWork,
+    resident: u64,
+) -> PricedQuantum {
+    PricedQuantum {
+        phase: IosPhase::Load,
+        resident: resident.saturating_add(work.pre_guard),
+        label: q::ADAPTER_MERGE,
+        scratch: work.scratch,
+    }
+}
+
+/// Logical upper ledger over a factual adapter producer run. This does not certify backing or
+/// make the served header-only exporter complete. FileScopeEnd never subtracts the raw payload:
+/// evaluated outputs, lazy parents and streamed/captured clones have distinct ownership lifetimes.
+#[derive(Default)]
+pub(crate) struct AdapterLoadLedger {
+    pub quanta: Vec<PricedQuantum>,
+    pub raw_parent_upper: u64,
+    pub installed_upper: u64,
+    pub preparation_upper: u64,
+    pub residuals: Vec<mlx_gen::adapters::facts::AdapterFacts>,
+}
+
+impl AdapterLoadLedger {
+    #[cfg(test)]
+    pub(crate) fn from_work(work: &[crate::adapters::AdapterWork], resident: u64) -> Self {
+        Self::from_work_checked(work, resident).expect("actual adapter producer dispatch is coherent")
+    }
+
+    pub(crate) fn retained_upper(&self) -> u64 {
+        self.raw_parent_upper.saturating_add(self.preparation_upper).saturating_add(self.installed_upper)
+    }
+
+    pub(crate) fn from_work_checked(work: &[crate::adapters::AdapterWork], resident: u64) -> Result<Self> {
+        use crate::adapters::{AdapterWork, AdapterInstallStorage as S, InstallKind as K};
+        let mut result = Self::default();
+        let mut selected = None;
+        let mut pending: Option<&crate::adapters::AdapterInstallWork> = None;
+        for item in work {
+            let current = resident.saturating_add(result.retained_upper());
+            match item {
+                AdapterWork::FileMaterialized(payloads) => {
+                    let (raw, load) = crate::adapters::adapter_file_payload_budget(payloads);
+                    result.quanta.push(PricedQuantum {
+                        phase: IosPhase::Load,
+                        resident: current,
+                        label: q::ADAPTER_LOAD,
+                        scratch: load,
+                    });
+                    result.raw_parent_upper = result.raw_parent_upper.saturating_add(raw);
+                }
+                AdapterWork::Selected(kind) => { selected = Some(*kind); }
+                AdapterWork::AlphaRead { key, scratch } => {
+                    if selected.is_none() || key.is_empty() {
+                        return Err(Error::Msg("sdxl alpha work lacks actual selected parser/key".into()));
+                    }
+                    result.quanta.push(PricedQuantum { phase: IosPhase::Load, resident: current,
+                        label: q::ADAPTER_LOAD, scratch: *scratch });
+                }
+                AdapterWork::Preparation(parents) => {
+                    result.preparation_upper = parents.iter().fold(result.preparation_upper,
+                        |n, p| n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(p.bytes())));
+                    result.quanta.push(PricedQuantum { phase: IosPhase::Load,
+                        resident: resident.saturating_add(result.retained_upper()),
+                        label: q::ADAPTER_MERGE, scratch: 0 });
+                }
+                AdapterWork::GuardAttempt(install) | AdapterWork::Install(install) => {
+                    let allowed = match selected {
+                        Some(K::Lora) => matches!(install.storage, S::DenseLinear | S::DenseConv | S::PackedLora | S::PackedDelta),
+                        Some(K::Lokr) => matches!(install.storage, S::DenseLinear | S::StructuredLokr),
+                        Some(K::ThirdPartyLokr | K::ThirdPartyLoha) => matches!(install.storage, S::DenseLinear | S::PackedDelta),
+                        None => return Err(Error::Msg("sdxl install has no selected file dispatch".into())),
+                    };
+                    if !allowed { return Err(Error::Msg("sdxl install storage disagrees with selected file dispatch".into())); }
+                    if matches!(item, AdapterWork::GuardAttempt(_)) {
+                        result.quanta.push(adapter_install_quantum(install, current));
+                        pending = Some(install);
+                        continue;
+                    }
+                    if let Some(attempt) = pending.take() {
+                        if attempt.target != install.target || attempt.storage != install.storage {
+                            return Err(Error::Msg("sdxl successful declaration disagrees with guard attempt".into()));
+                        }
+                    } else {
+                        // Actual producer witnesses record success only; their original event shape
+                        // remains protected. Header outcomes carry a distinct preceding attempt.
+                        result.quanta.push(adapter_install_quantum(install, current));
+                    }
+                    // An upper may overlap earlier base/raw/view payload. Never subtract one
+                    // logical upper from another to manufacture a physical lower/credit.
+                    result.installed_upper = install
+                        .installed
+                        .iter()
+                        .fold(result.installed_upper, |n, p| n.saturating_add(p.bytes()));
+                    if let Some(residual) = install.residual() {
+                        result.residuals.push(residual);
+                    }
+                }
+                AdapterWork::FileScopeEnd => { selected = None; pending = None; }
+            }
+        }
+        Ok(result)
     }
 }
 

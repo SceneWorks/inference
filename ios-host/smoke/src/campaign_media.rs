@@ -31,7 +31,183 @@ mod admission_tests;
 #[path = "campaign_media_tests.rs"]
 mod tests;
 
-pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
+fn capture_recipes(
+    registry: &ProviderRegistry,
+    provider: &str,
+    routes: &[String],
+    modes: &[String],
+    snapshots: Option<&Path>,
+) -> std::collections::BTreeMap<(String, String, String), Vec<campaign::CaptureRecipe>> {
+    use runtime_ios::media::{sampling, IosWork};
+    let mut out = std::collections::BTreeMap::new();
+    for route in routes {
+        for tier in ["q4", "q8", "bf16"] {
+            for mode in modes {
+                let case = Case {
+                    provider: provider.into(),
+                    route: route.clone(),
+                    tier: tier.into(),
+                    edge: campaign::reference_edge(provider),
+                    mode: mode.clone(),
+                    rung: 0,
+                    selection: campaign::BASE_SELECTION.into(),
+                    steps: if provider.starts_with("iris_") {
+                        0
+                    } else {
+                        campaign::ANCHOR_STEPS
+                    },
+                    recipe: None,
+                };
+                let carrier = work(&case, &CancelFlag::default(), registry);
+                let configured = snapshots.map(|root| snapshot(root, &case));
+                let refusal = |token, reason: String| campaign::CaptureRecipe {
+                    token,
+                    memory_class: None,
+                    configured_variant: None,
+                    steps: case.steps,
+                    refusal: Some(reason),
+                };
+                let mut recipes = Vec::new();
+                match carrier {
+                    Err(error) => recipes.push(refusal(
+                        None,
+                        format!("actual carrier construction failed: {error:?}"),
+                    )),
+                    Ok(mut carrier) if provider.starts_with("iris_") => {
+                        if let Some(Ok(spec)) = &configured {
+                            let variants =
+                                runtime_ios::media::configured_variant_digest(provider, spec)
+                                    .map(|digest| {
+                                        digest.map(|digest| runtime_ios::media::hex(&digest))
+                                    })
+                                    .map_err(|error| error.to_string());
+                            let resolved = match &mut carrier {
+                                IosWork::Generate(request) => {
+                                    sampling::iris_configured_representatives(spec, request)
+                                        .map(|items| items.into_iter().map(Ok).collect::<Vec<_>>())
+                                }
+                                IosWork::Restore(request) => {
+                                    sampling::restoration_configured_representatives(spec, request)
+                                }
+                                IosWork::Depth(request) => {
+                                    sampling::depth_configured_representatives(spec, request)
+                                }
+                            }
+                            .map_err(|error| error.to_string());
+                            match (variants, resolved) {
+                                (Ok(configured_variant), Ok(items)) => {
+                                    let mut classes = std::collections::BTreeSet::new();
+                                    for item in items {
+                                        match item {
+                                            Ok(identity) if classes.insert(identity.allocation_class().to_string()) => recipes.push(campaign::CaptureRecipe {
+                                                token: Some(identity.token().into()), memory_class: Some(identity.allocation_class().into()),
+                                                configured_variant: configured_variant.clone(), steps: identity.steps(), refusal: None,
+                                            }),
+                                            Ok(_) => {}, // Dedup ONLY actual provider-normalized configured classes.
+                                            Err(error) => recipes.push(refusal(None, format!("actual source topology unrepresentable: {error}"))),
+                                        }
+                                    }
+                                }
+                                (Err(error), _) | (_, Err(error)) => recipes.push(refusal(
+                                    None,
+                                    format!("actual configured metadata failed: {error}"),
+                                )),
+                            }
+                        } else {
+                            let reason = match &configured {
+                                Some(Err(error)) => format!("unresolved controls: {error}"),
+                                None => "unresolved controls: actual route/tier checkpoint metadata is not provisioned".into(),
+                                Some(Ok(_)) => unreachable!(),
+                            };
+                            match &carrier {
+                                IosWork::Generate(request) => {
+                                    match sampling::iris_raw_templates(request) {
+                                        Ok(tokens) => {
+                                            for token in tokens {
+                                                recipes.push(refusal(Some(token), reason.clone()));
+                                            }
+                                        }
+                                        Err(error) => recipes.push(refusal(
+                                            None,
+                                            format!("{reason}; raw template failure: {error}"),
+                                        )),
+                                    }
+                                }
+                                IosWork::Restore(_) | IosWork::Depth(_) => {
+                                    recipes.push(refusal(None, reason))
+                                }
+                            }
+                        }
+                    }
+                    Ok(IosWork::Generate(mut request)) => {
+                        let configured_variant = match &configured {
+                            Some(Ok(spec)) => {
+                                runtime_ios::media::configured_variant_digest(provider, spec)
+                                    .map(|digest| {
+                                        digest.map(|digest| runtime_ios::media::hex(&digest))
+                                    })
+                                    .map_err(|error| error.to_string())
+                            }
+                            Some(Err(error)) => Err(error.clone()),
+                            None => Ok(None),
+                        };
+                        match (
+                            sampling::representatives(provider).map_err(|error| error.to_string()),
+                            configured_variant,
+                        ) {
+                            (Ok(items), Ok(configured_variant)) => {
+                                for item in items {
+                                    match sampling::apply_representative(
+                                        provider,
+                                        item.token(),
+                                        &mut request,
+                                    ) {
+                                        Ok(actual) => recipes.push(campaign::CaptureRecipe {
+                                            token: Some(actual.token().into()),
+                                            memory_class: Some(actual.allocation_class().into()),
+                                            configured_variant: configured_variant.clone(),
+                                            steps: actual.steps(),
+                                            refusal: None,
+                                        }),
+                                        Err(error) => recipes.push(campaign::CaptureRecipe {
+                                            token: Some(item.token().into()),
+                                            memory_class: Some(item.allocation_class().into()),
+                                            configured_variant: configured_variant.clone(),
+                                            steps: item.steps(),
+                                            refusal: Some(error.to_string()),
+                                        }),
+                                    }
+                                }
+                            }
+                            (Err(error), _) | (_, Err(error)) => recipes.push(refusal(
+                                None,
+                                format!("actual sampling metadata failed: {error}"),
+                            )),
+                        }
+                    }
+                    Ok(_) => recipes.push(refusal(
+                        None,
+                        "registered task has no source-owned representative adapter".into(),
+                    )),
+                }
+                if recipes.is_empty() {
+                    recipes.push(refusal(None, "source-owned representative set was empty; no capture coverage established".into()));
+                }
+                out.insert((route.clone(), tier.into(), mode.clone()), recipes);
+            }
+        }
+    }
+    out
+}
+
+pub fn surfaces(registry: &ProviderRegistry) -> Result<Vec<Surface>, String> {
+    surfaces_with_snapshots(registry, None)
+}
+
+fn surfaces_with_snapshots(
+    registry: &ProviderRegistry,
+    snapshots: Option<&Path>,
+) -> Result<Vec<Surface>, String> {
     let mut out = Vec::new();
     for registration in registry.generators() {
         let d = (registration.descriptor)();
@@ -76,7 +252,8 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
             vec![d.id.into()]
         };
         out.push(Surface {
-            selections: selections(registry, d.id, &routes[0]),
+            recipes: capture_recipes(registry, d.id, &routes, &modes, snapshots),
+            selections: selections(registry, d.id, &routes, snapshots)?,
             provider: d.id.into(),
             routes,
             modes,
@@ -88,7 +265,14 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
             provider: d.id.into(),
             routes: vec![d.id.into()],
             modes: vec!["restore".into()],
-            selections: selections(registry, d.id, d.id),
+            recipes: capture_recipes(
+                registry,
+                d.id,
+                &[d.id.into()],
+                &["restore".into()],
+                snapshots,
+            ),
+            selections: selections(registry, d.id, &[d.id.into()], snapshots)?,
         });
     }
     // Composed provider-specific tasks are not generators. Discover them through their actual
@@ -96,7 +280,23 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     for r in registry.memory_strategy_registrations() {
         if !out.iter().any(|s| s.provider == r.provider_id) {
             out.push(Surface {
-                selections: selections(registry, r.provider_id, r.provider_id),
+                recipes: capture_recipes(
+                    registry,
+                    r.provider_id,
+                    &[r.provider_id.into()],
+                    &[if r.provider_id == "iris_3b_depth" {
+                        "depth".into()
+                    } else {
+                        "task".into()
+                    }],
+                    snapshots,
+                ),
+                selections: selections(
+                    registry,
+                    r.provider_id,
+                    &[r.provider_id.into()],
+                    snapshots,
+                )?,
                 provider: r.provider_id.into(),
                 routes: vec![r.provider_id.into()],
                 modes: vec![if r.provider_id == "iris_3b_depth" {
@@ -107,7 +307,7 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 /// The `MemoryMode` key a campaign mode runs as (`work_mode`'s mapping).
@@ -124,15 +324,140 @@ pub fn mode_key(mode: &str) -> &str {
     }
 }
 
-/// A campaign mode's anchor variant: the provider's proven additivity (`anchor_variant`).
-pub fn variant(provider: &str, mode: &str, tier: &str) -> String {
-    runtime_ios::media::pricing::anchor_variant(provider, mode_key(mode), tier)
+/// TRUE Reference/Mask/Control counts of the ACTUAL carrier constructor below, after accepted
+/// control-kind resolution. Geometry reference_count remains their AGGREGATE, not tuple.0.
+/// Counts are retained in evidence, not multiplied into a measured family grid.
+fn carrier_role_counts(mode: &str, required_control: bool) -> Result<(u32, u32, u32), String> {
+    let references = u32::from(matches!(mode, "reference" | "mask" | "ip_adapter"));
+    let masks = u32::from(mode == "mask");
+    let controls = u32::from(required_control || mode == "control");
+    if !matches!(
+        mode,
+        "text"
+            | "prompt_batch"
+            | "reference"
+            | "mask"
+            | "ip_adapter"
+            | "control"
+            | "restore"
+            | "depth"
+    ) {
+        return Err(format!("no actual campaign carrier for {mode}"));
+    }
+    Ok((references, masks, controls))
+}
+
+fn variant_for_registry(
+    registry: &ProviderRegistry,
+    provider: &str,
+    mode: &str,
+    tier: &str,
+    class: Option<&str>,
+) -> Result<String, String> {
+    if provider == runtime_ios::media::sdxl::SDXL_ID {
+        return Err(
+            "SDXL role family requires its actual configured spec and sampling recipe".into(),
+        );
+    }
+    let case = Case {
+        provider: provider.into(),
+        route: provider.into(),
+        tier: tier.into(),
+        edge: campaign::reference_edge(provider),
+        mode: mode.into(),
+        rung: 0,
+        selection: campaign::BASE_SELECTION.into(),
+        steps: 0,
+        recipe: None,
+    };
+    // Use the same accepted-kind resolver as work_with_spec, not a lossy mode-prefix guess.
+    let (actual, kind) = mode_and_kind(&case, registry).map_err(|error| format!("{error:?}"))?;
+    let (references, masks, controls) = carrier_role_counts(&actual, kind.is_some())?;
+    let aggregate = references
+        .checked_add(masks)
+        .and_then(|count| count.checked_add(controls))
+        .ok_or_else(|| "campaign carrier role total overflows geometry".to_string())?;
+    runtime_ios::media::pricing::anchor_variant_for_roles(
+        provider,
+        mode_key(&actual),
+        tier,
+        class,
+        aggregate,
+        masks,
+        controls,
+    )
+}
+
+/// Actual configured route classification, shared with admission, after recipe replay on the
+/// existing carrier. No label, IP-file presence alone, or ignored top-level scale chooses IP.
+fn variant_for_work(
+    provider: &str,
+    tier: &str,
+    class: Option<&str>,
+    spec: &LoadSpec,
+    work: &runtime_ios::media::IosWork,
+) -> Result<String, String> {
+    let mode =
+        runtime_ios::media::work_mode(provider, spec, work).map_err(|error| error.to_string())?;
+    let roles = match work {
+        runtime_ios::media::IosWork::Generate(request) => (
+            request.memory_reference_count(),
+            request
+                .conditioning
+                .iter()
+                .filter(|role| matches!(role, Conditioning::Mask { .. }))
+                .count() as u32,
+            request
+                .conditioning
+                .iter()
+                .filter(|role| matches!(role, Conditioning::Control { .. }))
+                .count() as u32,
+        ),
+        runtime_ios::media::IosWork::Restore(_) | runtime_ios::media::IosWork::Depth(_) => {
+            (0, 0, 0)
+        }
+    };
+    runtime_ios::media::pricing::anchor_variant_for_roles(
+        provider,
+        mode.as_key(),
+        tier,
+        class,
+        roles.0,
+        roles.1,
+        roles.2,
+    )
+}
+
+/// The production listing's single configured case path. Keep recipe replay and actual spec
+/// together; tests can exercise one case without enumerating a catalog or creating a model.
+fn variant_for_case(
+    registry: &ProviderRegistry,
+    case: &Case,
+    spec: &LoadSpec,
+    class: Option<&str>,
+) -> Result<String, String> {
+    let work = work_with_spec(case, &CancelFlag::default(), registry, Some(spec))
+        .map_err(|error| format!("{error:?}"))?;
+    variant_for_work(&case.provider, &case.tier, class, spec, &work)
+}
+
+/// Unresolved carriers remain visible as unresolved families, never borrowed text evidence.
+pub fn variant(provider: &str, mode: &str, tier: &str, class: Option<&str>) -> String {
+    runtime_ios::catalog()
+        .map_err(|error| error.to_string())
+        .and_then(|catalog| variant_for_registry(catalog.media(), provider, mode, tier, class))
+        .unwrap_or_else(|_| format!("unresolved-role-{mode}"))
 }
 
 /// The architecture group of `(provider, route, tier)`: on the host, the base-component
 /// ARCHITECTURE digest of the provisioned slot under `snapshots` (the same function admission keys
 /// the device's anchor families on); a slot that is absent or unreadable is its own group.
-fn architecture_group(snapshots: &Path, provider: &str, route: &str, tier: &str) -> String {
+fn architecture_group(
+    snapshots: &Path,
+    provider: &str,
+    route: &str,
+    tier: &str,
+) -> Result<String, String> {
     let case = Case {
         provider: provider.into(),
         route: route.into(),
@@ -142,14 +467,15 @@ fn architecture_group(snapshots: &Path, provider: &str, route: &str, tier: &str)
         rung: 0,
         selection: campaign::BASE_SELECTION.into(),
         steps: 0,
+        recipe: None,
     };
-    snapshot(snapshots, &case)
-        .ok()
-        .and_then(|spec| runtime_ios::media::architecture_digest(&spec).ok())
-        .map_or_else(
-            || format!("unprovisioned:{provider}/{route}/{tier}"),
-            |d| runtime_ios::media::hex(&d),
-        )
+    if !snapshots.join(slot_route(&case)).join(tier).is_dir() {
+        return Ok(format!("unprovisioned:{provider}/{route}/{tier}"));
+    }
+    let spec = snapshot(snapshots, &case)?;
+    let digest =
+        runtime_ios::media::architecture_digest(&spec).map_err(|error| error.to_string())?;
+    Ok(runtime_ios::media::hex(&digest))
 }
 
 /// The campaign listing (schema 2): every planned ANCHOR case with its purpose and repeat count,
@@ -158,16 +484,84 @@ fn architecture_group(snapshots: &Path, provider: &str, route: &str, tier: &str)
 /// grouped by architecture digest, so checkpoints of one architecture share anchors; without it,
 /// every route is its own family (weights-free, conservative).
 pub fn listing() -> Result<String, String> {
-    listing_with(std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS").map(PathBuf::from))
+    let snapshots = std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            #[cfg(target_os = "ios")]
+            {
+                super::dirs_documents().map(|docs| docs.join("campaign"))
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                None
+            }
+        });
+    listing_with(snapshots)
 }
 
 pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
     let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
-    let surfaces = surfaces(catalog.media());
-    let variant_of = |provider: &str, mode: &str, tier: &str| variant(provider, mode, tier);
-    let by_architecture = |provider: &str, route: &str, tier: &str| match &snapshots {
-        Some(root) => architecture_group(root, provider, slot_route_of(provider, route), tier),
-        None => format!("{provider}/{route}"),
+    let surfaces = surfaces_with_snapshots(catalog.media(), snapshots.as_deref())?;
+    let variant_of =
+        |provider: &str, route: &str, mode: &str, tier: &str, recipe: &campaign::CaptureRecipe| {
+            let resolved = (|| -> Result<String, String> {
+                if recipe.refusal.is_some() {
+                    return Err("capture recipe has unresolved actual controls".into());
+                }
+                if let Some(root) = snapshots.as_deref() {
+                    let case = Case {
+                        provider: provider.into(),
+                        route: route.into(),
+                        tier: tier.into(),
+                        edge: campaign::reference_edge(provider),
+                        mode: mode.into(),
+                        rung: 0,
+                        selection: campaign::BASE_SELECTION.into(),
+                        steps: recipe.steps,
+                        recipe: recipe.token.clone(),
+                    };
+                    let spec = snapshot(root, &case)?;
+                    variant_for_case(
+                        catalog.media(),
+                        &case,
+                        &spec,
+                        recipe.memory_class.as_deref(),
+                    )
+                } else {
+                    variant_for_registry(
+                        catalog.media(),
+                        provider,
+                        mode,
+                        tier,
+                        recipe.memory_class.as_deref(),
+                    )
+                }
+            })();
+            resolved.unwrap_or_else(|_| format!("unresolved-role-{mode}"))
+        };
+    let mut architectures = std::collections::BTreeMap::new();
+    for surface in &surfaces {
+        for route in &surface.routes {
+            for tier in ["q4", "q8", "bf16"]
+                .into_iter()
+                .filter(|tier| surface.serves_route(route, tier))
+            {
+                let group = match &snapshots {
+                    Some(root) => architecture_group(root, &surface.provider, route, tier)?,
+                    None => format!("{}/{route}", surface.provider),
+                };
+                architectures.insert(
+                    (surface.provider.clone(), route.clone(), tier.to_string()),
+                    group,
+                );
+            }
+        }
+    }
+    let by_architecture = |provider: &str, route: &str, tier: &str| {
+        architectures
+            .get(&(provider.into(), route.into(), tier.into()))
+            .expect("family traversal uses the same served route/tier surface")
+            .clone()
     };
     let grouping = campaign::Grouping {
         architecture: &by_architecture,
@@ -181,16 +575,20 @@ pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
             s.routes.iter().flat_map(move |route| {
                 ["q4", "q8", "bf16"]
                     .into_iter()
-                    .filter(|tier| !s.serves(tier))
+                    .filter(|tier| !s.serves_route(route, tier))
                     .map(move |tier| json!({"provider": s.provider, "route": route, "tier": tier}))
             })
         })
         .collect();
+    let unserved_sampling: Vec<Value> = surfaces.iter().flat_map(|surface| surface.recipes.iter()
+        .flat_map(move |((route, tier, mode), recipes)| recipes.iter().filter_map(move |recipe| recipe.refusal.as_ref()
+            .map(|reason| json!({"provider":surface.provider,"route":route,"tier":tier,"mode":mode,"recipe":recipe.token,"memory_class":recipe.memory_class,"configured_variant":recipe.configured_variant,"reason":reason}))))).collect();
     Ok(json!({"schema": 2,
         "grouping": if snapshots.is_some() { "architecture" } else { "per_route" },
-        "families": families.iter().map(|f| json!({"architecture": f.architecture, "tier": f.tier, "variant": f.variant,
+        "families": families.iter().map(|f| json!({"architecture": f.architecture, "tier": f.tier, "variant": f.variant, "sampling_recipe": f.recipe,
             "anchor": format!("{}/{}/{}", f.anchor.0, f.anchor.1, f.anchor.2), "members": f.members})).collect::<Vec<_>>(),
         "unserved": unserved,
+        "unserved_sampling": unserved_sampling,
         "cases": planned.iter().map(|p| json!({"case": p.case.key(), "purpose": p.purpose.label(), "repeats": p.repeats})).collect::<Vec<_>>(),
         "dependencies": [{"provider":"supra2", "epic":24212, "available": planned.iter().any(|p| p.case.provider.contains("supra")), "reason":"requires native engine and iOS catalog registration; absence is not a passing cell"}]
     }).to_string())
@@ -247,55 +645,94 @@ pub fn selection_token(p: &MemoryStrategyParameters) -> String {
 fn selections(
     registry: &ProviderRegistry,
     provider: &str,
-    route: &str,
-) -> std::collections::BTreeMap<(String, u8), Vec<String>> {
+    routes: &[String],
+    snapshots: Option<&Path>,
+) -> Result<std::collections::BTreeMap<(String, String, u8), Vec<String>>, String> {
     let mut out = std::collections::BTreeMap::new();
-    let Ok(contracts) = registry.memory_contract_surfaces() else {
-        return out;
-    };
-    for tier_name in ["q4", "q8", "bf16"] {
-        let probe = Case {
-            provider: provider.into(),
-            route: route.into(),
-            tier: tier_name.into(),
-            edge: 512,
-            mode: String::new(),
-            rung: 0,
-            selection: campaign::BASE_SELECTION.into(),
-            steps: 0,
-        };
-        let Ok(spec) = load_spec(&probe, WeightsSource::Dir(PathBuf::new())) else {
-            continue;
-        };
-        let Some(surface) = contracts.iter().find(|s| {
-            s.contract.provider_id == provider
-                && s.selector.offload_policy == spec.offload_policy
-                && s.selector.load_shape == spec.load_shape
-                && match s.selector.tier {
-                    MemoryContractSurfaceTier::Q4 => tier_name == "q4",
-                    MemoryContractSurfaceTier::Q8 => tier_name == "q8",
-                    MemoryContractSurfaceTier::Bf16 => tier_name == "bf16",
-                    _ => false,
+    let contracts = registry
+        .memory_contract_surfaces()
+        .map_err(|error| error.to_string())?;
+    for route in routes {
+        for tier_name in ["q4", "q8", "bf16"] {
+            for (rung, strategy) in MemoryStrategy::ALL.into_iter().enumerate().take(5) {
+                let probe = Case {
+                    provider: provider.into(),
+                    route: route.clone(),
+                    tier: tier_name.into(),
+                    edge: campaign::reference_edge(provider),
+                    mode: "text".into(),
+                    rung: rung as u8,
+                    selection: campaign::BASE_SELECTION.into(),
+                    steps: 0,
+                    recipe: None,
+                };
+                let configured = snapshots.filter(|root| {
+                    root.join(slot_route_of(provider, route))
+                        .join(tier_name)
+                        .is_dir()
+                });
+                let space = if let Some(root) = configured {
+                    let base = snapshot(root, &probe)?;
+                    let spec = match runtime_ios::media::configured_load_form(
+                        registry, provider, &base, strategy,
+                    ) {
+                        Ok(spec) => spec,
+                        Err(runtime_ios::media::AdmissionError::Refused(refusal))
+                            if refusal.kind == runtime_ios::media::RefusalKind::Strategy =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    let contract = registry.memory_strategy_contract(provider, &spec).map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("{provider}/{route}/{tier_name}: actual configured load has no memory contract"))?;
+                    if contract.capability(strategy).is_none_or(|capability| {
+                        capability.support != MemoryStrategySupport::Implemented
+                    }) {
+                        continue;
+                    }
+                    match contract.selection_space(strategy, tier_of(tier_name), false) {
+                        Ok(space) => space,
+                        Err(Error::Unsupported(_)) => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                } else {
+                    let spec = load_spec(&probe, WeightsSource::Dir(PathBuf::new()))?;
+                    let Some(surface) = contracts.iter().find(|surface| {
+                        surface.contract.provider_id == provider
+                            && surface.selector.offload_policy == spec.offload_policy
+                            && surface.selector.load_shape == spec.load_shape
+                            && match surface.selector.tier {
+                                MemoryContractSurfaceTier::Q4 => tier_name == "q4",
+                                MemoryContractSurfaceTier::Q8 => tier_name == "q8",
+                                MemoryContractSurfaceTier::Bf16 => tier_name == "bf16",
+                                _ => false,
+                            }
+                    }) else {
+                        continue;
+                    };
+                    match surface
+                        .contract
+                        .selection_space(strategy, tier_of(tier_name), false)
+                    {
+                        Ok(space) => space,
+                        Err(Error::Unsupported(_)) => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                if !space.is_empty() {
+                    out.insert(
+                        (route.clone(), tier_name.to_string(), rung as u8),
+                        space
+                            .iter()
+                            .map(|selection| selection_token(&selection.parameters))
+                            .collect(),
+                    );
                 }
-        }) else {
-            continue;
-        };
-        for (rung, strategy) in MemoryStrategy::ALL.into_iter().enumerate().take(5) {
-            if let Ok(space) = surface
-                .contract
-                .selection_space(strategy, tier_of(tier_name), false)
-            {
-                out.insert(
-                    (tier_name.to_string(), rung as u8),
-                    space
-                        .iter()
-                        .map(|s| selection_token(&s.parameters))
-                        .collect(),
-                );
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn tier(case: &Case) -> MemoryNumericTier {
@@ -397,8 +834,24 @@ fn work(
     cancel: &CancelFlag,
     registry: &ProviderRegistry,
 ) -> Result<runtime_ios::media::IosWork, AdmissionError> {
+    work_with_spec(c, cancel, registry, None)
+}
+
+fn work_with_spec(
+    c: &Case,
+    cancel: &CancelFlag,
+    registry: &ProviderRegistry,
+    spec: Option<&LoadSpec>,
+) -> Result<runtime_ios::media::IosWork, AdmissionError> {
     use runtime_ios::media::IosWork;
+    if c.recipe.is_some() && !runtime_ios::media::sampling::requires_recipe(&c.provider) {
+        return Err(AdmissionError::Refused(
+            "sampling recipe belongs to another provider".into(),
+        ));
+    }
     let (mode, required_kind) = mode_and_kind(c, registry)?;
+    let expected_roles =
+        carrier_role_counts(&mode, required_kind.is_some()).map_err(AdmissionError::Refused)?;
     let image = || synthetic_image(c.edge);
     let mut request = GenerationRequest {
         prompt: prompt(&c.provider),
@@ -419,53 +872,67 @@ fn work(
                 "A blue glass vase beside a window at sunset".into(),
             ];
         }
-        "reference" | "ip_adapter" => {
-            request.conditioning = vec![Conditioning::Reference {
-                image: image(),
-                strength: Some(0.6),
-            }]
-        }
-        // Inpainting carries its source image and the mask.
-        "mask" => {
-            request.conditioning = vec![
-                Conditioning::Reference {
-                    image: image(),
-                    strength: Some(0.6),
-                },
-                Conditioning::Mask { image: image() },
-            ]
-        }
-        // SDXL's optional ControlNet: its provisioned tile model.
-        "control" if required_kind.is_none() => {
-            request.conditioning = vec![Conditioning::Control {
-                image: image(),
-                kind: ControlKind::Other("tile".into()),
-                scale: Some(1.0),
-            }]
-        }
-        // A control-required route's control-only mode: the control image below.
-        "control" => {}
+        // Generation role construction below shares the family's source role partition.
+        "reference" | "ip_adapter" | "mask" | "control" => {}
         "restore" => {
-            return Ok(IosWork::Restore(TransformRequest {
+            let mut request = TransformRequest {
                 image: image(),
                 seed: Some(16774),
                 cancel: cancel.clone(),
                 steps: (c.steps > 0).then_some(c.steps),
                 ..Default::default()
-            }))
+            };
+            if let Some(token) = &c.recipe {
+                let spec = spec.ok_or_else(|| {
+                    AdmissionError::Refused(
+                        "restoration replay requires actual configured metadata".into(),
+                    )
+                })?;
+                runtime_ios::media::sampling::apply_transform_for_spec(spec, token, &mut request)
+                    .map_err(|error| AdmissionError::Refused(error.to_string()))?;
+            }
+            return Ok(IosWork::Restore(request));
         }
         "depth" => {
-            return Ok(IosWork::Depth(runtime_ios::iris_depth::DepthRequest {
+            let mut request = runtime_ios::iris_depth::DepthRequest {
                 image: image(),
                 cancel: cancel.clone(),
                 ..Default::default()
-            }))
+            };
+            if let Some(token) = &c.recipe {
+                let spec = spec.ok_or_else(|| {
+                    AdmissionError::Refused(
+                        "depth replay requires actual configured metadata".into(),
+                    )
+                })?;
+                runtime_ios::media::sampling::apply_depth_for_spec(spec, token, &mut request)
+                    .map_err(|error| AdmissionError::Refused(error.to_string()))?;
+            }
+            return Ok(IosWork::Depth(request));
         }
         other => {
             return Err(AdmissionError::Refused(format!(
                 "{other}: no request carrier for this registered task"
             )))
         }
+    }
+    if expected_roles.0 != 0 {
+        request.conditioning.push(Conditioning::Reference {
+            image: image(),
+            strength: Some(0.6),
+        });
+    }
+    if expected_roles.1 != 0 {
+        request
+            .conditioning
+            .push(Conditioning::Mask { image: image() });
+    }
+    if expected_roles.2 != 0 && required_kind.is_none() {
+        request.conditioning.push(Conditioning::Control {
+            image: image(),
+            kind: ControlKind::Other("tile".into()),
+            scale: Some(1.0),
+        });
     }
     if let Some(kind) = required_kind {
         request.conditioning.insert(
@@ -476,6 +943,29 @@ fn work(
                 scale: Some(1.0),
             },
         );
+    }
+    if let Some(token) = &c.recipe {
+        // Mode/conditioning carriers exist BEFORE compatibility validation. In particular, the
+        // provider's actual IP/Reference rules are not replaced by a planner-side guess.
+        if let Some(spec) = spec {
+            runtime_ios::media::sampling::apply_for_spec(&c.provider, spec, token, &mut request)
+                .map_err(|e| AdmissionError::Refused(e.to_string()))?;
+        } else {
+            runtime_ios::media::sampling::apply(&c.provider, token, &mut request).map_err(|e| {
+                AdmissionError::Refused(format!(
+                    "unresolved controls require actual configured metadata: {e}"
+                ))
+            })?;
+        }
+        // Steps remain the case's explicit validation axis; 0 requests actual factory defaults.
+        request.steps = (c.steps > 0).then_some(c.steps);
+        match spec {
+            Some(spec) => {
+                runtime_ios::media::sampling::resolve_for_spec(&c.provider, spec, &request)
+            }
+            None => runtime_ios::media::sampling::resolve(&c.provider, &request),
+        }
+        .map_err(|e| AdmissionError::Refused(e.to_string()))?;
     }
     Ok(IosWork::Generate(request))
 }
@@ -524,6 +1014,14 @@ fn load_spec(c: &Case, source: WeightsSource) -> Result<LoadSpec, String> {
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization),
     };
+    // Endpoint load form precedes contract lookup, selection, pricing, construction and identity.
+    // Ordinary provider defaults above remain unchanged outside this capture adapter.
+    let endpoint = if c.rung == 0 {
+        runtime_ios::media::evidence::AnchorKind::Resident
+    } else {
+        runtime_ios::media::evidence::AnchorKind::Optimized
+    };
+    endpoint.apply_load_form(&mut spec);
     spec.precision = tier(c).precision;
     spec.quantize = tier(c).quant;
     Ok(spec)
@@ -594,6 +1092,23 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             }
         }
     }
+    // Actual AdapterSpec transport is a separate typed list, never a named-component path hack
+    // or a caller-claimed memory class. Header normalization stays in the production provider.
+    let adapters = path.join("adapters.json");
+    if adapters.exists() {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&adapters)
+            .map_err(|e| e.to_string())?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 65536 {
+            return Err("typed adapter manifest exceeds 64 KiB".into());
+        }
+        spec.adapters =
+            runtime_ios::media::capture_adapters(&bytes, &path).map_err(|e| e.to_string())?;
+    }
     Ok(spec)
 }
 
@@ -615,10 +1130,21 @@ struct DeviceProvider<'a> {
     refusal_only: bool,
     /// An admitted case's price: demand, margin and its basis (measured anchor or derived).
     admitted: Option<Value>,
+    /// Actual sampler state shared only by the on-device capture, so its second baseline is taken
+    /// after real request carriers exist and before model/admit-load work.
+    telemetry: Option<Arc<Mutex<Extrema>>>,
 }
 impl DeviceProvider<'_> {
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
-        let spec = snapshot(&self.root, c)?;
+        let configured = snapshot(&self.root, c)?;
+        let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
+        let spec = runtime_ios::media::configured_load_form(
+            self.registry,
+            &c.provider,
+            &configured,
+            strategy,
+        )
+        .map_err(|error| classify(&mut self.refusal_kind, error))?;
         // A control / IP-Adapter case without its provisioned component would silently run as
         // another route: a provisioning failure, never admission or refusal evidence.
         if ((c.provider == "sdxl" && c.mode == "control")
@@ -647,7 +1173,6 @@ impl DeviceProvider<'_> {
             .memory_strategy_contract(&c.provider, &spec)
             .map_err(|e| e.to_string())?
             .ok_or("no provider memory contract")?;
-        let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
         if contract
             .capability(strategy)
             .is_none_or(|cap| !matches!(cap.support, MemoryStrategySupport::Implemented))
@@ -683,7 +1208,7 @@ impl DeviceProvider<'_> {
                     .collect::<Vec<_>>()
             )));
         };
-        let work = work(c, &self.cancel, self.registry).map_err(|e| {
+        let work = work_with_spec(c, &self.cancel, self.registry, Some(&spec)).map_err(|e| {
             if matches!(e, AdmissionError::Refused(_)) {
                 self.refusal_kind = Some("mode");
             }
@@ -775,7 +1300,7 @@ impl DeviceProvider<'_> {
                     else {
                         return Err("expected image output".into());
                     };
-                    let expected = request.prompt_batch.len().max(1);
+                    let expected = support::expected_generation_outputs(request)?;
                     if images.len() != expected {
                         return Err("wrong output count".into());
                     }
@@ -872,7 +1397,79 @@ impl Provider for DeviceProvider<'_> {
             return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
         }
         self.prepare(c)?;
+        // Provenance storage exists before the real counter boundary. Both capture ledger and
+        // SDK sidecar use THIS query, not a second arbitrarily timed footprint or budget guess.
+        let baseline_source =
+            String::from("TASK_VM_INFO.phys_footprint after prepare, before model admission/load");
+        let snapshot = if let Some(telemetry) = &self.telemetry {
+            let mut state = telemetry
+                .lock()
+                .map_err(|_| "capture sampler poisoned before model baseline")?;
+            let snapshot = footprint_snapshot();
+            state.start_model_coordinate(snapshot);
+            snapshot
+        } else {
+            footprint_snapshot()
+        };
+        let baseline = runtime_ios::media::IosMemoryBaseline {
+            domain: runtime_ios::media::IosMemoryDomain::ProcessGrowth,
+            coordinate: runtime_ios::media::IosMemoryCoordinate::BeforeModelLoad,
+            bytes: snapshot.current().ok_or_else(|| format!(
+                "before-model-load footprint unavailable: status={}, returned_words={}, requested_words={}",
+                snapshot.query_status, snapshot.returned_words, snapshot.requested_words))?,
+            source: baseline_source,
+        };
+        // This is an actual snapshot marker, NOT a declared/predicted solver evaluation.
+        if let Ok((current, peak)) = snapshot.complete_pair() {
+            runtime_ios::media::ios_quantum::diagnostic_metadata(
+                "ios_capture",
+                "before-model-load",
+                &[
+                    ("current_bytes", current),
+                    ("lifetime_highwater", peak),
+                    ("requested_words", u64::from(snapshot.requested_words)),
+                    ("returned_words", u64::from(snapshot.returned_words)),
+                ],
+            );
+        } else {
+            runtime_ios::media::ios_quantum::diagnostic_metadata(
+                "ios_capture",
+                "before-model-load",
+                &[
+                    ("query_valid", 0),
+                    ("returned_words", u64::from(snapshot.returned_words)),
+                ],
+            );
+        }
         let candidate = self.candidate.as_ref().ok_or("no exact work")?;
+        let (reference_count, mask_count, control_count) = match &candidate.work {
+            runtime_ios::media::IosWork::Generate(request) => (
+                u64::from(request.memory_reference_count()),
+                request
+                    .conditioning
+                    .iter()
+                    .filter(|item| matches!(item, Conditioning::Mask { .. }))
+                    .count() as u64,
+                request
+                    .conditioning
+                    .iter()
+                    .filter(|item| matches!(item, Conditioning::Control { .. }))
+                    .count() as u64,
+            ),
+            runtime_ios::media::IosWork::Restore(_) | runtime_ios::media::IosWork::Depth(_) => {
+                (0, 0, 0)
+            }
+        };
+        // Actual prepared carriers, not the case's mode label or caller-supplied evidence counts.
+        runtime_ios::media::ios_quantum::diagnostic_metadata(
+            "ios_capture",
+            "conditioning-roles",
+            &[
+                ("reference_count", reference_count),
+                ("mask_count", mask_count),
+                ("control_count", control_count),
+            ],
+        );
         if diagnostic {
             // CAPTURE: labelled, bounded per quantum, no evidence row consulted or created.
             let permit = runtime_ios::media::capture_permit(candidate)
@@ -885,14 +1482,15 @@ impl Provider for DeviceProvider<'_> {
         let now = runtime_ios::process_memory();
         let budget = runtime_ios::media::capacity_budget(
             u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB) << 20,
-            now.footprint.unwrap_or(0),
+            baseline.bytes,
             now.available,
         );
-        let admitted = runtime_ios::media::admit(
+        let admitted = runtime_ios::media::admit_with_baseline(
             self.registry,
             std::slice::from_ref(candidate),
             &runtime_ios::device_machine(),
             budget,
+            &baseline,
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if admitted.index() != 0 {
@@ -927,10 +1525,10 @@ impl Provider for DeviceProvider<'_> {
 // `phys_footprint` and the exact `ledger_phys_footprint_peak`, which only a REV3+ reply carries. A
 // shorter reply is an explicit `PeakReading::Unavailable`. Neither is RSS or MLX allocator
 // accounting. Unavailable readings stay null in the row, never zero evidence.
-fn phys_footprint() -> Option<(u64, support::PeakReading)> {
+fn footprint_snapshot() -> runtime_ios::media::evidence::KernelFootprintSnapshot {
     #[cfg(target_vendor = "apple")]
     {
-        support::read_footprint(|words, count| {
+        support::footprint_snapshot(|words, count| {
             #[allow(deprecated)]
             unsafe {
                 libc::task_info(libc::mach_task_self(), 22, words.as_mut_ptr().cast(), count)
@@ -939,8 +1537,30 @@ fn phys_footprint() -> Option<(u64, support::PeakReading)> {
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        None
+        use runtime_ios::media::evidence::{KernelFootprintMethod, KernelFootprintSnapshot};
+        KernelFootprintSnapshot {
+            method: KernelFootprintMethod::UnsupportedPlatform,
+            query_status: -1,
+            requested_words: support::TASK_VM_INFO_COUNT,
+            returned_words: 0,
+            current_required_words: support::TASK_VM_INFO_REV1_COUNT,
+            peak_required_words: support::TASK_VM_INFO_REV3_COUNT,
+            current_bytes: None,
+            lifetime_peak_bytes: None,
+        }
     }
+}
+fn phys_footprint() -> Option<(u64, support::PeakReading)> {
+    let snapshot = footprint_snapshot();
+    Some((
+        snapshot.current_bytes?,
+        snapshot.lifetime_peak_bytes.map_or(
+            support::PeakReading::Unavailable {
+                returned_words: snapshot.returned_words,
+            },
+            support::PeakReading::Read,
+        ),
+    ))
 }
 
 pub fn report(value: &str, diagnostic: bool) -> String {
@@ -951,7 +1571,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         // The catalog's DOMAIN (provider, route, mode): an anchor or any configuration the anchor
         // law derives. The selection is validated against the provider's declared space in
         // `prepare` (a token outside it is a typed strategy refusal).
-        if !surfaces(catalog.media()).iter().any(|s| {
+        if !surfaces(catalog.media())?.iter().any(|s| {
             s.provider == case.provider
                 && s.routes.contains(&case.route)
                 && s.modes.contains(&case.mode)
@@ -978,6 +1598,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             refused_quantum: None,
             refusal_only: std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"),
             admitted: None,
+            telemetry: None,
         };
         // Bind before any source inspection/load. This does not create footprint evidence.
         runtime_ios::bound_mlx_to_platform_limits()
@@ -988,18 +1609,32 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         mlx_rs::memory::reset_peak_memory();
         // The capture's starting footprint, before any of this case's loads: an evidence row's
         // demand is its peak minus this baseline (admission never credits a product's residents).
-        let baseline_footprint = phys_footprint().map(|(current, _)| current);
-        let start_peak = phys_footprint().and_then(|(_, peak)| match peak {
-            support::PeakReading::Read(peak) => Some(peak),
-            support::PeakReading::Unavailable { .. } => None,
-        });
+        let before_request_snapshot = footprint_snapshot();
+        let baseline_footprint = before_request_snapshot.current();
+        let start_peak = before_request_snapshot
+            .complete_pair()
+            .ok()
+            .map(|(_, peak)| peak);
         // Every quantum boundary reads the kernel lifetime peak, attributed to the phase the
         // provider says that quantum runs in: the anchor's per-phase split.
-        let marks = Arc::new(Mutex::new(Vec::<support::Mark>::new()));
+        let marks = Arc::new(Mutex::new(support::CaptureMarks::default()));
         let sink = Arc::clone(&marks);
+        let listener_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = Arc::clone(&listener_failed);
         let provider = case.provider.clone();
         runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
             let (label, opens, scratch) = match mark {
+                runtime_ios::media::ios_quantum::QuantumMark::Metadata {
+                    provider,
+                    kind,
+                    fields,
+                } => {
+                    match sink.lock() {
+                        Ok(mut captured) => captured.metadata(provider, kind, fields),
+                        Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
+                    }
+                    return;
+                }
                 runtime_ios::media::ios_quantum::QuantumMark::Checked { label, scratch } => {
                     (label, true, scratch)
                 }
@@ -1007,20 +1642,40 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                     (label, false, 0)
                 }
             };
-            if let Some((current, support::PeakReading::Read(lifetime_peak))) = phys_footprint() {
-                if let Ok(mut marks) = sink.lock() {
-                    marks.push(support::Mark {
-                        phase: runtime_ios::media::pricing::quantum_phase(&provider, label),
-                        opens,
-                        lifetime_peak,
-                        label: label.to_string(),
-                        scratch,
-                        current,
-                    });
+            let reading = phys_footprint();
+            match sink.lock() {
+                Ok(mut captured) => {
+                    let phase = runtime_ios::media::pricing::quantum_phase(&provider, label);
+                    // Check/context occurrence is real even when its footprint query failed.
+                    if opens {
+                        captured.checked(phase, label);
+                    }
+                    match reading {
+                        Some((current, support::PeakReading::Read(lifetime_peak))) => {
+                            let preceding_sampling_mark =
+                                if phase == Some(mlx_gen::ios_pricing::IosPhase::Denoise) {
+                                    captured.preceding_sampling_mark
+                                } else {
+                                    None
+                                };
+                            captured.marks.push(support::Mark {
+                                phase,
+                                opens,
+                                lifetime_peak,
+                                label: label.to_string(),
+                                scratch,
+                                current,
+                                preceding_sampling_mark,
+                            });
+                        }
+                        _ => captured.quantum_query_gaps += 1,
+                    }
                 }
+                Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
             }
         })));
         let sampler = Sampler::start();
+        adapter.telemetry = Some(Arc::clone(&sampler.extrema));
         let deadline = Deadline::start(
             adapter.cancel.clone(),
             adapter.deadline.saturating_duration_since(Instant::now()),
@@ -1033,8 +1688,85 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         drop(deadline);
         runtime_ios::media::ios_quantum::set_quantum_listener(None);
         let e = sampler.finish()?;
-        let phase_peaks = match (start_peak, e.lifetime_peak, marks.lock()) {
-            (Some(start), Some(end), Ok(marks)) => support::phase_peaks(start, &marks, end)
+        let ending_snapshot = footprint_snapshot();
+        if listener_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("capture observation listener failed".into());
+        }
+        let captured = marks
+            .lock()
+            .map_err(|_| "capture observation collector was poisoned")?;
+        captured.sampling.validate()?;
+        captured.quantum.validate(&captured.sampling)?;
+        let observed_current_peak = before_request_snapshot
+            .current()
+            .into_iter()
+            .chain(e.footprint)
+            .chain(ending_snapshot.current())
+            .chain(captured.marks.iter().map(|mark| mark.current))
+            .max();
+        let model_marks = captured
+            .model_mark_start
+            .and_then(|start| captured.marks.get(start..));
+        let observed_model_current_peak = e
+            .before_model_load
+            .and_then(|snapshot| snapshot.current())
+            .into_iter()
+            .chain(e.model_footprint)
+            .chain(ending_snapshot.current())
+            .chain(model_marks.into_iter().flatten().map(|mark| mark.current))
+            .max();
+        let valid_kernel_queries = e.valid_queries
+            + captured.marks.len() as u64
+            + u64::from(before_request_snapshot.complete_pair().is_ok())
+            + u64::from(ending_snapshot.complete_pair().is_ok());
+        let valid_model_kernel_queries = e.valid_model_queries
+            + model_marks.map_or(0, |marks| marks.len() as u64)
+            + u64::from(ending_snapshot.complete_pair().is_ok());
+        let growth = |start: Option<runtime_ios::media::evidence::KernelFootprintSnapshot>,
+                      current_peak: Option<u64>,
+                      queries|
+         -> Result<mlx_gen::ios_anchor_law::KernelGrowth, String> {
+            let (current, old_peak) = start
+                .ok_or("starting kernel snapshot missing")?
+                .complete_pair()?;
+            let (_, end_peak) = ending_snapshot.complete_pair()?;
+            mlx_gen::ios_anchor_law::KernelGrowth::from_queries(
+                current,
+                old_peak,
+                end_peak,
+                current_peak.ok_or("observed current footprint missing")?,
+                queries,
+            )
+            .map_err(|e| e.to_string())
+        };
+        let original_growth = growth(
+            Some(before_request_snapshot),
+            observed_current_peak,
+            valid_kernel_queries,
+        );
+        let sdk_growth = growth(
+            e.before_model_load,
+            observed_model_current_peak,
+            valid_model_kernel_queries,
+        );
+        let sampling_required = adapter.candidate.as_ref().is_some_and(|candidate| {
+            matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
+        });
+        let sampling_missing = sampling_required && !captured.sampling.has_execution_observation();
+        let quantum_missing = sampling_required && captured.quantum.checks.is_empty();
+        if matches!(status, Status::Successful | Status::DiagnosticSuccess)
+            && (sampling_missing
+                || quantum_missing
+                || captured.sampling.truncated
+                || captured.quantum.truncated)
+        {
+            status = Status::DiagnosticFailure;
+            reason = format!("actual observations missing_sampling={sampling_missing}, missing_quantum={quantum_missing}, sampling_truncated={}, quantum_truncated={}, dropped_metadata={}, dropped_checks={}, malformed={}; not class-coverage evidence",
+                captured.sampling.truncated, captured.quantum.truncated, captured.sampling.dropped_marks,
+                captured.quantum.dropped_checks, captured.sampling.malformed_marks);
+        }
+        let phase_peaks = match (start_peak, e.lifetime_peak) {
+            (Some(start), Some(end)) => support::phase_peaks(start, &captured.marks, end)
                 .into_iter()
                 .map(|(phase, (peak, exact))| {
                     (
@@ -1046,38 +1778,94 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             _ => serde_json::Map::new(),
         };
         // The per-formula DEVICE calibration: each quantum's priced scratch vs its observed growth.
-        let quanta = match (e.lifetime_peak, marks.lock()) {
-            (Some(end), Ok(marks)) => support::quantum_observations(&marks, end)
+        let quanta = match e.lifetime_peak {
+            Some(end) => support::quantum_observations(&captured.marks, end)
                 .into_iter()
                 .map(|(label, o)| {
-                    (label, json!({"priced_scratch_bytes": o.priced, "observed_bytes": o.observed, "exact": o.exact}))
+                    (label, json!({"priced_scratch_bytes": o.priced, "observed_bytes": o.observed, "exact": o.exact, "preceding_sampling_mark": o.preceding_sampling_mark}))
                 })
                 .collect::<serde_json::Map<_, _>>(),
             _ => serde_json::Map::new(),
         };
-        let (status, reason) = if status.production_success()
-            && (e.footprint.is_none() || e.min_headroom_mib.is_none() || e.lifetime_peak.is_none())
+        let (status, reason) = if matches!(status, Status::Successful | Status::DiagnosticSuccess)
+            && (e.footprint.is_none()
+                || e.min_headroom_mib.is_none()
+                || e.lifetime_peak.is_none()
+                || before_request_snapshot.complete_pair().is_err()
+                || ending_snapshot.complete_pair().is_err()
+                || e.before_model_load
+                    .is_none_or(|snapshot| snapshot.complete_pair().is_err())
+                || captured.model_mark_start.is_none()
+                || original_growth.is_err()
+                || sdk_growth.is_err())
         {
             (Status::DiagnosticFailure, "completed but process footprint/headroom telemetry unavailable; not production evidence".into())
         } else {
             (status, reason)
         };
+        let sampling_identity = adapter
+            .evidence_key
+            .as_ref()
+            .and_then(|key| key.sampling_recipe.as_deref())
+            .map(|token| {
+                runtime_ios::media::sampling::from_token(&case.provider, token)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        if sampling_identity.is_none()
+            && adapter.candidate.as_ref().is_some_and(|candidate| {
+                matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
+            })
+        {
+            return Err(
+                "prepared generation capture is missing its resolved sampling identity".into(),
+            );
+        }
+        let resolved_steps = sampling_identity
+            .as_ref()
+            .map_or(case.steps, |identity| identity.steps());
+        let expected_render_count = adapter
+            .candidate
+            .as_ref()
+            .map(|candidate| match &candidate.work {
+                runtime_ios::media::IosWork::Generate(request) => {
+                    support::expected_generation_outputs(request)
+                }
+                _ => Ok(1),
+            })
+            .transpose()?;
         let mut row = json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
-            "baseline_phys_footprint_bytes":baseline_footprint, "phase_peaks":phase_peaks, "quanta":quanta, "steps":case.steps,
+            "baseline_phys_footprint_bytes":baseline_footprint,
+            "before_request_snapshot":before_request_snapshot, "before_model_load_snapshot":e.before_model_load,
+            "ending_snapshot":ending_snapshot, "observed_current_peak_bytes":observed_current_peak,
+            "observed_model_current_peak_bytes":observed_model_current_peak,
+            "valid_kernel_queries":valid_kernel_queries, "valid_model_kernel_queries":valid_model_kernel_queries,
+            "physical_growth_bounds":{"before_request_construction":support::growth_report(&original_growth),
+                "before_model_load":support::growth_report(&sdk_growth)},
+            "phase_attribution_gaps":captured.quantum_query_gaps, "phase_peaks":phase_peaks, "quanta":quanta, "steps":resolved_steps, "requested_steps":case.steps,
+            "load_form":adapter.candidate.as_ref().map(|c| json!({"offload_policy":format!("{:?}",c.spec.offload_policy),"load_shape":format!("{:?}",c.spec.load_shape)})),
             "anchor_selection":adapter.candidate.as_ref().map(|c| runtime_ios::media::evidence::AnchorSelection::from_parts(c.context.selection.strategy, &c.context.selection.parameters)),
+            "sampling_recipe":sampling_identity.as_ref().map(|identity| identity.provenance()),
+            "sampling_allocation_class":sampling_identity.as_ref().map(|identity| identity.allocation_class()),
+            "sampling_metadata_required":sampling_required, "sampling_metadata_missing":sampling_missing,
+            "sampling_coverage":if captured.sampling.total_marks > 0 { Some(&captured.sampling) } else { None },
+            "quantum_coverage":Some(&captured.quantum), "quantum_query_gaps":captured.quantum_query_gaps,
             "admitted":adapter.admitted,
             "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,
             "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),
             "refusal_kind":adapter.refusal_kind, "refusal_only":adapter.refusal_only,
-            "expected_render_count":adapter.candidate.as_ref().map(|c| match &c.work { runtime_ios::media::IosWork::Generate(r) => r.prompt_batch.len().max(1), _ => 1 }),
+            "expected_render_count":expected_render_count,
             "build_sha":option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
             "entitlement":std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok(),
             "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() });
         e.write(&mut row);
+        // The final same-task kernel query, not a sampled lower/current value, is the run upper.
+        row["kernel_lifetime_phys_footprint_peak_bytes"] =
+            json!(ending_snapshot.lifetime_peak_bytes);
         Ok(row)
     };
     let result = if value == primitive::PROBE_KEY {
@@ -1127,10 +1915,23 @@ pub(super) struct Extrema {
     pub footprint: Option<u64>,
     pub min_headroom_mib: Option<f64>,
     pub lifetime_peak: Option<u64>,
+    pub before_model_load: Option<runtime_ios::media::evidence::KernelFootprintSnapshot>,
+    pub model_footprint: Option<u64>,
+    pub valid_queries: u64,
+    pub valid_model_queries: u64,
     /// The kernel's reply word count when it lacked the lifetime peak (below REV3).
     pub peak_unavailable_words: Option<u32>,
 }
 impl Extrema {
+    fn start_model_coordinate(
+        &mut self,
+        snapshot: runtime_ios::media::evidence::KernelFootprintSnapshot,
+    ) {
+        self.before_model_load = Some(snapshot);
+        self.model_footprint = snapshot.current();
+        self.valid_model_queries = u64::from(snapshot.complete_pair().is_ok());
+    }
+
     fn sample(&mut self) {
         let (active, cache) = (
             mlx_rs::memory::get_active_memory(),
@@ -1139,16 +1940,31 @@ impl Extrema {
         self.active = self.active.max(active);
         self.cache = self.cache.max(cache);
         self.combined = self.combined.max(active + cache);
-        if let Some((current, peak)) = phys_footprint() {
-            self.footprint = Some(self.footprint.unwrap_or(0).max(current));
-            match peak {
-                support::PeakReading::Read(peak) => {
-                    self.lifetime_peak = Some(self.lifetime_peak.unwrap_or(0).max(peak));
-                }
-                support::PeakReading::Unavailable { returned_words } => {
-                    self.peak_unavailable_words = Some(returned_words);
+        let snapshot = footprint_snapshot();
+        if let Some(current) = snapshot.current() {
+            self.footprint = Some(
+                self.footprint
+                    .map_or(current, |previous| previous.max(current)),
+            );
+            if self.before_model_load.is_some() {
+                self.model_footprint = Some(
+                    self.model_footprint
+                        .map_or(current, |previous| previous.max(current)),
+                );
+            }
+        }
+        match snapshot.complete_pair() {
+            Ok((_, peak)) => {
+                self.lifetime_peak = Some(
+                    self.lifetime_peak
+                        .map_or(peak, |previous| previous.max(peak)),
+                );
+                self.valid_queries += 1;
+                if self.before_model_load.is_some() {
+                    self.valid_model_queries += 1;
                 }
             }
+            Err(_) => self.peak_unavailable_words = Some(snapshot.returned_words),
         }
         if let Some(a) = super::available_memory_mib() {
             self.min_headroom_mib = Some(self.min_headroom_mib.unwrap_or(a).min(a));

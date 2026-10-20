@@ -215,25 +215,19 @@ pub fn artifact_layout_digest(spec: &LoadSpec) -> Result<[u8; 32]> {
 /// text encoder and named components), from safetensors HEADERS alone: per component directory and
 /// tensor name, its dtype and shape (so packing — `.scales`/`.biases` tensors and packed shapes —
 /// is read from the headers, never from a config marker), plus the load settings that shape memory
-/// (precision, requested tier, offload policy, load shape). No tensor value, no config content, no
+/// (precision, requested tier). Endpoint policy and load shape belong to exact artifact/execution
+/// identity, NOT the shared architecture family. No tensor value, no config content, no
 /// file name, no path, no route. Two checkpoints of one architecture (fine-tunes sharing every
 /// tensor name, shape and dtype) share it; a distilled U-Net or another VAE that differs in any
 /// header does not.
 ///
-/// Mode-added components — a ControlNet, an IP-Adapter, adapter overlays — are deliberately NOT
-/// part of it: they are component-additive and priced by the counted formulas on top of the
-/// family's anchor (see `crate::anchor`), so a request that carries one still belongs to the base
-/// architecture's family.
+/// Configured ControlNet/IP/adapter overlays stay outside this BASE digest. Their actual
+/// provider-normalized graph is a separate configured variant in exact and family identity;
+/// exclusion here never grants component-additivity or a native/process transfer certificate.
 pub fn architecture_digest(spec: &LoadSpec) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"ios-architecture-v1");
-    digest.update(
-        format!(
-            "{:?}|{:?}|{:?}|{:?}",
-            spec.precision, spec.quantize, spec.offload_policy, spec.load_shape
-        )
-        .as_bytes(),
-    );
+    digest.update(format!("{:?}|{:?}", spec.precision, spec.quantize).as_bytes());
     let mut roles: Vec<(String, &WeightsSource)> = vec![("weights".into(), &spec.weights)];
     if let Some(s) = &spec.text_encoder {
         roles.push(("text_encoder".into(), s));
@@ -294,6 +288,17 @@ pub fn architecture_digest(spec: &LoadSpec) -> Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
+/// Filesystem-safe capture artifact identity. Keep legacy eight-field case names unchanged;
+/// versioned recipe-bearing cases use a digest rather than an unbounded JSON-hex component.
+/// The full replayable case remains in wire metadata and the evidence key, never replaced by this.
+pub fn capture_artifact_stem(case: &str) -> String {
+    if case.split('/').count() == 8 {
+        case.replace('/', "-")
+    } else {
+        format!("recipe-{}", hex(&Sha256::digest(case.as_bytes())))
+    }
+}
+
 /// Lowercase hex of a digest.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -302,6 +307,29 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_recipe_artifact_paths_are_bounded_and_keep_full_wire_identity() {
+        let legacy = "sdxl/sdxl/q4/1024/text/4/base/3";
+        assert_eq!(capture_artifact_stem(legacy), legacy.replace('/', "-"));
+        let key = format!("{legacy}/sdxl1-{}", "ab".repeat(1024));
+        let stem = capture_artifact_stem(&key);
+        assert_eq!(
+            stem,
+            format!("recipe-{}", hex(&Sha256::digest(key.as_bytes())))
+        );
+        assert!(stem.len() < 128);
+        assert_ne!(stem, capture_artifact_stem(&format!("{key}ab")));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("campaign-{stem}-0.png"));
+        std::fs::write(&path, b"path-only fixture").unwrap();
+        assert!(path.is_file());
+        let metadata = dir.path().join("report.json");
+        std::fs::write(&metadata, serde_json::json!({"case": key}).to_string()).unwrap();
+        let read: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
+        assert_eq!(read["case"], key);
+    }
 
     /// The architecture digest is the headers' names, shapes, dtypes (and so packing) only: two
     /// installs of fine-tunes of one architecture — other directory, other file names, other
@@ -345,6 +373,19 @@ mod tests {
             artifact_layout_digest(&LoadSpec::new(WeightsSource::Dir(root.to_owned()))).unwrap()
         };
         assert_ne!(layout(base.path()), layout(tune.path()));
+        // The two endpoint load forms are one architecture family, but distinct exact identities.
+        let mut resident = LoadSpec::new(WeightsSource::Dir(base.path().to_owned()));
+        crate::evidence::AnchorKind::Resident.apply_load_form(&mut resident);
+        let mut optimized = resident.clone();
+        crate::evidence::AnchorKind::Optimized.apply_load_form(&mut optimized);
+        assert_eq!(
+            architecture_digest(&resident).unwrap(),
+            architecture_digest(&optimized).unwrap()
+        );
+        assert_ne!(
+            artifact_layout_digest(&resident).unwrap(),
+            artifact_layout_digest(&optimized).unwrap()
+        );
         // A mode-added component does not change the base architecture.
         let control = make("controlnet.safetensors", "F16", 1, "{}");
         let mut with_control = LoadSpec::new(WeightsSource::Dir(base.path().to_owned()));
@@ -449,6 +490,110 @@ mod tests {
         assert!(
             !matches!(artifact_layout_digest(&spec), Err(Error::Unsupported(_))),
             "a malformed shard is a failure, not an artifact refusal"
+        );
+    }
+}
+
+/// Hash only the actual provider's normalized configured graph, separately from base architecture.
+/// Exporters exclude paths/payloads and continuous nonzero scale; discrete inactive/format/dtype/
+/// reconstruction choices remain. This is identity, never a component-additivity/physical proof.
+pub fn configured_variant_digest(provider: &str, spec: &LoadSpec) -> Result<Option<[u8; 32]>> {
+    let facts = match provider {
+        "iris_3b" => mlx_gen_iris::adapters::generation_adapter_semantic_facts(spec)?,
+        crate::sdxl::SDXL_ID => mlx_gen_sdxl::ios_pricing::configured_overlay_semantic_facts(spec)?,
+        crate::anima::ANIMA_TURBO_ID => {
+            mlx_gen_anima::ios_pricing::configured_overlay_semantic_facts(spec)?
+        }
+        id if crate::zimage::is_z_image(id) => {
+            mlx_gen_z_image::ios_pricing::configured_overlay_semantic_facts_for(id, spec)?
+        }
+        _ if spec.adapters.is_empty()
+            && spec.control.is_none()
+            && spec.extra_controls.is_empty()
+            && spec.ip_adapter.is_none()
+            && spec.pid.is_none()
+            && spec.identity.is_none() =>
+        {
+            return Ok(None)
+        }
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "{provider}: configured semantic exporter unavailable"
+            )))
+        }
+    };
+    // Only the provider knows whether its configured graph is empty. In particular, an empty
+    // set of LoadSpec overlay slots does not erase Iris's intrinsic/default graph semantics.
+    if facts.is_null() {
+        return Ok(None);
+    }
+    semantic_variant_digest(facts).map(Some)
+}
+
+fn semantic_variant_digest(mut facts: serde_json::Value) -> Result<[u8; 32]> {
+    fn canonical(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.sort_keys();
+                for value in map.values_mut() {
+                    canonical(value);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    canonical(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    struct HashWriter<'a>(&'a mut Sha256);
+    impl std::io::Write for HashWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    canonical(&mut facts);
+    let mut digest = Sha256::new();
+    digest.update(b"ios-configured-semantic-variant\0");
+    // No whole Debug/JSON string or payload clone at the admission boundary.
+    serde_json::to_writer(HashWriter(&mut digest), &facts)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    Ok(digest.finalize().into())
+}
+
+#[cfg(test)]
+mod semantic_variant_tests {
+    use super::*;
+    #[test]
+    fn configured_semantics_hash_is_canonical_but_preserves_graph_and_stack_order() {
+        let one: serde_json::Value =
+            serde_json::from_str(r#"{"stack":[{"dtype":"f16","shape":[4,2]}],"inactive":false}"#)
+                .unwrap();
+        let reordered: serde_json::Value =
+            serde_json::from_str(r#"{"inactive":false,"stack":[{"shape":[4,2],"dtype":"f16"}]}"#)
+                .unwrap();
+        assert_eq!(
+            semantic_variant_digest(one.clone()).unwrap(),
+            semantic_variant_digest(reordered).unwrap()
+        );
+        for changed in [
+            serde_json::json!({"stack":[{"dtype":"f32","shape":[4,2]}],"inactive":false}),
+            serde_json::json!({"stack":[{"dtype":"f16","shape":[4,3]}],"inactive":false}),
+            serde_json::json!({"stack":[{"dtype":"f16","shape":[4,2]}],"inactive":true}),
+        ] {
+            assert_ne!(
+                semantic_variant_digest(one.clone()).unwrap(),
+                semantic_variant_digest(changed).unwrap()
+            );
+        }
+        assert_ne!(
+            semantic_variant_digest(serde_json::json!({"stack":["a","b"]})).unwrap(),
+            semantic_variant_digest(serde_json::json!({"stack":["b","a"]})).unwrap()
         );
     }
 }

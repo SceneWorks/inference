@@ -37,6 +37,20 @@ fn cpu_child(name: &str) -> bool {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         assert!(crate::test_metal_guard::forbid_metal());
         assert!(crate::test_metal_guard::metal_forbidden());
+        assert_eq!(
+            mlx_rs::Device::try_default().unwrap(),
+            mlx_rs::Device::cpu()
+        );
+        // Pin the native stream too, before any fixture is built (not only inside diagnostic
+        // scopes). The handle is retained by MLX's default-stream table.
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         return true;
     }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -51,6 +65,141 @@ fn cpu_child(name: &str) -> bool {
         .unwrap();
     assert!(status.success(), "CPU child for {name} failed");
     false
+}
+
+/// Completion is armed only at the actual end of each admitted test body. Because this guard is
+/// bound before fixture locals, it drops last: after fixtures/Arrays, then CPU stream completion.
+/// Panic or an unarmed early return never produces a success marker.
+struct CpuBodyCompletion {
+    body_completed: bool,
+}
+
+impl Drop for CpuBodyCompletion {
+    fn drop(&mut self) {
+        if self.body_completed && !std::thread::panicking() {
+            assert_eq!(
+                unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+                0,
+                "CPU body completion stream synchronization failed"
+            );
+            std::fs::write(
+                std::env::var("SDXL_IOS_QUANTUM_CPU_BODY_DONE")
+                    .expect("CPU body completion marker path"),
+                b"ok",
+            )
+            .expect("write CPU normal-body completion marker");
+        }
+    }
+}
+
+/// Six admitted regression bodies opt into completion evidence without altering unrelated tests.
+/// The existing helper installs its unchanged device/stream readbacks and fatal Metal trap
+/// before this returns a guard and before any fixture can be constructed.
+fn completed_cpu_child(name: &str) -> Option<CpuBodyCompletion> {
+    if std::env::var_os("SDXL_IOS_QUANTUM_CPU_CHILD").is_some() {
+        assert!(cpu_child(name));
+        return Some(CpuBodyCompletion { body_completed: false });
+    }
+    let done = tempfile::tempdir().unwrap();
+    let marker = done.path().join("done");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("quantum_tests::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("SDXL_IOS_QUANTUM_CPU_CHILD", "1")
+        .env("SDXL_IOS_QUANTUM_CPU_BODY_DONE", &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "CPU child for {name} failed");
+    assert_eq!(
+        std::fs::read(&marker).expect("CPU child ran no completed normal body"),
+        b"ok"
+    );
+    None
+}
+
+/// Header-only target topology must equal the ACTUAL constructor's target surfaces, including
+/// optional time projections/shortcuts. This is a native CPU construction test, not backing proof.
+#[test]
+fn configured_header_targets_match_actual_constructor_surfaces() {
+    if !cpu_child("configured_header_targets_match_actual_constructor_surfaces") {
+        return;
+    }
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader};
+    for optional in [true, false] {
+        let cfg = crate::test_support::tiny_unet_config();
+        let mut weights = crate::test_support::tiny_unet_weights_for(&cfg, 71).unwrap();
+        if !optional {
+            let keys: Vec<_> = weights
+                .keys()
+                .filter(|key| key.contains(".time_emb_proj.") || key.contains(".conv_shortcut."))
+                .map(str::to_owned)
+                .collect();
+            for key in keys {
+                weights.remove(&key);
+            }
+        }
+        let headers: Vec<_> = weights
+            .keys()
+            .map(|name| {
+                let array = weights.require(name).unwrap();
+                let dtype = match array.dtype() {
+                    Dtype::Float32 => Stored::F32,
+                    Dtype::Float16 => Stored::F16,
+                    Dtype::Bfloat16 => Stored::BF16,
+                    other => panic!("unexpected tiny fixture dtype {other:?}"),
+                };
+                SafetensorsTensorHeader {
+                    name: name.to_owned(),
+                    dtype,
+                    shape: array.shape().iter().map(|d| *d as usize).collect(),
+                    data_bytes: array.size() as u64 * crate::quantum::dtype_bytes(array.dtype()),
+                }
+            })
+            .collect();
+        let actual = UNet2DConditionModel::from_weights(&weights, &cfg).unwrap();
+        let (vendored, complete, convs) =
+            crate::unet::adapter_target_paths_from_headers(&cfg, &headers);
+        assert_eq!(
+            vendored,
+            actual.lora_target_paths(),
+            "header/runtime vendored topology optional={optional}"
+        );
+        assert_eq!(
+            complete,
+            actual.lora_target_paths_complete(),
+            "header/runtime complete topology optional={optional}"
+        );
+        assert_eq!(
+            convs,
+            actual.conv_target_paths(),
+            "header/runtime convolution topology optional={optional}"
+        );
+    }
+}
+
+/// Safety is a hard lower bound; a conservative ratio above the reporting threshold is not a
+/// safety failure (epic 16774). Keep the measured figures visible without weakening the bound.
+fn assert_tracks_measured(label: &str, formula: u64, measured: u64, report_ratio: f64) {
+    assert!(
+        formula >= measured,
+        "{label}: formula {formula} B is BELOW the measured peak {measured} B"
+    );
+    if formula as f64 > report_ratio * measured as f64 {
+        eprintln!("OVERPRICE {label}: formula {formula} B / measured {measured} B exceeds {report_ratio}x (report only)");
+    }
+}
+
+#[test]
+fn measured_lower_bound_is_hard_and_overpricing_is_report_only() {
+    assert_tracks_measured("report-only control", 151, 100, 1.5);
+    assert!(std::panic::catch_unwind(|| {
+        assert_tracks_measured("underpriced mutation", 99, 100, 1.5)
+    })
+    .is_err());
 }
 
 /// A quantum event with the (per-run) stream index dropped, so two runs compare.
@@ -1413,13 +1562,25 @@ fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
         return;
     }
     use mlx_gen::gen_core::CfgBatching;
-    let unet = crate::test_support::tiny_unet(7).unwrap();
-    let euler =
-        crate::sampler::EulerSampler::new(&crate::config::DiffusionConfig::sdxl_base(), true)
-            .unwrap();
+    // This test isolates guard/evaluation identity, not the separately-proven iOS boundary
+    // quantization. Match production compute dtypes so that those casts are identities here.
+    // actual_noised_unet_input_is_cast_at_every_forward retains the f32-state counterexample;
+    // the full-request RGB matrix owns the unchanged numerical cast tolerances.
+    let mut unet = crate::test_support::tiny_unet(7).unwrap();
+    unet.cast_weights(crate::model::DTYPE).unwrap();
+    let euler = crate::sampler::EulerSampler::new_with_dtype(
+        &crate::config::DiffusionConfig::sdxl_base(),
+        true,
+        crate::model::DTYPE,
+    )
+    .unwrap();
     let sampler = crate::sampler::AncestralEuler::new(&euler, 3, 1000.0).unwrap();
     let (_, ctx, pooled, ids) = unet_inputs(2, 8, 8);
-    let latents = rnd(&[1, 8, 8, 4], 21, 1.0);
+    let ctx = ctx.as_dtype(crate::model::DTYPE).unwrap();
+    let pooled = pooled.as_dtype(crate::model::DTYPE).unwrap();
+    let latents = rnd(&[1, 8, 8, 4], 21, 1.0)
+        .as_dtype(crate::model::DTYPE)
+        .unwrap();
     latents.eval().unwrap();
     let cancel = mlx_gen::CancelFlag::default();
     let (unet, sampler, cancel) = (&unet, &sampler, &cancel);
@@ -1457,22 +1618,92 @@ fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
         assert!(steps
             .iter()
             .all(|s| *s == sampler_step_bytes(&latents, false)));
+        // At tiny f16 geometries the sequential path's pair-side k/v and page slack can
+        // outweigh its one-row activation savings. Prove the actual row geometry, not an
+        // unsupported ordering between aggregate budgets.
+        let sequential = !batching.is_batched();
+        let batch = if sequential { 1 } else { 2 };
+        let x = shaped(&[batch, 8, 8, 4], crate::model::DTYPE).unwrap();
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED
+            .with_cfg_batching(batching)
+            .with_cfg_row(sequential.then_some(0));
+        let mut predicted = Vec::new();
+        unet.price_forward(&x, ctx, pooled, None, None, plan, &mut predicted)
+            .unwrap();
+        let blocks: Vec<_> = predicted
+            .iter()
+            .filter(|(label, _)| *label == TRANSFORMER_BLOCK)
+            .map(|(_, scratch)| *scratch)
+            .collect();
+        assert!(!blocks.is_empty());
+        let forwards = 3 * if sequential { 2 } else { 1 };
+        assert_eq!(checked(&events, TRANSFORMER_BLOCK), blocks.repeat(forwards),
+            "{batching:?}: every actual block is priced at its explicit {batch}-row forward geometry");
+        assert_eq!(
+            checked(&events, UNET_STEM),
+            vec![unet.stem_scratch_for_test(&x, ctx); forwards],
+            "{batching:?}: actual stem input has exactly {batch} latent rows"
+        );
     }
-    let blocks = |batching| checked(&observe(PLENTY, run(batching)).1, TRANSFORMER_BLOCK);
-    let (batched, sequential) = (
-        blocks(CfgBatching::Batched),
-        blocks(CfgBatching::Sequential),
+}
+
+/// The VAE-boundary cast alone is insufficient: adding f32 noise promotes sampler state again.
+/// Every actual noised/scaled U-Net input must still enter its stem at the compute dtype. Guard
+/// scratch observes the actual forward input, so removing ONLY the forward-boundary cast fails
+/// this test even when the init-latent cast remains.
+#[test]
+fn actual_noised_unet_input_is_cast_at_every_forward() {
+    if !cpu_child("actual_noised_unet_input_is_cast_at_every_forward") {
+        return;
+    }
+    let mut unet = crate::test_support::tiny_unet(7).unwrap();
+    unet.cast_weights(crate::model::DTYPE).unwrap();
+    let (pair, ctx, pooled, ids) = unet_inputs(2, 8, 8);
+    let ctx = ctx.as_dtype(crate::model::DTYPE).unwrap();
+    let pooled = pooled.as_dtype(crate::model::DTYPE).unwrap();
+    let narrow = pair.as_dtype(crate::model::DTYPE).unwrap();
+    let expected = unet.stem_scratch_for_test(&narrow, &ctx);
+    assert_ne!(
+        expected,
+        unet.stem_scratch_for_test(&pair, &ctx),
+        "the fixture must distinguish f32 from compute-dtype stem inputs"
     );
+    let euler = crate::sampler::EulerSampler::new_with_dtype(
+        &crate::config::DiffusionConfig::sdxl_base(),
+        true,
+        crate::model::DTYPE,
+    )
+    .unwrap();
+    let sampler = crate::sampler::AncestralEuler::new(&euler, 2, 800.0).unwrap();
+    let d = crate::pipeline::Denoiser::with_plan(
+        &unet,
+        &sampler,
+        crate::plan::SdxlForwardPlan::UNBOUNDED,
+    );
+    let init = rnd(&[1, 8, 8, 4], 4, 1.0)
+        .as_dtype(crate::model::DTYPE)
+        .unwrap();
+    let noise = rnd(init.shape(), 5, 1.0);
+    let noised = euler.add_noise_with(&init, &noise, 800.0).unwrap();
+    assert_eq!(noised.dtype(), Dtype::Float32);
+    let (out, events) = observe(PLENTY, || {
+        crate::pipeline::denoise(
+            &d,
+            noised,
+            &ctx,
+            &pooled,
+            &ids,
+            5.0,
+            &mlx_gen::CancelFlag::default(),
+            &mut |_| {},
+        )
+    });
     assert_eq!(
-        sequential.len(),
-        2 * batched.len(),
-        "two halves per guided step"
+        out.unwrap().dtype(),
+        Dtype::Float32,
+        "forward casts must not narrow the persistent sampler state"
     );
-    // A sequential half prices one latent row; the batched forward two.
-    assert!(
-        sequential.iter().max() < batched.iter().min(),
-        "sequential {sequential:?} vs batched {batched:?}"
-    );
+    assert_eq!(checked(&events, UNET_STEM), vec![expected; 2]);
 }
 
 /// Item 3 (sc-26270 round 3): the ControlNet branch keeps the request's bounded attention plan, so
@@ -1704,16 +1935,16 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
 // ---------------------------------------------------------------------------------------------
 // Measured-peak proofs (sc-26270 round 3): every counted SDXL quantum price, evaluated with the
 // CPU backend's kernel transients, is at least MLX's measured CPU peak for that quantum's body and
-// within `MAX_RATIO` of it. Each body is the guarded quantum's own code (or the one-to-three-line
+// reports ratios above `MAX_RATIO`. Each body is the guarded quantum's own code (or the one-to-three-line
 // op sequence it runs, spelled with the same `mlx_gen::nn` calls), at a small shape where the
 // activations dominate the weights; weights and inputs are materialized before the measurement.
 // ---------------------------------------------------------------------------------------------
 
 mod proofs {
     use super::*;
-    use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use mlx_gen::ios_quantum::measured_peak_bytes;
 
-    /// The stated bound: a counted price may exceed the measurement by at most 1.5x.
+    /// Efficiency reporting threshold, not a safety gate.
     const MAX_RATIO: f64 = 1.5;
 
     /// Measurements per proof; the WORST (largest) peak is the one the formula must cover.
@@ -1797,6 +2028,389 @@ mod proofs {
             (1.0 / (inp * k * k) as f32).sqrt(),
         ));
         crate::unet::nchw_to_nhwc(&nchw).unwrap()
+    }
+
+    /// Native retained storage of the actual input operation forms: state alias (ancestral),
+    /// owned scale/cast (DDPM), and owned f32 scale followed by a pre-CFG half cast (curated).
+    /// Caller state remains held, as it does in the solver; aliases are never counted twice.
+    #[test]
+    fn forward_input_owners_match_native_alias_cast_and_cfg_storage() {
+        if !cpu_child("proofs::forward_input_owners_match_native_alias_cast_and_cfg_storage") {
+            return;
+        }
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            let _scope = mlx_gen::ios_quantum::Scope::new();
+            for state_dtype in [Dtype::Float16, Dtype::Float32] {
+                let state = evaluated(rnd(&[1, 8, 8, 4], 7700, 1.0).as_dtype(state_dtype)?);
+                let coefficient = evaluated(Array::from_f32(0.75).as_dtype(state_dtype)?);
+                for cfg_rows in [1u64, 2] {
+                    for flow in [
+                        ForwardInputOwnership { state: state_dtype, scaled: None, cast_before_cfg: false },
+                        ForwardInputOwnership { state: state_dtype, scaled: Some(Dtype::Float16), cast_before_cfg: false },
+                        ForwardInputOwnership { state: state_dtype, scaled: Some(Dtype::Float32), cast_before_cfg: true },
+                    ] {
+                        let owned = flow.bytes(elements(&state), crate::model::DTYPE, cfg_rows);
+                        let before = mlx_rs::memory::get_active_memory() as u64;
+                        // Construction temporaries have their own quantum; the assertion below
+                        // inspects only retained owners AFTER its barrier, not sum-of-history peaks.
+                        mlx_gen::ios_quantum::before("retained forward input unit", owned + bytes(&state).max(elements(&state) * 4))?;
+                        let scaled = match flow.scaled {
+                            None => state.clone(),
+                            Some(dtype) => mlx_rs::ops::multiply(&state, &coefficient)?.as_dtype(dtype)?,
+                        };
+                        let pre_cfg = if flow.cast_before_cfg { scaled.as_dtype(crate::model::DTYPE)? } else { scaled.clone() };
+                        let pair = if cfg_rows == 2 { mlx_rs::ops::concatenate_axis(&[&pre_cfg, &pre_cfg], 0)? } else { pre_cfg.clone() };
+                        let forward = crate::pipeline::ios_unet_input(&pair)?;
+                        mlx_gen::ios_quantum::finish("retained forward input unit", &[&scaled, &pre_cfg, &pair, &forward])?;
+                        let retained = (mlx_rs::memory::get_active_memory() as u64).saturating_sub(before);
+                        assert_eq!(retained, owned - bytes(&state), "{flow:?} CFGrows={cfg_rows}: distinct native owners only");
+                        assert_eq!(forward.dtype(), crate::model::DTYPE);
+                        assert_eq!(forward.shape()[0] as u64, cfg_rows);
+                        eprintln!("FORWARD OWNERS {flow:?} rows={cfg_rows}: caller={} native_extra={retained} priced_total={owned}", bytes(&state));
+                        drop((scaled, pre_cfg, pair, forward));
+                    }
+                }
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    /// Exact native-counter proof at the actual allocator page boundaries. These are tiny
+    /// operation/alias classes, not a model/sampler/rung measurement grid or process certificate.
+    #[test]
+    fn native_forward_backings_cover_page_boundaries_and_parent_views() {
+        if !cpu_child("proofs::native_forward_backings_cover_page_boundaries_and_parent_views") {
+            return;
+        }
+        use mlx_rs::ops::indexing::TryIndexOp;
+        fn active() -> u64 {
+            let mut bytes = 0usize;
+            assert_eq!(unsafe { mlx_sys::mlx_get_active_memory(&mut bytes) }, 0);
+            bytes as u64
+        }
+        fn sync_cpu() -> Result<()> {
+            let status = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(mlx_gen::Error::Msg(
+                    "native input fixture CPU sync failed".into(),
+                ))
+            }
+        }
+        fn verify(
+            state: &Array,
+            coefficient: &Array,
+            flow: ForwardInputOwnership,
+            rows: u64,
+            parent_elements: u64,
+            page: u64,
+        ) -> Result<()> {
+            let parent = mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
+                parent_elements
+                    .checked_mul(dtype_bytes(state.dtype()))
+                    .unwrap(),
+                page,
+            )
+            .unwrap();
+            let predicted = flow
+                .fresh_native_bytes(
+                    elements(state),
+                    parent_elements,
+                    crate::model::DTYPE,
+                    rows,
+                    page,
+                )
+                .expect("source-known fresh full parent and outputs");
+            let before = active();
+            mlx_gen::ios_quantum::before(
+                "native unique input construction",
+                predicted.checked_mul(2).unwrap(),
+            )?;
+            let scaled = match flow.scaled {
+                None => state.clone(),
+                Some(dtype) => mlx_rs::ops::multiply(state, coefficient)?.as_dtype(dtype)?,
+            };
+            let pre = if flow.cast_before_cfg {
+                scaled.as_dtype(crate::model::DTYPE)?
+            } else {
+                scaled.clone()
+            };
+            let pair = if rows == 2 {
+                mlx_rs::ops::concatenate_axis(&[&pre, &pre], 0)?
+            } else {
+                pre.clone()
+            };
+            let input = crate::pipeline::ios_unet_input(&pair)?;
+            mlx_gen::ios_quantum::finish(
+                "native unique input construction",
+                &[&scaled, &pre, &pair, &input],
+            )?;
+            let retained = active()
+                .checked_sub(before)
+                .expect("held caller/coefficient cannot disappear");
+            assert_eq!(retained, predicted.checked_sub(parent).unwrap(),
+                "{flow:?} shape={:?} rows={rows} page={page} parent_elements={parent_elements}: unique physical backings", state.shape());
+            assert_eq!(input.dtype(), crate::model::DTYPE);
+            eprintln!("NATIVE UNIQUE INPUT {flow:?} shape={:?} rows={rows} parent={parent} total={predicted} extra={retained} page={page}", state.shape());
+            // Keep caller state, coefficient and the actual scope alive THROUGH the assertion.
+            drop((scaled, pre, pair, input));
+            Ok(())
+        }
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            let _scope = mlx_gen::ios_quantum::Scope::try_new()?;
+            let page = mlx_gen::ios_quantum::native_metal_page_bytes().expect("actual Darwin allocator operand");
+            assert!(page.checked_mul(64).is_some_and(|n| n <= 32 * 1024 * 1024),
+                "this finite fixture has a 32MiB allocation budget, not an unbounded allocator probe");
+            let edge = i32::try_from(page / 8).unwrap();
+            for shape in [[1, 1, edge-1, 4], [1, 1, edge, 4], [1, 1, edge+1, 4], [1, 31, 35, 4]] {
+                for dtype in [Dtype::Float16, Dtype::Float32] {
+                    let before_state = active();
+                    let state = evaluated(rnd(&shape, 7710, 1.0).as_dtype(dtype)?);
+                    sync_cpu()?;
+                    let parent = mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes(&state), page).unwrap();
+                    assert_eq!(active().checked_sub(before_state), Some(parent),
+                        "the source-created full state must have the exact fresh native backing");
+                    let coefficient = evaluated(Array::from_f32(0.75).as_dtype(dtype)?);
+                    sync_cpu()?;
+                    for rows in [1, 2] {
+                        for flow in [
+                            ForwardInputOwnership { state: dtype, scaled: None, cast_before_cfg: false },
+                            ForwardInputOwnership { state: dtype, scaled: Some(Dtype::Float16), cast_before_cfg: false },
+                            ForwardInputOwnership { state: dtype, scaled: Some(Dtype::Float32), cast_before_cfg: true },
+                        ] { verify(&state, &coefficient, flow, rows, elements(&state), page)?; }
+                    }
+                    drop((state, coefficient));
+                }
+            }
+            // A genuine offset slice/reshape keeps its FULL larger parent after that original
+            // Rust handle drops. Logical nbytes or distinct data pointers do not identify backing.
+            let logical_width = edge + 1;
+            let parent_width = 2 * logical_width + 3;
+            let before_parent = active();
+            let parent = evaluated(rnd(&[1, 1, parent_width, 4], 7720, 1.0).as_dtype(Dtype::Float16)?);
+            sync_cpu()?;
+            let parent_elements = elements(&parent);
+            let physical_parent = active().checked_sub(before_parent).unwrap();
+            let view = parent.try_index((.., .., 1..1+logical_width, ..))?.reshape(&[1, 1, logical_width, 4])?;
+            view.eval()?;
+            sync_cpu()?;
+            drop(parent);
+            assert_eq!(active().checked_sub(before_parent), Some(physical_parent),
+                "slice/reshape retains the full original allocation, not just its logical span");
+            assert!(physical_parent > mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes(&view), page).unwrap());
+            let coefficient = evaluated(Array::from_f32(0.75).as_dtype(Dtype::Float16)?);
+            sync_cpu()?;
+            verify(&view, &coefficient, ForwardInputOwnership {
+                state: Dtype::Float16, scaled: None, cast_before_cfg: false,
+            }, 1, parent_elements, page)?;
+            drop((view, coefficient));
+            // Conversely a broadcast can have a logical plane larger than its tiny shared parent.
+            let parent = evaluated(rnd(&[1, 1, 1, 4], 7730, 1.0).as_dtype(Dtype::Float16)?);
+            let broadcast = mlx_rs::ops::broadcast_to(&parent, &[1, 31, 35, 4])?;
+            broadcast.eval()?;
+            sync_cpu()?;
+            let parent_elements = elements(&parent);
+            drop(parent);
+            let coefficient = evaluated(Array::from_f32(0.75).as_dtype(Dtype::Float16)?);
+            sync_cpu()?;
+            verify(&broadcast, &coefficient, ForwardInputOwnership {
+                state: Dtype::Float16, scaled: None, cast_before_cfg: false,
+            }, 1, parent_elements, page)?;
+            Ok(())
+        }).unwrap();
+    }
+
+    /// The frontend cast of a permuted half weight and CPU GEMM's layout copy coexist.
+    /// The pre-promoted control keeps exactly the same layout, but has no pending dtype cast.
+    #[test]
+    fn mixed_conv_cast_and_layout_are_distinct_live_allocations() {
+        if !cpu_child("proofs::mixed_conv_cast_and_layout_are_distinct_live_allocations") {
+            return;
+        }
+        let x = rand(&[1, 16, 16, 128], 7601);
+        let w = half_conv_weight(128, 3, 128, 7602);
+        let promoted = evaluated(w.as_dtype(Dtype::Float32).unwrap());
+        eprintln!(
+            "CONV input {:?}/{:?}/{:?}, weight {:?}/{:?}/{:?}, promoted strides {:?}",
+            x.shape(),
+            x.dtype(),
+            x.strides(),
+            w.shape(),
+            w.dtype(),
+            w.strides(),
+            promoted.strides()
+        );
+        let mixed = ConvCall::new(x.shape(), 4, &w, 1, 1);
+        let ready = ConvCall::new(x.shape(), 4, &promoted, 1, 1);
+        for (name, weight, call) in [("mixed", &w, mixed), ("pre-promoted", &promoted, ready)] {
+            prove(name, single_conv_bytes(&call, 0, 0, Backend::Cpu), || {
+                Ok(vec![mlx_gen::nn::conv2d(&x, weight, None, 1, 1)?])
+            });
+        }
+        assert_eq!(
+            mixed.transient(Backend::Cpu) - ready.transient(Backend::Cpu),
+            elements(&w) * dtype_bytes(Dtype::Float32),
+            "frontend weight cast only"
+        );
+    }
+
+    #[test]
+    fn affine_norm_fallback_tracks_both_compute_widths() {
+        if !cpu_child("proofs::affine_norm_fallback_tracks_both_compute_widths") {
+            return;
+        }
+        for dtype in [Dtype::Float16, Dtype::Float32] {
+            let x = evaluated(rnd(&[2, 8, 64], 7610, 1.0).as_dtype(dtype).unwrap());
+            let w = evaluated(Array::ones::<f32>(&[64]).unwrap().as_dtype(dtype).unwrap());
+            let b = evaluated(rnd(&[64], 7611, 0.02).as_dtype(dtype).unwrap());
+            eprintln!("NORM {:?}/{:?}/{:?}", x.shape(), x.dtype(), x.strides());
+            prove(
+                &format!("affine norm {dtype:?}"),
+                final_norm_bytes(x.shape(), dtype, &w, &b),
+                || {
+                    Ok(vec![mlx_rs::fast::layer_norm(
+                        &x,
+                        Some(&w),
+                        Some(&b),
+                        1e-5,
+                    )?])
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn biased_projection_prices_all_addmm_operand_promotions() {
+        if !cpu_child("proofs::biased_projection_prices_all_addmm_operand_promotions") {
+            return;
+        }
+        use mlx_gen::adapters::AdaptableLinear;
+        let x = half(&rand(&[1, 8, 32], 7620));
+        let w = half(&rand(&[64, 32], 7621));
+        let b = rand(&[64], 7622);
+        let p = AdaptableLinear::dense(w.clone(), Some(b));
+        let ready_x = evaluated(x.as_dtype(Dtype::Float32).unwrap());
+        let ready_w = evaluated(w.as_dtype(Dtype::Float32).unwrap());
+        let ready = AdaptableLinear::dense(ready_w, Some(rand(&[64], 7622)));
+        assert_eq!(
+            linear_output_dtype(&p, x.dtype()),
+            Dtype::Float32,
+            "bias participates in addmm result_type"
+        );
+        let out_bytes = 8 * 64 * 4;
+        prove(
+            "mixed biased addmm",
+            linear_operand_bytes(&p, x.shape(), x.dtype()) + out_bytes,
+            || Ok(vec![p.forward(&x)?]),
+        );
+        prove("pre-promoted biased addmm", out_bytes, || {
+            Ok(vec![ready.forward(&ready_x)?])
+        });
+        assert_eq!(
+            linear_operand_bytes(&p, x.shape(), x.dtype()),
+            (elements(&x) + elements(&w)) * 4,
+            "activation and weight casts, no invented bias-add output"
+        );
+        assert_eq!(
+            linear_operand_bytes(&ready, ready_x.shape(), ready_x.dtype()),
+            0
+        );
+    }
+
+    #[test]
+    fn control_injection_prices_lazy_and_materialized_owned_residuals() {
+        if !cpu_child("proofs::control_injection_prices_lazy_and_materialized_owned_residuals") {
+            return;
+        }
+        for dtype in [Dtype::Float16, Dtype::Float32] {
+            let x = evaluated(rnd(&[1, 4, 4, 32], 7630, 1.0).as_dtype(dtype).unwrap());
+            let source = rand(x.shape(), 7631);
+            let ready = half(&source);
+            let scratch = control_injection_bytes(&x, &ready);
+            for lazy in [false, true] {
+                prove(
+                    &format!("control owned {dtype:?} lazy={lazy}"),
+                    scratch,
+                    || {
+                        let c = if lazy {
+                            source.as_dtype(Dtype::Float16)?
+                        } else {
+                            ready.clone()
+                        };
+                        let control = crate::unet::ControlResiduals {
+                            down: vec![],
+                            mid: c,
+                        };
+                        let y =
+                            crate::unet::inject_control_mid_residual(x.clone(), Some(&control))?;
+                        y.eval()?;
+                        // Production retains ControlResiduals through the entire U-Net forward.
+                        drop(control);
+                        Ok(vec![y])
+                    },
+                );
+            }
+            assert_eq!(scratch, elements(&x) * (2 + dtype_bytes(dtype)));
+        }
+    }
+
+    #[test]
+    fn decode_input_dtype_alias_and_retention_are_priced_without_narrowing_state() {
+        if !cpu_child(
+            "proofs::decode_input_dtype_alias_and_retention_are_priced_without_narrowing_state",
+        ) {
+            return;
+        }
+        let (mut weights, cfg) = crate::vae::tests::fixture();
+        weights.cast_all(Dtype::Float16).unwrap();
+        let vae = crate::vae::Autoencoder::from_weights(&weights, &cfg).unwrap();
+        let shape = [1, 8, 8, 4];
+        let x32 = rand(&shape, 7640);
+        let x16 = half(&x32);
+        assert_eq!(vae.dtype(), Dtype::Float16);
+        assert_eq!(
+            vae.decode_input_retained_bytes(&x16),
+            bytes(&x16),
+            "compute input aliases caller"
+        );
+        assert_eq!(
+            vae.decode_input_retained_bytes(&x32),
+            bytes(&x32) + bytes(&x16),
+            "caller plus distinct compute cast"
+        );
+        let euler = crate::sampler::EulerSampler::new_with_dtype(
+            &crate::config::DiffusionConfig::sdxl_base(),
+            false,
+            Dtype::Float16,
+        )
+        .unwrap();
+        let noised = euler.add_noise_with(&x16, &x32, 800.0).unwrap();
+        assert_eq!(
+            noised.dtype(),
+            Dtype::Float32,
+            "sampler state must NOT be narrowed to fix accounting"
+        );
+        for caller in [&x16, &x32] {
+            let mut quanta = Vec::new();
+            vae.price_decode(caller, None, &mut quanta).unwrap();
+            let (decoded, events) = observe(PLENTY, || vae.decode(caller));
+            decoded.unwrap().eval().unwrap();
+            let actual = checked(&events, VAE_DECODE_IN);
+            assert_eq!(
+                actual,
+                [quanta[0].1],
+                "first guard and header price include the same pending cast"
+            );
+            assert_eq!(
+                caller.dtype(),
+                if std::ptr::eq(caller, &x16) {
+                    Dtype::Float16
+                } else {
+                    Dtype::Float32
+                }
+            );
+        }
     }
 
     // -- U-Net ---------------------------------------------------------------------------------
@@ -2226,6 +2840,8 @@ mod proofs {
         assert_eq!(
             resnet.quantum_scratch(&x16, Some(&temb32)),
             resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Cpu)
+                // packed temb bias, norm2 weight/bias, conv2 bias: four promoted channel vectors.
+                + 4 * c2.shape()[0] as u64 * dtype_bytes(Dtype::Float32)
         );
         assert!(
             resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Metal)
@@ -2261,12 +2877,83 @@ mod proofs {
                 Ok(vec![mlx_gen::nn::conv2d(&y, &wo, Some(&bo), 1, 1)?])
             },
         );
-        // The Metal kernel's weight copy is at the activation width when it is wider: MLX's
-        // `conv2d` casts the f16 weight up, and that cast is the row-contiguous copy.
+        // GPU AsType also preserves the dense transposed layout. Mixed precision holds a
+        // distinct f32 frontend cast AND an f32 layout copy, versus one f16 layout copy.
         let narrow = ConvCall::new(x16.shape(), 2, &wo, 1, 1);
         assert_eq!(
             call.transient(Backend::Metal) - narrow.transient(Backend::Metal),
-            call.weight_elements() * 2
+            call.weight_elements() * (4 + 4 - 2)
+        );
+    }
+
+    #[test]
+    fn composed_conv_bias_promotion_is_separate_from_weight_layout() {
+        if !cpu_child("proofs::composed_conv_bias_promotion_is_separate_from_weight_layout") {
+            return;
+        }
+        let x = rand(&[1, 8, 8, 64], 7660);
+        let b = half(&rand(&[64], 7661));
+        let w = half_conv_weight(64, 3, 64, 7662);
+        let casts = conv_bias_bytes(x.dtype(), &w, Some(&b), elements(&x));
+        assert_eq!(
+            casts,
+            elements(&b) * 4,
+            "only the bias vector needs promotion"
+        );
+        prove(
+            "composed convolution bias promotion",
+            bytes(&x) + casts,
+            || Ok(vec![mlx_rs::ops::add(&x, &b)?]),
+        );
+        let x16 = half(&x);
+        let b32 = rand(&[64], 7661);
+        let widened = conv_bias_bytes(x16.dtype(), &w, Some(&b32), elements(&x16));
+        assert_eq!(
+            widened,
+            elements(&x16) * 4,
+            "wider output, not a second weight copy"
+        );
+        prove("composed convolution wider bias", widened, || {
+            Ok(vec![mlx_rs::ops::add(&x16, &b32)?])
+        });
+    }
+
+    #[test]
+    fn resnet_affine_bias_and_shortcut_promotions_are_tensor_derived() {
+        if !cpu_child("proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived") {
+            return;
+        }
+        let (cin, cout) = (64, 32);
+        let mut g = Gen::new(7650);
+        g.resnet("r", cin, cout, None);
+        let mut map = g.map;
+        for value in map.values_mut() {
+            *value = half(value);
+        }
+        let weights = Weights::from_map(map);
+        let r = crate::unet::ResnetBlock2D::from_weights(&weights, "r").unwrap();
+        let x = rand(&[1, 8, 8, cin], 7651);
+        // norm1's two cin vectors, both conv biases + norm2's two cout vectors, and the
+        // shortcut addmm's cout×cin weight and cout bias, all promoted from f16 to f32.
+        let casts = (2 * cin + 5 * cout + cin * cout) as u64 * 4;
+        assert_eq!(r.promotion_scratch(&x, None), casts);
+        let c1 = crate::unet::nchw_to_nhwc(weights.require("r.conv1.weight").unwrap()).unwrap();
+        let c2 = crate::unet::nchw_to_nhwc(weights.require("r.conv2.weight").unwrap()).unwrap();
+        assert_eq!(
+            r.quantum_scratch(&x, None),
+            resnet_bytes(x.shape(), 4, 4, &c1, &c2, Backend::Cpu) + casts
+        );
+        prove(
+            "resnet affine/bias/shortcut",
+            r.quantum_scratch(&x, None),
+            || {
+                Ok(vec![r.forward_quantum(
+                    &x,
+                    None,
+                    None,
+                    crate::plan::SdxlForwardPlan::UNBOUNDED,
+                )?])
+            },
         );
     }
 
@@ -2815,6 +3502,56 @@ mod proofs {
             Ok(vec![schedule.step(&eps, &latents, 3)?])
         });
     }
+
+    /// One projection's load-time pack (epic 16774) over a resident dense f16 `[1280, 2048]`
+    /// projection with its bias (an SDXL IP K/V or ControlNet attention projection's width), at
+    /// both packed tiers.
+    #[test]
+    fn load_quantize_tracks_its_measured_peak() {
+        if !cpu_child("proofs::load_quantize_tracks_its_measured_peak") {
+            return;
+        }
+        let mut g = Gen::new(9300);
+        g.linear("p", 1280, 2048, true);
+        let w = g.weights();
+        let mut half = std::collections::HashMap::new();
+        for key in ["p.weight", "p.bias"] {
+            half.insert(
+                key.to_owned(),
+                evaluated(w.get(key).unwrap().as_dtype(Dtype::Float16).unwrap()),
+            );
+        }
+        let base = crate::quant::lin(&Weights::from_map(half), "p", true).unwrap();
+        let (weight, bias) = base.dense_weight().unwrap();
+        for bits in [4, 8] {
+            let formula = crate::quant::quantize_bytes(weight, bias, bits);
+            prove(LOAD_QUANTIZE, formula, || {
+                let mut packed = base.clone();
+                crate::quant::guarded_load_quantize(|| {
+                    crate::quant::quantize_linear(&mut packed, bits)
+                })?;
+                let (wq, scales, biases, bias, _, _) = packed.quantized_params().unwrap();
+                let mut out = vec![wq.clone(), scales.clone(), biases.clone()];
+                out.extend(bias.cloned());
+                Ok(out)
+            });
+        }
+    }
+
+    /// The IP tokens' CFG pair (epic 16774), at the production plus Resampler's 16 x 2048 tokens
+    /// (f16, and f32 where a packed tier promotes them).
+    #[test]
+    fn ip_cfg_tokens_track_their_measured_peak() {
+        if !cpu_child("proofs::ip_cfg_tokens_track_their_measured_peak") {
+            return;
+        }
+        for dtype in [Dtype::Float16, Dtype::Float32] {
+            let tokens = evaluated(rand(&[1, 16, 2048], 4).as_dtype(dtype).unwrap());
+            prove(IP_CFG_TOKENS, ip_cfg_tokens_bytes(&tokens), || {
+                Ok(vec![crate::ip_adapter::cfg_pair(&tokens)?])
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2839,7 +3576,7 @@ mod pricing;
 mod adapters {
     use super::*;
     use mlx_gen::adapters::AdaptableHost;
-    use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use mlx_gen::ios_quantum::measured_peak_bytes;
     use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 
     use crate::adapters::{apply_sdxl_adapters_with, LoraCoverage};
@@ -2959,6 +3696,210 @@ mod adapters {
             }
         }
         unet
+    }
+
+    /// Actual loader/installed-state parity for the configured exporter. Tiny CPU-only installs,
+    /// not generation, allocator measurements, or ProcessGrowth evidence.
+    #[test]
+    fn configured_adapter_facts_match_actual_install_branches() {
+        let Some(mut completion) = completed_cpu_child("adapters::configured_adapter_facts_match_actual_install_branches") else {
+            return;
+        };
+        use mlx_gen::adapters::Adapter;
+        use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader};
+        let cfg = crate::test_support::tiny_unet_config();
+        for (name, packed, kind, scale, form) in [
+            ("dense_lora", false, AdapterKind::Lora, 0.8, 0),
+            ("packed_lora_zero", true, AdapterKind::Lora, 0.0, 0),
+            ("structured_lokr_zero", true, AdapterKind::Lokr, 0.8, 1),
+            ("thirdparty_lokr_zero", true, AdapterKind::Lora, 0.0, 2),
+            ("thirdparty_loha_zero", true, AdapterKind::Lora, 0.0, 3),
+            ("packed_conv_lora", true, AdapterKind::Lora, 0.8, 4),
+        ] {
+            let mut weights = crate::test_support::tiny_unet_weights_for(&cfg, 191).unwrap();
+            if packed {
+                let weight = weights
+                    .require(&format!("{Q}.weight"))
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap();
+                let (codes, scales, biases) =
+                    mlx_rs::ops::quantize(&weight, crate::quant::GROUP_SIZE, 4).unwrap();
+                weights.insert(format!("{Q}.weight"), codes);
+                weights.insert(format!("{Q}.scales"), scales);
+                weights.insert(format!("{Q}.biases"), biases);
+            }
+            let headers: Vec<_> = weights
+                .keys()
+                .map(|key| {
+                    let a = weights.require(key).unwrap();
+                    let dtype = match a.dtype() {
+                        Dtype::Float32 => Stored::F32,
+                        Dtype::Bfloat16 => Stored::BF16,
+                        Dtype::Float16 => Stored::F16,
+                        Dtype::Uint32 => Stored::U32,
+                        other => panic!("unexpected fixture dtype {other:?}"),
+                    };
+                    SafetensorsTensorHeader {
+                        name: key.to_owned(),
+                        dtype,
+                        shape: a.shape().iter().map(|d| *d as usize).collect(),
+                        data_bytes: a.size() as u64 * crate::quantum::dtype_bytes(a.dtype()),
+                    }
+                })
+                .collect();
+            let prefix = flat(Q);
+            let (tensors, metadata) = match form {
+                0 => (lora_linear(Q, 64, 64, 4, 201), vec![]),
+                1 => (
+                    vec![
+                        (format!("{Q}.lokr_w1"), rnd(&[8, 8], 211, 0.1)),
+                        (format!("{Q}.lokr_w2"), rnd(&[8, 8], 212, 0.1)),
+                    ],
+                    vec![("networkType", "lokr"), ("rank", "4"), ("alpha", "0")],
+                ),
+                2 => (
+                    vec![
+                        (format!("{prefix}.lokr_w1"), rnd(&[8, 8], 221, 0.1)),
+                        (format!("{prefix}.lokr_w2"), rnd(&[8, 8], 222, 0.1)),
+                        (format!("{prefix}.alpha"), Array::from_f32(0.0)),
+                    ],
+                    vec![],
+                ),
+                3 => (
+                    vec![
+                        (format!("{prefix}.hada_w1_a"), rnd(&[64, 4], 231, 0.1)),
+                        (format!("{prefix}.hada_w1_b"), rnd(&[4, 64], 232, 0.1)),
+                        (format!("{prefix}.hada_w2_a"), rnd(&[64, 4], 233, 0.1)),
+                        (format!("{prefix}.hada_w2_b"), rnd(&[4, 64], 234, 0.1)),
+                        (format!("{prefix}.alpha"), Array::from_f32(0.0)),
+                    ],
+                    vec![],
+                ),
+                4 => (lora_conv(Q, 64, 64, 1, 4, 241), vec![]),
+                _ => unreachable!(),
+            };
+            let mut tensors = tensors;
+            // Deliberately out of surface: the actual loader materializes this too, even when
+            // the accepted adapter's forward is disabled. It must survive numeric read pricing.
+            tensors.push((
+                "lora_te1_ignored.weight".into(),
+                half(rnd(&[3, 7], 249, 0.1)),
+            ));
+            let file = write(&format!("semantic-{name}.safetensors"), tensors, &metadata);
+            let adapter = AdapterSpec::new(file, scale, kind);
+            let mut spec = mlx_gen::gen_core::LoadSpec::new(mlx_gen::WeightsSource::Dir(dir()));
+            spec.adapters.push(adapter.clone());
+            let facts =
+                crate::adapters::configured_adapter_semantic_facts_with(&spec, &headers, &cfg)
+                    .unwrap();
+            let entry = &facts["adapters"][0]["installed"][0];
+            let (loaded, work) = crate::adapters::with_adapter_work(|| {
+                with_cpu_diagnostic_headroom(PLENTY, || {
+                    crate::loader::cast_for_load(&mut weights, crate::model::DTYPE).unwrap();
+                    let mut unet = UNet2DConditionModel::from_weights(&weights, &cfg).unwrap();
+                    apply_sdxl_adapters_with(
+                        &mut unet,
+                        std::slice::from_ref(&adapter),
+                        crate::adapters::configured_lora_coverage(),
+                    )
+                    .unwrap();
+                    Ok(unet)
+                })
+            });
+            let mut unet = loaded.unwrap();
+            let ledger = crate::ios_pricing::AdapterLoadLedger::from_work(&work, 123);
+            let raw =
+                mlx_gen::ios_quantum::load_floor_bytes(std::slice::from_ref(&adapter.path), |_| {
+                    true
+                })
+                .unwrap();
+            assert_eq!(
+                ledger.raw_parent_upper, raw,
+                "{name}: actual adapter producer lost a materialized raw key"
+            );
+            assert!(
+                matches!(
+                    work.first(),
+                    Some(crate::adapters::AdapterWork::FileMaterialized(_))
+                ) && matches!(
+                    work.last(),
+                    Some(crate::adapters::AdapterWork::FileScopeEnd)
+                ),
+                "{name}: actual adapter producer file-map scope order"
+            );
+            assert_eq!(
+                ledger.quanta[0].scratch, raw,
+                "{name}: actual adapter producer raw-file load price"
+            );
+            assert!(
+                ledger
+                    .quanta
+                    .iter()
+                    .filter(|q| q.label == ADAPTER_MERGE)
+                    .all(|q| q.resident >= 123 + raw),
+                "{name}: actual adapter producer dropped raw parents before install"
+            );
+            let target = unet
+                .adaptable_mut(&Q.split('.').collect::<Vec<_>>())
+                .unwrap();
+            let describe = |facts: &mlx_gen::adapters::facts::AdapterFacts| {
+                (
+                    facts.disabled(),
+                    facts
+                        .tensors()
+                        .iter()
+                        .map(|tensor| (tensor.shape.clone(), tensor.dtype, tensor.bytes()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let native: Vec<_> = target
+                .adapters()
+                .iter()
+                .map(mlx_gen::adapters::facts::AdapterFacts::of)
+                .collect();
+            assert_eq!(
+                ledger.residuals.iter().map(describe).collect::<Vec<_>>(),
+                native.iter().map(describe).collect::<Vec<_>>(),
+                "{name}: actual adapter producer declared residual/disable parity"
+            );
+            for dtype in [Dtype::Float16, Dtype::Float32] {
+                let output = crate::quantum::linear_output_dtype(target, dtype);
+                let residual = native.iter().fold(0u64, |n, fact| {
+                    n.saturating_add(crate::adapters::adapter_forward_scratch(
+                        fact,
+                        &[2, 3, 64],
+                        dtype,
+                        output,
+                    ))
+                });
+                assert!(
+                    crate::quantum::linear_operand_bytes(target, &[2, 3, 64], dtype) >= residual,
+                    "{name}: actual adapter producer residual absent from operand budget"
+                );
+            }
+            let (storage, disabled) = match target.adapters() {
+                [] => ("merged_dense", false),
+                [Adapter::Lora { .. }] => ("factor_residual", target.adapters()[0].is_disabled()),
+                [Adapter::LokrStructured { .. }] => {
+                    ("structured_residual", target.adapters()[0].is_disabled())
+                }
+                [Adapter::Lokr { .. }] => (
+                    "materialized_delta_residual",
+                    target.adapters()[0].is_disabled(),
+                ),
+                other => panic!("unexpected installed stack length {}", other.len()),
+            };
+            assert_eq!(
+                entry["installed"], storage,
+                "{name}: exporter disagrees with actual installed storage"
+            );
+            assert_eq!(
+                entry["configured_zero_branch"], disabled,
+                "{name}: exporter disagrees with actual disable predicate"
+            );
+        }
+        completion.body_completed = true;
     }
 
     fn weight_of(unet: &mut crate::unet::UNet2DConditionModel, dotted: &str) -> Array {
@@ -3283,3 +4224,33 @@ mod adapters {
         assert_eq!(synced(&events, ADAPTER_MERGE), 4);
     }
 }
+
+/// Direct constructor equivalence, not a native-memory or layout certificate. Mixed source
+/// widths ensure metadata passes the actual PRE-CAST weight element width, not nbytes or act.
+#[test]
+fn conv_call_metadata_constructor_matches_native_element_width() {
+    let Some(mut completed) = completed_cpu_child("conv_call_metadata_constructor_matches_native_element_width") else { return; };
+    for (input, weight_shape, stride, pad) in [
+        ([1, 3, 5, 32], [224, 3, 3, 32], 1, 1),
+        ([1, 64, 64, 32], [224, 3, 3, 32], 1, 1),
+        ([1, 7, 9, 32], [64, 3, 3, 32], 2, 0),
+    ] {
+        let count = weight_shape.iter().map(|d| *d as usize).product::<usize>();
+        for (activation, weight_dtype) in [
+            (Dtype::Float16, Dtype::Float32), (Dtype::Float32, Dtype::Float16),
+            (Dtype::Float16, Dtype::Bfloat16), (Dtype::Float32, Dtype::Float32),
+        ] {
+            let weight = Array::from_slice(&vec![0.25f32; count], &weight_shape)
+                .as_dtype(weight_dtype).unwrap();
+            let native = ConvCall::new(&input, dtype_bytes(activation), &weight, stride, pad);
+            let metadata = ConvCall::from_metadata(&input, dtype_bytes(activation), &weight_shape,
+                dtype_bytes(weight_dtype), stride, pad);
+            let describe = |call: ConvCall| (call.in_bytes(), call.out_bytes(), call.weight_elements(),
+                call.winograd(), call.transient(Backend::Cpu), call.transient(Backend::Metal));
+            assert_eq!(describe(native), describe(metadata),
+                "ConvCall metadata element-width equivalence input={input:?} weight={weight_dtype:?} activation={activation:?}");
+        }
+    }
+    completed.body_completed = true;
+}
+

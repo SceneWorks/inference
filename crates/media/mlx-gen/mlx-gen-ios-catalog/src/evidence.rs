@@ -52,6 +52,50 @@ pub const ANCHOR_MARGIN_FLOOR_BYTES: u64 = 32 << 20;
 
 const EVIDENCE_JSON: &str = include_str!("../evidence/ios_device_evidence.json");
 
+/// Actual configured load form, not inferred from endpoint/rung names. An optimized configured
+/// operation may require Eager (e.g. valid Iris adapters); ordinary catalog defaults are untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorLoadForm {
+    ResidentEager,
+    ResidentDeferred,
+    SequentialEager,
+    SequentialDeferred,
+}
+impl AnchorLoadForm {
+    pub fn from_spec(spec: &mlx_gen::LoadSpec) -> Self {
+        use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+        match (spec.offload_policy, spec.load_shape) {
+            (OffloadPolicy::Resident, LoadShape::EagerMaterialization) => Self::ResidentEager,
+            (OffloadPolicy::Resident, LoadShape::DeferredMaterialization) => Self::ResidentDeferred,
+            (OffloadPolicy::Sequential, LoadShape::EagerMaterialization) => Self::SequentialEager,
+            (OffloadPolicy::Sequential, LoadShape::DeferredMaterialization) => {
+                Self::SequentialDeferred
+            }
+        }
+    }
+    pub fn apply(self, spec: &mut mlx_gen::LoadSpec) {
+        use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+        (spec.offload_policy, spec.load_shape) = match self {
+            Self::ResidentEager => (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+            Self::ResidentDeferred => (OffloadPolicy::Resident, LoadShape::DeferredMaterialization),
+            Self::SequentialEager => (OffloadPolicy::Sequential, LoadShape::EagerMaterialization),
+            Self::SequentialDeferred => (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+            ),
+        };
+    }
+    pub fn execution_prefix(self) -> &'static str {
+        match self {
+            Self::ResidentEager => "Resident|EagerMaterialization|",
+            Self::ResidentDeferred => "Resident|DeferredMaterialization|",
+            Self::SequentialEager => "Sequential|EagerMaterialization|",
+            Self::SequentialDeferred => "Sequential|DeferredMaterialization|",
+        }
+    }
+}
+
 /// The memory-relevant identity of one request (or anchor) on one artifact and device.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,14 +115,30 @@ pub struct EvidenceKey {
     /// checkpoints of one architecture share it; the per-checkpoint `layout_sha256` above stays the
     /// exact-key artifact check.
     pub architecture_sha256: String,
+    /// Actual normalized configured overlay graph. Separate from base architecture; no paths,
+    /// payload values or continuous nonzero-scale grid. None only for a genuinely unconfigured
+    /// provider without an overlay exporter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_variant_sha256: Option<String>,
     /// `MemoryMode::as_key` of the request route.
     pub mode: String,
     pub width: u32,
     pub height: u32,
     pub batch: u32,
+    /// Existing AGGREGATE image-carrier geometry (Reference + Mask + Control in the current
+    /// validated closed set), identical to GenerationRequest::memory_reference_count.
     pub reference_count: u32,
+    /// Typed subcounts WITHIN that aggregate, not additional images. A mode alone cannot
+    /// distinguish control+reference or reconstruct a mask; replay must not invent media.
+    pub mask_count: u32,
+    pub control_count: u32,
+    pub load_form: AnchorLoadForm,
     /// Canonical selection + request execution levers ([`crate::ios_admission::execution_key`]).
     pub execution: String,
+    /// Canonical, validated provider sampling recipe. The family derives its class from the real
+    /// resolver; a capture cannot claim a compatible class with an arbitrary string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_recipe: Option<String>,
     /// Encoded text window: CLIP windows x 77 for SDXL, 0 where the provider pads to a fixed,
     /// artifact-determined window (covered by the layout digest).
     pub token_window: u32,
@@ -86,13 +146,72 @@ pub struct EvidenceKey {
 
 impl EvidenceKey {
     /// The anchor family this key belongs to: everything a derivation must hold EQUAL.
-    pub fn family(&self) -> AnchorFamily {
-        AnchorFamily {
+    pub fn family(&self) -> Result<AnchorFamily, String> {
+        let sampling = self
+            .sampling_recipe
+            .as_ref()
+            .map(|token| {
+                crate::sampling::from_token(&self.provider, token).map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        if self.provider == crate::sdxl::SDXL_ID {
+            if let Some(token) = &self.sampling_recipe {
+                // Token decoding alone has no conditioning carrier. Revalidate its actual typed
+                // roles through the SAME SDXL gate before claiming a family (no RGB/request).
+                let recipe = mlx_gen_sdxl::sampling::SamplingRecipe::from_token(token)
+                    .map_err(|error| error.to_string())?;
+                mlx_gen_sdxl::sampling::ResolvedSampling::resolve_recipe(
+                    &recipe,
+                    mlx_gen_sdxl::sampling::SamplingWorkFacts {
+                        reference_count: crate::pricing::reference_role_count(
+                            self.reference_count,
+                            self.mask_count,
+                            self.control_count,
+                        )
+                        .map_err(|error| error.to_string())?
+                            as usize,
+                        mask_count: self.mask_count as usize,
+                        control_count: self.control_count as usize,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        // Active multi-branch topology belongs to the actual configured overlay, not an
+        // unbounded raw-count family grid or an assumed component-additivity proof.
+        if self.control_count > 1 && self.configured_variant_sha256.is_none() {
+            return Err("multi-control anchor lacks its configured branch graph identity".into());
+        }
+        let mut variant = crate::pricing::anchor_variant_for_roles(
+            &self.provider,
+            &self.mode,
+            &self.tier,
+            sampling
+                .as_ref()
+                .map(|sampling| sampling.allocation_class()),
+            self.reference_count,
+            self.mask_count,
+            self.control_count,
+        )?;
+        if let Some(sampling) = &sampling {
+            variant.push('/');
+            variant.push_str(sampling.allocation_class());
+        } else if crate::sampling::requires_recipe(&self.provider) {
+            return Err(format!(
+                "{} evidence is missing its resolved sampling recipe",
+                self.provider
+            ));
+        }
+        if let Some(configured) = &self.configured_variant_sha256 {
+            variant.push_str("/configured=");
+            variant.push_str(configured);
+        }
+        Ok(AnchorFamily {
             machine: self.machine.clone(),
             architecture_sha256: self.architecture_sha256.clone(),
             tier: self.tier.clone(),
-            variant: crate::pricing::anchor_variant(&self.provider, &self.mode, &self.tier),
-        }
+            variant,
+        })
     }
 }
 
@@ -117,6 +236,21 @@ pub enum AnchorKind {
     Resident,
     /// The deepest implemented rung at its cheapest selection.
     Optimized,
+}
+
+impl AnchorKind {
+    /// The literal endpoint load form, shared by capture and anchor re-pricing. This is NOT an
+    /// ordinary catalog default: a resident anchor must not arm a deferred full-cover stream.
+    pub fn apply_load_form(self, spec: &mut mlx_gen::gen_core::LoadSpec) {
+        use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+        (spec.offload_policy, spec.load_shape) = match self {
+            Self::Resident => (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+            Self::Optimized => (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+            ),
+        };
+    }
 }
 
 /// The anchor's memory selection, structurally (the anchor law re-prices the anchor's own
@@ -197,6 +331,211 @@ pub struct PhasePeak {
     pub exact: bool,
 }
 
+/// Engineering bounds on observation storage, NOT a memory estimate, step cap or fit gate.
+pub const MAX_SAMPLING_MARKS: usize = 1024;
+pub const MAX_SAMPLING_FIELDS: usize = 64;
+const MAX_SAMPLING_NAME_BYTES: usize = 128;
+
+/// Scalar metadata emitted at an ACTUAL production observation site. A request/serial mark is
+/// not a model evaluation; kind/fields retain that distinction. No tensors/values are serialized.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingMark {
+    pub provider: String,
+    pub kind: String,
+    pub fields: BTreeMap<String, u64>,
+}
+
+/// Bounded observed metadata and retained per-kind counters. This records what ran, not a claim
+/// that every epoch required by a class was covered. Missing/truncated observations are explicit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingCoverage {
+    pub marks: Vec<SamplingMark>,
+    pub counts: BTreeMap<String, BTreeMap<String, u64>>,
+    pub total_marks: u64,
+    pub dropped_marks: u64,
+    pub malformed_marks: u64,
+    pub truncated: bool,
+}
+
+impl SamplingCoverage {
+    /// Return the retained mark ordinal for temporal quantum attribution. An oversized/malformed
+    /// event cannot leave a stale mark active; callers clear their preceding ordinal on None.
+    pub fn record(&mut self, provider: &str, kind: &str, fields: &[(&str, u64)]) -> Option<u32> {
+        if self.total_marks == u64::MAX {
+            self.truncated = true;
+            return None;
+        }
+        self.total_marks += 1;
+        let name_ok = |name: &str| !name.is_empty() && name.len() <= MAX_SAMPLING_NAME_BYTES;
+        let malformed = !name_ok(provider)
+            || !name_ok(kind)
+            || fields.len() > MAX_SAMPLING_FIELDS
+            || fields.iter().any(|(name, _)| !name_ok(name))
+            || fields
+                .iter()
+                .enumerate()
+                .any(|(i, (name, _))| fields[..i].iter().any(|(prior, _)| prior == name));
+        if malformed || self.marks.len() >= MAX_SAMPLING_MARKS {
+            self.dropped_marks += 1;
+            if malformed {
+                self.malformed_marks += 1;
+            }
+            self.truncated = true;
+            return None;
+        }
+        let index = self.marks.len() as u32;
+        self.marks.push(SamplingMark {
+            provider: provider.into(),
+            kind: kind.into(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).into(), *value))
+                .collect(),
+        });
+        *self
+            .counts
+            .entry(provider.into())
+            .or_default()
+            .entry(kind.into())
+            .or_default() += 1;
+        Some(index)
+    }
+
+    /// Presence at actual published execution sites, NOT proof of complete class coverage or
+    /// materialized/free storage. Request, serial declarations and allocator policy alone do not
+    /// count as solver/forward observations.
+    pub fn has_execution_observation(&self) -> bool {
+        self.marks.iter().any(|mark| {
+            mark.kind.starts_with("solver")
+                || mark.kind.starts_with("forward")
+                || mark.kind.starts_with("discrete-")
+                || mark.kind.starts_with("scm_")
+                || mark.kind.starts_with("predict_")
+                || matches!(
+                    mark.kind.as_str(),
+                    "solve_complete" | "callback_evaluated" | "denoised_pair_return"
+                )
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.marks.len() > MAX_SAMPLING_MARKS
+            || self.malformed_marks > self.dropped_marks
+            || self.total_marks
+                != (self.marks.len() as u64)
+                    .checked_add(self.dropped_marks)
+                    .ok_or("sampling counter overflow")?
+            || self.truncated != (self.dropped_marks > 0)
+        {
+            return Err("inconsistent bounded sampling observation counts".into());
+        }
+        let mut rebuilt = Self::default();
+        for mark in &self.marks {
+            let fields: Vec<_> = mark
+                .fields
+                .iter()
+                .map(|(key, value)| (key.as_str(), *value))
+                .collect();
+            if rebuilt
+                .record(&mark.provider, &mark.kind, &fields)
+                .is_none()
+            {
+                return Err("malformed retained sampling observation".into());
+            }
+        }
+        if rebuilt.counts != self.counts {
+            return Err("sampling per-kind counters disagree with retained observations".into());
+        }
+        Ok(())
+    }
+}
+
+/// Bounded actual Checked/context witnesses. Identical repeated label/context entries retain a
+/// count; this does NOT disambiguate different operations sharing that label. Providers must use
+/// conservative plausible-candidate MAX and source-proved correspondence.
+pub const MAX_QUANTUM_CHECKS: usize = 4096;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantumCheck {
+    pub phase: Option<String>,
+    pub label: String,
+    pub context: Vec<u32>,
+    pub count: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantumCoverage {
+    pub checks: Vec<QuantumCheck>,
+    pub total_checks: u64,
+    pub dropped_checks: u64,
+    pub truncated: bool,
+}
+impl QuantumCoverage {
+    pub fn record(&mut self, phase: Option<IosPhase>, label: &str, context: Vec<u32>) {
+        if self.total_checks == u64::MAX {
+            self.truncated = true;
+            return;
+        }
+        self.total_checks += 1;
+        let phase = phase.map(|p| p.as_key().into());
+        if let Some(check) = self
+            .checks
+            .iter_mut()
+            .find(|check| check.phase == phase && check.label == label && check.context == context)
+        {
+            check.count += 1;
+            return;
+        }
+        if self.checks.len() >= MAX_QUANTUM_CHECKS
+            || context.len() > MAX_SAMPLING_FIELDS
+            || label.is_empty()
+            || label.len() > MAX_SAMPLING_NAME_BYTES
+        {
+            self.dropped_checks += 1;
+            self.truncated = true;
+            return;
+        }
+        self.checks.push(QuantumCheck {
+            phase,
+            label: label.into(),
+            context,
+            count: 1,
+        });
+    }
+    pub fn validate(&self, metadata: &SamplingCoverage) -> Result<(), String> {
+        if self.checks.len() > MAX_QUANTUM_CHECKS || self.truncated != (self.dropped_checks > 0) {
+            return Err("inconsistent bounded quantum coverage".into());
+        }
+        let mut total = self.dropped_checks;
+        for check in &self.checks {
+            if check.count == 0
+                || check.label.is_empty()
+                || check.label.len() > MAX_SAMPLING_NAME_BYTES
+                || check.context.len() > MAX_SAMPLING_FIELDS
+                || check
+                    .phase
+                    .as_ref()
+                    .is_some_and(|phase| IosPhase::from_key(phase).is_none())
+                || check
+                    .context
+                    .iter()
+                    .any(|index| *index as usize >= metadata.marks.len())
+            {
+                return Err("invalid actual quantum/context witness".into());
+            }
+            total = total
+                .checked_add(check.count)
+                .ok_or("quantum coverage counter overflow")?;
+        }
+        if total != self.total_checks {
+            return Err("quantum coverage total disagrees with checks".into());
+        }
+        Ok(())
+    }
+}
+
 /// One quantum formula as the device saw it in a capture: the guard's priced scratch at the
 /// invocation with the largest observed/priced ratio, the kernel-footprint growth across it (the
 /// lifetime peak at its end minus the footprint at its check), and whether that growth is exact
@@ -207,6 +546,66 @@ pub struct QuantumObservation {
     pub priced_scratch_bytes: u64,
     pub observed_bytes: u64,
     pub exact: bool,
+    /// Last actual sampling metadata mark before this quantum's check. This is a temporal
+    /// association, not an assertion that a reported logical owner remains live after its scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceding_sampling_mark: Option<u32>,
+}
+
+/// Raw same-task kernel query provenance. Required field word counts come from the exact SDK
+/// layout used by the capture decoder; absent/short/error fields remain None, never synthetic zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelFootprintMethod {
+    TaskVmInfo,
+    UnsupportedPlatform,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelFootprintSnapshot {
+    pub method: KernelFootprintMethod,
+    pub query_status: i32,
+    pub requested_words: u32,
+    pub returned_words: u32,
+    pub current_required_words: u32,
+    pub peak_required_words: u32,
+    pub current_bytes: Option<u64>,
+    pub lifetime_peak_bytes: Option<u64>,
+}
+// Darwin LP64 TASK_VM_INFO, pack(4): phys_footprint ends at word38; the REV3
+// ledger_phys_footprint_peak member ends at word84. These are ABI offsets, not memory evidence.
+pub const TASK_VM_INFO_CURRENT_REQUIRED_WORDS: u32 = 38;
+pub const TASK_VM_INFO_PEAK_REQUIRED_WORDS: u32 = 84;
+impl KernelFootprintSnapshot {
+    pub fn current(&self) -> Option<u64> {
+        if self.method != KernelFootprintMethod::TaskVmInfo
+            || self.query_status != 0
+            || self.current_required_words != TASK_VM_INFO_CURRENT_REQUIRED_WORDS
+            || self.returned_words < self.current_required_words
+            || self.returned_words > self.requested_words
+        {
+            return None;
+        }
+        self.current_bytes.filter(|current| *current > 0)
+    }
+    pub fn complete_pair(&self) -> Result<(u64, u64), String> {
+        let current = self
+            .current()
+            .ok_or("kernel current footprint unavailable/short/error")?;
+        if self.peak_required_words != TASK_VM_INFO_PEAK_REQUIRED_WORDS
+            || self.returned_words < self.peak_required_words
+            || self.requested_words < self.peak_required_words
+        {
+            return Err("kernel lifetime footprint peak unavailable/short/error".into());
+        }
+        let peak = self
+            .lifetime_peak_bytes
+            .ok_or("kernel lifetime peak missing")?;
+        if peak < current {
+            return Err("kernel lifetime peak below current footprint".into());
+        }
+        Ok((current, peak))
+    }
 }
 
 /// One capture run of an anchor.
@@ -215,15 +614,39 @@ pub struct QuantumObservation {
 pub struct Capture {
     pub run_id: String,
     pub build_sha: String,
-    /// Denoise steps the capture ran (anchors capture short: 1-2 steps).
+    /// Resolved requested denoise steps; actual callback/update coverage is recorded separately.
+    /// Short reference recipes must still exercise their class's required warm-up/terminal epochs.
     pub steps: u32,
     /// The capture process's `phys_footprint` before any of the case's loads.
     pub baseline_footprint_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_request_snapshot: Option<KernelFootprintSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_model_load_snapshot: Option<KernelFootprintSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending_snapshot: Option<KernelFootprintSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_current_peak_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model_current_peak_bytes: Option<u64>,
+    #[serde(default)]
+    pub valid_kernel_queries: u64,
+    #[serde(default)]
+    pub valid_model_kernel_queries: u64,
     /// Kernel-ledger LIFETIME `phys_footprint` peak of the capture process (absolute).
     pub footprint_bytes: u64,
     /// Per-phase peaks split through the quantum marks (`IosPhase::as_key` → peak). A phase the
     /// capture could not attribute is absent and is priced at the whole-run peak (erring large).
     pub phase_peaks: BTreeMap<String, PhasePeak>,
+    /// Actual production-emitted bounded observations, never a predicted plan/progress replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_coverage: Option<SamplingCoverage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantum_coverage: Option<QuantumCoverage>,
+    /// Missing/unreadable quantum footprint marks invalidate phase attribution, not a valid
+    /// starting/ending whole-run kernel upper. Consumers must then use the whole-run upper.
+    #[serde(default)]
+    pub quantum_query_gaps: u64,
     /// Per quantum label, the device's observation of that formula (the per-formula DEVICE
     /// calibration: priced scratch vs observed peak).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -236,6 +659,55 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// Construct a validated physical upper in ONE explicit baseline coordinate. Both original
+    /// and SDK/pre-load ledgers remain available; this is never a free baseline conversion.
+    pub fn kernel_growth(
+        &self,
+        coordinate: mlx_gen::ios_pricing::IosMemoryCoordinate,
+    ) -> Result<mlx_gen::ios_anchor_law::KernelGrowth, String> {
+        use mlx_gen::ios_pricing::IosMemoryCoordinate;
+        let (start, current_peak, queries) = match coordinate {
+            IosMemoryCoordinate::BeforeRequestConstruction => (
+                self.before_request_snapshot.as_ref(),
+                self.observed_current_peak_bytes,
+                self.valid_kernel_queries,
+            ),
+            IosMemoryCoordinate::BeforeModelLoad => (
+                self.before_model_load_snapshot.as_ref(),
+                self.observed_model_current_peak_bytes,
+                self.valid_model_kernel_queries,
+            ),
+            _ => return Err("capture has no measurement in requested baseline coordinate".into()),
+        };
+        let (current, old_highwater) = start
+            .ok_or("capture starting kernel snapshot missing")?
+            .complete_pair()?;
+        if coordinate == IosMemoryCoordinate::BeforeRequestConstruction
+            && current != self.baseline_footprint_bytes
+        {
+            return Err(
+                "original baseline scalar disagrees with its actual kernel snapshot".into(),
+            );
+        }
+        let (_, ending_highwater) = self
+            .ending_snapshot
+            .as_ref()
+            .ok_or("capture ending kernel snapshot missing")?
+            .complete_pair()?;
+        if ending_highwater != self.footprint_bytes {
+            return Err("capture peak disagrees with ending kernel query".into());
+        }
+        let peak = current_peak.ok_or("actual run current-footprint observations missing")?;
+        mlx_gen::ios_anchor_law::KernelGrowth::from_queries(
+            current,
+            old_highwater,
+            ending_highwater,
+            peak,
+            queries,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// The render's own growth over the capture's starting footprint.
     pub fn demand_bytes(&self) -> u64 {
         self.footprint_bytes
@@ -288,6 +760,55 @@ impl AnchorRow {
         }
     }
 
+    /// Validated upper in one declared coordinate. Masked highwater remains an upper only.
+    pub fn upper_growth_at(
+        &self,
+        coordinate: mlx_gen::ios_pricing::IosMemoryCoordinate,
+    ) -> Result<u64, String> {
+        self.captures()
+            .iter()
+            .map(|capture| {
+                capture
+                    .kernel_growth(coordinate)
+                    .map(|growth| growth.growth_upper)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "anchor has no completed capture".into())
+    }
+
+    /// Accurate reference demand/spread requires exact attained peaks for every repeat; no masked
+    /// upper is silently called measured variability or rescued by a smaller exact repeat.
+    pub fn exact_growth_and_margin_at(
+        &self,
+        coordinate: mlx_gen::ios_pricing::IosMemoryCoordinate,
+    ) -> Result<(u64, u64), String> {
+        let demands = self
+            .captures()
+            .iter()
+            .map(|capture| {
+                capture
+                    .kernel_growth(coordinate)?
+                    .exact_growth()
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let max = demands
+            .iter()
+            .copied()
+            .max()
+            .ok_or("anchor has no completed capture")?;
+        let min = demands
+            .iter()
+            .copied()
+            .min()
+            .ok_or("anchor has no completed capture")?;
+        Ok((max, (max - min).max(ANCHOR_MARGIN_FLOOR_BYTES)))
+    }
+
+    /// The ORIGINAL pre-request ledger, retained for diagnostics/compatibility, not silently
+    /// substituted for SDK BeforeModelLoad growth.
     /// The anchor's measured demand: the largest growth over the starting footprint across its
     /// repeats (`None` for a refused anchor).
     pub fn demand_bytes(&self) -> Option<u64> {
@@ -368,7 +889,10 @@ struct Table {
 }
 
 fn validate_key(k: &EvidenceKey) -> Result<(), String> {
-    for digest in [&k.layout_sha256, &k.architecture_sha256] {
+    for digest in [&k.layout_sha256, &k.architecture_sha256]
+        .into_iter()
+        .chain(k.configured_variant_sha256.iter())
+    {
         if digest.len() != 64
             || !digest
                 .bytes()
@@ -389,10 +913,19 @@ fn validate_key(k: &EvidenceKey) -> Result<(), String> {
     {
         return Err(format!("row {k:?}: incomplete key"));
     }
+    k.family()?;
+    if !k.execution.starts_with(k.load_form.execution_prefix()) {
+        return Err("typed load form disagrees with actual execution provenance".into());
+    }
+    if let Some(token) = &k.sampling_recipe {
+        if !k.execution.ends_with(&format!("|recipe={token}")) {
+            return Err("sampling recipe disagrees with execution provenance".into());
+        }
+    }
     Ok(())
 }
 
-fn validate(rows: &[AnchorRow]) -> Result<(), String> {
+pub(crate) fn validate_rows(rows: &[AnchorRow]) -> Result<(), String> {
     let mut families = std::collections::BTreeSet::new();
     let mut keys = std::collections::BTreeSet::new();
     for row in rows {
@@ -405,6 +938,9 @@ fn validate(rows: &[AnchorRow]) -> Result<(), String> {
         validate_key(k)?;
         if row.selection.strategy().is_none() || row.selection.parameters().is_none() {
             return Err(format!("row {k:?}: malformed anchor selection"));
+        }
+        if row.anchor_kind == AnchorKind::Resident && k.load_form != AnchorLoadForm::ResidentEager {
+            return Err(format!("row {k:?}: resident endpoint must be actual Resident+Eager, not staged/stream-armed"));
         }
         if (row.anchor_kind == AnchorKind::Resident) != (row.selection.rung == 0) {
             return Err(format!(
@@ -442,6 +978,67 @@ fn validate(rows: &[AnchorRow]) -> Result<(), String> {
                     if c.run_id.is_empty() || c.build_sha.is_empty() || c.steps == 0 {
                         return Err(format!("row {k:?}: capture missing run/build/steps"));
                     }
+                    c.kernel_growth(
+                        mlx_gen::ios_pricing::IosMemoryCoordinate::BeforeRequestConstruction,
+                    )
+                    .map_err(|error| {
+                        format!("row {k:?}: original footprint ledger invalid: {error}")
+                    })?;
+                    c.kernel_growth(mlx_gen::ios_pricing::IosMemoryCoordinate::BeforeModelLoad)
+                        .map_err(|error| {
+                            format!("row {k:?}: SDK footprint ledger invalid: {error}")
+                        })?;
+                    if let Some(coverage) = &c.sampling_coverage {
+                        coverage.validate().map_err(|e| format!("row {k:?}: {e}"))?;
+                    }
+                    if crate::sampling::requires_recipe(&k.provider) {
+                        let mut roles = c
+                            .sampling_coverage
+                            .as_ref()
+                            .ok_or("actual conditioning role witness missing")?
+                            .marks
+                            .iter()
+                            .filter(|mark| {
+                                mark.provider == "ios_capture" && mark.kind == "conditioning-roles"
+                            });
+                        let role = roles
+                            .next()
+                            .ok_or("actual conditioning role witness missing")?;
+                        if roles.next().is_some()
+                            || role.fields.len() != 3
+                            || role.fields.get("reference_count")
+                                != Some(&u64::from(k.reference_count))
+                            || role.fields.get("mask_count") != Some(&u64::from(k.mask_count))
+                            || role.fields.get("control_count") != Some(&u64::from(k.control_count))
+                        {
+                            return Err(format!("row {k:?}: conditioning roles disagree with actual prepared-carrier witness"));
+                        }
+                    }
+                    if let Some(quantum) = &c.quantum_coverage {
+                        let metadata = c
+                            .sampling_coverage
+                            .as_ref()
+                            .ok_or("quantum contexts have no metadata witness list")?;
+                        quantum.validate(metadata)?;
+                    }
+                    if crate::sampling::requires_generation_recipe(&k.provider)
+                        && c.quantum_coverage
+                            .as_ref()
+                            .is_none_or(|quantum| quantum.checks.is_empty() || quantum.truncated)
+                    {
+                        return Err(format!(
+                            "row {k:?}: actual quantum/context coverage missing/truncated"
+                        ));
+                    }
+                    if crate::sampling::requires_generation_recipe(&k.provider)
+                        && c.sampling_coverage.as_ref().is_none_or(|coverage| {
+                            !coverage.has_execution_observation() || coverage.truncated
+                        })
+                    {
+                        return Err(format!(
+                            "row {k:?}: actual sampling observations are missing/truncated"
+                        ));
+                    }
                     if c.baseline_footprint_bytes == 0
                         || c.baseline_footprint_bytes >= c.footprint_bytes
                     {
@@ -450,6 +1047,15 @@ fn validate(rows: &[AnchorRow]) -> Result<(), String> {
                         ));
                     }
                     for (label, q) in &c.quanta {
+                        if let Some(index) = q.preceding_sampling_mark {
+                            if c.sampling_coverage
+                                .as_ref()
+                                .and_then(|coverage| coverage.marks.get(index as usize))
+                                .is_none()
+                            {
+                                return Err(format!("row {k:?}: quantum {label} refers to missing sampling observation"));
+                            }
+                        }
                         if label.is_empty() || q.observed_bytes > c.footprint_bytes {
                             return Err(format!(
                                 "row {k:?}: quantum {label} observed above the lifetime peak"
@@ -477,7 +1083,7 @@ fn validate(rows: &[AnchorRow]) -> Result<(), String> {
         if !keys.insert(k.clone()) {
             return Err(format!("row {k:?}: duplicate key"));
         }
-        if !families.insert((k.family(), row.anchor_kind)) {
+        if !families.insert((k.family()?, row.anchor_kind)) {
             return Err(format!(
                 "row {k:?}: a family has at most one {:?} anchor",
                 row.anchor_kind
@@ -494,7 +1100,7 @@ pub(crate) fn parse(json: &str) -> Result<Vec<AnchorRow>, String> {
     if table.schema != EVIDENCE_SCHEMA {
         return Err(format!("unknown evidence schema {}", table.schema));
     }
-    validate(&table.anchors)?;
+    validate_rows(&table.anchors)?;
     Ok(table.anchors)
 }
 
@@ -519,7 +1125,7 @@ pub fn family_anchors<'a>(
 ) -> (Option<&'a AnchorRow>, Option<&'a AnchorRow>) {
     let of = |kind| {
         rows.iter()
-            .find(|r| r.anchor_kind == kind && &r.key.family() == family)
+            .find(|r| r.anchor_kind == kind && r.key.family().as_ref() == Ok(family))
     };
     (of(AnchorKind::Resident), of(AnchorKind::Optimized))
 }
@@ -530,11 +1136,36 @@ pub(crate) mod fixture {
     use super::*;
 
     pub fn capture(run: &str, baseline: u64, peak: u64, phases: &[(IosPhase, u64)]) -> Capture {
+        // Synthetic admission/schema fixture ONLY; native execution coverage is proved by actual
+        // callback tests, never by this fabricated measurement record.
+        let mut sampling = SamplingCoverage::default();
+        sampling
+            .record("synthetic_fixture", "solve_complete", &[("fixture", 1)])
+            .unwrap();
+        let mut quantum = QuantumCoverage::default();
+        quantum.record(Some(IosPhase::Denoise), "synthetic_kernel", vec![0]);
+        let snapshot = |current, peak| KernelFootprintSnapshot {
+            method: KernelFootprintMethod::TaskVmInfo,
+            query_status: 0,
+            requested_words: 93,
+            returned_words: 93,
+            current_required_words: 38,
+            peak_required_words: 84,
+            current_bytes: Some(current),
+            lifetime_peak_bytes: Some(peak),
+        };
         Capture {
             run_id: run.into(),
             build_sha: "synthetic".into(),
             steps: 1,
             baseline_footprint_bytes: baseline,
+            before_request_snapshot: Some(snapshot(baseline, baseline)),
+            before_model_load_snapshot: Some(snapshot(baseline, baseline)),
+            ending_snapshot: Some(snapshot(peak, peak)),
+            observed_current_peak_bytes: Some(peak),
+            observed_model_current_peak_bytes: Some(peak),
+            valid_kernel_queries: 2,
+            valid_model_kernel_queries: 2,
             footprint_bytes: peak,
             phase_peaks: phases
                 .iter()
@@ -548,11 +1179,30 @@ pub(crate) mod fixture {
                     )
                 })
                 .collect(),
+            sampling_coverage: Some(sampling),
+            quantum_coverage: Some(quantum),
+            quantum_query_gaps: 0,
             quanta: BTreeMap::new(),
             mlx_peak_bytes: 1,
             min_headroom_mib: 1.0,
             elapsed_seconds: 1.0,
         }
+    }
+
+    /// Change a synthetic capture's WHOLE-RUN kernel ledger consistently. Preserve role and
+    /// sampling observations; callers changing phase-attributed peaks must update those separately.
+    pub fn set_kernel_footprints(capture: &mut Capture, baseline: u64, peak: u64) {
+        assert!(baseline > 0 && peak > baseline);
+        let ledger = self::capture("synthetic-ledger", baseline, peak, &[]);
+        capture.baseline_footprint_bytes = ledger.baseline_footprint_bytes;
+        capture.before_request_snapshot = ledger.before_request_snapshot;
+        capture.before_model_load_snapshot = ledger.before_model_load_snapshot;
+        capture.ending_snapshot = ledger.ending_snapshot;
+        capture.observed_current_peak_bytes = ledger.observed_current_peak_bytes;
+        capture.observed_model_current_peak_bytes = ledger.observed_model_current_peak_bytes;
+        capture.valid_kernel_queries = ledger.valid_kernel_queries;
+        capture.valid_model_kernel_queries = ledger.valid_model_kernel_queries;
+        capture.footprint_bytes = ledger.footprint_bytes;
     }
 
     /// A completed anchor whose repeats all measure `demand` over a 1-byte baseline (phase-blind).
@@ -566,13 +1216,28 @@ pub(crate) mod fixture {
             AnchorKind::Optimized => MIN_OPTIMIZED_REPEATS,
             AnchorKind::Resident => 1,
         };
+        let roles = [
+            ("reference_count", u64::from(key.reference_count)),
+            ("mask_count", u64::from(key.mask_count)),
+            ("control_count", u64::from(key.control_count)),
+        ];
         AnchorRow {
             key,
             anchor_kind: kind,
             selection,
             outcome: AnchorOutcome::Completed {
                 captures: (0..repeats)
-                    .map(|i| capture(&format!("r{i}"), 1, demand + 1, &[]))
+                    .map(|i| {
+                        let mut capture = capture(&format!("r{i}"), 1, demand + 1, &[]);
+                        // Deliberately synthetic schema fixture, not a production witness/proof.
+                        capture
+                            .sampling_coverage
+                            .as_mut()
+                            .unwrap()
+                            .record("ios_capture", "conditioning-roles", &roles)
+                            .unwrap();
+                        capture
+                    })
                     .collect(),
             },
             evidence_class: DEVICE_CAPTURE_CLASS.into(),
@@ -585,22 +1250,143 @@ mod tests {
     use super::fixture::*;
     use super::*;
 
+    #[test]
+    fn sampling_observations_are_bounded_and_dangling_quantum_contexts_fail_closed() {
+        let mut coverage = SamplingCoverage::default();
+        assert_eq!(
+            coverage.record(
+                "curated",
+                "solver_primary",
+                &[("step", 0), ("history_denoised", 1)]
+            ),
+            Some(0)
+        );
+        assert_eq!(coverage.counts["curated"]["solver_primary"], 1);
+        assert_eq!(
+            coverage.record("curated", "solver_primary", &[("step", 1), ("step", 2)]),
+            None
+        );
+        assert_eq!(coverage.malformed_marks, 1);
+        assert!(coverage.truncated);
+        coverage.validate().unwrap();
+        let mut bounded = SamplingCoverage::default();
+        for i in 0..MAX_SAMPLING_MARKS {
+            assert!(bounded
+                .record("curated", "solver_update", &[("step", i as u64)])
+                .is_some());
+        }
+        assert!(bounded
+            .record(
+                "curated",
+                "solve_complete",
+                &[("evaluations", MAX_SAMPLING_MARKS as u64)]
+            )
+            .is_none());
+        assert_eq!(bounded.marks.len(), MAX_SAMPLING_MARKS);
+        assert_eq!(bounded.dropped_marks, 1);
+        assert!(bounded.truncated);
+        bounded.validate().unwrap();
+        let mut row = completed(key(), AnchorKind::Optimized, optimized(), 1000);
+        let AnchorOutcome::Completed { captures } = &mut row.outcome else {
+            unreachable!()
+        };
+        captures[0].quanta.insert(
+            "q".into(),
+            QuantumObservation {
+                priced_scratch_bytes: 1,
+                observed_bytes: 1,
+                exact: true,
+                preceding_sampling_mark: Some(99),
+            },
+        );
+        assert!(parse(&table(&[row]))
+            .unwrap_err()
+            .contains("missing sampling observation"));
+    }
+
     fn key() -> EvidenceKey {
         EvidenceKey {
             machine: "iPhone17,2".into(),
-            provider: "sana_1600m".into(),
-            route: "sana_1600m".into(),
+            provider: "synthetic_task".into(),
+            route: "synthetic_task".into(),
             tier: "q4".into(),
             layout_sha256: "ab".repeat(32),
             architecture_sha256: "cd".repeat(32),
+            configured_variant_sha256: None,
             mode: "text_to_image".into(),
             width: 512,
             height: 512,
             batch: 1,
             reference_count: 0,
-            execution: "x".into(),
+            mask_count: 0,
+            control_count: 0,
+            load_form: AnchorLoadForm::SequentialDeferred,
+            execution: "Sequential|DeferredMaterialization|x".into(),
+            sampling_recipe: None,
             token_window: 0,
         }
+    }
+
+    #[test]
+    fn evidence_family_keeps_actual_control_init_and_mask_roles() {
+        let mut control = key();
+        control.mode = "control".into();
+        control.reference_count = 1; // aggregate: one Control, no true Reference.
+        control.control_count = 1;
+        let mut init = control.clone();
+        init.reference_count = 2; // aggregate: one Control + one true Reference.
+        let mut mask = init.clone();
+        mask.mode = "edit".into();
+        mask.control_count = 0;
+        mask.mask_count = 1;
+        assert_ne!(control.family().unwrap(), init.family().unwrap());
+        assert_ne!(init.family().unwrap(), mask.family().unwrap());
+        let mut alias = init.clone();
+        alias.mode = "control_alias".into();
+        assert_eq!(init.family().unwrap(), alias.family().unwrap());
+        let mut other_geometry = init.clone();
+        other_geometry.width *= 2;
+        other_geometry.height *= 2;
+        other_geometry.batch = 3;
+        assert_eq!(init.family().unwrap(), other_geometry.family().unwrap());
+        let mut multi = control.clone();
+        multi.reference_count = 2; // aggregate of two loaded control branches.
+        multi.control_count = 2;
+        assert!(multi.family().is_err());
+        multi.configured_variant_sha256 = Some("ef".repeat(32));
+        assert_ne!(control.family().unwrap(), multi.family().unwrap());
+
+        // Actual SDXL metadata replay revalidates roles before family classification, without
+        // fabricating a media payload or accepting rejected combinations as an INIT family.
+        let mut native = key();
+        native.provider = crate::sdxl::SDXL_ID.into();
+        native.route = "sdxl".into();
+        let mut scalar = mlx_gen::GenerationRequest {
+            sampler: Some("lcm".into()),
+            ..Default::default()
+        };
+        native.sampling_recipe = Some(
+            mlx_gen_sdxl::sampling::SamplingRecipe::from_request(&scalar)
+                .unwrap()
+                .canonical_token(),
+        );
+        native.mode = "ip_adapter".into();
+        native.reference_count = 1;
+        assert!(native.family().is_err()); // Actual early acceleration+Reference refusal.
+        scalar.sampler = None;
+        native.sampling_recipe = Some(
+            mlx_gen_sdxl::sampling::SamplingRecipe::from_request(&scalar)
+                .unwrap()
+                .canonical_token(),
+        );
+        native.mode = "edit".into();
+        native.reference_count = 3; // Reference + Mask + Control, before native policy refusal.
+        native.mask_count = 1;
+        native.control_count = 1;
+        assert!(native.family().is_err()); // Actual mask+Control refusal.
+        native.control_count = 0;
+        native.reference_count = 2; // supported Reference + Mask aggregate.
+        assert!(native.family().is_ok()); // Actual supported single-reference mask graph.
     }
 
     fn optimized() -> AnchorSelection {
@@ -635,7 +1421,8 @@ mod tests {
         // A resident refusal is evidence; an optimized refusal is a defect.
         let refused = |kind, rung| AnchorRow {
             key: EvidenceKey {
-                execution: "resident".into(),
+                execution: "Resident|EagerMaterialization|resident".into(),
+                load_form: AnchorLoadForm::ResidentEager,
                 ..key()
             },
             anchor_kind: kind,
@@ -711,7 +1498,7 @@ mod tests {
         rung0.selection.rung = 0;
         assert!(parse(&table(&[rung0])).is_err());
         let mut twin = good.clone();
-        twin.key.execution = "y".into();
+        twin.key.execution = "Sequential|DeferredMaterialization|y".into();
         assert!(parse(&table(&[good.clone(), twin])).is_err());
         let mut host = good.clone();
         host.evidence_class = "mac_host_peak".into();
@@ -758,6 +1545,7 @@ mod tests {
             priced_scratch_bytes: priced,
             observed_bytes: observed,
             exact,
+            preceding_sampling_mark: None,
         };
         if let AnchorOutcome::Completed { captures } = &mut row.outcome {
             captures.push(capture("r2", 1, 1001, &[]));

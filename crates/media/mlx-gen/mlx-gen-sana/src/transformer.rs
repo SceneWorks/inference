@@ -996,6 +996,18 @@ impl SanaTransformer {
         self.blocks.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_block_stream(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        std::iter::once(&self.caption_norm)
+            .chain(self.blocks.iter().map(|b| &b.scale_shift_table))
+            .collect()
+    }
+
     /// Forward one denoise step.
     ///
     /// * `latent_nchw` — `[B, in_channels, H, W]` (channels-first, diffusers-native).
@@ -1060,7 +1072,7 @@ impl SanaTransformer {
         let p = cfg.patch_size;
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         // The previous step's CFG combine + sampler update is lazy and materializes here.
         mlx_gen::ios_quantum::before(
             crate::quantum::labels::ENTRY,

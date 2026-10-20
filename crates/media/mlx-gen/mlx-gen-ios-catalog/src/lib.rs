@@ -51,22 +51,31 @@
 mod admission;
 pub mod anchor;
 pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
+mod binding;
 mod bound;
+mod capture_config;
+pub use capture_config::capture_adapters;
 pub mod evidence;
 pub mod ios_admission;
 mod layout;
 pub mod pricing;
 mod refusal;
+pub mod sampling;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
 /// The labelled bounded device-capture permit; compiled only for the device harness.
 #[cfg(feature = "device-capture")]
 pub use ios_admission::capture_permit;
 pub use ios_admission::{
-    admit, build_candidate, capacity_budget, evidence_key, execution_for, execution_key,
-    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, AdmissionBasis,
-    IosCandidate, IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+    admit, admit_with_baseline, build_candidate, capacity_budget, configured_endpoint,
+    configured_load_form, evidence_key, execution_for, execution_key, tier_label, token_window,
+    validate_actual, work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork,
+    IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
-pub use layout::{architecture_digest, artifact_layout_digest, hex};
+pub use layout::{
+    architecture_digest, artifact_layout_digest, capture_artifact_stem, configured_variant_digest,
+    hex,
+};
+pub use mlx_gen::ios_pricing::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads
 /// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
 pub use mlx_gen::ios_quantum;

@@ -106,8 +106,10 @@ fn tier_name(bits: Option<i32>) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::evidence::{AnchorKind, AnchorSelection};
-    use crate::ios_admission::{admit, admit_with_rows, build_candidate, evidence_key, IosWork};
-    use crate::sdxl::tests::{budget, write_tensor, DEVICE};
+    use crate::ios_admission::{admit, build_candidate, evidence_key, IosWork};
+    use crate::sdxl::tests::{
+        admit_fixture_rows as admit_with_rows, budget, write_tensor, DEVICE, FIXTURE_BML_BYTES,
+    };
     use crate::RefusalKind;
     use mlx_gen::gen_core::{
         Conditioning, ControlKind, GenerationOutput, GenerationRequest, Generator, Image,
@@ -503,15 +505,14 @@ pub(crate) mod tests {
         );
         if let crate::evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
             for c in captures.iter_mut() {
-                c.footprint_bytes = 3 << 30;
-                c.baseline_footprint_bytes = 1 << 28;
+                crate::evidence::fixture::set_kernel_footprints(c, 1 << 28, 3 << 30);
             }
         }
         let admitted = admit_with_rows(
             &registry,
             std::slice::from_ref(&candidate),
             DEVICE,
-            crate::capacity_budget(8 << 30, 0, None),
+            crate::capacity_budget(8 << 30, FIXTURE_BML_BYTES, None),
             &[row],
         )
         .unwrap();

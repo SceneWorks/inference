@@ -71,6 +71,19 @@ pub struct StepCoeffs {
     pub a_noise: f32,
 }
 
+impl StepCoeffs {
+    /// The EXISTING legacy backend byte-parity branch. Metadata uses this same predicate;
+    /// it does not introduce a new multiply-by-one/zero optimization or backing guarantee.
+    pub fn uses_unity_noiseless_update(&self) -> bool {
+        self.a_x == 1.0 && self.a_noise == 0.0
+    }
+
+    /// Whether the existing legacy update draws/re-noises. Preserve exact `!= 0` semantics.
+    pub fn has_noise(&self) -> bool {
+        self.a_noise != 0.0
+    }
+}
+
 /// The precision in which the backend computes the step update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepDtype {
@@ -149,6 +162,35 @@ impl AlphaSchedule {
     }
 }
 
+/// The actual fixed origin-table producer for LCM/TCD. Its size depends on the policy's
+/// original-step table, never on the requested inference count. Kept signed exactly as the
+/// historical producer until the selected timestep is cast by its caller.
+pub fn lcm_style_origin_timesteps(num_train_timesteps: usize, original_steps: usize) -> Vec<i64> {
+    let original_steps = original_steps.max(1);
+    let k = num_train_timesteps / original_steps;
+    let origin: Vec<i64> = (1..=original_steps as i64)
+        .map(|i| i * k as i64 - 1)
+        .collect();
+    origin.into_iter().rev().collect()
+}
+
+/// One EXACT `floor(linspace(0,len,num_steps,endpoint=False))` index from the executable
+/// producer, with its literal f64 evaluation order. A metadata caller may query bounded interval
+/// endpoints without allocating/iterating the requested schedule. No inference-step cap exists.
+pub fn lcm_style_timestep_index(
+    origin_len: usize,
+    num_steps: usize,
+    index: usize,
+) -> Option<usize> {
+    let num_steps = num_steps.max(1);
+    if origin_len == 0 || index >= num_steps {
+        return None;
+    }
+    let len = origin_len as f64;
+    let idx = (len * index as f64 / num_steps as f64).floor() as usize;
+    Some(idx.min(origin_len - 1))
+}
+
 /// Select the LCM/TCD inference timesteps (the shared diffusers logic): take `original_steps`
 /// linearly-spaced training timesteps `arange(1, original_steps+1)·k − 1` (`k = N/original_steps`),
 /// reverse, then pick `num_steps` evenly-spaced-by-index entries. For SDXL `N=1000`,
@@ -163,18 +205,12 @@ pub fn lcm_style_timesteps(
     // floor is `Capabilities::validate_request` rejecting `steps == Some(0)` upstream (F-007/F-037).
     let original_steps = original_steps.max(1);
     let num_steps = num_steps.max(1);
-    let k = num_train_timesteps / original_steps;
-    // lcm_origin_timesteps = arange(1, original_steps+1)·k − 1, then reversed (descending).
-    let origin: Vec<i64> = (1..=original_steps as i64)
-        .map(|i| i * k as i64 - 1)
-        .collect();
-    let reversed: Vec<i64> = origin.into_iter().rev().collect();
-    // inference_indices = floor(linspace(0, len, num_steps, endpoint=False)).
-    let len = reversed.len() as f64;
+    let reversed = lcm_style_origin_timesteps(num_train_timesteps, original_steps);
     (0..num_steps)
         .map(|j| {
-            let idx = (len * j as f64 / num_steps as f64).floor() as usize;
-            reversed[idx.min(reversed.len() - 1)] as usize
+            let idx = lcm_style_timestep_index(reversed.len(), num_steps, j)
+                .expect("LCM/TCD nonempty origin and in-range step");
+            reversed[idx] as usize
         })
         .collect()
 }
@@ -534,6 +570,46 @@ pub struct LcmPolicy {
     timestep_scaling: f32,
 }
 
+/// The existing LCMScheduler constructor constant, shared with bounded metadata projection.
+pub const LCM_TIMESTEP_SCALING: f32 = 10.0;
+
+/// Exact LCM coefficient producer for one actual transition. `None` is the policy's FINAL
+/// step (no re-noise), not missing metadata. Expression order/types match the executable policy.
+pub fn lcm_transition_coeffs(
+    sched: &AlphaSchedule,
+    t: usize,
+    next_t: Option<usize>,
+    timestep_scaling: f32,
+) -> StepCoeffs {
+    let apt = sched.acp(t);
+    let bpt = 1.0 - apt;
+    let scaled_t = t as f64 * timestep_scaling as f64;
+    let c_skip = 0.25 / (scaled_t * scaled_t + 0.25);
+    let c_out = scaled_t / (scaled_t * scaled_t + 0.25).sqrt();
+    let d_x = c_out / apt.sqrt() + c_skip;
+    let d_eps = -c_out * bpt.sqrt() / apt.sqrt();
+    let det = StepCoeffs {
+        timestep: t as f32,
+        c_in: 1.0,
+        a_x: d_x as f32,
+        a_out: d_eps as f32,
+        a_noise: 0.0,
+    };
+    let Some(next_t) = next_t else {
+        return det;
+    };
+    let apt_prev = sched.acp(next_t);
+    let bpt_prev = 1.0 - apt_prev;
+    let s = apt_prev.sqrt() as f32;
+    StepCoeffs {
+        timestep: det.timestep,
+        c_in: 1.0,
+        a_x: det.a_x * s,
+        a_out: det.a_out * s,
+        a_noise: bpt_prev.sqrt() as f32,
+    }
+}
+
 impl LcmPolicy {
     /// Build for `num_steps` inference steps. `original_inference_steps` is diffusers' default 50.
     pub fn new(
@@ -549,31 +625,14 @@ impl LcmPolicy {
                 num_steps,
             ),
             sched,
-            timestep_scaling: 10.0,
+            timestep_scaling: LCM_TIMESTEP_SCALING,
         }
     }
 
     /// The consistency-prediction (`denoised`) coefficients at step `i` — diffusers' deterministic
     /// `denoised` before the between-step re-noise. `x_next = d_x·x + d_eps·eps`.
     pub fn denoised_coeffs(&self, i: usize) -> StepCoeffs {
-        let t = self.timesteps[i];
-        let apt = self.sched.acp(t);
-        let bpt = 1.0 - apt;
-        // Boundary-condition scalings (sigma_data=0.5 → sigma_data²=0.25).
-        let scaled_t = t as f64 * self.timestep_scaling as f64;
-        let c_skip = 0.25 / (scaled_t * scaled_t + 0.25);
-        let c_out = scaled_t / (scaled_t * scaled_t + 0.25).sqrt();
-        // denoised = c_out·pred_x0 + c_skip·x, pred_x0 = (x − √β̄·eps)/√ᾱ
-        //          = (c_out/√ᾱ + c_skip)·x + (−c_out·√β̄/√ᾱ)·eps.
-        let d_x = c_out / apt.sqrt() + c_skip;
-        let d_eps = -c_out * bpt.sqrt() / apt.sqrt();
-        StepCoeffs {
-            timestep: t as f32,
-            c_in: 1.0,
-            a_x: d_x as f32,
-            a_out: d_eps as f32,
-            a_noise: 0.0,
-        }
+        lcm_transition_coeffs(&self.sched, self.timesteps[i], None, self.timestep_scaling)
     }
 }
 
@@ -591,22 +650,12 @@ impl SamplerPolicy for LcmPolicy {
     }
 
     fn coeffs(&self, i: usize) -> StepCoeffs {
-        let det = self.denoised_coeffs(i);
-        if i == self.timesteps.len() - 1 {
-            // No re-noise on the final step (also: one-step sampling never re-noises).
-            return det;
-        }
-        // prev = √ᾱ_prev·denoised + √β̄_prev·noise.
-        let apt_prev = self.sched.acp(self.timesteps[i + 1]);
-        let bpt_prev = 1.0 - apt_prev;
-        let s = apt_prev.sqrt() as f32;
-        StepCoeffs {
-            timestep: det.timestep,
-            c_in: 1.0,
-            a_x: det.a_x * s,
-            a_out: det.a_out * s,
-            a_noise: bpt_prev.sqrt() as f32,
-        }
+        lcm_transition_coeffs(
+            &self.sched,
+            self.timesteps[i],
+            self.timesteps.get(i + 1).copied(),
+            self.timestep_scaling,
+        )
     }
 
     fn sigma(&self, _i: usize) -> Option<f32> {
@@ -622,6 +671,53 @@ pub struct TcdPolicy {
     sched: AlphaSchedule,
     timesteps: Vec<usize>,
     eta: f32,
+}
+
+fn tcd_pred_noised_coeffs_at(
+    sched: &AlphaSchedule,
+    t: usize,
+    prev_t: usize,
+    eta: f32,
+) -> StepCoeffs {
+    let timestep_s = ((1.0 - eta as f64) * prev_t as f64).floor() as usize;
+    let apt = sched.acp(t);
+    let bpt = 1.0 - apt;
+    let aps = sched.acp(timestep_s);
+    let bps = 1.0 - aps;
+    let p_x = (aps / apt).sqrt();
+    let p_eps = bps.sqrt() - aps.sqrt() * bpt.sqrt() / apt.sqrt();
+    StepCoeffs {
+        timestep: t as f32,
+        c_in: 1.0,
+        a_x: p_x as f32,
+        a_out: p_eps as f32,
+        a_noise: 0.0,
+    }
+}
+
+/// Exact TCD coefficient producer for an actual transition. The policy's terminal `prev_t=0`
+/// and eta/noise decision are preserved. No timestep schedule or tensor is constructed.
+pub fn tcd_transition_coeffs(
+    sched: &AlphaSchedule,
+    t: usize,
+    next_t: Option<usize>,
+    eta: f32,
+) -> StepCoeffs {
+    let prev_t = next_t.unwrap_or(0);
+    let det = tcd_pred_noised_coeffs_at(sched, t, prev_t, eta);
+    if eta > 0.0 && next_t.is_some() {
+        let timestep_s = ((1.0 - eta as f64) * prev_t as f64).floor() as usize;
+        let ratio = sched.acp(prev_t) / sched.acp(timestep_s);
+        let r = ratio.sqrt() as f32;
+        return StepCoeffs {
+            timestep: det.timestep,
+            c_in: 1.0,
+            a_x: det.a_x * r,
+            a_out: det.a_out * r,
+            a_noise: (1.0 - ratio).max(0.0).sqrt() as f32,
+        };
+    }
+    det
 }
 
 impl TcdPolicy {
@@ -650,24 +746,8 @@ impl TcdPolicy {
     pub fn pred_noised_coeffs(&self, i: usize) -> StepCoeffs {
         let t = self.timesteps[i];
         let last = i == self.timesteps.len() - 1;
-        // prev_timestep = timesteps[i+1] if it exists else 0; timestep_s = floor((1−η)·prev_t).
         let prev_t = if last { 0 } else { self.timesteps[i + 1] };
-        let timestep_s = ((1.0 - self.eta as f64) * prev_t as f64).floor() as usize;
-        let apt = self.sched.acp(t);
-        let bpt = 1.0 - apt;
-        let aps = self.sched.acp(timestep_s);
-        let bps = 1.0 - aps;
-        // pred_noised = √ᾱ_s·pred_x0 + √β̄_s·eps, pred_x0 = (x − √β̄_t·eps)/√ᾱ_t
-        //            = √(ᾱ_s/ᾱ_t)·x + (√β̄_s − √ᾱ_s·√β̄_t/√ᾱ_t)·eps.
-        let p_x = (aps / apt).sqrt();
-        let p_eps = bps.sqrt() - aps.sqrt() * bpt.sqrt() / apt.sqrt();
-        StepCoeffs {
-            timestep: t as f32,
-            c_in: 1.0,
-            a_x: p_x as f32,
-            a_out: p_eps as f32,
-            a_noise: 0.0,
-        }
+        tcd_pred_noised_coeffs_at(&self.sched, t, prev_t, self.eta)
     }
 }
 
@@ -685,23 +765,12 @@ impl SamplerPolicy for TcdPolicy {
     }
 
     fn coeffs(&self, i: usize) -> StepCoeffs {
-        let det = self.pred_noised_coeffs(i);
-        let last = i == self.timesteps.len() - 1;
-        if self.eta > 0.0 && !last {
-            // prev = √(ᾱ_prev/ᾱ_s)·pred_noised + √(1 − ᾱ_prev/ᾱ_s)·noise.
-            let prev_t = self.timesteps[i + 1];
-            let timestep_s = ((1.0 - self.eta as f64) * prev_t as f64).floor() as usize;
-            let ratio = self.sched.acp(prev_t) / self.sched.acp(timestep_s);
-            let r = ratio.sqrt() as f32;
-            return StepCoeffs {
-                timestep: det.timestep,
-                c_in: 1.0,
-                a_x: det.a_x * r,
-                a_out: det.a_out * r,
-                a_noise: (1.0 - ratio).max(0.0).sqrt() as f32,
-            };
-        }
-        det
+        tcd_transition_coeffs(
+            &self.sched,
+            self.timesteps[i],
+            self.timesteps.get(i + 1).copied(),
+            self.eta,
+        )
     }
 
     fn sigma(&self, _i: usize) -> Option<f32> {
@@ -715,6 +784,164 @@ mod tests {
 
     fn sdxl_sched() -> AlphaSchedule {
         AlphaSchedule::scaled_linear(1000, 0.00085, 0.012)
+    }
+
+    #[test]
+    fn scalar_lcm_indices_preserve_original_floor_and_u32_boundaries() {
+        // Independent frozen expression from the pre-extraction producer. Small runtime schedules
+        // are references; MAX is queried only by scalar, never allocated or iterated.
+        for requested in [0usize, 1, 2, 49, 50, 51, 52, 99, 1000] {
+            let n = requested.max(1);
+            let origin: Vec<i64> = (1..=50i64).map(|i| i * 20 - 1).rev().collect();
+            let indices: Vec<_> = (0..n)
+                .map(|j| {
+                    ((origin.len() as f64 * j as f64 / n as f64).floor() as usize)
+                        .min(origin.len() - 1)
+                })
+                .collect();
+            let expected: Vec<_> = indices.iter().map(|j| origin[*j] as usize).collect();
+            let actual_indices: Vec<_> = (0..n)
+                .map(|j| lcm_style_timestep_index(origin.len(), requested, j).unwrap())
+                .collect();
+            assert_eq!(
+                (lcm_style_timesteps(1000, 50, requested), actual_indices),
+                (expected, indices),
+                "original index rule requested={requested}"
+            );
+        }
+        let n = u32::MAX as usize;
+        for j in [0, 1, n / 50, n / 2, n - 2, n - 1] {
+            let expected = ((50f64 * j as f64 / n as f64).floor() as usize).min(49);
+            assert_eq!(
+                lcm_style_timestep_index(50, n, j),
+                Some(expected),
+                "MAX scalar index j={j}"
+            );
+        }
+        assert_eq!(lcm_style_timestep_index(0, 51, 0), None);
+        assert_eq!(lcm_style_timestep_index(50, 51, 51), None);
+    }
+
+    #[test]
+    fn scalar_acceleration_coefficients_preserve_legacy_float_bits_and_predicates() {
+        fn bits(c: StepCoeffs) -> [u32; 5] {
+            [
+                c.timestep.to_bits(),
+                c.c_in.to_bits(),
+                c.a_x.to_bits(),
+                c.a_out.to_bits(),
+                c.a_noise.to_bits(),
+            ]
+        }
+        // Independent pre-extraction arithmetic, including every f64/f32 rounding boundary.
+        fn old_lcm(s: &AlphaSchedule, t: usize, next: Option<usize>) -> StepCoeffs {
+            let apt = s.acp(t);
+            let bpt = 1.0 - apt;
+            let scaled_t = t as f64 * 10.0_f32 as f64;
+            let c_skip = 0.25 / (scaled_t * scaled_t + 0.25);
+            let c_out = scaled_t / (scaled_t * scaled_t + 0.25).sqrt();
+            let d_x = c_out / apt.sqrt() + c_skip;
+            let d_eps = -c_out * bpt.sqrt() / apt.sqrt();
+            let det = StepCoeffs {
+                timestep: t as f32,
+                c_in: 1.0,
+                a_x: d_x as f32,
+                a_out: d_eps as f32,
+                a_noise: 0.0,
+            };
+            let Some(next) = next else {
+                return det;
+            };
+            let apt_prev = s.acp(next);
+            let bpt_prev = 1.0 - apt_prev;
+            let scale = apt_prev.sqrt() as f32;
+            StepCoeffs {
+                timestep: det.timestep,
+                c_in: 1.0,
+                a_x: det.a_x * scale,
+                a_out: det.a_out * scale,
+                a_noise: bpt_prev.sqrt() as f32,
+            }
+        }
+        fn old_tcd(s: &AlphaSchedule, t: usize, next: Option<usize>, eta: f32) -> StepCoeffs {
+            let prev = next.unwrap_or(0);
+            let timestep_s = ((1.0 - eta as f64) * prev as f64).floor() as usize;
+            let apt = s.acp(t);
+            let bpt = 1.0 - apt;
+            let aps = s.acp(timestep_s);
+            let bps = 1.0 - aps;
+            let p_x = (aps / apt).sqrt();
+            let p_eps = bps.sqrt() - aps.sqrt() * bpt.sqrt() / apt.sqrt();
+            let det = StepCoeffs {
+                timestep: t as f32,
+                c_in: 1.0,
+                a_x: p_x as f32,
+                a_out: p_eps as f32,
+                a_noise: 0.0,
+            };
+            if eta > 0.0 && next.is_some() {
+                let timestep_s = ((1.0 - eta as f64) * prev as f64).floor() as usize;
+                let ratio = s.acp(prev) / s.acp(timestep_s);
+                let r = ratio.sqrt() as f32;
+                return StepCoeffs {
+                    timestep: det.timestep,
+                    c_in: 1.0,
+                    a_x: det.a_x * r,
+                    a_out: det.a_out * r,
+                    a_noise: (1.0 - ratio).max(0.0).sqrt() as f32,
+                };
+            }
+            det
+        }
+        let alpha = sdxl_sched();
+        for n in [1usize, 2, 50, 51] {
+            let times = lcm_style_timesteps(1000, 50, n);
+            let lcm = LcmPolicy::new(alpha.clone(), 1000, 50, n);
+            for i in 0..n {
+                let expected = old_lcm(&alpha, times[i], times.get(i + 1).copied());
+                assert_eq!(
+                    (
+                        bits(lcm.coeffs(i)),
+                        bits(lcm_transition_coeffs(
+                            &alpha,
+                            times[i],
+                            times.get(i + 1).copied(),
+                            LCM_TIMESTEP_SCALING
+                        ))
+                    ),
+                    (bits(expected), bits(expected)),
+                    "LCM exact bits n={n} i={i}"
+                );
+            }
+            for eta in [0.0_f32, 0.3] {
+                let tcd = TcdPolicy::new(alpha.clone(), 1000, 50, n, eta);
+                for i in 0..n {
+                    let expected = old_tcd(&alpha, times[i], times.get(i + 1).copied(), eta);
+                    let actual = tcd.coeffs(i);
+                    assert_eq!(
+                        (
+                            bits(actual),
+                            bits(tcd_transition_coeffs(
+                                &alpha,
+                                times[i],
+                                times.get(i + 1).copied(),
+                                eta
+                            ))
+                        ),
+                        (bits(expected), bits(expected)),
+                        "TCD exact bits n={n} i={i} eta={eta}"
+                    );
+                    assert_eq!(
+                        (actual.uses_unity_noiseless_update(), actual.has_noise()),
+                        (
+                            expected.a_x == 1.0 && expected.a_noise == 0.0,
+                            expected.a_noise != 0.0
+                        ),
+                        "actual legacy graph predicates n={n} i={i} eta={eta}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

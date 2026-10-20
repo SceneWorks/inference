@@ -1,7 +1,7 @@
 //! The shared seam across providers/modes: typed mode refusals, SANA's request-bound wrapper,
 //! the bound transform/depth wrappers, and the non-circular capture permit.
 use super::*;
-use crate::sdxl::tests::{budget, DEVICE};
+use crate::sdxl::tests::{admit_fixture_rows as admit_with_rows, budget, DEVICE};
 use mlx_gen::gen_core::iris::depth::{DepthOutput, IrisDepthEstimator};
 use mlx_gen::gen_core::{
     GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform, TransformDescriptor,
@@ -10,6 +10,52 @@ use mlx_gen::gen_core::{
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+
+// Reuse the existing provider CPU-child/Metal-trap mechanism, not a second guard implementation.
+#[cfg(target_os = "macos")]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+mod metal_guard;
+
+#[cfg(target_os = "macos")]
+fn in_cpu_child(test: &str, body: fn()) {
+    const CHILD: &str = "IOS_ADMISSION_CPU_CHILD";
+    const DONE: &str = "IOS_ADMISSION_CPU_CHILD_DONE";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert_eq!(
+            mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+            mlx_rs::Device::cpu()
+        );
+        assert!(metal_guard::forbid_metal());
+        assert!(metal_guard::metal_forbidden());
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
+        body();
+        std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
+        return;
+    }
+    let done = tempfile::tempdir().unwrap();
+    let marker = done.path().join("done");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .env(CHILD, test)
+        .env(DONE, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} failed in its CPU child");
+    assert!(marker.is_file(), "{test}: the CPU child ran no body");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn in_cpu_child(_: &str, body: fn()) {
+    body();
+}
 
 fn sana(root: &Path) -> LoadSpec {
     for (dir, key) in [
@@ -204,6 +250,261 @@ fn the_loaded_tier_is_recorded_in_the_key() {
         );
         assert_eq!(tier_label(&c.spec), label);
         assert_eq!(evidence_key(&registry, &c, DEVICE).unwrap().tier, label);
+    }
+}
+
+#[test]
+fn endpoint_family_is_shared_but_execution_and_receipt_load_forms_are_not() {
+    use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+    let registry = crate::provider_registry().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut resident_spec = sana(root.path());
+    AnchorKind::Resident.apply_load_form(&mut resident_spec);
+    let resident = build_candidate(
+        &registry,
+        "sana_1600m",
+        resident_spec.clone(),
+        None,
+        MemoryStrategy::Resident,
+        generation(512, vec![]),
+    )
+    .unwrap();
+    let mut optimized_spec = resident_spec;
+    AnchorKind::Optimized.apply_load_form(&mut optimized_spec);
+    let optimized = build_candidate(
+        &registry,
+        "sana_1600m",
+        optimized_spec,
+        None,
+        MemoryStrategy::BoundedAttention,
+        generation(512, vec![]),
+    )
+    .unwrap();
+    let resident_key = evidence_key(&registry, &resident, DEVICE).unwrap();
+    let optimized_key = evidence_key(&registry, &optimized, DEVICE).unwrap();
+    assert_eq!(resident_key.family(), optimized_key.family());
+    assert_ne!(resident_key.layout_sha256, optimized_key.layout_sha256);
+    assert_ne!(resident_key.execution, optimized_key.execution);
+    assert!(resident_key
+        .execution
+        .starts_with("Resident|EagerMaterialization|"));
+    assert!(optimized_key
+        .execution
+        .starts_with("Sequential|DeferredMaterialization|"));
+    assert!(!resident.execution.stage_residency);
+    let mut drifted = resident.clone();
+    drifted.spec.load_shape = LoadShape::DeferredMaterialization;
+    assert!(validate_actual(&registry, &drifted).is_err());
+    // A receipt cannot substitute either axis after admission, even if a forged context copies it.
+    for shape_axis in [false, true] {
+        let rows = [row(&registry, &resident, 1 << 20)];
+        let mut receipt = admit_with_rows(
+            &registry,
+            std::slice::from_ref(&resident),
+            DEVICE,
+            budget(),
+            &rows,
+        )
+        .unwrap();
+        if shape_axis {
+            receipt.spec.load_shape = LoadShape::DeferredMaterialization;
+            receipt.context.load_shape = LoadShape::DeferredMaterialization;
+        } else {
+            receipt.spec.offload_policy = OffloadPolicy::Sequential;
+        }
+        let called = Rc::new(Cell::new(false));
+        let loaded = called.clone();
+        assert!(receipt
+            .load_generator_using(
+                move |_| {
+                    loaded.set(true);
+                    panic!("forged load form reached loader")
+                },
+                Box::new(|_| Ok(()))
+            )
+            .is_err());
+        assert!(!called.get());
+    }
+}
+
+#[test]
+fn sdxl_token_window_uses_effective_sampler_guidance_not_an_unconditional_negative_row() {
+    let registry = crate::provider_registry().unwrap();
+    let root = crate::sdxl::tests::fixture();
+    let base =
+        crate::sdxl::tests::candidate(&registry, root.path(), "sdxl", 512, None, "text_to_image");
+    let descriptor = registry
+        .generators()
+        .map(|r| (r.descriptor)())
+        .find(|d| d.id == "sdxl")
+        .unwrap();
+    for sampler in descriptor.capabilities.samplers {
+        let mut candidate = base.clone();
+        let IosWork::Generate(request) = &mut candidate.work else {
+            unreachable!()
+        };
+        request.sampler = Some(sampler.into());
+        request.negative_prompt = Some("many long negative prompt tokens ".repeat(1000));
+        request.guidance = Some(1.0);
+        let off = token_window(&candidate).unwrap();
+        let IosWork::Generate(request) = &mut candidate.work else {
+            unreachable!()
+        };
+        request.negative_prompt = None;
+        assert_eq!(
+            token_window(&candidate).unwrap(),
+            off,
+            "CFG-off {sampler} must not tokenize the negative prompt"
+        );
+        let IosWork::Generate(request) = &mut candidate.work else {
+            unreachable!()
+        };
+        request.negative_prompt = Some("many long negative prompt tokens ".repeat(1000));
+        request.guidance = Some(7.0);
+        assert!(
+            token_window(&candidate).unwrap() > off,
+            "CFG-on {sampler} must include the actual negative window"
+        );
+        let IosWork::Generate(request) = &mut candidate.work else {
+            unreachable!()
+        };
+        request.guidance = None;
+        let cfg_on = crate::sdxl::sampling::ResolvedSampling::resolve(request)
+            .unwrap()
+            .guidance()
+            > 1.0;
+        assert_eq!(
+            token_window(&candidate).unwrap() > off,
+            cfg_on,
+            "{sampler} actual default guidance"
+        );
+    }
+}
+
+/// Evidence compatibility uses resolved allocation graphs, while exact records retain the full
+/// canonical recipe. Each advertised solver remains expressible; another graph needs its anchors.
+#[test]
+fn sdxl_sampling_classes_and_explicit_cfg_are_bound_before_loading() {
+    use mlx_gen::gen_core::CfgBatching;
+    let registry = crate::provider_registry().unwrap();
+    let root = crate::sdxl::tests::fixture();
+    let base =
+        crate::sdxl::tests::candidate(&registry, root.path(), "sdxl", 512, None, "text_to_image");
+    let base_key = evidence_key(&registry, &base, DEVICE).unwrap();
+    let ancestral_rows = [row(&registry, &base, 3 << 20)];
+    let with_sampling = |sampler: &str, guidance: f32, batching: CfgBatching| {
+        let IosWork::Generate(mut request) = base.work.clone() else {
+            unreachable!()
+        };
+        request.sampler = Some(sampler.into());
+        request.guidance = Some(guidance);
+        request.memory.as_mut().unwrap().cfg_batching = Some(batching);
+        build_candidate(
+            &registry,
+            "sdxl",
+            base.spec.clone(),
+            None,
+            base.context.selection.strategy,
+            IosWork::Generate(request),
+        )
+        .unwrap()
+    };
+    let descriptor = registry
+        .generators()
+        .map(|r| (r.descriptor)())
+        .find(|d| d.id == "sdxl")
+        .unwrap();
+    for sampler in descriptor.capabilities.samplers {
+        let candidate = with_sampling(sampler, 7.0, CfgBatching::Sequential);
+        let key = evidence_key(&registry, &candidate, DEVICE).unwrap();
+        assert!(key.sampling_recipe.is_some());
+        let own_rows = [row(&registry, &candidate, 3 << 20)];
+        assert!(
+            admit_with_rows(
+                &registry,
+                std::slice::from_ref(&candidate),
+                DEVICE,
+                budget(),
+                &own_rows
+            )
+            .is_ok(),
+            "{sampler}"
+        );
+        if key.family().unwrap() != base_key.family().unwrap() {
+            assert_eq!(
+                kind(admit_with_rows(
+                    &registry,
+                    &[candidate],
+                    DEVICE,
+                    budget(),
+                    &ancestral_rows
+                )),
+                Some(RefusalKind::NoEvidence),
+                "{sampler}"
+            );
+        }
+    }
+    let batched = with_sampling("euler", 7.0, CfgBatching::Batched);
+    assert_eq!(
+        batched.execution.cfg_batching,
+        Some(CfgBatching::Batched),
+        "the iOS default must not override an explicit caller choice"
+    );
+    let IosWork::Generate(actual) = &batched.work else {
+        unreachable!()
+    };
+    assert_eq!(
+        actual.memory.unwrap().cfg_batching,
+        Some(CfgBatching::Batched)
+    );
+    let batch_rows = [row(&registry, &batched, 3 << 20)];
+    assert!(admit_with_rows(
+        &registry,
+        std::slice::from_ref(&batched),
+        DEVICE,
+        budget(),
+        &batch_rows
+    )
+    .is_ok());
+    assert_eq!(
+        kind(admit_with_rows(
+            &registry,
+            std::slice::from_ref(&batched),
+            DEVICE,
+            budget(),
+            &ancestral_rows
+        )),
+        Some(RefusalKind::NoEvidence)
+    );
+    let continuous = with_sampling("euler", 8.25, CfgBatching::Batched);
+    let k1 = evidence_key(&registry, &batched, DEVICE).unwrap();
+    let k2 = evidence_key(&registry, &continuous, DEVICE).unwrap();
+    assert_eq!(
+        k1.family().unwrap(),
+        k2.family().unwrap(),
+        "continuous guidance values must not create a measurement grid"
+    );
+    assert_ne!(
+        k1.execution, k2.execution,
+        "exact execution provenance retains the actual recipe"
+    );
+    for missing in [true, false] {
+        let mut forged = batch_rows[0].clone();
+        if missing {
+            forged.key.sampling_recipe = None;
+        } else {
+            forged.key.sampling_recipe = ancestral_rows[0].key.sampling_recipe.clone();
+        }
+        assert_eq!(
+            kind(admit_with_rows(
+                &registry,
+                std::slice::from_ref(&batched),
+                DEVICE,
+                budget(),
+                &[forged]
+            )),
+            Some(RefusalKind::NoEvidence)
+        );
     }
 }
 
@@ -518,72 +819,465 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
 /// another generator) makes a load that would fit an empty process a typed capacity refusal.
 #[test]
 fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
+    in_cpu_child(
+        "ios_admission::tests::an_unrelated_resident_is_never_credited_as_reusable_headroom",
+        || {
+            let registry = crate::provider_registry().unwrap();
+            let root = crate::sdxl::tests::fixture();
+            let candidate = crate::sdxl::tests::candidate(
+                &registry,
+                root.path(),
+                "sdxl",
+                512,
+                Some(mlx_gen::gen_core::Quant::Q4),
+                "text_to_image",
+            );
+            const MIB: u64 = 1 << 20;
+            let mut row = row(&registry, &candidate, 0);
+            // The harness's own baseline at capture start (200 MiB) and its lifetime peak (3600 MiB).
+            if let evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
+                for c in captures.iter_mut() {
+                    evidence::fixture::set_kernel_footprints(c, 200 * MIB, 3600 * MIB);
+                }
+            }
+            let rows = [row];
+            let budget = |held: u64, available: u64| {
+                capacity_budget(6142 * MIB, held * MIB, Some(available * MIB))
+            };
+            // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + 32 MiB margin fits.
+            let admitted = admit_with_rows(
+                &registry,
+                std::slice::from_ref(&candidate),
+                DEVICE,
+                budget(200, 5900),
+                &rows,
+            )
+            .unwrap();
+            assert_eq!(admitted.demand_bytes(), 3400 * MIB);
+            assert_eq!(admitted.margin_bytes(), evidence::ANCHOR_MARGIN_FLOOR_BYTES);
+            assert_eq!(
+                admitted.basis(),
+                AdmissionBasis::Measured(AnchorKind::Optimized)
+            );
+            // SANA (~2 GB) still resident: 2400 MiB available. The absolute-peak arithmetic would credit
+            // the resident 2200 MiB (3600 - 2200 = 1400 <= 2400) and admit; the growth is 3400: refused.
+            assert_eq!(
+                kind(admit_with_rows(
+                    &registry,
+                    std::slice::from_ref(&candidate),
+                    DEVICE,
+                    budget(2200, 2400),
+                    &rows
+                )),
+                Some(RefusalKind::Capacity)
+            );
+            // The margin is part of the boundary: growth + margin must fit, not growth alone.
+            assert_eq!(
+                kind(admit_with_rows(
+                    &registry,
+                    std::slice::from_ref(&candidate),
+                    DEVICE,
+                    budget(200, 3400 + 32 - 1),
+                    &rows
+                )),
+                Some(RefusalKind::Capacity)
+            );
+            admit_with_rows(
+                &registry,
+                std::slice::from_ref(&candidate),
+                DEVICE,
+                budget(200, 3400 + 32),
+                &rows,
+            )
+            .unwrap();
+        },
+    );
+}
+
+/// Positive exact-key admission must use the SDK BML ledger, not the older pre-request scalar.
+#[test]
+fn exact_key_uses_before_model_load_growth_and_rejects_masked_repeats() {
+    in_cpu_child(
+        "ios_admission::tests::exact_key_uses_before_model_load_growth_and_rejects_masked_repeats",
+        || {
+            const MIB: u64 = 1 << 20;
+            let registry = crate::provider_registry().unwrap();
+            let root = crate::sdxl::tests::fixture();
+            let candidate = crate::sdxl::tests::candidate(
+                &registry,
+                root.path(),
+                "sdxl",
+                512,
+                None,
+                "text_to_image",
+            );
+            // This is an admission/header-contract fixture, not a runnable SDXL model. An
+            // actually empty overlay must not enumerate unused base adapter targets, while ANY
+            // active overlay must still use the real exporter and reject the missing targets.
+            assert_eq!(
+                crate::layout::configured_variant_digest("sdxl", &candidate.spec).unwrap(),
+                None
+            );
+            let source = root.path().join("unet/diffusion_pytorch_model.safetensors");
+            let missing = "down_blocks.1.attentions.0.proj_in.weight";
+            let quality_artifact = || mlx_gen::gen_core::MemoryDecodeArtifactIdentity {
+                repository: "synthetic-negative-control".into(),
+                revision: "not-measured".into(),
+                variant: "presence-only".into(),
+                fingerprint: "not-a-production-receipt".into(),
+            };
+            // Invoke ONLY variant dispatch: no artifact/key validation can mask an empty-guard
+            // defect. Every case changes exactly ONE empty slot; removing that slot's predicate
+            // returns Null/None and fails expect_err instead of reaching the target-table sentinel.
+            for slot in [
+                "lora",
+                "zero_lora",
+                "control",
+                "extra_control",
+                "ip_adapter",
+                "vae_override",
+                "unknown_component",
+                "identity",
+                "text_encoder",
+                "quality_table",
+                "quality_binding",
+            ] {
+                let mut configured = candidate.spec.clone();
+                match slot {
+                    "lora" | "zero_lora" => {
+                        configured.adapters.push(mlx_gen::gen_core::AdapterSpec {
+                            path: source.clone(),
+                            scale: if slot == "zero_lora" { 0.0 } else { 1.0 },
+                            kind: mlx_gen::gen_core::AdapterKind::Lora,
+                            pass_scales: None,
+                            moe_expert: None,
+                        })
+                    }
+                    "control" => configured.control = Some(WeightsSource::File(source.clone())),
+                    "extra_control" => configured
+                        .extra_controls
+                        .push(WeightsSource::File(source.clone())),
+                    "identity" => {
+                        configured.identity = Some(mlx_gen::gen_core::IdentityWeights {
+                            encoder: Some(WeightsSource::File(source.clone())),
+                            eva: None,
+                            face_dir: None,
+                        })
+                    }
+                    "text_encoder" => {
+                        configured.text_encoder = Some(WeightsSource::File(source.clone()))
+                    }
+                    "unknown_component" => {
+                        configured.components.insert(
+                            "unknown-negative-control".into(),
+                            WeightsSource::File(source.clone()),
+                        );
+                    }
+                    "quality_binding" => {
+                        configured.decode_quality_runtime_identity =
+                            Some(mlx_gen::gen_core::MemoryDecodeQualityRuntimeIdentity {
+                                artifact: quality_artifact(),
+                            })
+                    }
+                    "quality_table" => {
+                        // An explicitly REFUSED/invalid synthetic row tests only table presence;
+                        // it is never passed off as an admitted quality or physical-memory record.
+                        configured.decode_geometry_policies.push(
+                            mlx_gen::gen_core::MemoryDecodeGeometryPolicy {
+                                quality_abi: 0,
+                                family: "negative-control".into(),
+                                resolved_route: "sdxl".into(),
+                                backend: mlx_gen::gen_core::MemoryBackend::Mlx,
+                                tier: candidate.context.selection.tier,
+                                load_shape: candidate.spec.load_shape,
+                                artifact: quality_artifact(),
+                                implementation_fingerprint: "not-measured".into(),
+                                mode: MemoryMode::TextToImage,
+                                overlay: None,
+                                geometry: candidate.context.geometry,
+                                use_pid: false,
+                                tile_edge: 1,
+                                overlap: 0,
+                                metric: "presence-only".into(),
+                                maximum_error: 0,
+                                fixtures: vec![],
+                                production_evidence_sha256: String::new(),
+                                disposition:
+                                    mlx_gen::gen_core::MemoryDecodeQualityDisposition::Refused {
+                                        reason:
+                                            "negative presence fixture, not a quality admission"
+                                                .into(),
+                                    },
+                            },
+                        );
+                    }
+                    "ip_adapter" => {
+                        configured.ip_adapter = Some(WeightsSource::Dir(root.path().to_owned()))
+                    }
+                    "vae_override" => {
+                        configured.components.insert(
+                            mlx_gen_sdxl::loader::VAE_FP16_FIX_COMPONENT.into(),
+                            WeightsSource::File(source.clone()),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let error = crate::layout::configured_variant_digest("sdxl", &configured)
+                    .expect_err("active overlay must validate the actual base target graph");
+                assert!(error.to_string().contains(missing), "{slot}: {error}");
+            }
+            let mut sealed = candidate.spec.clone();
+            sealed.decode_geometry_policy_authoritative = true;
+            assert!(matches!(
+                crate::layout::configured_variant_digest("sdxl", &sealed),
+                Err(Error::Unsupported(_))
+            ));
+            let mut pid = candidate.spec.clone();
+            pid.pid = Some(mlx_gen::gen_core::PidWeights {
+                checkpoint: WeightsSource::File(source),
+                gemma: WeightsSource::Dir(root.path().to_owned()),
+            });
+            assert!(matches!(
+                crate::layout::configured_variant_digest("sdxl", &pid),
+                Err(Error::Unsupported(_))
+            ));
+            // Empty-overlay identity never substitutes for the separate base-artifact checks.
+            let malformed = tempfile::tempdir().unwrap();
+            let file = malformed.path().join("invalid.safetensors");
+            std::fs::write(&file, b"invalid base header").unwrap();
+            let malformed = LoadSpec::new(WeightsSource::File(file));
+            assert_eq!(
+                crate::layout::configured_variant_digest("sdxl", &malformed).unwrap(),
+                None
+            );
+            assert!(crate::layout::artifact_layout_digest(&malformed).is_err());
+            assert!(crate::layout::architecture_digest(&malformed).is_err());
+
+            let mut anchor = row(&registry, &candidate, 256 * MIB);
+            if let evidence::AnchorOutcome::Completed { captures } = &mut anchor.outcome {
+                for capture in captures {
+                    evidence::fixture::set_kernel_footprints(capture, 128 * MIB, 384 * MIB);
+                    let bml = capture.before_model_load_snapshot.as_mut().unwrap();
+                    bml.current_bytes = Some(192 * MIB);
+                    bml.lifetime_peak_bytes = Some(192 * MIB);
+                }
+            }
+            let candidates = std::slice::from_ref(&candidate);
+            let admitted =
+                admit_with_rows(&registry, candidates, DEVICE, budget(), &[anchor.clone()])
+                    .unwrap();
+            assert_eq!(admitted.demand_bytes(), 192 * MIB);
+            assert_eq!(admitted.margin_bytes(), evidence::ANCHOR_MARGIN_FLOOR_BYTES);
+            assert_eq!(
+                admitted.required_bytes(),
+                192 * MIB + evidence::ANCHOR_MARGIN_FLOOR_BYTES
+            );
+            assert_eq!(
+                admitted.context().predicted_peak_bytes,
+                admitted.required_bytes()
+            );
+            assert_eq!(
+                admitted.basis(),
+                AdmissionBasis::Measured(AnchorKind::Optimized)
+            );
+
+            // One repeat's BML highwater was already at the ending highwater, never attained by a
+            // current-footprint observation. Its pre-request ledger is still exact: substituting that
+            // ledger or dropping this repeat would wrongly admit the exact-key reference.
+            if let evidence::AnchorOutcome::Completed { captures } = &mut anchor.outcome {
+                captures[1]
+                    .before_model_load_snapshot
+                    .as_mut()
+                    .unwrap()
+                    .lifetime_peak_bytes = Some(384 * MIB);
+                captures[1].observed_model_current_peak_bytes = Some(320 * MIB);
+                captures[1].ending_snapshot.as_mut().unwrap().current_bytes = Some(320 * MIB);
+            }
+            assert_eq!(
+                kind(admit_with_rows(
+                    &registry,
+                    candidates,
+                    DEVICE,
+                    budget(),
+                    &[anchor]
+                )),
+                Some(RefusalKind::NoEvidence),
+            );
+        },
+    );
+}
+
+#[test]
+fn exact_key_requires_actual_positive_matching_request_boundary() {
+    in_cpu_child(
+        "ios_admission::tests::exact_key_requires_actual_positive_matching_request_boundary",
+        || {
+            let registry = crate::provider_registry().unwrap();
+            let root = crate::sdxl::tests::fixture();
+            let candidate = crate::sdxl::tests::candidate(
+                &registry,
+                root.path(),
+                "sdxl",
+                512,
+                None,
+                "text_to_image",
+            );
+            let rows = [row(&registry, &candidate, 64 << 20)];
+            let candidates = std::slice::from_ref(&candidate);
+            let budget = budget();
+            let baseline = IosMemoryBaseline {
+                domain: IosMemoryDomain::ProcessGrowth,
+                coordinate: IosMemoryCoordinate::BeforeModelLoad,
+                bytes: budget.committed_bytes,
+                source: "explicit-synthetic-sdk-bml".into(),
+            };
+            let admit = |budget, boundary: Option<&IosMemoryBaseline>| {
+                admit_rows_at_boundary(&registry, candidates, DEVICE, budget, &rows, boundary)
+            };
+            assert!(admit(budget, Some(&baseline)).is_ok());
+            assert_eq!(
+                kind(super::admit_with_rows(
+                    &registry, candidates, DEVICE, budget, &rows
+                )),
+                Some(RefusalKind::NoEvidence),
+            );
+            // The zero control deliberately matches a ZERO committed budget, so it isolates
+            // missing positive baseline evidence rather than merely tripping the mismatch check.
+            // This invalid case never goes through the positive-fixture helper.
+            let zero_budget = MemoryBudget {
+                committed_bytes: 0,
+                ..budget
+            };
+            for (case, request_budget, invalid) in [
+                (
+                    "zero",
+                    zero_budget,
+                    IosMemoryBaseline {
+                        bytes: 0,
+                        ..baseline.clone()
+                    },
+                ),
+                (
+                    "mismatch",
+                    budget,
+                    IosMemoryBaseline {
+                        bytes: baseline.bytes + 1,
+                        ..baseline.clone()
+                    },
+                ),
+                (
+                    "coordinate",
+                    budget,
+                    IosMemoryBaseline {
+                        coordinate: IosMemoryCoordinate::BeforeRequestConstruction,
+                        ..baseline.clone()
+                    },
+                ),
+                (
+                    "domain",
+                    budget,
+                    IosMemoryBaseline {
+                        domain: IosMemoryDomain::NativeAllocatorGrowth,
+                        ..baseline.clone()
+                    },
+                ),
+                (
+                    "provenance",
+                    budget,
+                    IosMemoryBaseline {
+                        source: String::new(),
+                        ..baseline.clone()
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    kind(admit(request_budget, Some(&invalid))),
+                    Some(RefusalKind::NoEvidence),
+                    "{case}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn complete_envelope_overflow_is_refused_before_seal_and_valid_sum_is_preserved() {
+    in_cpu_child("ios_admission::tests::complete_envelope_overflow_is_refused_before_seal_and_valid_sum_is_preserved", || {
     let registry = crate::provider_registry().unwrap();
     let root = crate::sdxl::tests::fixture();
-    let candidate = crate::sdxl::tests::candidate(
-        &registry,
-        root.path(),
-        "sdxl",
-        512,
-        Some(mlx_gen::gen_core::Quant::Q4),
-        "text_to_image",
-    );
-    const MIB: u64 = 1 << 20;
-    let mut row = row(&registry, &candidate, 0);
-    // The harness's own baseline at capture start (200 MiB) and its lifetime peak (3600 MiB).
-    if let evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
-        for c in captures.iter_mut() {
-            c.baseline_footprint_bytes = 200 * MIB;
-            c.footprint_bytes = 3600 * MIB;
-        }
-    }
-    let rows = [row];
-    let budget =
-        |held: u64, available: u64| capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
-    // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + 32 MiB margin fits.
-    let admitted = admit_with_rows(
-        &registry,
-        std::slice::from_ref(&candidate),
-        DEVICE,
-        budget(200, 5900),
-        &rows,
-    )
-    .unwrap();
-    assert_eq!(admitted.demand_bytes(), 3400 * MIB);
-    assert_eq!(admitted.margin_bytes(), evidence::ANCHOR_MARGIN_FLOOR_BYTES);
+    let candidate =
+        crate::sdxl::tests::candidate(&registry, root.path(), "sdxl", 512, None, "text_to_image");
+    let candidates = std::slice::from_ref(&candidate);
+    let budget = capacity_budget(u64::MAX, 1, None);
+    let margin = evidence::ANCHOR_MARGIN_FLOOR_BYTES;
+    let overflowing = [row(&registry, &candidate, u64::MAX - margin + 1)];
+    let error = admit_with_rows(&registry, candidates, DEVICE, budget, &overflowing)
+        .expect_err("demand fits u64 but demand + margin does not");
+    assert_eq!(error.refusal_kind(), Some(RefusalKind::NoEvidence));
+    assert!(error
+        .to_string()
+        .contains("complete admitted envelope arithmetic"));
+
+    let demand = u64::MAX - margin - budget.committed_bytes;
+    let valid = [row(&registry, &candidate, demand)];
+    let admitted = admit_with_rows(&registry, candidates, DEVICE, budget, &valid).unwrap();
+    assert_eq!(admitted.demand_bytes(), demand);
+    assert_eq!(admitted.margin_bytes(), margin);
     assert_eq!(
-        admitted.basis(),
-        AdmissionBasis::Measured(AnchorKind::Optimized)
+        admitted.required_bytes(),
+        demand.checked_add(margin).unwrap()
     );
-    // SANA (~2 GB) still resident: 2400 MiB available. The absolute-peak arithmetic would credit
-    // the resident 2200 MiB (3600 - 2200 = 1400 <= 2400) and admit; the growth is 3400: refused.
+    assert_eq!(admitted.required_bytes(), budget.effective_bytes());
     assert_eq!(
-        kind(admit_with_rows(
-            &registry,
-            std::slice::from_ref(&candidate),
-            DEVICE,
-            budget(2200, 2400),
-            &rows
-        )),
-        Some(RefusalKind::Capacity)
+        admitted.context().predicted_peak_bytes,
+        admitted.required_bytes()
     );
-    // The margin is part of the boundary: growth + margin must fit, not growth alone.
-    assert_eq!(
-        kind(admit_with_rows(
-            &registry,
-            std::slice::from_ref(&candidate),
-            DEVICE,
-            budget(200, 3400 + 32 - 1),
-            &rows
-        )),
-        Some(RefusalKind::Capacity)
+    });
+}
+
+#[test]
+fn core_pricing_errors_preserve_typed_refusal_vs_failure() {
+    let unsupported = pricing_error(Error::Unsupported("unpriced configured graph".into()));
+    assert_eq!(unsupported.refusal_kind(), Some(RefusalKind::NoEvidence));
+    assert!(unsupported
+        .to_string()
+        .contains("unpriced configured graph"));
+    let failed = pricing_error(Error::Msg("unreadable source header".into()));
+    assert!(matches!(failed, AdmissionError::Failed(_)));
+    assert!(failed.to_string().contains("unreadable source header"));
+}
+
+#[test]
+fn backend_pricing_errors_preserve_typed_refusal_vs_failure() {
+    let unsupported = pricing_error(mlx_gen::Error::Unsupported(
+        "unpriced configured graph".into(),
+    ));
+    assert_eq!(unsupported.refusal_kind(), Some(RefusalKind::NoEvidence));
+    assert!(unsupported
+        .to_string()
+        .contains("unpriced configured graph"));
+    let failed = pricing_error(mlx_gen::Error::Msg("unreadable source header".into()));
+    assert!(matches!(failed, AdmissionError::Failed(_)));
+    assert!(failed.to_string().contains("unreadable source header"));
+}
+
+#[test]
+fn actual_output_cardinality_is_checked_never_clamped_or_promoted_from_zero() {
+    let mut request = GenerationRequest {
+        count: 3,
+        ..Default::default()
+    };
+    assert_eq!(generation_batch(&request).unwrap(), 3);
+    request.prompt_batch = vec!["first".into(), "second".into()];
+    assert_eq!(generation_batch(&request).unwrap(), 6);
+    request.count = 0;
+    assert!(
+        matches!(generation_batch(&request), Err(AdmissionError::Refused(refusal)) if refusal.kind == RefusalKind::Mode)
     );
-    admit_with_rows(
-        &registry,
-        std::slice::from_ref(&candidate),
-        DEVICE,
-        budget(200, 3400 + 32),
-        &rows,
-    )
-    .unwrap();
+    request.count = u32::MAX;
+    assert!(
+        matches!(generation_batch(&request), Err(AdmissionError::Refused(refusal)) if refusal.kind == RefusalKind::Mode)
+    );
+    request.prompt_batch.clear();
+    assert_eq!(generation_batch(&request).unwrap(), u32::MAX);
 }

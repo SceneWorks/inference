@@ -1,0 +1,1384 @@
+{
+  "state": "CANONICAL_OWNER_SOURCE_BOUND",
+  "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
+  "UTC": "2026-10-20T20:22:25.564692+00:00",
+  "rust_proof_closure_sha256": "a6359803a866f7702683e809badc0490311824089234834c91b7c5040431de4a",
+  "compiler_packages": [
+    "mlx-gen",
+    "mlx-gen-z-image",
+    "mlx-gen-ios-catalog"
+  ],
+  "artifact_features": {
+    "mlx_gen": [],
+    "mlx_gen_z_image": [],
+    "mlx_gen_ios_catalog": []
+  },
+  "files": [
+    {
+      "path": ".cargo/config.toml",
+      "sha256": "f784f55120306ca7be3b744d230b3a29af2fe4b3d689b579d2f7962b11d14aac"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "cfb4c6fedf3359b1191e2a961e1452aa939ba4c3fc205f57e9871594fe891654"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "44642075ee00bb72b9ad8f42fbf065c3c3042b553a72a1c086f5f13de0483680"
+    },
+    {
+      "path": "crates/bundles/runtime-ios/src/lib.rs",
+      "sha256": "5f7a6be0f21a3ab44efe3df0241d11e66a10300dea697fdb80e0d35811b4f923"
+    },
+    {
+      "path": "crates/contracts/gen-core/Cargo.toml",
+      "sha256": "e20e773f9d575429b69caca2e15ad0fe1b2acb05b24bd2e04ff17336f70d1a8d"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/encoder_contract.rs",
+      "sha256": "9ae279cd692900560ea48163493cb053d9644161225540b4487e0a26f4ee51c8"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/imageops.rs",
+      "sha256": "67698562ededf18047247ad475a8d00e7af7cfd3da3e7ea36fb024ec071e55ae"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/iris.rs",
+      "sha256": "eb33ebb2dcdbbfc27f03a3a2fa94ebda1363e02d7c348dc559d1f30c1e1ffb0f"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/iris/depth.rs",
+      "sha256": "19f252710c71582d5e2e7306150fb9c4d0fe8895df486b2fb2e2319236638a7c"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/iris/restoration.rs",
+      "sha256": "7c7bb17019e63554f140970c051206138a59a188abe2453cc2ec01e04860bd90"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/lib.rs",
+      "sha256": "72a07ce111fd6b1a74510602199d2f2a1e8cc4e25a0f7a7d1f8dc3d033df7e28"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/residency.rs",
+      "sha256": "003650ad0acbb3dc10e0399bf163e5f8eecb5586e9e15dc5ecb7e13bc8694790"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/sampling.rs",
+      "sha256": "2a2006c72c39d51a4c8c8bdb937cb580b756afd9d560f527bcc2d1d843983bc2"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/sampling/cfgpp.rs",
+      "sha256": "905a2c4989d705cebcdf43f830e087c88b52d57d067e5397a0841353acdc57a8"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/sampling/latent_ops.rs",
+      "sha256": "37583dddf2c2ad29e58e9ab66608053262615c9d9a8e94ec77f79367fb4bf986"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/sampling/solvers.rs",
+      "sha256": "743320c1c02c1c446e8b3a57c31de742acb23fd7ba3fc2af1c4130f8d3dff759"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/sampling/unified.rs",
+      "sha256": "8e3f6d2b85f313d0081954b6d7b0d5c747072ad059127df3afa3eb39bb643acb"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/weightsmeta.rs",
+      "sha256": "97abbbbe4bd54447dc47c557edf3ce6707f68e863c299471785292e7865b05f1"
+    },
+    {
+      "path": "crates/media/mlx-gen/Cargo.toml",
+      "sha256": "3564d7adc1a7a2c8fb0e93e5f1f0ddaad9dec8649d2c5d34d82fa76a6a7fc676"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/Cargo.toml",
+      "sha256": "2b43ee077eb02b97a5b8a1c2f6d9c7e7900ee23bc52d9c2bb0085cfffd32fee3"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/conditioner.rs",
+      "sha256": "bcbe74c94f479f229bf9b5a398612a3c69bb3502e0c10e1f87a505d7a53e735a"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/ios_pricing.rs",
+      "sha256": "0a7589b8a5cb8a219ff5a116aaaa0df52d5a4ae14301508f4b2b0641337979d4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/lib.rs",
+      "sha256": "5b092578e37b2d54a017e996581e3f69548579e80ab839ed43cbba3f79f06de6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/model.rs",
+      "sha256": "7ea4e9bf01dcc91113c4893513dc4984bf67087a9da3c630e9db68d80c4a3738"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/pipeline.rs",
+      "sha256": "8283e013a3d266fb78eaa4d3d5e9dd848303ebdd0c577fab2e48c29a870d61a7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/sampling.rs",
+      "sha256": "ace8d84fe28fd86f12409f6e5143cdd407a8f46c2603b266845e4dada7620fd6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/text_encoder.rs",
+      "sha256": "9027a15b3c6a50a5082122b121169667b1071da78b96faf162a7fef80db1aa25"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-anima/src/transformer.rs",
+      "sha256": "b75c8db8cd5642073a56f13a02f64c9609b7cbaf314ecc60b6ac9ab1b22328ae"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/Cargo.toml",
+      "sha256": "68b6accd9212aa99c6ee562ee5050d52d03369af0739568eafa1bffc46f918b5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor.rs",
+      "sha256": "30e7a7a35cd64cc25581170a8cfe367993a7136274ad42b15c0e264f31627266"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
+      "sha256": "8f858e121b8df22c02add168667a02bb11bf7a1d633bf94bd6250817cddde6b9"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
+      "sha256": "940a672556caad36d2019634c15c3afbdf2ba90f761c5b7de85ed15bc8a9e573"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/capture_config.rs",
+      "sha256": "a7a791fe9ebe08c567356bf596af8aa12c13300672852bf80955980fecdfd14f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/evidence.rs",
+      "sha256": "bd4db826c5bd299d6af80562def55abfd5e3abd60889df8d735a2bb44f047b08"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
+      "sha256": "03cfd4ce6fcfc8e3a45acd4e2d988e28726efe9ec8fa9e7578bc62337553cce9"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
+      "sha256": "0276733e3019b6b3f7bd97a4fc018430140623c053211f5853cc07302f961962"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/layout.rs",
+      "sha256": "09d3717bdc858b58c29bd609b18e5e0616e6020f2c353071a0cec21a0720c397"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/lib.rs",
+      "sha256": "39587eeb83acf9ed41e810a2c400a5fce263ed049b7dfb065636dd6c9675359a"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
+      "sha256": "fd7a7bb5cfd2e47960e6fbbf8bb32de053c9b17be80c7029fae8a34151de0a90"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
+      "sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
+      "sha256": "7b9807e970ba9c273e6fac62d8e5d544ac95d7c6324c8f6ef48d2346e758e3b2"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/zimage.rs",
+      "sha256": "948978f6e5530e03c51e633b691269844904bc63b6c45b2025be7a8f256081eb"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/Cargo.toml",
+      "sha256": "55dfa8ec831c0d7e7de3ee3f167811ea236e4e9561092489518a5a3f1fc74cc5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_facts_tests.rs",
+      "sha256": "8028de8b442c32af6f2473f216deba511c571f0145924430494cfd3b1bf87840"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_load.rs",
+      "sha256": "00819bc9f9205239e1021f69f0705b8f27621bb327b3d5744fd6ae2014f3fff4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapters.rs",
+      "sha256": "92e6aefad034325d1d66609e7987c5c4a32386e87b51df2ad832d5a28a8c8dc7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
+      "sha256": "ce8e367721befd06cef31f90a55907110ca0fee27bfd91e4f52010b84564ceef"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
+      "sha256": "d01aa75d210b9077b0497418f80dac36bf669e8aa29b9604619c14d26701dac6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/dit.rs",
+      "sha256": "e4b5875ac33ab9f8e6a1929237fb6f81be03e00e96aeb408ebd39f6a0ce72f68"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
+      "sha256": "72fca8eadc1f07a79d6c884c3d16037563e6adff083d56644e860d1c618da45f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
+      "sha256": "a49fa77f460a1098a89f1ac56f41a80aec2480a3b94c5544389264555c1a7cbc"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/model.rs",
+      "sha256": "b3be1d754c434f7409a05c99d865af9f3ee2400b030fb3ab444acedeb46feee6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/nn.rs",
+      "sha256": "e0665832e7d1897188caaf375e36abbbb0b53f0a127cea3aee8810fc3d363b32"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/pipeline.rs",
+      "sha256": "fc6f034da394e651459fde781b5226bc3f4d756d5649480738741eab8710c812"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs",
+      "sha256": "ad9a0bffae78658025d4769ca207c685291da8e70d488926401004c28f4c1431"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_tests.rs",
+      "sha256": "a7cbad08ce48aac8610912443811c26e73c352cf046c52dbd4e146b1c7425c4f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/reachable_sizes.rs",
+      "sha256": "e843706ffc5ca44e1e982d9af32fb717141f9d0eb298c07d5e8a86a0c8028f26"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/restoration.rs",
+      "sha256": "0077d3a86da7cf0cb5df3d54d331980a6e8f670ec06024b17b4525f7bb5a0107"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/retention.rs",
+      "sha256": "961e62723b3f3f4b789c9776d18d3f51aa5c5cde0285742a69728d28fcb0bde1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/solver.rs",
+      "sha256": "48619983cb5379a66a614d33f788e0322a4a8bd60db8710ba7758e06ef268db1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs",
+      "sha256": "ebe518a92b880fef856f78d3d3bfc4a5470cbd419b7708688727fead70d389a7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs",
+      "sha256": "5aa61c63719ac5ac3dc7eec4df12da7cdb19fc58eeb7d332bf6df2b17012379b"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs",
+      "sha256": "b9adaa98233e1510136aec2d3f96831621d2e5b9145ecef97401ea6299355e90"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/budget.rs",
+      "sha256": "c2acd672d18ebcc64de60623c87c42aa781771f140b3cefc69bd951abdbd4077"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/caption.rs",
+      "sha256": "a1a75da309aca177bed47aae8863f4b6c6e67c6e67151eaa351b3ba97cb1b93e"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/config.rs",
+      "sha256": "9174f87767aac0b209d0cb5566d98e996ef2cc51069abe2e3e0a418c52eeba51"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/decode_routes.rs",
+      "sha256": "c7590b5f75ce741548597748ac5338e192842525d0c742e09adb0586fc9c44c3"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/decoder.rs",
+      "sha256": "fef4b80b2e8bc39000d7af92f6e3342b482f15e05b578e4508efc6d9b780198f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/engine.rs",
+      "sha256": "b3a4764ae93417a5a94c0574cf7c5b40513fdac38039dfe9ac4e1909be5d31a3"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/gemma2.rs",
+      "sha256": "ae5d86dffa5b2d39875347a536bd041a2fde336e4fafa116115342bb83884c90"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/lq.rs",
+      "sha256": "58f014895788223a13d61db054aa259693dc434c0b4733e41c34c873e249ce24"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/sampler.rs",
+      "sha256": "366c4995a195b9ba90e09fce6c7bdb4418acb32e7f87c0c482416efe13f3f900"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-pid/src/tiling.rs",
+      "sha256": "3a3ba768e6339fe0a11c554d54dd2345e4f97b45ed8abf90cafe584668fabaf8"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/Cargo.toml",
+      "sha256": "c5bc2ac5e5e866367be45228fb90ef3f0ff1bec04bb7acca1669d6ca687814c9"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/dc_ae.rs",
+      "sha256": "53267d2a936c3fab201b2d00564a8706a77820be3e9eb090a97b07f66821edfc"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing.rs",
+      "sha256": "66ee4a687caf2e50ac1410ebab50392a9208d5e40769dc1739abb7c2fa0a42d0"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/additivity.rs",
+      "sha256": "b76c50bfdd52bc537c80c398c485537f3e78e6319e75696839b58cd40df06ce6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/tests.rs",
+      "sha256": "9929b7ab723a5c67e348437df0c51afa5a6f0b206c5ad7349e5ba1b3e435d055"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/lib.rs",
+      "sha256": "871a2240634c8b8ba14065d8f271f8f59d48a9d6b1b17416c29202c6b8f2caa0"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/model.rs",
+      "sha256": "52b1c84400a5756ff46be2dc536f50b2f93e59fe7f8d13f3a55de3fa3f1fbc1f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/pipeline.rs",
+      "sha256": "02403a87dc31e9a949ebe6fdb423b9f27a0012803cedad2499685456e49e1314"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/quantum.rs",
+      "sha256": "c243581d3f81ae5eaa588b39f3445d91a67eb40753235b6e6d92e58650b469f2"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/sampling.rs",
+      "sha256": "18a9345f7e8c41b7a00442071b3e04f3c7132ca395ff6ab1202b9dfa1aa12eb1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sana/src/transformer.rs",
+      "sha256": "faa4c103f9d90a2154a2a4d8c4c7a731e090708e66c619b8672ad527ba960067"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/Cargo.toml",
+      "sha256": "61c45a634d958c04ae6fc30dbfd790788553b95f810557a5950a4b508f579dd7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/adapters.rs",
+      "sha256": "0ed627a0632b0ec0f4ee50d9693436851dd557634c763513b276045551265733"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
+      "sha256": "37b5e5edbd9799fb98e3be533dc8913a2fd725292d45479e7a2d834c414c6afc"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
+      "sha256": "a2485aa8bcc0b981e2075482cf2299f6d79c82e142c2771720d0c4d870478b80"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
+      "sha256": "552abdce249c7c00cd583136d5de6ead494461319af2ed384319b474b1ccebd3"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
+      "sha256": "50ea4648fc8f699a26a6e03bd5d4e631f9d078712e50d8f4dae705b20fbbe6f4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/loader.rs",
+      "sha256": "2ac35af1e113624035c5912dfbd2569e7fcd40fc15e445535bb90578b189a7fd"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/model.rs",
+      "sha256": "0258029f6c50c7672addbd40ae1d13acbeb36e71e6763794e83e7cd98669bf60"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/pipeline.rs",
+      "sha256": "865e4bbb427deeec0516c0edaea9571a762117e6610f8ce332beb0eca6622bb5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quant.rs",
+      "sha256": "18ed6def4aee6fae1a0c962028364a2a37fc8fbabfbd7e4aa830a7d876a6aecd"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum.rs",
+      "sha256": "2c8bf165b0c22fba69a93cd99fdad3b931828905ecb42d173b86665ec55b85d5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
+      "sha256": "95ad020c399d276db3aeee7941eb6e40d91e956cf3ce42f92f81d8fde3c1acbb"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs",
+      "sha256": "bc1dbfc73303bfba568039107d68cf4a2563653f1e152ae51a3a75f774112e8a"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
+      "sha256": "873a958ea84d5ae6985125e44f363c392ca2b034f8f94ce0ea182b1d4e19fe1f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
+      "sha256": "d6978eb4bb3b0ee21dfb47411b399eeb2428a7832e84c4b377e34257e9d9622f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampler.rs",
+      "sha256": "b380ade5839e63bae4155b7d7fb474597a09663ccecb54d5945d8624cea1db7b"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling.rs",
+      "sha256": "08d505850ec0bae7c7afb462ba0a713eaa89cb39be264160bf19609b85502d88"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling_tests.rs",
+      "sha256": "4b5716eb537cc2c04ce9cc801aa9bc7c96e45cea5fcc3b02b9c3c00963768c11"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/text_encoder.rs",
+      "sha256": "f343cf89e156bc4f218c20f23c881b085078353b38244f979a824282d2a4e818"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
+      "sha256": "9f20de0f2a59e249851ae1b64235bc466245ec4f33ab83feaa2d9b2c35aeb019"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/controlnet.rs",
+      "sha256": "f9b4b04fc1a404ba2dce95565fdeea960957f40b99b5fd8f5c2300e1fb6f7ae5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/mod.rs",
+      "sha256": "cb90b3047788aed2bd2695a3c0a6cfa9e722c2e7a6c146f44ea824af44fe1ed5"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
+      "sha256": "5aa25d00e232d9d4c1a89a1950002b75718a02658529de787c406559f8ec16da"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/transformer.rs",
+      "sha256": "36891b88fd3a06cd3d8be848ee022152a4a3bcefbf0d04d2a2e0a52ae23baefd"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae.rs",
+      "sha256": "e37d0b82e25f9f66426a9e6faacefbeda35a3525bc8205aae9409b22e189c52f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
+      "sha256": "f7ced5b7de3ac91f82b6b907b707a06012c8eb94c9dc14aeac673742d8c7c6cf"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/Cargo.toml",
+      "sha256": "75b1482601a0d4ea17a4480794855f62deb62e810a616411a6859263636d93f7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/adapters.rs",
+      "sha256": "ec365f0049376822fab9640930e43d29f15c184aacfba28f46cd63630563308c"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/attention.rs",
+      "sha256": "454c2ba9075af945f8fac60f22161d1cbce1b9ebd7551ddd343d1d47ec1cc648"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/block_stream.rs",
+      "sha256": "6144c7ebf23d76e37adda43ce8b7d94a01d6f225448c47710b013bcbac3c4c69"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/comfyui.rs",
+      "sha256": "ace49bd49d726c5e5d4d2d232f5dc0eb1940f3c2d5c6732426d865c4b0db08be"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/context_block.rs",
+      "sha256": "ce68968ec34cd27768a0216f091a5f5457edded5ed3e05f6ac1dac05bbb9e624"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer.rs",
+      "sha256": "6bc8c32702fda3b13b60951a052810551517657cb0faf17b24c69c79ee78c604"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer_block.rs",
+      "sha256": "137223cb776ef7c03e2851bbb35ddd98ecb1f5d5f4a6f8b3e2c403e013086874"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/convert.rs",
+      "sha256": "9d810181114eea727dae45817f52aa37c1df6d5a785960d329a4bf204ab12446"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/feed_forward.rs",
+      "sha256": "d9467e212e75167a650ae1f03c15eb23033e041002f8153cc8a7e9c874852d77"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/final_layer.rs",
+      "sha256": "3dcd421550cc502b7ef648b4ae5c5a1ba0bc4ff599a584f797f9720022f60f6f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs",
+      "sha256": "0ad2075671844c0a942797c63bb084f6e826cb0a0fcd4120de6405c01bf7a2f8"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
+      "sha256": "ffb8fc0dc0920438a95596619482da84ffeca6fec8a40b0e604c0d3095296e24"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing_tests.rs",
+      "sha256": "a0b0fc97622700744da3e5e5f1fbe7773b0d272075542e1116706e79f27b80b1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/lib.rs",
+      "sha256": "83d88693321f49c0a37a3d21d1f99452b0c3bd25cc53f1a8b8cd4676fdb792ff"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/loader.rs",
+      "sha256": "d74534de5aabdd38b13f77b59d6adc8439614b9d15b2c8695fadc4896e6f67a3"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/memory_strategy.rs",
+      "sha256": "21539e279f34ed2842e1bd2224e86cc4710dac4bb84351c52c4c025abdd2c142"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/model.rs",
+      "sha256": "d00a285c798d2525711b99d46d608b723f39367cc65938e316cd1e0580ae08af"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/model_base.rs",
+      "sha256": "90679d9982bd5e8c2552bc98ed1e27a9c0f57db7da726d1cd364d73ee388d0ce"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/model_base_control.rs",
+      "sha256": "e0d990b4ae5c810baeb2355bf1b44d4420942637d1d155640781e92f2cd81ff8"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/model_control.rs",
+      "sha256": "ec85e3f7c38b76d3fed1c7438fa30bd1557ec0a07ac9b5710c555ca0440fa9e7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/pipeline.rs",
+      "sha256": "c222e485a985264aa36dc9b1ff2e86fad377e6cd0e9b139f375a7d4404a60f3f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/preview.rs",
+      "sha256": "8cae4d40fda822c78d0e5b8622f002bfa1ece58b586fabc5c7712e97ffb2da9e"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/quant.rs",
+      "sha256": "32b14dc01346262d9a0a2104d71ae0ca73227aa426d98b322e1f5feaef93d334"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum.rs",
+      "sha256": "6f9fcfba28a4cdc4f90cd338bb6e618eb2d31c9fdbf8b8b5aae9ed5fe2c85090"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs",
+      "sha256": "11025c3cbdef790b4f46d86787e30f4a356d2434163dc43000e6acffee082a1c"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_tests.rs",
+      "sha256": "5aa2f48ff23339d6c0e162b7883ea2bf9a284272be68a027970edc07c31f8cf8"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/reachable_sizes.rs",
+      "sha256": "1fad1bf0b19ff67a52ae7e9cdad5b47d5a0c0226a44796058f3b49cddb0f5cbe"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/rope_embedder.rs",
+      "sha256": "551b193d11f5d8443ac0a6267c75bca4e4905d66afaac808880f50102f14a64e"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/sampling.rs",
+      "sha256": "63498fa70555e8d410259b5b6f48105a3808f050a075b8b175c0fbe1b8cda62b"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/attention.rs",
+      "sha256": "a490c95685a7ed8c2e35b46a56331b7472146dc25c5f0a20bbb08051632bff2b"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/encoder.rs",
+      "sha256": "f24bad1630dd0f73473a463b8a8a7189b4d9c1da30944297251265d9cef1c3a4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/layer.rs",
+      "sha256": "07a3acccaa4a7fcd81da30793e40a6902342a97764c5e309ce1a512d5738af21"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/mlp.rs",
+      "sha256": "d274528737d9c1d5ab58ad66cd933f819129a6425ca041eec3e95233aa4ce2c7"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/mod.rs",
+      "sha256": "a686a7962cd13622b076fdeaa87c264867e451868f7a0d442ffd1a931132daf8"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/stream.rs",
+      "sha256": "6493e0bcb60305449957e66f128bf6c68d5009e45ce78e05d23ea9d6e36d7d37"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/timestep_embedder.rs",
+      "sha256": "f239d6e0985a1f91486362bbe0773ddf014a32e7f7676b5bea12ee681d964252"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/training.rs",
+      "sha256": "695fb68fd248710f1eca46eceedc79273aff6761cbcd1f2ae8ea36e9d3054f30"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/training_adapter.rs",
+      "sha256": "5d2d5c7f5f71620ad474247a8be85e24e4c4538066e8e5f55364dd3159cc27fd"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/transformer.rs",
+      "sha256": "c8894d42e6d139164659b24f686fb167cbfdc97ab104a6c880e1e3c371494ccf"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/transformer_block.rs",
+      "sha256": "37569137b1a25bd507859b5769e1e8296367cbdf7efc70f03cdd5d91ec0e7b58"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/attention.rs",
+      "sha256": "9c944bc3be5e4f109dd9caccb36c3590e719bb6edf464c32173266d8ac42a1d4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/conv_layers.rs",
+      "sha256": "6c7710dc04f23a4594637183e253d234fa2058ca1bccb0cca4c1b59edadc8387"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/decoder.rs",
+      "sha256": "f3f079e37e6f38771323fe760d14ea092bd6be1f3deedd6932f2b4940667d927"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/down_encoder_block.rs",
+      "sha256": "50d60d56b1643ab76232d4935ee05e7d12b4ce0201e11d4a356849e6b91b4766"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/down_sampler.rs",
+      "sha256": "a61212dd93b120e0ac2d94e03619537c4d0c72e29daa84323df48273a9886d34"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/encoder.rs",
+      "sha256": "3f633c8aa899de0273856c97d40dc19eeedf4ba0b81b76f9ac02cfd97f433d9d"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/mid_block.rs",
+      "sha256": "bc103efb09d2bccc91d0ec5d4c07358a94ff2c01d59759f7a43b9c302750820d"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/mod.rs",
+      "sha256": "c9d1ffa6d19277b025152bba9692b9c69b272f73076dcfb13e75edaa4e046a4f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/resnet_block.rs",
+      "sha256": "d02251d973cae43ae403a7ce6c7bd77dcc8c67879a11c5923ab136568bace9ca"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/up_decoder_block.rs",
+      "sha256": "d1b49885b85554d29de0dc949def110ba158924d2fb953d51081cfa90760f229"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/vae/up_sampler.rs",
+      "sha256": "75c093367ecfa6d2ae0c4fca219219e55742f2f426c787f4fda24fe8c3165a82"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/tests/common/original_z_execution_sidecar.rs",
+      "sha256": "51b8e33ca9f59f6be11dd2e96901b028d68a829813c0217f5f1ee503d6c2beb7"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/adapters.rs",
+      "sha256": "6c5576d106667981405ef967da8a2860233ff647cc39e57b91d9e603c8cb6172"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/adapters/facts.rs",
+      "sha256": "37a1af541d4fc17bc85d942a57993980a3c6bec85e1fbf36bcf69c56580941ea"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/adapters/loader.rs",
+      "sha256": "7d15f5441c19aa215772e7995c9e071f49a4238ed66dfa0c04ee05d79f0de757"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/array.rs",
+      "sha256": "269ce72afad672497fce54c99631619759e71a63eae610ac0689d6e7f2845fd8"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/coherence.rs",
+      "sha256": "1515299660e4e9487d3bcb5d897d166106d2a24de936759f5aeb43662ee8cf34"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/flow_sampling.rs",
+      "sha256": "e480e7f814cefb95d769c0effa029cdf643441d4ded5a0e018f2e95bd055a1e7"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/flow_sampling_tests.rs",
+      "sha256": "778deb1e57ef70e03cf966d25ffcfc6afba07c575aa4a7fd8ac1661e0e9d1509"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/ios_anchor_law.rs",
+      "sha256": "8f9c03f34095ea5dbaa403eaef5f4b706b395811e04eaa9289598ead4eac6889"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/ios_pricing.rs",
+      "sha256": "8a979e53efa1c92d91deab6bb71254d67cf4604a6dad7fe6772a8c07eee29556"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/ios_quantum.rs",
+      "sha256": "3670a4fe35b6888b4ec28647e236cc9632ee2ad8abaf3a54a56e7323a0d8bf78"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/ios_quantum_budget.rs",
+      "sha256": "7e33e81b227e8dd304e3412113179c4dc91192a55936f736e0fc7b9012316a61"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/ios_quantum_kernels.rs",
+      "sha256": "5947e74e68ecbf6ae932341d8088ef53903314a1157d0283b37358b0ceed904f"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/lib.rs",
+      "sha256": "3669983e750185cc51284656e26f69fa2de55051c808152eb273be386cf59554"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/nn.rs",
+      "sha256": "20fd7e55dae057815d38207900bfeed552e5c65c67eb3bd213d53a81fabc0021"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/quant.rs",
+      "sha256": "0ef8dc5e228f985ef212e947556d158236365da018b36bbd328522cb04d04c49"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/residency.rs",
+      "sha256": "e44d56daea84b1d3a4512ec9397675fbb109ea71cb56e810069605f51d38a3af"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/sampler.rs",
+      "sha256": "8e9888d9928313bbaa65d339485a5fcaf64d7a7c06b494134327225a7cddea8c"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/solver_memory.rs",
+      "sha256": "8a931a68510f5e06074d161a478c85373258e062574e77ad0888a3257666fcd9"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/weights.rs",
+      "sha256": "1d00969b2298236a790b53d29771b1dd62e0ccad0e21e67fb1a5dd0bdee68a14"
+    },
+    {
+      "path": "docs/ios-device-runbook.md",
+      "sha256": "6a480c87d51f5bdb9b7d93449481d53a9d8f7b969c59e5e39daea40c62e17373"
+    },
+    {
+      "path": "ios-host/smoke/Cargo.lock",
+      "sha256": "03f163ed989bedff13676af5540c53db51166083171a551820bdd81d95cdc798"
+    },
+    {
+      "path": "ios-host/smoke/src/campaign.rs",
+      "sha256": "883feedaf4ffe1f596c231b37ed0941964f4ffff98b60ea2b1b4bbd673cc1a0c"
+    },
+    {
+      "path": "ios-host/smoke/src/campaign_admission_tests.rs",
+      "sha256": "85116249bcd8936d94c658304612dafb219d7da16495841f740e15c0b7aede9e"
+    },
+    {
+      "path": "ios-host/smoke/src/campaign_media.rs",
+      "sha256": "806e04337926f2c3df6406db176cd4fb51da6ea9a0410346a516e77f4e9a4cbd"
+    },
+    {
+      "path": "ios-host/smoke/src/campaign_media_tests.rs",
+      "sha256": "913536ab451cd34cdaa4a36f3cc1fd4ae95441e18c34364f973ded3c7ef597c1"
+    },
+    {
+      "path": "ios-host/smoke/src/campaign_support.rs",
+      "sha256": "4681623d5521e3e18fc3f74aa7f0a8e0c6e16713cb1a10e4415ee6636258efa1"
+    },
+    {
+      "path": "ios-host/smoke/src/lib.rs",
+      "sha256": "498874bbebe0482600b7b16f097d046f34be223569956a0a7c3304a23e0585b8"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "0496bc858d2c470e8acab0556cdd4177a5e3c96cfdbad3d1b8d1c93d371fcc7b"
+    },
+    {
+      "path": "scripts/ios/campaign.py",
+      "sha256": "2075aae8864bb2b5c6186a8442a2e858e85f75bbfba37c8dbd8d1d3cabffe38e"
+    },
+    {
+      "path": "scripts/tests/test_ios_campaign.py",
+      "sha256": "ab86d7bed9c261fd8424264500f8d8fbd6f064789df3c0e83dffede5f0c8efb1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/config.rs",
+      "sha256": "0afbd6b268798bd3d1ce78234c72a371c7981a2b777928fe81c98d88e07108b1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/test_support.rs",
+      "sha256": "c66761e3767c30b7b9176f70ec7f0bf82aafed5ac21019b4baca633031b18c1e"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/embeddings.rs",
+      "sha256": "210f6b33b61e9bd87b8b4940a656b08cca3ca9226c24ae449592e58111de1923"
+    },
+    {
+      "path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs",
+      "sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
+      "sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
+      "sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
+      "sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10"
+    },
+    {
+      "path": ".github/workflows/real-weights.yml",
+      "sha256": "e381d088c79ae9b7dd1bbdf9d0c3166b2aa4a8d2a59741b1c0ea3377d9002a4d"
+    },
+    {
+      "path": "scripts/ci/ios_pricing_compile_only.py",
+      "sha256": "bca0c8bb957dca3b538b7b9057c89c59ebf840a8a5cd6e786525e9c05c9d5f8a"
+    }
+  ],
+  "HOSTs": [
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::family_validates_actual_stop_order_and_action_multiplicity_not_only_sets",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::callback_error_preserves_same_nonempty_prefix_once_without_replay",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::future_file_io_cannot_preempt_an_earlier_known_parse_failure",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::repeated_literal_paths_keep_file_epochs_and_global_same_target_slots",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::full_alpha_vector_cast_and_orphan_raw_materialization_survive_in_source_work",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::every_existing_unfused_family_produces_and_materializes_its_exact_source_keys",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::packed_tucker_probe_and_full_factor_precedence_keep_shadow_raw_sources",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::sequential_naive_products_preserve_integer_intermediate_and_local_shapes",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::operator_refusals_preserve_only_reached_casts_and_no_successful_output",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::failed_raw_materialization_is_consumed_once_before_any_future_file_observation",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::aggregate_zero_relaxation_does_not_change_successful_semantic_v1_json_or_unknown_targets",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::enumerator_abort_keeps_actual_pending_prefix_before_any_callback_delivery",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen",
+      "fqn": "adapters::loader::source_facts::tests::same_width_f16_bf16_cast_is_conversion_work_not_source_clone",
+      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_work_basis::tests::actual_utf8_input_bytes_roundtrip_without_prompt_or_synthetic_replay_request",
+      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_work_basis::tests::missing_is_not_empty_or_fixed300_and_old_successful_non_pid_token_is_identical",
+      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_work_basis::tests::canonical_A_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec",
+      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_work_basis::tests::outer_decode_bound_is_inner_limit_plus_tuple_u64_not_a_prompt_cap",
+      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_work_basis::tests::malformed_outer_tokens_preserve_prefix_lowerhex_tuple_and_version_checks",
+      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::same_cache_endpoint_survives_steps_and_count_but_geometry_config_and_domain_do_not_alias",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::lazy_caption_keeps_full_hidden_parent_and_frozen_old_window_survives_later_graph_detach",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::initial_noise_and_all_eps_are_distinct_full_resolution_source_factories",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::row_strip_full_accumulator_and_full_normalizer_remain_coincident_not_tile_sized",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::composite_consumer_abort_keeps_same_prefix_and_prior_whole_case_only_once",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::raw_union_is_by_epoch_key_but_alpha_and_constructor_work_is_by_action",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::operation_identity_never_falls_back_to_first_same_label",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::retained_endpoint_requires_the_exact_epoch_constructor_and_global_slot",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::same_global_slot_consumes_cold_recurrent_zero_late_and_serial_history_owners",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_callback_abort_preserves_prefix_and_previous_whole_windows_once",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::global_abort_and_all_refused_keep_prior_prices_without_valid_envelope",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_legacy_listener_enabled_and_disabled_preserves_typed_causes",
+      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 2,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "pure_HOST_fork_protocol": {
+        "child": "ZIMAGE_ADAPTER_ABORT_DIAGNOSTIC_HOST_CHILD",
+        "done": "ZIMAGE_ADAPTER_ABORT_DIAGNOSTIC_HOST_DONE",
+        "parent_clears_child_env": true,
+        "fresh_absolute_done_created_by_parent": true,
+        "parent_checks_actual_b_ok_after_status_success": true,
+        "no_Device_Array_model_counter_calls": true
+      },
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_ios_catalog",
+      "fqn": "sampling::z_pid_work_token_tests::actual_utf8_basis_roundtrips_without_treating_recipe_projection_as_real_prompt",
+      "source_sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_ios_catalog",
+      "fqn": "sampling::z_pid_work_token_tests::strict_apply_checks_real_bytes_and_full_work_binding_still_checks_content",
+      "source_sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_ios_catalog",
+      "fqn": "sampling::z_pid_work_token_tests::representative_mints_its_actual_work_basis_but_legacy_replay_does_not_invent_one",
+      "source_sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_ios_catalog",
+      "fqn": "sampling::z_pid_work_token_tests::non_pid_control_and_existing_flow_semantics_keep_exact_old_tokens",
+      "source_sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_ios_catalog",
+      "fqn": "sampling::z_pid_work_token_tests::private_wire_is_canonical_bounded_and_does_not_cap_the_prompt_dimension",
+      "source_sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18",
+      "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "source_path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::gemma_gathered_affine_preserves_actual_batch_rank_layout_and_single_output_source",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "scope": "pure source exactrank/layout/storage regression; no nativebackendquery",
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    },
+    {
+      "binary_binding": "mlx_gen_z_image",
+      "fqn": "ios_pricing::pid_sources::source_tests::gemma_affine_shape_only_or_wrong_slot_provenance_is_not_a_layout_certificate",
+      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "expected_Rust_rows": 1,
+      "expected_logical_targets": 1,
+      "expected_each_passed": 1,
+      "expected_each_failed": 0,
+      "expected_each_ignored": 0,
+      "scope": "pure source exactrank/layout/storage regression; no nativebackendquery",
+      "source_path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs"
+    }
+  ],
+  "logical_HOST_count": 37,
+  "expected_HOST_Rust_rows": 38,
+  "native_files": [
+    {
+      "name": "pmetal-mlx-prebuilt.txt",
+      "sha256": "9dd2bd72b9511afb3b645525c8ee74af118f55fc7b9148f3df2a0adfd39e77d8"
+    },
+    {
+      "name": "libmlx.a",
+      "sha256": "1e1229726c85a70a0c5c6a09ea1dba88310e494d3de7b8d2a8fb4ff72d0aa7d8"
+    },
+    {
+      "name": "libmlxc.a",
+      "sha256": "b091e8c42e611c9ce4c842c1a70401a4f2e16056252aa933e92719bbf4ff15ee"
+    },
+    {
+      "name": "libjaccl.a",
+      "sha256": "e1611e85393692b262e049272bc34e969efe50e7e08a6266c69a9b1377702e59"
+    },
+    {
+      "name": "mlx.metallib",
+      "sha256": "ed247b9c448cdcb7f5a196bdce0ed3e7c5f564a1317f26c22777287bbe4af774"
+    }
+  ],
+  "SDK_headers": [
+    {
+      "relative_path": "System/Library/Frameworks/Metal.framework/Headers/MTLBuffer.h",
+      "sha256": "b2b7c4e7bb41241eda8c8f5b294a63f94fc51ac3cfd3025ff187537ee7df11b5"
+    },
+    {
+      "relative_path": "System/Library/Frameworks/Metal.framework/Headers/MTLDevice.h",
+      "sha256": "d1ef1bb5bc85faeeec9bc85f49124a453a8cd33b1182b0a71a41ba0dc4ebbb89"
+    },
+    {
+      "relative_path": "System/Library/Frameworks/Metal.framework/Headers/MTLHeap.h",
+      "sha256": "503d850aa73162d6875f1cb35eac1acb14aa01ef50d5d2f5a69180e422e27f39"
+    }
+  ],
+  "clear_env_before_all": [
+    "ZIMAGE_ORIGINAL_PREFIX_CPU_CHILD",
+    "ZIMAGE_ORIGINAL_PREFIX_CPU_DONE",
+    "ZIMAGE_IOS_ADDITIVITY_CPU_CHILD",
+    "ZIMAGE_IOS_ADDITIVITY_CPU_CHILD_DONE",
+    "ZIMAGE_IOS_PRICING_CPU_CHILD",
+    "ZIMAGE_IOS_PRICING_CPU_CHILD_DONE",
+    "ZIMAGE_VAE_HISTORY_CPU_CHILD",
+    "ZIMAGE_TE_SOURCE_CAPACITY_CPU_CHILD",
+    "ZIMAGE_TE_SOURCE_CAPACITY_CPU_DONE",
+    "ZIMAGE_BLOCK_SOURCE_CAPACITY_CPU_CHILD",
+    "ZIMAGE_BLOCK_SOURCE_CAPACITY_CPU_DONE",
+    "MLX_ROOT_METADATA_CPU_CHILD",
+    "MLX_ROOT_METADATA_CPU_DONE",
+    "ZIMAGE_THREE_ROOT_LOWER_CPU_CHILD",
+    "ZIMAGE_THREE_ROOT_LOWER_CPU_DONE",
+    "ZIMAGE_CONTROL_ADAPTER_NAMESPACE_CPU_CHILD",
+    "ZIMAGE_CONTROL_ADAPTER_NAMESPACE_CPU_DONE",
+    "ZIMAGE_ADAPTER_ABORT_DIAGNOSTIC_HOST_CHILD",
+    "ZIMAGE_ADAPTER_ABORT_DIAGNOSTIC_HOST_DONE"
+  ],
+  "provider_training_absent": [
+    "mlx_gen_z_image",
+    "mlx_gen_anima",
+    "mlx_gen_iris",
+    "mlx_gen_sdxl",
+    "mlx_gen_wan"
+  ],
+  "catalog_dependency_targets_expected": [
+    "mlx_gen_z_image",
+    "mlx_gen_anima",
+    "mlx_gen_iris",
+    "mlx_gen_sdxl",
+    "mlx_gen_sana",
+    "mlx_gen_pid",
+    "mlx_gen_qwen_image",
+    "mlx_gen_wan"
+  ],
+  "placement": {
+    "label": "rw-llm",
+    "hard_name": "nax-macos-2",
+    "before_checkout_build": true,
+    "no_credentials_inventory_requirement": true,
+    "no_hosted_fallback": true
+  },
+  "contract": {
+    "compile_only_default": "3compilers+ALL37solelists; NOtestbodies",
+    "compile_host_explicit_phase": "same3compilers/all37lists THEN37pureHOSTtargets/38RustPASSrows;1declaredHOSTfork",
+    "catalog_capture": "separateexplicitrequiredlaterstageNOTenabled",
+    "SDXL": "separateaffectedcompiler/HOSTand6boundednativeTP3P5RGB2; PEFTconstructorseparateunrun; no donorgreen"
+  },
+  "unknowns_NOT_zero": [
+    "packedaffineconditionalcopy/nativeCPUCustomfallback",
+    "RustStringVecfmtHashMapABI",
+    "CAPIArrayDescDataStdAllocatorABI",
+    "MetaldriverJIT/privateGPUspills/retirement/cache/mallocretention",
+    "NativeToProcess/Darwinphysical/runtimeNoAD"
+  ],
+  "source_guard_provenance": {
+    "role44_newmap_sha256": "b9328731bddca530790850494ab163c5358fc9a08b1d3ced4c6db18bc3e5d2cb",
+    "role44_exact_preservation_proof_sha256": "52dd1439fa89a988d534a5f0998e3293cc6d4ac9e223adc761092934d3f7bf50",
+    "original379dapproveddelta_preservation_sha256": "eb2b28a5930fec70627e26df81f1cafc6e5970be47135a0badf12df29750484a"
+  },
+  "prior_proofs_not_current_runtime_acceptance": true,
+  "no_local_build_or_dispatch_admitted": true,
+  "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance."
+}

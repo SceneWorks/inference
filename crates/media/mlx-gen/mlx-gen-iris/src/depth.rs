@@ -40,8 +40,68 @@ pub(crate) mod quanta {
     pub const LOAD: &str = "Iris depth load";
     pub const INPUT: &str = "Iris depth input";
     pub const REDUCER: &str = "Iris depth reducer";
+    pub const HOST_PREP: &str = "Iris depth host preprocessing";
+    pub const RGB: &str = "Iris depth RGB input copy";
+    pub const HOST_MAP: &str = "Iris depth host map copy";
+    pub const HOST_POST: &str = "Iris depth source resize";
     /// Every label above, for the phase attribution's coverage test.
-    pub const ALL: [&str; 3] = [LOAD, INPUT, REDUCER];
+    pub const ALL: [&str; 7] = [LOAD, INPUT, REDUCER, HOST_PREP, RGB, HOST_MAP, HOST_POST];
+}
+
+/// New internal whole-estimate payloads, not caller RGB ownership or phone evidence. A source
+/// bounder must account for caller storage according to the ACTUAL observation coordinate; a
+/// BeforeRequestConstruction process capture is not a BeforeModelLoad native measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepthHostBytes {
+    pub preprocessing_peak: u64,
+    pub input_live: u64,
+    pub rgb_copy: u64,
+    pub map_copy: u64,
+    pub postprocess_new: u64,
+}
+
+pub fn depth_host_bytes(plan: &gen_core::iris::depth::DepthInputPlan) -> Result<DepthHostBytes> {
+    let overflow = || Error::Msg("Iris depth host-payload accounting overflow".into());
+    let model = u64::from(plan.model_width)
+        .checked_mul(u64::from(plan.model_height))
+        .ok_or_else(overflow)?;
+    let source = u64::from(plan.source_width)
+        .checked_mul(u64::from(plan.source_height))
+        .ok_or_else(overflow)?;
+    let input = model
+        .checked_mul(3 * std::mem::size_of::<f32>() as u64)
+        .ok_or_else(overflow)?;
+    let map_copy = model
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or_else(overflow)?;
+    let mut preprocessing_peak = input.checked_mul(2).ok_or_else(overflow)?;
+    let postprocess_new = if plan.resized() {
+        preprocessing_peak = preprocessing_peak.max(
+            gen_core::imageops::resize_lanczos_u8_host_bytes(
+                plan.source_height,
+                plan.source_width,
+                plan.model_height,
+                plan.model_width,
+            )
+            .map_err(Error::from)?,
+        );
+        let axes = (u64::from(plan.source_width) + u64::from(plan.source_height))
+            .checked_mul(std::mem::size_of::<(usize, usize, f32, f32)>() as u64)
+            .ok_or_else(overflow)?;
+        source
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .and_then(|pixels| pixels.checked_add(axes))
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    Ok(DepthHostBytes {
+        preprocessing_peak,
+        input_live: input,
+        rgb_copy: crate::retention::allocated(input),
+        map_copy,
+        postprocess_new,
+    })
 }
 
 /// A loaded Iris-3B depth model.
@@ -295,19 +355,21 @@ fn depth_forward_with(
     )
 }
 
-/// The depth input quantum over a `[B, 3, H, W]` input: the f32 RGB ‖ zero-channel
+/// The depth input quantum over a `[B, 3, H, W]` input (each allocation page-rounded): the f32
+/// RGB ‖ zero-channel
 /// concatenation (`[B, 4, H, W]`), the zero channel itself and its f32 fill scalar, and the `[B]`
 /// model times. The prompt states are broadcast to the batch as a view, so they allocate nothing.
 pub(crate) fn depth_input_scratch(b: i32, h: i32, w: i32) -> u64 {
+    use crate::retention::allocated;
     use mlx_gen::ios_quantum::tensor_bytes;
     let d = |v: i32| v.max(0) as u64;
     let channels = 3 + DEPTH_EXTRA_INPUT_CHANNELS as u64;
-    tensor_bytes(4, &[d(b), channels, d(h), d(w)])
-        .saturating_add(tensor_bytes(
+    allocated(tensor_bytes(4, &[d(b), channels, d(h), d(w)]))
+        .saturating_add(allocated(tensor_bytes(
             4,
             &[d(b), DEPTH_EXTRA_INPUT_CHANNELS as u64, d(h), d(w)],
-        ))
-        .saturating_add(tensor_bytes(4, &[d(b)]))
+        )))
+        .saturating_add(allocated(tensor_bytes(4, &[d(b)])))
         .saturating_add(4)
 }
 
@@ -330,8 +392,8 @@ pub(crate) fn depth_input_body(parts: &DepthParts, rgb: &Array) -> Result<(Array
     Ok((x, t, states))
 }
 
-/// The depth reducer quantum over the backbone's `[B, C, H, W]` f32 output: the `[B·H·W, C]`
-/// re-layout (f32), and the reduced `[B·H·W, 1]` map — under bf16 also the re-layout's
+/// The depth reducer quantum over the backbone's `[B, C, H, W]` f32 output (each allocation
+/// page-rounded): the `[B·H·W, C]` re-layout (f32), and the reduced `[B·H·W, 1]` map — under bf16 also the re-layout's
 /// compute-width cast and the map's f32 copy.
 pub(crate) fn depth_reducer_scratch(out: &Array, compute: Dtype) -> u64 {
     depth_reducer_bytes(
@@ -343,12 +405,13 @@ pub(crate) fn depth_reducer_scratch(out: &Array, compute: Dtype) -> u64 {
 
 /// [`depth_reducer_scratch`] over `n` output elements of `c` channels at compute width `cw`.
 pub(crate) fn depth_reducer_bytes(n: u64, c: u64, cw: u64) -> u64 {
+    use crate::retention::allocated;
     use mlx_gen::ios_quantum::tensor_bytes;
     let c = c.max(1);
-    tensor_bytes(4, &[n])
-        .saturating_add(tensor_bytes(cw, &[n / c]))
+    allocated(tensor_bytes(4, &[n]))
+        .saturating_add(allocated(tensor_bytes(cw, &[n / c])))
         .saturating_add(if cw < 4 {
-            tensor_bytes(cw, &[n]).saturating_add(tensor_bytes(4, &[n / c]))
+            allocated(tensor_bytes(cw, &[n])).saturating_add(allocated(tensor_bytes(4, &[n / c])))
         } else {
             0
         })
@@ -374,6 +437,28 @@ pub(crate) fn depth_reducer_body(parts: &DepthParts, out: &Array) -> Result<Arra
 }
 
 impl IrisDepth {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn assert_endpoint_ownership(&self, streamed: bool) {
+        self.dit.assert_endpoint_ownership(streamed);
+        assert!(self.embeddings.nbytes() > 0, "depth owns no conditioning");
+        assert!(
+            self.reducer_weight.nbytes() > 0 && self.reducer_bias.nbytes() > 0,
+            "depth owns no reducer parameters"
+        );
+        let _addresses = self.endpoint_parameter_addresses();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_parameter_addresses(&self) -> Vec<usize> {
+        let mut addresses = self.dit.endpoint_parameter_addresses();
+        addresses.extend(crate::anchor_tests::materialized_addresses([
+            &self.embeddings,
+            &self.reducer_weight,
+            &self.reducer_bias,
+        ]));
+        addresses
+    }
+
     pub fn export(&self) -> &TaskExport {
         &self.export
     }
@@ -431,8 +516,36 @@ impl IrisDepth {
             Dtype::Float32 => "float32",
             _ => "bfloat16",
         };
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        estimate_with(
+        let _quantum_scope =
+            mlx_gen::ios_quantum::Scope::try_new().map_err(gen_core::Error::from)?;
+        gen_core::iris::depth::validate_depth_request(req)?;
+        let input_plan = gen_core::iris::depth::plan_depth_input(
+            req.image.width,
+            req.image.height,
+            req.resolution,
+            self.export.config.model.patch_size,
+        )?;
+        let host = depth_host_bytes(&input_plan).map_err(gen_core::Error::from)?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            DEPTH_MODEL_ID,
+            "depth_request",
+            &[
+                ("source_width", u64::from(req.image.width)),
+                ("source_height", u64::from(req.image.height)),
+                ("model_width", u64::from(input_plan.model_width)),
+                ("model_height", u64::from(input_plan.model_height)),
+                ("max_side", u64::from(req.resolution.max_side())),
+                ("caller_rgb_bytes", req.image.pixels.len() as u64),
+                (
+                    "caller_rgb_capacity_bytes",
+                    req.image.pixels.capacity() as u64,
+                ),
+                ("backbone_streamed", u64::from(self.dit.is_streamed())),
+            ],
+        );
+        mlx_gen::ios_quantum::before(quanta::HOST_PREP, host.preprocessing_peak)
+            .map_err(gen_core::Error::from)?;
+        let output = estimate_with(
             req,
             self.export.config.model.patch_size,
             |plan| {
@@ -446,19 +559,42 @@ impl IrisDepth {
             },
             on_progress,
             |input, plan| {
-                self.predict(input, plan.model_width, plan.model_height)
-                    .map_err(Into::into)
+                mlx_gen::ios_quantum::finish(quanta::HOST_PREP, &[])
+                    .map_err(gen_core::Error::from)?;
+                let prediction = self
+                    .predict(input, plan.model_width, plan.model_height)
+                    .map_err(gen_core::Error::from)?;
+                if plan.resized() {
+                    mlx_gen::ios_quantum::before(quanta::HOST_POST, host.postprocess_new)
+                        .map_err(gen_core::Error::from)?;
+                }
+                Ok(prediction)
             },
-        )
+        )?;
+        if input_plan.resized() {
+            mlx_gen::ios_quantum::finish(quanta::HOST_POST, &[]).map_err(gen_core::Error::from)?;
+        }
+        Ok(output)
     }
 
     /// One `[3, h, w]` host input → the `h × w` host prediction.
     fn predict(&self, input: &[f32], width: u32, height: u32) -> Result<Vec<f32>> {
         let (h, w) = (height as i32, width as i32);
+        let rgb_bytes = crate::retention::allocated(mlx_gen::ios_quantum::tensor_bytes(
+            4,
+            &[3, u64::from(height), u64::from(width)],
+        ));
+        mlx_gen::ios_quantum::before(quanta::RGB, rgb_bytes)?;
         let rgb = Array::from_slice(input, &[1, 3, h, w]);
+        mlx_gen::ios_quantum::finish(quanta::RGB, &[&rgb])?;
         let depth = self.forward(&rgb)?;
         eval([&depth])?;
+        mlx_gen::ios_quantum::before(
+            quanta::HOST_MAP,
+            mlx_gen::ios_quantum::tensor_bytes(4, &[u64::from(height), u64::from(width)]),
+        )?;
         let values = depth.reshape(&[h * w])?.as_slice::<f32>().to_vec();
+        mlx_gen::ios_quantum::finish(quanta::HOST_MAP, &[])?;
         drop(depth);
         mlx_rs::memory::clear_cache();
         Ok(values)

@@ -11,6 +11,15 @@ use mlx_rs::{Array, Dtype};
 
 /// Label of one solver update's iOS execution quantum.
 pub(crate) const STEP_QUANTUM: &str = "Iris solver step";
+/// Host-owned canonical plan and preview sigma payload, checked before allocation.
+pub(crate) const PLAN_QUANTUM: &str = "Iris solver plan";
+/// The final pixel-space clamp, evaluated before the solve returns and releases its text batches.
+pub(crate) const FINALIZE_QUANTUM: &str = "Iris solver final clamp";
+
+/// `clip(x, -1, 1)` is a maximum followed by a minimum: two f32 arrays and two f32 bounds.
+pub(crate) fn final_clamp_scratch(elements: u64) -> u64 {
+    2 * crate::retention::allocated(mlx_gen::ios_quantum::tensor_bytes(4, &[elements])) + 8
+}
 
 /// Integrate `z` along `plan`. `model_out(x, step)` returns the raw (CFG-combined) network output
 /// at `step.s` in f32, read as `prediction` (`_pred_x0`: velocity `x0 = x − s·out`, or the clean
@@ -27,16 +36,48 @@ pub fn sample(
 ) -> Result<Array> {
     let mut x = z.as_dtype(Dtype::Float32)?;
     let mut prev_x0: Option<Array> = None;
+    let mut completed_steps = 0u64;
     for (i, step) in plan.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "solver",
+            &[
+                ("step", i as u64),
+                ("steps", plan.len() as u64),
+                ("first", u64::from(i == 0)),
+                ("terminal", u64::from(i + 1 == plan.len())),
+                (
+                    "update_order",
+                    match step.update {
+                        DpmUpdate::First { .. } => 1,
+                        DpmUpdate::Second { .. } => 2,
+                    },
+                ),
+                ("history_present", u64::from(prev_x0.is_some())),
+                (
+                    "history_rows",
+                    prev_x0
+                        .as_ref()
+                        .map_or(0, |previous| previous.shape()[0] as u64),
+                ),
+                ("state_rows", x.shape()[0] as u64),
+                ("state_f32", u64::from(x.dtype() == Dtype::Float32)),
+                // This is completed-loop evidence, not a native availability assertion on lazy state.
+                ("prior_completed_steps", completed_steps),
+            ],
+        );
+        #[cfg(all(test, target_os = "macos"))]
+        crate::anchor_tests::observe_solver_epoch(i, step, &x, prev_x0.as_ref());
         let out = model_out(&x, step)?.as_dtype(Dtype::Float32)?;
         mlx_gen::ios_quantum::before(STEP_QUANTUM, step_scratch(x.size() as u64, &step.update))?;
         let (next, x0) = step_update(&x, &out, step, prediction, prev_x0.as_ref())?;
         x = next;
         eval([&x, &x0])?;
         mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[&x, &x0])?;
+        completed_steps += 1;
         on_step(i + 1, &x0);
         prev_x0 = Some(x0);
     }
@@ -56,18 +97,6 @@ pub(crate) fn step_scratch(state_elements: u64, update: &DpmUpdate) -> u64 {
         DpmUpdate::Second { .. } => (4, 6),
     };
     states * crate::retention::allocated(4 * state_elements) + 4 * scalars
-}
-
-/// [`step_scratch`] of the costlier update (second order) — the price of every step of a request
-/// whose sampler is not priced (`crate::ios_pricing`).
-pub(crate) fn worst_step_scratch(state_elements: u64) -> u64 {
-    let second = DpmUpdate::Second {
-        cx: 0.0,
-        c0: 0.0,
-        c1: 0.0,
-        r0: 1.0,
-    };
-    step_scratch(state_elements, &second)
 }
 
 /// One FlowDPM-Solver++ update of `x` from the network output `out` (both f32): returns the new

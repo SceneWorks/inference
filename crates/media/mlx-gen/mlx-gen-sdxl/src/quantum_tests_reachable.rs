@@ -2,7 +2,6 @@ use super::*;
 use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype as Stored};
 
 const MIB: u64 = 1 << 20;
-const ENTITLED: u64 = 6142 * MIB;
 const HALF: u64 = 2;
 
 /// The caller-provisioned snapshot for `name`, from `SDXL_PREDICTION_SNAPSHOTS` (a directory
@@ -637,7 +636,7 @@ fn write_ip_adapter(dir: &std::path::Path) {
 /// The iOS load spec of `route` at `tier` (`mlx-gen-ios-catalog::sdxl::sdxl_load_spec`'s
 /// fields: the sequential offload policy, deferred materialization, the staged fp16-fix VAE), with
 /// the mode's overlay.
-fn ios_spec(
+pub(super) fn ios_spec(
     route: &str,
     dir: &std::path::Path,
     bits: Option<u64>,
@@ -671,7 +670,7 @@ fn ios_spec(
 /// deepest `Implemented` rung of `spec`'s contract at the LAST (cheapest) selection of its
 /// quality-first `selection_space` — what the campaign captures — and the Resident selection; each
 /// with the catalog's sequential CFG.
-fn selections(
+pub(super) fn selections(
     spec: &mlx_gen::LoadSpec,
 ) -> (
     (
@@ -720,12 +719,12 @@ fn mib(bytes: u64) -> String {
     format!("{:.0}", bytes as f64 / MIB as f64)
 }
 
-/// Every SDXL-family route x tier x iOS mode x size: the per-phase peak (resident + largest
-/// counted quantum + the 512 MiB reserve, MiB) of (A) the fully optimized selection under the
-/// pre-epic model, (B) the same selection priced by `crate::ios_pricing` (the guards' formulas, the
-/// levers in place), the binding quantum and the lever that made a previously refused cell fit, and
-/// (C) the rung-0 resident configuration. Asserts every (B) cell fits the 6142 MiB entitled launch
-/// headroom.
+/// Header-only estimates for every declared SDXL-family route, tier and mode. A is the legacy
+/// formula, B the current optimized formula, C resident. These are raw formula estimates plus
+/// PROCESS_RESERVE_BYTES, NOT measured phone footprints, anchors or admission evidence.
+/// SDXL_PREDICTION_BUDGET_BYTES optionally supplies a diagnostic comparison budget; exceeding it
+/// is reported, never asserted away. No launch headroom is treated as a validated capacity cap.
+/// Hard invariants are nonempty execution and independent header-derived resident tensor floors.
 #[test]
 #[ignore = "prediction table from on-disk safetensors headers; run with --ignored --nocapture"]
 fn reachable_sizes_prediction() {
@@ -733,11 +732,18 @@ fn reachable_sizes_prediction() {
         return;
     }
     use mlx_gen::ios_pricing::{IosPhase, IosPricingRequest};
-    let (Some(fix_dir), Some(cn_dir)) = (snapshot("vae_fp16_fix"), snapshot("controlnet_tile"))
-    else {
-        println!("SDXL_PREDICTION_SNAPSHOTS lacks vae_fp16_fix / controlnet_tile");
-        return;
-    };
+    let fix_dir =
+        snapshot("vae_fp16_fix").expect("SDXL_PREDICTION_SNAPSHOTS must provision vae_fp16_fix");
+    let cn_dir = snapshot("controlnet_tile")
+        .expect("SDXL_PREDICTION_SNAPSHOTS must provision controlnet_tile");
+    let budget = std::env::var_os("SDXL_PREDICTION_BUDGET_BYTES").map(|value| {
+        value
+            .to_str()
+            .expect("prediction budget must be UTF-8")
+            .parse::<u64>()
+            .expect("prediction budget must be unsigned bytes")
+    });
+    println!("HEADER-ONLY DIAGNOSTIC: comparison budget {budget:?}; not measured capacity, target admission, or on-phone completion evidence");
     let fix = fix_dir.join("diffusion_pytorch_model.safetensors");
     let cn = cn_dir.join("diffusion_pytorch_model.safetensors");
     let ip_tmp = tempfile::tempdir().unwrap();
@@ -767,20 +773,31 @@ fn reachable_sizes_prediction() {
     println!("| route | tier | mode | edge | selection | load A→B | conditioning A→B | encode A→B | denoise A→B | decode A→B | A | B | B binding (phase: quantum) | lever | rung-0 C |");
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     let mut refused = Vec::new();
+    let mut rows = 0usize;
+    let vae_floor = resident(&fix, Stored::F16, HALF);
     for route in routes {
-        let Some(route_dir) = snapshot(route) else {
-            println!("<!-- {route}: not provisioned -->");
-            continue;
-        };
+        let route_dir = snapshot(route).unwrap_or_else(|| panic!("missing declared route {route}"));
         for (tier, bits) in [("bf16", None), ("q8", Some(8u64)), ("q4", Some(4))] {
             let dir = route_dir.join(tier);
-            if !dir.is_dir() {
-                println!("<!-- {route} {tier}: not provisioned -->");
-                continue;
-            }
+            assert!(
+                dir.is_dir(),
+                "missing declared tier {route} {tier}: {}",
+                dir.display()
+            );
+            let half_unet = dir.join("unet/diffusion_pytorch_model.fp16.safetensors");
+            let unet_file = if half_unet.is_file() {
+                half_unet
+            } else {
+                dir.join("unet/diffusion_pytorch_model.safetensors")
+            };
+            let heavy_floor = resident(&unet_file, Stored::F16, HALF) + vae_floor;
             for (mode_name, mode, references) in &modes {
                 let spec = ios_spec(route, &dir, bits, &fix_dir, (mode_name, &cn, ip_tmp.path()));
                 let ((optimized, memory), (resident_sel, resident_memory)) = selections(&spec);
+                let resident_spec = spec
+                    .clone()
+                    .with_load_shape(mlx_gen::LoadShape::EagerMaterialization)
+                    .with_offload_policy(mlx_gen::OffloadPolicy::Resident);
                 let streamable = crate::memory_strategy::streamable(&spec);
                 for edge in [512u32, 768, 1024] {
                     let geometry = mlx_gen::gen_core::MemoryGeometry {
@@ -790,20 +807,54 @@ fn reachable_sizes_prediction() {
                         frames: 1,
                         reference_count: *references,
                     };
-                    let price = |selection, execution| {
+                    let price = |selection: &mlx_gen::gen_core::MemorySelection, execution| {
+                        let generation = super::pricing::generation_request(
+                            crate::ios_pricing::Route::from_mode(mode).unwrap(),
+                            edge,
+                            edge,
+                            execution,
+                        );
                         crate::ios_pricing::ios_pricing(&IosPricingRequest {
                             provider: "sdxl",
-                            spec: &spec,
+                            spec: if selection.strategy
+                                == mlx_gen::gen_core::MemoryStrategy::Resident
+                            {
+                                &resident_spec
+                            } else {
+                                &spec
+                            },
                             mode,
                             geometry,
                             selection,
                             execution,
+                            generation: Some(&generation),
+                            transform: None,
+                            depth: None,
                             token_window: 77,
                         })
                         .unwrap()
                     };
                     let after = price(&optimized, &memory);
                     let rung0 = price(&resident_sel, &resident_memory);
+                    // Independently count actual stored/cast tensors: neither a large activation
+                    // price nor a synthetic capacity verdict may hide a missing resident component.
+                    assert!(
+                        after
+                            .phase(IosPhase::Decode)
+                            .expect("decode phase must exist")
+                            .resident_bytes
+                            >= vae_floor,
+                        "{route} {tier} {mode_name}: optimized decode omits resident VAE tensors"
+                    );
+                    assert!(
+                        rung0
+                            .phase(IosPhase::Denoise)
+                            .expect("denoise phase must exist")
+                            .resident_bytes
+                            >= heavy_floor,
+                        "{route} {tier} {mode_name}: resident denoise omits UNet/VAE tensors"
+                    );
+                    rows += 1;
                     let before = before_cell(&dir, &fix, &cn, bits, mode_name, edge as i32);
                     let reserve = PROCESS_RESERVE_BYTES;
                     let a_peak = before.iter().flatten().max().unwrap() + reserve;
@@ -837,21 +888,15 @@ fn reachable_sizes_prediction() {
                         .max_by_key(|p| p.peak_bytes())
                         .map(|p| format!("{}: {}", p.phase.as_key(), p.binding))
                         .unwrap();
-                    let lever = if a_peak <= ENTITLED {
-                        "—".to_string()
-                    } else if b_peak > ENTITLED {
-                        "STILL REFUSED".to_string()
-                    } else {
-                        let mut levers = Vec::new();
-                        if streamable {
-                            levers.push("b");
-                        }
-                        if *mode_name == "ip_adapter" && memory.stage_residency {
-                            levers.push("d");
-                        }
-                        levers.join("+")
-                    };
-                    if b_peak > ENTITLED {
+                    let mut levers = Vec::new();
+                    if streamable {
+                        levers.push("b");
+                    }
+                    if *mode_name == "ip_adapter" && memory.stage_residency {
+                        levers.push("d");
+                    }
+                    let lever = levers.join("+");
+                    if budget.is_some_and(|limit| b_peak > limit) {
                         refused.push(format!("{route} {tier} {mode_name} {edge}"));
                     }
                     let selection = format!(
@@ -862,11 +907,14 @@ fn reachable_sizes_prediction() {
                         u8::from(memory.stage_residency)
                     );
                     let verdict = |peak: u64| {
-                        format!(
-                            "{} {}",
-                            mib(peak),
-                            if peak <= ENTITLED { "fits" } else { "REFUSED" }
-                        )
+                        let status = match budget {
+                            Some(limit) if peak > limit => {
+                                "predicted capacity refusal (comparison only)"
+                            }
+                            Some(_) => "within comparison budget (NOT admission)",
+                            None => "no supplied budget verdict",
+                        };
+                        format!("{} {status}", mib(peak))
                     };
                     println!(
                         "| {route} | {tier} | {mode_name} | {edge} | {selection} | {} | {} | {} | {} | {} | {} | {} | {binding} | {lever} | {} |",
@@ -878,7 +926,8 @@ fn reachable_sizes_prediction() {
         }
     }
     assert!(
-        refused.is_empty(),
-        "fully optimized cells that do not fit: {refused:?}"
+        rows > 0,
+        "header diagnostic must execute requests, not silently skip its corpus"
     );
+    println!("HEADER DIAGNOSTIC: {rows} rows; {} optimized predictions exceed supplied comparison budget {budget:?}: {refused:?}. Target phone completion remains unverified.", refused.len());
 }

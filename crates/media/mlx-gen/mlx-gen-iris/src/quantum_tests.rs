@@ -52,8 +52,21 @@ fn in_cpu_child(test: &str, body: fn()) {
     const DONE: &str = "IRIS_QUANTUM_CPU_CHILD_DONE";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert_eq!(
+            mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+            mlx_rs::Device::cpu()
+        );
         assert!(metal_guard::forbid_metal());
         assert!(metal_guard::metal_forbidden());
+        // Select the native CPU stream before constructing any fixture, not just in scopes.
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         body();
         std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
         return;
@@ -267,26 +280,29 @@ fn dit_forward_guarded_body() {
             host(&unguarded),
             "guarded execution changed the backbone output ({budget:?})"
         );
-        for (label, count) in [
+        let expected = [
             (dit_q::EMBED, 1),
             (dit_q::TEXT_LAYER_BLOCK, 2),
             (dit_q::TEXT_POOL, 1),
+            (dit_q::TEXT_MASK, 1),
             (dit_q::TEXT_REFINER_BLOCK, 2),
             (dit_q::TEXT_OUTPUT, 1),
+            (dit_q::TRUNK_POSITIONS, 1),
             (dit_q::TRUNK_BLOCK, dit.trunk_depth()),
             (dit_q::PIXEL_EMBED, 1),
+            (dit_q::PIXEL_POSITIONS, 1),
             (dit_q::PIXEL_BLOCK, dit.pixel_depth()),
             (dit_q::OUTPUT, 1),
-        ] {
+        ];
+        for &(label, count) in &expected {
             assert_paired(&events, label, count);
         }
         assert_eq!(
             checks(&events).len(),
-            9 + dit.trunk_depth() + dit.pixel_depth()
+            expected.iter().map(|(_, count)| count).sum::<usize>()
         );
-        // Lazy small work is priced where it materializes. The entry quantum carries the previous
-        // step's guidance combine + solver arithmetic (16 latent-sized f32 buffers); the FIRST trunk
-        // block carries both RoPE tables (4 tables each) and the text positional add (3 buffers).
+        // The embed guard carries the previous lazy guidance/solver allowance. Positional
+        // constructors have their own EARLY quantum, not a late allowance on the first trunk.
         let m = &config.model;
         let p = m.patch_size as i32;
         let (b, n_patches, n_txt) = (2, (16 / p) * (24 / p), m.text_len as i32);
@@ -306,13 +322,17 @@ fn dit_forward_guarded_body() {
         let entry = 4 * n_patches as u64 * head_dim * 4
             + 4 * n_txt as u64 * head_dim * 4
             + 3 * (b * n_txt) as u64 * m.hidden_size as u64 * 4;
+        assert_eq!(
+            of(dit_q::TRUNK_POSITIONS),
+            [entry],
+            "positions are checked before their constructors"
+        );
         let trunk = of(dit_q::TRUNK_BLOCK);
         for (i, scratch) in trunk.iter().enumerate() {
             let floor = dit.trunk_block_scratch(i, b, n_patches, n_txt, plan);
             assert_eq!(
-                *scratch,
-                floor + if i == 0 { entry } else { 0 },
-                "trunk {i}"
+                *scratch, floor,
+                "trunk {i}: positional allocations already completed in their own quantum"
             );
         }
         let mid = assert_refusals(&events, |headroom| {
@@ -324,6 +344,106 @@ fn dit_forward_guarded_body() {
             "a trunk block must be refusable on its own: {mid:?}"
         );
     }
+}
+
+fn allocation_region_body() {
+    use mlx_gen::ios_quantum::{set_quantum_listener, QuantumMark};
+    use std::sync::{Arc, Mutex};
+    let (dit, config) = tiny_backbone();
+    let case = DitCase::new(&config);
+    for (role, label) in [
+        (0, dit_q::TEXT_MASK),
+        (1, dit_q::TRUNK_POSITIONS),
+        (2, dit_q::PIXEL_POSITIONS),
+    ] {
+        let baseline = Arc::new(Mutex::new(None));
+        let sink = baseline.clone();
+        assert!(!set_quantum_listener(Some(Box::new(move |mark| {
+            if let QuantumMark::Metadata {
+                provider,
+                kind,
+                fields,
+            } = mark
+            {
+                if provider == crate::model::MODEL_ID && kind == "allocation_region" {
+                    let actual = fields
+                        .iter()
+                        .find(|(key, _)| *key == "role")
+                        .expect("actual allocation role missing")
+                        .1;
+                    if actual == role {
+                        let mut active = 0;
+                        assert_eq!(
+                            unsafe { mlx_sys::mlx_get_active_memory(&mut active) },
+                            0,
+                            "native active-memory query failed"
+                        );
+                        assert!(
+                            active > 0,
+                            "the witness must own real materialized fixtures"
+                        );
+                        assert_eq!(
+                            unsafe { mlx_sys::mlx_reset_peak_memory() },
+                            0,
+                            "native peak reset failed"
+                        );
+                        *sink.lock().expect("allocation witness poisoned") = Some(active);
+                    }
+                }
+            }
+        }))));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_quantum_listener(None);
+            }
+        }
+        let restore = Restore;
+        take_refusal();
+        let (result, events) = observed(AMPLE, || {
+            mlx_gen::ios_quantum::with_cpu_diagnostic_short_at(label, || {
+                case.forward(&dit, AttentionBudget::UNBOUNDED)
+            })
+        });
+        let mut peak = 0;
+        assert_eq!(
+            unsafe { mlx_sys::mlx_get_peak_memory(&mut peak) },
+            0,
+            "native peak query failed"
+        );
+        drop(restore);
+        assert!(
+            result.is_err(),
+            "{label} must refuse at its own early guard"
+        );
+        assert_eq!(
+            take_refusal().expect("constructor refusal recorded").label,
+            label
+        );
+        let before = baseline
+            .lock()
+            .unwrap()
+            .expect("actual constructor region was never entered");
+        assert!(before > 0);
+        // Native reset_peak resets to zero, not active memory. With no later allocation it stays
+        // zero; any constructor allocation updates it to the then-active total, even if freed.
+        assert_eq!(
+            peak, 0,
+            "{label}: native constructor allocation occurred before refusal"
+        );
+        assert!(
+            !events.iter().any(|(event, _, _)| is_checked(event, label)),
+            "a refused constructor must not pass its check"
+        );
+    }
+}
+
+#[test]
+fn allocation_regions_refuse_before_native_constructor_buffers() {
+    in_cpu_child(
+        "quantum_tests::allocation_regions_refuse_before_native_constructor_buffers",
+        allocation_region_body,
+    );
 }
 
 #[test]
@@ -629,12 +749,32 @@ fn restoration_body() {
     // The driver's host planes are checked before the first tile, and the post-tile planes once
     // the last tile has returned (after its synchronization, before the driver allocates them).
     let plan = restorer.plan(&request).unwrap();
-    let host = crate::restoration::host_plane_bytes(&plan);
+    let host = crate::restoration::host_plane_bytes(&plan).unwrap();
+    let checked = checks(&events);
     assert_eq!(
-        checks(&events)[0],
+        checked[0],
+        (
+            restore_q::PLAN.to_string(),
+            plan.metadata().axis_bytes().unwrap(),
+            0
+        )
+    );
+    let host_position = checked
+        .iter()
+        .position(|event| event.0 == restore_q::HOST_PLANES)
+        .expect("host planes checked");
+    assert_eq!(
+        checked[host_position],
         (restore_q::HOST_PLANES.to_string(), host.peak(), 0)
     );
-    assert!(is_checked(&events[1].0, restore_q::TILE));
+    let first_tile = checked
+        .iter()
+        .position(|event| event.0 == restore_q::TILE)
+        .expect("tile checked");
+    assert!(
+        host_position < first_tile,
+        "host construction is guarded before any tile"
+    );
     let last = checks(&events).last().cloned().unwrap();
     assert_eq!(
         (last.0.as_str(), last.1),
@@ -698,12 +838,57 @@ fn generation_body() {
     // Two prompts and the CFG negative are encoded; each step is one batched CFG forward.
     assert_paired(&events, te_q::TOWER, 3);
     assert_paired(&events, crate::solver::STEP_QUANTUM, steps as usize);
+    assert_paired(&events, crate::solver::FINALIZE_QUANTUM, 1);
     assert_paired(&events, dit_q::EMBED, steps as usize);
     assert_paired(&events, dit_q::TRUNK_BLOCK, 3 * steps as usize);
     assert_paired(&events, crate::model::IMAGE_QUANTUM, 1);
     assert!(is_checked(&events[0].0, te_q::TOWER));
     let mid = assert_refusals(&events, |headroom| observed(headroom, generate));
     eprintln!("generation refuses mid-request at {mid:?}");
+
+    // Refuse the final clamp of the f32 solver state [prompts, 3, H, W] specifically.
+    // Its price need not exceed earlier quanta, so the monotone-headroom walk above is not proof.
+    let final_label = crate::solver::FINALIZE_QUANTUM;
+    let final_position = events
+        .iter()
+        .position(|(event, _, _)| is_checked(event, final_label))
+        .expect("the passing route checked its final clamp");
+    let final_scratch = checks(&events)
+        .into_iter()
+        .find(|(label, _, _)| label == final_label)
+        .unwrap()
+        .1;
+    assert_eq!(
+        crate::ios_pricing::ios_quantum_phase(final_label),
+        Some(mlx_gen::ios_pricing::IosPhase::Denoise)
+    );
+    assert!(events[final_position + 1..]
+        .iter()
+        .any(|(event, _, _)| is_checked(event, crate::model::IMAGE_QUANTUM)));
+    take_refusal();
+    let (refused, refused_events) = observed(AMPLE, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_short_at(final_label, generate)
+    });
+    assert!(refused.is_err(), "the final-clamp guard must refuse");
+    let refusal = take_refusal().expect("final-clamp refusal must be recorded");
+    assert_eq!(refusal.label, final_label);
+    assert_eq!(refusal.scratch_bytes, final_scratch);
+    let prefix: Vec<_> = events[..final_position].iter().map(|e| &e.0).collect();
+    let got: Vec<_> = refused_events.iter().map(|e| &e.0).collect();
+    assert_eq!(got, prefix, "only quanta before the final clamp ran");
+    assert_eq!(diagnostics::observations().len(), events[final_position].1);
+    assert!(
+        refused_events.iter().all(|(event, _, _)| {
+            let label = match event {
+                QuantumEvent::Checked { label, .. } | QuantumEvent::Synchronized { label, .. } => {
+                    label
+                }
+            };
+            crate::ios_pricing::ios_quantum_phase(label)
+                != Some(mlx_gen::ios_pricing::IosPhase::Decode)
+        }),
+        "Decode must not be entered after a final-clamp refusal"
+    );
 }
 
 #[test]

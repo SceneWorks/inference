@@ -10,10 +10,10 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    ActivationMemoryAnchor, Capabilities, ConditioningKind, Error, FlowMatchEuler,
-    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, ActivationMemoryAnchor,
+    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    Residency, Result, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 use std::path::Path;
@@ -445,14 +445,16 @@ fn build_residency_with_source(
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the
 /// [`build_residency`] dispatch and the `Sequential` [`resolve_precision_and_root`] guard.
-const PRECISION_ERROR: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
+pub(crate) const PRECISION_ERROR: &str =
+    "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
      encoder already runs f32 internally (drop the precision override)";
-const FILE_ERROR: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+pub(crate) const FILE_ERROR: &str =
+    "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
      transformer/ vae/), not a single .safetensors file";
 
 /// Precision guard + snapshot-dir resolution (rejecting a single-file source), shared by
 /// [`build_residency`]'s per-phase loaders (sc-10839, sc-11126).
-fn resolve_precision_and_root<'a>(
+pub(crate) fn resolve_precision_and_root<'a>(
     spec: &'a LoadSpec,
     precision_msg: &str,
     file_msg: &str,
@@ -606,6 +608,18 @@ impl ZImageTurbo {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            MODEL_ID,
+            "request",
+            &[
+                ("schema", 1),
+                ("serial_count", req.count as u64),
+                ("forward_rows", 1),
+                ("requested_width", req.width as u64),
+                ("requested_height", req.height as u64),
+                ("requested_steps", req.steps.unwrap_or(DEFAULT_STEPS) as u64),
+            ],
+        );
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -678,13 +692,8 @@ impl ZImageTurbo {
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
                 // seed-independent. An unset `req.scheduler` keeps this native schedule byte-exact
                 // (epic 7114 N1); a curated name re-shapes the σ schedule over the same `shift=3.0`.
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let resolved_sigmas = resolve_flow_schedule(
-                    req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
-                    steps,
-                    &native.sigmas,
-                );
+                let sampling = crate::sampling::resolve_full(req)?;
+                let resolved_sigmas = sampling.sigmas().to_vec();
                 // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
                 // `use_pid` is set AND an overlay was loaded, else `None` → the native VAE. The
                 // `(capture_sigma, keep)` fold truncates the denoise to the achieved-σ step; the clean
@@ -710,7 +719,7 @@ impl ZImageTurbo {
                     None
                 };
 
-                let sampler_name = req.sampler.as_deref();
+                let sampler_name = Some(sampling.solver().name());
                 let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),

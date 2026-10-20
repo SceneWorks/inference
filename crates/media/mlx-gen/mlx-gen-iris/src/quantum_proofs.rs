@@ -3,9 +3,8 @@
 //! Each body below builds the REAL module (the committed miniature exports), materializes the
 //! quantum's inputs, then measures MLX's peak allocation while exactly that quantum's body builds
 //! and evaluates — UNTHROTTLED, natural and stalled, the worst of several runs ([`measure`]) — and
-//! asserts the counted formula ([`crate::retention`]) is at least the measurement (hard), reporting
-//! a ratio above [`PROOF_MAX`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]: report-only;
-//! low-end accuracy is calibrated on the device). Shapes are small, so
+//! asserts the counted formula ([`crate::retention`]) is at least the measurement, reporting ratios
+//! above [`PROOF_MAX`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]). Shapes are small, so
 //! the CPU's unfused fallbacks (RMSNorm, attention with materialized scores) are priced as such
 //! ([`crate::retention::unfused`]); the iOS GPU runs those fused. Every body runs at the f32 and
 //! the bf16 compute width, and the attention sites under both an unbounded and a chunking plan.
@@ -26,7 +25,7 @@ use crate::nn::key_padding_mask;
 
 use crate::test_metal_guard as metal_guard;
 
-/// The largest formula / measurement ratio a proof accepts.
+/// Report-only formula / measurement ratio, shared by decoder and other quanta.
 const PROOF_MAX: f64 = 1.5;
 
 fn fixtures() -> PathBuf {
@@ -42,8 +41,21 @@ fn in_cpu_child(test: &str, body: fn()) {
     const DONE: &str = "IRIS_QUANTUM_PROOF_CHILD_DONE";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert_eq!(
+            mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+            mlx_rs::Device::cpu()
+        );
         assert!(metal_guard::forbid_metal());
         assert!(metal_guard::metal_forbidden());
+        // Select the native CPU stream before constructing any fixture, not just in scopes.
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         body();
         std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
         return;
@@ -60,21 +72,31 @@ fn in_cpu_child(test: &str, body: fn()) {
     assert!(marker.is_file(), "{test}: the CPU child ran no body");
 }
 
-/// Assert `formula` tracks `measured` within [`PROOF_MAX`], printing both.
+/// Enforce `formula >= measured` in every mode, printing both and reporting ratios above
+/// [`PROOF_MAX`]. `IRIS_PROOF_PRINT_ONLY` no longer disables safety assertions.
 fn prove(label: &str, formula: u64, measured: u64) {
-    prove_within(label, formula, measured, PROOF_MAX);
-}
-
-/// [`prove`] with a stated, site-specific bound (never above 2.0).
-fn prove_within(label: &str, formula: u64, measured: u64, max: f64) {
-    assert!(max <= PROOF_MAX);
     eprintln!(
         "PROOF {label}: formula {formula} B, measured {measured} B, ratio {:.3}",
         formula as f64 / measured.max(1) as f64
     );
-    if std::env::var_os("IRIS_PROOF_PRINT_ONLY").is_none() {
-        assert_tracks_measured(label, formula, measured, max);
-    }
+    assert_tracks_measured(label, formula, measured, PROOF_MAX);
+}
+
+#[test]
+fn proof_policy_cannot_be_disabled_by_print_only() {
+    in_cpu_child(
+        "quantum_proofs::proof_policy_cannot_be_disabled_by_print_only",
+        || {
+            // This isolated, single-test child cannot affect the parent or another test.
+            std::env::set_var("IRIS_PROOF_PRINT_ONLY", "1");
+            prove("report-only control", 151, 100);
+            prove("decoder report-only control", 170, 100);
+            assert!(
+                std::panic::catch_unwind(|| prove("underpriced discriminator", 99, 100)).is_err(),
+                "print-only must not disable the measured lower bound"
+            );
+        },
+    );
 }
 
 fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
@@ -356,10 +378,8 @@ fn text_encoder_body() {
             // next state alone — a fresh graph per run, natural and stalled (see [`measure`]).
             let mut worst = 0;
             for stalled in [false, true] {
-                // Twice the runs: the layer (~80 CPU ops) outruns the CPU's encode-ahead window, so
-                // how much of it a run retains swings with timing. Its ratio (~1.53-1.56: the
-                // device holds the whole layer, the CPU the last ~50 ops) is reported against the
-                // shared threshold, not excused.
+                // Twice the runs: how much of the layer the CPU encode-ahead window retains
+                // swings with timing. Excess conservatism is reported at the common threshold.
                 for _ in 0..2 * RUNS {
                     let peak = with_cpu_diagnostic_headroom(PLENTY, || {
                         let _scope = mlx_gen::ios_quantum::Scope::new();
@@ -380,16 +400,11 @@ fn text_encoder_body() {
                 }
             }
             let (layer, _held) = te.layer_scratch_parts(n, k + 1);
-            prove_within(
-                &format!("text decoder layer {k} n{n}"),
-                layer,
-                worst,
-                PROOF_MAX,
-            );
+            prove(&format!("text decoder layer {k} n{n}"), layer, worst);
         }
     }
     // The decoder layer's counted components, each a graph short enough for the CPU to retain
-    // whole (so each is held to the plain bound): its bf16 RMSNorm, its NeoX RoPE and its causal
+    // whole (each uses the common reporting threshold): its bf16 RMSNorm, its NeoX RoPE and its causal
     // grouped-query attention, through `mlx_llm`'s own functions.
     use crate::retention::Retention;
     use crate::text_encoder::{decoder_attention, decoder_norm, decoder_rope};
@@ -526,7 +541,17 @@ fn small_steps_body() {
             );
         }
     }
-    // The RGB8 conversion (its MLX part; the u8 host pixels are the formula's last term).
+    // The final solve clamp is its own guarded denoise quantum, not deferred decode work.
+    for (b, h, w) in [(1, 64, 64), (2, 32, 48)] {
+        let x = rand(&[b, 3, h, w], 6, Dtype::Float32);
+        let (peak, _) = measure(|| Ok(vec![mlx_rs::ops::clip(&x, (-1.0f32, 1.0f32))?]));
+        prove(
+            "final solver clamp",
+            crate::solver::final_clamp_scratch(x.size() as u64),
+            peak,
+        );
+    }
+    // RGB8 conversion starts from an evaluated solved batch; the host pixels are the last term.
     for (b, h, w) in [(1, 64, 64), (2, 32, 48)] {
         let x = rand(&[b, 3, h, w], 6, Dtype::Float32);
         let elements = x.size() as u64;
@@ -536,7 +561,7 @@ fn small_steps_body() {
         });
         prove(
             &format!("image conversion b{b} {h}x{w}"),
-            crate::model::image_scratch(elements) - elements,
+            crate::model::image_scratch(elements, b as u64) - elements,
             peak,
         );
     }
@@ -667,7 +692,7 @@ fn streamed_body() {
             let (h, cos, sin) = (out[0].clone(), out[1].clone(), out[2].clone());
             for i in [0, 1] {
                 let layer = tower.build_layer(i).unwrap();
-                // One cache-free decoder layer — the bound of `DECODER_PROOF_MAX` (see there).
+                // One cache-free decoder layer, with the same hard lower/report-only upper policy.
                 let mut worst = 0;
                 for stalled in [false, true] {
                     for _ in 0..2 * RUNS {
@@ -684,11 +709,10 @@ fn streamed_body() {
                         worst = worst.max(peak);
                     }
                 }
-                prove_within(
+                prove(
                     &format!("text streamed layer {i} n{n} {quant:?}"),
                     crate::text_encoder::streamed_layer_bytes(cfg, n as u64),
                     worst,
-                    DECODER_PROOF_MAX,
                 );
             }
         }

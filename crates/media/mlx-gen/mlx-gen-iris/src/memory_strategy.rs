@@ -208,8 +208,10 @@ const fn export_tier(precision: Precision, quant: Option<gen_core::Quant>) -> Me
 /// Refuse an adapter stack on a deferred-materialization (streamed) load: the adapters are
 /// installed on the projections of the materialized backbone, which a streamed load never holds —
 /// each window rebuilds its blocks from the checkpoint. The loaders and the contract factories
-/// share this one refusal.
-pub(crate) fn refuse_streamed_adapters(id: &str, spec: &LoadSpec) -> CoreResult<()> {
+/// share this one refusal. This metadata-only check performs no I/O or model construction;
+/// configured endpoint enumeration can identify this known load-form incompatibility without
+/// treating unrelated contract/configuration errors as candidate skips.
+pub fn refuse_streamed_adapters(id: &str, spec: &LoadSpec) -> CoreResult<()> {
     if spec.load_shape == LoadShape::DeferredMaterialization && !spec.adapters.is_empty() {
         return Err(CoreError::Unsupported(format!(
             "{id}: LoadSpec::adapters cannot ride a deferred-materialization (streamed) load; each \
@@ -542,7 +544,13 @@ pub(crate) fn generation_contract(
     if !production_calibration_identity(&[backbone_tier, text_tier], requested) {
         contract.calibration = None;
     }
-    let overlays = adapter_overlay_components(spec, precision)?;
+    let overlays = adapter_overlay_components(
+        spec,
+        precision,
+        &resources
+            .backbone_dir
+            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+    )?;
     let overlay_bytes = overlays
         .iter()
         .try_fold(0_u64, |total, component| {
@@ -641,9 +649,12 @@ pub(crate) fn production_calibration_identity(
 /// weight (a rank-2 `.weight`) as [`crate::nn::ProjectionLayout::of`] holds it under `quant` —
 /// in the compute dtype on the dense tier, packed (over its zero-padded input) on a quantized one;
 /// every other tensor of rank two or more (the text position table excepted) cast to the compute
-/// dtype; vectors (norm gains, biases) and that table as stored. The rule is the one in
-/// [`crate::model::load_backbone_quantized`] and [`crate::depth::load_depth_export`] (whose keys
-/// carry a `pixel.` prefix, hence the suffix match).
+/// dtype; a projection's bias in the compute dtype (the dtype [`crate::nn`]'s linear layers hold
+/// it in); other vectors (norm gains) and that table as stored. Each tensor is one allocation,
+/// counted as the allocator holds it ([`crate::retention::allocated`]: page-rounded above a page).
+/// The rule is the one in [`crate::model::load_backbone_quantized`] and
+/// [`crate::depth::load_depth_export`] (whose keys carry a `pixel.` prefix, hence the suffix
+/// match).
 pub(crate) fn backbone_bytes(
     weights: &Path,
     precision: Precision,
@@ -663,6 +674,13 @@ pub(crate) fn backbone_bytes_where(
     let width = u64::from(compute_width(precision));
     let mut total = 0_u64;
     let mut headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
+    // Every projection of the checkpoint (a rank-2 `.weight`, dense or packed), whether or not
+    // `keep` retains its weight: its bias is held in the compute dtype.
+    let projections: std::collections::HashSet<String> = headers
+        .iter()
+        .filter(|h| h.shape.len() == 2)
+        .filter_map(|h| h.name.strip_suffix(".weight").map(str::to_owned))
+        .collect();
     headers.retain(|h| keep(&h.name));
     // A packed artifact (`crate::packed`) is resident exactly as stored: its codes, scales,
     // biases and logical-width markers.
@@ -687,8 +705,13 @@ pub(crate) fn backbone_bytes_where(
                 .strip_suffix(suffix)
                 .is_some_and(|base| packed.contains(base))
         });
+        let projection_bias = header
+            .name
+            .strip_suffix(".bias")
+            .is_some_and(|base| projections.contains(base));
         let bytes = match header.shape.as_slice() {
             _ if packed_part => header.data_bytes,
+            [_] if projection_bias => elements * width,
             [out, input] if header.name.ends_with(".weight") => crate::nn::ProjectionLayout::of(
                 *input, quant,
             )
@@ -697,7 +720,7 @@ pub(crate) fn backbone_bytes_where(
             _ => header.data_bytes,
         };
         total = total
-            .checked_add(bytes)
+            .checked_add(crate::retention::allocated(bytes))
             .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: backbone byte sum overflow")))?;
     }
     Ok(total)
@@ -783,7 +806,22 @@ const ADAPTER_DELTAS_COMPONENT_ID: &str = "iris_3b.adapters.materialized_deltas"
 fn adapter_overlay_components(
     spec: &LoadSpec,
     precision: Precision,
+    backbone: &Path,
 ) -> CoreResult<Vec<MemoryResidentComponent>> {
+    if spec.adapters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (projections, _) = crate::adapters::projection_shapes_from_headers(backbone)?;
+    let inventory = crate::adapters::header_inventory(
+        &spec.adapters,
+        &projections,
+        crate::model::compute_dtype(spec),
+        IrisTask::Generation,
+        MODEL_ID,
+    )?;
+    // Validate the SAME reconstruction form the actual loader selects. In particular LoHa uses
+    // Tucker only with BOTH t tensors; decomposed LoKr may use vectors or batched matmuls.
+    inventory.projection_loads()?;
     let mut components = Vec::new();
     let residuals = adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive)
         .ok_or_else(|| {
@@ -792,15 +830,21 @@ fn adapter_overlay_components(
                  sized; refusing to declare a zero the shared validator would wave through"
             ))
         })?;
-    push_overlay(&mut components, ADAPTER_RESIDUALS_COMPONENT_ID, residuals);
-    let mut elements = 0_u64;
-    for adapter in &spec.adapters {
-        elements = elements.saturating_add(materialized_delta_elements(&adapter.path)?);
-    }
+    // Same factor category, not two independent allocations: keep the historical conservative
+    // whole-file allowance, but never below the actual normalized retained LoRA payloads (B can
+    // widen to F32 when alpha is folded). LoKr/LoHa deltas remain their separate existing axis.
+    push_overlay(
+        &mut components,
+        ADAPTER_RESIDUALS_COMPONENT_ID,
+        adapter_factor_bytes(residuals, &inventory)?,
+    );
+    let elements = materialized_delta_elements(&inventory)?;
     push_overlay(
         &mut components,
         ADAPTER_DELTAS_COMPONENT_ID,
-        elements.saturating_mul(u64::from(compute_width(precision))),
+        elements
+            .checked_mul(u64::from(compute_width(precision)))
+            .ok_or_else(|| CoreError::Msg("iris: materialized adapter byte sum overflow".into()))?,
     );
     Ok(components)
 }
@@ -821,88 +865,62 @@ fn push_overlay(into: &mut Vec<MemoryResidentComponent>, id: &str, resident_byte
     });
 }
 
-/// Elements of the full `[out, in]` deltas the shared LyCORIS install materializes for the adapter
-/// file at `path`, read from its safetensors headers (no tensor data): `|w1| · |w2|` per LoKr
-/// module (`kron(w1, w2)`), and one delta per LoHa module sized by its first Hadamard pair. A
-/// module whose factor set cannot describe a delta fails closed — the install refuses it too.
-fn materialized_delta_elements(path: &Path) -> CoreResult<u64> {
-    use gen_core::weightsmeta::{
-        safetensors_path_tensor_headers, split_factor_key, LOHA_TP_SUFFIXES, LOKR_TP_SUFFIXES,
-    };
-    use std::collections::BTreeMap;
+/// Full deltas after the SAME normalized loader graph has been validated by projection_loads.
+/// Do not re-infer a matrix product from the first/second factor axes: vector/batched matmul and
+/// LoHa's both-or-neither Tucker rule are real accepted forms, not a 2-D low-rank shorthand.
+pub(crate) fn materialized_delta_elements(
+    inventory: &crate::adapters::AdapterHeaderInventory,
+) -> CoreResult<u64> {
+    use mlx_gen::adapters::facts::AdapterFacts;
+    inventory
+        .projections
+        .values()
+        .flatten()
+        .try_fold(0_u64, |total, adapter| {
+            let elements = match adapter {
+                AdapterFacts::Lora { .. } => 0,
+                AdapterFacts::Materialized { delta, .. } => delta.elements(),
+                AdapterFacts::Structured { .. } => {
+                    return Err(CoreError::Unsupported(
+                        "iris: the dense install host does not produce a structured residual"
+                            .into(),
+                    ))
+                }
+            };
+            total.checked_add(elements).ok_or_else(|| {
+                CoreError::Msg("iris: materialized adapter element sum overflow".into())
+            })
+        })
+}
 
-    type Factors<'a> = BTreeMap<&'a str, &'a [usize]>;
-    let headers = safetensors_path_tensor_headers(path)?;
-    let mut lokr: BTreeMap<&str, Factors<'_>> = BTreeMap::new();
-    let mut loha: BTreeMap<&str, Factors<'_>> = BTreeMap::new();
-    for header in &headers {
-        if let Some((module, factor)) = split_factor_key(&header.name, &LOKR_TP_SUFFIXES) {
-            lokr.entry(module)
-                .or_default()
-                .insert(factor, header.shape.as_slice());
-        } else if let Some((module, factor)) = split_factor_key(&header.name, &LOHA_TP_SUFFIXES) {
-            loha.entry(module)
-                .or_default()
-                .insert(factor, header.shape.as_slice());
-        }
-    }
-    let refuse = |module: &str, what: &str| {
-        CoreError::Unsupported(format!(
-            "{MODEL_ID}: adapter {} module `{module}` {what}; its materialized delta cannot be \
-             priced",
-            path.display()
-        ))
-    };
-    fn numel(shape: &[usize]) -> u64 {
-        shape.iter().map(|&d| d as u64).product()
-    }
-    // A low-rank pair `a [p, r] · b [r, q, k…]` reconstructs `[p, q, k…]`.
-    fn low_rank(a: &[usize], b: &[usize]) -> Option<u64> {
-        Some((*a.first()? as u64).saturating_mul(numel(b.get(1..)?)))
-    }
-    // A tucker triple `einsum(t [i, j, k…], a [i, p], b [j, q]) → [p, q, k…]`.
-    fn tucker(t: &[usize], a: &[usize], b: &[usize]) -> Option<u64> {
-        Some(
-            (*a.get(1)? as u64)
-                .saturating_mul(*b.get(1)? as u64)
-                .saturating_mul(numel(t.get(2..)?)),
-        )
-    }
+pub(crate) fn adapter_factor_bytes(
+    file_allowance: u64,
+    inventory: &crate::adapters::AdapterHeaderInventory,
+) -> CoreResult<u64> {
+    Ok(file_allowance.max(retained_lora_bytes(inventory)?))
+}
 
-    let mut elements = 0_u64;
-    for (&module, f) in &lokr {
-        let w1 = match (f.get("lokr_w1"), f.get("lokr_w1_a"), f.get("lokr_w1_b")) {
-            (Some(w), _, _) => Some(numel(w)),
-            (None, Some(a), Some(b)) => low_rank(a, b),
-            _ => None,
-        }
-        .ok_or_else(|| refuse(module, "has no complete w1 factor"))?;
-        let w2 = match (
-            f.get("lokr_w2"),
-            f.get("lokr_t2"),
-            f.get("lokr_w2_a"),
-            f.get("lokr_w2_b"),
-        ) {
-            (Some(w), _, _, _) => Some(numel(w)),
-            (None, Some(t), Some(a), Some(b)) => tucker(t, a, b),
-            (None, None, Some(a), Some(b)) => low_rank(a, b),
-            _ => None,
-        }
-        .ok_or_else(|| refuse(module, "has no complete w2 factor"))?;
-        elements = elements.saturating_add(w1.saturating_mul(w2));
-    }
-    for (&module, f) in &loha {
-        let (Some(a), Some(b)) = (f.get("hada_w1_a"), f.get("hada_w1_b")) else {
-            return Err(refuse(module, "has no complete hada_w1 pair"));
-        };
-        let delta = match f.get("hada_t1") {
-            Some(t) => tucker(t, a, b),
-            None => low_rank(a, b),
-        }
-        .ok_or_else(|| refuse(module, "has a malformed hada_w1 pair"))?;
-        elements = elements.saturating_add(delta);
-    }
-    Ok(elements)
+pub(crate) fn retained_lora_bytes(
+    inventory: &crate::adapters::AdapterHeaderInventory,
+) -> CoreResult<u64> {
+    use mlx_gen::adapters::facts::AdapterFacts;
+    inventory
+        .projections
+        .values()
+        .flatten()
+        .try_fold(0_u64, |total, adapter| {
+            let bytes = match adapter {
+                AdapterFacts::Lora { a, b, .. } => {
+                    a.bytes().checked_add(b.bytes()).ok_or_else(|| {
+                        CoreError::Msg("iris: retained LoRA factor sum overflow".into())
+                    })?
+                }
+                _ => 0,
+            };
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| CoreError::Msg("iris: retained LoRA stack sum overflow".into()))
+        })
 }
 
 /// The provider safety check of all three routes: the shared handshake (calibration identity,

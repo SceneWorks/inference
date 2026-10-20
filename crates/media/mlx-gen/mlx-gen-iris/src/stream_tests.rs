@@ -34,13 +34,13 @@ use crate::dit::{Execution, Stack, TextBatch};
 use crate::packed::ConvertKind;
 use crate::test_metal_guard as metal_guard;
 
-const AMPLE: u64 = 1 << 34;
+pub(crate) const AMPLE: u64 = 1 << 34;
 
-fn fixtures() -> PathBuf {
+pub(crate) fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn backbone_dir() -> PathBuf {
+pub(crate) fn backbone_dir() -> PathBuf {
     fixtures().join("tiny-snapshot/iris")
 }
 
@@ -48,13 +48,26 @@ fn text_encoder_dir() -> PathBuf {
     fixtures().join("tiny-snapshot/text_encoder")
 }
 
-fn in_cpu_child(test: &str, body: fn()) {
+pub(crate) fn in_cpu_child(test: &str, body: fn()) {
     const CHILD: &str = "IRIS_STREAM_CPU_CHILD";
     const DONE: &str = "IRIS_STREAM_CPU_CHILD_DONE";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert_eq!(
+            mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+            mlx_rs::Device::cpu()
+        );
         assert!(metal_guard::forbid_metal());
         assert!(metal_guard::metal_forbidden());
+        // Select the native CPU stream before constructing any fixture, not just in scopes.
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         body();
         std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
         return;
@@ -78,7 +91,7 @@ fn host(a: &Array) -> Vec<f32> {
     a.as_slice::<f32>().to_vec()
 }
 
-fn rand(shape: &[i32], seed: u64) -> Array {
+pub(crate) fn rand(shape: &[i32], seed: u64) -> Array {
     random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap())).unwrap()
 }
 
@@ -337,7 +350,7 @@ fn a_streamed_text_tower_reproduces_the_resident_one() {
     );
 }
 
-fn generation_spec(shape: LoadShape) -> LoadSpec {
+pub(crate) fn generation_spec(shape: LoadShape) -> LoadSpec {
     let mut spec = LoadSpec::new(WeightsSource::Dir(backbone_dir())).with_load_shape(shape);
     spec.components.insert(
         TEXT_ENCODER_COMPONENT.into(),
@@ -366,7 +379,18 @@ fn selection(
         .rev()
         .find(|s| component.is_none() || s.parameters.transformer_window_component == component)
         .unwrap();
-    let memory = contract.generation_memory(&chosen).unwrap_or_default();
+    let memory = contract.generation_memory(&chosen).unwrap_or_else(|| {
+        assert_eq!(
+            chosen.strategy,
+            MemoryStrategy::Resident,
+            "optimized selection lost its execution controls"
+        );
+        assert_eq!(
+            contract.resident_request_memory,
+            mlx_gen::gen_core::ResidentRequestMemory::PreserveLoadDefaults
+        );
+        GenerationMemory::default()
+    });
     (chosen, memory)
 }
 
@@ -391,58 +415,64 @@ fn pixels(output: GenerationOutput) -> Vec<Vec<u8>> {
 }
 
 fn generation_parity_body() {
-    let eager = crate::model::load(&generation_spec(LoadShape::EagerMaterialization)).unwrap();
-    let deferred_spec = generation_spec(LoadShape::DeferredMaterialization);
-    let deferred = crate::model::load(&deferred_spec).unwrap();
-    let run = |g: &dyn mlx_gen::Generator, memory| {
-        pixels(
-            g.generate(&prompt_batch_request(memory), &mut |_| {})
-                .unwrap(),
-        )
-    };
-    // The Mac default (no memory block) on a deferred load: whole-stack windows, the resident
-    // image bit for bit.
-    let default = run(eager.as_ref(), GenerationMemory::default());
-    assert_eq!(run(deferred.as_ref(), GenerationMemory::default()), default);
-    // Rung 3 (staged, chunked attention, per-row PiT stage) on the eager load is the reference of
-    // every rung-4 scope on the deferred one.
-    let (_, rung3) = selection(
-        crate::model::MODEL_ID,
-        &generation_spec(LoadShape::EagerMaterialization),
-        MemoryStrategy::BoundedAttention,
-        None,
-    );
-    assert!(rung3.chunk_attention && rung3.stage_residency);
-    let reference = run(eager.as_ref(), rung3);
-    for component in [
-        TransformerComponent::Dit,
-        TransformerComponent::TextEncoder,
-        TransformerComponent::Both,
-    ] {
+    let root = tempfile::tempdir().unwrap();
+    for (tier, deferred_spec) in crate::anchor_tests::generation_tiers(root.path()) {
+        eprintln!("GENERATION PARITY {tier}");
+        let eager_spec = deferred_spec
+            .clone()
+            .with_load_shape(LoadShape::EagerMaterialization);
+        let eager = crate::model::load(&eager_spec).unwrap();
+        let deferred = crate::model::load(&deferred_spec).unwrap();
+        let run = |g: &dyn mlx_gen::Generator, memory| {
+            pixels(
+                g.generate(&prompt_batch_request(memory), &mut |_| {})
+                    .unwrap(),
+            )
+        };
+        // The Mac default (no memory block) on a deferred load: whole-stack windows, the resident
+        // image bit for bit.
+        let default = run(eager.as_ref(), GenerationMemory::default());
+        assert_eq!(run(deferred.as_ref(), GenerationMemory::default()), default);
+        // Rung 3 (staged, chunked attention, per-row PiT stage) on the eager load is the reference of
+        // every rung-4 scope on the deferred one.
+        let (_, rung3) = selection(
+            crate::model::MODEL_ID,
+            &eager_spec,
+            MemoryStrategy::BoundedAttention,
+            None,
+        );
+        assert!(rung3.chunk_attention && rung3.stage_residency);
+        let reference = run(eager.as_ref(), rung3);
+        for component in [
+            TransformerComponent::Dit,
+            TransformerComponent::TextEncoder,
+            TransformerComponent::Both,
+        ] {
+            let (_, rung4) = selection(
+                crate::model::MODEL_ID,
+                &deferred_spec,
+                MemoryStrategy::BoundedTransformerResidency,
+                Some(component),
+            );
+            assert!(rung4.stream_transformer_blocks && rung4.chunk_attention);
+            assert_eq!(rung4.transformer_window_size, Some(1));
+            assert_eq!(
+                run(deferred.as_ref(), rung4),
+                reference,
+                "{component:?}: rung 4 must reproduce rung 3's image"
+            );
+        }
+        // The eager generator refuses a rung-4 request by name rather than ignoring it.
         let (_, rung4) = selection(
             crate::model::MODEL_ID,
             &deferred_spec,
             MemoryStrategy::BoundedTransformerResidency,
-            Some(component),
+            None,
         );
-        assert!(rung4.stream_transformer_blocks && rung4.chunk_attention);
-        assert_eq!(rung4.transformer_window_size, Some(1));
-        assert_eq!(
-            run(deferred.as_ref(), rung4),
-            reference,
-            "{component:?}: rung 4 must reproduce rung 3's image"
-        );
+        assert!(eager
+            .generate(&prompt_batch_request(rung4), &mut |_| {})
+            .is_err());
     }
-    // The eager generator refuses a rung-4 request by name rather than ignoring it.
-    let (_, rung4) = selection(
-        crate::model::MODEL_ID,
-        &deferred_spec,
-        MemoryStrategy::BoundedTransformerResidency,
-        None,
-    );
-    assert!(eager
-        .generate(&prompt_batch_request(rung4), &mut |_| {})
-        .is_err());
 }
 
 #[test]
@@ -453,7 +483,7 @@ fn a_deferred_generation_reproduces_the_eager_one() {
     );
 }
 
-fn restore_request() -> TransformRequest {
+pub(crate) fn restore_request() -> TransformRequest {
     TransformRequest {
         image: Image {
             width: 16,
@@ -468,33 +498,40 @@ fn restore_request() -> TransformRequest {
 
 fn downstream_parity_body() {
     use crate::restoration::IrisRestorer;
-    let upscaler = || {
-        LoadSpec::new(WeightsSource::Dir(
-            fixtures().join("tiny-snapshot/upscaler"),
-        ))
-    };
-    let eager = IrisRestorer::load(&upscaler()).unwrap();
-    let deferred =
-        IrisRestorer::load(&upscaler().with_load_shape(LoadShape::DeferredMaterialization))
-            .unwrap();
-    let req = restore_request();
-    assert!(eager.plan(&req).unwrap().forward_count() > 1);
-    assert_eq!(
-        deferred.apply(&req, &mut |_| {}).unwrap().pixels,
-        eager.apply(&req, &mut |_| {}).unwrap().pixels,
-        "a deferred restorer must reproduce the eager one"
-    );
-    let depth = || LoadSpec::new(WeightsSource::Dir(fixtures().join("tiny-depth")));
-    let eager = crate::depth::load_depth(&depth()).unwrap();
-    let deferred =
-        crate::depth::load_depth(&depth().with_load_shape(LoadShape::DeferredMaterialization))
-            .unwrap();
-    let rgb = rand(&[1, 3, 16, 24], 11);
-    assert_eq!(
-        host(&deferred.forward(&rgb).unwrap()),
-        host(&eager.forward(&rgb).unwrap()),
-        "a deferred depth model must reproduce the eager one"
-    );
+    let root = tempfile::tempdir().unwrap();
+    let upscaler = fixtures().join("tiny-snapshot/upscaler");
+    for (tier, spec) in crate::anchor_tests::downstream_tiers(root.path(), &upscaler, false) {
+        let eager = IrisRestorer::load(
+            &spec
+                .clone()
+                .with_load_shape(LoadShape::EagerMaterialization),
+        )
+        .unwrap();
+        let deferred = IrisRestorer::load(&spec).unwrap();
+        let req = restore_request();
+        assert!(eager.plan(&req).unwrap().forward_count() > 1);
+        assert_eq!(
+            deferred.apply(&req, &mut |_| {}).unwrap().pixels,
+            eager.apply(&req, &mut |_| {}).unwrap().pixels,
+            "{tier}: a deferred restorer must reproduce the eager one"
+        );
+    }
+    let depth = fixtures().join("tiny-depth");
+    for (tier, spec) in crate::anchor_tests::downstream_tiers(root.path(), &depth, true) {
+        let eager = crate::depth::load_depth(
+            &spec
+                .clone()
+                .with_load_shape(LoadShape::EagerMaterialization),
+        )
+        .unwrap();
+        let deferred = crate::depth::load_depth(&spec).unwrap();
+        let rgb = rand(&[1, 3, 16, 24], 11);
+        assert_eq!(
+            host(&deferred.forward(&rgb).unwrap()),
+            host(&eager.forward(&rgb).unwrap()),
+            "{tier}: a deferred depth model must reproduce the eager one"
+        );
+    }
 }
 
 #[test]
@@ -785,6 +822,9 @@ fn generation_pricing_case(
             },
             selection: &chosen,
             execution: &memory,
+            generation: Some(&request),
+            transform: None,
+            depth: None,
             token_window,
         },
         crate::ios_pricing::Pricing::default(),
@@ -929,7 +969,13 @@ fn pricing_body() {
             let restorer = crate::restoration::IrisRestorer::load(&spec)?;
             let plan = restorer.plan(&req)?;
             assert!(!plan.enlarged && plan.color_fix);
-            geometry = Some(crate::memory_strategy::restoration_memory_geometry(&plan));
+            geometry = Some(mlx_gen::gen_core::MemoryGeometry {
+                width: req.image.width,
+                height: req.image.height,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            });
             restorer
                 .apply(&req, &mut |_| {})
                 .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
@@ -946,6 +992,9 @@ fn pricing_body() {
                 geometry: geometry.unwrap(),
                 selection: &chosen,
                 execution: &memory,
+                generation: None,
+                transform: Some(&req),
+                depth: None,
                 token_window: 0,
             },
             crate::ios_pricing::Pricing::default(),
@@ -959,11 +1008,23 @@ fn pricing_body() {
 
         // Depth, at its model grid.
         let spec = with_tier(LoadSpec::new(WeightsSource::Dir(depth_dir)).with_load_shape(shape));
-        let rgb = rand(&[1, 3, 16, 24], 11);
-        eval([&rgb]).unwrap();
+        let actual_depth = mlx_gen::gen_core::iris::depth::DepthRequest {
+            image: Image {
+                width: 24,
+                height: 16,
+                pixels: (0..24 * 16 * 3).map(|i| (i * 31 % 256) as u8).collect(),
+            },
+            resolution: mlx_gen::gen_core::iris::depth::DepthResolution::Native,
+            ..Default::default()
+        };
         let observed = observed_phases(|| {
             let depth = crate::depth::load_depth(&spec)?;
-            depth.forward(&rgb)?;
+            mlx_gen::gen_core::iris::depth::IrisDepthEstimator::estimate(
+                &depth,
+                &actual_depth,
+                &mut |_| {},
+            )
+            .map_err(mlx_gen::Error::from)?;
             Ok(())
         });
         let (chosen, memory) = selection(crate::depth::DEPTH_MODEL_ID, &spec, strategy, None);
@@ -982,6 +1043,9 @@ fn pricing_body() {
                 },
                 selection: &chosen,
                 execution: &memory,
+                generation: None,
+                transform: None,
+                depth: Some(&actual_depth),
                 token_window: 0,
             },
             crate::ios_pricing::Pricing::default(),

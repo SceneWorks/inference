@@ -5,7 +5,8 @@ use super::*;
 /// anchors' short step count. Any configuration of the catalog's domain, anchor or derived.
 pub(super) fn cell(prefix: &str) -> Case {
     static SURFACES: std::sync::OnceLock<Vec<Surface>> = std::sync::OnceLock::new();
-    let surfaces = SURFACES.get_or_init(|| surfaces(runtime_ios::catalog().unwrap().media()));
+    let surfaces =
+        SURFACES.get_or_init(|| surfaces(runtime_ios::catalog().unwrap().media()).unwrap());
     let mut c = Case::parse(&format!(
         "{prefix}/{}/{}",
         campaign::BASE_SELECTION,
@@ -13,7 +14,7 @@ pub(super) fn cell(prefix: &str) -> Case {
     ))
     .unwrap();
     if let Some(s) = surfaces.iter().find(|s| s.provider == c.provider) {
-        c.selection = s.first_selection(&c.tier, c.rung);
+        c.selection = s.first_selection(&c.route, &c.tier, c.rung);
     }
     c
 }
@@ -32,6 +33,7 @@ fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
         refused_quantum: None,
         refusal_only: false,
         admitted: None,
+        telemetry: None,
     }
 }
 fn tokenizer(dir: &Path) {
@@ -413,6 +415,7 @@ fn campaign_capture_requires_bounded_quanta_and_skips_evidence() {
 fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
     let catalog = runtime_ios::catalog().unwrap();
     let sdxl = surfaces(catalog.media())
+        .unwrap()
         .into_iter()
         .find(|s| s.provider == "sdxl")
         .unwrap();
@@ -618,13 +621,17 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
 #[test]
 fn campaign_cells_execute_their_own_declared_selection() {
     let catalog = runtime_ios::catalog().unwrap();
-    let discovered = surfaces(catalog.media());
+    let discovered = surfaces(catalog.media()).unwrap();
     // The provider's declared space for `provider/tier/rung`, quality first.
     let tokens = |provider: &str, tier: &str, rung: u8| {
         discovered
             .iter()
             .find(|s| s.provider == provider)
-            .and_then(|s| s.selections.get(&(tier.to_string(), rung)).cloned())
+            .and_then(|s| {
+                s.selections
+                    .get(&(provider.to_string(), tier.to_string(), rung))
+                    .cloned()
+            })
             .unwrap_or_default()
     };
     // Z-Image rung 4: staging x window scope x tile, quality first (unstaged, DiT-only scope,

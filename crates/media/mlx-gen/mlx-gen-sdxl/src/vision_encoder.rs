@@ -298,7 +298,7 @@ impl ClipVisionEncoder {
     /// L{n-1}_out]` (length `num_layers + 1`). IP-Adapter "plus" reads `[-2]` (= the penultimate
     /// layer's output).
     pub fn hidden_states(&self, pixel_values: &Array) -> Result<Vec<Array>> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut x = self.embed_quantum(pixel_values)?;
         let mut states = Vec::with_capacity(self.layers.len() + 1);
         states.push(x.clone());
@@ -401,7 +401,7 @@ impl ClipVisionEncoder {
     /// so forwarding the whole tower and discarding the last layer + every intermediate state was
     /// wasted work (one ViT-H layer + the retained states; F-076).
     pub fn penultimate(&self, pixel_values: &Array) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut x = self.embed_quantum(pixel_values)?;
         let keep = self.layers.len().saturating_sub(1);
         for layer in &self.layers[..keep] {

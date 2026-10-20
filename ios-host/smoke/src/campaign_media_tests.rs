@@ -1,10 +1,375 @@
 use super::*;
+
+#[test]
+fn campaign_grouping_uses_actual_control_carriers_not_lossy_mode_labels() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let registry = catalog.media();
+    let provider = runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID;
+    let kinds = accepted_kinds(registry, provider);
+    assert!(!kinds.is_empty());
+    let mut control_variants = std::collections::BTreeSet::new();
+    let mut init_variants = std::collections::BTreeSet::new();
+    for kind in &kinds {
+        for (prefix, references) in [("control", 0), ("reference", 1)] {
+            let mode = format!("{prefix}_{}", kind_token(kind));
+            let case = Case {
+                provider: provider.into(),
+                route: provider.into(),
+                tier: "q4".into(),
+                edge: 32,
+                mode: mode.clone(),
+                rung: 0,
+                selection: campaign::BASE_SELECTION.into(),
+                steps: 1,
+                recipe: None,
+            };
+            let runtime_ios::media::IosWork::Generate(request) =
+                work(&case, &CancelFlag::default(), registry).unwrap()
+            else {
+                panic!("expected generation carrier")
+            };
+            let actual = (
+                request.memory_reference_count(),
+                request
+                    .conditioning
+                    .iter()
+                    .filter(|role| matches!(role, Conditioning::Mask { .. }))
+                    .count() as u32,
+                request
+                    .conditioning
+                    .iter()
+                    .filter(|role| matches!(role, Conditioning::Control { .. }))
+                    .count() as u32,
+            );
+            assert_eq!(
+                actual,
+                (references + 1, 0, 1),
+                "geometry counts ALL image carriers"
+            );
+            assert_eq!(
+                request
+                    .conditioning
+                    .iter()
+                    .filter(|role| matches!(role, Conditioning::Reference { .. }))
+                    .count() as u32,
+                references,
+                "true Reference role remains separate from aggregate geometry"
+            );
+            let planned =
+                variant_for_registry(registry, provider, &mode, "q4", Some("actual-same-class"));
+            assert!(
+                planned.is_ok(),
+                "accepted actual carrier must retain its complete scalar role tuple"
+            );
+            let planned = planned.unwrap();
+            assert_eq!(
+                planned,
+                runtime_ios::media::pricing::anchor_variant_for_roles(
+                    provider,
+                    "control",
+                    "q4",
+                    Some("actual-same-class"),
+                    actual.0,
+                    actual.1,
+                    actual.2,
+                )
+                .unwrap()
+            );
+            if references == 0 {
+                control_variants.insert(planned);
+            } else {
+                init_variants.insert(planned);
+            }
+        }
+    }
+    assert_eq!(
+        control_variants.len(),
+        1,
+        "role-identical accepted union-control aliases share"
+    );
+    assert_eq!(init_variants.len(), 1, "role-identical init aliases share");
+    assert!(control_variants.is_disjoint(&init_variants));
+
+    // Same actual SDXL carrier: only configured spec + resolved native route decides IP/init.
+    let mut spec = runtime_ios::media::sdxl::sdxl_load_spec(
+        "sdxl",
+        WeightsSource::Dir("metadata-only".into()),
+    )
+    .unwrap();
+    spec.ip_adapter = Some(WeightsSource::File("metadata-only-ip".into()));
+    let mut request = GenerationRequest {
+        prompt: "role fixture".into(),
+        conditioning: vec![Conditioning::Reference {
+            image: synthetic_image(32),
+            strength: Some(0.4),
+        }],
+        ..Default::default()
+    };
+    let sampling = runtime_ios::media::sampling::resolve("sdxl", &request).unwrap();
+    let class = sampling.allocation_class();
+    let work = runtime_ios::media::IosWork::Generate(request.clone());
+    let ip = variant_for_work("sdxl", "q4", Some(class), &spec, &work).unwrap();
+    assert_eq!(ip, "ip_adapter");
+    spec.ip_adapter = None;
+    assert_eq!(
+        variant_for_work("sdxl", "q4", Some(class), &spec, &work).unwrap(),
+        "image_to_image"
+    );
+    assert!(
+        variant_for_registry(registry, "sdxl", "ip_adapter", "q4", Some(class)).is_err(),
+        "unprovisioned spec must stay unresolved"
+    );
+    spec.ip_adapter = Some(WeightsSource::File("metadata-only-ip".into()));
+    let case = Case {
+        provider: "sdxl".into(),
+        route: "sdxl".into(),
+        tier: "q4".into(),
+        edge: 32,
+        mode: "ip_adapter".into(),
+        rung: 0,
+        selection: campaign::BASE_SELECTION.into(),
+        steps: sampling.steps(),
+        recipe: Some(sampling.token().into()),
+    };
+    let projected = variant_for_case(registry, &case, &spec, Some(class));
+    assert!(
+        projected.is_ok(),
+        "actual configured ordinary case must replay before grouping"
+    );
+    assert_eq!(projected.unwrap(), "ip_adapter");
+    let masked_case = Case {
+        mode: "mask".into(),
+        ..case.clone()
+    };
+    let masked = variant_for_case(registry, &masked_case, &spec, Some(class));
+    assert!(
+        masked.is_ok(),
+        "the actual supported single-reference mask case must replay"
+    );
+    assert_ne!(
+        masked.unwrap(),
+        "ip_adapter",
+        "a real Mask carrier suppresses configured IP"
+    );
+    let acceleration = runtime_ios::media::sampling::resolve(
+        "sdxl",
+        &GenerationRequest {
+            sampler: Some("lcm".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rejected_case = Case {
+        steps: acceleration.steps(),
+        recipe: Some(acceleration.token().into()),
+        ..case
+    };
+    assert!(
+        variant_for_case(
+            registry,
+            &rejected_case,
+            &spec,
+            Some(acceleration.allocation_class())
+        )
+        .is_err(),
+        "the real campaign case must apply its captured recipe, not silently use ordinary defaults"
+    );
+    request.sampler = Some("lcm".into());
+    let rejected = runtime_ios::media::IosWork::Generate(request);
+    assert!(
+        variant_for_work("sdxl", "q4", None, &spec, &rejected).is_err(),
+        "actual early accel+Ref refusal is not an accepted INIT family"
+    );
+}
+
+#[test]
+fn capture_output_cardinality_includes_serial_count_and_prompt_rows() {
+    let mut request = GenerationRequest {
+        count: 3,
+        ..Default::default()
+    };
+    assert_eq!(support::expected_generation_outputs(&request).unwrap(), 3);
+    request.prompt_batch = vec!["first".into(), "second".into()];
+    assert_eq!(support::expected_generation_outputs(&request).unwrap(), 6);
+    assert_eq!(request.count, 3);
+    request.count = 0;
+    assert!(support::expected_generation_outputs(&request).is_err());
+}
+
+#[test]
+fn campaign_endpoints_use_literal_load_forms_before_contract_selection() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let registry = catalog.media();
+    let discovered = surfaces(registry).unwrap();
+    let variant_of = |p: &str, _route: &str, m: &str, t: &str, recipe: &campaign::CaptureRecipe| {
+        variant(p, m, t, recipe.memory_class.as_deref())
+    };
+    let (_, cases) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
+    let contracts = registry.memory_contract_surfaces().unwrap();
+    for planned in cases.iter().filter(|c| {
+        matches!(
+            c.purpose,
+            campaign::Purpose::Resident | campaign::Purpose::Optimized
+        )
+    }) {
+        let c = &planned.case;
+        let spec = load_spec(c, WeightsSource::Dir(PathBuf::new())).unwrap();
+        let (policy, shape) = if planned.purpose == campaign::Purpose::Resident {
+            (OffloadPolicy::Resident, LoadShape::EagerMaterialization)
+        } else {
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+            )
+        };
+        assert_eq!(
+            (spec.offload_policy, spec.load_shape),
+            (policy, shape),
+            "{}",
+            c.key()
+        );
+        let surface = contracts
+            .iter()
+            .find(|s| {
+                s.contract.provider_id == c.provider
+                    && s.selector.offload_policy == policy
+                    && s.selector.load_shape == shape
+                    && match s.selector.tier {
+                        MemoryContractSurfaceTier::Q4 => c.tier == "q4",
+                        MemoryContractSurfaceTier::Q8 => c.tier == "q8",
+                        MemoryContractSurfaceTier::Bf16 => c.tier == "bf16",
+                        _ => false,
+                    }
+            })
+            .expect("endpoint load form must have a declared contract surface");
+        let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
+        let selection = surface
+            .contract
+            .selection_space(strategy, tier(c), false)
+            .unwrap()
+            .into_iter()
+            .find(|s| selection_token(&s.parameters) == c.selection)
+            .expect("enumeration must use the endpoint's own contract");
+        let execution = match surface.contract.generation_memory(&selection) {
+            Some(execution) => execution,
+            None if strategy == MemoryStrategy::Resident
+                && surface.contract.resident_request_memory
+                    == ResidentRequestMemory::PreserveLoadDefaults =>
+            {
+                // A declared resident load-default policy legitimately has no request override.
+                // The adapter still binds literal Resident+Eager and writes explicit no-stage work.
+                GenerationMemory::default()
+            }
+            None => panic!("optimized endpoint lacks execution levers"),
+        };
+        if planned.purpose == campaign::Purpose::Resident {
+            assert!(!execution.stage_residency);
+            assert!(!execution.stream_transformer_blocks);
+        }
+    }
+}
+#[test]
+fn sdxl_capture_families_follow_real_recipe_classes_and_preserve_unsupported_combinations() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let registry = catalog.media();
+    let discovered = surfaces(registry).unwrap();
+    let surface = discovered.iter().find(|s| s.provider == "sdxl").unwrap();
+    let descriptor = registry
+        .generators()
+        .map(|r| (r.descriptor)())
+        .find(|d| d.id == "sdxl")
+        .unwrap();
+    let variant_of = |p: &str, _route: &str, m: &str, t: &str, recipe: &campaign::CaptureRecipe| {
+        variant(p, m, t, recipe.memory_class.as_deref())
+    };
+    let (families, planned) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
+    for sampler in descriptor.capabilities.samplers {
+        assert!(
+            surface.recipes.values().flatten().any(|entry| {
+                let recipe = runtime_ios::media::sdxl::sampling::SamplingRecipe::from_token(
+                    entry.token.as_deref().unwrap(),
+                )
+                .unwrap();
+                runtime_ios::media::sdxl::sampling::ResolvedSampling::resolve(&recipe.to_request())
+                    .unwrap()
+                    .sampler_name()
+                    == sampler
+            }),
+            "advertised sampler {sampler} has no reproducible carrier"
+        );
+    }
+    for ((route, recipe_tier, mode), entries) in &surface.recipes {
+        for entry in entries {
+            let token = entry.token.as_ref().unwrap();
+            let recipe =
+                runtime_ios::media::sdxl::sampling::SamplingRecipe::from_token(token).unwrap();
+            let class =
+                runtime_ios::media::sdxl::sampling::ResolvedSampling::resolve(&recipe.to_request())
+                    .unwrap()
+                    .allocation_class();
+            assert_eq!(entry.memory_class.as_deref(), Some(class.as_str()));
+            let case = Case {
+                provider: "sdxl".into(),
+                route: route.clone(),
+                tier: recipe_tier.clone(),
+                edge: 256,
+                mode: mode.clone(),
+                rung: 0,
+                selection: campaign::BASE_SELECTION.into(),
+                steps: entry.steps,
+                recipe: Some(token.clone()),
+            };
+            let actual = work(&case, &CancelFlag::default(), registry);
+            if entry.refusal.is_some() {
+                assert!(
+                    matches!(actual, Err(AdmissionError::Refused(_))),
+                    "unsupported combinations must be visible typed refusals"
+                );
+            } else {
+                let runtime_ios::media::IosWork::Generate(request) = actual.unwrap() else {
+                    panic!("wrong work carrier")
+                };
+                let resolved =
+                    runtime_ios::media::sdxl::sampling::ResolvedSampling::resolve(&request)
+                        .unwrap();
+                assert_eq!(resolved.allocation_class(), class);
+                let member = format!("sdxl/{route}/{mode}");
+                let homes: Vec<_> = families
+                    .iter()
+                    .filter(|f| {
+                        f.tier == *recipe_tier
+                            && f.variant
+                                == format!(
+                                    "{}/{class}",
+                                    variant("sdxl", mode, recipe_tier, Some(&class))
+                                )
+                            && f.members.contains(&member)
+                    })
+                    .collect();
+                assert_eq!(homes.len(), 1, "{member} {class}");
+                for purpose in [campaign::Purpose::Resident, campaign::Purpose::Optimized] {
+                    assert!(planned.iter().any(|p| p.purpose == purpose
+                        && p.case.tier == "bf16"
+                        && p.case.recipe == homes[0].recipe
+                        && (
+                            p.case.provider.clone(),
+                            p.case.route.clone(),
+                            p.case.mode.clone()
+                        ) == homes[0].anchor));
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     let catalog = runtime_ios::catalog().unwrap();
     let registry = catalog.media();
-    let discovered = surfaces(registry);
-    let variant_of = |p: &str, m: &str, t: &str| variant(p, m, t);
+    let discovered = surfaces(registry).unwrap();
+    let variant_of = |p: &str, _route: &str, m: &str, t: &str, recipe: &campaign::CaptureRecipe| {
+        variant(p, m, t, recipe.memory_class.as_deref())
+    };
     let (families, cases) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
     for registration in registry.generators() {
         let descriptor = (registration.descriptor)();
@@ -24,9 +389,8 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
                 descriptor.id
             );
         }
-        // Every registered mode of every route and served tier belongs to exactly one family, and
-        // that family has its resident anchor and — the fully optimized end must exist on the phone —
-        // its optimized anchor.
+        // Every registered mode remains represented; each supported allocation-graph family has
+        // both endpoints. Unsupported recipe/mode combinations are explicit listing refusals.
         for route in &surface.routes {
             for tier in ["q4", "q8", "bf16"] {
                 for mode in &surface.modes {
@@ -35,23 +399,51 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
                         .iter()
                         .filter(|f| f.tier == tier && f.members.contains(&member))
                         .collect();
-                    assert_eq!(homes.len(), 1, "{member} {tier}");
-                    let anchored = |purpose| {
-                        cases.iter().any(|p| {
-                            p.purpose == purpose
-                                && (
-                                    p.case.provider.clone(),
-                                    p.case.route.clone(),
-                                    p.case.mode.clone(),
-                                ) == homes[0].anchor
-                                && p.case.tier == tier
-                        })
-                    };
-                    assert!(anchored(campaign::Purpose::Resident), "{member} {tier}");
-                    assert!(
-                        anchored(campaign::Purpose::Optimized),
-                        "{member} {tier}: no fully optimized anchor"
-                    );
+                    if descriptor.id == "iris_3b" {
+                        // A weights-free listing cannot know this checkpoint's resolved defaults.
+                        // Require explicit visible templates, not guessed classes or fake anchors.
+                        let entries = surface
+                            .recipes
+                            .get(&(route.clone(), tier.into(), mode.clone()))
+                            .unwrap();
+                        assert!(
+                            !entries.is_empty(),
+                            "{member} {tier}: unresolved capability omitted"
+                        );
+                        assert!(entries
+                            .iter()
+                            .all(|entry| entry.memory_class.is_none() && entry.refusal.is_some()));
+                        assert!(
+                            homes.is_empty(),
+                            "unresolved templates cannot form physical families"
+                        );
+                        continue;
+                    }
+                    assert!(!homes.is_empty(), "{member} {tier}");
+                    for home in homes {
+                        let anchored = |purpose| {
+                            cases.iter().any(|p| {
+                                p.purpose == purpose
+                                    && (
+                                        p.case.provider.clone(),
+                                        p.case.route.clone(),
+                                        p.case.mode.clone(),
+                                    ) == home.anchor
+                                    && p.case.tier == tier
+                                    && p.case.recipe == home.recipe
+                            })
+                        };
+                        assert!(
+                            anchored(campaign::Purpose::Resident),
+                            "{member} {tier} {}",
+                            home.variant
+                        );
+                        assert!(
+                            anchored(campaign::Purpose::Optimized),
+                            "{member} {tier} {}: no fully optimized anchor",
+                            home.variant
+                        );
+                    }
                 }
             }
         }
@@ -77,7 +469,7 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
             planned.case
         );
     }
-    for purpose in ["validation_steps", "validation_geometry", "validation_mode"] {
+    for purpose in ["validation_steps", "validation_geometry"] {
         assert_eq!(
             listed.iter().filter(|e| e["purpose"] == purpose).count(),
             1,
@@ -103,12 +495,27 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
         .as_str()
         .unwrap()
         .starts_with("sdxl/illustrious_xl_v2/q4/1024/text/")));
-    // Additive modes never get their own anchors; their family's text member does.
-    assert!(!listed.iter().any(|e| {
-        let c = e["case"].as_str().unwrap();
-        matches!(e["purpose"].as_str(), Some("resident" | "optimized"))
-            && (c.contains("/mask/") || c.contains("/ip_adapter/"))
-    }));
+    // Component-collapse is not inferred from a factory name. Until a corrected per-class mode
+    // proof is accepted, mask/IP remain visible independent endpoint families.
+    for mode in ["mask", "ip_adapter"] {
+        assert!(listed.iter().any(|e| matches!(
+            e["purpose"].as_str(),
+            Some("resident" | "optimized")
+        ) && e["case"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("/{mode}/"))));
+    }
+    let additive_control = families.iter().any(|f| {
+        f.tier == "q4" && f.anchor.2 == "text" && f.members.iter().any(|m| m.ends_with("/control"))
+    });
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|e| e["purpose"] == "validation_mode")
+            .count(),
+        usize::from(additive_control)
+    );
 }
 #[cfg(not(target_os = "ios"))]
 #[test]
@@ -155,6 +562,7 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
         label: String::new(),
         scratch: 0,
         current: 0,
+        preceding_sampling_mark: None,
     };
     let marks = [
         m(Load, true, 100),          // load floor checked (pre-load glue → load)
@@ -171,6 +579,7 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
             label: String::new(),
             scratch: 0,
             current: 0,
+            preceding_sampling_mark: None,
         },
     ];
     let split = support::phase_peaks(50, &marks, 2100);
@@ -195,6 +604,7 @@ fn a_capture_observes_each_quantum_formula_against_its_priced_scratch() {
         label: label.into(),
         scratch,
         current,
+        preceding_sampling_mark: None,
     };
     let marks = [
         q("tile", true, 400, 1000, 1500), // peak rose to 1700 inside: 700 observed, exact
@@ -211,7 +621,8 @@ fn a_capture_observes_each_quantum_formula_against_its_priced_scratch() {
         support::Observation {
             priced: 400,
             observed: 700,
-            exact: true
+            exact: true,
+            preceding_sampling_mark: None,
         }
     );
     assert_eq!(
@@ -219,7 +630,8 @@ fn a_capture_observes_each_quantum_formula_against_its_priced_scratch() {
         support::Observation {
             priced: 100,
             observed: 150,
-            exact: false
+            exact: false,
+            preceding_sampling_mark: None,
         }
     );
     assert_eq!(
@@ -227,8 +639,191 @@ fn a_capture_observes_each_quantum_formula_against_its_priced_scratch() {
         support::Observation {
             priced: 50,
             observed: 100,
-            exact: true
+            exact: true,
+            preceding_sampling_mark: None,
         }
     );
     assert_eq!(o.len(), 3, "synchronizations are not quanta");
+}
+
+#[test]
+fn unprovisioned_iris_templates_are_visible_unresolved_and_never_physical_anchor_classes() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let registry = catalog.media();
+    let discovered = surfaces(registry).unwrap();
+    let variant_of = |p: &str, _route: &str, m: &str, t: &str, recipe: &campaign::CaptureRecipe| {
+        variant(p, m, t, recipe.memory_class.as_deref())
+    };
+    let (_, planned) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
+    for surface in discovered
+        .iter()
+        .filter(|surface| surface.provider.starts_with("iris_"))
+    {
+        assert!(!surface.modes.is_empty());
+        for route in &surface.routes {
+            for tier in ["q4", "q8", "bf16"] {
+                for mode in &surface.modes {
+                    let entries = surface
+                        .recipes
+                        .get(&(route.clone(), tier.into(), mode.clone()))
+                        .unwrap();
+                    assert!(
+                        !entries.is_empty(),
+                        "missing unresolved {route}/{tier}/{mode}"
+                    );
+                    assert!(entries.iter().all(|entry| entry.memory_class.is_none()
+                        && entry.configured_variant.is_none()
+                        && entry
+                            .refusal
+                            .as_deref()
+                            .is_some_and(|reason| reason.starts_with("unresolved controls:"))));
+                    if surface.provider == "iris_3b" {
+                        assert!(entries.iter().all(|entry| entry
+                            .token
+                            .as_deref()
+                            .is_some_and(|token| token.starts_with("iris-template1-"))));
+                    }
+                }
+            }
+        }
+        assert!(
+            !planned
+                .iter()
+                .any(|entry| entry.case.provider == surface.provider),
+            "unresolved templates cannot masquerade as resolved physical two-anchor families"
+        );
+    }
+    let listed: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
+    assert!(listed["unserved_sampling"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["provider"] == "iris_3b"
+            && entry["tier"] == "q8"
+            && entry["memory_class"].is_null()
+            && entry["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("unresolved controls:")));
+}
+
+fn copy_tiny_iris_metadata_slot(root: &Path, tier: &str, shift: f64, prediction: &str) {
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    // Existing synthetic source fixture, never downloaded/real model weights or Array evaluation.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot");
+    let slot = root.join("iris_3b").join(tier);
+    copy_dir(&fixture.join("iris"), &slot);
+    copy_dir(&fixture.join("text_encoder"), &slot.join("text_encoder"));
+    let config = slot.join("config.yaml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(original.matches("  shift: 4.0").count(), 1);
+    assert_eq!(original.matches("  prediction: v").count(), 1);
+    let changed = original
+        .replacen("  shift: 4.0", &format!("  shift: {shift:?}"), 1)
+        .replacen("  prediction: v", &format!("  prediction: {prediction}"), 1);
+    std::fs::write(config, changed).unwrap();
+    std::fs::write(
+        slot.join("components.json"),
+        r#"{"text_encoder":"text_encoder"}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn configured_iris_recipes_read_actual_tier_and_mode_and_dedup_only_normalized_classes() {
+    let root = tempfile::tempdir().unwrap();
+    copy_tiny_iris_metadata_slot(root.path(), "q8", 3.0, "x");
+    copy_tiny_iris_metadata_slot(root.path(), "bf16", 4.0, "v");
+    let catalog = runtime_ios::catalog().unwrap();
+    let registry = catalog.media();
+    let routes = vec!["iris_3b".into()];
+    let modes = vec!["text".into(), "prompt_batch".into()];
+    let recipes = capture_recipes(registry, "iris_3b", &routes, &modes, Some(root.path()));
+    for (tier, shift, prediction) in [("q8", 3.0f64, "x"), ("bf16", 4.0f64, "v")] {
+        for (mode, rows) in [("text", 1u64), ("prompt_batch", 2u64)] {
+            let key = ("iris_3b".into(), tier.into(), mode.into());
+            let entries = recipes.get(&key).unwrap();
+            assert!(
+                entries.iter().any(|entry| entry.refusal.is_none()),
+                "{key:?}: {entries:?}"
+            );
+            let mut classes = std::collections::BTreeSet::new();
+            for entry in entries.iter().filter(|entry| entry.refusal.is_none()) {
+                let actual = runtime_ios::media::sampling::from_token(
+                    "iris_3b",
+                    entry.token.as_deref().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    entry.memory_class.as_deref(),
+                    Some(actual.allocation_class())
+                );
+                assert!(
+                    classes.insert(actual.allocation_class().to_string()),
+                    "duplicate configured class"
+                );
+                assert_eq!(
+                    actual.provenance()["prediction"].as_str(),
+                    Some(prediction),
+                    "wrong actual tier's artifact prediction semantics"
+                );
+                assert_eq!(
+                    actual.provenance()["prompt_rows"].as_u64(),
+                    Some(rows),
+                    "wrong actual mode carrier"
+                );
+                assert!(entry.configured_variant.is_some());
+                let case = Case {
+                    provider: "iris_3b".into(),
+                    route: "iris_3b".into(),
+                    tier: tier.into(),
+                    edge: campaign::reference_edge("iris_3b"),
+                    mode: mode.into(),
+                    rung: 0,
+                    selection: campaign::BASE_SELECTION.into(),
+                    steps: entry.steps,
+                    recipe: entry.token.clone(),
+                };
+                let spec = snapshot(root.path(), &case).unwrap();
+                let raw = GenerationRequest {
+                    prompt: prompt("iris_3b"),
+                    width: case.edge,
+                    height: case.edge,
+                    ..Default::default()
+                };
+                let default =
+                    runtime_ios::media::sampling::resolve_for_spec("iris_3b", &spec, &raw).unwrap();
+                assert_eq!(default.provenance()["flow_shift_bits"].as_u64(), Some(shift.to_bits()),
+                    "None must resolve the actual tier's f64 default, not a unit-shift template override");
+                let runtime_ios::media::IosWork::Generate(request) =
+                    work_with_spec(&case, &CancelFlag::default(), registry, Some(&spec)).unwrap()
+                else {
+                    panic!("wrong actual work kind")
+                };
+                assert_eq!(
+                    runtime_ios::media::sampling::resolve_for_spec("iris_3b", &spec, &request)
+                        .unwrap()
+                        .token(),
+                    entry.token.as_deref().unwrap()
+                );
+            }
+        }
+    }
+    // The absent q4 slot must not borrow q8/bf16 defaults or a fabricated class.
+    assert!(recipes
+        .get(&("iris_3b".into(), "q4".into(), "text".into()))
+        .unwrap()
+        .iter()
+        .all(|entry| entry.refusal.is_some() && entry.memory_class.is_none()));
 }

@@ -81,8 +81,12 @@ impl ResnetBlock2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+    }
+
+    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
         if let Some(t) = &mut self.time_emb_proj {
-            crate::quant::quantize_linear(t, bits)?;
+            visit(&crate::quant::child_path(prefix, "time_emb_proj"), t, bits)?;
         }
         // `shortcut` is the 1×1 `conv_shortcut` stored as a Linear (for the NHWC channel-matmul
         // forward), not a true Linear — so it stays DENSE like every other conv in the U-Net
@@ -208,22 +212,88 @@ impl ResnetBlock2D {
     /// promotes the second half to (a packed `time_emb_proj` with BF16 scales, or an f32 `temb`,
     /// makes it f32 — [`crate::quantum::linear_output_dtype`]), on the running backend.
     pub(crate) fn quantum_scratch(&self, x: &Array, temb: Option<&Array>) -> u64 {
+        self.quantum_scratch_with_effects(x, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    pub(crate) fn quantum_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+        #[cfg(test)]
+        {
+            crate::quantum::trace_layout(crate::quantum::UNET_RESNET, x);
+            crate::quantum::trace_layout("resnet conv1", self.conv1.weight());
+            crate::quantum::trace_layout("resnet conv2", self.conv2.weight());
+        }
         let act_in = crate::quantum::element_bytes(x);
         let act_out = match (&self.time_emb_proj, temb) {
             (Some(proj), Some(t)) => {
-                let projected = crate::quantum::linear_output_dtype(proj, t.dtype());
+                let projected = effects.linear("time_emb_proj", proj)?.output_dtype(t.dtype());
                 crate::quantum::dtype_bytes(Dtype::from_promoting_types(x.dtype(), projected))
             }
             _ => act_in,
         };
-        crate::quantum::resnet_bytes(
-            x.shape(),
-            act_in,
-            act_out,
-            self.conv1.weight(),
-            self.conv2.weight(),
+        let conv1 = effects.conv("conv1", &self.conv1);
+        let conv2 = effects.conv("conv2", &self.conv2);
+        Ok(crate::quantum::resnet_bytes_from_metadata(
+            x.shape(), act_in, act_out,
+            &conv1.weight.shape, crate::quantum::dtype_bytes(conv1.weight.dtype),
+            &conv2.weight.shape, crate::quantum::dtype_bytes(conv2.weight.dtype),
             crate::quantum::backend(),
         )
+        .saturating_add(self.promotion_scratch_with_effects(x, temb, effects)?))
+    }
+
+    /// Small affine/bias casts and the dense shortcut's addmm operand casts are distinct from
+    /// the two 3x3 convolution kernels. Read their actual dtypes instead of widening every buffer.
+    #[cfg(test)]
+    pub(crate) fn promotion_scratch(&self, x: &Array, temb: Option<&Array>) -> u64 {
+        self.promotion_scratch_with_effects(x, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    fn promotion_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+        use crate::quantum as q;
+        let casts = |input: Dtype, arrays: &[&Array]| {
+            let output = q::promote_all(input, arrays);
+            arrays
+                .iter()
+                .map(|a| {
+                    if a.dtype() != output {
+                        q::elements(a) * q::dtype_bytes(output)
+                    } else {
+                        0
+                    }
+                })
+                .sum::<u64>()
+        };
+        let conv1 = effects.conv("conv1", &self.conv1);
+        let conv2 = effects.conv("conv2", &self.conv2);
+        let n1 = q::promote_all(x.dtype(), &[&self.norm1_w, &self.norm1_b]);
+        let c1 = Dtype::from_promoting_types(n1, conv1.weight.dtype);
+        let mut mid = self
+            .conv1
+            .bias()
+            .map_or(c1, |b| Dtype::from_promoting_types(c1, b.dtype()));
+        let mut extra = casts(x.dtype(), &[&self.norm1_w, &self.norm1_b]);
+        if let Some(b) = self.conv1.bias() {
+            extra += casts(c1, &[b]);
+        }
+        if let (Some(p), Some(t)) = (&self.time_emb_proj, temb) {
+            let projection = effects.linear("time_emb_proj", p)?;
+            extra += projection.operand_bytes(t.shape(), t.dtype());
+            mid = Dtype::from_promoting_types(mid, projection.output_dtype(t.dtype()));
+        }
+        extra += casts(mid, &[&self.norm2_w, &self.norm2_b]);
+        let n2 = q::promote_all(mid, &[&self.norm2_w, &self.norm2_b]);
+        let c2 = Dtype::from_promoting_types(n2, conv2.weight.dtype);
+        if let Some(b) = self.conv2.bias() {
+            extra += casts(c2, &[b]);
+        }
+        if let Some(shortcut) = &self.shortcut {
+            let mut shape = x.shape().to_vec();
+            *shape.last_mut().expect("NHWC input") = conv1.weight.shape[3];
+            extra += effects.shortcut("conv_shortcut", shortcut).operand_bytes(&shape, x.dtype());
+        }
+        Ok(extra)
     }
 
     /// The dtype [`Self::forward_core`] returns for an `input`-typed input (the up path's
@@ -231,21 +301,46 @@ impl ResnetBlock2D {
     /// every weight, bias and norm affine the forward touches and the projected embedding
     /// ([`crate::quantum::linear_output_dtype`]). Header-only pricing threads it.
     pub(crate) fn output_dtype(&self, input: Dtype, temb: Option<Dtype>) -> Dtype {
-        let mut arrays: Vec<&Array> = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
+        self.output_dtype_with_effects(input, temb, &crate::quantum::EffectScope::native())
+            .expect("native projection facts are infallible")
+    }
+
+    pub(crate) fn output_dtype_with_effects(&self, input: Dtype, temb: Option<Dtype>, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
+        let mut arrays: Vec<&Array> = vec![&self.norm1_w, &self.norm1_b];
         arrays.extend(self.conv1.bias());
-        arrays.extend([&self.norm2_w, &self.norm2_b, self.conv2.weight()]);
+        arrays.extend([&self.norm2_w, &self.norm2_b]);
         arrays.extend(self.conv2.bias());
-        let mut y = crate::quantum::promote_all(input, &arrays);
+        let conv1 = effects.conv("conv1", &self.conv1);
+        let conv2 = effects.conv("conv2", &self.conv2);
+        let mut y = Dtype::from_promoting_types(crate::quantum::promote_all(input, &arrays),
+            Dtype::from_promoting_types(conv1.weight.dtype, conv2.weight.dtype));
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
-            y = Dtype::from_promoting_types(y, crate::quantum::linear_output_dtype(proj, t));
+            y = Dtype::from_promoting_types(y, effects.linear("time_emb_proj", proj)?.output_dtype(t));
         }
         let residual = match &self.shortcut {
             Some(sc) => {
-                Dtype::from_promoting_types(input, crate::quantum::linear_output_dtype(sc, input))
+                Dtype::from_promoting_types(input, effects.shortcut("conv_shortcut", sc).output_dtype(input))
             }
             None => input,
         };
-        Dtype::from_promoting_types(residual, y)
+        Ok(Dtype::from_promoting_types(residual, y))
+    }
+
+    pub(crate) fn output_shape_with_effects(
+        &self, input: &[i32], skip: Option<&[i32]>, effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Vec<i32>> {
+        let mut input = input.to_vec();
+        if let Some(skip) = skip {
+            if input[..3] != skip[..3] { return Err(mlx_gen::Error::Msg("sdxl resnet skip concat axes disagree".into())); }
+            input[3] = input[3].checked_add(skip[3]).ok_or_else(|| mlx_gen::Error::Msg("sdxl resnet concat width overflow".into()))?;
+        }
+        let first = effects.conv("conv1", &self.conv1).output_shape(&input, 1, 1)?;
+        let output = effects.conv("conv2", &self.conv2).output_shape(&first, 1, 1)?;
+        let residual = match &self.shortcut {
+            Some(shortcut) => effects.shortcut("conv_shortcut", shortcut).output_shape(&input)?,
+            None => input,
+        };
+        crate::adapters::broadcast_shape(&output, &residual)
     }
 
     /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).
@@ -405,7 +500,15 @@ impl ResnetBlock2D {
     /// (`conv1`/`conv2`/`conv_shortcut`) are conv-layer targets, enumerated by
     /// [`conv_target_paths`](Self::conv_target_paths) instead (sc-2919).
     pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
-        if self.time_emb_proj.is_some() {
+        Self::append_lora_target_paths(prefix, self.time_emb_proj.is_some(), out);
+    }
+
+    pub(crate) fn append_lora_target_paths(
+        prefix: &str,
+        time_projection: bool,
+        out: &mut Vec<String>,
+    ) {
+        if time_projection {
             out.push(format!("{prefix}.time_emb_proj"));
         }
     }
@@ -414,9 +517,13 @@ impl ResnetBlock2D {
     /// `conv_shortcut`. Merged only under [`crate::adapters::LoraCoverage::Complete`]; the
     /// Linear-only vendored coverage drops them (preserving byte-parity with the retired Python path).
     pub fn conv_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        Self::append_conv_target_paths(prefix, self.shortcut.is_some(), out);
+    }
+
+    pub(crate) fn append_conv_target_paths(prefix: &str, shortcut: bool, out: &mut Vec<String>) {
         out.push(format!("{prefix}.conv1"));
         out.push(format!("{prefix}.conv2"));
-        if self.shortcut.is_some() {
+        if shortcut {
             out.push(format!("{prefix}.conv_shortcut"));
         }
     }

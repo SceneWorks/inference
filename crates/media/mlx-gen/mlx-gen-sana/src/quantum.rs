@@ -678,6 +678,15 @@ mod reachable_sizes {
                         ("reference", MemoryMode::ImageToImage, 1),
                     ] {
                         for edge in [512u32, 768, 1024] {
+                            // Explicit native-default sampling request for this header diagnostic;
+                            // mode/reference geometry is carried below, without fake media payloads.
+                            let generation = mlx_gen::gen_core::GenerationRequest {
+                                width: edge,
+                                height: edge,
+                                count: 1,
+                                memory: Some(execution),
+                                ..Default::default()
+                            };
                             let req = IosPricingRequest {
                                 provider,
                                 spec: &spec,
@@ -692,6 +701,9 @@ mod reachable_sizes {
                                 selection: &selection,
                                 execution: &execution,
                                 token_window: 0,
+                                generation: Some(&generation),
+                                transform: None,
+                                depth: None,
                             };
                             let pricing = crate::ios_pricing::ios_pricing(&req).unwrap();
                             for p in &pricing.phases {

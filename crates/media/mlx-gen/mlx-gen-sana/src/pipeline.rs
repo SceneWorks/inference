@@ -187,13 +187,55 @@ pub(crate) fn denoise_cfg_with_memory(
     preview: &PreviewSink,
     plan: crate::transformer::SanaForwardPlan,
 ) -> Result<Array> {
+    let mut forwards = 0u64;
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        forwards += 1;
+        let rows = x.shape().first().copied().unwrap_or(0) as u64;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::MODEL_ID,
+            "forward_argument",
+            forwards,
+            rows,
+            x,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "forward",
+            &[
+                ("evaluation", forwards),
+                ("rows", rows),
+                ("conditioned", 1),
+                (
+                    "guided",
+                    u64::from(uncond.is_some() && guidance_scale > 1.0),
+                ),
+            ],
+        );
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
         let pred_cond =
             transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
+                forwards += 1;
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "forward",
+                    &[
+                        ("evaluation", forwards),
+                        ("rows", rows),
+                        ("conditioned", 0),
+                        ("guided", 1),
+                        (
+                            "held_cond_prediction_dtype",
+                            mlx_gen::sampler::sampling_dtype_code(pred_cond.dtype()),
+                        ),
+                        (
+                            "held_cond_prediction_logical_bytes",
+                            mlx_gen::ios_quantum::bytes(&pred_cond),
+                        ),
+                    ],
+                );
                 let pred_uncond =
                     transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?;
                 // pred = uncond + scale·(cond − uncond).
@@ -459,7 +501,7 @@ fn decode_tiled(
     }
     let plan = tiling.plan(vae, 1, height, width);
     let lifted = head.reshape(&[1, 1, height, width, channels])?;
-    let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
     let (out_h, out_w) = (
         (height as u64).saturating_mul(decoder.tail_scale() as u64),
         (width as u64).saturating_mul(decoder.tail_scale() as u64),
@@ -701,6 +743,8 @@ pub(crate) fn denoise_sprint_from_with_memory(
     let preview_schedule = &scheduler.timesteps[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(preview_schedule);
     let mut denoised = latents.clone();
+    let mut completed_steps = 0u64;
+    let mut previous_renoise = false;
     // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
     // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
     let step_key = |step: usize| -> Result<Array> {
@@ -720,6 +764,28 @@ pub(crate) fn denoise_sprint_from_with_memory(
             &[&latents],
             crate::quantum::scm_step_bytes(latents.size() as u64),
         )?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::SPRINT_MODEL_ID,
+            "scm_callback_evaluated",
+            &[
+                ("schema", 1),
+                ("step", i as u64),
+                ("start", start as u64),
+                ("declared_steps", n as u64),
+                ("completed_steps", completed_steps),
+                ("history_present", u64::from(completed_steps > 0)),
+                ("previous_renoise", u64::from(previous_renoise)),
+                (
+                    "state_dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                ),
+                ("state_logical_bytes", mlx_gen::ios_quantum::bytes(&latents)),
+                (
+                    "denoised_owner_logical_bytes",
+                    mlx_gen::ios_quantum::bytes(&denoised),
+                ),
+            ],
+        );
         on_progress(Progress::Step {
             current: (i - start) as u32 + 1,
             total,
@@ -741,6 +807,13 @@ pub(crate) fn denoise_sprint_from_with_memory(
         // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
         let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
         let scm_t_arr = arr1(scm_t);
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::SPRINT_MODEL_ID,
+            "forward_argument",
+            completed_steps + 1,
+            lat_in.shape().first().copied().unwrap_or(0) as u64,
+            &lat_in,
+        );
         let raw = transformer.forward_with_memory(
             &lat_in,
             cond,
@@ -750,6 +823,14 @@ pub(crate) fn denoise_sprint_from_with_memory(
             plan,
             cancel,
         )?;
+
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::SPRINT_MODEL_ID,
+            "forward_return",
+            completed_steps + 1,
+            raw.shape().first().copied().unwrap_or(0) as u64,
+            &raw,
+        );
 
         // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
         // `if len(self.timesteps) > 1`). On the last step `t_next == 0` ⇒ `cos(0)=1`, `sin(0)=0`, so the
@@ -776,6 +857,24 @@ pub(crate) fn denoise_sprint_from_with_memory(
         )?;
         denoised = pred_x0;
         latents = next;
+        completed_steps += 1;
+        previous_renoise = renoise_key.is_some();
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::SPRINT_MODEL_ID,
+            "scm_update",
+            &[
+                ("schema", 1),
+                ("step", i as u64),
+                ("completed_steps", completed_steps),
+                ("noise", u64::from(previous_renoise)),
+                ("terminal_alias", u64::from(renoise_key.is_none())),
+                ("next_angle_bits", t_next.to_bits() as u64),
+                (
+                    "state_dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                ),
+            ],
+        );
     }
 
     // diffusers: latents = denoised / sigma_data (the decode input). The last step's update is
@@ -788,6 +887,20 @@ pub(crate) fn denoise_sprint_from_with_memory(
             mlx_gen::ios_quantum::elementwise_bytes(out.size() as u64, 1),
         ),
     )?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        crate::model::SPRINT_MODEL_ID,
+        "solve_complete",
+        &[
+            ("schema", 1),
+            ("evaluations", completed_steps),
+            ("steps", completed_steps),
+            (
+                "final_dtype",
+                mlx_gen::sampler::sampling_dtype_code(out.dtype()),
+            ),
+            ("final_scaling", 1),
+        ],
+    );
     Ok(out)
 }
 
@@ -1072,6 +1185,21 @@ pub fn prepare_reference_latent(
 }
 
 impl SanaHeavy {
+    /// Inspect actual endpoint ownership, not the requested selection name.
+    #[cfg(test)]
+    pub(crate) fn endpoint_inventory(&self) -> (usize, bool, bool) {
+        (
+            self.transformer.n_blocks(),
+            self.encoder.is_some(),
+            self.transformer.has_block_stream(),
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        self.transformer.endpoint_storage_witnesses()
+    }
+
     /// Compose the **base SANA-1.6B** heavy bundle (true-CFG flow-match) from its render-phase
     /// components plus the DC-AE config (used for the latent `scaling_factor`).
     pub fn new(
@@ -1347,13 +1475,24 @@ impl SanaHeavy {
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build once. An
         // unset scheduler keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(mlx_gen::resolve_flow_schedule(
-            req.scheduler,
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        ))?;
+        let sampling_request = mlx_gen::GenerationRequest {
+            // Low-level pipeline parity hooks retain legacy unknown/default fallbacks. Actual
+            // generation requests crossed the descriptor floor before reaching this projection.
+            sampler: Some(
+                mlx_gen::sampler::canonical_solver(req.sampler, mlx_gen::Solver::Euler)
+                    .name()
+                    .into(),
+            ),
+            scheduler: req
+                .scheduler
+                .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
+                .map(str::to_owned),
+            steps: Some(steps.max(1) as u32),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let sampling = crate::sampling::resolve_base_full(&sampling_request)?;
+        let scheduler = FlowMatchEuler::from_sigmas(sampling.sigmas().to_vec())?;
 
         // img2img (sc-10190): a reference image + positive strength starts the denoise at
         // `sigmas[start_step]` over the DC-AE-encoded init latent blended with noise; else start 0
@@ -1383,7 +1522,7 @@ impl SanaHeavy {
         let latents = denoise_cfg_with_memory(
             &self.transformer,
             &scheduler,
-            req.sampler,
+            Some(sampling.solver().name()),
             start_step,
             seed,
             latents,
@@ -1424,7 +1563,7 @@ impl SanaHeavy {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
-        let scheduler = ScmScheduler::new(steps);
+        let scheduler = crate::sampling::sprint_scheduler(steps);
         let n = scheduler.num_steps();
         let sd = scheduler.sigma_data;
 

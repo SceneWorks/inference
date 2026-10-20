@@ -274,27 +274,44 @@ pub fn needs_load_time_quant(
 /// Q4/Q8 width. The shared load seam for every Group-B packed snapshot feeds straight off external
 /// `.safetensors`, so these tensors are untrusted.
 pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
-    let sshape = scales.shape();
-    let wshape = wq.shape();
+    packed_bits_from_metadata(
+        wq.shape(),
+        wq.dtype(),
+        scales.shape(),
+        scales.dtype(),
+        group_size,
+    )
+}
+
+/// The exact packed-load geometry validator without constructing or reading a tensor. Both the
+/// executable loader and provider-owned header normalization use this seam; metadata supplies no
+/// allocator/backing authority. Accepted layouts and refusals are those of [`packed_bits`].
+pub fn packed_bits_from_metadata(
+    wshape: &[i32],
+    weight_dtype: Dtype,
+    sshape: &[i32],
+    scales_dtype: Dtype,
+    group_size: i32,
+) -> Result<i32> {
     if sshape.len() != 2 || wshape.len() != 2 {
         return Err(crate::Error::Msg(format!(
             "packed quant: scales and weight must be 2-D, got scales {:?} / weight {:?}",
             sshape, wshape
         )));
     }
-    if wq.dtype() != Dtype::Uint32 {
+    if weight_dtype != Dtype::Uint32 {
         return Err(crate::Error::Msg(format!(
             "packed quant: weight codes must be u32, got {:?}",
-            wq.dtype()
+            weight_dtype
         )));
     }
     if !matches!(
-        scales.dtype(),
+        scales_dtype,
         Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
     ) {
         return Err(crate::Error::Msg(format!(
             "packed quant: scales must be floating point, got {:?}",
-            scales.dtype()
+            scales_dtype
         )));
     }
     if sshape[0] != wshape[0] {
@@ -840,6 +857,29 @@ mod tests {
         }
         assert!(needs_load_time_quant(&root, "vae", 3, "model").is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Pure production validator coverage: no native device/stream/tensor is constructed.
+    #[test]
+    fn packed_metadata_preserves_exact_load_geometry_refusals() {
+        let check = |w: &[i32], wd, s: &[i32], sd, g| packed_bits_from_metadata(w, wd, s, sd, g);
+        assert_eq!(
+            check(&[128, 32], Dtype::Uint32, &[128, 4], Dtype::Float32, 64).unwrap(),
+            4
+        );
+        assert_eq!(
+            check(&[64, 32], Dtype::Uint32, &[64, 2], Dtype::Float16, 64).unwrap(),
+            8
+        );
+        assert!(check(&[2, 33], Dtype::Uint32, &[2, 2], Dtype::Bfloat16, 64).is_err());
+        assert!(check(&[3, 32], Dtype::Uint32, &[2, 2], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Float32, &[2, 2], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, 2], Dtype::Uint32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, 0], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 24], Dtype::Uint32, &[2, 4], Dtype::Float32, 64).is_err());
+        assert!(check(&[2], Dtype::Uint32, &[2, 4], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, i32::MAX], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, i32::MAX], Dtype::Uint32, &[2, 2], Dtype::Float32, 64).is_err());
     }
 
     /// F-011: a Q4 pack at group_size 64 derives bits == 4 from the standard shapes.

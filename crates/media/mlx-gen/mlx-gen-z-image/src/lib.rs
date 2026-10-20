@@ -37,6 +37,7 @@ pub mod model_control;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+pub mod sampling;
 // iOS execution-quantum labels and counted prices (epic 16774, sc-26433).
 #[cfg(all(test, target_os = "macos"))]
 mod ios_additivity_tests;

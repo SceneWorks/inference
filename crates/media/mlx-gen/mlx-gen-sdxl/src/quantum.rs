@@ -20,6 +20,7 @@
 //! (macOS, Linux, the simulator), so nothing here can change host numerics or ordering.
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::Result;
 use mlx_gen::ios_quantum::{
     attention_block_bytes, scores_bytes, tensor_bytes, AttentionBlockGeometry, Scores,
 };
@@ -29,13 +30,30 @@ use mlx_gen::ios_quantum::{
 pub(crate) use mlx_gen::ios_quantum::{
     bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes, downsample_tile_bytes,
     dtype_bytes, element_bytes, elements, group_norm_buffers, norm_conv_bytes,
-    norm_promotion_units, page_slack, resnet_bytes, single_conv_bytes, tile_bytes,
+    norm_promotion_units, page_slack, resnet_bytes_from_metadata, single_conv_bytes, tile_bytes,
     tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall, TileSource,
     VAE_ATTENTION_SCORE_ELEMENTS,
 };
 #[cfg(test)]
-pub(crate) use mlx_gen::ios_quantum::{GROUP_NORM_BUFFERS, PAGE_BYTES};
+pub(crate) use mlx_gen::ios_quantum::{resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES};
 use mlx_rs::{Array, Dtype};
+
+#[cfg(test)]
+pub(crate) fn trace_layout(label: &str, a: &Array) {
+    use std::collections::HashSet;
+    thread_local! { static SEEN: std::cell::RefCell<HashSet<String>> = Default::default(); }
+    let signature = format!(
+        "{label}: shape={:?} dtype={:?} strides={:?}",
+        a.shape(),
+        a.dtype(),
+        a.strides()
+    );
+    SEEN.with(|seen| {
+        if seen.borrow_mut().insert(signature.clone()) {
+            eprintln!("LAYOUT {signature}");
+        }
+    });
+}
 
 fn u(v: i32) -> u64 {
     v.max(0) as u64
@@ -125,6 +143,9 @@ pub(crate) const RESAMPLER_PROJ_IN: &str = "SDXL IP resampler proj_in";
 pub(crate) const RESAMPLER_LAYER: &str = "SDXL IP resampler layer";
 /// IP-Adapter Resampler `proj_out` + `norm_out`.
 pub(crate) const RESAMPLER_PROJ_OUT: &str = "SDXL IP resampler proj_out";
+/// The IP image-prompt tokens' CFG pair: the zeros uncond row and the concatenation (epic 16774:
+/// the last conditioning quantum before a staged request sheds the image encoder).
+pub(crate) const IP_CFG_TOKENS: &str = "SDXL IP CFG tokens";
 /// VAE decode de-normalization, `post_quant_conv` and decoder `conv_in`.
 pub(crate) const VAE_DECODE_IN: &str = "SDXL VAE decode conv_in";
 /// VAE encoder `conv_in`.
@@ -195,6 +216,9 @@ pub(crate) const VAE_FP16_FIX_LOAD: &str = "SDXL fp16-fix VAE load";
 pub(crate) const CONTROLNET_LOAD: &str = "SDXL ControlNet load";
 pub(crate) const IP_IMAGE_ENCODER_LOAD: &str = "SDXL IP image encoder load";
 pub(crate) const IP_ADAPTER_LOAD: &str = "SDXL IP adapter load";
+/// One projection's load-time Q4/Q8 pack (`quant::quantize_linear`, epic 16774): a ControlNet
+/// branch, the installed IP K/V pairs, or a dense U-Net / text encoder at a packed tier.
+pub(crate) const LOAD_QUANTIZE: &str = "SDXL load-time quantize";
 /// The fused single-file (LDM) checkpoint's phase loads.
 pub(crate) const LDM_TEXT_LOAD: &str = "SDXL LDM text load";
 pub(crate) const LDM_HEAVY_LOAD: &str = "SDXL LDM UNet+VAE load";
@@ -205,17 +229,510 @@ pub(crate) const ADAPTER_LOAD: &str = "SDXL adapter load";
 /// install of its forward-time residual).
 pub(crate) const ADAPTER_MERGE: &str = "SDXL adapter merge";
 
+/// Borrowed-operator metadata for one actual Linear. Header-selected installs update these
+/// existing checked facts; the native pricing model is never filled with invented adapter Arrays.
+/// Declared tensor extents are not allocation identities or a physical-release certificate.
+#[derive(Clone, Debug)]
+pub(crate) struct LinearWork {
+    pub base: mlx_gen::adapters::LinearFacts,
+    pub weights: Vec<mlx_gen::adapters::facts::TensorFacts>,
+    pub bias: Option<mlx_gen::adapters::facts::TensorFacts>,
+    pub residuals: Vec<mlx_gen::adapters::facts::AdapterFacts>,
+    pub group_size: i32,
+    pub bits: Option<i32>,
+}
+
+impl LinearWork {
+    pub(crate) fn of(linear: &AdaptableLinear) -> Self {
+        use mlx_gen::adapters::facts::{AdapterFacts, TensorFacts};
+        let mut base = mlx_gen::adapters::LinearFacts::of(linear);
+        let (weights, bias, group_size, bits) = if let Some((w, scales, offsets, bias, group, bits)) =
+            linear.quantized_params() {
+            // Keep the actual packed operand geometry, including its logical input width.
+            let mut logical = scales.shape().to_vec();
+            if let Some(input) = logical.last_mut() { *input = input.saturating_mul(group); }
+            base.base_shape = logical;
+            (vec![TensorFacts::of(w), TensorFacts::of(scales), TensorFacts::of(offsets)],
+                bias.map(TensorFacts::of), group, Some(bits))
+        } else {
+            let (w, bias) = linear.dense_weight().expect("LinearBase is dense or packed");
+            (vec![TensorFacts::of(w)], bias.map(TensorFacts::of), crate::quant::GROUP_SIZE, None)
+        };
+        Self { base, weights, bias,
+            residuals: linear.adapters().iter().map(AdapterFacts::of).collect(), group_size, bits }
+    }
+
+    pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
+        let weight = self.weights[usize::from(self.bits.is_some())].dtype;
+        let out = Dtype::from_promoting_types(input, weight);
+        self.bias.as_ref().map_or(out, |bias| Dtype::from_promoting_types(out, bias.dtype))
+    }
+
+    pub(crate) fn output_shape(&self, input: &[i32]) -> Result<Vec<i32>> {
+        let mut shape = self.base_output_shape(input)?;
+        for residual in self.residuals.iter().filter(|a| !a.disabled()) {
+            shape = crate::adapters::broadcast_shape(&shape,
+                &crate::adapters::adapter_residual_shape(residual, input)?)?;
+        }
+        Ok(shape)
+    }
+
+    fn base_output_shape(&self, input: &[i32]) -> Result<Vec<i32>> {
+        let mut transposed = self.base.base_shape.clone();
+        if self.bits.is_some() {
+            if transposed.len() < 2 { return Err(mlx_gen::Error::Msg("sdxl packed Linear rank is invalid".into())); }
+            let n = transposed.len();
+            transposed.swap(n - 1, n - 2);
+        } else { transposed.reverse(); }
+        let shape = crate::adapters::matmul_shape(input, &transposed)?;
+        match &self.bias {
+            Some(bias) => crate::adapters::broadcast_shape(&shape, &bias.shape),
+            None => Ok(shape),
+        }
+    }
+
+    pub(crate) fn output_width(&self) -> u64 {
+        let axis = if self.bits.is_some() { self.base.base_shape.len().saturating_sub(2) } else { 0 };
+        self.base.base_shape.get(axis).copied().unwrap_or(0).max(0) as u64
+    }
+
+    pub(crate) fn operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
+        let output = self.output_dtype(input);
+        let width = dtype_bytes(output);
+        let activation = if input != output {
+            shape.iter().fold(width, |n, &d| n.saturating_mul(u(d)))
+        } else { 0 };
+        let weight = if self.bits.is_none() && self.weights[0].dtype != output {
+            self.weights[0].elements().saturating_mul(width)
+        } else { 0 };
+        let bias = self.bias.as_ref().map_or(0, |bias| if bias.dtype != output {
+            bias.elements().saturating_mul(width)
+        } else { 0 });
+        let mut accumulated = self.base_output_shape(shape).ok();
+        self.residuals.iter().fold(activation.saturating_add(weight).saturating_add(bias), |n, adapter| {
+            if adapter.disabled() { return n; }
+            accumulated = accumulated.as_ref().and_then(|host|
+                crate::adapters::adapter_residual_shape(adapter, shape).ok().and_then(|residual|
+                    crate::adapters::broadcast_shape(host, &residual).ok()));
+            let add_elements = accumulated.as_ref().map_or(0, |s|
+                s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
+            // Invalid native operands keep their original operator error priority; this numeric
+            // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
+            // host-add geometry, including earlier residuals, not an independent residual maximum.
+            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(adapter,
+                shape, input, output, add_elements))
+        })
+    }
+
+    pub(crate) fn install(&mut self, work: &crate::adapters::AdapterInstallWork) -> Result<()> {
+        use crate::adapters::AdapterInstallStorage as S;
+        match work.storage {
+            S::DenseLinear if self.bits.is_none() => {
+                let weight = work.installed.first().ok_or_else(|| mlx_gen::Error::Msg(
+                    "sdxl selected dense install has no declared output".into()))?;
+                self.base.base_shape = weight.shape.clone();
+                self.weights = vec![weight.clone()];
+            }
+            S::PackedLora | S::PackedDelta | S::StructuredLokr if self.bits.is_some() => {
+                self.residuals.push(work.residual().ok_or_else(|| mlx_gen::Error::Msg(
+                    "sdxl selected packed install has incomplete declared operands".into()))?);
+                self.base.adapter_count = self.residuals.len();
+                self.base.has_live_adapters = self.residuals.iter().any(|a| !a.disabled());
+            }
+            _ => return Err(mlx_gen::Error::Msg("sdxl selected install disagrees with actual target storage".into())),
+        }
+        Ok(())
+    }
+
+    /// The SAME post-adapter base-only pack decision exposed by the actual private quant walk.
+    /// No tensor is manufactured or evaluated. Existing stored packs remain untouched; residuals
+    /// and their disabled owners are deliberately unchanged, exactly as AdaptableLinear::quantize.
+    pub(crate) fn pack(&mut self, bits: i32) -> Result<u64> {
+        use mlx_gen::adapters::facts::TensorFacts;
+        if self.bits.is_some() { return Ok(0); }
+        let shape = &self.base.base_shape;
+        if shape.len() < 2 || !matches!(bits, 4 | 8) {
+            return Err(mlx_gen::Error::Msg("sdxl load-time affine pack metadata is invalid".into()));
+        }
+        let input = *shape.last().unwrap();
+        if input % crate::quant::GROUP_SIZE != 0 {
+            return Err(mlx_gen::Error::Msg("sdxl load-time affine input is not group-aligned".into()));
+        }
+        let mut codes = shape.clone();
+        *codes.last_mut().unwrap() = input.checked_mul(bits).and_then(|n| n.checked_div(32))
+            .ok_or_else(|| mlx_gen::Error::Msg("sdxl packed column overflow".into()))?;
+        let mut scales = shape.clone();
+        *scales.last_mut().unwrap() = input / crate::quant::GROUP_SIZE;
+        let ordinary_bias = self.bias.as_ref().map_or(0, |b| b.elements().saturating_mul(2));
+        let scratch = crate::quant::quantize_bytes_from_metadata(self.weights[0].elements(), ordinary_bias, bits);
+        self.weights = vec![
+            TensorFacts { shape: codes, dtype: Dtype::Uint32, strides: Vec::new() },
+            TensorFacts { shape: scales.clone(), dtype: Dtype::Bfloat16, strides: Vec::new() },
+            TensorFacts { shape: scales, dtype: Dtype::Bfloat16, strides: Vec::new() },
+        ];
+        if let Some(bias) = &mut self.bias { bias.dtype = Dtype::Bfloat16; bias.strides.clear(); }
+        self.bits = Some(bits);
+        self.group_size = crate::quant::GROUP_SIZE;
+        self.base.is_quantized = true;
+        Ok(scratch)
+    }
+
+    pub(crate) fn declared_bytes(&self) -> u64 {
+        let payload = |a: &mlx_gen::adapters::facts::TensorFacts| mlx_gen::ios_quantum::allocated_bytes(a.bytes());
+        let base = self.weights.iter().fold(0u64, |n, a| n.saturating_add(payload(a)))
+            .saturating_add(self.bias.as_ref().map_or(0, payload));
+        self.residuals.iter().fold(base, |n, a| a.tensors().iter()
+            .fold(n, |n, tensor| n.saturating_add(payload(tensor))))
+    }
+}
+
+/// Explicit per-load projection facts. Keys come from the actual private quantization walk;
+/// lookup never falls back to a dense projection when a required final effect is missing.
+#[derive(Default)]
+pub(crate) struct LinearEffects(
+    pub std::collections::BTreeMap<String, LinearWork>,
+    /// Changed dense convolution weights in their ACTUAL installed OHWI layout. Unchanged weights
+    /// are borrowed from the native constructor; this map never contains synthetic Arrays.
+    pub std::collections::BTreeMap<String, mlx_gen::adapters::facts::TensorFacts>,
+);
+
+#[derive(Clone)]
+pub(crate) struct EffectScope<'a> {
+    effects: Option<&'a LinearEffects>,
+    prefix: String,
+}
+
+impl<'a> EffectScope<'a> {
+    pub(crate) fn native() -> Self { Self { effects: None, prefix: String::new() } }
+    pub(crate) fn root(effects: &'a LinearEffects) -> Self {
+        Self { effects: Some(effects), prefix: String::new() }
+    }
+    pub(crate) fn child(&self, name: &str) -> Self {
+        Self { effects: self.effects, prefix: crate::quant::child_path(&self.prefix, name) }
+    }
+    pub(crate) fn conv(&self, name: &str, native: &mlx_gen::adapters::AdaptableConv2d) -> ConvWork {
+        let path = crate::quant::child_path(&self.prefix, name);
+        let weight = self.effects.and_then(|effects| effects.1.get(&path)).cloned()
+            .unwrap_or_else(|| mlx_gen::adapters::facts::TensorFacts::of(native.weight()));
+        ConvWork { weight, bias: native.bias().map(mlx_gen::adapters::facts::TensorFacts::of) }
+    }
+    /// Dense shortcuts deliberately do not participate in the actual quantization walk.
+    pub(crate) fn shortcut(&self, name: &str, native: &AdaptableLinear) -> LinearWork {
+        let path = crate::quant::child_path(&self.prefix, name);
+        self.effects.and_then(|effects| effects.0.get(&path)).cloned()
+            .unwrap_or_else(|| LinearWork::of(native))
+    }
+    pub(crate) fn linear(&self, name: &str, native: &AdaptableLinear) -> Result<LinearWork> {
+        let path = crate::quant::child_path(&self.prefix, name);
+        match self.effects {
+            Some(effects) => effects.0.get(&path).cloned().ok_or_else(||
+                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))),
+            None => Ok(LinearWork::of(native)),
+        }
+    }
+}
+
 /// The dtype `x`-typed activations leave `linear` at: MLX promotes a dense matmul to
 /// `result_type(x, weight)` and a quantized one to `result_type(x, scales)`, so a pre-quantized
 /// SceneWorks snapshot's BF16 `.scales` (every packed U-Net / CLIP projection) turn f16 activations
 /// into f32 (measured: `quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks`),
 /// and everything downstream of that projection — residual sums, norms, convolutions — runs at f32.
 pub(crate) fn linear_output_dtype(linear: &AdaptableLinear, x: Dtype) -> Dtype {
-    let weight = match linear.quantized_params() {
-        Some((_, scales, ..)) => scales.dtype(),
-        None => linear.weight_dtype().unwrap_or(x),
-    };
-    Dtype::from_promoting_types(x, weight)
+    LinearWork::of(linear).output_dtype(x)
+}
+
+/// Convolution's composed bias add: its promoted bias vector and, if the bias widens the
+/// convolution result, the distinct wider output. The internal result cast may donate to add.
+#[cfg(test)]
+pub(crate) fn conv_bias_bytes(
+    input: Dtype,
+    weight: &Array,
+    bias: Option<&Array>,
+    output_elements: u64,
+) -> u64 {
+    ConvWork { weight: mlx_gen::adapters::facts::TensorFacts::of(weight),
+        bias: bias.map(mlx_gen::adapters::facts::TensorFacts::of) }.bias_bytes(input, output_elements)
+}
+
+/// Dense convolution facts in native OHWI order, at their PRECAST element widths. Source quant
+/// bits, total nbytes and a promoted activation width are never substituted for the weight width.
+pub(crate) struct ConvWork {
+    pub weight: mlx_gen::adapters::facts::TensorFacts,
+    pub bias: Option<mlx_gen::adapters::facts::TensorFacts>,
+}
+
+impl ConvWork {
+    pub(crate) fn call(&self, x: &[i32], act: u64, stride: i32, pad: i32) -> ConvCall {
+        ConvCall::from_metadata(x, act, &self.weight.shape, dtype_bytes(self.weight.dtype), stride, pad)
+    }
+    pub(crate) fn output_shape(&self, x: &[i32], stride: i32, pad: i32) -> Result<Vec<i32>> {
+        if x.len() != 4 || self.weight.shape.len() != 4 || x[3] != self.weight.shape[3] {
+            return Err(mlx_gen::Error::Msg("sdxl selected convolution input/weight axes disagree".into()));
+        }
+        let axis = |n: i32, k: i32| -> Result<i32> {
+            let result = (i64::from(n) + 2 * i64::from(pad) - i64::from(k)) / i64::from(stride) + 1;
+            i32::try_from(result).map_err(|_| mlx_gen::Error::Msg("sdxl convolution output dimension overflow".into()))
+        };
+        let shape = vec![x[0], axis(x[1], self.weight.shape[1])?,
+            axis(x[2], self.weight.shape[2])?, self.weight.shape[0]];
+        match &self.bias {
+            Some(bias) => crate::adapters::broadcast_shape(&shape, &bias.shape),
+            None => Ok(shape),
+        }
+    }
+    pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
+        let convolution = Dtype::from_promoting_types(input, self.weight.dtype);
+        self.bias.as_ref().map_or(convolution, |b| Dtype::from_promoting_types(convolution, b.dtype))
+    }
+    pub(crate) fn bias_bytes(&self, input: Dtype, output_elements: u64) -> u64 {
+        let Some(bias) = &self.bias else { return 0; };
+        let convolution = Dtype::from_promoting_types(input, self.weight.dtype);
+        let output = Dtype::from_promoting_types(convolution, bias.dtype);
+        let width = dtype_bytes(output);
+        let cast = if bias.dtype != output { bias.elements() * width } else { 0 };
+        cast + if convolution != output { output_elements * width } else { 0 }
+    }
+}
+
+/// Operand casts of a dense fused addmm, separate from its single output. In particular an f32
+/// bias promotes BOTH half-precision matrix operands; there is no second bias-add output.
+/// Packed matmul has no dense weight cast; its scales determine its compute promotion.
+pub(crate) fn linear_operand_bytes(linear: &AdaptableLinear, shape: &[i32], input: Dtype) -> u64 {
+    #[cfg(test)]
+    if let Some((w, b)) = linear.dense_weight() {
+        trace_layout("addmm weight", w);
+        if let Some(b) = b {
+            trace_layout("addmm bias", b);
+        }
+        eprintln!("OPERAND addmm input shape={shape:?} dtype={input:?}");
+    }
+    LinearWork::of(linear).operand_bytes(shape, input)
+}
+
+/// A final affine LayerNorm's peak, excluding its already-resident input. CPU fast.cpp's
+/// fallback has two competing live sets: the f32 centering/variance graph, and normalization +
+/// output cast + affine epilogue. Count the larger set, with the three row statistics and the
+/// promoted affine operands, rather than adding every intermediate in the graph.
+pub(crate) fn final_norm_bytes(shape: &[i32], input: Dtype, weight: &Array, bias: &Array) -> u64 {
+    #[cfg(test)]
+    {
+        trace_layout("final norm weight", weight);
+        trace_layout("final norm bias", bias);
+        eprintln!("OPERAND final norm input shape={shape:?} dtype={input:?}");
+    }
+    final_norm_bytes_from_metadata(shape, input,
+        &mlx_gen::adapters::facts::TensorFacts::of(weight),
+        &mlx_gen::adapters::facts::TensorFacts::of(bias))
+}
+
+/// The identical affine-norm formula over borrowed operand metadata. Native guards above and
+/// header-only CLIP pricing both consume this; metadata carries no backing or allocation identity.
+pub(crate) fn final_norm_bytes_from_metadata(
+    shape: &[i32], input: Dtype,
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: &mlx_gen::adapters::facts::TensorFacts,
+) -> u64 {
+    let output = Dtype::from_promoting_types(
+        Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
+    let count = shape.iter().fold(1u64, |n, &v| n.saturating_mul(u(v)));
+    let channels = u(*shape.last().expect("LayerNorm has a channel dimension")).max(1);
+    let width = dtype_bytes(output);
+    let affine = [weight, bias]
+        .iter()
+        .map(|a| {
+            if a.dtype != output {
+                a.elements() * width
+            } else {
+                0
+            }
+        })
+        .sum::<u64>();
+    match backend() {
+        Backend::Metal => count * width + affine,
+        Backend::Cpu => {
+            let input_width = dtype_bytes(input);
+            let centered = count * (2 * 4 + u64::from(input_width < 4) * 4);
+            let normalized = count * (3 * width + u64::from(input_width < 4) * 3 * 4);
+            centered.max(normalized) + 3 * (count / channels) * 4 + affine
+        }
+    }
+}
+
+/// Control residuals are caller-owned: their compute-dtype cast is lazy at the injection
+/// boundary, and cannot donate its retained storage. Price that potential pending allocation
+/// separately from the promoted sum (whose internal operand cast may donate).
+pub(crate) fn control_injection_bytes(hidden: &Array, residual: &Array) -> u64 {
+    #[cfg(test)]
+    {
+        trace_layout("control injection hidden", hidden);
+        trace_layout("control injection residual", residual);
+    }
+    let output = Dtype::from_promoting_types(hidden.dtype(), residual.dtype());
+    bytes(residual).saturating_add(elements(hidden) * dtype_bytes(output))
+}
+
+/// Deferred MultiControlNet sums are graph work, not already-held early-forward tensors. Record
+/// each actual add OUTPUT at its own width, and charge that logical workspace only at the existing
+/// down/mid injection barriers that evaluate it. This raw guard upper is never a subtractable
+/// physical lower or a fresh-allocation/cache certificate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ControlMergeWork {
+    pub down: u64,
+    pub mid: u64,
+}
+
+impl ControlMergeWork {
+    pub fn record_outputs(&mut self, down: &[Array], mid: &Array) -> mlx_gen::Result<()> {
+        for output in down {
+            self.down = self
+                .down
+                .checked_add(mlx_gen::ios_quantum::allocated_bytes(bytes(output)))
+                .ok_or_else(|| {
+                    mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
+                })?;
+        }
+        self.mid = self
+            .mid
+            .checked_add(mlx_gen::ios_quantum::allocated_bytes(bytes(mid)))
+            .ok_or_else(|| {
+                mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
+            })?;
+        Ok(())
+    }
+}
+
+/// Scalar-only observation of genuinely borrowed owners at a source scope boundary. Counts are
+/// logical holder sums (aliases may overlap), explicitly NOT native backing/footprint evidence.
+pub(crate) fn diagnostic_owned_tensors<'a>(
+    kind: &str,
+    context: u64,
+    tensors: impl Iterator<Item = &'a Array>,
+) {
+    let (mut count, mut available, mut pending) = (0u64, 0u64, 0u64);
+    for tensor in tensors {
+        count += 1;
+        if mlx_gen::array::is_materialized(tensor) {
+            available = available.saturating_add(bytes(tensor));
+        } else {
+            pending = pending.saturating_add(bytes(tensor));
+        }
+    }
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sdxl",
+        kind,
+        &[
+            ("schema", 1),
+            ("context", context),
+            ("holder_count", count),
+            ("available_logical_holder_bytes", available),
+            ("pending_logical_holder_bytes", pending),
+            ("physical_certificate", 0),
+        ],
+    );
+}
+
+/// Owned inputs live DURING a model forward, excluding construction-only temporaries. `None`
+/// scaled dtype is an alias of caller state; `Some` is a separately owned scaled input. Curated
+/// paths cast before CFG, whereas ancestral paths concatenate first and cast in forward_eps.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForwardInputOwnership {
+    pub state: Dtype,
+    pub scaled: Option<Dtype>,
+    pub cast_before_cfg: bool,
+}
+
+impl ForwardInputOwnership {
+    pub(crate) fn bytes(self, elements: u64, compute: Dtype, cfg_rows: u64) -> u64 {
+        self.unique_allocation_requests(elements, elements, compute, cfg_rows)
+            .into_iter()
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Unique allocation REQUEST sizes, not physical backing/allocator certificates. State may
+    /// be a slice/broadcast/reshape: its source-owned FULL parent request must be supplied, not
+    /// the view's logical nbytes/span. Each subsequent nonzero entry is a fresh distinct output;
+    /// aliases add no entry. Round/price these individually BEFORE taking any matched delta.
+    pub(crate) fn unique_allocation_requests(
+        self,
+        elements: u64,
+        state_parent_elements: u64,
+        compute: Dtype,
+        cfg_rows: u64,
+    ) -> [u64; 5] {
+        assert!(cfg_rows > 0, "an executed forward has at least one row");
+        let tensor = |dtype, rows| tensor_bytes(dtype_bytes(dtype), &[elements, rows]);
+        let mut owned = [0; 5];
+        owned[0] = tensor_bytes(dtype_bytes(self.state), &[state_parent_elements]);
+        let mut input = self.state;
+        if let Some(scaled) = self.scaled {
+            owned[1] = tensor(scaled, 1);
+            input = scaled;
+        }
+        if self.cast_before_cfg && input != compute {
+            owned[2] = tensor(compute, 1);
+            input = compute;
+        }
+        if cfg_rows > 1 {
+            owned[3] = tensor(input, cfg_rows);
+        }
+        if input != compute {
+            owned[4] = tensor(compute, cfg_rows);
+        }
+        owned
+    }
+
+    /// Physical native-counter size ONLY when source proves every nonzero request was freshly
+    /// allocated under cache-zero. A pre-scope/cached/external parent cannot use this path merely
+    /// because its current view is contiguous or a scope is active now.
+    pub(crate) fn fresh_native_bytes(
+        self,
+        elements: u64,
+        state_parent_elements: u64,
+        compute: Dtype,
+        cfg_rows: u64,
+        page_bytes: u64,
+    ) -> Option<u64> {
+        if cfg_rows == 0 || (elements != 0 && state_parent_elements == 0) {
+            return None;
+        }
+        self.unique_allocation_requests(elements, state_parent_elements, compute, cfg_rows)
+            .into_iter()
+            .try_fold(0u64, |sum, request| {
+                sum.checked_add(mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
+                    request, page_bytes,
+                )?)
+            })
+    }
+}
+
+/// A matched execution-epoch envelope, not difference-of-maxima: max(H+request)-max(H+base)
+/// <= max(request-base). The final base entry describes its proved steady suffix. An empty
+/// request executes no model forward, so contributes no retained-forward excess.
+#[cfg(test)]
+pub(crate) fn forward_input_excess(
+    elements: u64,
+    compute: Dtype,
+    cfg_rows: u64,
+    base: &[ForwardInputOwnership],
+    request: &[ForwardInputOwnership],
+) -> u64 {
+    assert!(
+        !base.is_empty(),
+        "a calibration baseline needs a model epoch"
+    );
+    request
+        .iter()
+        .enumerate()
+        .map(|(i, request)| {
+            let base = base
+                .get(i)
+                .unwrap_or_else(|| base.last().expect("nonempty baseline"));
+            request
+                .bytes(elements, compute, cfg_rows)
+                .saturating_sub(base.bytes(elements, compute, cfg_rows))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Output-row count of one projection (the `out` of its logical `[out, in]` weight).
@@ -430,13 +947,21 @@ pub(crate) fn sampler_step_bytes(latents: &Array, inpaint: bool) -> u64 {
     mlx_gen::ios_quantum::elementwise_bytes(latents.size() as u64, 4 + 3 * u64::from(inpaint))
 }
 
-/// `copies` buffers the size of `arrays` at their own widths: a small elementwise pass (residual
-/// add, scale) over already-materialized tensors.
-pub(crate) fn elementwise_bytes(arrays: &[&Array], copies: u64) -> u64 {
-    arrays
-        .iter()
-        .fold(0u64, |n, a| n.saturating_add(bytes(a)))
-        .saturating_mul(copies)
+/// The IP tokens' CFG pair over the materialized `[1, T, D]` `tokens`
+/// (`IpImageEncoder::zeros_like_tokens` + the concatenation): the f32 zeros, their cast to the
+/// tokens' width (absent at f32) and the `[2, T, D]` pair, each its own buffer.
+pub(crate) fn ip_cfg_tokens_bytes(tokens: &Array) -> u64 {
+    let t = bytes(tokens);
+    let f32_zeros = mlx_gen::ios_quantum::tensor_bytes(4, &[tokens.size() as u64]);
+    let cast = if tokens.dtype() == Dtype::Float32 {
+        0
+    } else {
+        t
+    };
+    f32_zeros
+        .saturating_add(cast)
+        .saturating_add(2 * t)
+        .saturating_add(page_slack(3))
 }
 
 /// One adapter target's install (`adapters.rs`), counted under MLX's retention (every buffer the

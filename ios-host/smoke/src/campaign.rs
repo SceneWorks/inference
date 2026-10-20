@@ -51,22 +51,55 @@ pub fn reference_edge(provider: &str) -> u32 {
     }
 }
 
+/// One provider-resolved allocation-graph representative, not a sampler/scheduler/float grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureRecipe {
+    pub token: Option<String>,
+    pub memory_class: Option<String>,
+    /// Actual normalized configured graph; separate from base architecture and sampling class.
+    pub configured_variant: Option<String>,
+    pub steps: u32,
+    /// An existing unsupported combination, visible in listing but not a completed-anchor target.
+    pub refusal: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     pub provider: String,
     pub routes: Vec<String>,
     pub modes: Vec<String>,
+    /// Canonical recipe representatives by (route, tier, mode), resolved on actual configuration
+    /// when required. Unresolved templates remain explicit refusals, never fabricated classes.
+    pub recipes: BTreeMap<(String, String, String), Vec<CaptureRecipe>>,
     /// Per `(tier, rung)`, the provider's own declared selection space as tokens, QUALITY FIRST
     /// (`MemoryProviderContract::selection_space`; only rungs the contract IMPLEMENTS have one).
     /// Absent: the single [`BASE_SELECTION`].
-    pub selections: BTreeMap<(String, u8), Vec<String>>,
+    pub selections: BTreeMap<(String, String, u8), Vec<String>>,
 }
 
 impl Surface {
+    fn recipes_for(&self, route: &str, tier: &str, mode: &str) -> Vec<CaptureRecipe> {
+        self.recipes
+            .get(&(route.into(), tier.into(), mode.into()))
+            .cloned()
+            .unwrap_or_else(|| {
+                vec![CaptureRecipe {
+                    token: None,
+                    memory_class: None,
+                    configured_variant: None,
+                    steps: ANCHOR_STEPS,
+                    refusal: None,
+                }]
+            })
+            .into_iter()
+            .filter(|recipe| recipe.refusal.is_none())
+            .collect()
+    }
+
     /// The first (most resident) selection token of `(tier, rung)`.
-    pub fn first_selection(&self, tier: &str, rung: u8) -> String {
+    pub fn first_selection(&self, route: &str, tier: &str, rung: u8) -> String {
         self.selections
-            .get(&(tier.to_string(), rung))
+            .get(&(route.to_string(), tier.to_string(), rung))
             .and_then(|v| v.first().cloned())
             .unwrap_or_else(|| BASE_SELECTION.into())
     }
@@ -77,13 +110,19 @@ impl Surface {
     /// rung at that tier (a route with no declared rung at a tier — e.g. a dense-only task asked for
     /// q4 — is not an anchor family; the listing reports it as unserved).
     pub fn serves(&self, tier: &str) -> bool {
-        self.selections.keys().any(|(t, _)| t == tier)
+        self.selections.keys().any(|(_, t, _)| t == tier)
     }
 
-    pub fn optimized(&self, tier: &str) -> Option<(u8, String)> {
+    pub fn serves_route(&self, route: &str, tier: &str) -> bool {
+        self.selections
+            .keys()
+            .any(|(r, t, _)| r == route && t == tier)
+    }
+
+    pub fn optimized(&self, route: &str, tier: &str) -> Option<(u8, String)> {
         (1..=4u8).rev().find_map(|rung| {
             self.selections
-                .get(&(tier.to_string(), rung))
+                .get(&(route.to_string(), tier.to_string(), rung))
                 .and_then(|v| v.last())
                 .map(|token| (rung, token.clone()))
         })
@@ -103,10 +142,13 @@ pub struct Case {
     pub selection: String,
     /// Denoise steps the case runs (`0`: the provider's own default — full steps).
     pub steps: u32,
+    /// Optional canonical sampling recipe token. Syntax is checked here; its semantics must be
+    /// validated by the provider's real resolver before the case can execute.
+    pub recipe: Option<String>,
 }
 impl Case {
     pub fn key(&self) -> String {
-        format!(
+        let base = format!(
             "{}/{}/{}/{}/{}/{}/{}/{}",
             self.provider,
             self.route,
@@ -116,11 +158,14 @@ impl Case {
             self.rung,
             self.selection,
             self.steps
-        )
+        );
+        self.recipe
+            .as_ref()
+            .map_or_else(|| base.clone(), |recipe| format!("{base}/{recipe}"))
     }
     pub fn parse(value: &str) -> Result<Self, String> {
         let p: Vec<_> = value.split('/').collect();
-        if p.len() != 8
+        if !matches!(p.len(), 8 | 9)
             || p.iter().any(|p| {
                 p.is_empty()
                     || !p
@@ -129,7 +174,8 @@ impl Case {
             })
         {
             return Err(
-                "case must be provider/route/{bf16,q8,q4}/edge/mode/rung/selection/steps".into(),
+                "case must be provider/route/{bf16,q8,q4}/edge/mode/rung/selection/steps[/recipe]"
+                    .into(),
             );
         }
         let edge = p[3].parse::<u32>().map_err(|_| "invalid edge")?;
@@ -138,9 +184,8 @@ impl Case {
         if !["bf16", "q8", "q4"].contains(&p[2])
             || ![256, 512, 768, 1024, 1280].contains(&edge)
             || rung > 4
-            || steps > 100
         {
-            return Err("tier, geometry, rung or steps outside finite campaign domain".into());
+            return Err("tier, geometry or rung outside campaign domain".into());
         }
         Ok(Self {
             provider: p[0].into(),
@@ -151,6 +196,7 @@ impl Case {
             rung,
             selection: p[6].into(),
             steps,
+            recipe: p.get(8).map(|s| (*s).into()),
         })
     }
 }
@@ -199,8 +245,9 @@ pub struct Planned {
 /// component-additive, else the mode itself).
 pub struct Grouping<'a> {
     pub architecture: &'a dyn Fn(&str, &str, &str) -> String,
-    /// `(provider, campaign mode, tier)` → variant.
-    pub variant: &'a dyn Fn(&str, &str, &str) -> String,
+    /// `(provider, route, campaign mode, tier, actual existing recipe)` → variant.
+    /// Route/token context lets configured role selection reuse the real provider resolver.
+    pub variant: &'a dyn Fn(&str, &str, &str, &str, &CaptureRecipe) -> String,
 }
 
 /// One anchor family: its group key, the member `provider/route/mode` cells it prices (all derived
@@ -210,6 +257,8 @@ pub struct Family {
     pub architecture: String,
     pub tier: String,
     pub variant: String,
+    pub recipe: Option<String>,
+    pub anchor_steps: u32,
     /// `(provider, route, mode)` the anchors run on: the first text-mode member, else the first.
     pub anchor: (String, String, String),
     pub members: Vec<String>,
@@ -217,7 +266,9 @@ pub struct Family {
 
 /// The weights-free grouping: no checkpoint collapse (each `(provider, route)` is its own
 /// architecture group), variants from `variant`.
-pub fn per_route<'a>(variant: &'a dyn Fn(&str, &str, &str) -> String) -> Grouping<'a> {
+pub fn per_route<'a>(
+    variant: &'a dyn Fn(&str, &str, &str, &str, &CaptureRecipe) -> String,
+) -> Grouping<'a> {
     Grouping {
         architecture: &|provider: &str, route: &str, _tier: &str| format!("{provider}/{route}"),
         variant,
@@ -229,27 +280,49 @@ pub fn families(surfaces: &[Surface], grouping: &Grouping<'_>) -> Vec<Family> {
     let mut out: Vec<Family> = Vec::new();
     for s in surfaces {
         for route in &s.routes {
-            for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
+            for tier in ["q4", "q8", "bf16"]
+                .into_iter()
+                .filter(|t| s.serves_route(route, t))
+            {
                 let architecture = (grouping.architecture)(&s.provider, route, tier);
                 for mode in &s.modes {
-                    let variant = (grouping.variant)(&s.provider, mode, tier);
-                    let member = format!("{}/{route}/{mode}", s.provider);
-                    match out.iter_mut().find(|f| {
-                        f.architecture == architecture && f.tier == tier && f.variant == variant
-                    }) {
-                        Some(f) => {
-                            if mode == "text" && f.anchor.2 != "text" {
-                                f.anchor = (s.provider.clone(), route.clone(), mode.clone());
-                            }
-                            f.members.push(member);
+                    for recipe in s.recipes_for(route, tier, mode) {
+                        let base_variant =
+                            (grouping.variant)(&s.provider, route, mode, tier, &recipe);
+                        let mut variant = recipe
+                            .memory_class
+                            .as_ref()
+                            .map_or(base_variant.clone(), |class| {
+                                format!("{base_variant}/{class}")
+                            });
+                        if let Some(configured) = &recipe.configured_variant {
+                            variant.push_str("/configured=");
+                            variant.push_str(configured);
                         }
-                        None => out.push(Family {
-                            architecture: architecture.clone(),
-                            tier: tier.into(),
-                            variant,
-                            anchor: (s.provider.clone(), route.clone(), mode.clone()),
-                            members: vec![member],
-                        }),
+                        let member = format!("{}/{route}/{mode}", s.provider);
+                        match out.iter_mut().find(|f| {
+                            f.architecture == architecture && f.tier == tier && f.variant == variant
+                        }) {
+                            Some(f) => {
+                                if mode == "text" && f.anchor.2 != "text" {
+                                    f.anchor = (s.provider.clone(), route.clone(), mode.clone());
+                                    f.recipe = recipe.token.clone();
+                                    f.anchor_steps = recipe.steps;
+                                }
+                                if !f.members.contains(&member) {
+                                    f.members.push(member);
+                                }
+                            }
+                            None => out.push(Family {
+                                architecture: architecture.clone(),
+                                tier: tier.into(),
+                                variant,
+                                recipe: recipe.token.clone(),
+                                anchor_steps: recipe.steps,
+                                anchor: (s.provider.clone(), route.clone(), mode.clone()),
+                                members: vec![member],
+                            }),
+                        }
                     }
                 }
             }
@@ -282,17 +355,18 @@ pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<
             mode: mode.clone(),
             rung,
             selection,
-            steps: ANCHOR_STEPS,
+            steps: f.anchor_steps,
+            recipe: f.recipe.clone(),
         };
         out.push(Planned {
-            case: case(0, s.first_selection(&f.tier, 0)),
+            case: case(0, s.first_selection(&f.anchor.1, &f.tier, 0)),
             purpose: Purpose::Resident,
             repeats: 1,
         });
-        if let Some((rung, selection)) = s.optimized(&f.tier) {
+        if let Some((rung, selection)) = s.optimized(&f.anchor.1, &f.tier) {
             let optimized = case(rung, selection);
             validation.get_or_insert_with(|| optimized.clone());
-            if mode_validation.is_none() && f.tier == "q4" {
+            if mode_validation.is_none() && f.tier == "q4" && mode == "text" {
                 if let Some(member) = f.members.iter().find(|m| m.ends_with("/control")) {
                     let mut parts = member.splitn(3, '/');
                     let (p, r) = (
@@ -348,7 +422,7 @@ pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<
 /// [`plan`] under the weights-free [`per_route`] grouping with every mode additive (the campaign
 /// shape the unit tests hold).
 pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
-    let variant = |_: &str, _: &str, _: &str| "base".to_string();
+    let variant = |_: &str, _: &str, _: &str, _: &str, _: &CaptureRecipe| "base".to_string();
     plan(surfaces, &per_route(&variant)).1
 }
 
@@ -466,10 +540,16 @@ mod tests {
             provider: "new_provider".into(),
             routes: vec!["new_provider".into()],
             modes: vec!["text".into(), "reference".into(), "mask".into()],
+            recipes: BTreeMap::new(),
             // Every tier served at rung 0 (its parameterless selection).
             selections: ["q4", "q8", "bf16"]
                 .into_iter()
-                .map(|t| ((t.to_string(), 0), vec![BASE_SELECTION.to_string()]))
+                .map(|t| {
+                    (
+                        ("new_provider".into(), t.to_string(), 0),
+                        vec![BASE_SELECTION.to_string()],
+                    )
+                })
                 .collect(),
         }
     }
@@ -482,6 +562,20 @@ mod tests {
         assert_eq!(c.selection, "t512_dit");
         assert_eq!(c.steps, 1);
         assert_eq!(Case::parse(&c.key()).unwrap(), c);
+        assert!(c.recipe.is_none());
+        assert_eq!(
+            Case::parse("p/p/q4/512/text/0/base/101").unwrap().steps,
+            101
+        );
+        assert_eq!(Case::parse("p/p/q4/512/text/0/base/0").unwrap().steps, 0);
+        let maximum_steps = Case::parse("p/p/q4/512/text/0/base/4294967295").unwrap();
+        assert_eq!(maximum_steps.steps, u32::MAX);
+        assert_eq!(Case::parse(&maximum_steps.key()).unwrap(), maximum_steps);
+        let long = format!("sdxl/sdxl/q4/1024/text/4/base/3/sdxl1-{}", "ab".repeat(512));
+        let recipe_case = Case::parse(&long).unwrap();
+        assert_eq!(recipe_case.key(), long);
+        assert_eq!(recipe_case.recipe.as_deref(), long.rsplit('/').next());
+        // Syntax alone is not semantic approval: the capture adapter validates the real recipe.
         for s in [
             "p/p/q4/0/text/1/base/1",
             "p/p/q4/999999999/text/1/base/1",
@@ -489,9 +583,9 @@ mod tests {
             "p/../q4/512/text/0/base/1",
             "p/p/q5/512/text/0/base/1",
             "p/p/q4/512/text/0/base",
-            "p/p/q4/512/text/0/base/1/extra",
+            "p/p/q4/512/text/0/base/1/extra/extra",
             "p/p/q4/512/text/0/t5.12/1",
-            "p/p/q4/512/text/0/base/101",
+            "p/p/q4/512/text/0/base/4294967296",
             "p/p/q4/512/text/0/base/x",
         ] {
             assert!(Case::parse(s).is_err(), "{s}");
@@ -515,18 +609,28 @@ mod tests {
             "control".into(),
             "batch".into(),
         ];
-        for tier in ["q4", "q8", "bf16"] {
-            a.selections
-                .insert((tier.into(), 2), vec!["t768".into(), "t512".into()]);
-            a.selections.insert(
-                (tier.into(), 4),
-                vec!["t768_w2".into(), "t512_w2".into(), "s_t256_w1".into()],
-            );
+        a.selections.clear();
+        for route in &a.routes {
+            for tier in ["q4", "q8", "bf16"] {
+                a.selections
+                    .insert((route.clone(), tier.into(), 0), vec![BASE_SELECTION.into()]);
+                a.selections.insert(
+                    (route.clone(), tier.into(), 2),
+                    vec!["t768".into(), "t512".into()],
+                );
+                a.selections.insert(
+                    (route.clone(), tier.into(), 4),
+                    vec!["t768_w2".into(), "t512_w2".into(), "s_t256_w1".into()],
+                );
+            }
         }
         let mut supra = surface();
         supra.provider = "supra2_img".into();
         supra.routes = vec!["supra2_img".into()];
-        supra.selections.retain(|(tier, _), _| tier == "q4");
+        supra.selections = BTreeMap::from([(
+            ("supra2_img".into(), "q4".into(), 0),
+            vec![BASE_SELECTION.into()],
+        )]);
         // `base` and `finetune` share every header; `distilled` does not. `batch` is non-additive.
         let architecture = |provider: &str, route: &str, _tier: &str| {
             if route == "distilled" {
@@ -535,7 +639,7 @@ mod tests {
                 provider.to_string()
             }
         };
-        let variant = |_: &str, mode: &str, _: &str| {
+        let variant = |_: &str, _: &str, mode: &str, _: &str, _: &CaptureRecipe| {
             if mode == "batch" {
                 mode.to_string()
             } else {
@@ -580,7 +684,7 @@ mod tests {
                 .iter()
                 .filter(|p| p.purpose == Purpose::Optimized)
                 .collect();
-            match s.optimized(&f.tier) {
+            match s.optimized(&f.anchor.1, &f.tier) {
                 Some((rung, selection)) => {
                     assert_eq!(optimized.len(), 1);
                     assert_eq!(
@@ -669,7 +773,7 @@ mod tests {
             "anchors and the three validation cases only"
         );
         // The weights-free grouping never collapses routes.
-        let variant = |_: &str, _: &str, _: &str| "base".to_string();
+        let variant = |_: &str, _: &str, _: &str, _: &str, _: &CaptureRecipe| "base".to_string();
         assert_eq!(families_count(&[a], &per_route(&variant)), 3 * 3);
         assert!(enumerate(&[supra])
             .iter()

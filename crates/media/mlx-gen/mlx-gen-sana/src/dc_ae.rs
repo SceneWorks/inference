@@ -542,7 +542,7 @@ impl DcAeDecoder {
         latent_nchw: &Array,
         cancel: &CancelFlag,
     ) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let (b, lh, lw, lc) = nhwc(&latent);
         let mut h = quantum(
@@ -575,7 +575,7 @@ impl DcAeDecoder {
 
     /// [`Self::decode_tail`], checking `cancel` before each bounded quantum.
     pub fn decode_tail_cancellable(&self, head_nhwc: &Array, cancel: &CancelFlag) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut h = head_nhwc.clone();
         let tail = self.num_tail_stages();
         for stage in self.stages[..tail].iter().rev() {
@@ -776,7 +776,7 @@ impl DcAeEncoder {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let h = self.encode_prefix(&x, cancel)?;
         self.encode_rest(&h, cancel)
@@ -898,7 +898,7 @@ impl DcAeEncoder {
         if self.num_prefix_stages() == 0 || (height <= core && width <= core) {
             return self.encode(image_nchw, cancel);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let halo = self.prefix_halo();
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let starts = |extent: i32| (0..extent).step_by(core as usize).collect::<Vec<i32>>();

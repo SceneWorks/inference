@@ -728,8 +728,8 @@ impl Decoder {
         })
     }
 
-    fn forward(&self, z: &Array) -> Result<Array> {
-        self.tail(&self.head(z)?)
+    fn forward(&self, z: &Array, pending_input: u64) -> Result<Array> {
+        self.tail(&self.head(z, pending_input)?)
     }
 
     /// The **globally-scoped** half of the decode: `conv_in` → mid resnet → mid **attention** → mid
@@ -745,7 +745,7 @@ impl Decoder {
     ///
     /// sc-26270: `conv_in` (which also materializes the caller's lazy de-normalization and
     /// `post_quant_conv`), each mid resnet and the mid attention are guarded iOS quanta.
-    fn head(&self, z: &Array) -> Result<Array> {
+    fn head(&self, z: &Array, pending_input: u64) -> Result<Array> {
         // `conv_in`'s output (+ its bias add) and kernel transient, plus the caller's lazy latent
         // de-normalization and `post_quant_conv` (two latent-sized buffers) materialized here.
         let call = crate::quantum::ConvCall::new(
@@ -755,7 +755,8 @@ impl Decoder {
             1,
             1,
         );
-        let scratch = crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::backend());
+        let scratch = crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::backend())
+            .saturating_add(pending_input);
         let mut x = mlx_gen::ios_quantum::run(crate::quantum::VAE_DECODE_IN, scratch, || {
             conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)
         })?;
@@ -781,7 +782,12 @@ impl Decoder {
     }
 
     /// Header-only pricing of [`Self::head`] over the shape-only `z`.
-    fn price_head(&self, z: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
+    fn price_head(
+        &self,
+        z: &Array,
+        pending_input: u64,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
         let call = crate::quantum::ConvCall::new(
             z.shape(),
             crate::quantum::element_bytes(z),
@@ -791,7 +797,8 @@ impl Decoder {
         );
         out.push((
             crate::quantum::VAE_DECODE_IN,
-            crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::backend()),
+            crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::backend())
+                .saturating_add(pending_input),
         ));
         let s = z.shape();
         let x = crate::quantum::shaped(
@@ -1366,11 +1373,13 @@ impl Autoencoder {
 
     /// Decode latents `[B, H/8, W/8, 4]` (NHWC) → image tensor `[B, H, W, 3]` in roughly `[-1, 1]`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let pending_input =
+            self.decode_input_retained_bytes(latents) - crate::quantum::bytes(latents);
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
-        self.to_output(self.decoder.forward(&z)?)
+        self.to_output(self.decoder.forward(&z, pending_input)?)
     }
 
     /// Untiled, evaluated inference decode. Uses exactly [`decode`](Self::decode)'s full-image
@@ -1379,11 +1388,13 @@ impl Autoencoder {
     /// generation; this is NOT a tiled reference and does not change convolution geometry.
     /// Do not use under autograd (evaluation intentionally releases the lazy graph).
     pub fn decode_evaluated(&self, latents: &Array) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let pending_input =
+            self.decode_input_retained_bytes(latents) - crate::quantum::bytes(latents);
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
-        let head = self.decoder.head(&z)?;
+        let head = self.decoder.head(&z, pending_input)?;
         head.eval()?;
         self.to_output(self.decoder.tail_evaluated(&head)?)
     }
@@ -1427,13 +1438,15 @@ impl Autoencoder {
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let pending_input =
+            self.decode_input_retained_bytes(latents) - crate::quantum::bytes(latents);
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
         // Head once on the whole latent. The tail tiles layer-by-layer so every GroupNorm keeps the
         // dense image's statistics while each 3×3 convolution stays bounded by the selected edge.
-        let head = self.decoder.head(&z)?;
+        let head = self.decoder.head(&z, pending_input)?;
         trace_decode_stage("head", &head)?;
         let tile_edge = cfg
             .spatial
@@ -1463,7 +1476,7 @@ impl Autoencoder {
 
     /// The historical whole-image encode.
     fn encode_dense(&self, x: &Array) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let x = self.to_compute(x)?;
         let body = self.encoder.forward_body(&x)?;
         // sc-26270: output norm/conv, `quant_conv`, the mean selection and scaling are one quantum.
@@ -1497,7 +1510,7 @@ impl Autoencoder {
         if s[1] <= tile_px && s[2] <= tile_px {
             return self.encode_dense(x);
         }
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let x = self.to_compute(x)?;
         let body = self.encoder.forward_body_tiled(&x, tile_px, cancel)?;
         mlx_gen::ios_quantum::run(
@@ -1528,6 +1541,19 @@ impl Autoencoder {
         }
     }
 
+    /// Caller-owned decode input plus its distinct compute copy, if any. The latent is held
+    /// across every decoder quantum; an identity to_compute is an alias, never a second buffer.
+    pub(crate) fn decode_input_retained_bytes(&self, latents: &Array) -> u64 {
+        let caller = crate::quantum::bytes(latents);
+        let compute = self.compute_dtype(latents.dtype());
+        caller
+            + if compute == latents.dtype() {
+                0
+            } else {
+                crate::quantum::elements(latents) * crate::quantum::dtype_bytes(compute)
+            }
+    }
+
     /// Header-only pricing of the decode the request runs ([`Self::decode_tiled`] under the
     /// rung-2 `tiling`, else [`Self::decode`]) over the shape-only NHWC `latents`: every quantum it
     /// checks, in order, with the guards' own formulas. Returns the shape-only decoded image (the
@@ -1549,7 +1575,9 @@ impl Autoencoder {
             sh,
             crate::quantum::linear_output_dtype(&self.post_quant_proj, z),
         )?;
-        let head = self.decoder.price_head(&z, out)?;
+        let pending_input =
+            self.decode_input_retained_bytes(latents) - crate::quantum::bytes(latents);
+        let head = self.decoder.price_head(&z, pending_input, out)?;
         let tile = tiling
             .filter(|cfg| cfg.needs_tiling(VAE_TILING, 1, sh[1], sh[2]))
             .and_then(|cfg| cfg.spatial.as_ref().map(|s| s.tile_px));
@@ -2147,7 +2175,7 @@ pub(crate) mod tests {
         let z = latent().as_dtype(Dtype::Float16).unwrap();
         let decode = || {
             half.decoder
-                .tail_tiled(&half.decoder.head(&z).unwrap(), 8, None)
+                .tail_tiled(&half.decoder.head(&z, 0).unwrap(), 8, None)
                 .unwrap()
         };
         let plain = f32_values(&decode());

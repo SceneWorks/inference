@@ -18,6 +18,7 @@ human reviews and commits). `validate` then runs the validation_geometry case AD
 committed anchors and prints the anchor law's prediction against the measurement. `run` exercises
 admission for any case of the catalog's domain."""
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -35,26 +36,48 @@ EDGES = (256, 512, 768, 1024, 1280)
 # Reserved synthetic primitive key: never a catalog case, never admission evidence.
 PRIMITIVE_KEY = "primitive/sana_block_quantum"
 PRIMITIVE_CLASS = "primitive_characterization"
-STEPS_MAX = 100
+# Wire/request u32 domain, not an arbitrary capture cap. Validation is scalar/O(1).
+STEPS_MAX = (1 << 32) - 1
 PURPOSES = ("resident", "optimized", "validation_steps", "validation_geometry", "validation_mode")
 ADMITTED_VALIDATIONS = ("validation_geometry", "validation_mode")
 CAPTURE_PURPOSES = ("resident", "optimized", "validation_steps")
 OPTIMIZED_REPEATS = 2
 # Mirrors evidence::ANCHOR_MARGIN_FLOOR_BYTES: the low-end margin's floor.
 ANCHOR_MARGIN_FLOOR_BYTES = 32 << 20
+# Structural observation bounds mirror evidence::{MAX_SAMPLING_MARKS,MAX_SAMPLING_FIELDS}.
+SAMPLING_MARKS_MAX = 1024
+SAMPLING_FIELDS_MAX = 64
+SAMPLING_NAME_BYTES_MAX = 128
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
 REFUSAL_KINDS = ("capacity", "no_evidence", "mode", "strategy", "artifact")
 EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json"
 
 
+def step_count(value):
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("steps must be a u32 integer (0 selects actual defaults)") from exc
+    if not 0 <= count <= STEPS_MAX:
+        raise argparse.ArgumentTypeError("steps must fit u32 (0 selects actual defaults)")
+    return count
+
+
 def case_key(value):
     p = value.split("/")
-    if len(p) != 8 or any(not s or not all(c.isascii() and (c.isalnum() or c in "_-") for c in s) for s in p):
-        raise argparse.ArgumentTypeError("case must be provider/route/tier/edge/mode/rung/selection/steps")
-    if p[2] not in TIERS or p[3] not in tuple(map(str, EDGES)) or p[5] not in tuple(map(str, range(5))) \
-            or not p[7].isdigit() or not 0 <= int(p[7]) <= STEPS_MAX:
-        raise argparse.ArgumentTypeError("case outside finite tier/geometry/rung/steps domain")
+    if len(p) not in (8, 9) or any(not s or not all(c.isascii() and (c.isalnum() or c in "_-") for c in s) for s in p):
+        raise argparse.ArgumentTypeError("case must be provider/route/tier/edge/mode/rung/selection/steps[/recipe]")
+    if p[2] not in TIERS or p[3] not in tuple(map(str, EDGES)) or p[5] not in tuple(map(str, range(5))) or not p[7].isdigit():
+        raise argparse.ArgumentTypeError("case outside tier/geometry/rung/step syntax domain")
+    step_count(p[7])
     return value
+
+
+def artifact_stem(key):
+    """Match runtime capture_artifact_stem; preserve replayable tokens in metadata, not filenames."""
+    if len(key.split("/")) == 8:
+        return key.replace("/", "-")
+    return "recipe-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def positive(value):
@@ -84,7 +107,7 @@ def parser():
     p.add_argument("--tier", choices=TIERS)
     p.add_argument("--edge", type=int, choices=EDGES)
     p.add_argument("--rung", type=int, choices=range(5))
-    p.add_argument("--steps", type=int, choices=range(STEPS_MAX + 1))
+    p.add_argument("--steps", type=step_count, metavar="U32_OR_DEFAULT_0")
     p.add_argument("--purpose", choices=PURPOSES)
     p.add_argument("--case", type=case_key)
     p.add_argument("--all-cases", action="store_true")
@@ -339,7 +362,7 @@ class DeviceSession:
         row = failure(key, "case did not produce a report")
         started = time.time()
         end = time.monotonic() + self.args.timeout_seconds
-        artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / (key.replace("/", "-") + ("-probe" if refusal_only else ""))
+        artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / (artifact_stem(key) + ("-probe" if refusal_only else ""))
         launcher_code = None
         run_id = uuid.uuid4().hex
         self.run_id = run_id
@@ -390,7 +413,7 @@ class DeviceSession:
                 if row["status"] == "successful" and (not names or len(names) != row.get("expected_render_count") or len(set(names)) != len(names)):
                     raise ValueError("successful case render manifest count is missing/wrong")
                 for name in names:
-                    if not name or Path(name).name != name or not name.startswith("campaign-" + key.replace("/", "-") + "-") or not name.endswith(".png"):
+                    if not name or Path(name).name != name or not name.startswith("campaign-" + artifact_stem(key) + "-") or not name.endswith(".png"):
                         raise ValueError("invalid render manifest path")
                     if self.copy(name, artifact / name).returncode:
                         raise ValueError("failed to pull case render " + name)
@@ -481,11 +504,113 @@ def _finite(value):
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
 
 
+def sampling_coverage_of(value):
+    """Validate bounded ACTUAL metadata transport, not class/epoch completeness or a planned graph."""
+    def integer(n):
+        return isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= (1 << 64) - 1
+    def name(text):
+        if not isinstance(text, str) or not text:
+            return False
+        try:
+            return len(text.encode("utf-8")) <= SAMPLING_NAME_BYTES_MAX
+        except UnicodeEncodeError:
+            return False
+    fields = {"marks", "counts", "total_marks", "dropped_marks", "malformed_marks", "truncated"}
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    marks, counts = value["marks"], value["counts"]
+    if not isinstance(marks, list) or len(marks) > SAMPLING_MARKS_MAX or not isinstance(counts, dict):
+        return None
+    if not all(integer(value[k]) for k in ("total_marks", "dropped_marks", "malformed_marks")) \
+            or not isinstance(value["truncated"], bool) \
+            or value["malformed_marks"] > value["dropped_marks"] \
+            or value["total_marks"] != len(marks) + value["dropped_marks"] \
+            or value["truncated"] != (value["dropped_marks"] > 0):
+        return None
+    rebuilt = {}
+    for mark in marks:
+        if not isinstance(mark, dict) or set(mark) != {"provider", "kind", "fields"} \
+                or not name(mark["provider"]) or not name(mark["kind"]) \
+                or not isinstance(mark["fields"], dict) or len(mark["fields"]) > SAMPLING_FIELDS_MAX \
+                or any(not name(k) or not integer(v) for k, v in mark["fields"].items()):
+            return None
+        kinds = rebuilt.setdefault(mark["provider"], {})
+        kinds[mark["kind"]] = kinds.get(mark["kind"], 0) + 1
+    if rebuilt != counts:
+        return None
+    return value
+
+
+def kernel_snapshot_of(value):
+    """Validate the recorded Darwin LP64 pack(4) ABI, not caller-claimed short-reply minima."""
+    fields = {"method", "query_status", "requested_words", "returned_words", "current_required_words",
+              "peak_required_words", "current_bytes", "lifetime_peak_bytes"}
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    if value["method"] != "task_vm_info" or value["query_status"] != 0 or isinstance(value["query_status"], bool):
+        return None
+    for name in ("requested_words", "returned_words", "current_required_words", "peak_required_words"):
+        if not _count(value[name]) or value[name] > (1 << 32) - 1:
+            return None
+    # SDK ABI offsets: phys_footprint words36-37; REV3 ledger peak ends at word84.
+    if value["current_required_words"] != 38 or value["peak_required_words"] != 84:
+        return None
+    if not 84 <= value["returned_words"] <= value["requested_words"]:
+        return None
+    current, peak = value["current_bytes"], value["lifetime_peak_bytes"]
+    if not _count(current) or not _count(peak) or not 0 < current <= peak <= (1 << 64) - 1:
+        return None
+    return value
+
+
+def quantum_coverage_of(value, metadata):
+    """Actual bounded checked/context transport; existence/counts never prove physical classes."""
+    if not isinstance(value, dict) or set(value) != {"checks", "total_checks", "dropped_checks", "truncated"}:
+        return None
+    if not isinstance(value["checks"], list) or len(value["checks"]) > 4096:
+        return None
+    if any(not _count(value[name]) or value[name] > (1 << 64) - 1 for name in ("total_checks", "dropped_checks")):
+        return None
+    if value["truncated"] is not False or value["dropped_checks"] != 0:
+        return None
+    total = 0
+    for check in value["checks"]:
+        if not isinstance(check, dict) or set(check) != {"phase", "label", "context", "count"}:
+            return None
+        if check["phase"] not in (None, "load", "conditioning", "encode", "denoise", "decode"):
+            return None
+        if not isinstance(check["label"], str) or not 0 < len(check["label"].encode("utf-8")) <= 128:
+            return None
+        if not isinstance(check["context"], list) or len(check["context"]) > 64:
+            return None
+        if any(not _count(index) or metadata is None or index >= len(metadata["marks"]) for index in check["context"]):
+            return None
+        if not _count(check["count"]) or not 0 < check["count"] <= (1 << 64) - 1:
+            return None
+        total += check["count"]
+        if total > (1 << 64) - 1:
+            return None
+    return value if total == value["total_checks"] else None
+
+
+def conditioning_roles_of(key):
+    """Required exact role counters; legacy missing counts are refused, never defaulted to zero."""
+    if not isinstance(key, dict):
+        return None
+    roles = {name: key.get(name) for name in ("reference_count", "mask_count", "control_count")}
+    if any(not _count(value) or value > (1 << 32) - 1 for value in roles.values()):
+        return None
+    return roles
+
+
 def capture_of(r):
     """A completed capture with full device telemetry, as a schema-3 `Capture`, else None."""
     peak = r.get("kernel_lifetime_phys_footprint_peak_bytes")
     baseline = r.get("baseline_phys_footprint_bytes")
     if r.get("status") != "diagnostic_success" or r.get("evidence_class") != "capture" or not isinstance(r.get("evidence_key"), dict):
+        return None
+    roles = conditioning_roles_of(r["evidence_key"])
+    if roles is None:
         return None
     if not all(_finite(r.get(n)) for n in ("mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds")) or not isinstance(peak, int) or isinstance(peak, bool):
         return None
@@ -494,7 +619,48 @@ def capture_of(r):
     if isinstance(baseline, bool) or not isinstance(baseline, int) or not 0 < baseline < peak:
         return None
     steps = r.get("steps")
-    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+    if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= STEPS_MAX:
+        return None
+    coverage = None
+    if r.get("sampling_coverage") is not None:
+        coverage = sampling_coverage_of(r["sampling_coverage"])
+        if coverage is None or coverage["truncated"]:
+            return None
+    if r["evidence_key"].get("sampling_recipe") is not None:
+        role_marks = [mark for mark in (coverage or {}).get("marks", [])
+                      if mark["provider"] == "ios_capture" and mark["kind"] == "conditioning-roles"]
+        if len(role_marks) != 1 or role_marks[0]["fields"] != roles:
+            return None
+        try:
+            generation = case_key(r.get("case", "")).split("/")[4] not in ("restore", "depth")
+        except argparse.ArgumentTypeError:
+            return None
+        if r.get("sampling_metadata_required") is not generation:
+            return None
+        if generation and (coverage is None or not coverage["marks"] or r.get("sampling_metadata_missing") is not False):
+            return None
+    snapshots = {name: kernel_snapshot_of(r.get(name)) for name in
+                 ("before_request_snapshot", "before_model_load_snapshot", "ending_snapshot")}
+    if any(value is None for value in snapshots.values()):
+        return None
+    if snapshots["before_request_snapshot"]["current_bytes"] != baseline or snapshots["ending_snapshot"]["lifetime_peak_bytes"] != peak:
+        return None
+    if not snapshots["before_request_snapshot"]["lifetime_peak_bytes"] <= snapshots["before_model_load_snapshot"]["lifetime_peak_bytes"] <= peak:
+        return None
+    for start_name, peak_name, query_name in (
+        ("before_request_snapshot", "observed_current_peak_bytes", "valid_kernel_queries"),
+        ("before_model_load_snapshot", "observed_model_current_peak_bytes", "valid_model_kernel_queries"),
+    ):
+        observed, queries = r.get(peak_name), r.get(query_name)
+        if not _count(observed) or not snapshots[start_name]["current_bytes"] <= observed <= peak:
+            return None
+        if not _count(queries) or not 0 < queries <= (1 << 64) - 1:
+            return None
+    quantum = quantum_coverage_of(r.get("quantum_coverage"), coverage)
+    if quantum is None or (r.get("sampling_metadata_required") is True and not quantum["checks"]):
+        return None
+    gaps = r.get("quantum_query_gaps")
+    if not _count(gaps) or gaps > (1 << 64) - 1:
         return None
     phases = {}
     for name, value in (r.get("phase_peaks") or {}).items():
@@ -507,9 +673,19 @@ def capture_of(r):
     for label, q in (r.get("quanta") or {}).items():
         if isinstance(q, dict) and label and _count(q.get("priced_scratch_bytes")) and _count(q.get("observed_bytes")) \
                 and isinstance(q.get("exact"), bool) and q["observed_bytes"] <= peak:
+            context = q.get("preceding_sampling_mark")
+            if context is not None and (isinstance(context, bool) or not isinstance(context, int)
+                                        or coverage is None or not 0 <= context < len(coverage["marks"])):
+                return None
             quanta[label] = {"priced_scratch_bytes": q["priced_scratch_bytes"], "observed_bytes": q["observed_bytes"], "exact": q["exact"]}
+            if context is not None:
+                quanta[label]["preceding_sampling_mark"] = context
     return {"run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or ""), "steps": steps,
-            "baseline_footprint_bytes": baseline, "footprint_bytes": peak, "phase_peaks": phases, "quanta": quanta,
+            "baseline_footprint_bytes": baseline, "footprint_bytes": peak, "phase_peaks": phases, "sampling_coverage": coverage, "quanta": quanta,
+            **snapshots, "observed_current_peak_bytes": r["observed_current_peak_bytes"],
+            "observed_model_current_peak_bytes": r["observed_model_current_peak_bytes"],
+            "valid_kernel_queries": r["valid_kernel_queries"], "valid_model_kernel_queries": r["valid_model_kernel_queries"],
+            "quantum_coverage": quantum, "quantum_query_gaps": gaps,
             "mlx_peak_bytes": int(r["mlx_peak_bytes"]), "min_headroom_mib": float(r["min_headroom_mib"]),
             "elapsed_seconds": float(r["elapsed_seconds"])}
 
@@ -524,6 +700,9 @@ def anchor_rows(rows):
             groups.setdefault((json.dumps(r["evidence_key"], sort_keys=True), r["purpose"]), []).append(r)
     anchors, problems = [], []
     for (key, purpose), group in sorted(groups.items()):
+        if conditioning_roles_of(json.loads(key)) is None:
+            problems.append(f"{purpose} {group[0]['case']}: missing/invalid actual conditioning role counts (legacy metadata is not migrated by guess)")
+            continue
         selection = next((r.get("anchor_selection") for r in group if isinstance(r.get("anchor_selection"), dict)), None)
         if selection is None:
             problems.append(f"{purpose} {group[0]['case']}: no anchor selection recorded")
@@ -576,15 +755,19 @@ def steps_validation(rows):
     phase) — a full-step peak above the short-step one means short captures under-measure."""
     out = []
     anchors = {}
+    def identity(key):
+        fields = key.split("/")
+        # Ignore only steps. A ninth recipe token must never be paired with another recipe's peak.
+        return tuple(fields[:7] + fields[8:])
     for r in rows:
         c = capture_of(r)
         if r.get("purpose") == "optimized" and c:
-            anchors.setdefault("/".join(r["case"].split("/")[:7]), []).append(c)
+            anchors.setdefault(identity(r["case"]), []).append(c)
     for r in rows:
         c = capture_of(r)
         if r.get("purpose") != "validation_steps" or not c:
             continue
-        short = anchors.get("/".join(r["case"].split("/")[:7]))
+        short = anchors.get(identity(r["case"]))
         if not short:
             out.append({"case": r["case"], "problem": "no completed optimized anchor of the same case"})
             continue

@@ -3,7 +3,9 @@
 use super::*;
 use crate::evidence::fixture::capture;
 use crate::evidence::{AnchorOutcome, AnchorSelection, RefusedQuantum, DEVICE_CAPTURE_CLASS};
-use crate::sdxl::tests::{candidate, fixture, DEVICE};
+use crate::sdxl::tests::{
+    admit_fixture_rows as admit_with_rows, candidate, fixture, DEVICE, FIXTURE_BML_BYTES,
+};
 use mlx_gen::gen_core::{MemoryStrategy, Quant};
 use mlx_gen::ios_pricing::IosPhase::{self, *};
 
@@ -17,6 +19,19 @@ fn synthetic(req: &IosPricingRequest<'_>) -> mlx_gen::Result<IosPricing> {
         bytes * u64::from(req.geometry.width) * u64::from(req.geometry.height) / (1024 * 1024)
     };
     let staged = req.selection.strategy != MemoryStrategy::Resident;
+    use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+    assert_eq!(
+        (req.spec.offload_policy, req.spec.load_shape),
+        if staged {
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+            )
+        } else {
+            (OffloadPolicy::Resident, LoadShape::EagerMaterialization)
+        },
+        "anchor re-pricing must use the ANCHOR load form, not the requesting endpoint's"
+    );
     let mut p = IosPricing::default();
     p.take(Conditioning, 600 * MIB, 10 * MIB, "SDXL CLIP layer");
     p.take(
@@ -51,22 +66,15 @@ fn at(
     strategy: MemoryStrategy,
     mode: &str,
 ) -> IosCandidate {
-    let mut c = candidate(registry, root, "sdxl", edge, Some(Quant::Q4), mode);
-    if strategy != c.context.selection.strategy {
-        let IosWork::Generate(request) = c.work.clone() else {
-            unreachable!()
-        };
-        c = build_candidate(
-            registry,
-            crate::sdxl::SDXL_ID,
-            c.spec.clone(),
-            None,
-            strategy,
-            IosWork::Generate(request),
-        )
-        .unwrap();
-    }
-    c
+    let c = candidate(registry, root, "sdxl", edge, Some(Quant::Q4), mode);
+    let mut spec = c.spec.clone();
+    (if strategy == MemoryStrategy::Resident {
+        AnchorKind::Resident
+    } else {
+        AnchorKind::Optimized
+    })
+    .apply_load_form(&mut spec);
+    build_candidate(registry, crate::sdxl::SDXL_ID, spec, None, strategy, c.work).unwrap()
 }
 
 /// The optimized anchor (at the iOS reference geometry, 1024²): three repeats over a 300 MiB
@@ -102,6 +110,7 @@ fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow 
                             priced_scratch_bytes: 400 * MIB,
                             observed_bytes: 200 * MIB,
                             exact: true,
+                            preceding_sampling_mark: None,
                         },
                     );
                     c
@@ -114,7 +123,7 @@ fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow 
 }
 
 fn budget(available_mib: u64) -> MemoryBudget {
-    capacity_budget(64 << 30, 0, Some(available_mib * MIB))
+    capacity_budget(64 << 30, FIXTURE_BML_BYTES, Some(available_mib * MIB))
 }
 
 fn admit_one_of(
@@ -217,6 +226,22 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
                 from: AnchorKind::Optimized
             }
         );
+        // Intermediate legal mechanisms still derive from the optimized endpoint's actual load
+        // form. No extra measurement grid: these are law/admission fixtures over synthetic prices.
+        for strategy in [
+            MemoryStrategy::StagedResidency,
+            MemoryStrategy::BoundedAttention,
+        ] {
+            let intermediate = at(&registry, root.path(), 512, strategy, "text_to_image");
+            let admitted = admit_one_of(&registry, &intermediate, 4096, &rows).unwrap();
+            assert_eq!(
+                admitted.basis(),
+                AdmissionBasis::Derived {
+                    from: AnchorKind::Optimized
+                }
+            );
+            assert_eq!(admitted.context().load_shape, intermediate.spec.load_shape);
+        }
         // Resident (rung 0) at 1024²: the U-Net 2000 resident + 700 + 300 = 3000; the untiled
         // decode is another quantum (κ = 1): 200 + 300 + 1600 = 2100. Demand 3000: upward from the
         // optimized anchor.
@@ -238,9 +263,87 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
     });
 }
 
-/// A component-additive mode (img2img) of the same ARCHITECTURE is derived from the text anchor; a
-/// header-different architecture is another family and never derived; a provider without counted
-/// pricing admits only its anchors' own keys.
+#[test]
+fn matching_sampling_class_derives_without_a_float_grid_and_reprices_the_anchor_recipe() {
+    use mlx_gen::gen_core::CfgBatching;
+    fn context_price(req: &IosPricingRequest<'_>) -> mlx_gen::Result<IosPricing> {
+        let actual = req
+            .generation
+            .expect("actual/faithful generation context is mandatory");
+        let resolved = crate::sdxl::sampling::ResolvedSampling::resolve(actual).unwrap();
+        assert_eq!(resolved.sampler_name(), "euler");
+        assert_eq!(resolved.cfg_batching(), CfgBatching::Batched);
+        assert_eq!(
+            actual.memory.unwrap().cfg_batching,
+            req.execution.cfg_batching
+        );
+        assert_eq!(
+            resolved.guidance(),
+            if req.geometry.width == 1024 {
+                7.0
+            } else {
+                8.25
+            },
+            "price the ANCHOR recipe at anchor geometry, not the request's recipe"
+        );
+        synthetic(req)
+    }
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let make = |edge, guidance| {
+        let c = at(
+            &registry,
+            root.path(),
+            edge,
+            MemoryStrategy::BoundedDecode,
+            "text_to_image",
+        );
+        let IosWork::Generate(mut request) = c.work else {
+            unreachable!()
+        };
+        request.sampler = Some("euler".into());
+        request.guidance = Some(guidance);
+        request.memory.as_mut().unwrap().cfg_batching = Some(CfgBatching::Batched);
+        build_candidate(
+            &registry,
+            crate::sdxl::SDXL_ID,
+            c.spec,
+            None,
+            MemoryStrategy::BoundedDecode,
+            IosWork::Generate(request),
+        )
+        .unwrap()
+    };
+    let anchor = make(1024, 7.0);
+    let request = make(512, 8.25);
+    let rows = [optimized_anchor(&registry, &anchor)];
+    assert_eq!(
+        evidence_key(&registry, &anchor, DEVICE)
+            .unwrap()
+            .family()
+            .unwrap(),
+        evidence_key(&registry, &request, DEVICE)
+            .unwrap()
+            .family()
+            .unwrap()
+    );
+    crate::pricing::with_test_pricing(Some((context_price, phase_of)), || {
+        let admitted = admit_one_of(&registry, &request, 4096, &rows).unwrap();
+        assert_eq!(
+            admitted.basis(),
+            AdmissionBasis::Derived {
+                from: AnchorKind::Optimized
+            }
+        );
+        assert_eq!(
+            admitted.context().selection.strategy,
+            MemoryStrategy::BoundedDecode
+        );
+    });
+}
+
+/// An unproved mode or a header-different architecture is another family and never derived;
+/// a provider without counted pricing admits only its anchors' own keys.
 #[test]
 fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let registry = crate::provider_registry().unwrap();
@@ -261,17 +364,19 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
         "image_to_image",
     );
     priced(|| {
-        let admitted = admit_one_of(&registry, &img2img, 8192, &rows).unwrap();
+        // A synthetic formula is not an accepted actual per-class component-additivity proof.
+        // The unproved reference mode keeps its own two-endpoint family.
         assert_eq!(
-            admitted.basis(),
-            AdmissionBasis::Derived {
-                from: AnchorKind::Optimized
-            }
+            kind(admit_one_of(&registry, &img2img, 8192, &rows)),
+            Some(RefusalKind::NoEvidence)
         );
-        // The anchor is priced as MEASURED (text mode, no encode): the img2img request's extra
-        // encode phase is its formula (1500 resident + 1500 scratch) + the anchor's largest
-        // unpriced overhead (denoise, 700) = 3700 MiB, above every anchored phase.
-        assert_eq!(admitted.demand_bytes(), 3700 * MIB);
+        assert_ne!(
+            evidence_key(&registry, &img2img, DEVICE)
+                .unwrap()
+                .family()
+                .unwrap(),
+            rows[0].key.family().unwrap()
+        );
     });
     // Another architecture (a U-Net with different headers) is another family: never derived.
     let other_root = fixture();
@@ -327,7 +432,12 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     assert_eq!(key.family(), rows[0].key.family());
     priced(|| {
         let admitted = admit_one_of(&registry, &realvis, 8192, &rows).unwrap();
-        assert_eq!(admitted.basis(), AdmissionBasis::Derived { from: AnchorKind::Optimized });
+        assert_eq!(
+            admitted.basis(),
+            AdmissionBasis::Derived {
+                from: AnchorKind::Optimized
+            }
+        );
         assert_eq!(admitted.demand_bytes(), 2500 * MIB);
     });
     // No pricing: the anchor's own key still admits (a measurement needs no scaling) …
@@ -346,8 +456,8 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
             Some(RefusalKind::NoEvidence)
         );
     });
-    // An execution lever outside the ladder (batched CFG; iOS runs SDXL CFG sequentially) is not
-    // derivable either.
+    // Batched CFG is another resolved allocation class: the sequential anchor cannot license it.
+    // A compatible batched anchor is exercised separately above.
     let mut batched = big.clone();
     batched.execution.cfg_batching = Some(mlx_gen::gen_core::CfgBatching::Batched);
     if let IosWork::Generate(r) = &mut batched.work {

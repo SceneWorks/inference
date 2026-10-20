@@ -724,6 +724,7 @@ dependencies = [
  "pmetal-mlx-sys",
  "safetensors",
  "sceneworks-gen-core",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -739,6 +740,7 @@ dependencies = [
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]
@@ -763,6 +765,7 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "serde",
  "serde_json",
 ]
 
@@ -793,6 +796,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "serde",
 ]
 
 [[package]]
@@ -803,6 +807,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
+ "serde",
  "serde_json",
 ]
 

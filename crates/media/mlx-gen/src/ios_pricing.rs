@@ -75,11 +75,188 @@ impl IosPhasePrice {
     }
 }
 
-/// One request's counted price, one entry per phase the request runs (a phase it does not run is
-/// absent — e.g. no `Encode` for text-to-image).
+/// Actual operands of ONE coincident binding/epoch/window. Zero fields mean not applicable only
+/// when the provider supplied this basis; `None` on a window is unverified, never inferred fixed.
+/// No generic area exponent or independent maxima are applied to these operands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IosWorkBasis {
+    pub forward_rows: u64,
+    pub token_count: u64,
+    pub model_width: u32,
+    pub model_height: u32,
+    pub source_plane_bytes: u64,
+    pub processed_plane_bytes: u64,
+    pub output_plane_bytes: u64,
+    pub patch_width: u32,
+    pub patch_height: u32,
+}
+
+/// One potentially binding physical-liveness domain. Counts are source-owned ledgers, NOT an
+/// automatic physical bound or subtractable lower bound. Only a provider's `IosBounder` supplies
+/// a certified transfer/full-physical bound. Equal labels/counts/classes alone prove nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosWindowPrice {
+    pub phase: IosPhase,
+    /// Stable semantic binding/epoch/window class, not an invocation number. Legacy `take` is None.
+    pub class: Option<String>,
+    pub label: String,
+    /// Structural resident components at this same point.
+    pub resident_bytes: u64,
+    /// Coincident ambient held owners, excluding storage already counted in resident/scratch.
+    pub held_bytes: u64,
+    /// The guarded operation's counted live-input/workspace upper, not a physical measurement.
+    pub scratch_bytes: u64,
+    pub basis: Option<IosWorkBasis>,
+    /// Source storage/liveness provenance domain, NOT a human signoff or proof-by-string.
+    pub owner_domain: String,
+}
+
+impl IosWindowPrice {
+    pub fn logical_peak_bytes(&self) -> u64 {
+        self.resident_bytes
+            .saturating_add(self.held_bytes)
+            .saturating_add(self.scratch_bytes)
+    }
+    pub fn profile_class(&self) -> Option<&str> {
+        self.class.as_deref().filter(|class| {
+            !class.is_empty() && self.basis.is_some() && !self.owner_domain.is_empty()
+        })
+    }
+}
+
+/// Bounded ACTUAL metadata/check facts attached by the catalog to ANCHOR pricing only. Providers
+/// map their real observed callback/window domains; no planned logical replay belongs here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosObservedMetadata {
+    pub provider: String,
+    pub kind: String,
+    pub fields: std::collections::BTreeMap<String, u64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosObservedCheck {
+    pub phase: Option<IosPhase>,
+    pub label: String,
+    /// Last actual mark of each producer/kind at this check; indices address `metadata`.
+    /// Co-occurrence/epoch correspondence is proved by provider CODE, not a generic string match.
+    pub context: Vec<u32>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IosAnchorObservation {
+    pub domain: IosMemoryDomain,
+    pub coordinate: IosMemoryCoordinate,
+    pub baseline_bytes: u64,
+    pub metadata: Vec<IosObservedMetadata>,
+    pub checks: Vec<IosObservedCheck>,
+    /// A gap invalidates phase attribution; the law uses the whole-run kernel upper instead.
+    pub telemetry_complete: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosAnchorWitness {
+    pub capture: u32,
+    pub check: u32,
+}
+
+/// Memory-counter domain of a certificate/measurement. Native allocator proofs do not include
+/// Rust/host/process allocator/driver demand and MUST NOT authorize process-growth admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IosMemoryDomain {
+    Unspecified,
+    ProcessGrowth,
+    NativeAllocatorGrowth,
+    NativeAllocatorAbsolute,
+}
+impl Default for IosMemoryDomain {
+    fn default() -> Self {
+        Self::Unspecified
+    }
+}
+
+/// Baseline coordinate is part of the certificate, not an implicit zero/foreign-inventory credit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IosMemoryCoordinate {
+    Unspecified,
+    Absolute,
+    BeforeRequestConstruction,
+    BeforeModelLoad,
+    WindowEntry,
+}
+impl Default for IosMemoryCoordinate {
+    fn default() -> Self {
+        Self::Unspecified
+    }
+}
+
+/// A provider-certified correspondence candidate. The signed upper must hold at EVERY matched
+/// instant covered by its classes, not be a difference of independently maximized logical uppers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosAnchorCandidate {
+    pub anchor_class: String,
+    pub delta_growth_upper: i128,
+    /// Optional SOURCE-PROVED co-resident growth lower bound in the anchor's baseline domain.
+    /// None is not a zero-baseline assumption: it means this transfer does not subtract such a
+    /// bound. A logical resident/scratch upper must never be supplied as this lower bound.
+    pub physical_anchor_lower_bound: Option<u64>,
+    /// Actual check/metadata witnesses in `anchor_pricing.observations`. Provider CODE validates
+    /// their source epoch/window correspondence; the consumer checks existence/label/context.
+    pub witnesses: Vec<IosAnchorWitness>,
+}
+
+/// Returned only by source-owned proof callbacks. Each record covers the WHOLE request class;
+/// every plausible anchor correspondence belongs in `anchor_candidates` (the law takes MAX).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IosWindowBound {
+    Transfer {
+        domain: IosMemoryDomain,
+        coordinate: IosMemoryCoordinate,
+        request_class: String,
+        anchor_candidates: Vec<IosAnchorCandidate>,
+    },
+    /// COMPLETE unmargined growth upper in the named domain. ProcessGrowth includes co-residency,
+    /// host, allocator/cache and workspace. Native-only certificates never authorize process use.
+    /// A raw guard scratch or logical upper sum alone is NOT this certificate.
+    RawPhysical {
+        domain: IosMemoryDomain,
+        coordinate: IosMemoryCoordinate,
+        request_class: String,
+        growth_upper: u64,
+    },
+}
+
+/// Proof authority remains provider CODE using actual contexts/ledgers/bases. No backend dependency
+/// is introduced here, and no class string/numeric equality is accepted as a transfer proof.
+pub type IosBounder = fn(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> crate::Result<Vec<IosWindowBound>>;
+
+/// Actual boundary snapshot, supplied by SDK/capture/test caller at the declared point, NEVER
+/// read at an arbitrary time by a pure pricing/normalization helper. Bytes alone do not prove
+/// inventory cancellation; provider code must validate source-compatible owner/birth facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosMemoryBaseline {
+    pub domain: IosMemoryDomain,
+    pub coordinate: IosMemoryCoordinate,
+    pub bytes: u64,
+    /// Actual counter/query method and boundary provenance, not a human approval marker.
+    pub source: String,
+}
+
+/// Every potentially binding candidate plus a backwards-compatible phase winner summary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IosPricing {
     pub phases: Vec<IosPhasePrice>,
+    pub windows: Vec<IosWindowPrice>,
+    /// Bounded actual capture witnesses, attached by catalog/CPU capture code to ANCHOR pricing.
+    /// Analytic providers leave this empty; pure planned replay must never populate it.
+    pub observations: Vec<IosAnchorObservation>,
+    /// Real REQUEST boundary fact. Anchor baselines remain per-capture in `observations` so
+    /// differing repeat baselines are never collapsed into a fabricated single zero/value.
+    pub request_baseline: Option<IosMemoryBaseline>,
+    /// Actual execution facts for phases that do not run (e.g. no init encode / zero denoise).
+    /// Never fill this automatically just because an expected window was forgotten.
+    pub absent_phases: std::collections::BTreeMap<IosPhase, String>,
 }
 
 impl IosPricing {
@@ -100,6 +277,42 @@ impl IosPricing {
     /// Fold one quantum into its phase, keeping the phase's worst (largest resident + scratch)
     /// quantum. Providers build their pricing with this so a phase is always its worst quantum.
     pub fn take(&mut self, phase: IosPhase, resident_bytes: u64, scratch_bytes: u64, label: &str) {
+        self.windows.push(IosWindowPrice {
+            phase,
+            class: None,
+            label: label.into(),
+            resident_bytes,
+            held_bytes: 0,
+            scratch_bytes,
+            basis: None,
+            owner_domain: String::new(),
+        });
+        self.take_summary(phase, resident_bytes, scratch_bytes, label);
+    }
+
+    /// Preserve the WHOLE candidate before reducing the compatibility summary. Held owners are
+    /// folded into the summary's resident bucket; guard scratch retains its original meaning.
+    pub fn take_window(&mut self, window: IosWindowPrice) {
+        self.take_summary(
+            window.phase,
+            window.resident_bytes.saturating_add(window.held_bytes),
+            window.scratch_bytes,
+            &window.label,
+        );
+        self.windows.push(window);
+    }
+
+    pub fn phase_not_run(&mut self, phase: IosPhase, reason: &str) {
+        self.absent_phases.insert(phase, reason.into());
+    }
+
+    fn take_summary(
+        &mut self,
+        phase: IosPhase,
+        resident_bytes: u64,
+        scratch_bytes: u64,
+        label: &str,
+    ) {
         let candidate = IosPhasePrice {
             phase,
             resident_bytes,
@@ -129,9 +342,34 @@ pub struct IosPricingRequest<'a> {
     pub geometry: MemoryGeometry,
     pub selection: &'a MemorySelection,
     pub execution: &'a GenerationMemory,
+    /// Actual post-caller-policy request, or a faithful capture replay. Dynamic sampling providers
+    /// must reject missing context; header/default diagnostics construct an explicit request.
+    /// Fixed-provider laws may omit it only when their price genuinely does not depend on it.
+    pub generation: Option<&'a crate::gen_core::GenerationRequest>,
+    /// Actual transform request when transform controls affect host/tensor liveness. Mutually
+    /// exclusive with `generation`; fixed-provider diagnostics may omit both only explicitly.
+    pub transform: Option<&'a crate::gen_core::TransformRequest>,
+    /// Actual Iris depth request, including original source and resolution projection.
+    pub depth: Option<&'a crate::gen_core::iris::depth::DepthRequest>,
     /// Encoded text window in tokens where it is request-dependent (SDXL CLIP windows x 77); 0
     /// where the provider pads to a fixed, artifact-determined window.
     pub token_window: u32,
+}
+
+impl IosPricingRequest<'_> {
+    /// Context carriers are mutually exclusive. Absence is permitted only for explicitly fixed
+    /// diagnostic laws; dynamic providers separately require their actual matching request.
+    pub fn validate_work_context(&self) -> crate::Result<()> {
+        let count = u8::from(self.generation.is_some())
+            + u8::from(self.transform.is_some())
+            + u8::from(self.depth.is_some());
+        if count > 1 {
+            return Err(crate::Error::Unsupported(
+                "iOS pricing work contexts are mutually exclusive".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A provider's pricing entry point.

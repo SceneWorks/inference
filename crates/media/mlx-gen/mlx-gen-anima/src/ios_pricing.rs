@@ -22,7 +22,7 @@ use mlx_gen::gen_core::weightsmeta::{Dtype as StoredDtype, SafetensorsTensorHead
 use mlx_gen::gen_core::{
     adapter_stack_resident_bytes, AdapterResidencyMode, GenerationMemory, LoadSpec, MemoryMode,
 };
-use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest, IosWindowPrice, IosWorkBasis};
 use mlx_gen::ios_quantum::{dtype_bytes, sampler_step_bytes, tensor_bytes, Backend};
 use mlx_gen::sampler::SAMPLER_STEP_QUANTUM;
 use mlx_gen::weights::Weights;
@@ -97,11 +97,56 @@ pub(crate) struct PricedQuantum {
     pub(crate) label: &'static str,
     pub(crate) resident_bytes: u64,
     pub(crate) scratch_bytes: u64,
+    pub(crate) window: IosWindowPrice,
 }
 
 /// The [`mlx_gen::ios_pricing::IosPricer`] for `anima_turbo` (and the other Anima variants, which
 /// share the architecture): read the load's headers and price the request's phases.
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
+    req.validate_work_context()?;
+    let generation = mlx_gen::sampler::flow_sampling::require_generation(req.generation)?;
+    let variant = Variant::from_id(req.provider)
+        .ok_or_else(|| Error::Unsupported(format!("{}: not an Anima provider", req.provider)))?;
+    let sampling = if variant == Variant::Turbo {
+        Some(crate::sampling::resolve(generation)?)
+    } else {
+        None
+    };
+    price_request_controls(req, generation.count, sampling)
+}
+
+/// Explicit payload-free anchor replay: no media or GenerationRequest is constructed. Typed
+/// mode/geometry/load and the separately supplied serial count remain enclosing case facts.
+pub fn ios_pricing_with_token(
+    req: &IosPricingRequest<'_>,
+    token: &str,
+    count: u32,
+) -> Result<IosPricing> {
+    req.validate_work_context()?;
+    if req.provider != Variant::Turbo.id() {
+        return Err(Error::Unsupported(
+            "Anima captured FLOW recipe requires the Turbo provider".into(),
+        ));
+    }
+    let recipe = mlx_gen::sampler::flow_sampling::FlowSamplingRecipe::from_token(token)?;
+    let controls = mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(
+        &recipe,
+        crate::sampling::defaults(),
+        mlx_gen::TimestepConvention::Sigma,
+    )?;
+    price_request_controls(req, count, Some(controls))
+}
+
+fn price_request_controls(
+    req: &IosPricingRequest<'_>,
+    count: u32,
+    sampling: Option<mlx_gen::sampler::flow_sampling::ResolvedFlowControls>,
+) -> Result<IosPricing> {
+    if count == 0 {
+        return Err(Error::Unsupported(
+            "pricing requires a positive serial output count".into(),
+        ));
+    }
     let variant = Variant::from_id(req.provider)
         .ok_or_else(|| Error::Unsupported(format!("{}: not an Anima provider", req.provider)))?;
     if !matches!(req.mode, MemoryMode::TextToImage) || req.geometry.reference_count != 0 {
@@ -121,13 +166,147 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
     let work = AnimaPricingWork {
         width: req.geometry.width,
         height: req.geometry.height,
-        count: req.geometry.batch.max(1),
+        count: count.max(1),
         qwen_tokens: tokens,
         t5_tokens: tokens,
         // A physical iOS device runs the Metal kernels.
         backend: Backend::Metal,
     };
-    Ok(fold(&price_quanta(&facts, work, req.execution)?))
+    let quanta = price_quanta(&facts, work, req.execution)?;
+    let mut pricing = IosPricing::default();
+    if let Some(sampling) = sampling {
+        let elements = u64::from(work.width / crate::config::VAE_COMPRESSION as u32)
+            * u64::from(work.height / crate::config::VAE_COMPRESSION as u32)
+            * crate::config::VAE_CHANNELS as u64;
+        let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
+            sampling.solver(),
+            sampling.convention(),
+            elements,
+            4,
+            4,
+        )?;
+        let host_schedule = sampling.host_schedule_bytes()?;
+        for quantum in &quanta {
+            let callback_body = matches!(
+                quantum.label,
+                DIT_EMBED_QUANTUM | DIT_BLOCK_QUANTUM | DIT_OUTPUT_QUANTUM | SAMPLER_STEP_QUANTUM
+            );
+            if callback_body {
+                for callback in &callbacks {
+                    let mut window = quantum.window.clone();
+                    window.class = Some(format!(
+                        "{}/{}/{}",
+                        window.class.as_deref().unwrap(),
+                        sampling.allocation_class(),
+                        callback.family()
+                    ));
+                    // Coincident callback ownership, not a difference of independent maxima.
+                    // The latent's F32 caller handle stays alive across the BF16 DiT forward.
+                    let caller_input = if quantum.label == SAMPLER_STEP_QUANTUM {
+                        0
+                    } else {
+                        callback.state_bytes
+                    };
+                    window.held_bytes = window
+                        .held_bytes
+                        .saturating_add(callback.callback_outer_bytes)
+                        .saturating_add(caller_input)
+                        .saturating_add(host_schedule);
+                    pricing.take_window(window);
+                }
+                if quantum.label == SAMPLER_STEP_QUANTUM {
+                    let mut final_window = quantum.window.clone();
+                    final_window.class = Some(format!(
+                        "{}/{}/solve-complete",
+                        final_window.class.as_deref().unwrap(),
+                        sampling.allocation_class()
+                    ));
+                    final_window.held_bytes = final_window.held_bytes.saturating_add(host_schedule);
+                    pricing.take_window(final_window);
+                }
+            } else {
+                pricing.take_window(quantum.window.clone());
+            }
+        }
+    } else {
+        pricing = fold(&quanta);
+    }
+    pricing.phase_not_run(IosPhase::Encode, "Anima serves text-to-image only");
+    Ok(pricing)
+}
+
+/// Actual configured Anima-Turbo adapter graph, using only validated headers and the bounded
+/// alpha-control exception. Convert-at-install packing is read from the artifact, not guessed
+/// from advisory spec.quantize. No media, model, Array, factor payload or continuous value is used.
+pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::Value> {
+    use mlx_gen::adapters::facts::{linear_header_facts, native_header_dtype};
+    use mlx_gen::gen_core::weightsmeta as wm;
+    crate::model::validate_load_precision(spec, Variant::Turbo.id())?;
+    let root = crate::loader::resolve_split_files(&spec.weights)?;
+    let file = root
+        .join("diffusion_models")
+        .join(Variant::Turbo.dit_filename());
+    let headers = wm::safetensors_path_tensor_headers(&file).map_err(Error::from)?;
+    for header in &headers {
+        native_header_dtype(header.dtype)?;
+    }
+    let prefix = headers
+        .iter()
+        .find_map(|header| header.name.strip_suffix(PREFIX_ANCHOR))
+        .ok_or_else(|| Error::Msg("Anima adapter facts: DiT root prefix not found".into()))?
+        .to_owned();
+    let headers = headers
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let (dit, conditioner, _) = crate::loader::model_configs();
+    let paths = |globals| {
+        let mut paths = crate::transformer::adapter_target_paths(dit.num_layers, globals);
+        paths.extend(
+            crate::conditioner::adapter_target_paths(conditioner.num_layers, globals)
+                .into_iter()
+                .map(|path| format!("llm_adapter.{path}")),
+        );
+        paths
+    };
+    let kohya = paths(false);
+    let mut projections = std::collections::BTreeMap::new();
+    for path in paths(true) {
+        let base = format!("{prefix}.{path}");
+        projections.insert(
+            path,
+            linear_header_facts(&headers, &base, mlx_gen::quant::DEFAULT_GROUP_SIZE, None)?,
+        );
+    }
+    let adapters = mlx_gen::adapters::loader::configured_adapter_semantic_facts(
+        &spec.adapters,
+        &kohya,
+        mlx_gen::adapters::DEFAULT_LYCORIS_DTYPE,
+        |path| {
+            let mut segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+            let index = if segments.first().is_some_and(|s| s == "blocks") {
+                Some(1)
+            } else if segments.first().is_some_and(|s| s == "llm_adapter")
+                && segments.get(1).is_some_and(|s| s == "blocks")
+            {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(index) = index {
+                let Some(value) = segments.get(index).and_then(|s| s.parse::<usize>().ok()) else {
+                    return Ok(None);
+                };
+                segments[index] = value.to_string();
+            }
+            let canonical = segments.join(".");
+            Ok(projections
+                .get(&canonical)
+                .cloned()
+                .map(|facts| (canonical, facts)))
+        },
+    )?;
+    Ok(serde_json::json!({"schema":"anima_configured_overlay_semantics_v1","adapters":adapters}))
 }
 
 /// The phase every quantum label this route emits runs in — this crate's own labels, the shared
@@ -186,7 +365,7 @@ pub(crate) fn snapshot_facts(spec: &LoadSpec, variant: Variant) -> Result<AnimaP
 pub(crate) fn fold(quanta: &[PricedQuantum]) -> IosPricing {
     let mut pricing = IosPricing::default();
     for q in quanta {
-        pricing.take(q.phase, q.resident_bytes, q.scratch_bytes, q.label);
+        pricing.take_window(q.window.clone());
     }
     pricing
 }
@@ -385,15 +564,145 @@ pub(crate) fn price_quanta(
     };
 
     let mut out = Vec::new();
-    let mut push = |phase, label, resident_bytes, scratch_bytes| {
+    let mut points = std::collections::BTreeMap::<&str, usize>::new();
+    let mut push = |phase: IosPhase,
+                    label: &'static str,
+                    resident_bytes: u64,
+                    scratch_bytes: u64| {
+        let point = points.entry(label).or_default();
+        let structural = match phase {
+            IosPhase::Load => match label {
+                TEXT_LOAD_QUANTUM => 0,
+                HEAVY_LOAD_QUANTUM => {
+                    if staged {
+                        0
+                    } else {
+                        te_bytes
+                    }
+                }
+                VAE_LOAD_QUANTUM => heavy_floor + if staged { 0 } else { te_bytes },
+                _ => 0,
+            },
+            IosPhase::Conditioning => conditioning,
+            IosPhase::Denoise => {
+                if staged {
+                    heavy_resident
+                } else {
+                    te_bytes + heavy_resident
+                }
+            }
+            IosPhase::Decode => {
+                if staged {
+                    vae_resident
+                } else {
+                    te_bytes + heavy_resident
+                }
+            }
+            IosPhase::Encode => 0,
+        };
+        let callback = matches!(
+            label,
+            DIT_EMBED_QUANTUM | DIT_BLOCK_QUANTUM | DIT_OUTPUT_QUANTUM | SAMPLER_STEP_QUANTUM
+        );
+        let mut held = if phase == IosPhase::Denoise {
+            if callback {
+                // All completed serial outputs precede the last serial callback; count is never
+                // forward rows. The initial noise remains borrowed throughout denoise_loop.
+                cond_inputs + cond_outputs + (count - 1) * latent_bytes + latent_bytes
+            } else if label == LATENTS_QUANTUM {
+                cond_inputs + cond_outputs // the guarded array list owns all final latents
+            } else {
+                // Conditioner runs before ANY output noise/latent exists.
+                cond_inputs
+                    + if facts.uses_cfg {
+                        cond_outputs / prompts
+                    } else {
+                        0
+                    }
+            }
+        } else if phase == IosPhase::Decode {
+            // The denoise closure's conditioning owners have dropped before decode. RGB images
+            // from preceding serial decodes remain in the returned host vector.
+            latents
+                + if label == DECODE_HEAD_QUANTUM {
+                    0
+                } else {
+                    decode_carried
+                }
+                + (count - 1) * 3 * u64::from(work.width) * u64::from(work.height)
+        } else {
+            resident_bytes.saturating_sub(structural) // split this SAME source sum, not maxima
+        };
+        if matches!(label, TE_LAYER_QUANTUM | TE_NORM_QUANTUM) {
+            held = held
+                .saturating_add(2 * tensor_bytes(4, &[s, qwen_cfg.head_dim as u64]))
+                .saturating_add(tensor_bytes(te_width, &[1, s, s]));
+        }
+        if matches!(
+            label,
+            CONDITIONER_BLOCK_QUANTUM | CONDITIONER_OUTPUT_QUANTUM
+        ) {
+            held = held.saturating_add(2 * tensor_bytes(4, &[s + st, cond_cfg.head_dim() as u64]));
+        }
+        if label == DIT_BLOCK_QUANTUM {
+            held = held
+                .saturating_add(
+                    2 * tensor_bytes(4, &[image_tokens, dit_cfg.attention_head_dim as u64]),
+                )
+                .saturating_add(2 * tensor_bytes(dit_width, &[1, dit_cfg.hidden_size() as u64]));
+        }
+        let text = matches!(phase, IosPhase::Conditioning)
+            || matches!(
+                label,
+                CONDITIONER_EMBED_QUANTUM | CONDITIONER_BLOCK_QUANTUM | CONDITIONER_OUTPUT_QUANTUM
+            );
+        let basis = IosWorkBasis {
+            forward_rows: if phase == IosPhase::Load { 0 } else { 1 },
+            token_count: if text {
+                s
+            } else if phase == IosPhase::Denoise {
+                image_tokens
+            } else {
+                0
+            },
+            model_width: work.width,
+            model_height: work.height,
+            output_plane_bytes: 3 * u64::from(work.width) * u64::from(work.height),
+            patch_width: if phase == IosPhase::Denoise {
+                pw as u32
+            } else {
+                0
+            },
+            patch_height: if phase == IosPhase::Denoise {
+                ph as u32
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        let window = IosWindowPrice {
+            phase,
+            class: Some(format!(
+                "anima/{}/{label}/source-op-{}",
+                phase.as_key(),
+                *point
+            )),
+            label: label.into(),
+            resident_bytes: structural,
+            held_bytes: held,
+            scratch_bytes,
+            basis: Some(basis),
+            owner_domain: "anima/source-logical-owners-v1".into(),
+        };
+        *point += 1;
         out.push(PricedQuantum {
             phase,
             label,
             resident_bytes,
             scratch_bytes,
+            window,
         })
     };
-    let max = |it: &mut dyn Iterator<Item = u64>| it.max().unwrap_or(0);
     use IosPhase::{Conditioning, Decode, Denoise, Load};
 
     // Loads, in the order the residency drives them.
@@ -406,12 +715,14 @@ pub(crate) fn price_quanta(
             conditioning,
             te.embed_body_bytes(1, s_i),
         );
-        push(
-            Conditioning,
-            TE_LAYER_QUANTUM,
-            conditioning,
-            max(&mut (0..te.num_layers()).map(|i| te.layer(i, 1, s_i, te_stream, work.backend).1)),
-        );
+        for i in 0..te.num_layers() {
+            push(
+                Conditioning,
+                TE_LAYER_QUANTUM,
+                conditioning,
+                te.layer(i, 1, s_i, te_stream, work.backend).1,
+            );
+        }
         push(
             Conditioning,
             TE_NORM_QUANTUM,
@@ -437,15 +748,14 @@ pub(crate) fn price_quanta(
         cond.embed_body_bytes(1, st_i, s_i, te_stream)
             .saturating_add(AnimaTextConditioner::mask_multiply_bytes_for(s * source)),
     );
-    push(
-        Denoise,
-        CONDITIONER_BLOCK_QUANTUM,
-        denoise,
-        max(&mut cond
-            .blocks()
-            .iter()
-            .map(|b| b.quantum_scratch(1, st_i, s_i, cond_stream, work.backend))),
-    );
+    for block in cond.blocks() {
+        push(
+            Denoise,
+            CONDITIONER_BLOCK_QUANTUM,
+            denoise,
+            block.quantum_scratch(1, st_i, s_i, cond_stream, work.backend),
+        );
+    }
     push(
         Denoise,
         CONDITIONER_OUTPUT_QUANTUM,
@@ -459,12 +769,12 @@ pub(crate) fn price_quanta(
         dit.embed_quantum_scratch_for(&latent_shape, crate::pipeline::DIT_DTYPE),
     );
     let context = cond_cfg.min_sequence_length as i32;
-    push(
-        Denoise,
-        DIT_BLOCK_QUANTUM,
-        denoise,
-        max(&mut dit.blocks().iter().enumerate().map(|(i, b)| {
-            b.quantum_scratch(
+    for (i, block) in dit.blocks().iter().enumerate() {
+        push(
+            Denoise,
+            DIT_BLOCK_QUANTUM,
+            denoise,
+            block.quantum_scratch(
                 1,
                 image_tokens as i32,
                 context,
@@ -472,9 +782,9 @@ pub(crate) fn price_quanta(
                 dit_stream,
                 if windowed { block_read(i) } else { 0 },
                 work.backend,
-            )
-        })),
-    );
+            ),
+        );
+    }
     push(
         Denoise,
         DIT_OUTPUT_QUANTUM,

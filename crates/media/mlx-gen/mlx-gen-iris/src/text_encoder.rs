@@ -694,6 +694,8 @@ impl IrisTextEncoder {
         cfg: &TextEncoderConfig,
         quant: Option<Quant>,
     ) -> Result<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        crate::anchor_tests::record_generation_loader_entry("tower");
         let model_cfg = checked_config(dir, cfg)?;
         let untied_head = !model_cfg.tie_word_embeddings;
         let files = present_shards(dir, untied_head)?;
@@ -766,6 +768,8 @@ impl IrisTextEncoder {
         cfg: &TextEncoderConfig,
         quant: Option<Quant>,
     ) -> Result<Self> {
+        #[cfg(all(test, target_os = "macos"))]
+        crate::anchor_tests::record_generation_loader_entry("tower");
         let model_cfg = checked_config(dir, cfg)?;
         let files = present_shards(dir, !model_cfg.tie_word_embeddings)?;
         let stored_quant = match model_cfg.quantization {
@@ -881,6 +885,50 @@ impl IrisTextEncoder {
     /// Whether the decoder layers are streamed by window (rung 4) rather than resident.
     pub fn is_streamed(&self) -> bool {
         matches!(self.tower, Tower::Streamed(_))
+    }
+
+    /// Inspect actual decoder parameter ownership, including every resident layer group.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn assert_endpoint_ownership(&self, streamed: bool) {
+        assert_eq!(self.is_streamed(), streamed, "tower stream state");
+        match &self.tower {
+            Tower::Resident(lm) => {
+                let groups = lm.param_groups();
+                assert_eq!(
+                    groups.len(),
+                    lm.config().num_layers + 1,
+                    "resident tower must own outside parameters and every decoder layer"
+                );
+                assert!(
+                    groups
+                        .iter()
+                        .all(|group| !group.is_empty()
+                            && group.iter().all(|array| array.nbytes() > 0)),
+                    "resident tower contains an empty parameter group"
+                );
+            }
+            Tower::Streamed(tower) => {
+                assert_eq!(tower.reads.len(), tower.cfg.num_layers);
+                assert!(
+                    tower.embed.nbytes() > 0 && tower.norm.nbytes() > 0,
+                    "streamed tower must own its embedding and final norm"
+                );
+            }
+        }
+        let _addresses = self.endpoint_parameter_addresses();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_parameter_addresses(&self) -> Vec<usize> {
+        match &self.tower {
+            Tower::Resident(lm) => {
+                let groups = lm.param_groups();
+                crate::anchor_tests::materialized_addresses(groups.iter().flatten())
+            }
+            Tower::Streamed(tower) => {
+                crate::anchor_tests::materialized_addresses([&tower.embed, &tower.norm])
+            }
+        }
     }
 
     /// The streamed tower (test builds: the read proofs read layers from it).
@@ -1228,7 +1276,7 @@ impl IrisTextEncoder {
         layer_window: Option<usize>,
         cancel: &mlx_gen::CancelFlag,
     ) -> Result<TextConditioning> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let states = match &self.tower {
             Tower::Resident(lm) => self.resident_states(lm, window)?,
             Tower::Streamed(tower) => self.streamed_states(tower, window, layer_window, cancel)?,

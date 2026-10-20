@@ -13,6 +13,8 @@ use mlx_gen::Result;
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
 
+pub(crate) const QUANTIZATION_LINEAR_PATHS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+
 pub struct VaeAttention {
     gn_w: Array,
     gn_b: Array,
@@ -45,10 +47,10 @@ impl VaeAttention {
         Ok(Self {
             gn_w: g("group_norm.weight")?,
             gn_b: g("group_norm.bias")?,
-            q: lin("to_q")?,
-            k: lin("to_k")?,
-            v: lin("to_v")?,
-            out: lin("to_out.0")?,
+            q: lin(QUANTIZATION_LINEAR_PATHS[0])?,
+            k: lin(QUANTIZATION_LINEAR_PATHS[1])?,
+            v: lin(QUANTIZATION_LINEAR_PATHS[2])?,
+            out: lin(QUANTIZATION_LINEAR_PATHS[3])?,
             label: labels.attention,
         })
     }

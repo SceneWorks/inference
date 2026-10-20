@@ -148,14 +148,20 @@ one anchor per (model, tier, lane, VARIANT/decoder), keyed on what actually shap
   architecture share anchors; any header difference (a distilled U-Net, another VAE, other dense
   dtypes) is its own family automatically. The per-checkpoint artifact `layout_sha256` stays in
   the key: an anchor's own key is exact; any other request of the family is derived.
-* **Variant**: `base` for every mode the provider has PROVEN component-additive on its CPU
-  fixtures (`mlx_gen::ios_anchor_law::measure_phases` + `derive`: the measured mode peak never
-  exceeds the peak derived from the text-mode run) — img2img/reference/mask, ControlNet,
-  IP-Adapter, Z-Image control, prompt batches — so those requests derive from the family's TEXT
-  anchor: `C_req` re-adds the mode's resident components and its extra phase (the VAE /
-  control-hint encode) is priced by its guarded counted formula plus the anchor's largest
-  unpriced overhead. A mode whose proof fails is listed explicitly by its provider
-  (`IOS_NON_ADDITIVE_MODES`) and is its own family. <!-- NONADDITIVE -->
+* **Variant**: actual source role/mechanism family plus its resolved sampling class and
+  configured overlay identity. Unproved reference/init, control+reference, mask/edit and IP
+  graphs do not borrow text/control-only evidence. Role-identical aliases may share a family;
+  the existing raw `reference_count` remains aggregate image geometry (including Mask/Control).
+  Typed mask/control subcounts partition that aggregate only in the validated source-known
+  carrier set; true Reference roles are counted separately when the actual carrier exists.
+  Exact raw counts remain binding/pricing inputs, not an arbitrary measured-count grid.
+  Only a source-certified correlated additivity domain can permit further sharing. Legacy
+  `derive` fixtures, logical scratch sums, and `IOS_NON_ADDITIVE_MODES` are not that proof;
+  `Uncertified` is not capability completion. SDXL validates its actual sampler first, then
+  applies the runtime's IP predicate to configured IP + Reference with no mask/control/acceleration.
+  Its current earlier accel+Reference refusal remains a refusal, not an invented accepted INIT
+  family. Reference strength overrides global strength; Control uses each conditioning scale,
+  not the ignored top-level `control_scale`. <!-- NONADDITIVE -->
 
 Per family at most two anchors (`evidence/ios_device_evidence.json`, schema 3):
 

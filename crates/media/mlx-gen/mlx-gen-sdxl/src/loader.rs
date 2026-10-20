@@ -508,6 +508,22 @@ pub(crate) const IP_ADAPTER_WEIGHT_FILES: [&str; 2] = [
     "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
 ];
 
+/// The actual configured IP source selector, shared with header-only semantic normalization.
+/// Returning paths is local loader plumbing; the exported semantic facts never serialize them.
+pub(crate) fn resolve_ip_adapter_files(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let weights = IP_ADAPTER_WEIGHT_FILES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
+                dir.display(),
+            ))
+        })?;
+    Ok((dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE), weights))
+}
+
 /// Load the **IP-Adapter** (sc-3059) from an `h94/IP-Adapter`-layout snapshot directory: the ViT-H
 /// image encoder at `models/image_encoder/model.safetensors` and the IP weights (Resampler +
 /// decoupled-attn K/V pairs) at `sdxl_models/ip-adapter-plus[-face]_sdxl_vit-h.safetensors`
@@ -556,16 +572,7 @@ pub(crate) fn load_ip_adapter_with(
     enc_w.materialize_accessed()?;
     drop(enc_sources);
 
-    let ip_file = IP_ADAPTER_WEIGHT_FILES
-        .iter()
-        .map(|f| dir.join(f))
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            Error::Msg(format!(
-                "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
-                dir.display()
-            ))
-        })?;
+    let (_, ip_file) = resolve_ip_adapter_files(dir)?;
     before_cast_for_load(
         crate::quantum::IP_ADAPTER_LOAD,
         std::slice::from_ref(&ip_file),

@@ -23,7 +23,7 @@
 //! row-slicing the packed triple `[lo:hi]` on load is byte-identical to the load-time split-then-
 //! quantize the dense path runs.
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
@@ -36,35 +36,102 @@ use mlx_gen::Result;
 /// builds its components straight from lazy file arrays. Forcing the packed triple right away bounds
 /// the dense transient to one projection. An already-packed base is left untouched (never read), as
 /// [`AdaptableLinear::quantize`] leaves it, so a streamed pre-packed trunk stays lazy.
+///
+/// Inside [`guarded_load_quantize`] (the heavy bundle's load-time pack: the U-Net with its installed
+/// IP K/V pairs, the ControlNet branches) each projection's pack is a checked iOS load quantum
+/// ([`crate::quantum::LOAD_QUANTIZE`], epic 16774), priced by [`quantize_bytes`].
 pub(crate) fn quantize_linear(linear: &mut AdaptableLinear, bits: i32) -> Result<()> {
-    if linear.quantized_params().is_some() {
+    let Some((weight, bias)) = linear.dense_weight() else {
         return Ok(());
-    }
-    if LAZY_QUANTIZE.with(std::cell::Cell::get) {
-        return linear.quantize(bits, None);
+    };
+    let bytes = quantize_bytes(weight, bias, bits);
+    // Actual borrowed owner observations. These page-rounded logical payload sums never
+    // establish unique backing or a physical credit.
+    let payload =
+        |array: &Array| mlx_gen::ios_quantum::allocated_bytes(crate::quantum::bytes(array));
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sdxl",
+        "quantize-linear-before",
+        &[
+            ("schema", 1),
+            ("elements", weight.size() as u64),
+            ("bits", bits.max(0) as u64),
+            ("logical_bytes", payload(weight) + bias.map_or(0, payload)),
+            ("budget", bytes),
+            ("physical_certificate", 0),
+        ],
+    );
+    if GUARDED_LOAD_QUANTIZE.with(std::cell::Cell::get) {
+        mlx_gen::ios_quantum::before(crate::quantum::LOAD_QUANTIZE, bytes)?;
     }
     linear.materialize_weights()?;
     linear.quantize(bits, None)?;
-    linear.materialize_weights()
+    linear.materialize_weights()?;
+    if let Some((codes, scales, offsets, bias, _, packed_bits)) = linear.quantized_params() {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "quantize-linear-after",
+            &[
+                ("schema", 1),
+                ("bits", packed_bits.max(0) as u64),
+                (
+                    "logical_bytes",
+                    payload(codes) + payload(scales) + payload(offsets) + bias.map_or(0, payload),
+                ),
+                ("physical_certificate", 0),
+            ],
+        );
+    }
+    Ok(())
+}
+
+/// The transient of one projection's load-time pack ([`AdaptableLinear::quantize`]) beside its
+/// resident dense `weight` `[out, in]` (+ `bias`): the bf16 casts it packs from and the packed
+/// triple (`bits`-wide u32 codes, a bf16 scale and bias per [`GROUP_SIZE`] group), each its own
+/// buffer.
+pub(crate) fn quantize_bytes(weight: &Array, bias: Option<&Array>, bits: i32) -> u64 {
+    let elements = weight.size() as u64;
+    let bias = bias.map_or(0, |b| b.size() as u64 * 2);
+    quantize_bytes_from_metadata(elements, bias, bits)
+}
+
+/// The SAME existing raw pack budget over metadata; `bias` is its BF16 byte extent. No Array,
+/// readiness/allocator query or physical-allocation certificate is involved.
+pub(crate) fn quantize_bytes_from_metadata(elements: u64, bias: u64, bits: i32) -> u64 {
+    let packed = elements
+        .saturating_mul(bits.max(0) as u64)
+        .div_ceil(8)
+        .saturating_add(elements.div_ceil(GROUP_SIZE as u64).saturating_mul(4));
+    elements
+        .saturating_mul(2)
+        .saturating_add(bias)
+        .saturating_add(packed)
+        .saturating_add(mlx_gen::ios_quantum::page_slack(5))
 }
 
 thread_local! {
-    static LAZY_QUANTIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GUARDED_LOAD_QUANTIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run `body` with [`quantize_linear`] building the packed projection LAZILY (never reading the
-/// dense source or evaluating the pack): header-only pricing (`crate::ios_pricing`) quantizes a
-/// lazily constructed component to learn the dtypes its packed projections promote to, without a
-/// tensor payload. Restored on return or unwind.
-pub(crate) fn with_lazy_quantize<T>(body: impl FnOnce() -> T) -> T {
+/// Run the heavy bundle's load-time pack (`model::load_heavy`) with every projection's pack checked
+/// as a [`crate::quantum::LOAD_QUANTIZE`] quantum. Restored on return or unwind.
+pub(crate) fn guarded_load_quantize<T>(body: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
-            LAZY_QUANTIZE.with(|flag| flag.set(self.0));
+            GUARDED_LOAD_QUANTIZE.with(|flag| flag.set(self.0));
         }
     }
-    let _restore = Restore(LAZY_QUANTIZE.with(|flag| flag.replace(true)));
+    let _restore = Restore(GUARDED_LOAD_QUANTIZE.with(|flag| flag.replace(true)));
     body()
+}
+
+/// Private projection callback over the ACTUAL module quant walk. Runtime delegates to the same
+/// quantize_linear body; header pricing records/applies typed pack effects without fake Arrays.
+pub(crate) type QuantizeLinear<'a> = dyn FnMut(&str, &mut AdaptableLinear, i32) -> Result<()> + 'a;
+
+pub(crate) fn child_path(prefix: &str, child: &str) -> String {
+    if prefix.is_empty() { child.to_owned() } else { format!("{prefix}.{child}") }
 }
 
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
@@ -74,6 +141,18 @@ pub(crate) const GROUP_SIZE: i32 = 64;
 /// is present (a pre-quantized snapshot), else dense. The shared [`mlx_gen::quant::lin`].
 pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
+}
+
+/// Actual base-model GEGLU row selector, shared by construction and header normalization.
+/// Adapter UP routing intentionally has a different existing odd-row floor split.
+pub(crate) fn geglu_half_ranges(output_rows: i32) -> Result<[(i32, i32); 2]> {
+    if output_rows % 2 != 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "sdxl GEGLU: ff.net.0.proj has odd output dim {output_rows}; cannot split value/gate halves",
+        )));
+    }
+    let half = output_rows / 2;
+    Ok([(0, half), (half, output_rows)])
 }
 
 /// Load the value/gate **half** of a GEGLU `ff.net.0.proj` — rows `[lo, hi)` of the stored
@@ -105,6 +184,133 @@ pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Resul
         row_slice(w.require(&format!("{base}.weight"))?)?,
         bias,
     ))
+}
+
+/// Header-only projection geometry at the adapter-install boundary. A load-time pack happens
+/// AFTER adapter installation, whereas an existing affine pack takes the residual install branch.
+/// Keeping both states is necessary even when their final requested tier is identical.
+#[derive(Clone, Debug)]
+pub(crate) struct HeaderLinear {
+    pub shape: [i32; 2],
+    pub source_packed_bits: Option<i32>,
+    pub weight_dtype: Dtype,
+    pub scales_dtype: Option<Dtype>,
+    pub affine_biases_dtype: Option<Dtype>,
+    pub packed_codes_shape: Option<Vec<usize>>,
+    pub packed_scales_shape: Option<Vec<usize>>,
+    pub packed_biases_shape: Option<Vec<usize>>,
+}
+
+pub(crate) fn header_dtype(dtype: mlx_gen::gen_core::weightsmeta::Dtype) -> Result<Dtype> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    Ok(match dtype {
+        Stored::BOOL => Dtype::Bool,
+        Stored::U8 => Dtype::Uint8,
+        Stored::I8 => Dtype::Int8,
+        Stored::U16 => Dtype::Uint16,
+        Stored::I16 => Dtype::Int16,
+        Stored::U32 => Dtype::Uint32,
+        Stored::I32 => Dtype::Int32,
+        Stored::U64 => Dtype::Uint64,
+        Stored::I64 => Dtype::Int64,
+        Stored::F16 => Dtype::Float16,
+        Stored::BF16 => Dtype::Bfloat16,
+        Stored::F32 => Dtype::Float32,
+        // The actual pinned native safetensors decoder stores these as uint8, NOT decoded fp8.
+        Stored::F8_E4M3 | Stored::F8_E8M0 => Dtype::Uint8,
+        Stored::F64 | Stored::F8_E5M2 => {
+            return Err(mlx_gen::Error::Unsupported(
+                "sdxl native safetensors loader does not accept this source dtype".into(),
+            ))
+        }
+    })
+}
+
+/// `loader::cast_for_load`'s actual iOS leaf cast, after the native source dtype conversion.
+pub(crate) fn loaded_header_dtype(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> Result<Dtype> {
+    let stored = header_dtype(header.dtype)?;
+    let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
+    if !packed
+        || (header.is_float()
+            && !header.name.ends_with(".scales")
+            && !header.name.ends_with(".biases"))
+    {
+        Ok(crate::model::DTYPE)
+    } else {
+        Ok(stored)
+    }
+}
+
+/// `quant::lin`'s actual `.scales` selector and `packed_bits` validator, without an Array. The
+/// component-wide packed flag follows `loader::cast_for_load`; this exporter describes the iOS
+/// load, whose floating dense leaves are cast even when the component is prepacked.
+pub(crate) fn linear_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    base: &str,
+) -> Result<HeaderLinear> {
+    let require = |suffix: &str| {
+        headers
+            .iter()
+            .find(|h| h.name == format!("{base}.{suffix}"))
+            .ok_or_else(|| mlx_gen::Error::MissingTensor(format!("{base}.{suffix}")))
+    };
+    let shape = |h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| -> Result<Vec<i32>> {
+        h.shape
+            .iter()
+            .map(|d| {
+                i32::try_from(*d).map_err(|_| {
+                    mlx_gen::Error::Msg(
+                        "sdxl header normalization: projection dimension exceeds native i32".into(),
+                    )
+                })
+            })
+            .collect()
+    };
+    let weight = require("weight")?;
+    let wshape = shape(weight)?;
+    if let Some(scales) = headers.iter().find(|h| h.name == format!("{base}.scales")) {
+        let sshape = shape(scales)?;
+        let wd = header_dtype(weight.dtype)?;
+        let sd = header_dtype(scales.dtype)?;
+        let bits = mlx_gen::quant::packed_bits_from_metadata(&wshape, wd, &sshape, sd, GROUP_SIZE)?;
+        let biases = require("biases")?;
+        // The runtime loads this exact companion, not an inferred bf16 replacement.
+        let bd = header_dtype(biases.dtype)?;
+        return Ok(HeaderLinear {
+            shape: [
+                wshape[0],
+                sshape[1].checked_mul(GROUP_SIZE).ok_or_else(|| {
+                    mlx_gen::Error::Msg("sdxl header input width overflow".into())
+                })?,
+            ],
+            source_packed_bits: Some(bits),
+            weight_dtype: wd,
+            scales_dtype: Some(sd),
+            affine_biases_dtype: Some(bd),
+            packed_codes_shape: Some(weight.shape.clone()),
+            packed_scales_shape: Some(scales.shape.clone()),
+            packed_biases_shape: Some(biases.shape.clone()),
+        });
+    }
+    let [out, input] = wshape.as_slice() else {
+        return Err(mlx_gen::Error::Msg(
+            "sdxl header Linear weight is not a matrix".into(),
+        ));
+    };
+    let dtype = loaded_header_dtype(headers, weight)?;
+    Ok(HeaderLinear {
+        shape: [*out, *input],
+        source_packed_bits: None,
+        weight_dtype: dtype,
+        scales_dtype: None,
+        affine_biases_dtype: None,
+        packed_codes_shape: None,
+        packed_scales_shape: None,
+        packed_biases_shape: None,
+    })
 }
 
 #[cfg(test)]

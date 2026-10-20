@@ -32,18 +32,92 @@ fn component_map<'a>(
     }
 }
 
-fn squeeze_linear(value: Array) -> Result<Array> {
-    let dims: Vec<i32> = value
-        .shape()
+fn squeezed_dimensions<T: Copy + PartialEq + From<u8>>(shape: &[T]) -> Vec<T> {
+    shape
         .iter()
         .copied()
-        .filter(|&dim| dim != 1)
-        .collect();
+        .filter(|dim| *dim != T::from(1))
+        .collect()
+}
+
+fn squeeze_linear(value: Array) -> Result<Array> {
+    let dims = squeezed_dimensions(value.shape());
     if dims.len() == value.shape().len() {
         Ok(value)
     } else {
         Ok(value.reshape(&dims)?)
     }
+}
+
+/// Normalize a fused component's headers through the SAME key-remap producer as the actual load.
+/// Transpose/squeeze/split are shape-only here; no source payload or Array is constructed.
+pub(crate) fn component_headers(
+    path: &Path,
+    component: SdxlComponent,
+) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+    use mlx_gen::gen_core::weightsmeta::{
+        safetensors_path_tensor_headers, SafetensorsTensorHeader,
+    };
+    let mut result = std::collections::BTreeMap::new();
+    for header in safetensors_path_tensor_headers(path).map_err(|e| Error::Msg(e.to_string()))? {
+        let Some(remap) = remap_sdxl_ldm_key(&header.name) else {
+            continue;
+        };
+        let mut insert = |name: String, shape: Vec<usize>| -> Result<()> {
+            let elements = shape.iter().try_fold(1u64, |n, dim| {
+                n.checked_mul(*dim as u64)
+                    .ok_or_else(|| Error::Msg("sdxl LDM header element count overflow".into()))
+            })?;
+            let data_bytes = elements
+                .checked_mul(header.dtype.size() as u64)
+                .ok_or_else(|| Error::Msg("sdxl LDM header byte count overflow".into()))?;
+            let target = SafetensorsTensorHeader {
+                name: name.clone(),
+                dtype: header.dtype,
+                shape,
+                data_bytes,
+            };
+            if result.insert(name, target).is_some() {
+                return Err(Error::Unsupported(
+                    "sdxl LDM normalization: ambiguous duplicate remapped target".into(),
+                ));
+            }
+            Ok(())
+        };
+        match remap {
+            TensorRemap::Rename(c, name) if c == component => insert(name, header.shape.clone())?,
+            TensorRemap::Transpose(c, name) if c == component => {
+                let mut shape = header.shape.clone();
+                shape.reverse();
+                insert(name, shape)?;
+            }
+            TensorRemap::Squeeze(c, name) if c == component => {
+                insert(name, squeezed_dimensions(&header.shape))?
+            }
+            TensorRemap::SplitQkv(c, names) if c == component => {
+                let mut shape = header.shape.clone();
+                let Some(rows) = shape.first_mut() else {
+                    return Err(Error::Msg("sdxl LDM QKV source is scalar".into()));
+                };
+                if *rows % 3 != 0 {
+                    return Err(Error::Msg(
+                        "sdxl LDM QKV source does not split evenly".into(),
+                    ));
+                }
+                *rows /= 3;
+                for name in names {
+                    insert(name, shape.clone())?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if result.is_empty() {
+        return Err(Error::Msg(
+            "sdxl LDM component contains no remapped headers".into(),
+        ));
+    }
+    Ok(result.into_values().collect())
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {

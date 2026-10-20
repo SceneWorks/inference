@@ -990,27 +990,28 @@ pub fn shift_sigma(sigma: f64, shift: f64) -> f64 {
 /// `FlowDPMSolver.time_grid`: `1 − linspace(1, 0.001, steps + 1)`, shifted, descending, ending at
 /// exactly 0. Computed in f64 like upstream (`torch.linspace(..., dtype=float64)`).
 pub fn time_grid(steps: usize, shift: f64) -> Vec<f64> {
+    (0..=steps)
+        .map(|index| time_grid_at(steps, shift, index))
+        .collect()
+}
+
+/// The same producer expression as `time_grid`, indexed AFTER its descending reversal. Keep the
+/// symmetric torch-linspace arithmetic order unchanged; metadata need not allocate the whole grid.
+fn time_grid_at(steps: usize, shift: f64, index: usize) -> f64 {
     let n = steps + 1;
-    let mut grid: Vec<f64> = (0..n)
-        .map(|i| {
-            // torch.linspace(start, end, n): start + i·step for the first half, end − (n−1−i)·step
-            // for the second (its symmetric evaluation), step = (end − start)/(n − 1).
-            let (start, end) = (1.0f64, 0.001f64);
-            let lin = if n == 1 {
-                start
-            } else {
-                let step = (end - start) / (n - 1) as f64;
-                if i < n / 2 {
-                    start + step * i as f64
-                } else {
-                    end - step * (n - 1 - i) as f64
-                }
-            };
-            shift_sigma(1.0 - lin, shift)
-        })
-        .collect();
-    grid.reverse();
-    grid
+    let i = steps - index;
+    let (start, end) = (1.0f64, 0.001f64);
+    let lin = if n == 1 {
+        start
+    } else {
+        let step = (end - start) / (n - 1) as f64;
+        if i < n / 2 {
+            start + step * i as f64
+        } else {
+            end - step * (n - 1 - i) as f64
+        }
+    };
+    shift_sigma(1.0 - lin, shift)
 }
 
 fn lambda(t: f64) -> f64 {
@@ -1054,21 +1055,58 @@ impl DpmStep {
 /// the first steps and back down at the end (`lower_order_final`), so the terminal update is the
 /// exact `x ← x0` projection. NFE == steps.
 pub fn dpm_solver_plan(steps: usize, order: usize, shift: f64) -> Result<Vec<DpmStep>> {
-    if steps == 0 {
-        return Err(Error::Msg("iris: steps must be >= 1".into()));
+    Ok(DpmSolverPlan::new(steps, order, shift)?.iter().collect())
+}
+
+/// Bounded canonical plan metadata. Runtime collection and pre-admission indexed access use the
+/// SAME producer math; legal large step counts never require a pre-admission grid/plan allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DpmSolverPlan {
+    steps: usize,
+    order: usize,
+    shift: f64,
+}
+
+impl DpmSolverPlan {
+    pub fn new(steps: usize, order: usize, shift: f64) -> Result<Self> {
+        if steps == 0 {
+            return Err(Error::Msg("iris: steps must be >= 1".into()));
+        }
+        steps
+            .checked_add(1)
+            .ok_or_else(|| Error::Msg("iris: schedule length overflow".into()))?;
+        if !(1..=2).contains(&order) {
+            return Err(Error::Unsupported(format!(
+                "iris: DPM-Solver++ order {order} is not a distinct upstream solver (1 and 2 are)"
+            )));
+        }
+        if !shift.is_finite() || shift <= 0.0 {
+            return Err(Error::Msg("iris: shift must be finite and positive".into()));
+        }
+        Ok(Self {
+            steps,
+            order,
+            shift,
+        })
     }
-    if !(1..=2).contains(&order) {
-        // Upstream runs the second-order update for every `step_order > 1`, so an order ≥ 3 is the
-        // order-2 computation under another number, and order 0 indexes past its history.
-        return Err(Error::Unsupported(format!(
-            "iris: DPM-Solver++ order {order} is not a distinct upstream solver (1 and 2 are)"
-        )));
+
+    pub fn len(&self) -> usize {
+        self.steps
     }
-    let grid = time_grid(steps, shift);
-    let mut plan = Vec::with_capacity(steps);
-    for i in 1..=steps {
-        let (s, t) = (grid[i - 1], grid[i]);
-        let step_order = i.min(order).min(steps + 1 - i);
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn step(&self, index: usize) -> Option<DpmStep> {
+        if index >= self.steps {
+            return None;
+        }
+        let i = index + 1;
+        let (s, t) = (
+            time_grid_at(self.steps, self.shift, i - 1),
+            time_grid_at(self.steps, self.shift, i),
+        );
+        let step_order = i.min(self.order).min(self.steps + 1 - i);
         let update = if step_order == 1 {
             let h = lambda(t) - lambda(s);
             let phi1 = (-h).exp_m1();
@@ -1077,7 +1115,7 @@ pub fn dpm_solver_plan(steps: usize, order: usize, shift: f64) -> Result<Vec<Dpm
                 c0: ((1.0 - t) * phi1) as f32,
             }
         } else {
-            let s1 = grid[i - 2];
+            let s1 = time_grid_at(self.steps, self.shift, i - 2);
             let (lam_t, lam_0, lam_1) = (lambda(t), lambda(s), lambda(s1));
             let (h, h0) = (lam_t - lam_0, lam_0 - lam_1);
             let r0 = h0 / h;
@@ -1089,9 +1127,79 @@ pub fn dpm_solver_plan(steps: usize, order: usize, shift: f64) -> Result<Vec<Dpm
                 r0: r0 as f32,
             }
         };
-        plan.push(DpmStep { s, t, update });
+        Some(DpmStep { s, t, update })
     }
-    Ok(plan)
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = DpmStep> + '_ {
+        (0..self.steps).map(|index| {
+            self.step(index)
+                .expect("index is inside the canonical plan")
+        })
+    }
+
+    /// Guided evaluations form one contiguous range on the actual descending sigma grid. Strict
+    /// boundaries and flat floating-point plateaus are handled by monotone index searches.
+    pub fn cfg_span(&self, scale: f32, interval: (f64, f64)) -> Option<std::ops::Range<usize>> {
+        if scale == 1.0 {
+            return None;
+        }
+        let lower_bound = |threshold: f64, inclusive: bool| {
+            let (mut lo, mut hi) = (0, self.steps);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let s = time_grid_at(self.steps, self.shift, mid);
+                if if inclusive {
+                    s <= threshold
+                } else {
+                    s < threshold
+                } {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+        let start = lower_bound(interval.1, false);
+        let end = lower_bound(interval.0, true);
+        (start < end).then_some(start..end)
+    }
+
+    /// Complete epoch mechanism envelope: first/later history, interior update, terminal update,
+    /// and both sides of the CFG transitions. Size is bounded independently of `steps`.
+    pub fn epoch_indices(&self, scale: f32, interval: (f64, f64)) -> Vec<usize> {
+        let mut indices = vec![0, self.steps - 1];
+        if self.steps > 1 {
+            indices.extend([1, self.steps - 2]);
+        }
+        if let Some(span) = self.cfg_span(scale, interval) {
+            indices.extend([span.start, span.end - 1]);
+            if span.start > 0 {
+                indices.push(span.start - 1);
+            }
+            if span.end < self.steps {
+                indices.push(span.end);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    /// Actual runtime-owned host payload: collected DpmStep plan and the N+1 f32 preview schedule.
+    pub fn host_bytes(&self) -> Result<u64> {
+        let steps =
+            u64::try_from(self.steps).map_err(|_| Error::Msg("iris: steps overflow u64".into()))?;
+        steps
+            .checked_mul(std::mem::size_of::<DpmStep>() as u64)
+            .and_then(|plan| {
+                steps
+                    .checked_add(1)?
+                    .checked_mul(std::mem::size_of::<f32>() as u64)?
+                    .checked_add(plan)
+            })
+            .ok_or_else(|| Error::Msg("iris: solver host payload overflow".into()))
+    }
 }
 
 /// Whether CFG runs at model time `s` (`lo < s < hi`, upstream's strict gate).
@@ -1214,9 +1322,14 @@ impl GenerationParams {
         self.cfg_scale != 1.0
     }
 
-    /// The solver plan these controls select.
+    /// Bounded metadata of the solver plan these controls select (safe before admission).
+    pub fn plan_metadata(&self) -> Result<DpmSolverPlan> {
+        DpmSolverPlan::new(self.steps, self.order, self.shift)
+    }
+
+    /// The executable solver plan; collect only after its host payload has been admitted.
     pub fn plan(&self) -> Result<Vec<DpmStep>> {
-        dpm_solver_plan(self.steps, self.order, self.shift)
+        Ok(self.plan_metadata()?.iter().collect())
     }
 
     /// Whether guidance runs at `step` (the interval gate of `FlowDPMSolver._model_out`).
@@ -1306,8 +1419,13 @@ pub fn validate_generation_request(
              off); raise guidance or drop the interval"
         )));
     }
-    let plan = params.plan().map_err(|e| prefix_error(model_id, e))?;
-    if params.uses_cfg() && !plan.iter().any(|step| params.cfg_at(step)) {
+    let plan = DpmSolverPlan::new(params.steps, params.order, params.shift)
+        .map_err(|e| prefix_error(model_id, e))?;
+    if params.uses_cfg()
+        && plan
+            .cfg_span(params.cfg_scale, params.cfg_interval)
+            .is_none()
+    {
         return Err(Error::Unsupported(format!(
             "{model_id}: cfg_interval ({}, {}) contains none of the {} solver evaluation times, so \
              guidance {} (and any negative prompt) would never apply; widen the interval or set \
@@ -1582,6 +1700,81 @@ flow:
         assert_eq!(empty.mask, [1, 1, 0, 0, 0]);
         assert_eq!(caption_overflow_warning(&empty, 5, 2), None);
         assert!(assemble_window(&[1], &[3], &[8, 9], 2).is_err());
+    }
+
+    #[test]
+    fn indexed_plan_has_exact_cfg_spans_and_bounded_epoch_envelopes() {
+        for steps in 1..=17 {
+            for order in [1, 2] {
+                for shift in [0.5, 1.0, 4.0] {
+                    let indexed = DpmSolverPlan::new(steps, order, shift).unwrap();
+                    let dense = dpm_solver_plan(steps, order, shift).unwrap();
+                    let grid = time_grid(steps, shift);
+                    for (i, step) in dense.iter().enumerate() {
+                        assert_eq!(indexed.step(i), Some(*step));
+                        assert_eq!((step.s, step.t), (grid[i], grid[i + 1]));
+                    }
+                    for interval in [
+                        (0.0, 1.0),
+                        (0.25, 0.75),
+                        (0.9, 1.0),
+                        (0.0, 0.1),
+                        (0.5, 0.500001),
+                    ] {
+                        for scale in [1.0, 3.0] {
+                            let expected: Vec<_> = dense
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, step)| cfg_active(scale, step.s, interval))
+                                .map(|(i, _)| i)
+                                .collect();
+                            assert_eq!(
+                                indexed
+                                    .cfg_span(scale, interval)
+                                    .into_iter()
+                                    .flatten()
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            let indices = indexed.epoch_indices(scale, interval);
+                            assert!(indices.len() <= 8, "epoch envelope must not grow with N");
+                            let facts = |i: usize| {
+                                let step = dense[i];
+                                [
+                                    i != 0,
+                                    i + 1 == steps,
+                                    cfg_active(scale, step.s, interval),
+                                    matches!(step.update, DpmUpdate::Second { .. }),
+                                ]
+                            };
+                            for i in 0..steps {
+                                assert!(
+                                    indices.iter().any(|&j| facts(i) == facts(j)),
+                                    "missing actual epoch mechanism"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let n = u32::MAX as usize;
+        let large = DpmSolverPlan::new(n, 2, 4.0).unwrap();
+        assert_eq!(large.len(), n);
+        assert_eq!(large.step(n - 1).unwrap().t, 0.0);
+        assert!(large.epoch_indices(3.0, (0.25, 0.75)).len() <= 8);
+        assert!(large.host_bytes().unwrap() > n as u64);
+        let request = GenerationRequest {
+            prompt: "metadata only".into(),
+            steps: Some(u32::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_generation_request(GENERATION_MODEL_ID, &request, &release())
+                .unwrap()
+                .steps,
+            n
+        );
     }
 
     #[test]

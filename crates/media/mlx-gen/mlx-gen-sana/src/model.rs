@@ -43,7 +43,6 @@ use crate::config::{DcAeConfig, SanaTransformerConfig};
 use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::pipeline::{
     encode_conditioning, SanaConditioning, SanaGenerateRequest, SanaHeavy, DEFAULT_GUIDANCE,
-    SPRINT_DEFAULT_GUIDANCE,
 };
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
@@ -304,6 +303,31 @@ pub(crate) fn load_heavy(
     needs_encoder: bool,
     streamable: bool,
 ) -> Result<SanaHeavy> {
+    let cfg = if sprint {
+        SanaTransformerConfig::sana_sprint_1600m()
+    } else {
+        SanaTransformerConfig::sana_1600m()
+    };
+    load_heavy_with_config(
+        root,
+        sprint,
+        needs_encoder,
+        streamable,
+        DcAeConfig::sana_f32c32(),
+        cfg,
+    )
+}
+
+/// Production eager materialization and shared DC-AE ownership, at an explicit geometry. The
+/// weights-free endpoint fixture changes only configs, never retention or loader semantics.
+pub(crate) fn load_heavy_with_config(
+    root: &Path,
+    sprint: bool,
+    needs_encoder: bool,
+    streamable: bool,
+    dcfg: DcAeConfig,
+    trunk_cfg: SanaTransformerConfig,
+) -> Result<SanaHeavy> {
     // Only the components this bundle constructs are priced: a text-to-image bundle (and the
     // Sequential img2img bundle, whose reference was encoded in its own phase) never builds the
     // DC-AE encoder, so its `encoder.*` tensors are never materialized.
@@ -314,7 +338,6 @@ pub(crate) fn load_heavy(
     )?;
     let transformer_dir = root.join("transformer");
     let trunk_w = Weights::from_dir(&transformer_dir)?;
-    let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
     // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
@@ -346,7 +369,6 @@ pub(crate) fn load_heavy(
         Ok(trunk)
     };
     if sprint {
-        let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
         let trunk = with_stream(build_trunk(&trunk_cfg)?, &trunk_cfg);
         Ok(match encoder {
@@ -358,7 +380,6 @@ pub(crate) fn load_heavy(
             }
         })
     } else {
-        let trunk_cfg = SanaTransformerConfig::sana_1600m();
         let trunk = with_stream(build_trunk(&trunk_cfg)?, &trunk_cfg);
         Ok(match encoder {
             Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
@@ -371,7 +392,7 @@ pub(crate) fn load_heavy(
 /// adapter overrides (neither is wired for SANA) — but ACCEPT a quant spec, since a pre-quantized tier
 /// is packed-detected from disk (sc-8489) — then resolve the `LoadSpec` to the snapshot directory. The
 /// `{id}` in each message comes from the descriptor, so the two paths' error text differs only by id).
-fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
+pub(crate) fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
@@ -401,7 +422,10 @@ fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
 /// `Conditioning::Reference` (multiple → error), returning its image and the effective strength
 /// (per-reference → request → [`mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH`]). An explicit zero
 /// remains a deliberate no-op/txt2img selection. Mirrors the sibling img2img families (Z-Image).
-fn resolve_reference<'a>(req: &'a GenerationRequest, id: &str) -> Result<Option<(&'a Image, f32)>> {
+pub(crate) fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, f32)>> {
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
@@ -461,10 +485,29 @@ fn render_batch_with_prepared_reference<P, O>(
     let prepared_reference = prepare()?;
     let mut outputs = Vec::with_capacity(count as usize);
     for offset in 0..count {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "serial",
+            &[
+                ("schema", 1),
+                ("serial", offset as u64),
+                ("completed_batches", outputs.len() as u64),
+                ("forward_rows", 1),
+            ],
+        );
         outputs.push(render(
             base_seed.wrapping_add(offset as u64),
             prepared_reference.as_ref(),
         )?);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "serial_complete",
+            &[
+                ("schema", 1),
+                ("serial", offset as u64),
+                ("completed_batches", outputs.len() as u64),
+            ],
+        );
     }
     Ok(outputs)
 }
@@ -557,7 +600,24 @@ impl Sana {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            self.descriptor.id,
+            "request",
+            &[
+                ("schema", 1),
+                ("serial_count", req.count as u64),
+                ("sprint", u64::from(self.sprint)),
+                (
+                    "requested_steps",
+                    req.steps.unwrap_or(if self.sprint {
+                        crate::pipeline::SPRINT_DEFAULT_STEPS as u32
+                    } else {
+                        crate::pipeline::DEFAULT_STEPS as u32
+                    }) as u64,
+                ),
+            ],
+        );
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         // SC-15523: a request-scoped memory selection is refused HERE, on the production path, not
         // only at shared-contract admission — a caller that sets `req.memory` directly must not be
         // able to execute an unmeasured tile edge, score budget or block cadence.
@@ -583,12 +643,16 @@ impl Sana {
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
-        let guidance_scale = resolve_base_guidance(req);
-        let guidance = guidance_scale.unwrap_or(if self.sprint {
-            SPRINT_DEFAULT_GUIDANCE
+        let sprint_sampling = if self.sprint {
+            Some(crate::sampling::resolve_sprint(req)?)
         } else {
-            DEFAULT_GUIDANCE
-        });
+            None
+        };
+        let guidance_scale = resolve_base_guidance(req);
+        let guidance = match &sprint_sampling {
+            Some(sampling) => sampling.guidance(),
+            None => guidance_scale.unwrap_or(DEFAULT_GUIDANCE),
+        };
         let tiling =
             crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
         // img2img's bounded DC-AE encode: iOS, or a request whose bounded-VAE rung asks for it.

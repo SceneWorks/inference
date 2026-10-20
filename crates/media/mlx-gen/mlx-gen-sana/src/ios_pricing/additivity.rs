@@ -13,19 +13,20 @@
 //! Each case runs the production modules on a tiny, structurally real snapshot (a 6-stage x32 DC-AE,
 //! a two-block trunk, a two-layer Gemma-2, at widths the production converter can pack), dense and
 //! converted by [`crate::convert::prequantize_turnkey`] to q4 / q8, at two selections of the iOS
-//! load spec (`Sequential`): the FULLY OPTIMIZED one (the deepest rung the contract declares
-//! `Implemented`, the last selection of its `selection_space`) and rung 0 `Resident`. The text
+//! load forms: FULLY OPTIMIZED (`Sequential` + `DeferredMaterialization`, deepest legal bounded
+//! attention/decode; transformer windows intentionally withheld) and literal FULLY RESIDENT
+//! (`Resident` + `EagerMaterialization`, actual eager warm-pair ownership through decode). The text
 //! anchor and the mode are each MEASURED ([`mlx_gen::ios_anchor_law::measure_phases`]: MLX
-//! active-memory growth per phase over a fresh load + generate in the generator's `Sequential`
-//! phase order, the worst of [`RUNS`]); the mode's demand derived from the anchor must cover the
+//! active-memory growth per phase over a fresh load + generate, the worst of [`RUNS`]); the mode's
+//! demand derived from the anchor must cover the
 //! mode's measurement, overall and in every phase both ran. CPU child, Metal fatal.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
-    GenerationMemory, LoadSpec, MemoryNumericTier, MemoryStrategy, MemoryStrategySupport,
-    OffloadPolicy, Quant,
+    GenerationMemory, LoadShape, LoadSpec, MemoryNumericTier, MemoryStrategy,
+    MemoryStrategySupport, OffloadPolicy, Quant,
 };
 use mlx_gen::ios_anchor_law::{area, derive, measure_phases, MeasuredRun};
 use mlx_gen::ios_quantum::with_cpu_diagnostic_headroom;
@@ -34,12 +35,28 @@ use mlx_gen::StagedHeavy;
 use mlx_rs::Array;
 
 use super::*;
-use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
+use crate::dc_ae::DcAeEncoder;
 use crate::pipeline::{SanaConditioning, SanaGenerateRequest, SanaHeavy};
 use crate::text_encoder::Gemma2;
-use crate::transformer::SanaTransformer;
 
 const CHILD: &str = "SANA_IOS_ADDITIVITY_CPU_CHILD";
+
+const DONE: &str = "SANA_IOS_ADDITIVITY_CPU_CHILD_DONE";
+
+// Existing CPU-child isolation, with a normal-return marker after every fixture has dropped.
+struct CpuChildCompletion;
+impl Drop for CpuChildCompletion {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            std::fs::write(
+                std::env::var(DONE).expect("CPU child completion path"),
+                b"ok",
+            )
+            .expect("write CPU child completion marker");
+        }
+    }
+}
+
 /// Measured runs per configuration (each a fresh load); the worst per phase is the measurement.
 const RUNS: usize = 3;
 /// Far above every tiny quantum's scratch + the reserve: every guard passes.
@@ -54,6 +71,8 @@ const CAPTION: i32 = 16;
 
 fn in_cpu_child(name: &str) -> bool {
     if std::env::var_os(CHILD).is_none() {
+        let done = tempfile::tempdir().unwrap();
+        let marker = done.path().join("done");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -62,13 +81,31 @@ fn in_cpu_child(name: &str) -> bool {
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
+            .env(DONE, &marker)
             .status()
             .unwrap();
         assert!(status.success(), "CPU child for {name} failed");
+        assert!(
+            marker.is_file(),
+            "CPU child for {name} ran no completed body"
+        );
         return false;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert_eq!(
+        mlx_rs::Device::try_default().expect("CPU default-device query failed"),
+        mlx_rs::Device::cpu()
+    );
+    assert_eq!(
+        unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+        0
+    );
+    assert_eq!(
+        mlx_rs::Stream::new().get_index().unwrap(),
+        mlx_rs::Stream::cpu().get_index().unwrap()
+    );
     assert!(crate::test_metal_guard::forbid_metal());
+    assert!(crate::test_metal_guard::metal_forbidden());
     true
 }
 
@@ -232,38 +269,82 @@ fn fixture() -> Fixture {
     Fixture { _dir: dir, roots }
 }
 
-/// The two selections of `provider`'s iOS load spec (mirrors `mlx_gen_ios_catalog::sana_load_spec`:
-/// a `Sequential` load of the tier directory), as `ios_admission::build_candidate` builds each:
-/// (fully optimized, rung 0).
-fn selections(provider: &str, root: &Path, bits: Option<i32>) -> [(String, GenerationMemory); 2] {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
-        .with_offload_policy(OffloadPolicy::Sequential);
-    spec.quantize = bits.map(|b| if b == 4 { Quant::Q4 } else { Quant::Q8 });
-    let contract =
-        crate::memory_strategy::weights_free_memory_strategy_contract(provider, &spec).unwrap();
-    let tier = MemoryNumericTier {
-        precision: spec.precision,
-        quant: spec.quantize,
-        component_precision_floors: &[],
-    };
-    let deepest = MemoryStrategy::ALL
-        .into_iter()
-        .rev()
-        .find(|s| {
-            contract
-                .capability(*s)
-                .is_some_and(|c| c.support == MemoryStrategySupport::Implemented)
-        })
-        .unwrap();
-    [deepest, MemoryStrategy::Resident].map(|strategy| {
+/// Each literal capture endpoint's own load spec and contract: (fully optimized, fully resident).
+/// Prior resident-labelled runs staged components and do not validate the corrected eager endpoint.
+fn selections(
+    provider: &str,
+    root: &Path,
+    bits: Option<i32>,
+) -> [(String, GenerationMemory, LoadSpec); 2] {
+    [false, true].map(|resident| {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(if resident {
+                OffloadPolicy::Resident
+            } else {
+                OffloadPolicy::Sequential
+            })
+            .with_load_shape(if resident {
+                LoadShape::EagerMaterialization
+            } else {
+                LoadShape::DeferredMaterialization
+            });
+        spec.quantize = bits.map(|b| match b {
+            4 => Quant::Q4,
+            8 => Quant::Q8,
+            _ => panic!("unsupported fixture tier {b}"),
+        });
+        let contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract(provider, &spec).unwrap();
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+            component_precision_floors: &[],
+        };
+        let strategy = if resident {
+            MemoryStrategy::Resident
+        } else {
+            MemoryStrategy::ALL
+                .into_iter()
+                .rev()
+                .find(|s| {
+                    contract
+                        .capability(*s)
+                        .is_some_and(|c| c.support == MemoryStrategySupport::Implemented)
+                })
+                .unwrap()
+        };
         let selection = *contract
             .selection_space(strategy, tier, false)
             .unwrap()
             .last()
             .unwrap();
-        let execution = contract.generation_memory(&selection).unwrap_or_default();
+        let execution = contract
+            .generation_memory(&selection)
+            .expect("endpoint execution must be defined");
         crate::memory_strategy::validate_request_memory(provider, &spec, &execution).unwrap();
-        (format!("{strategy:?}"), execution)
+        assert_eq!(execution.stage_residency, !resident);
+        assert!(
+            !execution.stream_transformer_blocks,
+            "SANA transformer windows are intentionally withheld"
+        );
+        if !resident {
+            assert!(execution.tile_vae_decode && execution.chunk_attention);
+            assert_eq!(
+                execution.decode_tile_edge,
+                crate::memory_strategy::DECODE_TILE_EDGES
+                    .iter()
+                    .copied()
+                    .min()
+            );
+            assert_eq!(
+                execution.attention_chunk_size,
+                crate::memory_strategy::ATTENTION_CHUNK_SIZES
+                    .iter()
+                    .copied()
+                    .min()
+            );
+        }
+        (format!("{strategy:?}"), execution, spec)
     })
 }
 
@@ -274,21 +355,95 @@ struct Request {
     img2img: bool,
     root: PathBuf,
     execution: GenerationMemory,
+    spec: LoadSpec,
+}
+
+fn storage_witness(array: &Array) -> usize {
+    let mut available = false;
+    assert_eq!(
+        unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) },
+        0
+    );
+    assert!(
+        available,
+        "endpoint owns a lazy stored parameter, not resident storage"
+    );
+    let address = unsafe { mlx_sys::mlx_array_data_uint8(array.as_ptr()) } as usize;
+    assert_ne!(address, 0);
+    address
+}
+
+fn load_fixture_encoder(root: &Path) -> Result<Gemma2> {
+    mlx_gen::ios_quantum::before_load(labels::TEXT_LOAD, &[root.join("text_encoder")])?;
+    let w = Weights::from_file(root.join("text_encoder/gemma-2-2b-it.safetensors"))?;
+    let encoder = Gemma2::from_weights(&w, "model.", &gemma())?;
+    // Exactly SanaTextEncoder::from_snapshot's eager materialization and alias ownership.
+    w.materialize_accessed()?;
+    // Observe the actual materialized source aliases without retaining copies. Derived Gemma
+    // normalization expressions may legitimately stay lazy; do not force them to evaluate here.
+    let accessed = w.accessed_entries();
+    assert!(!accessed.is_empty());
+    for (_, array) in &accessed {
+        storage_witness(array);
+    }
+    Ok(encoder)
+}
+
+fn fixture_conditioning(encoder: &Gemma2, sprint: bool) -> Result<SanaConditioning> {
+    let encode = |offset: i32| -> Result<(Array, Array)> {
+        let ids: Vec<i32> = (0..WINDOW).map(|i| (i * 7 + offset) % VOCAB).collect();
+        let pad = vec![1i32; WINDOW as usize];
+        let hidden = encoder.forward(
+            &Array::from_slice(&ids, &[1, WINDOW]),
+            Some(&Array::from_slice(&pad, &[1, WINDOW])),
+        )?;
+        let cond = mlx_gen::attention::slice_axis(&hidden, 1, WINDOW - CAPTION, CAPTION)?;
+        let mask = Array::from_slice(&vec![1i32; CAPTION as usize], &[1, CAPTION]);
+        Ok((cond, mask))
+    };
+    let (cond, cond_mask) = encode(0)?;
+    let uncond = if sprint { None } else { Some(encode(3)?) };
+    let mut arrays = vec![&cond, &cond_mask];
+    if let Some((u, um)) = &uncond {
+        arrays.push(u);
+        arrays.push(um);
+    }
+    mlx_rs::transforms::eval(arrays)?;
+    Ok(SanaConditioning {
+        cond,
+        cond_mask,
+        uncond,
+    })
 }
 
 impl Request {
-    /// The plan exactly as [`super::ios_pricing`] resolves it on device (a `Sequential` load).
+    /// The plan exactly as [`super::ios_pricing`] resolves it for this actual endpoint load.
     fn plan(&self) -> SanaPricingPlan {
         let memory = Some(self.execution);
+        assert_eq!(
+            self.execution.stage_residency,
+            self.spec.offload_policy == OffloadPolicy::Sequential
+        );
+        assert_eq!(
+            self.spec.load_shape,
+            if self.execution.stage_residency {
+                LoadShape::DeferredMaterialization
+            } else {
+                LoadShape::EagerMaterialization
+            }
+        );
         SanaPricingPlan {
             sprint: self.sprint,
-            sequential: true,
+            sequential: self.spec.offload_policy == OffloadPolicy::Sequential,
             img2img: self.img2img,
             width: EDGE,
             height: EDGE,
             count: 1,
-            decode_tiling: crate::pipeline::resolved_decode_plan(memory, true)
-                .map(|p| (p.edge, p.overlap)),
+            decode_tiling: crate::pipeline::resolved_decode_plan(
+                memory,
+                self.spec.offload_policy == OffloadPolicy::Sequential,
+            )
+            .map(|p| (p.edge, p.overlap)),
             encode_tile: crate::pipeline::resolved_encode_tile_on(memory, true),
             attention: crate::pipeline::resolved_rung_plan(memory, 2)
                 .unwrap()
@@ -296,8 +451,8 @@ impl Request {
         }
     }
 
-    fn pricing(&self) -> IosPricing {
-        let facts = SanaPricingFacts {
+    fn facts(&self) -> SanaPricingFacts {
+        SanaPricingFacts {
             root: self.root.clone(),
             transformer: trunk_cfg(self.sprint),
             dc_ae: dcae(),
@@ -307,8 +462,11 @@ impl Request {
             text_encoder: Inventory::read(&self.root.join("text_encoder")).unwrap(),
             trunk: Inventory::read(&self.root.join("transformer")).unwrap(),
             vae: Inventory::read(&self.root.join("vae")).unwrap(),
-        };
-        price(&facts, &self.plan()).unwrap()
+        }
+    }
+
+    fn pricing(&self) -> IosPricing {
+        price(&self.facts(), &self.plan()).unwrap()
     }
 
     /// One fresh load + generate in the generator's `Sequential` phase order
@@ -321,40 +479,14 @@ impl Request {
         let memory = Some(self.execution);
         let plan = self.plan();
         let cancel = mlx_gen::CancelFlag::default();
-        let g = gemma();
+        if !plan.sequential {
+            return self.run_resident();
+        }
 
-        // Phase A: the Gemma-2 encoder (`load_text_encoder_component`), the conditioning (the CFG
-        // pair for base SANA), materialized, then the encoder dropped.
+        // Optimized: the actual encoder is dropped before either heavy component loads.
         let conditioning = {
-            mlx_gen::ios_quantum::before_load(labels::TEXT_LOAD, &[root.join("text_encoder")])?;
-            let w = Weights::from_file(root.join("text_encoder/gemma-2-2b-it.safetensors"))?;
-            let encoder = Gemma2::from_weights(&w, "model.", &g)?;
-            w.materialize_accessed()?;
-            drop(w);
-            let encode = |offset: i32| -> Result<(Array, Array)> {
-                let ids: Vec<i32> = (0..WINDOW).map(|i| (i * 7 + offset) % VOCAB).collect();
-                let pad = vec![1i32; WINDOW as usize];
-                let hidden = encoder.forward(
-                    &Array::from_slice(&ids, &[1, WINDOW]),
-                    Some(&Array::from_slice(&pad, &[1, WINDOW])),
-                )?;
-                let cond = mlx_gen::attention::slice_axis(&hidden, 1, WINDOW - CAPTION, CAPTION)?;
-                let mask = Array::from_slice(&vec![1i32; CAPTION as usize], &[1, CAPTION]);
-                Ok((cond, mask))
-            };
-            let (cond, cond_mask) = encode(0)?;
-            let uncond = if sprint { None } else { Some(encode(3)?) };
-            let mut arrays = vec![&cond, &cond_mask];
-            if let Some((u, um)) = &uncond {
-                arrays.push(u);
-                arrays.push(um);
-            }
-            mlx_rs::transforms::eval(arrays)?;
-            SanaConditioning {
-                cond,
-                cond_mask,
-                uncond,
-            }
+            let encoder = load_fixture_encoder(root)?;
+            fixture_conditioning(&encoder, sprint)?
         };
         mlx_gen::residency::drain_allocator_cache();
 
@@ -402,30 +534,20 @@ impl Request {
         mlx_gen::residency::drain_allocator_cache();
 
         // Phase B: the heavy bundle (`load_heavy`, no encoder), the denoise, the latent batch.
-        let heavy = {
-            mlx_gen::ios_quantum::before_load_where(
-                labels::HEAVY_LOAD,
-                &[root.join("transformer"), root.join("vae")],
-                |name| !name.starts_with("encoder."),
-            )?;
-            let trunk_w = Weights::from_dir(root.join("transformer"))?;
-            let vae_w = Weights::from_dir(root.join("vae"))?;
-            let decoder = DcAeDecoder::from_weights(&vae_w, dcae())?;
-            vae_w.materialize_accessed()?;
-            let cfg = trunk_cfg(sprint);
-            let trunk = SanaTransformer::from_weights(&trunk_w, cfg.clone())?;
-            trunk_w.materialize_accessed()?;
-            if sprint {
-                SanaHeavy::new_sprint_text_to_image(
-                    trunk,
-                    decoder,
-                    dcae(),
-                    cfg.guidance_embeds_scale,
-                )
-            } else {
-                SanaHeavy::new_text_to_image(trunk, decoder, dcae())
-            }
-        };
+        let streamable = crate::memory_strategy::is_streamable(&self.spec);
+        let heavy = crate::model::load_heavy_with_config(
+            root,
+            sprint,
+            false,
+            streamable,
+            dcae(),
+            trunk_cfg(sprint),
+        )?;
+        assert_eq!(
+            heavy.endpoint_inventory(),
+            (2, false, streamable),
+            "optimized heavy has no reference encoder and no missing trunk blocks"
+        );
         let forward = crate::pipeline::resolved_rung_plan(memory, 2)?;
         let latent = heavy.denoise_one_with_prepared_reference(
             &conditioning,
@@ -449,6 +571,143 @@ impl Request {
         // Phase C: the decode with only the decoder resident.
         let tiling = crate::pipeline::resolve_decode_tiling(memory, true);
         SanaHeavy::light_view(&light).decode_one(&latent, &cancel, tiling.as_ref())?;
+        Ok(())
+    }
+
+    /// The production warm-pair state machine owns the literal resident endpoint. In particular,
+    /// its heavy callback receives true even for TEXT and retains one DC-AE encoder alongside the
+    /// decoder from the same source. Nothing here invents extra component copies or retention.
+    fn run_resident(&self) -> Result<()> {
+        self.run_resident_observing(|_| {})
+    }
+
+    // Test-only scalar observation of the SAME borrowed conditioning owners. It neither clones
+    // arrays nor evaluates extra graphs and does not change the resident warm-pair lifecycle.
+    fn run_resident_observing(&self, mut observe: impl FnMut(&SanaConditioning)) -> Result<()> {
+        let text_root = self.root.clone();
+        let heavy_root = self.root.clone();
+        let sprint = self.sprint;
+        let streamable = crate::memory_strategy::is_streamable(&self.spec);
+        let callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let text_calls = callbacks.clone();
+        let heavy_calls = callbacks.clone();
+        let residency = mlx_gen::Residency::<Gemma2, SanaHeavy>::from_policy(
+            self.spec.offload_policy,
+            move || {
+                text_calls.lock().unwrap().push("text");
+                load_fixture_encoder(&text_root)
+            },
+            move |needs_encoder| {
+                heavy_calls.lock().unwrap().push("heavy");
+                assert!(
+                    needs_encoder,
+                    "production resident warm callback must request the reusable encoder superset"
+                );
+                crate::model::load_heavy_with_config(
+                    &heavy_root,
+                    sprint,
+                    needs_encoder,
+                    streamable,
+                    dcae(),
+                    trunk_cfg(sprint),
+                )
+            },
+        )?;
+        assert_eq!(
+            *callbacks.lock().unwrap(),
+            ["text", "heavy"],
+            "all resident components load eagerly, before conditioning"
+        );
+        assert!(!residency.is_sequential());
+        let memory = Some(self.execution);
+        let plan = self.plan();
+        let cancel = mlx_gen::CancelFlag::default();
+        residency
+            .with_resident_parts(|encoder, heavy| -> Result<()> {
+                assert_eq!(
+                    heavy.endpoint_inventory(),
+                    (2, true, false),
+                    "literal resident warm inventory (including TEXT encoder superset)"
+                );
+                let storage: Vec<_> = heavy
+                    .endpoint_storage_witnesses()
+                    .into_iter()
+                    .map(storage_witness)
+                    .collect();
+                assert_eq!(
+                    storage.len(),
+                    3,
+                    "caption norm and every resident trunk block have real materialized storage"
+                );
+                let conditioning = fixture_conditioning(encoder, sprint)?;
+                observe(&conditioning);
+                let image = mlx_gen::Image {
+                    width: EDGE,
+                    height: EDGE,
+                    pixels: (0..EDGE * EDGE * 3).map(|i| (i % 251) as u8).collect(),
+                };
+                let req = SanaGenerateRequest {
+                    width: EDGE,
+                    height: EDGE,
+                    steps: Some(2),
+                    seed: Some(3),
+                    init_image: self.img2img.then_some(&image),
+                    strength: self.img2img.then_some(0.9),
+                    ..SanaGenerateRequest::new("a fox")
+                };
+                let reference =
+                    heavy.prepare_reference_with_tiling(&req, &cancel, plan.encode_tile)?;
+                assert_eq!(reference.is_some(), self.img2img);
+                let forward =
+                    crate::pipeline::resolved_rung_plan(memory, heavy.transformer_blocks())?;
+                let latent = heavy.denoise_one_with_prepared_reference(
+                    &conditioning,
+                    &req,
+                    if sprint {
+                        crate::pipeline::SPRINT_DEFAULT_GUIDANCE
+                    } else {
+                        crate::pipeline::DEFAULT_GUIDANCE
+                    },
+                    reference.as_ref(),
+                    &cancel,
+                    &mut |_| {},
+                    &mlx_gen::PreviewSink::default(),
+                    forward,
+                )?;
+                crate::model::materialize_latent_batch(std::slice::from_ref(&latent))?;
+                drop((conditioning, reference));
+                assert_eq!(
+                    heavy.endpoint_inventory(),
+                    (2, true, false),
+                    "no resident shedding before decode"
+                );
+                let tiling = crate::pipeline::resolve_decode_tiling(memory, false);
+                heavy
+                    .decode_view()
+                    .decode_one(&latent, &cancel, tiling.as_ref())?;
+                // Both actual owners are still borrowed from the SAME warm pair through decode.
+                assert_eq!(heavy.endpoint_inventory(), (2, true, false));
+                assert_eq!(
+                    heavy
+                        .endpoint_storage_witnesses()
+                        .into_iter()
+                        .map(storage_witness)
+                        .collect::<Vec<_>>(),
+                    storage,
+                    "same materialized trunk parameters survive conditioning, denoise and decode"
+                );
+                let _ = encoder;
+                Ok(())
+            })?
+            .expect("Resident must own the eager warm pair")?;
+        assert_eq!(
+            *callbacks.lock().unwrap(),
+            ["text", "heavy"],
+            "no per-phase reload or rematerialization"
+        );
+        assert!(residency
+            .with_resident_parts(|_, heavy| heavy.endpoint_inventory())?
+            .is_some());
         Ok(())
     }
 
@@ -540,6 +799,10 @@ fn verdict(
         .unwrap_or(0);
     for d in &derived.phases {
         let Some(&m) = measured.worst.phases.get(&d.phase) else {
+            failures.push(format!(
+                "{case} {selection} {tier}: missing measured phase {}",
+                d.phase.as_key()
+            ));
             continue;
         };
         let (limit, tag) = bound(at_anchor, request, anchor, measured, d);
@@ -591,12 +854,15 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
         let sprint_root = &fx.roots[&(true, tier)];
         let base = selections(crate::MODEL_ID, base_root, bits);
         let sprint = selections(crate::SPRINT_MODEL_ID, sprint_root, bits);
-        for ((name, base_execution), (_, sprint_execution)) in base.iter().zip(&sprint) {
+        for ((name, base_execution, base_spec), (_, sprint_execution, sprint_spec)) in
+            base.iter().zip(&sprint)
+        {
             let anchor = Request {
                 sprint: false,
                 img2img: false,
                 root: base_root.clone(),
                 execution: *base_execution,
+                spec: base_spec.clone(),
             };
             let measured_anchor = anchor.measure();
             let at_anchor = anchor.pricing();
@@ -615,6 +881,7 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                         img2img: false,
                         root: sprint_root.clone(),
                         execution: *sprint_execution,
+                        spec: sprint_spec.clone(),
                     },
                 ),
                 (
@@ -624,6 +891,7 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                         img2img: true,
                         root: sprint_root.clone(),
                         execution: *sprint_execution,
+                        spec: sprint_spec.clone(),
                     },
                 ),
             ];
@@ -647,15 +915,117 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
     failures
 }
 
-/// THE PROOF: base SANA's reference mode and Sprint's text and reference modes are covered by their
-/// derivation from the `sana_1600m` text anchor, overall and per phase, at the fully optimized
-/// selection and rung 0, dense and packed. No mode is listed in [`super::IOS_NON_ADDITIVE_MODES`].
+/// Literal resident TEXT uses the production warm callback's encoder superset, independent of
+/// img2img. Price each actual header inventory once (packed weights stay packed).
+#[test]
+fn resident_text_keeps_and_prices_the_production_encoder_superset() {
+    if !in_cpu_child("resident_text_keeps_and_prices_the_production_encoder_superset") {
+        return;
+    }
+    let _completion = CpuChildCompletion;
+    let fx = fixture();
+    for (tier, bits) in TIERS {
+        for sprint in [false, true] {
+            let root = &fx.roots[&(sprint, tier)];
+            let endpoints = selections(
+                if sprint {
+                    crate::SPRINT_MODEL_ID
+                } else {
+                    crate::MODEL_ID
+                },
+                root,
+                bits,
+            );
+            let (_, execution, spec) = &endpoints[1];
+            let request = Request {
+                sprint,
+                img2img: false,
+                root: root.clone(),
+                execution: *execution,
+                spec: spec.clone(),
+            };
+            let facts = request.facts();
+            let expected = facts.text_encoder.stored_where(|_| true)
+                + facts.trunk.stored_where(|_| true)
+                + facts
+                    .vae
+                    .f32_where(|n| n.starts_with("encoder.") || n.starts_with("decoder."));
+            assert!(facts.vae.f32_where(|n| n.starts_with("encoder.")) > 0);
+            let mut actual_owners = None;
+            with_cpu_diagnostic_headroom(AMPLE, || {
+                request.run_resident_observing(|conditioning| {
+                    // Logical payload metadata of the ACTUAL borrowed outputs. A sliced caption
+                    // may retain a larger hidden-state parent; these are NOT parent allocation
+                    // bytes, physical lower bounds or a process-footprint certificate.
+                    let owners = (
+                        mlx_gen::ios_quantum::bytes(&conditioning.cond),
+                        mlx_gen::ios_quantum::bytes(&conditioning.cond_mask),
+                        conditioning.uncond.is_some(),
+                    );
+                    assert!(
+                        actual_owners.replace(owners).is_none(),
+                        "one actual conditioning owner set per warm run"
+                    );
+                })
+            })
+            .unwrap();
+            let (caption_bytes, mask_bytes, has_uncond) =
+                actual_owners.expect("actual resident conditioning producer must be observed");
+            assert_eq!(
+                has_uncond, !sprint,
+                "Sprint is CFG-free; base fixture actually encodes the negative prompt"
+            );
+            let one_prompt = caption_bytes.checked_add(mask_bytes).unwrap();
+            assert!(caption_bytes > 0 && mask_bytes > 0);
+            let quanta = priced_quanta(&facts, &request.plan()).unwrap();
+            let conditioning: Vec<_> = quanta
+                .iter()
+                .filter(|q| q.phase == IosPhase::Conditioning)
+                .collect();
+            let per_pass = usize::try_from(facts.gemma.num_layers)
+                .unwrap()
+                .checked_add(2)
+                .unwrap();
+            assert_eq!(
+                conditioning.len(),
+                per_pass * if has_uncond { 2 } else { 1 },
+                "every actual Gemma pass is present, including CFG-free absence"
+            );
+            for (index, q) in conditioning.into_iter().enumerate() {
+                let held = if has_uncond && index >= per_pass {
+                    one_prompt
+                } else {
+                    0
+                };
+                assert_eq!(
+                    q.window.resident_bytes, expected,
+                    "{tier} sprint={sprint} {} structural warm encoder/decoder inventory exactly once",
+                    q.label
+                );
+                assert_eq!(q.window.held_bytes, held,
+                    "{tier} sprint={sprint} {} actual first-prompt logical owner during negative encode",
+                    q.label);
+                assert_eq!(
+                    q.resident_bytes,
+                    expected.checked_add(held).unwrap(),
+                    "{tier} sprint={sprint} {} aggregate structural plus actual held payload",
+                    q.label
+                );
+            }
+        }
+    }
+}
+
+/// Legacy positive additivity regression, still requiring a source-correlated verdict. Logical
+/// counts and the legacy mode inventory do not prove text-anchor inheritance. Preserve the real
+/// positive assertions; Uncertified must not become passing refusal or a capture-family collapse.
 #[test]
 fn every_mode_is_derivable_from_the_text_anchor() {
     if !in_cpu_child("every_mode_is_derivable_from_the_text_anchor") {
         return;
     }
-    assert!(super::IOS_NON_ADDITIVE_MODES.is_empty());
+    let _completion = CpuChildCompletion;
+    // No additivity certificate is inferred from the legacy inventory.
     let failures = prove_all(|_, _| {}, TIERS.len());
     assert!(failures.is_empty(), "not additive: {failures:#?}");
 }
@@ -669,6 +1039,7 @@ fn dropping_the_carried_sampler_state_breaks_the_proof() {
     if !in_cpu_child("dropping_the_carried_sampler_state_breaks_the_proof") {
         return;
     }
+    let _completion = CpuChildCompletion;
     let latent = tensor_bytes(4, &[32 * u64::from(EDGE / 32) * u64::from(EDGE / 32)]);
     let failures = prove_all(
         |request, pricing| {

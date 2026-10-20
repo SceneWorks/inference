@@ -576,7 +576,7 @@ impl ZImageControlTransformer {
 
         // iOS: every stage is one bounded quantum (see `ZImageTransformer::forward_with_rungs`);
         // pass-throughs off device.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let backend = mlx_gen::ios_quantum::Backend::current;
         let quanta = mlx_gen::ios_quantum::enabled();
         let cfg = &self.base.cfg;
@@ -825,6 +825,10 @@ impl AdaptableHost for ZImageControlTransformer {
         // ControlNet weights, never adapter targets). Delegate the whole path to the composed base.
         self.base.adaptable_mut(path)
     }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        self.base.adaptable_paths()
+    }
 }
 
 /// One ControlNet block as one iOS quantum: (block 0) the `before_proj` seed added to the base
@@ -939,6 +943,236 @@ fn patchify_control(cc: &Array, patch_size: i32, f_patch_size: i32) -> Result<Ar
     let ori = ft * ht * wt;
     let pad = (-(ori as i64)).rem_euclid(32) as i32;
     crate::transformer::pad_rows(&tokens, pad)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod adapter_namespace_proofs {
+    use super::*;
+    use crate::transformer::ZImageTransformerConfig;
+    use mlx_gen::adapters::Adapter;
+    use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write;
+
+    const CHILD: &str = "ZIMAGE_CONTROL_ADAPTER_NAMESPACE_CPU_CHILD";
+    const DONE: &str = "ZIMAGE_CONTROL_ADAPTER_NAMESPACE_CPU_DONE";
+    const FQN: &str = "control_transformer::adapter_namespace_proofs::control_host_exposes_base_kohya_paths_and_strict_adapter_batch";
+
+    struct Completion;
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert_eq!(unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) }, 0,
+                    "Control namespace CPU synchronization after fixture owners dropped");
+                std::fs::write(std::env::var(DONE).expect("fresh completion path"), b"ok")
+                    .expect("write Control namespace completion");
+            }
+        }
+    }
+
+    type Shapes = BTreeMap<String, Vec<usize>>;
+    fn linear(out: &mut Shapes, base: &str, rows: usize, cols: usize, bias: bool) {
+        assert!(out.insert(format!("{base}.weight"), vec![rows, cols]).is_none());
+        if bias { assert!(out.insert(format!("{base}.bias"), vec![rows]).is_none()); }
+    }
+    fn block(out: &mut Shapes, prefix: &str, dim: usize, heads: usize, modulation: bool) {
+        for path in ["attention.to_q", "attention.to_k", "attention.to_v", "attention.to_out.0",
+                     "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"] {
+            linear(out, &format!("{prefix}.{path}"), dim, dim, false);
+        }
+        for (path, width) in [("attention.norm_q.weight", dim / heads),
+                              ("attention.norm_k.weight", dim / heads),
+                              ("attention_norm1.weight", dim), ("attention_norm2.weight", dim),
+                              ("ffn_norm1.weight", dim), ("ffn_norm2.weight", dim)] {
+            assert!(out.insert(format!("{prefix}.{path}"), vec![width]).is_none());
+        }
+        if modulation { linear(out, &format!("{prefix}.adaLN_modulation.0"), 4 * dim, dim, true); }
+    }
+
+    /// Real file-backed model handles. Only adapter files carry small, NONZERO rank-one F32
+    /// payloads; parent model files have sparse BF16 extents and are never materialized here.
+    fn tensor_file(root: &std::path::Path, name: &str, shapes: &Shapes, adapter_payload: bool) -> std::path::PathBuf {
+        let width: u64 = if adapter_payload { 4 } else { 2 };
+        let mut offset = 0u64;
+        let mut header = serde_json::Map::new();
+        for (key, shape) in shapes {
+            let bytes = shape.iter().try_fold(width, |n, &dim| n.checked_mul(dim as u64)).unwrap();
+            header.insert(key.clone(), serde_json::json!({"dtype": if adapter_payload { "F32" } else { "BF16" },
+                "shape": shape, "data_offsets": [offset, offset + bytes]}));
+            offset += bytes;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while header.len() % 8 != 0 { header.push(b' '); }
+        let path = root.join(format!("{name}.safetensors"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        if adapter_payload {
+            for _ in 0..offset / 4 { file.write_all(&0.125_f32.to_le_bytes()).unwrap(); }
+        } else {
+            file.set_len(8 + header.len() as u64 + offset).unwrap();
+        }
+        path
+    }
+
+    fn actual_control(root: &std::path::Path, cfg: &ZImageTransformerConfig) -> ZImageControlTransformer {
+        let d = cfg.dim as usize;
+        let patch_in = (cfg.in_channels * cfg.patch_size * cfg.patch_size * cfg.f_patch_size) as usize;
+        let mut base = Shapes::new();
+        linear(&mut base, "all_x_embedder.2-1", d, patch_in, true);
+        base.insert("cap_embedder.0.weight".into(), vec![cfg.cap_feat_dim as usize]);
+        linear(&mut base, "cap_embedder.1", d, cfg.cap_feat_dim as usize, true);
+        linear(&mut base, "t_embedder.linear1", d, cfg.frequency_embedding_size as usize, true);
+        linear(&mut base, "t_embedder.linear2", d, d, true);
+        linear(&mut base, "all_final_layer.2-1.linear", patch_in, d, true);
+        linear(&mut base, "all_final_layer.2-1.adaLN_modulation.0", d, d, true);
+        base.insert("x_pad_token".into(), vec![d]);
+        base.insert("cap_pad_token".into(), vec![d]);
+        for (stack, count, modulation) in [("layers", cfg.n_layers, true),
+                                          ("noise_refiner", cfg.n_refiner_layers, true),
+                                          ("context_refiner", cfg.n_refiner_layers, false)] {
+            for index in 0..count { block(&mut base, &format!("{stack}.{index}"), d, cfg.n_heads as usize, modulation); }
+        }
+        let source = Weights::from_file(tensor_file(root, "base-model-metadata", &base, false)).unwrap();
+        // This is the production constructor, including its real small weightless RoPE constants.
+        // Those constants are not fake carriers, not claimed allocation-free, and need no forward.
+        let base = ZImageTransformer::from_weights(&source, "", cfg.clone()).unwrap();
+        let mut control = Shapes::new();
+        let control_in = ((2 * cfg.in_channels + 1) * cfg.patch_size * cfg.patch_size * cfg.f_patch_size) as usize;
+        linear(&mut control, "control_all_x_embedder.2-1", d, control_in, true);
+        for (stack, count) in [("control_layers", CONTROL_LAYERS_PLACES.len()),
+                               ("control_noise_refiner", CONTROL_REFINER_PLACES.len())] {
+            for index in 0..count {
+                let prefix = format!("{stack}.{index}");
+                block(&mut control, &prefix, d, cfg.n_heads as usize, true);
+                linear(&mut control, &format!("{prefix}.after_proj"), d, d, true);
+                if index == 0 { linear(&mut control, &format!("{prefix}.before_proj"), d, d, true); }
+            }
+        }
+        let control = Weights::from_file(tensor_file(root, "control-model-metadata", &control, false)).unwrap();
+        ZImageControlTransformer::from_weights(base, &control, "").unwrap()
+    }
+
+    fn independent_kohya_paths(cfg: &ZImageTransformerConfig) -> BTreeSet<String> {
+        // Literal trained-file schema, NOT control/base.adaptable_paths or header-target helpers.
+        let mut expected = BTreeSet::new();
+        for (stack, count, modulation) in [("layers", cfg.n_layers, true),
+                                          ("noise_refiner", cfg.n_refiner_layers, true),
+                                          ("context_refiner", cfg.n_refiner_layers, false)] {
+            for index in 0..count {
+                for leaf in ["attention.to_q", "attention.to_k", "attention.to_v", "attention.to_out.0",
+                             "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"] {
+                    expected.insert(format!("{stack}.{index}.{leaf}"));
+                }
+                if modulation { expected.insert(format!("{stack}.{index}.adaLN_modulation.0")); }
+            }
+        }
+        expected
+    }
+
+    fn spec(path: std::path::PathBuf) -> AdapterSpec {
+        AdapterSpec { path, kind: AdapterKind::Lora, scale: 1.0, pass_scales: None, moe_expert: None }
+    }
+
+    #[test]
+    fn control_host_exposes_base_kohya_paths_and_strict_adapter_batch() {
+        let mut completion: Option<Completion> = None; // FIRST None, true final arm below.
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("done");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env(DONE, &marker).status().unwrap();
+            assert!(status.success(), "Control namespace CPU child failed");
+            assert_eq!(std::fs::read(marker).expect("fresh normal-completion marker").as_slice(), b"ok");
+            return;
+        }
+        // BEFORE any source file, Array, or actual model constructor.
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
+        assert_eq!(mlx_rs::Device::try_default().unwrap(), mlx_rs::Device::cpu());
+        assert_eq!(unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) }, 0);
+        assert_eq!(mlx_rs::Stream::new().get_index().unwrap(), mlx_rs::Stream::cpu().get_index().unwrap());
+        eprintln!("ZIMAGE_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1");
+        let mut completed = 0u8;
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = ZImageTransformerConfig::turbo();
+            cfg.dim = 8;
+            cfg.n_heads = 1;
+            cfg.cap_feat_dim = 8;
+            cfg.frequency_embedding_size = 8;
+            cfg.axes_dims = vec![2, 2, 4];
+            cfg.axes_lens = vec![2, 2, 2];
+            // Preserve the real injection topology/counts; make only widths and RoPE tables small.
+            let mut control = actual_control(dir.path(), &cfg);
+            let expected = independent_kohya_paths(&cfg);
+            let actual = control.adaptable_paths();
+            assert_eq!(actual.iter().cloned().collect::<BTreeSet<_>>(), expected,
+                "CONTROL-ADAPTER-NAMESPACE: actual Control host must expose the independent base Kohya path schema");
+            assert_eq!(actual.len(), expected.len(), "Control namespace has no duplicate paths");
+            for path in &expected {
+                let parts = path.split('.').collect::<Vec<_>>();
+                assert!(control.adaptable_mut(&parts).is_some(), "real Control mutable target absent: {path}");
+            }
+            assert!(!actual.iter().any(|p| p.starts_with("control_")));
+            assert!(control.adaptable_mut(&["control_layers", "0", "attention", "to_q"]).is_none());
+            completed |= 1;
+            eprintln!("ZIMAGE_CONTROL_ADAPTER_NAMESPACE_MECHANISM_V1 index=0");
+            let global = "cap_embedder.1";
+            assert!(!expected.contains(global), "PEFT globals are not added to Kohya enumeration");
+            assert!(control.adaptable_mut(&["cap_embedder", "1"]).is_some());
+            completed |= 2;
+            eprintln!("ZIMAGE_CONTROL_ADAPTER_NAMESPACE_MECHANISM_V1 index=1");
+            let d = cfg.dim as usize;
+            let orphan = tensor_file(dir.path(), "orphan-peft", &Shapes::from([
+                ("layers.0.attention.to_v.lora_A.weight".into(), vec![1, d]),
+            ]), true);
+            let kohya = tensor_file(dir.path(), "matching-kohya", &Shapes::from([
+                ("lora_unet_layers_0_attention_to_q.lora_down.weight".into(), vec![1, d]),
+                ("lora_unet_layers_0_attention_to_q.lora_up.weight".into(), vec![d, 1]),
+            ]), true);
+            let peft = tensor_file(dir.path(), "matching-peft-global", &Shapes::from([
+                ("transformer.cap_embedder.1.lora_A.weight".into(), vec![1, cfg.cap_feat_dim as usize]),
+                ("transformer.cap_embedder.1.lora_B.weight".into(), vec![d, 1]),
+            ]), true);
+            // Actual shared strict wrapper in INPUT FILE ORDER. Its existing materialize_accessed
+            // reads only these tiny rank-one factors (no alpha, no parent-model weights/forward).
+            let report = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || {
+                crate::adapters::apply_z_image_adapters(&mut control,
+                    &[spec(orphan.clone()), spec(kohya), spec(peft)])
+            }).unwrap();
+            assert_eq!((report.applied, report.unmatched_paths.len()), (2, 0),
+                "CONTROL-ADAPTER-BATCH: aggregate matching accepts an orphan file alongside real Kohya and PEFT installs");
+            for (path, input) in [("layers.0.attention.to_q", d), (global, cfg.cap_feat_dim as usize)] {
+                let parts = path.split('.').collect::<Vec<_>>();
+                let target = control.adaptable_mut(&parts).unwrap();
+                assert_eq!(target.adapters().len(), 1, "actual target slot {path}");
+                match &target.adapters()[0] {
+                    Adapter::Lora { a, b, scale } => {
+                        assert_eq!((a.shape(), b.shape(), *scale), (&[input as i32, 1][..], &[1, d as i32][..], 1.0));
+                    }
+                    _ => panic!("wrong actual installed adapter variant at {path}"),
+                }
+            }
+            assert!(control.adaptable_mut(&["layers", "0", "attention", "to_v"]).unwrap().adapters().is_empty());
+            assert!(control.control_layers.iter().chain(control.control_noise_refiner.iter())
+                .flat_map(ZImageControlBlock::projections).all(|p| p.adapters().is_empty()));
+            completed |= 4;
+            eprintln!("ZIMAGE_CONTROL_ADAPTER_NAMESPACE_MECHANISM_V1 index=2");
+            let error = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || {
+                crate::adapters::apply_z_image_adapters(&mut control, &[spec(orphan)])
+            }).unwrap_err();
+            assert!(error.to_string().contains("no target modules matched"),
+                "orphan-only strict batch must refuse even when the host already carries adapters: {error}");
+            completed |= 8;
+            eprintln!("ZIMAGE_CONTROL_ADAPTER_NAMESPACE_MECHANISM_V1 index=3");
+        } // Actual model/file/factor/adapter owners dropped BEFORE final arm; no release claim.
+        assert_eq!(completed, 15, "all Control namespace/strict-batch mechanisms completed");
+        eprintln!("ZIMAGE_CONTROL_ADAPTER_NAMESPACE_BODY_COMPLETED_V1 mechanisms=4 fullmask=15 small_factor_io=1");
+        let _ = completion.replace(Completion);
+    }
 }
 
 #[cfg(test)]

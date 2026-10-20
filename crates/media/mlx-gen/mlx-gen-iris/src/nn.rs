@@ -126,6 +126,7 @@ pub struct AdaptedLinears {
     linears: RefCell<BTreeMap<String, AdaptableLinear>>,
     adapted: BTreeSet<String>,
     consumed: RefCell<BTreeSet<String>>,
+    load_facts: BTreeMap<String, crate::adapters::ProjectionAdapterLoadFacts>,
 }
 
 impl AdaptedLinears {
@@ -135,7 +136,36 @@ impl AdaptedLinears {
             linears: RefCell::new(linears),
             adapted,
             consumed: RefCell::new(BTreeSet::new()),
+            load_facts: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn with_load_facts(
+        mut self,
+        facts: BTreeMap<String, crate::adapters::ProjectionAdapterLoadFacts>,
+    ) -> Self {
+        self.load_facts = facts;
+        self
+    }
+
+    /// The actual ordered payload inventory before the Loader moves the projections into the
+    /// graph. Keys are the same upstream projection paths used by the header-only inventory.
+    pub fn adapter_facts(&self) -> crate::adapters::ProjectionAdapterFacts {
+        self.linears
+            .borrow()
+            .iter()
+            .filter(|(_, linear)| !linear.adapters().is_empty())
+            .map(|(path, linear)| {
+                (
+                    path.clone(),
+                    linear
+                        .adapters()
+                        .iter()
+                        .map(mlx_gen::adapters::facts::AdapterFacts::of)
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     /// Adapted paths no module consumed as a projection — must be empty after a model build.
@@ -216,9 +246,27 @@ impl Loader<'_> {
                     )));
                 }
                 adapted.consumed.borrow_mut().insert(prefix.to_owned());
-                // Every adapter factor is read and evaluated here, at the load boundary, so no
-                // forward ever waits on a lazy adapter read.
+                // Raw file reads and graph scalar construction are a separate guarded quantum.
+                // This is the ACTUAL lazy reconstruction boundary: all new casts, factor products,
+                // kron/Hadamard/einsum outputs are checked BEFORE evaluation allocates them. The
+                // already-held base/source tensors are deliberately absent from this scratch.
+                let load = adapted.load_facts.get(prefix);
+                if let Some(load) = load {
+                    mlx_gen::ios_quantum::before(
+                        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+                        load.materialize_scratch_bytes()?,
+                    )?;
+                }
+                // Every payload is evaluated at load, never on the first forward.
                 inner.materialize_adapters()?;
+                if load.is_some() {
+                    let arrays: Vec<&Array> =
+                        inner.adapters().iter().flat_map(|a| a.arrays()).collect();
+                    mlx_gen::ios_quantum::finish(
+                        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+                        &arrays,
+                    )?;
+                }
                 // A packed artifact's base is stored packed: the install acted on a zero-stride
                 // placeholder of its logical shape, and the adapters ride on the stored pack.
                 if let Some((mut packed, in_pad)) = self.packed(prefix, bias)? {
@@ -343,8 +391,9 @@ pub fn pack_projection(
 
 /// `nn.Linear` (`[out, in]` weight, stored in the compute dtype), as the repo's
 /// [`AdaptableLinear`]: the bare forward is `addmm(b, x, Wᵀ)` / `x·Wᵀ` exactly as before adapters
-/// existed, and an installed LoRA/LoKr adds its residual `Σ adapter(x)` on top (LoKr through the
-/// structured Kronecker product, never a materialized `[out, in]` delta).
+/// existed, and an installed LoRA/LoKr/LoHa adds its residual `Σ adapter(x)` on top. Iris's dense
+/// install host reconstructs LoKr/LoHa as materialized `[out, in]` deltas even over a packed base;
+/// packing the base does not change or re-install the adapter stack.
 pub struct Linear {
     inner: AdaptableLinear,
     compute: Dtype,
@@ -367,18 +416,29 @@ impl Linear {
         self.inner.forward(&x)
     }
 
-    /// The base parameters — dense weight and bias, or the packed codes, scales, biases and bias
-    /// (adapter factors are evaluated at load by the [`Loader`]).
+    /// All retained parameters: the dense/packed base AND the materialized adapter-owned
+    /// payloads. Transpose views are listed once; reconstruction-only source factors are absent.
     pub fn arrays(&self) -> Vec<&Array> {
-        if let Some((weight, bias)) = self.inner.dense_weight() {
-            return std::iter::once(weight).chain(bias).collect();
-        }
-        match self.inner.quantized_params() {
-            Some((codes, scales, biases, bias, _, _)) => {
-                [codes, scales, biases].into_iter().chain(bias).collect()
+        let mut arrays: Vec<&Array> = if let Some((weight, bias)) = self.inner.dense_weight() {
+            std::iter::once(weight).chain(bias).collect()
+        } else {
+            match self.inner.quantized_params() {
+                Some((codes, scales, biases, bias, _, _)) => {
+                    [codes, scales, biases].into_iter().chain(bias).collect()
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
-        }
+        };
+        arrays.extend(self.inner.adapters().iter().flat_map(|a| a.arrays()));
+        arrays
+    }
+
+    pub fn adapter_facts(&self) -> Vec<mlx_gen::adapters::facts::AdapterFacts> {
+        self.inner
+            .adapters()
+            .iter()
+            .map(mlx_gen::adapters::facts::AdapterFacts::of)
+            .collect()
     }
 
     /// The checkpoint's `[out, in]`, whatever the projection is held as.

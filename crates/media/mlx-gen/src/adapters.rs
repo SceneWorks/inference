@@ -22,7 +22,24 @@ use crate::array::scalar;
 use crate::nn::quantized_matmul_with_bias;
 use crate::Result;
 
+pub mod facts;
 pub mod loader;
+
+/// Default actual LyCORIS residual dtype, shared with header-only host normalization.
+pub const DEFAULT_LYCORIS_DTYPE: Dtype = Dtype::Bfloat16;
+
+/// The existing PEFT/global-metadata scale gate, shared with allocation-free header facts.
+/// Third-party per-module rank selection is a different format mechanism in `loader`.
+pub fn validate_lokr_metadata_scale(alpha: f32, rank: f32) -> Result<()> {
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be > 0 and \
+            alpha finite — a `rank = 0` / non-finite `alpha` would make the delta NaN"
+        )
+        .into());
+    }
+    Ok(())
+}
 
 /// Reconstruct a LoKr weight delta `ΔW = (alpha/rank) · kron(w1, w2)`, reshaped to the
 /// base weight's logical `[out, in]` and cast to `out_dtype`. Each Kronecker factor is either
@@ -50,13 +67,7 @@ pub fn reconstruct_lokr_delta(
     // subsequent render while the load reports success. `lora_delta` already rejects rank 0 (sc-5252),
     // but this middle path was missed; hoisting the guard here retires the class rather than patching
     // each callsite.
-    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
-        return Err(format!(
-            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be > 0 and \
-             alpha finite — a `rank = 0` / non-finite `alpha` would make the delta NaN"
-        )
-        .into());
-    }
+    validate_lokr_metadata_scale(alpha, rank)?;
     // The SceneWorks peft path bakes `alpha/rank` as the scale and is always linear (no tucker
     // factor, equal-rank factors) — delegate to the general scaled form, which is then byte-identical.
     reconstruct_lokr_delta_scaled(
@@ -175,6 +186,24 @@ pub struct LokrFactors {
     pub scale: f32,
 }
 
+/// Exact selector shared by actual packed installation and header normalization.
+pub fn lokr_structured_layout(
+    base_shape: &[i32],
+    factor1_shape: &[i32],
+    factor2_shape: &[i32],
+    has_tucker: bool,
+) -> Option<[i32; 4]> {
+    if has_tucker || base_shape.len() != 2 || factor1_shape.len() != 2 || factor2_shape.len() != 2 {
+        return None;
+    }
+    let (a, c) = (factor1_shape[0], factor1_shape[1]);
+    let (b, d) = (factor2_shape[0], factor2_shape[1]);
+    if a.checked_mul(b) != Some(base_shape[0]) || c.checked_mul(d) != Some(base_shape[1]) {
+        return None;
+    }
+    Some([a, b, c, d])
+}
+
 /// Build the small [`LokrFactors`] from a LoKr module's factors (full `w1`/`w2` or low-rank
 /// `w_a·w_b`), baking `scale` into `w2` and casting to `out_dtype` — the deferred, allocation-free
 /// counterpart to [`reconstruct_lokr_delta_scaled`] (which materializes the full `[out, in]` delta).
@@ -220,17 +249,16 @@ pub fn build_lokr_factors(
         (_, Some(a), Some(b)) => matmul(a, b)?,
         _ => return Err("LoKr: w2 missing (need full w2 or w2_a@w2_b)".into()),
     };
-    // A conv-shaped factor (>2-D) is likewise not a plain matrix — defer to materialization.
-    if factor1.shape().len() != 2 || factor2.shape().len() != 2 {
+    // A conv factor or a factor/base mismatch retains the materialization fallback. Metadata
+    // normalization consumes this same selector rather than inferring structured storage from kind.
+    let Some([a, b, c, d]) = lokr_structured_layout(
+        base_shape,
+        factor1.shape(),
+        factor2.shape(),
+        w2_t2.is_some(),
+    ) else {
         return Ok(None);
-    }
-    let (a, c) = (factor1.shape()[0], factor1.shape()[1]);
-    let (b, d) = (factor2.shape()[0], factor2.shape()[1]);
-    // The base must factor as `out = a·b`, `in = c·d` (a 2-element logical shape). Anything else
-    // (a conv weight with kernel dims, or a factor/base mismatch) is not this linear vec-trick.
-    if base_shape.len() != 2 || a * b != base_shape[0] || c * d != base_shape[1] {
-        return Ok(None);
-    }
+    };
     // Bake `scale` into `w2` (either factor works; `w2` keeps `w1` a clean copy) and match dtype.
     let factor2 = multiply(&factor2, scalar(scale))?.as_dtype(out_dtype)?;
     let factor1 = factor1.as_dtype(out_dtype)?;
@@ -371,14 +399,18 @@ impl Adapter {
     /// payload can first touch disk after the pin's post-check. Base Linear weights are intentionally
     /// absent from this evaluation set.
     pub fn materialize(&self) -> Result<()> {
-        match self {
-            Adapter::Lora { a, b, .. } => mlx_rs::transforms::eval([a, b])?,
-            Adapter::Lokr { delta, .. } => mlx_rs::transforms::eval([delta])?,
-            Adapter::LokrStructured { factors } => {
-                mlx_rs::transforms::eval([&factors.w1, &factors.w2])?
-            }
-        }
+        mlx_rs::transforms::eval(self.arrays())?;
         Ok(())
+    }
+
+    /// The adapter-owned payloads, without base parameters or reconstruction-only inputs.
+    /// Transpose/reshape views alias these payloads rather than adding another parameter.
+    pub fn arrays(&self) -> Vec<&Array> {
+        match self {
+            Adapter::Lora { a, b, .. } => vec![a, b],
+            Adapter::Lokr { delta, .. } => vec![delta],
+            Adapter::LokrStructured { factors } => vec![&factors.w1, &factors.w2],
+        }
     }
 
     /// One adapter's forward-time contribution `scale · …`, replicating the fork's `LoRALinear`
@@ -1151,7 +1183,7 @@ pub trait AdaptableHost {
     /// sc-2609), which every fork-parity family relies on; a host computing in f32 (e.g. Iris under
     /// `Precision::Fp32`) overrides it so the adapter is not rounded below its own compute.
     fn lycoris_dtype(&self) -> Dtype {
-        Dtype::Bfloat16
+        DEFAULT_LYCORIS_DTYPE
     }
 
     /// Resolve a dotted path to the [`AdaptableConv2d`] living there, for conv-layer LoRA merging

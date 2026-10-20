@@ -73,9 +73,26 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
     ) -> Result<L::Latent> {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
+            ops.observe_solver(SolverObservation::callback(
+                Solver::EulerAncestral,
+                i,
+                sigma,
+                sigmas[i + 1],
+                SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 x = x0;
+                ops.observe_solver(SolverObservation::update(
+                    Solver::EulerAncestral,
+                    i,
+                    sigma,
+                    sigmas[i + 1],
+                    &x,
+                    true,
+                    false,
+                ));
                 continue;
             }
             let (sd, su) = ancestral_step(sigma, sigmas[i + 1], self.eta);
@@ -85,6 +102,15 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
                 let noise = ops.randn_like(&x, seed, i)?;
                 x = ops.axpy(1.0, &x, su, &noise)?;
             }
+            ops.observe_solver(SolverObservation::update(
+                Solver::EulerAncestral,
+                i,
+                sigma,
+                sigmas[i + 1],
+                &x,
+                false,
+                su > 0.0,
+            ));
         }
         Ok(x)
     }
@@ -112,9 +138,26 @@ impl<L: LatentOps> Sampler<L> for Heun {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(SolverObservation::callback(
+                Solver::Heun,
+                i,
+                sigma,
+                s_next,
+                SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 x = x0;
+                ops.observe_solver(SolverObservation::update(
+                    Solver::Heun,
+                    i,
+                    sigma,
+                    s_next,
+                    &x,
+                    true,
+                    false,
+                ));
                 continue;
             }
             let d = to_d(ops, &x, sigma, &x0)?;
@@ -123,11 +166,31 @@ impl<L: LatentOps> Sampler<L> for Heun {
                 x = ops.axpy(1.0, &x, dt, &d)?;
             } else {
                 let x2 = ops.axpy(1.0, &x, dt, &d)?;
+                ops.observe_solver(
+                    SolverObservation::callback(
+                        Solver::Heun,
+                        i,
+                        s_next,
+                        s_next,
+                        SolverEvaluation::HeunCorrector,
+                        &x2,
+                    )
+                    .outer(Some(&x), Some(&x0), Some(&d)),
+                );
                 let x0_2 = denoise(&x2, s_next)?;
                 let d2 = to_d(ops, &x2, s_next, &x0_2)?;
                 let d_prime = ops.axpy(0.5, &d, 0.5, &d2)?;
                 x = ops.axpy(1.0, &x, dt, &d_prime)?;
             }
+            ops.observe_solver(SolverObservation::update(
+                Solver::Heun,
+                i,
+                sigma,
+                s_next,
+                &x,
+                false,
+                false,
+            ));
         }
         Ok(x)
     }
@@ -157,18 +220,37 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::Dpmpp2m,
+                    i,
+                    sigma,
+                    s_next,
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .history(old_x0.as_ref(), None, None),
+            );
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 // Degenerate leading σ==0 (no real schedule starts here): land on x0, avoid the
                 // λ(0)/coeff_x = s_next/σ division. Mirrors every sibling solver's leading guard.
                 x = x0.clone();
                 old_x0 = Some(x0);
+                ops.observe_solver(
+                    SolverObservation::update(Solver::Dpmpp2m, i, sigma, s_next, &x, true, false)
+                        .history(old_x0.as_ref(), None, None),
+                );
                 continue;
             }
             if s_next == 0.0 {
                 // Terminal: land on the denoised estimate (the 1st-order limit).
                 x = x0.clone();
                 old_x0 = Some(x0);
+                ops.observe_solver(
+                    SolverObservation::update(Solver::Dpmpp2m, i, sigma, s_next, &x, true, false)
+                        .history(old_x0.as_ref(), None, None),
+                );
                 continue;
             }
             let t = lambda(sigma);
@@ -184,11 +266,30 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
                     // denoised_d = (1 + 1/(2r))·x0 − (1/(2r))·old_x0
                     let a = 1.0 + 1.0 / (2.0 * r);
                     let b = -1.0 / (2.0 * r);
-                    ops.axpy(a as f32, &x0, b as f32, old)?
+                    let corrected = ops.axpy(a as f32, &x0, b as f32, old)?;
+                    ops.observe_solver(
+                        SolverObservation::update(
+                            Solver::Dpmpp2m,
+                            i,
+                            sigma,
+                            s_next,
+                            &corrected,
+                            false,
+                            false,
+                        )
+                        .history(old_x0.as_ref(), None, None)
+                        .stage(2)
+                        .correction(),
+                    );
+                    corrected
                 }
             };
             x = ops.axpy(coeff_x, &x, coeff_x0, &denoised_d)?;
             old_x0 = Some(x0);
+            ops.observe_solver(
+                SolverObservation::update(Solver::Dpmpp2m, i, sigma, s_next, &x, false, false)
+                    .history(old_x0.as_ref(), None, None),
+            );
         }
         Ok(x)
     }
@@ -226,15 +327,41 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(SolverObservation::callback(
+                Solver::DpmppSde,
+                i,
+                sigma,
+                s_next,
+                SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 x = x0;
+                ops.observe_solver(SolverObservation::update(
+                    Solver::DpmppSde,
+                    i,
+                    sigma,
+                    s_next,
+                    &x,
+                    true,
+                    false,
+                ));
                 continue;
             }
             if s_next == 0.0 {
                 // Terminal: plain Euler onto the denoised estimate.
                 let d = to_d(ops, &x, sigma, &x0)?;
                 x = ops.axpy(1.0, &x, s_next - sigma, &d)?;
+                ops.observe_solver(SolverObservation::update(
+                    Solver::DpmppSde,
+                    i,
+                    sigma,
+                    s_next,
+                    &x,
+                    false,
+                    false,
+                ));
                 continue;
             }
             let t = lambda(sigma);
@@ -253,6 +380,17 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
                 let noise1 = ops.randn_like(&x2, seed, 2 * i)?;
                 x2 = ops.axpy(1.0, &x2, su1, &noise1)?;
             }
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::DpmppSde,
+                    i,
+                    sigma_s,
+                    s_next,
+                    SolverEvaluation::SdeMidpoint,
+                    &x2,
+                )
+                .outer(Some(&x), Some(&x0), None),
+            );
             let x0_2 = denoise(&x2, sigma_s)?;
 
             // Full step using the midpoint denoised (fac = 1/(2r) = 1 -> denoised_d = x0_2), noised.
@@ -265,6 +403,15 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
                 let noise2 = ops.randn_like(&x, seed, 2 * i + 1)?;
                 x = ops.axpy(1.0, &x, su2, &noise2)?;
             }
+            ops.observe_solver(SolverObservation::update(
+                Solver::DpmppSde,
+                i,
+                sigma,
+                s_next,
+                &x,
+                false,
+                su1 > 0.0 || su2 > 0.0,
+            ));
         }
         Ok(x)
     }
@@ -296,6 +443,17 @@ impl<L: LatentOps> Sampler<L> for UniPc {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::UniPc,
+                    i,
+                    sigma,
+                    s_next,
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .history(prev_x0.as_ref(), None, last_sample.as_ref()),
+            );
             let x0 = denoise(&x, sigma)?;
 
             // Corrector: refine x_i (predicted at step i-1) using the fresh x0_i. Order-2 corrector
@@ -305,11 +463,21 @@ impl<L: LatentOps> Sampler<L> for UniPc {
                 let phi = (sigma / s_prev) - 1.0; // expm1(−h_corr)
                 let blend = ops.axpy(0.5, prev, 0.5, &x0)?; // 0.5·(x0_{i-1}+x0_i)
                 x = ops.axpy(sigma / s_prev, ls, -phi, &blend)?;
+                ops.observe_solver(
+                    SolverObservation::update(Solver::UniPc, i, sigma, s_next, &x, false, false)
+                        .history(prev_x0.as_ref(), None, last_sample.as_ref())
+                        .stage(2)
+                        .correction(),
+                );
             }
 
             if s_next == 0.0 {
                 // Terminal: land on the (corrected-then-)denoised estimate.
                 x = x0;
+                ops.observe_solver(
+                    SolverObservation::update(Solver::UniPc, i, sigma, s_next, &x, true, false)
+                        .history(prev_x0.as_ref(), None, last_sample.as_ref()),
+                );
                 break;
             }
 
@@ -328,6 +496,10 @@ impl<L: LatentOps> Sampler<L> for UniPc {
             prev_x0 = Some(x0);
             last_sample = Some(x);
             x = x_next;
+            ops.observe_solver(
+                SolverObservation::update(Solver::UniPc, i, sigma, s_next, &x, false, false)
+                    .history(prev_x0.as_ref(), None, last_sample.as_ref()),
+            );
         }
         Ok(x)
     }
@@ -355,6 +527,14 @@ impl<L: LatentOps> Sampler<L> for Lcm {
         seed: u64,
     ) -> Result<L::Latent> {
         for i in 0..sigmas.len().saturating_sub(1) {
+            ops.observe_solver(SolverObservation::callback(
+                Solver::Lcm,
+                i,
+                sigmas[i],
+                sigmas[i + 1],
+                SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigmas[i])?;
             x = x0;
             let s_next = sigmas[i + 1];
@@ -367,6 +547,15 @@ impl<L: LatentOps> Sampler<L> for Lcm {
                 let (k_noise, k_x0) = ms.noise_scaling_coeffs(s_next);
                 x = ops.axpy(k_x0, &x, k_noise, &noise)?;
             }
+            ops.observe_solver(SolverObservation::update(
+                Solver::Lcm,
+                i,
+                sigmas[i],
+                s_next,
+                &x,
+                s_next <= 0.0,
+                s_next > 0.0,
+            ));
         }
         Ok(x)
     }
@@ -394,13 +583,39 @@ impl<L: LatentOps> Sampler<L> for Ddim {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(SolverObservation::callback(
+                Solver::Ddim,
+                i,
+                sigma,
+                s_next,
+                SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 x = x0;
+                ops.observe_solver(SolverObservation::update(
+                    Solver::Ddim,
+                    i,
+                    sigma,
+                    s_next,
+                    &x,
+                    true,
+                    false,
+                ));
                 continue;
             }
             let ratio = s_next / sigma;
             x = ops.axpy(ratio, &x, 1.0 - ratio, &x0)?;
+            ops.observe_solver(SolverObservation::update(
+                Solver::Ddim,
+                i,
+                sigma,
+                s_next,
+                &x,
+                false,
+                false,
+            ));
         }
         Ok(x)
     }
@@ -459,14 +674,34 @@ impl<L: LatentOps> Sampler<L> for ErSde {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            let stage_used = max_stage.min(i + 1);
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::ErSde,
+                    i,
+                    sigma,
+                    s_next,
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .history(old_denoised.as_ref(), old_denoised_d.as_ref(), None)
+                .stage(if is_terminal(sigma) || s_next == 0.0 {
+                    0
+                } else {
+                    stage_used as u8
+                }),
+            );
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) || s_next == 0.0 {
                 // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
                 x = x0.clone();
                 old_denoised = Some(x0);
+                ops.observe_solver(
+                    SolverObservation::update(Solver::ErSde, i, sigma, s_next, &x, true, false)
+                        .history(old_denoised.as_ref(), old_denoised_d.as_ref(), None),
+                );
                 continue;
             }
-            let stage_used = max_stage.min(i + 1);
             // VE-sigma space: er_lambda == σ, α == 1 (so r_alpha == 1 and the α_t prefactors drop out).
             let lam_s = sigma as f64;
             let lam_t = s_next as f64;
@@ -499,6 +734,20 @@ impl<L: LatentOps> Sampler<L> for ErSde {
                 let denoised_d = ops.axpy(inv_d as f32, &x0, -inv_d as f32, old)?;
                 let c2 = (dt + s_int * phi_t) as f32;
                 x_next = ops.axpy(1.0, &x_next, c2, &denoised_d)?;
+                ops.observe_solver(
+                    SolverObservation::update(
+                        Solver::ErSde,
+                        i,
+                        sigma,
+                        s_next,
+                        &x_next,
+                        false,
+                        false,
+                    )
+                    .history(old_denoised.as_ref(), old_denoised_d.as_ref(), None)
+                    .stage(2)
+                    .correction(),
+                );
 
                 if stage_used >= 3 {
                     // Stage 3: denoised_u = (denoised_d − old_denoised_d)/((σ_i − σ_{i-2})/2);
@@ -510,21 +759,42 @@ impl<L: LatentOps> Sampler<L> for ErSde {
                     let denoised_u = ops.axpy(inv_u as f32, &denoised_d, -inv_u as f32, old_d)?;
                     let c3 = (dt * dt / 2.0 + s_u_int * phi_t) as f32;
                     x_next = ops.axpy(1.0, &x_next, c3, &denoised_u)?;
+                    ops.observe_solver(
+                        SolverObservation::update(
+                            Solver::ErSde,
+                            i,
+                            sigma,
+                            s_next,
+                            &x_next,
+                            false,
+                            false,
+                        )
+                        .history(old_denoised.as_ref(), old_denoised_d.as_ref(), None)
+                        .stage(3)
+                        .correction(),
+                    );
                 }
                 old_denoised_d = Some(denoised_d);
             }
 
             // Fresh per-step noise: x += s_noise·√max(σ_{i+1}² − σ_i²·r², 0)·ε (nan_to_num guard).
             x = x_next;
+            let mut noise_drawn = false;
             if self.s_noise > 0.0 {
                 let var = lam_t * lam_t - lam_s * lam_s * r * r;
                 let noise_coeff = self.s_noise as f64 * var.max(0.0).sqrt();
                 if noise_coeff != 0.0 {
                     let noise = ops.randn_like(&x, seed, i)?;
                     x = ops.axpy(1.0, &x, noise_coeff as f32, &noise)?;
+                    noise_drawn = true;
                 }
             }
             old_denoised = Some(x0);
+            ops.observe_solver(
+                SolverObservation::update(Solver::ErSde, i, sigma, s_next, &x, false, noise_drawn)
+                    .history(old_denoised.as_ref(), old_denoised_d.as_ref(), None)
+                    .stage(stage_used as u8),
+            );
         }
         Ok(x)
     }
@@ -573,11 +843,36 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::Dpmpp2mSde,
+                    i,
+                    sigma,
+                    s_next,
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .history(old_denoised.as_ref(), None, None)
+                .scalar_history(h_last.is_some()),
+            );
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) || s_next == 0.0 {
                 // Terminal (or degenerate leading σ==0): land on the denoised estimate, no noise.
                 x = x0.clone();
                 old_denoised = Some(x0);
+                ops.observe_solver(
+                    SolverObservation::update(
+                        Solver::Dpmpp2mSde,
+                        i,
+                        sigma,
+                        s_next,
+                        &x,
+                        true,
+                        false,
+                    )
+                    .history(old_denoised.as_ref(), None, None)
+                    .scalar_history(h_last.is_some()),
+                );
                 continue;
             }
             // VE-sigma space: λ = −ln σ, α_t = 1.
@@ -593,19 +888,49 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2mSde {
                 let c = (0.5 * (-(-h_eta).exp_m1()) / r) as f32;
                 let diff = ops.axpy(1.0, &x0, -1.0, old)?; // x0 − old_x0
                 x_next = ops.axpy(1.0, &x_next, c, &diff)?;
+                ops.observe_solver(
+                    SolverObservation::update(
+                        Solver::Dpmpp2mSde,
+                        i,
+                        sigma,
+                        s_next,
+                        &x_next,
+                        false,
+                        false,
+                    )
+                    .history(old_denoised.as_ref(), None, None)
+                    .scalar_history(h_last.is_some())
+                    .stage(2)
+                    .correction(),
+                );
             }
             // Fresh per-step noise: x += σ_{i+1}·√(1 − e^{−2ηh})·s_noise·ε.
             x = x_next;
+            let mut noise_drawn = false;
             if eta > 0.0 && self.s_noise > 0.0 {
                 let noise_coeff =
                     s_next as f64 * (-(-2.0 * eta * h).exp_m1()).sqrt() * self.s_noise as f64;
                 if noise_coeff != 0.0 {
                     let noise = ops.randn_like(&x, seed, i)?;
                     x = ops.axpy(1.0, &x, noise_coeff as f32, &noise)?;
+                    noise_drawn = true;
                 }
             }
             old_denoised = Some(x0);
             h_last = Some(h);
+            ops.observe_solver(
+                SolverObservation::update(
+                    Solver::Dpmpp2mSde,
+                    i,
+                    sigma,
+                    s_next,
+                    &x,
+                    false,
+                    noise_drawn,
+                )
+                .history(old_denoised.as_ref(), None, None)
+                .scalar_history(h_last.is_some()),
+            );
         }
         Ok(x)
     }
@@ -673,6 +998,22 @@ impl Solver {
         )
     }
 
+    /// Smallest complete transition sequence that reaches this default factory's warm-up,
+    /// steady/nonterminal update and final branch. Capture PLANNING only; real observations must
+    /// independently witness the required history/correction/noise branches in the chosen mode.
+    pub fn minimum_capture_transitions(self) -> usize {
+        match self {
+            Self::ErSde => 4, // third-order correction at i=2 must have a nonzero next node
+            Self::Dpmpp2m | Self::Dpmpp2mSde | Self::UniPc => 3,
+            Self::Euler
+            | Self::EulerAncestral
+            | Self::Heun
+            | Self::DpmppSde
+            | Self::Lcm
+            | Self::Ddim => 2, // first/nonterminal + steady/final
+        }
+    }
+
     /// Every curated solver, in menu order.
     pub const ALL: [Solver; 10] = [
         Self::Euler,
@@ -701,6 +1042,236 @@ impl Solver {
             Self::ErSde => Box::new(ErSde::default()),
             Self::Dpmpp2mSde => Box::new(Dpmpp2mSde::default()),
         }
+    }
+}
+
+/// A borrowed ACTUAL execution event, emitted by the solver implementation, never by its plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SolverObservationKind {
+    Callback(SolverEvaluation),
+    Correction,
+    Update,
+}
+pub struct SolverObservation<'a, T> {
+    pub solver: Solver,
+    pub step: usize,
+    pub sigma: f32,
+    pub next_sigma: f32,
+    pub kind: SolverObservationKind,
+    pub current: &'a T,
+    /// Actual Option occupancy: previous denoised, previous derivative, previous sample.
+    pub history: [Option<&'a T>; 3],
+    /// Actual borrowed outer x/x0/d held across a second evaluation.
+    pub outer: [Option<&'a T>; 3],
+    pub correction_order: u8,
+    /// Actual h_last Option occupancy for DPM++2M-SDE (a scalar, not a tensor allocation).
+    pub scalar_history: bool,
+    pub cfg_pp: bool,
+    pub terminal_alias: bool,
+    pub noise: bool,
+}
+impl<'a, T> SolverObservation<'a, T> {
+    pub fn callback(
+        solver: Solver,
+        step: usize,
+        sigma: f32,
+        next_sigma: f32,
+        evaluation: SolverEvaluation,
+        current: &'a T,
+    ) -> Self {
+        Self {
+            solver,
+            step,
+            sigma,
+            next_sigma,
+            kind: SolverObservationKind::Callback(evaluation),
+            current,
+            history: [None, None, None],
+            outer: [None, None, None],
+            correction_order: 0,
+            scalar_history: false,
+            cfg_pp: false,
+            terminal_alias: false,
+            noise: false,
+        }
+    }
+    pub fn update(
+        solver: Solver,
+        step: usize,
+        sigma: f32,
+        next_sigma: f32,
+        current: &'a T,
+        terminal_alias: bool,
+        noise: bool,
+    ) -> Self {
+        Self {
+            solver,
+            step,
+            sigma,
+            next_sigma,
+            kind: SolverObservationKind::Update,
+            current,
+            history: [None, None, None],
+            outer: [None, None, None],
+            correction_order: 0,
+            scalar_history: false,
+            cfg_pp: false,
+            terminal_alias,
+            noise,
+        }
+    }
+    pub fn history(
+        mut self,
+        denoised: Option<&'a T>,
+        derivative: Option<&'a T>,
+        sample: Option<&'a T>,
+    ) -> Self {
+        self.history = [denoised, derivative, sample];
+        self
+    }
+    pub fn outer(mut self, x: Option<&'a T>, x0: Option<&'a T>, d: Option<&'a T>) -> Self {
+        self.outer = [x, x0, d];
+        self
+    }
+    pub fn stage(mut self, stage: u8) -> Self {
+        self.correction_order = stage;
+        self
+    }
+    pub fn correction(mut self) -> Self {
+        self.kind = SolverObservationKind::Correction;
+        self
+    }
+    pub fn scalar_history(mut self, present: bool) -> Self {
+        self.scalar_history = present;
+        self
+    }
+    pub fn cfg_pp(mut self) -> Self {
+        self.cfg_pp = true;
+        self
+    }
+}
+
+/// One callback's logical lifetime facts for the DEFAULT factory produced by `Solver::boxed`.
+/// Handles are not disjoint physical allocations. Provider-owned input casts, conditioning,
+/// serial completed outputs and enclosing initialization owners are deliberately outside this scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolverEpoch {
+    pub step: usize,
+    pub sigma: f32,
+    pub next_sigma: f32,
+    pub evaluation: SolverEvaluation,
+    pub previous_denoised: bool,
+    pub previous_derivative: bool,
+    pub previous_sample: bool,
+    /// Additional outer x/x0/d owners across a second callback (Heun=3, SDE=2).
+    pub outer_owners: u8,
+    /// ER-SDE's actual stage_used; not a user-exposed solver-order knob.
+    pub correction_order: u8,
+    pub corrector_after_callback: bool,
+    /// Actual clone/assignment alias in the update, not algebraic x0 equivalence.
+    pub state_aliases_denoised_after_step: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SolverEvaluation {
+    Primary,
+    HeunCorrector,
+    SdeMidpoint,
+}
+
+impl SolverEpoch {
+    pub fn history_owners(&self) -> u8 {
+        u8::from(self.previous_denoised)
+            + u8::from(self.previous_derivative)
+            + u8::from(self.previous_sample)
+    }
+}
+
+impl Solver {
+    /// Metadata for the exact supplied transition sequence, including repeats, zero-leading
+    /// windows, strength tails and nonzero final nodes. Every shipped solver calls denoise BEFORE
+    /// testing its leading-zero guard. `[0]` has no transition/callback; `[0,0]` has one.
+    pub fn logical_epochs(self, sigmas: &[f32]) -> Result<Vec<SolverEpoch>> {
+        if sigmas.is_empty() || sigmas.iter().any(|s| !s.is_finite() || *s < 0.0) {
+            return Err(crate::Error::Msg("invalid solver sigma sequence".into()));
+        }
+        let (mut old, mut derivative, mut sample) = (false, false, false);
+        let mut out = Vec::new();
+        for (i, pair) in sigmas.windows(2).enumerate() {
+            let (sigma, next) = (pair[0], pair[1]);
+            let terminal = is_terminal(sigma);
+            let correction_order = if self == Self::ErSde && !terminal && next != 0.0 {
+                (i + 1).min(ErSde::default().max_stage as usize) as u8
+            } else {
+                0
+            };
+            let aliases = match self {
+                Self::Dpmpp2m | Self::ErSde | Self::Dpmpp2mSde => terminal || next == 0.0,
+                Self::UniPc | Self::Lcm => next == 0.0,
+                _ => terminal,
+            };
+            out.push(SolverEpoch {
+                step: i,
+                sigma,
+                next_sigma: next,
+                evaluation: SolverEvaluation::Primary,
+                previous_denoised: old,
+                previous_derivative: derivative,
+                previous_sample: sample,
+                outer_owners: 0,
+                correction_order,
+                corrector_after_callback: self == Self::UniPc && old && sample,
+                state_aliases_denoised_after_step: aliases,
+            });
+            if !terminal && next != 0.0 {
+                let secondary = match self {
+                    Self::Heun => Some((SolverEvaluation::HeunCorrector, next, 3)),
+                    Self::DpmppSde => {
+                        let t = lambda(sigma);
+                        let t_next = lambda(next);
+                        Some((
+                            SolverEvaluation::SdeMidpoint,
+                            sigma_of(t + (t_next - t) * 0.5) as f32,
+                            2,
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some((evaluation, sigma, outer_owners)) = secondary {
+                    out.push(SolverEpoch {
+                        step: i,
+                        sigma,
+                        next_sigma: next,
+                        evaluation,
+                        previous_denoised: false,
+                        previous_derivative: false,
+                        previous_sample: false,
+                        outer_owners,
+                        correction_order: 0,
+                        corrector_after_callback: false,
+                        state_aliases_denoised_after_step: false,
+                    });
+                }
+            }
+            match self {
+                Self::Dpmpp2m | Self::Dpmpp2mSde => old = true,
+                Self::ErSde => {
+                    old = true;
+                    if correction_order >= 2 {
+                        derivative = true;
+                    }
+                }
+                Self::UniPc if next != 0.0 => {
+                    old = true;
+                    sample = true;
+                }
+                _ => {}
+            }
+            if self == Self::UniPc && next == 0.0 {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 

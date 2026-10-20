@@ -155,6 +155,8 @@ pub fn denoise_in(
     window: Option<usize>,
     pixel_rows: bool,
 ) -> Result<Array> {
+    let plan_metadata = params.plan_metadata()?;
+    mlx_gen::ios_quantum::before(crate::solver::PLAN_QUANTUM, plan_metadata.host_bytes()?)?;
     let plan = params.plan()?;
     let rows = conditioning.cond.len();
     if rows == 0 || noise.shape()[0] as usize != rows {
@@ -196,7 +198,9 @@ pub fn denoise_in(
         .chain(std::iter::once(0.0))
         .collect();
     let counter = PreviewCounter::new(&sigmas);
+    mlx_gen::ios_quantum::finish(crate::solver::PLAN_QUANTUM, &[])?;
     let patch = dit.config().patch_size;
+    let mut evaluations = 0u64;
     let x = sample(
         noise,
         &plan,
@@ -208,6 +212,18 @@ pub fn denoise_in(
                 Some(batch) if params.cfg_at(step) => {
                     let xb = concatenate_axis(&[x, x], 0)?;
                     let tb = Array::from_slice(&vec![t; 2 * rows], &[2 * rows as i32]);
+                    evaluations += 1;
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        crate::model::MODEL_ID,
+                        "forward",
+                        &[
+                            ("evaluation", evaluations),
+                            ("rows", xb.shape()[0] as u64),
+                            ("conditioning_rows", batch.states.shape()[0] as u64),
+                            ("guided", 1),
+                            ("input_f32", u64::from(xb.dtype() == mlx_rs::Dtype::Float32)),
+                        ],
+                    );
                     let out = dit.forward_exec(
                         &xb,
                         &tb,
@@ -221,16 +237,30 @@ pub fn denoise_in(
                     let halves = out.split(2, 0)?;
                     cfg_combine(&halves[0], &halves[1], params.cfg_scale)
                 }
-                _ => dit.forward_exec(
-                    x,
-                    &Array::from_slice(&vec![t; rows], &[rows as i32]),
-                    &cond_text,
-                    crate::dit::Execution {
-                        plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
-                        window,
-                        pixel_rows,
-                    },
-                ),
+                _ => {
+                    evaluations += 1;
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        crate::model::MODEL_ID,
+                        "forward",
+                        &[
+                            ("evaluation", evaluations),
+                            ("rows", x.shape()[0] as u64),
+                            ("conditioning_rows", cond_text.states.shape()[0] as u64),
+                            ("guided", 0),
+                            ("input_f32", u64::from(x.dtype() == mlx_rs::Dtype::Float32)),
+                        ],
+                    );
+                    dit.forward_exec(
+                        x,
+                        &Array::from_slice(&vec![t; rows], &[rows as i32]),
+                        &cond_text,
+                        crate::dit::Execution {
+                            plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                            window,
+                            pixel_rows,
+                        },
+                    )
+                }
             }
         },
         |i, x0| {
@@ -240,7 +270,19 @@ pub fn denoise_in(
             });
         },
     )?;
-    Ok(clip(&x, (-1.0f32, 1.0f32))?)
+    // Do not leave the final clamp lazy across the denoise/decode boundary: it allocates while
+    // this solve still holds its text batches, and belongs to the denoise's live set.
+    let solved = mlx_gen::ios_quantum::run(
+        crate::solver::FINALIZE_QUANTUM,
+        crate::solver::final_clamp_scratch(x.size() as u64),
+        || Ok(clip(&x, (-1.0f32, 1.0f32))?),
+    )?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        crate::model::MODEL_ID,
+        "solve_complete",
+        &[("evaluations", evaluations), ("steps", plan.len() as u64)],
+    );
+    Ok(solved)
 }
 
 /// The exact RGB decode of a pixel-space prediction (`(x + 1)/2`, clamped) as a preview projection.

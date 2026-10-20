@@ -95,15 +95,13 @@ pub(crate) const BACKBONE_LOAD_QUANTUM: &str = "Iris backbone load";
 /// Label of one solved batch's RGB8 conversion quantum.
 pub(crate) const IMAGE_QUANTUM: &str = "Iris image conversion";
 
-/// The RGB8 conversion (`mlx_gen::image::decoded_to_image`, one row at a time) of a solved
-/// `[B, 3, H, W]` batch of `elements` values: the `x · 0.5 + 0.5` clamp, the `· 255` rounding and
-/// the NHWC re-layout keep four f32 copies of a row live (priced over the whole batch), plus the
-/// conversion's four f32 scalars and the u8 host pixels of every image (one byte per element),
-/// which stay allocated.
-pub(crate) fn image_scratch(elements: u64) -> u64 {
-    mlx_gen::ios_quantum::tensor_bytes(4, &[4, elements])
-        .saturating_add(16)
-        .saturating_add(elements)
+/// RGB8 conversion of an evaluated `[B, 3, H, W]` solved batch, one row at a time. The
+/// denoise finalization quantum has already materialized its clamp. Denormalization, rounding and
+/// NHWC layout hold four f32 row copies and four f32 scalars; the host u8 pixels of all rows stay
+/// allocated. Count each row buffer at its allocator-rounded size.
+pub(crate) fn image_scratch(elements: u64, images: u64) -> u64 {
+    let row = mlx_gen::ios_quantum::tensor_bytes(4, &[elements / images.max(1)]);
+    4 * crate::retention::allocated(row) + 16 + elements
 }
 
 /// The backbone half of the generation task.
@@ -178,6 +176,8 @@ pub fn load_backbone_quantized(
     base_model: &str,
     quant: Option<Quant>,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
+    #[cfg(all(test, target_os = "macos"))]
+    crate::anchor_tests::record_generation_loader_entry("backbone");
     let requested = quant;
     let quant = BackboneQuant::for_load(quant)?;
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
@@ -257,6 +257,8 @@ pub fn load_backbone_streamed(
     quant: Option<Quant>,
     default_window: Option<usize>,
 ) -> Result<IrisDiT> {
+    #[cfg(all(test, target_os = "macos"))]
+    crate::anchor_tests::record_generation_loader_entry("backbone");
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
     let artifact = crate::packed::artifact_tier(&path)?;
     crate::packed::check_requested("the backbone", artifact, quant)?;
@@ -338,6 +340,11 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 /// runs one request the same staged way when its admitted `GenerationMemory::stage_residency` is
 /// set and rebuilds the warm pair on the next unstaged request.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_model(spec)?))
+}
+
+/// The concrete loader shared by the public adapter and endpoint-ownership proofs.
+pub(crate) fn load_model(spec: &LoadSpec) -> Result<Iris3b> {
     refuse_unsupported_spec(spec)?;
     let resources = GenerationResources::from_spec(spec, MODEL_ID)?;
     let config = IrisConfig::from_dir(&resources.backbone_dir)?;
@@ -358,15 +365,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || {
-            if streamed {
+            let tower = if streamed {
                 IrisTextEncoder::load_streamed(&te_dir, &te_cfg, quant)
             } else {
                 IrisTextEncoder::load_quantized(&te_dir, &te_cfg, quant)
-            }
+            }?;
+            #[cfg(all(test, target_os = "macos"))]
+            crate::anchor_tests::observe_generation_tower(&tower);
+            Ok(tower)
         },
         move |_use_pid| {
             if streamed {
                 let dit = load_backbone_streamed(&bb_dir, &bb_cfg, compute, quant, None)?;
+                #[cfg(all(test, target_os = "macos"))]
+                crate::anchor_tests::observe_generation_backbone(&dit);
                 return Ok(Heavy { dit });
             }
             let (dit, reports) = load_backbone_quantized(
@@ -381,13 +393,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             if let Ok(mut sink) = reports_sink.lock() {
                 *sink = reports;
             }
+            #[cfg(all(test, target_os = "macos"))]
+            crate::anchor_tests::observe_generation_backbone(&dit);
             Ok(Heavy { dit })
         },
     )?;
     // Priced from the resources' tensor headers after the components loaded, so a broken
     // resource surfaces as its loader's own error.
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
-    Ok(Box::new(Iris3b {
+    Ok(Iris3b {
         descriptor: descriptor(),
         config,
         residency,
@@ -395,10 +409,30 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         spec: spec.clone(),
         memory_strategy,
         streamed,
-    }))
+    })
 }
 
 impl Iris3b {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn assert_retained_endpoint(&self, owns_components: bool) -> Option<Vec<usize>> {
+        let owned = self
+            .residency
+            .with_resident_parts(|tower, heavy| {
+                tower.assert_endpoint_ownership(false);
+                heavy.dit.assert_endpoint_ownership(false);
+                let mut addresses = tower.endpoint_parameter_addresses();
+                addresses.extend(heavy.dit.endpoint_parameter_addresses());
+                addresses
+            })
+            .unwrap();
+        assert_eq!(
+            owned.is_some(),
+            owns_components,
+            "endpoint retained-component ownership differs from its execution regime"
+        );
+        owned
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -406,10 +440,22 @@ impl Iris3b {
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
         let rungs = request_rungs(req, self.streamed)?;
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
         let rows = params.prompts.len() as u32;
-        let total = (params.steps as u32) * req.count;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            MODEL_ID,
+            "request",
+            &[
+                ("stage", u64::from(stage_residency_for(&self.spec, req))),
+                ("serial_count", u64::from(req.count)),
+                ("prompt_rows", u64::from(rows)),
+                ("steps", params.steps as u64),
+                ("load_streamed", u64::from(self.streamed)),
+            ],
+        );
+        // Progress is a u32 UI counter; exact execution counts are emitted as u64 metadata.
+        let total = (params.steps as u32).saturating_mul(req.count);
         let flow = self.config.flow.clone();
         // Staged residency is a per-request execution decision: the shared worker selects it
         // through the memory-strategy scope, which writes `GenerationMemory` onto the request.
@@ -429,11 +475,29 @@ impl Iris3b {
                 // One batched solve over the whole prompt batch per `count` repetition; image
                 // `k = c·rows + j` draws its noise from `seed + k`.
                 for c in 0..req.count {
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        MODEL_ID,
+                        "serial",
+                        &[
+                            ("serial", u64::from(c)),
+                            ("completed_batches", images.len() as u64),
+                            (
+                                "completed_rows",
+                                images
+                                    .iter()
+                                    .map(|image: &mlx_rs::Array| image.shape()[0] as u64)
+                                    .sum(),
+                            ),
+                            ("backbone_streamed", u64::from(heavy.dit.is_streamed())),
+                        ],
+                    );
+                    #[cfg(all(test, target_os = "macos"))]
+                    crate::anchor_tests::observe_serial_outputs(c, &images);
                     let seeds: Vec<u64> = (0..rows)
                         .map(|j| params.seed.wrapping_add((c * rows + j) as u64))
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height)?;
-                    let done = c * params.steps as u32;
+                    let done = c.saturating_mul(params.steps as u32);
                     let x = crate::pipeline::denoise_in(
                         &heavy.dit,
                         &flow,
@@ -443,7 +507,7 @@ impl Iris3b {
                         &req.cancel,
                         |step| {
                             on_progress(Progress::Step {
-                                current: done + step as u32,
+                                current: done.saturating_add(step as u32),
                                 total,
                             })
                         },
@@ -461,7 +525,10 @@ impl Iris3b {
                 }
                 let mut out = Vec::with_capacity((rows * req.count) as usize);
                 for x in &images {
-                    mlx_gen::ios_quantum::before(IMAGE_QUANTUM, image_scratch(x.size() as u64))?;
+                    mlx_gen::ios_quantum::before(
+                        IMAGE_QUANTUM,
+                        image_scratch(x.size() as u64, x.shape()[0] as u64),
+                    )?;
                     out.extend(to_images(x)?);
                     mlx_gen::ios_quantum::finish(IMAGE_QUANTUM, &[])?;
                 }
@@ -561,7 +628,7 @@ pub(crate) fn request_rungs(req: &GenerationRequest, streamed: bool) -> Result<R
 /// Refuse the memory-ladder controls this route has no mechanism for, so none is accepted and
 /// ignored: there is no decoder to tile (pixel space). Staged residency, bounded attention and
 /// (on a deferred load) the transformer window are request-scoped controls ([`request_rungs`]).
-fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
+pub(crate) fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
     let Some(memory) = req.memory else {
         return Ok(());
     };

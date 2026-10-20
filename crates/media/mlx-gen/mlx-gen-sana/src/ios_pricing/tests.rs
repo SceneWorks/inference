@@ -85,6 +85,13 @@ fn pricing_refuses_unknown_routes_and_unexecutable_levers() {
             },
         ),
     ] {
+        let generation = mlx_gen::gen_core::GenerationRequest {
+            width: geometry.width,
+            height: geometry.height,
+            count: geometry.batch,
+            memory: Some(execution),
+            ..Default::default()
+        };
         let r = IosPricingRequest {
             provider,
             spec: &spec,
@@ -93,6 +100,9 @@ fn pricing_refuses_unknown_routes_and_unexecutable_levers() {
             selection: &selection,
             execution: &execution,
             token_window: 0,
+            generation: Some(&generation),
+            transform: None,
+            depth: None,
         };
         assert!(
             matches!(ios_pricing(&r), Err(Error::Unsupported(_))),

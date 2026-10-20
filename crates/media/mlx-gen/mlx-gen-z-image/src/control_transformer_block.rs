@@ -34,6 +34,28 @@ pub struct ZImageControlBlock {
 }
 
 impl ZImageControlBlock {
+    const BEFORE_PROJ_PATH: &'static str = "before_proj";
+    const AFTER_PROJ_PATH: &'static str = "after_proj";
+
+    /// The exact named Linear set visited by this block's quantizer, not every 2-D header in a
+    /// checkpoint. The base schema is shared with its native adapter/constructor targets; control
+    /// projection keys below are the SAME constants the constructor consumes. The patch embedder
+    /// and norm parameters are not members of this set.
+    pub(crate) fn quantization_header_targets(
+        prefix: &str,
+        has_before_proj: bool,
+    ) -> Vec<(String, bool)> {
+        let mut targets = crate::transformer_block::adapter_target_paths()
+            .into_iter()
+            .map(|path| (format!("{prefix}.{path}"), false))
+            .collect::<Vec<_>>();
+        targets.push((format!("{prefix}.{}", Self::AFTER_PROJ_PATH), false));
+        if has_before_proj {
+            targets.push((format!("{prefix}.{}", Self::BEFORE_PROJ_PATH), false));
+        }
+        targets
+    }
+
     /// Load a control block from the Fun-Controlnet-Union checkpoint under `prefix` (e.g.
     /// `"control_layers.0"`). The base-block keys (`attention.*`, `feed_forward.*`,
     /// `attention_norm{1,2}`, `ffn_norm{1,2}`, `adaLN_modulation.0`) map 1:1 onto
@@ -49,11 +71,12 @@ impl ZImageControlBlock {
         // Packed-detect (sc-8670): the control projections load packed from a pre-quantized control
         // snapshot or dense otherwise; both carry a bias. Their in-features (3840) are group-64
         // divisible, so they pack in a quantized tier.
-        let after_proj = crate::quant::lin(w, &format!("{prefix}.after_proj"), true)?;
+        let after_proj =
+            crate::quant::lin(w, &format!("{prefix}.{}", Self::AFTER_PROJ_PATH), true)?;
         let before_proj = if has_before_proj {
             Some(crate::quant::lin(
                 w,
-                &format!("{prefix}.before_proj"),
+                &format!("{prefix}.{}", Self::BEFORE_PROJ_PATH),
                 true,
             )?)
         } else {

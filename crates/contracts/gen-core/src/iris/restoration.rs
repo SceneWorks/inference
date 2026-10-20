@@ -183,7 +183,7 @@ impl Default for RestorationOptions {
 /// (`1.3f32` → `1.3`), i.e. the Python float a caller of upstream `Restorer(scale=…)` writes.
 /// Widening the f32 directly (`1.2999999523…`) would floor a 1000-px side at ×1.3 to 1299 instead
 /// of torch's `floor(1000 · 1.3) = 1300`, and skew the bicubic coordinate scale `1 / scale`.
-fn request_scale(s: f32) -> f64 {
+pub fn request_scale(s: f32) -> f64 {
     // `f32`'s `Display` is the shortest round-trip decimal; every such string parses as an f64
     // (incl. `NaN` / `inf`, which `check_scale` then refuses).
     s.to_string().parse().unwrap_or(f64::NAN)
@@ -307,6 +307,7 @@ pub struct RestorationPlan {
     pub padded: Dims,
     pub tile: u32,
     pub stride: u32,
+    pub patch: u32,
     /// Tile top offsets (empty when the padded image is a single tile).
     pub tile_rows: Vec<u32>,
     /// Tile left offsets (empty when the padded image is a single tile).
@@ -314,7 +315,159 @@ pub struct RestorationPlan {
     pub color_fix: bool,
 }
 
+/// Canonical indexed tile positions. Same start/stride/flush-last ordering as `tile_positions`,
+/// with bounded metadata instead of a pre-admission allocation proportional to the image axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileAxis {
+    last: u32,
+    stride: u32,
+    count: u64,
+}
+
+impl TileAxis {
+    fn empty() -> Self {
+        Self {
+            last: 0,
+            stride: 1,
+            count: 0,
+        }
+    }
+    fn new(size: u32, tile: u32, stride: u32) -> Self {
+        if size <= tile {
+            return Self {
+                last: 0,
+                stride: 1,
+                count: 1,
+            };
+        }
+        let last = size - tile;
+        let stride = stride.max(1);
+        Self {
+            last,
+            stride,
+            count: u64::from(last).div_ceil(u64::from(stride)) + 1,
+        }
+    }
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn position(&self, index: u64) -> Option<u32> {
+        if index >= self.count {
+            None
+        } else if index + 1 == self.count {
+            Some(self.last)
+        } else {
+            u32::try_from(index * u64::from(self.stride)).ok()
+        }
+    }
+    fn collect(&self) -> Result<Vec<u32>> {
+        let count = usize::try_from(self.count)
+            .map_err(|_| Error::Msg("Iris tile axis length overflow".into()))?;
+        let mut positions = Vec::with_capacity(count);
+        for index in 0..self.count {
+            positions.push(self.position(index).expect("canonical tile axis index"));
+        }
+        Ok(positions)
+    }
+}
+
+/// Scalar/indexed plan from the same producer as `RestorationPlan`. Safe for token/class/pricing
+/// metadata even for huge legal source/scale values; runtime collects only after payload admission.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestorationPlanMetadata {
+    pub source: Dims,
+    pub input_sizing: InputSizing,
+    pub input: Dims,
+    pub budget_applied: bool,
+    pub scale: f64,
+    pub output: Dims,
+    pub processing: Dims,
+    pub enlarged: bool,
+    pub padded: Dims,
+    pub tile: u32,
+    pub stride: u32,
+    pub patch: u32,
+    pub tile_rows: TileAxis,
+    pub tile_cols: TileAxis,
+    pub color_fix: bool,
+}
+
+impl RestorationPlanMetadata {
+    pub fn single_pass(&self) -> bool {
+        self.tile_rows.is_empty()
+    }
+    pub fn forward_count(&self) -> Result<u64> {
+        if self.single_pass() {
+            Ok(1)
+        } else {
+            self.tile_rows
+                .len()
+                .checked_mul(self.tile_cols.len())
+                .ok_or_else(|| Error::Msg("Iris tile count overflow".into()))
+        }
+    }
+    pub fn axis_bytes(&self) -> Result<u64> {
+        self.tile_rows
+            .len()
+            .checked_add(self.tile_cols.len())
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u32>() as u64))
+            .ok_or_else(|| Error::Msg("Iris tile axis payload overflow".into()))
+    }
+    pub fn collect(self) -> Result<RestorationPlan> {
+        let tile_rows = self.tile_rows.collect()?;
+        let tile_cols = self.tile_cols.collect()?;
+        Ok(RestorationPlan {
+            source: self.source,
+            input_sizing: self.input_sizing,
+            input: self.input,
+            budget_applied: self.budget_applied,
+            scale: self.scale,
+            output: self.output,
+            processing: self.processing,
+            enlarged: self.enlarged,
+            padded: self.padded,
+            tile: self.tile,
+            stride: self.stride,
+            patch: self.patch,
+            tile_rows,
+            tile_cols,
+            color_fix: self.color_fix,
+        })
+    }
+}
+
 impl RestorationPlan {
+    pub fn metadata(&self) -> RestorationPlanMetadata {
+        let (tile_rows, tile_cols) = if self.single_pass() {
+            (TileAxis::empty(), TileAxis::empty())
+        } else {
+            (
+                TileAxis::new(self.padded.height, self.tile, self.stride),
+                TileAxis::new(self.padded.width, self.tile, self.stride),
+            )
+        };
+        RestorationPlanMetadata {
+            source: self.source,
+            input_sizing: self.input_sizing,
+            input: self.input,
+            budget_applied: self.budget_applied,
+            scale: self.scale,
+            output: self.output,
+            processing: self.processing,
+            enlarged: self.enlarged,
+            padded: self.padded,
+            tile: self.tile,
+            stride: self.stride,
+            patch: self.patch,
+            tile_rows,
+            tile_cols,
+            color_fix: self.color_fix,
+        }
+    }
+
     /// One forward over the whole padded image (upstream `tiled`'s `height <= tile and width <=
     /// tile` branch, no fusion window).
     pub fn single_pass(&self) -> bool {
@@ -330,7 +483,21 @@ impl RestorationPlan {
         }
     }
 
-    /// `(top, left)` of every tile, in upstream's row-major order.
+    /// Runtime row-major iterator: no Cartesian job-vector allocation.
+    pub fn tile_iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        (0..self.forward_count()).map(move |index| {
+            if self.single_pass() {
+                (0, 0)
+            } else {
+                (
+                    self.tile_rows[index / self.tile_cols.len()],
+                    self.tile_cols[index % self.tile_cols.len()],
+                )
+            }
+        })
+    }
+
+    /// `(top, left)` of every tile; explicit collection is for small executable/parity consumers.
     pub fn tiles(&self) -> Vec<(u32, u32)> {
         if self.single_pass() {
             return vec![(0, 0)];
@@ -362,12 +529,9 @@ pub fn fit_budget_dims(source: Dims, budget: InputBudget) -> Dims {
 
 /// `tile_positions`: start offsets along one axis; the last tile is flush with the far edge.
 pub fn tile_positions(size: u32, tile: u32, stride: u32) -> Vec<u32> {
-    if size <= tile {
-        return vec![0];
-    }
-    let mut out: Vec<u32> = (0..size - tile).step_by(stride.max(1) as usize).collect();
-    out.push(size - tile);
-    out
+    TileAxis::new(size, tile, stride)
+        .collect()
+        .expect("tile axis fits this executable target")
 }
 
 /// `floor(side · scale)` — torch's `F.interpolate(scale_factor=…)` output size (f64 product).
@@ -385,6 +549,16 @@ pub fn plan(
     geometry: TileGeometry,
     model_id: &str,
 ) -> Result<RestorationPlan> {
+    plan_metadata(source, options, geometry, model_id)?.collect()
+}
+
+/// The exact same geometry producer without allocating either tile axis or Cartesian jobs.
+pub fn plan_metadata(
+    source: Dims,
+    options: &RestorationOptions,
+    geometry: TileGeometry,
+    model_id: &str,
+) -> Result<RestorationPlanMetadata> {
     options.check_scale(model_id)?;
     if source.width == 0 || source.height == 0 {
         return Err(Error::Msg(format!(
@@ -451,14 +625,14 @@ pub fn plan(
     let stride = geometry.stride();
     let (tile_rows, tile_cols) = if padded.height <= geometry.tile && padded.width <= geometry.tile
     {
-        (Vec::new(), Vec::new())
+        (TileAxis::empty(), TileAxis::empty())
     } else {
         (
-            tile_positions(padded.height, geometry.tile, stride),
-            tile_positions(padded.width, geometry.tile, stride),
+            TileAxis::new(padded.height, geometry.tile, stride),
+            TileAxis::new(padded.width, geometry.tile, stride),
         )
     };
-    Ok(RestorationPlan {
+    Ok(RestorationPlanMetadata {
         source,
         input_sizing: options.input_sizing,
         input,
@@ -470,6 +644,7 @@ pub fn plan(
         padded,
         tile: geometry.tile,
         stride,
+        patch: geometry.patch,
         tile_rows,
         tile_cols,
         color_fix: options.color_fix,
@@ -484,16 +659,28 @@ pub fn plan_request(
     geometry: TileGeometry,
     model_id: &str,
 ) -> Result<RestorationPlan> {
+    plan_request_metadata(req, geometry, model_id)?.collect()
+}
+
+pub fn plan_request_metadata(
+    req: &TransformRequest,
+    geometry: TileGeometry,
+    model_id: &str,
+) -> Result<RestorationPlanMetadata> {
     let options = RestorationOptions::from_request(req, model_id)?;
     let (w, h) = (req.image.width as usize, req.image.height as usize);
-    if req.image.pixels.len() != w * h * 3 {
+    let bytes = w
+        .checked_mul(h)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| Error::Msg(format!("{model_id}: source image byte count overflow")))?;
+    if req.image.pixels.len() != bytes {
         return Err(Error::Msg(format!(
             "{model_id}: a {w}x{h} RGB image needs {} bytes, got {}",
             w * h * 3,
             req.image.pixels.len()
         )));
     }
-    plan(
+    plan_metadata(
         Dims::new(req.image.width, req.image.height),
         &options,
         geometry,
@@ -693,6 +880,59 @@ fn bicubic_aa_taps(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f32>)> {
             (xmin as usize, w)
         })
         .collect()
+}
+
+/// New RGB host payload at the largest allocation of `bicubic_aa_resize`, excluding its borrowed
+/// source. Counts the actual cloned current plane, next horizontal/vertical plane and tap tables.
+pub fn bicubic_aa_rgb_host_bytes(source: Dims, output: Dims) -> Result<u64> {
+    let overflow = || Error::Msg("Iris bicubic host-payload accounting overflow".into());
+    let plane = |height: u32, width: u32| {
+        u64::from(height)
+            .checked_mul(u64::from(width))
+            .and_then(|pixels| pixels.checked_mul(3 * std::mem::size_of::<f32>() as u64))
+            .ok_or_else(overflow)
+    };
+    let taps = |input: u32, output: u32| -> Result<u64> {
+        if input == 0 || output == 0 {
+            return Err(Error::Msg("Iris bicubic axis must be positive".into()));
+        }
+        let scale = input as f32 / output as f32;
+        let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };
+        let count = (support.ceil() as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(overflow)?
+            .min(u64::from(input));
+        count
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(usize, Vec<f32>)>() as u64))
+            .and_then(|bytes| bytes.checked_mul(u64::from(output)))
+            .ok_or_else(overflow)
+    };
+    let mut current = plane(source.height, source.width)?;
+    let mut peak = current; // unconditional src.clone()
+    if source.width != output.width {
+        let next = plane(source.height, output.width)?;
+        let coefficients = taps(source.width, output.width)?;
+        peak = peak.max(
+            current
+                .checked_add(next)
+                .and_then(|sum| sum.checked_add(coefficients))
+                .ok_or_else(overflow)?,
+        );
+        current = next;
+    }
+    if source.height != output.height {
+        let next = plane(output.height, output.width)?;
+        let coefficients = taps(source.height, output.height)?;
+        peak = peak.max(
+            current
+                .checked_add(next)
+                .and_then(|sum| sum.checked_add(coefficients))
+                .ok_or_else(overflow)?,
+        );
+    }
+    Ok(peak)
 }
 
 /// `F.interpolate(x, size=(h, w), mode="bicubic", align_corners=False, antialias=True)` — separable,
@@ -945,6 +1185,14 @@ pub fn restore_detailed(
 
 /// The restoration driver: `(fused, restored)`, with `fused` returned only when `keep_fused`
 /// (otherwise it is dropped as soon as it is cropped — 3×H×W f32 of the padded output).
+/// Narrow only the progress wire representation, never an inventory or execution count.
+fn display_step_count(count: u64) -> u32 {
+    match u32::try_from(count) {
+        Ok(value) => value,
+        Err(_) => u32::MAX,
+    }
+}
+
 fn run_restoration(
     image: &Image,
     plan: &RestorationPlan,
@@ -1010,7 +1258,9 @@ fn run_restoration(
             .map(|(x, v)| x - sigma * v)
             .collect())
     };
-    let total = plan.forward_count() as u32;
+    // Progress's wire counters are u32; legal indexed plans can contain more jobs. Saturate
+    // DISPLAY ONLY. The plan/iterator and backend metadata retain their exact checked counts.
+    let total = display_step_count(plan.forward_count() as u64);
     let fused = if plan.single_pass() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1023,7 +1273,7 @@ fn run_restoration(
         let window = gaussian_window(plan.tile);
         let mut out = Planes::zeros(3, ph, pw);
         let mut weight = vec![0f32; ph * pw];
-        for (k, (top, left)) in plan.tiles().into_iter().enumerate() {
+        for (k, (top, left)) in plan.tile_iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -1044,7 +1294,7 @@ fn run_restoration(
                 }
             }
             on_progress(Progress::Step {
-                current: k as u32 + 1,
+                current: display_step_count((k + 1) as u64),
                 total,
             });
         }
@@ -1094,6 +1344,16 @@ mod tests {
             input_sizing,
             color_fix: true,
         }
+    }
+
+    #[test]
+    fn progress_wire_narrowing_handles_u32_boundary_without_jobs_or_allocations() {
+        let boundary = u64::from(u32::MAX);
+        assert_eq!(display_step_count(0), 0);
+        assert_eq!(display_step_count(boundary - 1), u32::MAX - 1);
+        assert_eq!(display_step_count(boundary), u32::MAX);
+        assert_eq!(display_step_count(boundary + 1), u32::MAX);
+        assert_eq!(display_step_count(u64::MAX), u32::MAX);
     }
 
     #[test]
@@ -1243,6 +1503,99 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, Error::Unsupported(_)), "{scale}: {err:?}");
         }
+    }
+
+    #[test]
+    fn indexed_tile_metadata_matches_the_original_positions_and_job_order() {
+        for size in [1, 2, 3, 15, 16, 17, 31, 32, 33, 64, 127] {
+            for tile in [2, 4, 16] {
+                for stride in [0, 1, tile / 2, tile + 1] {
+                    let old = if size <= tile {
+                        vec![0]
+                    } else {
+                        let mut positions: Vec<_> =
+                            (0..size - tile).step_by(stride.max(1) as usize).collect();
+                        positions.push(size - tile);
+                        positions
+                    };
+                    let axis = TileAxis::new(size, tile, stride);
+                    assert_eq!(axis.collect().unwrap(), old);
+                    assert_eq!(axis.len(), old.len() as u64);
+                }
+            }
+        }
+        for source in [
+            Dims::new(1, 1),
+            Dims::new(16, 16),
+            Dims::new(17, 31),
+            Dims::new(64, 37),
+        ] {
+            for scale in [0.25, 1.0, 1.3, 4.0] {
+                for input_sizing in [InputSizing::Budgeted, InputSizing::Original] {
+                    for color_fix in [false, true] {
+                        let options = RestorationOptions {
+                            scale,
+                            input_sizing,
+                            color_fix,
+                        };
+                        let planned = plan_metadata(
+                            source,
+                            &options,
+                            TileGeometry { tile: 16, patch: 2 },
+                            MODEL_ID,
+                        );
+                        if (f64::from(source.width) * scale).floor() < 1.0
+                            || (f64::from(source.height) * scale).floor() < 1.0
+                        {
+                            assert!(planned.is_err(), "vanishing output remains a typed refusal");
+                            continue;
+                        }
+                        let metadata = planned.unwrap();
+                        let executable = metadata.clone().collect().unwrap();
+                        assert_eq!(executable.metadata(), metadata);
+                        assert_eq!(
+                            executable.tile_iter().collect::<Vec<_>>(),
+                            executable.tiles()
+                        );
+                        assert_eq!(
+                            metadata.forward_count().unwrap(),
+                            executable.forward_count() as u64
+                        );
+                        assert_eq!(
+                            metadata.axis_bytes().unwrap(),
+                            (executable.tile_rows.len() + executable.tile_cols.len()) as u64
+                                * std::mem::size_of::<u32>() as u64
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_restoration_geometry_has_bounded_metadata_without_collecting_axes() {
+        let metadata = plan_metadata(
+            Dims::new(1_000_000_000, 16),
+            &RestorationOptions {
+                scale: 1.0,
+                input_sizing: InputSizing::Original,
+                color_fix: false,
+            },
+            TileGeometry { tile: 16, patch: 2 },
+            MODEL_ID,
+        )
+        .unwrap();
+        assert_eq!(metadata.tile_rows.len(), 1);
+        assert!(metadata.tile_cols.len() > 1_000_000);
+        assert_eq!(metadata.tile_cols.position(0), Some(0));
+        assert_eq!(metadata.tile_cols.position(1), Some(metadata.stride));
+        assert_eq!(
+            metadata.tile_cols.position(metadata.tile_cols.len() - 1),
+            Some(metadata.padded.width - metadata.tile)
+        );
+        assert_eq!(metadata.forward_count().unwrap(), metadata.tile_cols.len());
+        assert!(metadata.axis_bytes().unwrap() > 1_000_000);
+        // Never collect this plan or run an image; these are scalar/indexed source facts only.
     }
 
     #[test]

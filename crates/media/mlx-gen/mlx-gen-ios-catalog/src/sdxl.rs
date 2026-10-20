@@ -10,6 +10,9 @@ use mlx_gen::gen_core::{
     CfgBatching, Error, GenerationMemory, LoadShape, LoadSpec, Result, WeightsSource,
 };
 
+/// The production host-only recipe resolver, shared by capture, evidence and execution.
+pub use mlx_gen_sdxl::sampling;
+
 pub const SDXL_ID: &str = "sdxl";
 /// Catalog routes, not additional provider ids. Never substitute one sibling's capture for another.
 pub const SDXL_FAMILY_ROUTES: &[&str] = &[
@@ -53,7 +56,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::evidence::{AnchorKind, AnchorRow, AnchorSelection, ANCHOR_MARGIN_FLOOR_BYTES};
     use crate::ios_admission::{
-        admit_with_rows, build_candidate, capacity_budget, evidence_key, IosCandidate, IosWork,
+        build_candidate, capacity_budget, evidence_key, IosCandidate, IosWork,
     };
     use crate::refusal::{AdmissionError, RefusalKind};
     use mlx_gen::gen_core::{
@@ -63,6 +66,41 @@ pub(crate) mod tests {
     use std::path::Path;
 
     pub(crate) const DEVICE: &str = "synthetic-test-device";
+    /// Explicit positive unit-fixture footprint, NOT a device measurement or physical charge bound.
+    pub(crate) const FIXTURE_BML_BYTES: u64 = 1;
+
+    /// Synthetic request-boundary fact for positive admission mechanism tests. The caller must
+    /// explicitly supply a positive committed budget; never synthesize a zero/default baseline
+    /// or enlarge headroom. Production `admit_with_rows` remains the no-sidecar path.
+    pub(crate) fn admit_fixture_rows(
+        registry: &ProviderRegistry,
+        candidates: &[IosCandidate],
+        machine: &str,
+        budget: MemoryBudget,
+        rows: &[AnchorRow],
+    ) -> crate::refusal::AdmissionResult<crate::Admission> {
+        use mlx_gen::ios_pricing::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
+        assert!(
+            budget.committed_bytes > 0,
+            "fixture needs an explicit BML footprint"
+        );
+        let baseline = IosMemoryBaseline {
+            domain: IosMemoryDomain::ProcessGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            bytes: budget.committed_bytes,
+            source: "synthetic-test-sdk-before-model-load".into(),
+        };
+        crate::ios_admission::admit_rows_at_boundary(
+            registry,
+            candidates,
+            machine,
+            budget,
+            rows,
+            Some(&baseline),
+        )
+    }
+
+    use admit_fixture_rows as admit_with_rows;
 
     pub(crate) fn write_tensor(path: &Path, dtype: &str, count: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -198,7 +236,10 @@ pub(crate) mod tests {
                 candidate.context.selection.strategy,
                 &candidate.context.selection.parameters,
             ),
-            bytes.saturating_sub(ANCHOR_MARGIN_FLOOR_BYTES),
+            bytes
+                .checked_sub(ANCHOR_MARGIN_FLOOR_BYTES)
+                .filter(|demand| *demand > 0)
+                .expect("a completed fixture needs positive growth plus the explicit margin"),
         )
     }
 
@@ -206,7 +247,7 @@ pub(crate) mod tests {
         // Mechanism fixture, NOT an iPhone cap or a fabricated measured model fit.
         MemoryBudget {
             total_bytes: 1 << 30,
-            committed_bytes: 0,
+            committed_bytes: FIXTURE_BML_BYTES,
             reclaimable_bytes: 0,
             reserved_headroom_bytes: 0,
         }
@@ -386,7 +427,7 @@ pub(crate) mod tests {
                 "text_to_image",
             ),
         ];
-        let cap = budget().total_bytes;
+        let cap = budget().effective_bytes();
         let rows = [
             capture(&registry, &candidates[0], cap + 1),
             capture(&registry, &candidates[1], cap + 1),
@@ -502,7 +543,7 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         base.context.calibration_fingerprint = "wrong-provider-identity".into();
         assert_eq!(
             refusal(admit_with_rows(&registry, &[base], DEVICE, budget(), &rows)),
@@ -518,7 +559,7 @@ pub(crate) mod tests {
         );
         base.execution.tile_vae_decode = false;
         generate(&mut base).memory = Some(base.execution);
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         assert_eq!(
             refusal(admit_with_rows(&registry, &[base], DEVICE, budget(), &rows)),
             RefusalKind::Strategy
@@ -532,7 +573,7 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        let rows = [capture(&registry, &base, 1)];
+        let rows = [capture(&registry, &base, ANCHOR_MARGIN_FLOOR_BYTES + 1)];
         generate(&mut base).width = 768;
         assert!(matches!(
             admit_with_rows(&registry, &[base], DEVICE, budget(), &rows),
@@ -558,7 +599,7 @@ pub(crate) mod tests {
             capture(&registry, &fallback, 2 << 30),
         ];
         let both = [preferred.clone(), fallback.clone()];
-        let live = capacity_budget(4 << 30, 0, Some(5 << 29)); // 4GiB fixed, 2.5GiB live
+        let live = capacity_budget(4 << 30, FIXTURE_BML_BYTES, Some(5 << 29)); // 4GiB fixed, 2.5GiB live
         assert_eq!(
             admit_with_rows(&registry, &both, DEVICE, live, &rows)
                 .unwrap()
@@ -601,7 +642,7 @@ pub(crate) mod tests {
                     &registry,
                     &[first, fallback.clone()],
                     DEVICE,
-                    capacity_budget(4 << 30, 0, None),
+                    capacity_budget(4 << 30, FIXTURE_BML_BYTES, None),
                     &rows
                 )
                 .unwrap()
@@ -614,9 +655,10 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod execution_tests {
+    use super::tests::admit_fixture_rows as admit_with_rows;
     use super::tests::{budget, candidate, capture, fixture, write_tensor, DEVICE};
     use super::*;
-    use crate::ios_admission::{admit_with_rows, Admission, IosCandidate, IosWork};
+    use crate::ios_admission::{Admission, IosCandidate, IosWork};
     use mlx_gen::gen_core::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;

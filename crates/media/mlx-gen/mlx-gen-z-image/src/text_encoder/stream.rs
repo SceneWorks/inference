@@ -188,11 +188,14 @@ pub(crate) fn layer_counted(
     // refcounted handle to every tensor the constructor cloned. Draining exactly the accessed keys
     // is what makes the window's drop a real release rather than a no-op that still produces a
     // correct conditioning tensor. The DiT twin measured 8.0 MiB vs 238.4 MiB on this distinction.
+    // Match the logical capacity domain of the resident inventory and replayed packed outputs.
+    // Already-packed sources need this too: a production MLP scale/offset has 778240 stored
+    // bytes but 786432 page-rounded capacity. This is not a native backing or release witness.
     let mut extra = view
         .accessed_entries()
         .iter()
         .fold(0u64, |total, (_, array)| {
-            total.saturating_add(array.nbytes() as u64)
+            total.saturating_add(mlx_gen::ios_quantum::allocated_bytes(array.nbytes() as u64))
         });
     view.remove_accessed();
     if let Some(bits) = quant_bits {
@@ -263,6 +266,182 @@ pub(crate) fn run_windowed_layers(
         },
     )?;
     Ok(out.second_to_last)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod capacity_proofs {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write;
+
+    const CHILD: &str = "ZIMAGE_TE_SOURCE_CAPACITY_CPU_CHILD";
+    const DONE: &str = "ZIMAGE_TE_SOURCE_CAPACITY_CPU_DONE";
+    const FQN: &str = "text_encoder::stream::capacity_proofs::packed_local_layer_source_capacity_matches_full_logical_quantum";
+
+    struct Completion;
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert_eq!(unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) }, 0,
+                    "TE source-capacity CPU synchronization after fixture owners dropped");
+                std::fs::write(std::env::var(DONE).expect("fresh completion path"), b"ok")
+                    .expect("write TE source-capacity completion");
+            }
+        }
+    }
+
+    #[test]
+    fn source_capacity_rounds_only_above_one_page() {
+        let page = mlx_gen::ios_quantum::PAGE_BYTES;
+        for bytes in [0, 1, page - 1, page, page * 2] {
+            assert_eq!(mlx_gen::ios_quantum::allocated_bytes(bytes), bytes);
+        }
+        assert_eq!(mlx_gen::ios_quantum::allocated_bytes(page + 1), page * 2);
+        assert_eq!(mlx_gen::ios_quantum::allocated_bytes(page * 2 + 1), page * 3);
+    }
+
+    /// One real packed local-layer source factory, with only a header and a sparse payload extent.
+    /// Nothing evaluates the payload. Dimensions come from the production config/group, not a
+    /// corpus population golden. The oracle is a SOURCE-KEY capacity sum, not native alias identity.
+    fn packed_source(
+        root: &std::path::Path,
+        cfg: &ZTextEncoderConfig,
+        bits: i32,
+    ) -> (std::path::PathBuf, BTreeMap<String, u64>, BTreeSet<String>) {
+        let mut header = serde_json::Map::new();
+        let mut selected = BTreeMap::new();
+        let mut offset = 0u64;
+        let mut tensor = |name: String, shape: Vec<i32>, dtype: &str, width: u64, used: bool| {
+            let bytes = shape.iter().fold(width, |n, &dim| n * dim as u64);
+            header.insert(name.clone(), serde_json::json!({
+                "dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]
+            }));
+            offset += bytes;
+            if used { selected.insert(name, bytes); }
+        };
+        for (path, out, input) in [
+            ("self_attn.q_proj", cfg.n_heads * cfg.head_dim, cfg.hidden_size),
+            ("self_attn.k_proj", cfg.n_kv_heads * cfg.head_dim, cfg.hidden_size),
+            ("self_attn.v_proj", cfg.n_kv_heads * cfg.head_dim, cfg.hidden_size),
+            ("self_attn.o_proj", cfg.hidden_size, cfg.n_heads * cfg.head_dim),
+            ("mlp.gate_proj", cfg.intermediate_size, cfg.hidden_size),
+            ("mlp.up_proj", cfg.intermediate_size, cfg.hidden_size),
+            ("mlp.down_proj", cfg.hidden_size, cfg.intermediate_size),
+        ] {
+            let base = format!("model.layers.0.{path}");
+            tensor(format!("{base}.weight"), vec![out, input * bits / 32], "U32", 4, true);
+            for suffix in ["scales", "biases"] {
+                tensor(format!("{base}.{suffix}"), vec![out, input / crate::quant::GROUP_SIZE], "BF16", 2, true);
+            }
+        }
+        for (path, size) in [
+            ("input_layernorm", cfg.hidden_size),
+            ("post_attention_layernorm", cfg.hidden_size),
+            ("self_attn.q_norm", cfg.head_dim),
+            ("self_attn.k_norm", cfg.head_dim),
+        ] {
+            tensor(format!("model.layers.0.{path}.weight"), vec![size], "BF16", 2, true);
+        }
+        let untouched = BTreeSet::from([
+            "model.layers.0.mlp.gate_proj.bias".to_owned(), // actual bias-free constructor ignores it
+            "model.layers.0.unused".to_owned(),
+            "model.layers.1.unused".to_owned(),
+        ]);
+        for key in &untouched { tensor(key.clone(), vec![1], "BF16", 2, false); }
+        let mut bytes = serde_json::to_vec(&header).unwrap();
+        while bytes.len() % 8 != 0 { bytes.push(b' '); }
+        let path = root.join(format!("packed-q{bits}.safetensors"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_len(8 + bytes.len() as u64 + offset).unwrap();
+        (path, selected, untouched)
+    }
+
+    #[test]
+    fn packed_local_layer_source_capacity_matches_full_logical_quantum() {
+        // Declared FIRST and armed LAST: the marker follows all native owners and fixture scopes.
+        let mut completion: Option<Completion> = None;
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("done");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env(DONE, &marker).status().unwrap();
+            assert!(status.success(), "TE source-capacity CPU child failed");
+            assert_eq!(std::fs::read(marker).expect("fresh normal-completion marker"), b"ok");
+            return;
+        }
+        // BEFORE any Array/model/file factory; no inherited native device or stream is trusted.
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
+        assert_eq!(mlx_rs::Device::try_default().unwrap(), mlx_rs::Device::cpu());
+        assert_eq!(unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) }, 0);
+        assert_eq!(mlx_rs::Stream::new().get_index().unwrap(), mlx_rs::Stream::cpu().get_index().unwrap());
+        eprintln!("ZIMAGE_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1");
+        let mut completed = 0u8;
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = ZTextEncoderConfig::z_image();
+            let page = mlx_gen::ios_quantum::PAGE_BYTES;
+            for (tier, stored_bits) in [4, 8].into_iter().enumerate() {
+                let (path, selected, untouched) = packed_source(dir.path(), &cfg, stored_bits);
+                let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path).unwrap();
+                let selected_headers = headers.iter().filter(|h| selected.contains_key(&h.name))
+                    .collect::<Vec<_>>();
+                assert_eq!(selected_headers.iter().map(|h| h.name.clone()).collect::<BTreeSet<_>>(),
+                    selected.keys().cloned().collect::<BTreeSet<_>>());
+                let raw = selected_headers.iter().map(|h| h.data_bytes).sum::<u64>();
+                let capacity = selected_headers.iter().map(|h| {
+                    let bytes = h.data_bytes;
+                    if bytes > page { bytes.div_ceil(page) * page } else { bytes }
+                }).sum::<u64>();
+                assert!(capacity > raw, "derived packed geometry must discriminate source capacity");
+                for (replay, quant_bits) in [None, Some(4), Some(8)].into_iter().enumerate() {
+                    let mut view = Weights::from_file(&path).unwrap();
+                    // Re-reading ONE key must not count it twice. This is not arbitrary alias-key
+                    // deduplication: distinct keys sharing an ArrayDesc remain a different domain.
+                    let key = selected.keys().next().unwrap();
+                    view.require(key).unwrap();
+                    view.require(key).unwrap();
+                    let (layer, read) = materialize_layer_counted(
+                        &mut view, "model.layers.0", &cfg, quant_bits,
+                    ).unwrap();
+                    assert_eq!(view.keys().map(str::to_owned).collect::<BTreeSet<_>>(), untouched,
+                        "TE-CAPACITY-EXACT-DRAIN: only actual constructor keys leave the view");
+                    assert!(view.accessed_entries().is_empty());
+                    // This PRIVATE layer API no-op does not authorize a production Q4->Q8 load:
+                    // needs_load_time_quant's stored/requested mismatch refusal is unchanged.
+                    assert_eq!(layer.quantize_bytes(quant_bits.unwrap_or(stored_bits)), 0);
+                    let scratch = layer.quantum_scratch(1, crate::loader::MAX_LENGTH as i32, 4,
+                        mlx_gen::ios_quantum::Backend::Metal);
+                    let total = scratch + read;
+                    assert_eq!(total, scratch + capacity,
+                        "TE-CAPACITY-FULL-QUANTUM: SAME layer scratch plus independent source-key capacity");
+                    // Fresh exact child, with NO admitted/calibrated envelope ever opened. Assert
+                    // the actual requirement's full scratch AND unchanged reserve, not a delta.
+                    let old_total = scratch + raw;
+                    let reserve = mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES;
+                    mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(old_total + reserve, || {
+                        assert!(mlx_gen::ios_quantum::take_refusal().is_none());
+                        mlx_gen::ios_quantum::before(crate::quantum::TE_LAYER, old_total)?;
+                        assert!(mlx_gen::ios_quantum::before(crate::quantum::TE_LAYER, total).is_err(),
+                            "TE-CAPACITY-FULL-BUDGET: corrected logical total refuses before graph construction");
+                        let refusal = mlx_gen::ios_quantum::take_refusal().expect("actual logical guard refusal");
+                        assert_eq!((refusal.scratch_bytes, refusal.reserve_bytes), (total, reserve));
+                        Ok(())
+                    }).unwrap();
+                    let index = tier * 3 + replay;
+                    completed |= 1 << index;
+                    eprintln!("ZIMAGE_TE_SOURCE_CAPACITY_MECHANISM_V1 index={index}");
+                }
+            }
+        }
+        assert_eq!(completed, 63, "all packed source-capacity mechanisms completed");
+        eprintln!("ZIMAGE_TE_SOURCE_CAPACITY_BODY_COMPLETED_V1 mechanisms=6 fullmask=63 payload_eval=0");
+        let _ = completion.replace(Completion);
+    }
 }
 
 #[cfg(test)]

@@ -22,8 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use mlx_gen::attention::AttentionBudget;
-use mlx_gen::gen_core::{MemoryMode, OffloadPolicy, WeightsSource};
-use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+#[cfg(test)]
+use mlx_gen::gen_core::WeightsSource;
+use mlx_gen::gen_core::{MemoryMode, OffloadPolicy};
+use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest, IosWindowPrice, IosWorkBasis};
 use mlx_gen::ios_quantum::{elementwise_bytes, load_floor_bytes, sampler_step_bytes, tensor_bytes};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::{Error, Result};
@@ -55,12 +57,10 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     }
 }
 
-/// The `MemoryMode` keys of the requests this crate serves that are NOT derivable from the
-/// `sana_1600m` TEXT anchor by the anchor law (`mlx_gen::ios_anchor_law::derive`) — each such mode
-/// would be its own anchor family. Empty: `sana_1600m` reference and `sana_sprint_1600m` text and
-/// reference are component-additive over the base architecture's text anchor, proven on the CPU
-/// fixtures at the fully optimized selection and rung 0, dense and packed
-/// (`ios_pricing::additivity::every_mode_is_derivable_from_the_text_anchor`).
+/// Legacy diagnostic inventory, NOT an accepted additivity domain or capture-family policy.
+/// The old `derive` fixtures do not certify correlated native/process transfer. Runtime and
+/// capture grouping use the catalog's source-role policy; unproved reference modes retain their
+/// own two-endpoint families. An empty legacy inventory grants no text-anchor inheritance.
 pub const IOS_NON_ADDITIVE_MODES: &[&str] = &[];
 
 /// One tensor of a safetensors header inventory.
@@ -279,9 +279,11 @@ fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>,
         }
     };
     let latent_channels = cfg.latent_channels as u64;
-    out.take(
+    out.take_at(
         quantum::dcae_decoder_input_bytes(1, lh, lw, latent_channels, ch(n - 1)),
         labels::DECODER_INPUT,
+        lh,
+        lw,
     );
     // `run_decoder` per stage, deepest first: its upsample (every stage but the deepest), then its
     // blocks. `stages` is one closure over (range, extent) so head and tail price identically.
@@ -290,22 +292,26 @@ fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>,
             if i + 1 < n {
                 h *= 2;
                 w *= 2;
-                out.take(
+                out.take_at(
                     quantum::dcae_upsample_bytes(1, h, w, ch(i + 1), ch(i)),
                     labels::DECODER_UPSAMPLE,
+                    h,
+                    w,
                 );
             }
             for _ in 0..cfg.layers_per_block[i] {
-                out.take(block(i, h, w), labels::DECODER_BLOCK);
+                out.take_at(block(i, h, w), labels::DECODER_BLOCK, h, w);
             }
         }
         (h, w)
     };
     if tail == 0 {
         let (h, w) = stages(0..n, lh, lw, out);
-        out.take(
+        out.take_at(
             quantum::dcae_decoder_output_bytes(1, h, w, ch(0), cfg.in_channels as u64),
             labels::DECODER_OUTPUT,
+            h,
+            w,
         );
         return;
     }
@@ -323,34 +329,62 @@ fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>,
         .filter(|t| t.needs_tiling(vae, 1, hh as i32, hw as i32));
     let Some(tiles) = tiles else {
         let (h, w) = stages(0..tail, hh, hw, out);
-        out.take(
+        out.take_at(
             quantum::dcae_decoder_output_bytes(1, h, w, ch(0), cfg.in_channels as u64),
             labels::DECODER_OUTPUT,
+            h,
+            w,
         );
         return;
     };
     let plan = tiles.plan(vae, 1, hh as i32, hw as i32);
-    let extent = |axis: &[mlx_gen::tiling::AxisTile]| {
+    let extents = |axis: &[mlx_gen::tiling::AxisTile]| {
         axis.iter()
             .map(|a| (a.end - a.start) as u64)
-            .max()
-            .unwrap_or(0)
+            .collect::<std::collections::BTreeSet<_>>()
     };
-    let (th, tw) = (extent(&plan.h), extent(&plan.w));
-    let (h, w) = stages(0..tail, th, tw, out);
-    out.take(
-        quantum::dcae_decoder_output_bytes(1, h, w, ch(0), cfg.in_channels as u64),
-        labels::DECODER_OUTPUT,
-    );
     let (out_h, out_w) = (hh * tail_scale, hw * tail_scale);
-    out.take(
-        quantum::tile_fold_bytes(h, w, out_h, out_w, cfg.in_channels as u64),
-        labels::TILE_FOLD,
-    );
-    out.take(
+    let head = tensor_bytes(4, &[1, hh, hw, ch(tail)]);
+    for th in extents(&plan.h) {
+        for tw in extents(&plan.w) {
+            let start = out.0.len();
+            let (h, w) = stages(0..tail, th, tw, out);
+            out.take_at(
+                quantum::dcae_decoder_output_bytes(1, h, w, ch(0), cfg.in_channels as u64),
+                labels::DECODER_OUTPUT,
+                h,
+                w,
+            );
+            // Per-axis fold owners exist beside a later tile's decode. They are not two
+            // independently maximized full-image slabs: w_acc spans THIS tile row, h_acc the image.
+            let accumulators = if plan.w.len() > 1 {
+                tensor_bytes(4, &[h, out_w, cfg.in_channels as u64])
+            } else {
+                0
+            } + if plan.h.len() > 1 {
+                tensor_bytes(4, &[out_h, out_w, cfg.in_channels as u64])
+            } else {
+                0
+            };
+            for q in &mut out.0[start..] {
+                q.3 = q.3.saturating_add(head).saturating_add(accumulators);
+            }
+            out.take_at(
+                quantum::tile_fold_bytes(h, w, out_h, out_w, cfg.in_channels as u64),
+                labels::TILE_FOLD,
+                h,
+                w,
+            );
+            out.0.last_mut().unwrap().3 = head; // fold guard already prices its accumulators
+        }
+    }
+    out.take_at(
         quantum::tile_finalize_bytes(out_h, out_w),
         labels::TILE_FINALIZE,
+        out_h,
+        out_w,
     );
+    out.0.last_mut().unwrap().3 = head + tensor_bytes(4, &[out_h, out_w, cfg.in_channels as u64]);
 }
 
 /// Largest counted DC-AE encode quantum of an `height x width` image (`DcAeEncoder::encode`, or
@@ -373,12 +407,14 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
     let stages = |range: std::ops::Range<usize>, mut h: u64, mut w: u64, out: &mut Quanta| {
         for i in range {
             for _ in 0..cfg.encoder_layers_per_block[i] {
-                out.take(block(i, h, w), labels::ENCODER_BLOCK);
+                out.take_at(block(i, h, w), labels::ENCODER_BLOCK, h, w);
             }
             if i + 1 < n {
-                out.take(
+                out.take_at(
                     quantum::dcae_downsample_bytes(1, h, w, ch(i), ch(i + 1)),
                     labels::ENCODER_DOWNSAMPLE,
+                    h,
+                    w,
                 );
                 h = h.div_ceil(2);
                 w = w.div_ceil(2);
@@ -387,9 +423,11 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
         (h, w)
     };
     let input = |h: u64, w: u64, out: &mut Quanta| {
-        out.take(
+        out.take_at(
             quantum::dcae_encoder_input_bytes(1, h, w, cfg.in_channels as u64, ch(0)),
             labels::ENCODER_INPUT,
+            h,
+            w,
         );
     };
     let downsamples = (0..prefix).filter(|i| i + 1 < n).count() as u32;
@@ -407,22 +445,54 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
     let tiled = tile.map(|core| (core.max(1) as u64).div_ceil(cell) * cell);
     let (h, w) = match tiled {
         Some(core) if prefix > 0 && (height > core || width > core) => {
-            // Each tile is its core plus the halo, clipped at the border; price the largest.
-            let extent = |len: u64| {
+            // Preserve every border/interior extent family, not only the largest tile. Cropped
+            // prefix features remain in rows until stitch and can retain the full halo parent.
+            let extents = |len: u64| {
                 (0..len)
                     .step_by(core as usize)
                     .map(|s0| ((s0 + core).min(len) + halo).min(len) - s0.saturating_sub(halo))
-                    .max()
-                    .unwrap_or(0)
+                    .collect::<Vec<_>>()
             };
-            let (th, tw) = (extent(height), extent(width));
-            input(th, tw, out);
-            stages(0..prefix, th, tw, out);
+            let hs = extents(height);
+            let ws = extents(width);
+            let channels = ch(prefix.min(n - 1));
+            let parent_elements = hs
+                .iter()
+                .map(|h| h / cell)
+                .sum::<u64>()
+                .saturating_mul(ws.iter().map(|w| w / cell).sum::<u64>())
+                .saturating_mul(channels);
+            let parents = parent_elements.saturating_mul(4);
+            for th in hs
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                for tw in ws
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                {
+                    let start = out.0.len();
+                    input(th, tw, out);
+                    stages(0..prefix, th, tw, out);
+                    let current_parent = tensor_bytes(4, &[th / cell, tw / cell, channels]);
+                    for q in &mut out.0[start..] {
+                        q.3 = q.3.saturating_add(parents.saturating_sub(current_parent));
+                    }
+                }
+            }
             let (sh, sw) = (height / cell, width / cell);
-            out.take(
-                quantum::dcae_encode_stitch_bytes(1, sh, sw, ch(prefix.min(n - 1))),
+            out.take_at(
+                quantum::dcae_encode_stitch_bytes(1, sh, sw, channels),
                 labels::ENCODER_STITCH,
+                sh,
+                sw,
             );
+            // The stitch guard counts the core crops; only their additional halo parent extent
+            // belongs beside it. Logical view/backing accounting is NOT a physical certificate.
+            out.0.last_mut().unwrap().3 =
+                parents.saturating_sub(tensor_bytes(4, &[sh, sw, channels]));
             stages(prefix..n, sh, sw, out)
         }
         _ => {
@@ -430,29 +500,35 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
             stages(0..n, height, width, out)
         }
     };
-    out.take(
+    out.take_at(
         quantum::dcae_encoder_output_bytes(1, h, w, ch(n - 1), cfg.latent_channels as u64),
         labels::ENCODER_OUTPUT,
+        h,
+        w,
     );
 }
 
 /// The counted quanta of one phase, `(scratch, label)` in run order.
-#[derive(Default)]
-struct Quanta(Vec<(u64, &'static str)>);
+#[derive(Clone, Default)]
+struct Quanta(Vec<(u64, &'static str, Option<(u64, u64)>, u64)>);
 impl Quanta {
     fn take(&mut self, scratch: u64, label: &'static str) {
-        self.0.push((scratch, label));
+        self.0.push((scratch, label, None, 0));
+    }
+    fn take_at(&mut self, scratch: u64, label: &'static str, h: u64, w: u64) {
+        self.0.push((scratch, label, Some((h, w)), 0));
     }
 }
 
 /// One counted quantum of a priced request: its phase, the component bytes resident around it, its
 /// guard's scratch and its label.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PricedQuantum {
     pub phase: IosPhase,
     pub resident_bytes: u64,
     pub scratch_bytes: u64,
     pub label: &'static str,
+    pub window: IosWindowPrice,
 }
 
 /// Gemma-2's compute width and the largest promoted dense-weight copy of any layer
@@ -556,7 +632,7 @@ fn entry_weight_bytes(inv: &Inventory, cfg: &SanaTransformerConfig) -> Result<u6
 pub fn price(facts: &SanaPricingFacts, plan: &SanaPricingPlan) -> Result<IosPricing> {
     let mut pricing = IosPricing::default();
     for q in priced_quanta(facts, plan)? {
-        pricing.take(q.phase, q.resident_bytes, q.scratch_bytes, q.label);
+        pricing.take_window(q.window);
     }
     Ok(pricing)
 }
@@ -567,22 +643,17 @@ pub fn priced_quanta(
     facts: &SanaPricingFacts,
     plan: &SanaPricingPlan,
 ) -> Result<Vec<PricedQuantum>> {
+    priced_quanta_with_cfg(facts, plan, !plan.sprint)
+}
+
+fn priced_quanta_with_cfg(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    cfg_on: bool,
+) -> Result<Vec<PricedQuantum>> {
     let cfg = &facts.transformer;
     let dcae = &facts.dc_ae;
     let mut out = Vec::new();
-    let mut phase = |phase: IosPhase, resident_bytes: u64, quanta: Quanta| {
-        out.extend(
-            quanta
-                .0
-                .into_iter()
-                .map(|(scratch_bytes, label)| PricedQuantum {
-                    phase,
-                    resident_bytes,
-                    scratch_bytes,
-                    label,
-                }),
-        );
-    };
     let count = u64::from(plan.count.max(1));
 
     // ---- component bytes (resident widths) ----
@@ -594,7 +665,7 @@ pub fn priced_quanta(
     // ---- carried tensors ----
     let (gw, layer_weights) = gemma_facts(&facts.text_encoder, &facts.gemma)?;
     let hidden = facts.gemma.hidden_size as u64;
-    let n_cond = if plan.sprint { 1 } else { 2 }; // base: cond + the CFG uncond twin
+    let n_cond = if cfg_on { 2 } else { 1 }; // actual encode_conditioning guidance > 1 gate
     let cond_bytes = tensor_bytes(gw, &[n_cond, facts.caption_tokens, hidden])
         .saturating_add(tensor_bytes(4, &[n_cond, facts.caption_tokens]));
     let (lh, lw) = (
@@ -607,11 +678,105 @@ pub fn priced_quanta(
 
     // ---- regime: which components each phase holds ----
     let staged = plan.sequential;
-    // A staged img2img encodes in its own phase; an unstaged bundle builds the encoder with the
-    // trunk (`load_heavy`'s `needs_encoder`).
-    let heavy_has_encoder = plan.img2img && !staged;
+    // A staged img2img encodes separately. The resident warm pair eagerly loads the reusable
+    // heavy superset (`Residency::ensure_warm_locked` passes true to `load_heavy`), including the
+    // DC-AE encoder even on text requests. Encoder and decoder use one shared weight inventory.
+    let heavy_has_encoder = !staged;
     let all = te_bytes + dit_bytes + dec_bytes + if heavy_has_encoder { enc_bytes } else { 0 };
     let resident = |sequential: u64| if staged { sequential } else { all };
+    let mut points = BTreeMap::<&str, usize>::new();
+    let mut phase = |phase: IosPhase, resident_bytes: u64, quanta: Quanta| {
+        for (scratch_bytes, label, extent, extra_held) in quanta.0 {
+            let structural = match phase {
+                IosPhase::Load => {
+                    if staged || label == labels::TEXT_LOAD {
+                        0
+                    } else {
+                        te_bytes
+                    }
+                }
+                IosPhase::Conditioning => resident(te_bytes),
+                IosPhase::Encode => resident(enc_bytes),
+                IosPhase::Denoise => resident(dit_bytes + dec_bytes),
+                IosPhase::Decode => resident(dec_bytes),
+            };
+            let mut held = resident_bytes
+                .saturating_sub(structural)
+                .saturating_add(extra_held);
+            if phase == IosPhase::Decode {
+                held = held.saturating_add(
+                    (count - 1) * 3 * u64::from(plan.width) * u64::from(plan.height),
+                );
+            }
+            if matches!(label, labels::BLOCK | labels::OUTPUT) {
+                // entry() returns these owners and forward_with_memory retains them across the
+                // stack. The block guard counts projected K/V, not this projected caption input.
+                held = held.saturating_add(tensor_bytes(
+                    4,
+                    &[1, facts.caption_tokens, cfg.inner_dim() as u64],
+                ));
+                let time_columns = if label == labels::BLOCK { 7 } else { 6 };
+                // OUTPUT guard already counts emb among its modulation vectors; temb still lives.
+                held = held
+                    .saturating_add(tensor_bytes(4, &[1, time_columns, cfg.inner_dim() as u64]));
+            }
+            let point = points.entry(label).or_default();
+            let (op_h, op_w) = extent.unwrap_or((u64::from(plan.height), u64::from(plan.width)));
+            let patch = cfg.patch_size.max(1) as u64;
+            let basis = IosWorkBasis {
+                forward_rows: if phase == IosPhase::Load { 0 } else { 1 },
+                token_count: if phase == IosPhase::Conditioning {
+                    facts.gemma_tokens
+                } else if phase == IosPhase::Denoise {
+                    (lh / patch) * (lw / patch)
+                } else {
+                    0
+                },
+                model_width: op_w as u32,
+                model_height: op_h as u32,
+                processed_plane_bytes: if phase == IosPhase::Encode {
+                    4 * dcae.in_channels as u64 * u64::from(plan.height) * u64::from(plan.width)
+                } else {
+                    0
+                },
+                output_plane_bytes: 3 * u64::from(plan.width) * u64::from(plan.height),
+                patch_width: if phase == IosPhase::Denoise {
+                    patch as u32
+                } else {
+                    0
+                },
+                patch_height: if phase == IosPhase::Denoise {
+                    patch as u32
+                } else {
+                    0
+                },
+                ..Default::default()
+            };
+            let window = IosWindowPrice {
+                phase,
+                class: Some(format!(
+                    "sana/{}/{}/{label}/source-op-{}",
+                    if plan.sprint { "scm" } else { "flow" },
+                    phase.as_key(),
+                    *point
+                )),
+                label: label.into(),
+                resident_bytes: structural,
+                held_bytes: held,
+                scratch_bytes,
+                basis: Some(basis),
+                owner_domain: "sana/source-logical-owners-v1".into(),
+            };
+            *point += 1;
+            out.push(PricedQuantum {
+                phase,
+                resident_bytes,
+                scratch_bytes,
+                label,
+                window,
+            });
+        }
+    };
 
     // ---- Load ----
     let te_dir = facts.root.join("text_encoder");
@@ -670,7 +835,14 @@ pub fn priced_quanta(
         text.take(gemma_layer_bytes(g, 1, l, gw, *w), GEMMA_LABELS[1]);
     }
     text.take(gemma_final_norm_bytes(g, 1, l, gw), GEMMA_LABELS[2]);
-    phase(IosPhase::Conditioning, resident(te_bytes), text);
+    phase(IosPhase::Conditioning, resident(te_bytes), text.clone());
+    if cfg_on {
+        phase(
+            IosPhase::Conditioning,
+            resident(te_bytes) + cond_bytes / n_cond,
+            text,
+        );
+    }
 
     // ---- Encode (img2img: the reference, from the preprocessed f32 NCHW image) ----
     if plan.img2img {
@@ -791,7 +963,76 @@ pub fn priced_quanta(
 /// Price an iOS SANA (`sana_1600m`) or SANA-Sprint (`sana_sprint_1600m`) request: text-to-image or
 /// img2img (one reference), under the request's load policy and execution levers. A request the
 /// generator would refuse (an out-of-domain lever, the withheld rung 4) is refused here too.
+enum PricingSampling {
+    Flow(mlx_gen::sampler::flow_sampling::ResolvedFlowControls),
+    Scm(crate::sampling::ResolvedSprintControls),
+}
+
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
+    req.validate_work_context()?;
+    let generation = mlx_gen::sampler::flow_sampling::require_generation(req.generation)?;
+    let has_init = matches!(req.mode, MemoryMode::ImageToImage);
+    let sampling = match req.provider {
+        crate::MODEL_ID => PricingSampling::Flow(crate::sampling::resolve_base_with_init(
+            generation, has_init,
+        )?),
+        crate::SPRINT_MODEL_ID => PricingSampling::Scm(crate::sampling::resolve_sprint_with_init(
+            generation, has_init,
+        )?),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "SANA pricing: unknown provider {other}"
+            )))
+        }
+    };
+    price_request_controls(req, generation.count, sampling)
+}
+
+/// Explicit payload-free captured-controls replay. No GenerationRequest or media carrier is
+/// constructed; typed mode supplies init presence and the anchor supplies its serial count.
+pub fn ios_pricing_with_token(
+    req: &IosPricingRequest<'_>,
+    token: &str,
+    count: u32,
+) -> Result<IosPricing> {
+    req.validate_work_context()?;
+    let has_init = matches!(req.mode, MemoryMode::ImageToImage);
+    let sampling = match req.provider {
+        crate::MODEL_ID => {
+            let recipe = mlx_gen::sampler::flow_sampling::FlowSamplingRecipe::from_token(token)?;
+            PricingSampling::Flow(
+                mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(
+                    &recipe,
+                    crate::sampling::base_defaults(),
+                    mlx_gen::TimestepConvention::Sigma,
+                )?,
+            )
+        }
+        crate::SPRINT_MODEL_ID => {
+            let recipe = crate::sampling::ScmSamplingRecipe::from_token(token)?;
+            PricingSampling::Scm(crate::sampling::ResolvedSprintControls::from_recipe(
+                &recipe, has_init,
+            )?)
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "SANA pricing: unknown provider {other}"
+            )))
+        }
+    };
+    price_request_controls(req, count, sampling)
+}
+
+fn price_request_controls(
+    req: &IosPricingRequest<'_>,
+    count: u32,
+    sampling: PricingSampling,
+) -> Result<IosPricing> {
+    if count == 0 {
+        return Err(Error::Unsupported(
+            "pricing requires a positive serial output count".into(),
+        ));
+    }
     let sprint = match req.provider {
         crate::MODEL_ID => false,
         crate::SPRINT_MODEL_ID => true,
@@ -802,7 +1043,7 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
         }
     };
     let img2img = match req.mode {
-        MemoryMode::TextToImage => false,
+        MemoryMode::TextToImage if req.geometry.reference_count == 0 => false,
         MemoryMode::ImageToImage if req.geometry.reference_count == 1 => true,
         other => {
             return Err(Error::Unsupported(format!(
@@ -813,15 +1054,11 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
             )))
         }
     };
-    let WeightsSource::Dir(root) = &req.spec.weights else {
-        return Err(Error::Unsupported(format!(
-            "{}: pricing needs a snapshot directory",
-            req.provider
-        )));
-    };
+    let root = crate::model::load_components(req.spec, req.provider)?;
     crate::memory_strategy::validate_request_memory(req.provider, req.spec, req.execution)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
     let facts = SanaPricingFacts::read(root, sprint)?;
+    let cfg_on = matches!(&sampling, PricingSampling::Flow(flow) if flow.effective_guidance().is_some_and(|g| g > 1.0));
     let sequential = req.spec.offload_policy == OffloadPolicy::Sequential;
     let memory = Some(*req.execution);
     let plan = SanaPricingPlan {
@@ -830,7 +1067,7 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
         img2img,
         width: req.geometry.width,
         height: req.geometry.height,
-        count: req.geometry.batch,
+        count,
         decode_tiling: crate::pipeline::resolved_decode_plan(memory, sequential)
             .map(|p| (p.edge, p.overlap)),
         // On device the iOS quantum scope is always enabled.
@@ -841,7 +1078,122 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
         )?
         .attention,
     };
-    price(&facts, &plan)
+    let elements = u64::from(plan.width / crate::pipeline::SPATIAL_SCALE)
+        * u64::from(plan.height / crate::pipeline::SPATIAL_SCALE)
+        * facts.transformer.in_channels as u64;
+    // A finite source family is a POSSIBLE callback/update window, never an observed witness.
+    // Tuple: family, enclosing callback owner bytes, prior-output owner bytes at the step guard.
+    let (families, host_schedule, zero_scm) = if let PricingSampling::Scm(sampling) = &sampling {
+        let transitions = sampling.effective_transitions();
+        let latent = elements.saturating_mul(4);
+        let mut families = Vec::new();
+        if transitions == 1 {
+            families.push(("scm/warmup-terminal".to_owned(), latent, 0));
+        } else if transitions > 1 {
+            families.push(("scm/warmup-renoise".to_owned(), latent, 0));
+            if transitions > 2 {
+                families.push(("scm/history-renoise".to_owned(), 2 * latent, latent));
+            }
+            families.push(("scm/history-terminal".to_owned(), 2 * latent, latent));
+        }
+        (families, sampling.host_schedule_bytes()?, transitions == 0)
+    } else {
+        let PricingSampling::Flow(sampling) = &sampling else {
+            unreachable!("typed FLOW branch")
+        };
+        let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
+            sampling.solver(),
+            sampling.convention(),
+            elements,
+            4,
+            4,
+        )?;
+        let cfg = sampling.effective_guidance().is_some_and(|g| g > 1.0);
+        let mut families = Vec::new();
+        for callback in callbacks {
+            for uncond in [false, true].into_iter().filter(|u| !*u || cfg) {
+                let prior_prediction = if uncond {
+                    elements.saturating_mul(4)
+                } else {
+                    0
+                };
+                families.push((
+                    format!(
+                        "{}/{}/{}",
+                        sampling.allocation_class(),
+                        callback.family(),
+                        if uncond {
+                            "uncond-held-conditional"
+                        } else {
+                            "conditional"
+                        }
+                    ),
+                    callback
+                        .callback_outer_bytes
+                        .saturating_add(prior_prediction),
+                    callback.callback_outer_bytes,
+                ));
+            }
+        }
+        (families, sampling.host_schedule_bytes()?, false)
+    };
+    let mut pricing = IosPricing::default();
+    for quantum in priced_quanta_with_cfg(&facts, &plan, cfg_on)? {
+        let forward = matches!(
+            quantum.label,
+            labels::ENTRY | labels::BLOCK | labels::OUTPUT
+        );
+        let step = quantum.label == mlx_gen::sampler::SAMPLER_STEP_QUANTUM
+            || quantum.label == labels::SCM_STEP;
+        if forward || step {
+            for (family, callback_held, step_held) in &families {
+                let mut window = quantum.window.clone();
+                window.class = Some(format!("{}/{family}", window.class.as_deref().unwrap()));
+                let held = if step { *step_held } else { *callback_held };
+                // ENTRY guard includes its input. At block/output points the forward input remains
+                // in the enclosing callback beside the block hidden state priced by that guard.
+                let forward_input = if forward && quantum.label != labels::ENTRY {
+                    elements * 4
+                } else {
+                    0
+                };
+                window.held_bytes = window
+                    .held_bytes
+                    .saturating_add(held)
+                    .saturating_add(forward_input)
+                    .saturating_add(host_schedule);
+                pricing.take_window(window);
+            }
+            if !sprint && step {
+                let mut final_window = quantum.window.clone();
+                final_window.class = Some(format!(
+                    "{}/solve-complete",
+                    final_window.class.as_deref().unwrap()
+                ));
+                final_window.held_bytes = final_window.held_bytes.saturating_add(host_schedule);
+                pricing.take_window(final_window);
+            }
+        } else {
+            let mut window = quantum.window;
+            if quantum.label == labels::SCM_FINAL {
+                window.class = Some(format!(
+                    "{}/{}",
+                    window.class.as_deref().unwrap(),
+                    if zero_scm {
+                        "zero-transition-final-divide"
+                    } else {
+                        "terminal-final-divide"
+                    }
+                ));
+                window.held_bytes = window.held_bytes.saturating_add(host_schedule);
+            }
+            pricing.take_window(window);
+        }
+    }
+    if !img2img {
+        pricing.phase_not_run(IosPhase::Encode, "text mode has no reference encode");
+    }
+    Ok(pricing)
 }
 
 #[cfg(all(test, target_os = "macos"))]

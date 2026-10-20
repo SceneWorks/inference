@@ -154,7 +154,8 @@ fn price(
     spec: &LoadSpec,
     mode: &MemoryMode,
     edge: u32,
-    reference_count: u32,
+    true_reference_count: u32,
+    control_count: u32,
     strategy: MemoryStrategy,
 ) -> Cell {
     let contract = crate::memory_strategy::memory_strategy_contract(provider, spec).unwrap();
@@ -162,6 +163,20 @@ fn price(
     let space = contract.selection_space(strategy, tier, false).unwrap();
     let selection = *space.last().unwrap();
     let execution: GenerationMemory = contract.generation_memory(&selection).unwrap_or_default();
+    let reference_count = true_reference_count.checked_add(control_count).unwrap();
+    let has_init = true_reference_count == 1;
+    // This header-only prediction case owns explicit typed roles; aggregate geometry is their sum.
+    // Resolve explicit scalar controls once and replay their token through the payload-free API.
+    let generation = mlx_gen::GenerationRequest {
+        width: edge,
+        height: edge,
+        strength: has_init.then_some(1.0),
+        ..Default::default()
+    };
+    let token = crate::sampling::resolve_with_init(&generation, has_init)
+        .unwrap()
+        .recipe()
+        .canonical_token();
     let req = IosPricingRequest {
         provider,
         spec,
@@ -176,6 +191,9 @@ fn price(
         selection: &selection,
         execution: &execution,
         token_window: 0,
+        generation: None,
+        transform: None,
+        depth: None,
     };
     let p = selection.parameters;
     Cell {
@@ -193,7 +211,15 @@ fn price(
                 None => "-".into(),
             }
         ),
-        pricing: crate::ios_pricing::ios_pricing(&req).unwrap(),
+        pricing: crate::ios_pricing::ios_pricing_with_token(
+            &req,
+            &token,
+            1,
+            true_reference_count,
+            0,
+            control_count,
+        )
+        .unwrap(),
     }
 }
 
@@ -242,17 +268,18 @@ fn reachable_sizes() {
     let turbo = crate::model::MODEL_ID;
     let control_id = crate::model_control::MODEL_ID;
     let control_mode = MemoryMode::Other("control".into());
-    // (provider, mode name, MemoryMode, reference count): `ios_admission::work_mode` + the request's
-    // `memory_reference_count` (a control image is one reference, an img2img init another).
-    let mut modes: Vec<(&str, String, MemoryMode, u32)> = vec![
-        (turbo, "text".into(), MemoryMode::TextToImage, 0),
-        (turbo, "reference".into(), MemoryMode::ImageToImage, 1),
+    // (provider, mode name, MemoryMode, TRUE References, Controls). Masks are zero for every
+    // actual Z route; the legacy aggregate geometry remains the checked sum of these role counts.
+    let mut modes: Vec<(&str, String, MemoryMode, u32, u32)> = vec![
+        (turbo, "text".into(), MemoryMode::TextToImage, 0, 0),
+        (turbo, "reference".into(), MemoryMode::ImageToImage, 1, 0),
     ];
     for kind in ["canny", "depth", "pose"] {
         modes.push((
             control_id,
             format!("control_{kind}"),
             control_mode.clone(),
+            0,
             1,
         ));
     }
@@ -261,7 +288,8 @@ fn reachable_sizes() {
             control_id,
             format!("reference_{kind}"),
             control_mode.clone(),
-            2,
+            1,
+            1,
         ));
     }
     let limit = ENTITLED_MIB;
@@ -274,7 +302,7 @@ fn reachable_sizes() {
     ] {
         println!("\n{table} — MiB per phase = resident + largest counted quantum + {} MiB reserve (binding quantum); entitled {ENTITLED_MIB} MiB\n", PROCESS_RESERVE_BYTES / MIB);
         println!("{header}\n{rule}");
-        for (provider, name, mode, refs) in &modes {
+        for (provider, name, mode, true_refs, controls) in &modes {
             for tier in ["q4", "q8", "bf16"] {
                 let spec = load_spec(
                     &root,
@@ -287,7 +315,7 @@ fn reachable_sizes() {
                     deepest(provider, &spec)
                 };
                 for edge in [512u32, 768, 1024] {
-                    let cell = price(provider, &spec, mode, edge, *refs, strategy);
+                    let cell = price(provider, &spec, mode, edge, *true_refs, *controls, strategy);
                     let (cells, peak) = row(&cell);
                     let fits = peak <= limit;
                     if !rung0 && !fits {

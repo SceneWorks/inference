@@ -23,7 +23,7 @@ pub use budget::{
 pub use kernels::{
     bytes, conv_channels, conv_sum, decoded_to_image_bytes, downsample_stage_bytes,
     downsample_tile_bytes, dtype_bytes, element_bytes, elements, group_norm_buffers,
-    norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes, sdpa_scores,
+    norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes, resnet_bytes_from_metadata, sdpa_scores,
     single_conv_bytes, tile_bytes, tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes,
     Backend, ConvCall, TileSource, GROUP_NORM_BUFFERS, PAGE_BYTES, VAE_ATTENTION_SCORE_ELEMENTS,
 };
@@ -214,9 +214,114 @@ pub fn available_bytes() -> Option<u64> {
     }
 }
 
-/// Cache lifetime matches the enclosing SANA/Gemma operation, including errors and early returns.
-/// Nested scopes restore zero; the outer scope restores the caller's previous cache policy.
-pub struct Scope(Option<usize>);
+/// Actual Darwin VM page operand used by the pinned Metal allocator. Metadata only, never
+/// proof that an existing backing was fresh or an absolute process-footprint certificate.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn native_metal_page_bytes() -> Option<u64> {
+    unsafe extern "C" {
+        static vm_page_size: usize;
+    }
+    let page = unsafe { vm_page_size } as u64;
+    page.is_power_of_two().then_some(page)
+}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn native_metal_page_bytes() -> Option<u64> {
+    None
+}
+
+pub fn fresh_metal_allocation_bytes(request_bytes: u64, page_bytes: u64) -> Option<u64> {
+    if !page_bytes.is_power_of_two() {
+        return None;
+    }
+    if request_bytes <= page_bytes {
+        return Some(request_bytes);
+    }
+    request_bytes
+        .checked_add(page_bytes - 1)?
+        .checked_div(page_bytes)?
+        .checked_mul(page_bytes)
+}
+
+// Private native-call seam only: production always uses pinned C bindings, never a provider hook.
+#[derive(Clone, Copy)]
+struct ScopeControls {
+    set_limit: unsafe extern "C" fn(*mut usize, usize) -> i32,
+    get_cached: unsafe extern "C" fn(*mut usize) -> i32,
+    clear: unsafe extern "C" fn() -> i32,
+    drain: fn() -> usize,
+}
+impl ScopeControls {
+    const NATIVE: Self = Self {
+        set_limit: mlx_sys::mlx_set_cache_limit,
+        get_cached: mlx_sys::mlx_get_cache_memory,
+        clear: mlx_sys::mlx_clear_cache,
+        drain: crate::residency::drain_allocator_cache,
+    };
+    fn cached(self) -> Option<usize> {
+        let mut bytes = 0;
+        (unsafe { (self.get_cached)(&mut bytes) } == 0).then_some(bytes)
+    }
+    fn drain(self) -> Result<()> {
+        (self.drain)();
+        let status = unsafe { (self.clear)() };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(Error::Msg(format!(
+                "native quantum cache clear failed with status {status}"
+            )))
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct ScopeRestore {
+    previous: usize,
+    controls: ScopeControls,
+}
+
+fn diagnostic_allocation_scope(
+    requested_limit: usize,
+    previous_return: Option<usize>,
+    cached_bytes: Option<usize>,
+    restoring: bool,
+) {
+    let Some(page_bytes) = native_metal_page_bytes() else {
+        return;
+    };
+    if let (Some(previous), Some(cached)) = (previous_return, cached_bytes) {
+        diagnostic_metadata(
+            "mlx",
+            "allocation-scope",
+            &[
+                ("schema", 1),
+                ("page_bytes", page_bytes),
+                ("cache_limit_requested_bytes", requested_limit as u64),
+                ("setter_succeeded", 1),
+                ("cache_query_succeeded", 1),
+                ("setter_previous_bytes", previous as u64),
+                ("cache_bytes", cached as u64),
+                ("restoring", u64::from(restoring)),
+            ],
+        );
+    } else {
+        diagnostic_metadata(
+            "mlx",
+            "allocation-scope",
+            &[
+                ("schema", 1),
+                ("page_bytes", page_bytes),
+                ("cache_limit_requested_bytes", requested_limit as u64),
+                ("setter_succeeded", u64::from(previous_return.is_some())),
+                ("cache_query_succeeded", u64::from(cached_bytes.is_some())),
+                ("restoring", u64::from(restoring)),
+            ],
+        );
+    }
+}
+
+/// Cache lifetime matches the operation, including errors and early returns. Failed native
+/// controls never become an inactive scope or fabricated previous/cache values.
+pub struct Scope(Option<ScopeRestore>);
 impl Default for Scope {
     fn default() -> Self {
         Self::new()
@@ -224,20 +329,280 @@ impl Default for Scope {
 }
 impl Scope {
     pub fn new() -> Self {
+        Self::try_new().expect("native quantum scope setup failed")
+    }
+    pub fn try_new() -> Result<Self> {
         if enabled() {
-            let previous = mlx_rs::memory::set_cache_limit(0);
-            crate::residency::drain_allocator_cache();
-            Self(Some(previous))
+            Self::try_new_enabled(ScopeControls::NATIVE)
         } else {
-            Self(None)
+            Ok(Self(None))
         }
+    }
+    fn try_new_enabled(controls: ScopeControls) -> Result<Self> {
+        let mut previous = 0;
+        let status = unsafe { (controls.set_limit)(&mut previous, 0) };
+        if status != 0 {
+            diagnostic_allocation_scope(0, None, controls.cached(), false);
+            return Err(Error::Msg(format!(
+                "native quantum cache-zero setter failed with status {status}"
+            )));
+        }
+        let scope = Self(Some(ScopeRestore { previous, controls }));
+        controls.drain()?;
+        let cached = controls.cached();
+        diagnostic_allocation_scope(0, Some(previous), cached, false);
+        if cached != Some(0) {
+            return Err(Error::Msg(format!(
+                "native quantum cache was not verifiably drained: {cached:?}"
+            )));
+        }
+        Ok(scope)
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        if let Some(previous) = self.0 {
-            crate::residency::drain_allocator_cache();
-            mlx_rs::memory::set_cache_limit(previous);
+        if let Some(ScopeRestore { previous, controls }) = self.0.take() {
+            if let Err(error) = controls.drain() {
+                eprintln!("MLX quantum cache cleanup failed: {error}");
+            }
+            let mut replaced = 0;
+            let status = unsafe { (controls.set_limit)(&mut replaced, previous) };
+            diagnostic_allocation_scope(
+                previous,
+                (status == 0).then_some(replaced),
+                controls.cached(),
+                true,
+            );
+            if status != 0 {
+                eprintln!("MLX quantum cache policy restoration failed (native status {status}, requested limit {previous})");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod allocation_scope_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    // Synthetic native-control faults exercise production setup/RAII, not backing physics.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        None,
+        Setter,
+        Query,
+        Clear,
+        Nonempty,
+        Restore,
+    }
+    struct State {
+        fault: Fault,
+        limit: usize,
+        cached: usize,
+        setters: usize,
+        restores: usize,
+    }
+    const PREVIOUS: usize = 123;
+    thread_local! {
+        static STATE: RefCell<State> = const { RefCell::new(State { fault: Fault::None, limit: PREVIOUS, cached: 7, setters: 0, restores: 0 }) };
+    }
+    fn reset(fault: Fault) {
+        STATE.with(|state| {
+            *state.borrow_mut() = State {
+                fault,
+                limit: PREVIOUS,
+                cached: if fault == Fault::Clear { 0 } else { 7 },
+                setters: 0,
+                restores: 0,
+            }
+        });
+    }
+    unsafe extern "C" fn setter(previous: *mut usize, requested: usize) -> i32 {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.setters += 1;
+            if requested != 0 {
+                state.restores += 1;
+            }
+            if state.fault == Fault::Setter || (state.fault == Fault::Restore && requested != 0) {
+                return 7;
+            }
+            unsafe {
+                *previous = state.limit;
+            }
+            state.limit = requested;
+            0
+        })
+    }
+    unsafe extern "C" fn query(bytes: *mut usize) -> i32 {
+        STATE.with(|state| {
+            let state = state.borrow();
+            if state.fault == Fault::Query {
+                return 9;
+            }
+            unsafe {
+                *bytes = state.cached;
+            }
+            0
+        })
+    }
+    unsafe extern "C" fn clear() -> i32 {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.fault == Fault::Clear {
+                return 11;
+            }
+            if state.fault != Fault::Nonempty {
+                state.cached = 0;
+            }
+            0
+        })
+    }
+    fn drain() -> usize {
+        0
+    }
+    const CONTROLS: ScopeControls = ScopeControls {
+        set_limit: setter,
+        get_cached: query,
+        clear,
+        drain,
+    };
+    fn assert_closed_before_work(fault: Fault, expected_restores: usize) {
+        reset(fault);
+        let work = Cell::new(0);
+        let result: Result<()> = (|| {
+            let _scope = Scope::try_new_enabled(CONTROLS)?;
+            work.set(work.get() + 1);
+            Ok(())
+        })();
+        assert!(
+            result.is_err(),
+            "native control fault must return typed setup error"
+        );
+        assert_eq!(work.get(), 0, "no work after failed setup");
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(
+                state.limit, PREVIOUS,
+                "restore known previous, not initialized zero"
+            );
+            assert_eq!(state.restores, expected_restores);
+            if fault == Fault::Setter {
+                assert_eq!(state.setters, 1);
+            }
+        });
+    }
+    #[test]
+    fn setter_failure_is_closed_before_work_without_fake_previous_zero() {
+        assert_closed_before_work(Fault::Setter, 0);
+    }
+    #[test]
+    fn query_failure_is_closed_before_work_and_restores_previous() {
+        assert_closed_before_work(Fault::Query, 1);
+    }
+    #[test]
+    fn clear_failure_is_closed_before_work_and_restores_previous() {
+        assert_closed_before_work(Fault::Clear, 1);
+    }
+    #[test]
+    fn nonempty_cache_is_closed_before_work_and_restores_previous() {
+        assert_closed_before_work(Fault::Nonempty, 1);
+    }
+    #[test]
+    fn successful_scope_restores_the_actual_previous_limit() {
+        reset(Fault::None);
+        let scope = Scope::try_new_enabled(CONTROLS).unwrap();
+        STATE.with(|state| assert_eq!(state.borrow().limit, 0));
+        drop(scope);
+        STATE.with(|state| {
+            assert_eq!(state.borrow().limit, PREVIOUS);
+            assert_eq!(state.borrow().restores, 1);
+        });
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn restore_failure_is_honest_and_does_not_panic_during_unwind() {
+        reset(Fault::Restore);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        assert!(!set_quantum_listener(Some(Box::new(move |mark| {
+            if let QuantumMark::Metadata {
+                provider: "mlx",
+                kind: "allocation-scope",
+                fields,
+            } = mark
+            {
+                sink.lock().unwrap().push(
+                    fields
+                        .iter()
+                        .map(|&(key, value)| (key.to_owned(), value))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                );
+            }
+        }))));
+        struct Remove;
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                set_quantum_listener(None);
+            }
+        }
+        let _remove = Remove;
+        const BODY_PANIC: &str = "synthetic body failure while scope lives";
+        let result = std::panic::catch_unwind(|| {
+            let _scope = Scope::try_new_enabled(CONTROLS).unwrap();
+            std::panic::panic_any(BODY_PANIC);
+        });
+        assert_eq!(
+            result
+                .expect_err("body panic preserved")
+                .downcast_ref::<&str>()
+                .copied(),
+            Some(BODY_PANIC)
+        );
+        let seen = seen.lock().unwrap();
+        let restore = seen.last().expect("actual restore metadata");
+        assert_eq!(restore.get("restoring"), Some(&1));
+        assert_eq!(restore.get("setter_succeeded"), Some(&0));
+        assert!(
+            !restore.contains_key("setter_previous_bytes") && !restore.contains_key("cache_bytes")
+        );
+        STATE.with(|state| {
+            assert_eq!(state.borrow().limit, 0);
+            assert_eq!(state.borrow().restores, 1);
+        });
+    }
+    #[test]
+    fn fresh_requests_use_the_supplied_page_boundary_not_a_machine_golden() {
+        for page in [4096u64, 16384] {
+            for (request, expected) in [
+                (0, 0),
+                (page - 1, page - 1),
+                (page, page),
+                (page + 1, 2 * page),
+                (2 * page, 2 * page),
+                (2 * page + 1, 3 * page),
+            ] {
+                assert_eq!(fresh_metal_allocation_bytes(request, page), Some(expected));
+            }
+        }
+    }
+    #[test]
+    fn fresh_requests_reject_invalid_basis_and_overflow() {
+        for page in [0u64, 3, u64::MAX] {
+            assert_eq!(fresh_metal_allocation_bytes(1, page), None);
+        }
+        for page in [4096u64, 16384] {
+            assert_eq!(fresh_metal_allocation_bytes(u64::MAX, page), None);
+        }
+    }
+    #[test]
+    fn fresh_requests_round_unique_allocations_before_summing() {
+        for page in [4096u64, 16384] {
+            let split = fresh_metal_allocation_bytes(page + 1, page).unwrap()
+                + fresh_metal_allocation_bytes(page + 1, page).unwrap();
+            let merged = fresh_metal_allocation_bytes(2 * page + 2, page).unwrap();
+            assert_eq!(split, 4 * page);
+            assert_eq!(merged, 3 * page);
+            assert!(split > merged);
         }
     }
 }
@@ -253,6 +618,23 @@ pub enum QuantumMark<'a> {
     Checked { label: &'a str, scratch: u64 },
     /// The quantum `label` completed and its stream was synchronized.
     Synchronized { label: &'a str },
+    /// Opt-in actual execution metadata. Keys/tags are provider literals and scalar fields are
+    /// borrowed only for the callback; never tensor references, clones, values or user text.
+    Metadata {
+        provider: &'a str,
+        kind: &'a str,
+        fields: &'a [(&'a str, u64)],
+    },
+}
+
+/// Send bounded, stack-backed actual execution facts through the existing diagnostic listener.
+/// Default is no-op; metadata never changes admission, scheduling or materialization.
+pub fn diagnostic_metadata<'a>(provider: &'a str, kind: &'a str, fields: &'a [(&'a str, u64)]) {
+    mark(QuantumMark::Metadata {
+        provider,
+        kind,
+        fields,
+    });
 }
 
 type Listener = Box<dyn Fn(QuantumMark<'_>) + Send + Sync>;
@@ -281,13 +663,10 @@ fn mark(m: QuantumMark<'_>) {
 struct Envelope {
     start_available: u64,
     budget: u64,
-    /// The device's per-quantum calibration (label → its anchor capture's priced scratch and the
-    /// device-observed peak over the quantum's starting footprint) and the margin it is charged at.
-    calibration: std::collections::BTreeMap<String, QuantumCalibration>,
-    margin: u64,
 }
 
-/// One quantum formula's DEVICE calibration, from an anchor capture: the guard's priced scratch at
+/// Diagnostic DEVICE observation only; this record grants no runtime calibration/discount.
+/// One quantum formula's captured counts: the guard's priced scratch at
 /// that invocation and the kernel-footprint growth the device observed across it (the lifetime
 /// peak at the quantum's end minus the footprint at its check — exact: the peak rose inside it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,20 +704,19 @@ impl Drop for AdmittedEnvelope {
     }
 }
 
-/// Open an [`AdmittedEnvelope`] of `budget_bytes` at the current live headroom, carrying the
-/// anchor's per-quantum DEVICE calibration and its margin (see `requirement`).
+/// Open an [`AdmittedEnvelope`] of the COMPLETE admitted bound (margin already included).
+/// Legacy label/size observations are accepted for call compatibility but grant NO discount:
+/// matching labels and smaller logical uppers do not prove transferable physical ratios.
 pub fn open_admitted_envelope(
     budget_bytes: u64,
-    calibration: std::collections::BTreeMap<String, QuantumCalibration>,
-    margin_bytes: u64,
+    _calibration: std::collections::BTreeMap<String, QuantumCalibration>,
+    _margin_bytes: u64,
 ) -> AdmittedEnvelope {
     let opened = match (ENVELOPE.lock(), available_bytes()) {
         (Ok(mut slot), Some(start_available)) if slot.is_none() => {
             *slot = Some(Envelope {
                 start_available,
                 budget: budget_bytes,
-                calibration,
-                margin: margin_bytes,
             });
             true
         }
@@ -353,20 +731,11 @@ pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) ->
     body()
 }
 
-/// The `(scratch, reserve)` the guard of `label` checks.
-///
-/// Outside an admitted envelope, or once the process has grown past it (the measurement no longer
-/// describes this run): the counted formula, `scratch + PROCESS_RESERVE_BYTES`. Inside it, the
-/// smallest of the formula and the two MEASURED requirements:
-/// * the envelope's remaining bytes (the anchor's whole-run growth still to come), and
-/// * the anchor-derived peak of THIS quantum: `scratch × observed / priced` from the device's
-///   calibration of the same formula (an exact observation in the anchor capture, at a priced size
-///   at least this invocation's), plus the anchor's margin.
-///
-/// So a guard whose formula over-prices what the device measured for that quantum never refuses a
-/// configuration the anchor shows fits, while every guard keeps its formula as the safety net past
-/// the measured envelope.
-fn requirement(label: &str, available: Option<u64>, scratch: u64) -> (u64, u64) {
+/// Outside an admitted envelope, or past its validated complete bound: the raw guarded formula
+/// plus engineering reserve. Inside it, only the complete envelope's remaining demand can be used
+/// instead. Per-label observed/priced ratios are NEVER transferable proof (raw100/physical80 vs
+/// raw50/physical45 is already a counterexample), even at or below the observed logical size.
+fn requirement(_label: &str, available: Option<u64>, scratch: u64) -> (u64, u64) {
     let formula = (scratch, PROCESS_RESERVE_BYTES);
     let formula_total = scratch.saturating_add(PROCESS_RESERVE_BYTES);
     let (Some(available), Ok(slot)) = (available, ENVELOPE.lock()) else {
@@ -379,22 +748,8 @@ fn requirement(label: &str, available: Option<u64>, scratch: u64) -> (u64, u64) 
     let Some(remaining) = envelope.budget.checked_sub(consumed) else {
         return formula;
     };
-    let calibrated = envelope
-        .calibration
-        .get(label)
-        // A device calibration holds at and below the size it was observed at (the observed/priced
-        // ratio rises with a quantum's size): a larger invocation keeps its formula.
-        .filter(|c| c.priced_bytes > 0 && scratch <= c.priced_bytes)
-        .map(|c| {
-            let scaled = (u128::from(scratch) * u128::from(c.observed_bytes))
-                .div_ceil(u128::from(c.priced_bytes));
-            u64::try_from(scaled)
-                .unwrap_or(u64::MAX)
-                .saturating_add(envelope.margin)
-        });
-    let measured = calibrated.map_or(remaining, |c| c.min(remaining));
-    if measured < formula_total {
-        (measured, 0)
+    if remaining < formula_total {
+        (remaining, 0)
     } else {
         formula
     }
@@ -857,6 +1212,11 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
         sink.lock().unwrap().push(match m {
             QuantumMark::Checked { label, .. } => format!("checked:{label}"),
             QuantumMark::Synchronized { label } => format!("synchronized:{label}"),
+            QuantumMark::Metadata {
+                provider,
+                kind,
+                fields,
+            } => format!("metadata:{provider}:{kind}:{fields:?}"),
         })
     }))));
     with_cpu_diagnostic_headroom(headroom, || {
@@ -906,19 +1266,17 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
     );
 }
 
-/// The per-quantum DEVICE calibration: inside an admitted envelope a guard whose formula
-/// over-prices what the device measured for that quantum needs only the anchor-derived quantum
-/// peak (`scratch × observed / priced` + margin); another label keeps its formula, and so does
-/// every guard once the process has grown past the envelope.
+/// Label/size ratios are diagnostic observations, not transferable physical bounds. Only the
+/// complete already-admitted request envelope may lower a guard's raw formula requirement.
 #[cfg(all(test, target_os = "macos"))]
 #[test]
-fn a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak() {
+fn a_label_ratio_never_authorizes_changed_quantum_discount() {
     const CHILD: &str = "MLX_IOS_QUANTUM_CALIBRATION_CPU_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ios_quantum::a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak",
+                "ios_quantum::a_label_ratio_never_authorizes_changed_quantum_discount",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -938,26 +1296,31 @@ fn a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak() {
         },
     )]);
     with_cpu_diagnostic_headroom(1024 * MIB, || {
-        // A large remaining envelope (5000 MiB) does not relax anything by itself …
-        let _envelope = open_admitted_envelope(5000 * MIB, calibration.clone(), 32 * MIB);
-        // … but the calibrated quantum needs 600 × 600/1200 + 32 = 332 MiB, not 600 + 512.
-        before("decode tile", 600 * MIB)?;
+        let envelope = open_admitted_envelope(5000 * MIB, calibration.clone(), 32 * MIB);
+        // Even matching label and a smaller counted size cannot reuse the observed/priced ratio.
         assert_eq!(
             requirement("decode tile", Some(1024 * MIB), 600 * MIB),
-            (332 * MIB, 0)
+            (600 * MIB, PROCESS_RESERVE_BYTES)
         );
-        // At 1200 MiB (the calibrated size) the anchor-derived peak 600 + 32 still fits 1024 …
-        before("decode tile", 1200 * MIB)?;
-        // … but 2100 MiB is LARGER than the device ever observed: its formula (2100 + 512) applies.
-        assert!(before("decode tile", 2100 * MIB).is_err());
+        assert!(before("decode tile", 600 * MIB).is_err());
         assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
-        // An uncalibrated label keeps its formula.
+        assert!(before("decode tile", 1200 * MIB).is_err());
+        assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
         assert!(before("denoise block", 600 * MIB).is_err());
         assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
+        drop(envelope);
+        // Only the complete admitted envelope's remaining demand, with its margin already
+        // included exactly once, may replace the more conservative per-quantum formula.
+        let _complete = open_admitted_envelope(900 * MIB, calibration.clone(), 32 * MIB);
+        assert_eq!(
+            requirement("decode tile", Some(1024 * MIB), 600 * MIB),
+            (900 * MIB, 0)
+        );
+        before("decode tile", 600 * MIB)?;
         Ok(())
     })
     .unwrap();
-    // Past the envelope the calibration no longer applies.
+    // Past the complete admitted envelope, only the raw guarded formula applies.
     with_cpu_diagnostic_headroom(1024 * MIB, || {
         let _envelope = open_admitted_envelope(100 * MIB, calibration.clone(), 32 * MIB);
         with_cpu_diagnostic_headroom(800 * MIB, || {

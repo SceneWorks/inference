@@ -17,6 +17,26 @@ use mlx_gen::{Error, Result};
 
 use crate::plan::SdxlForwardPlan;
 
+// Test-only borrowed operand-argument log; no Array, payload, registry or owner retention.
+#[cfg(test)]
+type ProjectionOperandRecord = (String, Vec<i32>, Dtype, u64);
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_OPERAND_LOG: std::cell::RefCell<Option<Vec<ProjectionOperandRecord>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_projection_operands_for_test<T>(body: impl FnOnce() -> T) -> (T, Vec<ProjectionOperandRecord>) {
+    struct Restore(Option<Vec<ProjectionOperandRecord>>);
+    impl Drop for Restore {
+        fn drop(&mut self) { PROJECTION_OPERAND_LOG.with(|log| { log.replace(self.0.take()); }); }
+    }
+    let restore = Restore(PROJECTION_OPERAND_LOG.with(|log| log.replace(Some(Vec::new()))));
+    let result = body();
+    let records = PROJECTION_OPERAND_LOG.with(|log| log.replace(None)).unwrap();
+    drop(restore);
+    (result, records)
+}
+
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
 const LN_EPS: f32 = 1e-5;
@@ -91,12 +111,13 @@ impl AttentionMHA {
         self.to_v_ip = Some(AdaptableLinear::dense(v_ip, None));
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
-        for lin in [&mut self.q, &mut self.k, &mut self.v, &mut self.out] {
-            crate::quant::quantize_linear(lin, bits)?;
+    fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+        for (name, lin) in [("to_q", &mut self.q), ("to_k", &mut self.k),
+            ("to_v", &mut self.v), ("to_out.0", &mut self.out)] {
+            visit(&crate::quant::child_path(prefix, name), lin, bits)?;
         }
-        for lin in [&mut self.to_k_ip, &mut self.to_v_ip].into_iter().flatten() {
-            crate::quant::quantize_linear(lin, bits)?;
+        for (name, lin) in [("to_k_ip", &mut self.to_k_ip), ("to_v_ip", &mut self.to_v_ip)] {
+            if let Some(lin) = lin { visit(&crate::quant::child_path(prefix, name), lin, bits)?; }
         }
         Ok(())
     }
@@ -116,7 +137,7 @@ impl AttentionMHA {
     /// an explicit softmax matmul was tried and gave no measurable parity gain at large e2e cost).
     /// The four LoRA-targetable attention projections, by diffusers leaf name (the `.to_out.0`
     /// dot is the GEGLU-style indexed leaf the kohya flattener turns into `to_out_0`).
-    fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+    fn append_lora_target_paths(prefix: &str, out: &mut Vec<String>) {
         for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
             out.push(format!("{prefix}.{leaf}"));
         }
@@ -239,15 +260,10 @@ impl TransformerBlock {
             Some(scales) => scales.shape()[0],
             None => w.require(&format!("{ff_proj}.weight"))?.shape()[0],
         };
-        if two_h % 2 != 0 {
-            return Err(Error::Msg(format!(
-                "sdxl GEGLU: ff.net.0.proj has odd output dim {two_h}; cannot split value/gate halves"
-            )));
-        }
-        let hidden = two_h / 2;
-        // Value/gate halves (rows `[0:hidden]` / `[hidden:2*hidden]`) — packed or dense.
-        let linear1 = crate::quant::lin_geglu_half(w, &ff_proj, 0, hidden)?;
-        let linear2 = crate::quant::lin_geglu_half(w, &ff_proj, hidden, two_h)?;
+        let [(lo1, hi1), (lo2, hi2)] = crate::quant::geglu_half_ranges(two_h)?;
+        // Value/gate halves — the same actual row selector serves header normalization.
+        let linear1 = crate::quant::lin_geglu_half(w, &ff_proj, lo1, hi1)?;
+        let linear2 = crate::quant::lin_geglu_half(w, &ff_proj, lo2, hi2)?;
         // FFN output (`ff.net.2`) is a plain quantized Linear.
         let linear3 = crate::quant::lin(w, &format!("{prefix}.ff.net.2"), true)?;
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
@@ -277,11 +293,15 @@ impl TransformerBlock {
     }
 
     pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.attn1.quantize(bits)?;
-        self.attn2.quantize(bits)?;
-        crate::quant::quantize_linear(&mut self.linear1, bits)?;
-        crate::quant::quantize_linear(&mut self.linear2, bits)?;
-        crate::quant::quantize_linear(&mut self.linear3, bits)?;
+        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+    }
+
+    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+        self.attn1.quantize_using(&crate::quant::child_path(prefix, "attn1"), bits, visit)?;
+        self.attn2.quantize_using(&crate::quant::child_path(prefix, "attn2"), bits, visit)?;
+        visit(&crate::quant::child_path(prefix, "ff.linear1"), &mut self.linear1, bits)?;
+        visit(&crate::quant::child_path(prefix, "ff.linear2"), &mut self.linear2, bits)?;
+        visit(&crate::quant::child_path(prefix, "ff.linear3"), &mut self.linear3, bits)?;
         Ok(())
     }
 
@@ -395,6 +415,7 @@ impl TransformerBlock {
     /// ([`Self::activation_bytes`]), `query_rows` from the request's attention plan, the
     /// score handling from the running backend ([`crate::quantum::transformer_block_bytes`]).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn quantum_scratch(
         &self,
         batch: i32,
@@ -405,8 +426,24 @@ impl TransformerBlock {
         x: Dtype,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> u64 {
+        self.quantum_scratch_from_facts(batch, context_batch, tokens, context_tokens,
+            ip, x, attention, self.activation_dtype(x), crate::quantum::linear_out(&self.linear1))
+    }
+
+    fn quantum_scratch_from_facts(
+        &self,
+        batch: i32,
+        context_batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        ip: bool,
+        x: Dtype,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+        activation: Dtype,
+        ff_width: u64,
+    ) -> u64 {
         let heads = self.attn1.num_heads;
-        let act = self.activation_bytes(x);
+        let act = crate::quantum::dtype_bytes(activation);
         let dim = self.norm1_w.shape()[0] as u64;
         // Entered narrower than the projections promote to: the self-attention's q/k/v each cast
         // the narrow LayerNorm output up (`quantized_matmul`'s `astype(x, result_type)`).
@@ -442,7 +479,7 @@ impl TransformerBlock {
             heads,
             self.attn1.head_dim,
             context_tokens,
-            crate::quantum::linear_out(&self.linear1),
+            ff_width,
             rows,
             ip && self.has_ip(),
             act,
@@ -454,6 +491,7 @@ impl TransformerBlock {
     /// projections it runs through (a packed snapshot's BF16 scales against f16 activations make
     /// every projection output, and so the residual stream, f32 —
     /// [`crate::quantum::linear_output_dtype`]).
+    #[cfg(test)]
     pub(crate) fn activation_dtype(&self, x: Dtype) -> Dtype {
         [
             &self.attn1.q,
@@ -469,8 +507,82 @@ impl TransformerBlock {
     }
 
     /// [`Self::activation_dtype`]'s bytes per element: the activation width the block is priced at.
+    #[cfg(test)]
     pub(crate) fn activation_bytes(&self, x: Dtype) -> u64 {
         crate::quantum::dtype_bytes(self.activation_dtype(x))
+    }
+
+    /// Final per-projection operands over the actual three sublayers. The residual stream and
+    /// each norm/projection retain their own dtype; the activation envelope is separate.
+    fn projection_work(
+        &self, batch: i32, context_batch: i32, tokens: i32, hidden_width: i32,
+        context_tokens: i32, memory_width: i32,
+        x: Dtype, memory: Dtype, ip: Option<(i32, i32, Dtype)>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<(Dtype, u64)> {
+        // Native projections read ACTIVATIONS, not the pre-install borrowed weight's axes.
+        // Selected effects may have changed a dense base before its actual load-time pack.
+        let dim = hidden_width;
+        let operand = |_family: &str, _role: &str, linear: &crate::quantum::LinearWork,
+            shape: &[i32], dtype: Dtype| {
+            let bytes = linear.operand_bytes(shape, dtype);
+            #[cfg(test)]
+            PROJECTION_OPERAND_LOG.with(|log| {
+                if let Some(records) = log.borrow_mut().as_mut() {
+                    records.push((format!("{_family}.{_role}"), shape.to_vec(), dtype, bytes));
+                }
+            });
+            bytes
+        };
+        let mut scratch = 0u64;
+        let mut hidden = x;
+        for (name, attention, norm_w, norm_b, cross) in [
+            ("attn1", &self.attn1, &self.norm1_w, &self.norm1_b, false),
+            ("attn2", &self.attn2, &self.norm2_w, &self.norm2_b, true),
+        ] {
+            let scope = effects.child(name);
+            let norm = crate::quantum::promote_all(hidden, &[norm_w, norm_b]);
+            let query = [batch, tokens, dim];
+            let key = [if cross { context_batch } else { batch },
+                if cross { context_tokens } else { tokens },
+                if cross { memory_width } else { hidden_width }];
+            let key_dtype = if cross { memory } else { norm };
+            let q = scope.linear("to_q", &attention.q)?;
+            let k = scope.linear("to_k", &attention.k)?;
+            let v = scope.linear("to_v", &attention.v)?;
+            scratch = scratch.saturating_add(operand(name, "to_q", &q, &query, norm))
+                .saturating_add(operand(name, "to_k", &k, &key, key_dtype))
+                .saturating_add(operand(name, "to_v", &v, &key, key_dtype));
+            let mut attended = Dtype::from_promoting_types(q.output_dtype(norm),
+                Dtype::from_promoting_types(k.output_dtype(key_dtype), v.output_dtype(key_dtype)));
+            if cross {
+                if let Some((ip_tokens, ip_width, ip_dtype)) = ip {
+                    for (name, projection) in [("to_k_ip", &attention.to_k_ip), ("to_v_ip", &attention.to_v_ip)] {
+                        if let Some(projection) = projection {
+                            let work = scope.linear(name, projection)?;
+                            scratch = scratch.saturating_add(operand("attn2", name, &work,
+                                &[context_batch, ip_tokens, ip_width], ip_dtype));
+                            attended = Dtype::from_promoting_types(attended, work.output_dtype(ip_dtype));
+                        }
+                    }
+                }
+            }
+            let out = scope.linear("to_out.0", &attention.out)?;
+            scratch = scratch.saturating_add(operand(name, "to_out.0", &out,
+                &[batch, tokens, attention.num_heads * attention.head_dim], attended));
+            hidden = Dtype::from_promoting_types(hidden, out.output_dtype(attended));
+        }
+        let norm = crate::quantum::promote_all(hidden, &[&self.norm3_w, &self.norm3_b]);
+        let value = effects.linear("ff.linear1", &self.linear1)?;
+        let gate = effects.linear("ff.linear2", &self.linear2)?;
+        let output = effects.linear("ff.linear3", &self.linear3)?;
+        let input = [batch, tokens, dim];
+        scratch = scratch.saturating_add(operand("ff", "linear1", &value, &input, norm))
+            .saturating_add(operand("ff", "linear2", &gate, &input, norm));
+        let product = Dtype::from_promoting_types(value.output_dtype(norm), gate.output_dtype(norm));
+        scratch = scratch.saturating_add(operand("ff", "linear3", &output,
+            &[batch, tokens, value.output_width() as i32], product));
+        Ok((Dtype::from_promoting_types(hidden, output.output_dtype(product)), scratch))
     }
 
     /// The cross-attention key count this block sees for `memory` (+ IP tokens when this block
@@ -641,10 +753,15 @@ impl Transformer2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        crate::quant::quantize_linear(&mut self.proj_in, bits)?;
-        crate::quant::quantize_linear(&mut self.proj_out, bits)?;
-        for b in &mut self.blocks {
-            b.quantize(bits)?;
+        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+    }
+
+    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+        // Preserve the actual pack order: BOTH projections precede the transformer blocks.
+        visit(&crate::quant::child_path(prefix, "proj_in"), &mut self.proj_in, bits)?;
+        visit(&crate::quant::child_path(prefix, "proj_out"), &mut self.proj_out, bits)?;
+        for (index, b) in self.blocks.iter_mut().enumerate() {
+            b.quantize_using(&crate::quant::child_path(prefix, &format!("transformer_blocks.{index}")), bits, visit)?;
         }
         Ok(())
     }
@@ -700,8 +817,9 @@ impl Transformer2D {
         plan: SdxlForwardPlan<'_>,
     ) -> Result<Array> {
         // sc-26270: GroupNorm + proj_in, each block, and proj_out + residual are guarded iOS
-        // quanta (pass-throughs off device), each priced by `projection_scratch`.
-        let (proj_in_scratch, proj_out_scratch) = self.projection_scratch(x);
+        // quanta (pass-throughs off device), each priced by the shared projection metadata budget.
+        let (proj_in_scratch, proj_out_scratch, _, _, _) = self.projection_budgets_with_effects(
+            x, encoder_x, ip, plan, &crate::quantum::EffectScope::native())?;
         let y = mlx_gen::ios_quantum::run(
             crate::quantum::TRANSFORMER_PROJ_IN,
             proj_in_scratch,
@@ -762,6 +880,7 @@ impl Transformer2D {
     /// (`quantum::group_norm_buffers`, input width) and the projection's output; proj_out: the
     /// projection's output (the reshape is a view, the residual sum donates). Projections run on
     /// the resident weights in place (no weight copy).
+    #[cfg(test)]
     pub(crate) fn projection_scratch(&self, x: &Array) -> (u64, u64) {
         let sh = x.shape();
         let act = crate::quantum::element_bytes(x);
@@ -795,6 +914,11 @@ impl Transformer2D {
         let out = crate::quantum::linear_out(&self.proj_out);
         let widened = u64::from(summed > projected);
         let proj_out = plane(projected, out)
+            .saturating_add(crate::quantum::linear_operand_bytes(
+                &self.proj_out,
+                &[sh[0], sh[1] * sh[2], self.proj_out.base_shape()[1]],
+                hidden,
+            ))
             .saturating_add(plane(summed, out).saturating_mul(widened))
             .saturating_add(crate::quantum::page_slack(1 + widened));
         (proj_in, proj_out)
@@ -829,22 +953,33 @@ impl Transformer2D {
         ip: Option<(&Array, f32)>,
         plan: SdxlForwardPlan<'_>,
     ) -> Result<u64> {
+        self.block_price_with_effects(index, y, encoder_x, ip, plan,
+            &crate::quantum::EffectScope::native())
+    }
+
+    pub(crate) fn block_price_with_effects(
+        &self,
+        index: usize,
+        y: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         let block = &self.blocks[index];
-        let activations = block.quantum_scratch(
-            y.shape()[0],
-            plan.conditioning_batch(y.shape()[0])
-                .max(encoder_x.shape()[0]),
-            y.shape()[1],
-            block.context_tokens(encoder_x, ip),
-            ip.is_some(),
-            y.dtype(),
-            plan.attention,
-        );
+        let scope = effects.child(&format!("transformer_blocks.{index}"));
+        let context_batch = plan.conditioning_batch(y.shape()[0]).max(encoder_x.shape()[0]);
+        let (activation, operands) = block.projection_work(y.shape()[0], context_batch, y.shape()[1], y.shape()[2],
+            encoder_x.shape()[1], encoder_x.shape()[2], y.dtype(), encoder_x.dtype(),
+            ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())), &scope)?;
+        let activations = block.quantum_scratch_from_facts(y.shape()[0], context_batch, y.shape()[1],
+            block.context_tokens(encoder_x, ip), ip.is_some(), y.dtype(), plan.attention,
+            activation, scope.linear("ff.linear1", &block.linear1)?.output_width());
         let weights = match &self.block_stream {
             Some(stream) => stream.streamed_bytes(index)?,
             None => 0,
         };
-        Ok(activations.saturating_add(weights))
+        Ok(activations.saturating_add(operands).saturating_add(weights))
     }
 
     /// Block `index`'s streamed bytes (epic 16774 proof tests).
@@ -875,44 +1010,70 @@ impl Transformer2D {
         block.forward_ip(y, encoder_x, None, plan)
     }
 
-    /// The dtype [`Self::forward_ip`] returns for an `x`-typed input: `proj_out`'s output (after
-    /// every block's promotion) summed with the residual.
-    pub(crate) fn output_dtype(&self, x: Dtype) -> Dtype {
-        let entered = crate::quantum::linear_output_dtype(&self.proj_in, x);
-        let hidden = self
-            .blocks
-            .iter()
-            .fold(entered, |d, block| block.activation_dtype(d));
-        let projected = crate::quantum::linear_output_dtype(&self.proj_out, hidden);
-        Dtype::from_promoting_types(projected, x)
+    fn projection_budgets_with_effects(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<(u64, u64, i32, Dtype, Dtype)> {
+        let input = effects.linear("proj_in", &self.proj_in)?;
+        let output = effects.linear("proj_out", &self.proj_out)?;
+        let s = x.shape();
+        let shape = [s[0], s[1] * s[2], s[3]];
+        let norm = crate::quantum::promote_all(x.dtype(), &[&self.norm_w, &self.norm_b]);
+        let inner = input.output_width() as i32;
+        let mut hidden = input.output_dtype(norm);
+        let groups = crate::quantum::group_norm_buffers(crate::quantum::backend(), crate::quantum::element_bytes(x));
+        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(crate::quantum::dtype_bytes(dtype),
+            &[s[0] as u64, s[1] as u64, s[2] as u64, width]);
+        let proj_in = plane(x.dtype(), s[3] as u64).saturating_mul(groups)
+            .saturating_add(input.operand_bytes(&shape, norm))
+            .saturating_add(plane(hidden, inner as u64))
+            .saturating_add(crate::quantum::page_slack(groups + 1));
+        let entered = hidden;
+        for (index, block) in self.blocks.iter().enumerate() {
+            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
+                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
+                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+                &effects.child(&format!("transformer_blocks.{index}")))?.0;
+        }
+        let projected = output.output_dtype(hidden);
+        let summed = Dtype::from_promoting_types(projected, x.dtype());
+        let widened = u64::from(summed != projected);
+        let proj_out = plane(projected, output.output_width())
+            .saturating_add(output.operand_bytes(&[s[0], s[1] * s[2], inner], hidden))
+            .saturating_add(plane(summed, output.output_width()).saturating_mul(widened))
+            .saturating_add(crate::quantum::page_slack(1 + widened));
+        Ok((proj_in, proj_out, inner, entered, summed))
     }
 
-    /// Header-only pricing of [`Self::forward_ip`] over the shape-only `x` (NHWC): every quantum it
-    /// checks, in order, with the guard's own formulas. Returns the shape-only output.
-    pub(crate) fn price_forward(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,
         encoder_x: &Array,
         ip: Option<(&Array, f32)>,
         plan: SdxlForwardPlan<'_>,
         out: &mut crate::quantum::Quanta,
+        effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Array> {
-        let (proj_in, proj_out) = self.projection_scratch(x);
+        let (proj_in, proj_out, inner, mut hidden, summed) =
+            self.projection_budgets_with_effects(x, encoder_x, ip, plan, effects)?;
         out.push((crate::quantum::TRANSFORMER_PROJ_IN, proj_in));
         let s = x.shape();
-        let inner = crate::quantum::linear_out(&self.proj_in) as i32;
-        let mut hidden = crate::quantum::linear_output_dtype(&self.proj_in, x.dtype());
         let inner_plan = plan.with_window(None);
         for (index, block) in self.blocks.iter().enumerate() {
             let y = crate::quantum::shaped(&[s[0], s[1] * s[2], inner], hidden)?;
-            out.push((
-                crate::quantum::TRANSFORMER_BLOCK,
-                self.block_price(index, &y, encoder_x, ip, inner_plan)?,
-            ));
-            hidden = block.activation_dtype(hidden);
+            out.push((crate::quantum::TRANSFORMER_BLOCK,
+                self.block_price_with_effects(index, &y, encoder_x, ip, inner_plan, effects)?));
+            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
+                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
+                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+                &effects.child(&format!("transformer_blocks.{index}")))?.0;
         }
         out.push((crate::quantum::TRANSFORMER_PROJ_OUT, proj_out));
-        crate::quantum::shaped(s, self.output_dtype(x.dtype()))
+        crate::quantum::shaped(s, summed)
     }
 
     /// Rung 4's block loop for this sub-stack: walk its blocks in windows, materializing each
@@ -997,13 +1158,20 @@ impl Transformer2D {
     /// is intentionally excluded — the vendored `lora.py` can't reach it (mlx-examples renames it),
     /// so faithfully porting that path omits it too (sc-2671 adds it).
     pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        Self::append_lora_target_paths(prefix, self.blocks.len(), out);
+    }
+
+    /// Same pure path producer for a constructed transformer or its header-only topology.
+    pub(crate) fn append_lora_target_paths(prefix: &str, blocks: usize, out: &mut Vec<String>) {
         out.push(format!("{prefix}.proj_in"));
         out.push(format!("{prefix}.proj_out"));
-        for (k, b) in self.blocks.iter().enumerate() {
-            b.attn1
-                .lora_target_paths(&format!("{prefix}.transformer_blocks.{k}.attn1"), out);
-            b.attn2
-                .lora_target_paths(&format!("{prefix}.transformer_blocks.{k}.attn2"), out);
+        for k in 0..blocks {
+            for attention in ["attn1", "attn2"] {
+                AttentionMHA::append_lora_target_paths(
+                    &format!("{prefix}.transformer_blocks.{k}.{attention}"),
+                    out,
+                );
+            }
         }
     }
 
@@ -1013,7 +1181,11 @@ impl Transformer2D {
     /// vendored `lora.py` can't reach the FF (mlx-examples renames it) — complete coverage (sc-2671)
     /// adds it on top of the faithful surface.
     pub fn lora_target_paths_ff(&self, prefix: &str, out: &mut Vec<String>) {
-        for k in 0..self.blocks.len() {
+        Self::append_lora_target_paths_ff(prefix, self.blocks.len(), out);
+    }
+
+    pub(crate) fn append_lora_target_paths_ff(prefix: &str, blocks: usize, out: &mut Vec<String>) {
+        for k in 0..blocks {
             out.push(format!("{prefix}.transformer_blocks.{k}.ff.net.0.proj"));
             out.push(format!("{prefix}.transformer_blocks.{k}.ff.net.2"));
         }

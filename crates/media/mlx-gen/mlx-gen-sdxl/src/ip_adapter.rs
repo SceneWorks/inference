@@ -129,26 +129,37 @@ impl IpImageEncoder {
     }
 }
 
+/// The CFG pair of image-prompt `tokens` `[1, T, D]`: the tokens over a zeros uncond row of the
+/// same shape and dtype (what [`IpImageEncoder::zeros_like_tokens`] builds), `[2, T, D]`.
+pub(crate) fn cfg_pair(tokens: &Array) -> Result<Array> {
+    let zeros = mlx_rs::ops::zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
+    Ok(mlx_rs::ops::concatenate_axis(&[tokens, &zeros], 0)?)
+}
+
 /// Load the decoupled cross-attention **K/V projection pairs** from an IP-Adapter checkpoint
 /// (`ip_adapter.{n}.to_k_ip/to_v_ip.weight`, bias-free `[hidden, cross_attention_dim]`), returned in
 /// the diffusers `ip_adapter.{1,3,…}` **numeric order** — which is the UNet cross-attention walk
 /// order ([`crate::unet::UNet2DConditionModel::install_ip_adapter`]). 70 pairs for SDXL.
-pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
-    let mut idxs: Vec<u32> = w
-        .keys()
-        .filter_map(|k| {
-            k.strip_prefix("ip_adapter.")
+pub(crate) fn ip_kv_indices<'a>(keys: impl Iterator<Item = &'a str>) -> Result<Vec<u32>> {
+    let mut indices: Vec<u32> = keys
+        .filter_map(|key| {
+            key.strip_prefix("ip_adapter.")
                 .and_then(|r| r.strip_suffix(".to_k_ip.weight"))
                 .and_then(|n| n.parse::<u32>().ok())
         })
         .collect();
-    idxs.sort_unstable();
-    if idxs.is_empty() {
+    indices.sort_unstable();
+    if indices.is_empty() {
         return Err(Error::Msg(
             "ip_adapter: no ip_adapter.{n}.to_k_ip.weight keys found".into(),
         ));
     }
-    idxs.into_iter()
+    Ok(indices)
+}
+
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
+    ip_kv_indices(w.keys())?
+        .into_iter()
         .map(|n| {
             let k = w
                 .require(&format!("ip_adapter.{n}.to_k_ip.weight"))?
@@ -400,7 +411,7 @@ impl Resampler {
         // (pass-throughs off device), each counted from its own ops: proj_in's output (+ its
         // bias add); each layer per `layer_scratch`; proj_out's output, its bias add and the
         // LayerNorm output.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let nx = image_features.shape()[1];
         let act = crate::quantum::element_bytes(&self.latents);
         let rows = |n: i32, width: u64| {
@@ -419,8 +430,7 @@ impl Resampler {
                 || Self::layer_body(attn, ff, &x, &latents),
             )?;
         }
-        let proj_out_scratch =
-            3 * rows(self.num_queries, crate::quantum::linear_out(&self.proj_out));
+        let proj_out_scratch = self.proj_out_scratch(b, latents.dtype());
         mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_OUT, proj_out_scratch, || {
             let out = self.proj_out.forward(&latents)?;
             Ok(layer_norm(
@@ -457,9 +467,26 @@ impl Resampler {
         }
         out.push((
             crate::quantum::RESAMPLER_PROJ_OUT,
-            3 * rows(self.num_queries, crate::quantum::linear_out(&self.proj_out)),
+            self.proj_out_scratch(b, self.latents.dtype()),
         ));
         crate::quantum::shaped(&[b, self.num_queries, self.output_dim()], self.dtype())
+    }
+
+    fn proj_out_scratch(&self, b: i32, input: Dtype) -> u64 {
+        use crate::quantum as q;
+        let projected = q::linear_output_dtype(&self.proj_out, input);
+        let shape = [b, self.num_queries, self.output_dim()];
+        let output = mlx_gen::ios_quantum::tensor_bytes(
+            q::dtype_bytes(projected),
+            &[b as u64, self.num_queries as u64, self.output_dim() as u64],
+        );
+        let projection =
+            q::linear_operand_bytes(&self.proj_out, &[b, self.num_queries, self.dim], input)
+                + output;
+        // The projection output remains the fallback norm's input until the quantum finishes.
+        projection.max(
+            output + q::final_norm_bytes(&shape, projected, &self.norm_out_w, &self.norm_out_b),
+        )
     }
 
     /// One perceiver layer: attention over `[x, latents]` + residual, then the FFN + residual.

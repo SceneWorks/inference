@@ -6,37 +6,38 @@
 //! bound) plus the LARGEST counted quantum the phase checks — through the very formulas the runtime
 //! guards check ([`crate::dit`], [`crate::text_encoder`], [`crate::stream`], [`crate::solver`],
 //! [`crate::model`], [`crate::depth`], [`crate::restoration`]), each fed the widths the loaded
-//! module would have, read here from the safetensors headers and the configs. Nothing is read
-//! beyond headers, configs and (when the request names no token window) the tokenizer.
+//! module would have, read here from the safetensors headers and the configs. Adapter inventory
+//! shares the strict loader's format checks and bounded packed-shape scalar reader; no model or
+//! adapter MLX tensors are allocated. Tokenization uses the actual tokenizer when needed.
 //! [`ios_quantum_phase`] attributes every quantum label the crate checks to its phase.
 //!
-//! A phase's resident bytes are one figure for the whole phase (its largest live set besides the
-//! quantum), so its price binds at its largest quantum: `scratch_bytes` is exactly the largest
-//! scratch any guard of the phase checks. `stream_tests::the_pricing_states_the_largest_check_of_
-//! every_phase` proves it on the CPU fixtures against the checks real runs observe — every quantum
-//! label priced at exactly its largest observed check, no label priced that the run never checks —
+//! A phase binds at its largest pointwise resident-plus-quantum price. Dynamic generation pairs
+//! each actual solver evaluation's rows/history/serial carry with that evaluation's forward before
+//! maximizing; independent maxima are not subtracted. `stream_tests::the_pricing_states_the_largest_check_of_
+//! every_phase` checks the guard formulas real runs observe — every quantum
+//! label priced at its largest observed check, no label priced that the run never checks —
 //! for generation (eager rung 0 / rung 3, deferred rung 4 under each scope, text and prompt batch,
 //! dense, quantized at load and packed), restoration and depth (eager, deferred, packed).
 //!
-//! A generation request's `geometry.batch` is priced as ONE solve of that many rows (a prompt
-//! batch, doubled under classifier-free guidance) — exact for a prompt batch, an upper bound for
-//! `count` repetitions — and `token_window` (when non-zero) as the longest encoded window.
+//! Generation requires `generation: Some(actual_request)`: forward rows are the actual prompt
+//! batch (doubled only at guided evaluation times), while `count` is serial with separately retained
+//! solved outputs. `geometry.batch` remains the total output count for admission consistency, not
+//! simultaneous activation rows. `token_window` (when non-zero) is the longest encoded window.
 
 use std::path::Path;
 
 use mlx_gen::gen_core::iris::depth::DEPTH_EXTRA_INPUT_CHANNELS;
 use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::restoration::{plan, Dims, RestorationOptions, RestorationResources};
+use mlx_gen::gen_core::iris::restoration::RestorationResources;
 use mlx_gen::gen_core::iris::{
-    GenerationResources, IrisConfig, IrisTask, ModelConfig as IrisModel, PROMPT_PREFIX,
+    DpmStep, GenerationParams, GenerationResources, IrisConfig, IrisTask, ModelConfig as IrisModel,
+    Prediction, PROMPT_PREFIX,
 };
 use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as Header};
-use mlx_gen::gen_core::{
-    GenerationMemory, InputSizing, LoadShape, MemoryMode, OffloadPolicy, Precision,
-};
-use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+use mlx_gen::gen_core::{GenerationMemory, LoadShape, MemoryMode, OffloadPolicy, Precision};
+use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest, IosWindowPrice, IosWorkBasis};
 use mlx_gen::ios_quantum::{sampler_step_bytes, tensor_bytes};
-use mlx_gen::{Error, Quant, Result};
+use mlx_gen::{Error, GenerationRequest, Quant, Result};
 
 use crate::dit::{
     quanta as dit_q, EmbedGeometry, IrisDiT, PixelBlockGeometry, Stack, StackInventory,
@@ -47,6 +48,695 @@ use crate::retention::allocated;
 use crate::stream::{largest_window, BlockRead, CastPolicy};
 use crate::text_encoder::{quanta as te_q, LANGUAGE_TOWER_PREFIX};
 
+/// Canonical Iris sampling recipe. Normalization is exclusively the production
+/// `GenerationParams::resolve` + `plan`; this is not the generic diffusion solver factory.
+#[derive(Clone, Debug)]
+pub struct GenerationRecipe {
+    pub params: GenerationParams,
+    pub plan: Vec<DpmStep>,
+    /// Independent serial solves; each solve has `params.prompts.len()` rows.
+    pub count: u32,
+    /// Faithful replay against the same checkpoint config, with seed and sampling defaults fixed.
+    pub replay: GenerationRequest,
+}
+
+/// One actual model evaluation and the solver/history state alive at that same epoch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenerationEpoch {
+    pub serial: u32,
+    pub index: usize,
+    pub step: DpmStep,
+    pub guided: bool,
+    pub forward_rows: u64,
+    /// The current implementation retains previous x0 even for order-1/Euler.
+    pub history_rows: u64,
+    /// Earlier clamped results held until the common RGB conversion.
+    pub completed_rows: u64,
+}
+
+/// Validated canonical wire identity; no caller-provided class or floating-point equality keys.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SamplingToken(String);
+
+/// Unresolved raw sampling controls for weights-free listing. None stays None: this is NOT a
+/// normalized recipe, memory class, or assertion that a template is legal for an unseen config.
+/// It contains no carrier text/media/seed/count/geometry and is safe to enumerate without cloning
+/// those payloads. `clear_negative_prompt` is the no-CFG representative's explicit control action.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingTemplate {
+    steps: Option<u32>,
+    sampler: Option<String>,
+    guidance_bits: Option<u32>,
+    scheduler_shift_bits: Option<u32>,
+    interval_bits: Option<[u32; 2]>,
+    clear_negative_prompt: bool,
+}
+
+impl SamplingTemplate {
+    pub fn from_request(request: &GenerationRequest) -> Self {
+        Self {
+            steps: request.steps,
+            sampler: request.sampler.clone(),
+            guidance_bits: request.guidance.map(f32::to_bits),
+            scheduler_shift_bits: request.scheduler_shift.map(f32::to_bits),
+            interval_bits: request
+                .cfg_interval
+                .map(|(lo, hi)| [lo.to_bits(), hi.to_bits()]),
+            clear_negative_prompt: false,
+        }
+    }
+
+    pub fn to_token(&self) -> Result<String> {
+        Ok(format!(
+            "iris-sampling-template-v1:{}",
+            serde_json::to_string(self)
+                .map_err(|e| Error::Msg(format!("Iris raw sampling template: {e}")))?
+        ))
+    }
+
+    pub fn from_token(token: &str) -> Result<Self> {
+        let json = token
+            .strip_prefix("iris-sampling-template-v1:")
+            .ok_or_else(|| {
+                Error::Unsupported("invalid Iris raw sampling template prefix".into())
+            })?;
+        let template: Self = serde_json::from_str(json)
+            .map_err(|e| Error::Msg(format!("Iris raw sampling template: {e}")))?;
+        if template.to_token()? != token {
+            return Err(Error::Unsupported(
+                "Iris raw sampling template is not canonical".into(),
+            ));
+        }
+        Ok(template)
+    }
+
+    pub fn to_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self)
+            .map_err(|e| Error::Msg(format!("Iris raw sampling template: {e}")))
+    }
+
+    fn apply_raw(&self, request: &mut GenerationRequest) {
+        request.steps = self.steps;
+        request.sampler = self.sampler.clone();
+        request.guidance = self.guidance_bits.map(f32::from_bits);
+        request.scheduler_shift = self.scheduler_shift_bits.map(f32::from_bits);
+        request.cfg_interval = self
+            .interval_bits
+            .map(|[lo, hi]| (f32::from_bits(lo), f32::from_bits(hi)));
+        if self.clear_negative_prompt {
+            request.negative_prompt = None;
+        }
+    }
+
+    /// Mutate only captured controls, then validate through the actual config/served factory.
+    /// No carrier payload is cloned. An Err leaves the raw controls applied, but authorizes no work.
+    /// Raw defaults resolve HERE, never to a fabricated weights-free class.
+    pub fn apply_to(
+        &self,
+        config: &IrisConfig,
+        carrier: &mut GenerationRequest,
+    ) -> Result<SamplingToken> {
+        self.apply_raw(carrier);
+        canonical_token(config, carrier)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SamplingWire {
+    order: u8,
+    steps: u32,
+    guidance_bits: u32,
+    interval_bits: [u32; 2],
+    flow_shift_bits: u64,
+    prediction: String,
+    num_train_timesteps: u64,
+    prompt_rows: u32,
+    serial_count: u32,
+}
+
+/// Computed graph semantics, not continuous scalar values or an admission permission. Epoch runs
+/// are compressed only when their actual (guided, history, second-update, terminal) facts match.
+/// Prompt rows/count remain distinct until the complete additivity proof permits sharing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SamplingMemoryClass {
+    pub order: u8,
+    pub clean_prediction: bool,
+    pub prompt_rows: u32,
+    pub serial_count: u32,
+    pub epoch_runs: Vec<[bool; 4]>,
+}
+
+impl SamplingWire {
+    fn of(config: &IrisConfig, params: &GenerationParams, count: u32) -> Self {
+        Self {
+            order: params.order as u8,
+            steps: params.steps as u32,
+            guidance_bits: params.cfg_scale.to_bits(),
+            interval_bits: [
+                (params.cfg_interval.0 as f32).to_bits(),
+                (params.cfg_interval.1 as f32).to_bits(),
+            ],
+            flow_shift_bits: params.shift.to_bits(),
+            prediction: match params.prediction {
+                Prediction::Velocity => "v",
+                Prediction::Clean => "x",
+            }
+            .into(),
+            num_train_timesteps: config.flow.num_train_timesteps as u64,
+            prompt_rows: params.prompts.len() as u32,
+            serial_count: count,
+        }
+    }
+
+    fn metadata_config(&self, actual: &IrisConfig) -> Result<IrisConfig> {
+        let mut config = actual.clone();
+        config.flow.shift = f64::from_bits(self.flow_shift_bits);
+        config.flow.prediction = self.prediction.clone();
+        config.flow.num_train_timesteps =
+            usize::try_from(self.num_train_timesteps).map_err(|_| {
+                Error::Msg("Iris recipe timestep count does not fit this target".into())
+            })?;
+        config.validate_supported().map_err(Error::from)?;
+        Ok(config)
+    }
+
+    /// Validate normalized metadata directly through the actual pure plan/gate methods: no fake
+    /// architecture config, prompts or invented checkpoint defaults are needed to parse a family.
+    fn checked_plan(&self) -> Result<mlx_gen::gen_core::iris::DpmSolverPlan> {
+        let images = self
+            .prompt_rows
+            .checked_mul(self.serial_count)
+            .ok_or_else(|| Error::Msg("Iris recipe image count overflow".into()))?;
+        let guidance = f32::from_bits(self.guidance_bits);
+        let interval = (
+            f32::from_bits(self.interval_bits[0]) as f64,
+            f32::from_bits(self.interval_bits[1]) as f64,
+        );
+        let shift = f64::from_bits(self.flow_shift_bits);
+        if self.prompt_rows == 0
+            || self.serial_count == 0
+            || images > crate::model::MAX_COUNT
+            || !guidance.is_finite()
+            || !shift.is_finite()
+            || shift <= 0.0
+            || !(0.0..=1.0).contains(&interval.0)
+            || !(0.0..=1.0).contains(&interval.1)
+            || interval.0 >= interval.1
+            || self.num_train_timesteps == 0
+            || usize::try_from(self.num_train_timesteps).is_err()
+            || Prediction::from_name(&self.prediction).is_none()
+        {
+            return Err(Error::Unsupported(
+                "invalid normalized Iris sampling metadata".into(),
+            ));
+        }
+        if guidance == 1.0 && self.interval_bits != [0.0f32.to_bits(), 1.0f32.to_bits()] {
+            return Err(Error::Unsupported(
+                "unguided Iris recipe cannot carry an ineffective interval".into(),
+            ));
+        }
+        let plan = mlx_gen::gen_core::iris::DpmSolverPlan::new(
+            self.steps as usize,
+            self.order as usize,
+            shift,
+        )
+        .map_err(Error::from)?;
+        if guidance != 1.0 && plan.cfg_span(guidance, interval).is_none() {
+            return Err(Error::Unsupported(
+                "Iris recipe interval contains no actual guided evaluation".into(),
+            ));
+        }
+        Ok(plan)
+    }
+
+    fn apply(
+        &self,
+        actual: &IrisConfig,
+        carrier: &GenerationRequest,
+    ) -> Result<(IrisConfig, GenerationRequest)> {
+        let config = self.metadata_config(actual)?;
+        if carrier.prompt_batch.len().max(1) != self.prompt_rows as usize {
+            return Err(Error::Unsupported(
+                "Iris recipe prompt rows disagree with the actual mode carrier".into(),
+            ));
+        }
+        let mut request = carrier.clone();
+        request.sampler = Some(
+            match self.order {
+                1 => "euler",
+                2 => "dpmpp_2m",
+                _ => {
+                    return Err(Error::Unsupported(
+                        "Iris recipe order is not an actual served solver".into(),
+                    ))
+                }
+            }
+            .into(),
+        );
+        request.steps = Some(self.steps);
+        request.guidance = Some(f32::from_bits(self.guidance_bits));
+        request.cfg_interval = if request.guidance == Some(1.0) {
+            None
+        } else {
+            Some((
+                f32::from_bits(self.interval_bits[0]),
+                f32::from_bits(self.interval_bits[1]),
+            ))
+        };
+        // Replay through sampling-only metadata, NOT a lossy f64 -> request-f32 conversion.
+        request.scheduler_shift = None;
+        request.count = self.serial_count;
+        let params = resolved_generation_controls(&config, &request, request.seed.unwrap_or(0))?;
+        if Self::of(&config, &params, request.count) != *self {
+            return Err(Error::Unsupported(
+                "Iris recipe is not canonical under the actual normalizer/plan".into(),
+            ));
+        }
+        Ok((config, request))
+    }
+}
+
+/// Read the actual provisioned Iris metadata config, without tensor loads or guessed defaults.
+pub fn generation_metadata_config(spec: &mlx_gen::LoadSpec) -> Result<IrisConfig> {
+    let resources =
+        GenerationResources::from_spec(spec, crate::model::MODEL_ID).map_err(Error::from)?;
+    IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)
+}
+
+/// Exact resolved sampling identity. Prompts/media/seed/step arrays are deliberately not wire data.
+pub fn canonical_token(config: &IrisConfig, request: &GenerationRequest) -> Result<SamplingToken> {
+    let params = resolved_generation_controls(config, request, request.seed.unwrap_or(0))?;
+    let wire = SamplingWire::of(config, &params, request.count);
+    let encoded = format!(
+        "iris-sampling-v1:{}",
+        serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+    );
+    SamplingToken::from_token(&encoded)
+}
+
+impl SamplingToken {
+    pub fn from_token(token: &str) -> Result<Self> {
+        let payload = token
+            .strip_prefix("iris-sampling-v1:")
+            .ok_or_else(|| Error::Unsupported("not an Iris sampling-v1 token".into()))?;
+        let wire: SamplingWire =
+            serde_json::from_str(payload).map_err(|e| Error::Msg(e.to_string()))?;
+        wire.checked_plan()?;
+        let canonical = format!(
+            "iris-sampling-v1:{}",
+            serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+        );
+        if canonical != token {
+            return Err(Error::Unsupported(
+                "Iris recipe token is not canonical".into(),
+            ));
+        }
+        Ok(Self(canonical))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Exact normalized wire metadata, including lossless f64/f32 bit representations.
+    pub fn to_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.wire()?).map_err(|e| Error::Msg(e.to_string()))
+    }
+
+    pub fn steps(&self) -> Result<u32> {
+        Ok(self.wire()?.steps)
+    }
+
+    fn wire(&self) -> Result<SamplingWire> {
+        serde_json::from_str(
+            self.0
+                .strip_prefix("iris-sampling-v1:")
+                .ok_or_else(|| Error::Unsupported("invalid Iris recipe prefix".into()))?,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))
+    }
+
+    pub fn metadata_config(&self, actual: &IrisConfig) -> Result<IrisConfig> {
+        self.wire()?.metadata_config(actual)
+    }
+
+    pub fn apply_to(
+        &self,
+        actual_config: &IrisConfig,
+        carrier: &GenerationRequest,
+    ) -> Result<(IrisConfig, GenerationRequest)> {
+        self.wire()?.apply(actual_config, carrier)
+    }
+
+    /// Replay against the ACTUAL runtime config, without overriding artifact metadata or cloning
+    /// carrier payloads. Work cardinality must already match; only sampling controls are changed.
+    pub fn apply_runtime_to(
+        &self,
+        actual_config: &IrisConfig,
+        carrier: &mut GenerationRequest,
+    ) -> Result<()> {
+        let wire = self.wire()?;
+        wire.checked_plan()?;
+        let prediction = match actual_config.prediction().map_err(Error::from)? {
+            Prediction::Velocity => "v",
+            Prediction::Clean => "x",
+        };
+        if prediction != wire.prediction
+            || actual_config.flow.num_train_timesteps as u64 != wire.num_train_timesteps
+            || carrier.prompt_batch.len().max(1) != wire.prompt_rows as usize
+            || carrier.count != wire.serial_count
+        {
+            return Err(Error::Unsupported(
+                "Iris runtime recipe disagrees with actual artifact/work basis".into(),
+            ));
+        }
+        let shift = f64::from_bits(wire.flow_shift_bits);
+        let scheduler_shift = if actual_config.flow.shift.to_bits() == wire.flow_shift_bits {
+            None
+        } else {
+            let request_shift = shift as f32;
+            if (request_shift as f64).to_bits() != wire.flow_shift_bits {
+                return Err(Error::Unsupported("Iris runtime recipe shift is neither the actual f64 default nor an exact f32 override".into()));
+            }
+            Some(request_shift)
+        };
+        let sampler = match wire.order {
+            1 => "euler",
+            2 => "dpmpp_2m",
+            _ => {
+                return Err(Error::Unsupported(
+                    "Iris runtime recipe order is not a served solver".into(),
+                ))
+            }
+        };
+        let previous = SamplingTemplate::from_request(carrier);
+        carrier.sampler = Some(sampler.into());
+        carrier.steps = Some(wire.steps);
+        carrier.guidance = Some(f32::from_bits(wire.guidance_bits));
+        carrier.cfg_interval = if carrier.guidance == Some(1.0) {
+            None
+        } else {
+            Some((
+                f32::from_bits(wire.interval_bits[0]),
+                f32::from_bits(wire.interval_bits[1]),
+            ))
+        };
+        carrier.scheduler_shift = scheduler_shift;
+        let result = canonical_token(actual_config, carrier).and_then(|actual| {
+            if actual == *self {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(
+                    "Iris runtime replay changed canonical sampling identity".into(),
+                ))
+            }
+        });
+        if result.is_err() {
+            previous.apply_raw(carrier);
+        }
+        result
+    }
+
+    pub fn memory_class(&self) -> Result<SamplingMemoryClass> {
+        let wire = self.wire()?;
+        let plan = wire.checked_plan()?;
+        let guidance = f32::from_bits(wire.guidance_bits);
+        let interval = (
+            f32::from_bits(wire.interval_bits[0]) as f64,
+            f32::from_bits(wire.interval_bits[1]) as f64,
+        );
+        let epoch_runs = epoch_class_runs(&plan, guidance, interval);
+        Ok(SamplingMemoryClass {
+            order: wire.order,
+            clean_prediction: wire.prediction == "x",
+            prompt_rows: wire.prompt_rows,
+            serial_count: wire.serial_count,
+            epoch_runs,
+        })
+    }
+}
+
+fn epoch_class_runs(
+    plan: &mlx_gen::gen_core::iris::DpmSolverPlan,
+    guidance: f32,
+    interval: (f64, f64),
+) -> Vec<[bool; 4]> {
+    let mut runs = Vec::new();
+    for index in plan.epoch_indices(guidance, interval) {
+        let step = plan.step(index).expect("bounded canonical epoch");
+        let facts = [
+            mlx_gen::gen_core::iris::cfg_active(guidance, step.s, interval),
+            index != 0,
+            matches!(
+                step.update,
+                mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
+            ),
+            index + 1 == plan.len(),
+        ];
+        if runs.last() != Some(&facts) {
+            runs.push(facts);
+        }
+    }
+    runs
+}
+
+/// Finite graph-mechanism representatives, not a measurement/step grid. First + terminal and at
+/// most two monotone CFG transitions require at most three steady slots (five evaluations total).
+/// Deduplication keeps the shortest actual producer-derived representative of each epoch-run class.
+/// N=2 is never claimed to observe an interior Second update.
+/// Configured mechanism representatives without a carrier payload clone. Build thresholds from
+/// the ACTUAL default-shift indexed plan as well as the explicit unit-shift override. Prefer the
+/// shortest canonical N per source-derived mechanism class, then actual default shift on ties.
+/// This preference is NOT a physical-equivalence certificate: pricing retains each request's
+/// actual solver/plan-vector payload, and certified transfer still requires complete window proof.
+/// Full actual-default provenance remains available via canonical_token and the raw carrier
+/// template, independently of this capture preference. Original controls/negative ownership are
+/// restored on success AND failure; the full default token must not force a long capture run.
+pub fn sampling_representatives_in_place(
+    config: &IrisConfig,
+    carrier: &mut GenerationRequest,
+) -> Result<Vec<SamplingToken>> {
+    let actual = canonical_token(config, carrier)?;
+    let actual_wire = actual.wire()?;
+    let default_shift = config.flow.shift.to_bits();
+    let rank = (
+        actual_wire.steps,
+        actual_wire.flow_shift_bits != default_shift,
+    );
+    let mut by_class = std::collections::BTreeMap::from([(actual.memory_class()?, (rank, actual))]);
+    let mut templates = sampling_grammar_templates(config.flow.shift, None)?;
+    templates.extend(sampling_grammar_templates(1.0, Some(1.0))?);
+    let controls = SamplingTemplate::from_request(carrier);
+    let mut negative = carrier.negative_prompt.take();
+    for template in templates {
+        if !template.clear_negative_prompt {
+            carrier.negative_prompt = negative.take();
+        }
+        let candidate = template.apply_to(config, carrier).and_then(|token| {
+            let class = token.memory_class()?;
+            let wire = token.wire()?;
+            Ok((
+                token,
+                class,
+                (wire.steps, wire.flow_shift_bits != default_shift),
+            ))
+        });
+        if !template.clear_negative_prompt {
+            negative = carrier.negative_prompt.take();
+        }
+        match candidate {
+            Ok((token, class, rank)) => match by_class.entry(class) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((rank, token));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if rank < entry.get().0 {
+                        entry.insert((rank, token));
+                    }
+                }
+            },
+            Err(error) => {
+                controls.apply_raw(carrier);
+                carrier.negative_prompt = negative;
+                return Err(error);
+            }
+        }
+    }
+    controls.apply_raw(carrier);
+    carrier.negative_prompt = negative;
+    Ok(by_class.into_values().map(|(_, token)| token).collect())
+}
+
+/// Weights-free raw controls only: unresolved default flow shift is preserved until the actual
+/// provisioned config is read. Enumerating this grammar never clones carrier text/media/seed.
+pub fn sampling_representative_templates(carrier: &GenerationRequest) -> Vec<SamplingTemplate> {
+    let mut representatives =
+        sampling_grammar_templates(1.0, Some(1.0)).expect("constant valid Iris sampling grammar");
+    // Unresolved actual defaults remain provenance, not a fabricated weights-free class.
+    representatives.push(SamplingTemplate::from_request(carrier));
+    representatives
+}
+
+fn sampling_grammar_templates(
+    shift: f64,
+    shift_override: Option<f32>,
+) -> Result<Vec<SamplingTemplate>> {
+    let mut by_class = std::collections::BTreeMap::new();
+    for sampler in mlx_gen::gen_core::iris::SAMPLERS {
+        let order = match sampler {
+            "euler" => 1,
+            "dpmpp_2m" => 2,
+            _ => unreachable!("served Iris solver needs a canonical order"),
+        };
+        // This finite grammar bound is independent of any requested step count or hardware cell.
+        for steps in 1..=5 {
+            let plan = mlx_gen::gen_core::iris::DpmSolverPlan::new(steps, order, shift)
+                .map_err(Error::from)?;
+            let mut controls = vec![(1.0, None)];
+            for start in 0..steps {
+                for end in start + 1..=steps {
+                    let hi = if start == 0 {
+                        1.0
+                    } else {
+                        ((plan.step(start - 1).unwrap().s + plan.step(start).unwrap().s) * 0.5)
+                            as f32
+                    };
+                    let lo = if end == steps {
+                        0.0
+                    } else {
+                        ((plan.step(end - 1).unwrap().s + plan.step(end).unwrap().s) * 0.5) as f32
+                    };
+                    // Request endpoints are f32 while the actual indexed plan is f64. Collapsed
+                    // or empty intervals are NOT served controls and receive no class/coverage
+                    // claim. Classify each legal candidate by its ACTUAL span, never the desired
+                    // start/end indices before endpoint rounding.
+                    if (0.0..=1.0).contains(&lo)
+                        && (0.0..=1.0).contains(&hi)
+                        && lo < hi
+                        && plan.cfg_span(3.0, (lo as f64, hi as f64)).is_some()
+                    {
+                        controls.push((3.0, Some((lo, hi))));
+                    }
+                }
+            }
+            for (guidance, interval) in controls {
+                let bounds = interval.map_or((0.0, 1.0), |(lo, hi)| (lo as f64, hi as f64));
+                let class = (order, epoch_class_runs(&plan, guidance, bounds));
+                let template = SamplingTemplate {
+                    sampler: Some(sampler.into()),
+                    steps: Some(steps as u32),
+                    guidance_bits: Some(guidance.to_bits()),
+                    scheduler_shift_bits: shift_override.map(f32::to_bits),
+                    interval_bits: interval.map(|(lo, hi)| [lo.to_bits(), hi.to_bits()]),
+                    clear_negative_prompt: guidance == 1.0,
+                };
+                by_class.entry(class).or_insert(template);
+            }
+        }
+    }
+    Ok(by_class.into_values().collect())
+}
+
+fn resolved_generation_controls(
+    config: &IrisConfig,
+    request: &GenerationRequest,
+    default_seed: u64,
+) -> Result<GenerationParams> {
+    crate::model::descriptor()
+        .capabilities
+        .validate_request(crate::model::MODEL_ID, request)
+        .map_err(Error::from)?;
+    mlx_gen::gen_core::iris::validate_generation_request(crate::model::MODEL_ID, request, config)
+        .map_err(Error::from)?;
+    crate::model::refuse_unhonored_memory(request)?;
+    GenerationParams::resolve(request, default_seed, config).map_err(Error::from)
+}
+
+/// Executable post-admission recipe. Token/class/price paths use bounded metadata instead.
+pub fn resolved_generation_recipe(
+    config: &IrisConfig,
+    request: &GenerationRequest,
+    default_seed: u64,
+) -> Result<GenerationRecipe> {
+    let params = resolved_generation_controls(config, request, default_seed)?;
+    let plan = params.plan().map_err(Error::from)?;
+    let mut replay = request.clone();
+    replay.seed = Some(params.seed);
+    replay.steps = Some(params.steps as u32);
+    replay.guidance = Some(params.cfg_scale);
+    replay.cfg_interval = params
+        .uses_cfg()
+        .then_some((params.cfg_interval.0 as f32, params.cfg_interval.1 as f32));
+    replay.sampler = Some(
+        if params.order == 1 {
+            "euler"
+        } else {
+            "dpmpp_2m"
+        }
+        .into(),
+    );
+    // Preserve an absent scheduler_shift: config.flow.shift is f64 and need not round-trip via
+    // the request's f32 override. Replay uses that same checkpoint, never a rounded substitute.
+    Ok(GenerationRecipe {
+        count: request.count,
+        params,
+        plan,
+        replay,
+    })
+}
+
+impl GenerationRecipe {
+    pub fn epochs(&self) -> impl Iterator<Item = GenerationEpoch> + '_ {
+        let rows = self.params.prompts.len() as u64;
+        (0..self.count).flat_map(move |serial| {
+            self.plan
+                .iter()
+                .copied()
+                .enumerate()
+                .map(move |(index, step)| {
+                    let guided = self.params.cfg_at(&step);
+                    GenerationEpoch {
+                        serial,
+                        index,
+                        step,
+                        guided,
+                        forward_rows: rows * if guided { 2 } else { 1 },
+                        history_rows: if index == 0 { 0 } else { rows },
+                        completed_rows: rows * u64::from(serial),
+                    }
+                })
+        })
+    }
+
+    /// Provenance is exact resolved controls, not a continuous-float memory-family grid.
+    pub fn provenance(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sampler": if self.params.order == 1 { "euler" } else { "dpmpp_2m" },
+            "order": self.params.order, "steps": self.plan.len(),
+            "guidance": self.params.cfg_scale, "cfg_interval": self.params.cfg_interval,
+            "flow_shift": self.params.shift,
+            "prediction": match self.params.prediction { Prediction::Velocity => "v", Prediction::Clean => "x" },
+            "prompt_rows": self.params.prompts.len(), "serial_count": self.count,
+            "width": self.params.width, "height": self.params.height,
+            "seed": self.params.seed, "mode": "text_to_image",
+            "prompt_batch": self.replay.prompt_batch, "prompt": self.replay.prompt,
+            "negative_prompt": self.params.negative_prompt,
+        })
+    }
+}
+
+/// Whether an `iris_3b` prompt batch cannot safely derive every phase from the text anchor.
+///
+/// `true` pending `anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase`.
+/// The earlier Decode counterexample predates final-clamp separation and dynamic sampling/count
+/// accounting. Its survival on this tree is unverified; whole-run coverage alone is never proof of
+/// phase-by-phase additivity.
+pub const IOS_NON_ADDITIVE_BATCH: bool = true;
+
 /// The phase every quantum label of this crate runs in.
 pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     use crate::depth::quanta as depth_q;
@@ -55,6 +745,8 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         te_q::LOAD
         | crate::model::BACKBONE_LOAD_QUANTUM
         | crate::adapters::ADAPTER_LOAD_QUANTUM
+        | crate::adapters::ADAPTER_HOST_QUANTUM
+        | crate::adapters::ADAPTER_MATERIALIZE_QUANTUM
         | depth_q::LOAD
         | restore_q::LOAD => IosPhase::Load,
         te_q::TOWER
@@ -64,21 +756,34 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         | te_q::CONDITIONING
         | te_q::LAYER_READ
         | te_q::STREAMED_LAYER => IosPhase::Conditioning,
-        depth_q::INPUT | restore_q::HOST_PLANES => IosPhase::Encode,
+        depth_q::INPUT
+        | depth_q::HOST_PREP
+        | depth_q::RGB
+        | restore_q::PLAN
+        | restore_q::HOST_PLANES => IosPhase::Encode,
         dit_q::EMBED
         | dit_q::TEXT_LAYER_BLOCK
         | dit_q::TEXT_POOL
+        | dit_q::TEXT_MASK
         | dit_q::TEXT_REFINER_BLOCK
         | dit_q::TEXT_OUTPUT
+        | dit_q::TRUNK_POSITIONS
         | dit_q::TRUNK_BLOCK
         | dit_q::PIXEL_EMBED
+        | dit_q::PIXEL_POSITIONS
         | dit_q::PIXEL_BLOCK
         | dit_q::OUTPUT
         | dit_q::BLOCK_READ
         | dit_q::OUTPUT_ROWS
+        | crate::solver::PLAN_QUANTUM
         | crate::solver::STEP_QUANTUM
+        | crate::solver::FINALIZE_QUANTUM
         | restore_q::TILE => IosPhase::Denoise,
-        crate::model::IMAGE_QUANTUM | depth_q::REDUCER | restore_q::POST_TILE => IosPhase::Decode,
+        crate::model::IMAGE_QUANTUM
+        | depth_q::REDUCER
+        | depth_q::HOST_MAP
+        | depth_q::HOST_POST
+        | restore_q::POST_TILE => IosPhase::Decode,
         _ => return None,
     };
     Some(phase)
@@ -90,7 +795,11 @@ pub fn quantum_labels() -> Vec<&'static str> {
         crate::model::BACKBONE_LOAD_QUANTUM,
         crate::model::IMAGE_QUANTUM,
         crate::adapters::ADAPTER_LOAD_QUANTUM,
+        crate::adapters::ADAPTER_HOST_QUANTUM,
+        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+        crate::solver::PLAN_QUANTUM,
         crate::solver::STEP_QUANTUM,
+        crate::solver::FINALIZE_QUANTUM,
     ];
     labels.extend(te_q::ALL);
     labels.extend(dit_q::ALL);
@@ -103,7 +812,69 @@ pub fn quantum_labels() -> Vec<&'static str> {
 
 /// Price one Iris request: see the module docs.
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
-    Ok(price(req, Pricing::default())?.pricing)
+    Ok(pricing_facts(req)?.pricing)
+}
+
+pub fn pricing_facts(req: &IosPricingRequest<'_>) -> Result<PricingFacts> {
+    Ok(price(req, Pricing::default())?.into_facts())
+}
+
+pub fn pricing_facts_with_token(
+    req: &IosPricingRequest<'_>,
+    token: &SamplingToken,
+) -> Result<PricingFacts> {
+    req.validate_work_context()?;
+    if req.provider != crate::model::MODEL_ID {
+        return Err(Error::Unsupported(
+            "Iris sampling token is only for iris_3b generation".into(),
+        ));
+    }
+    expect_mode(req.mode, &MemoryMode::TextToImage)?;
+    Ok(generation(req, Pricing::default(), Some(token))?.into_facts())
+}
+
+/// Reprice an anchor with its OWN resolved sampling metadata, keeping actual artifact architecture.
+/// Production default pricing never changes its checkpoint config; only this metadata replay does.
+pub fn ios_pricing_with_token(
+    req: &IosPricingRequest<'_>,
+    token: &SamplingToken,
+) -> Result<IosPricing> {
+    Ok(pricing_facts_with_token(req, token)?.pricing)
+}
+
+/// Explicit anchor-metadata replay: no fake RGB request is constructed. Actual work uses
+/// `pricing_facts` with its real matching Some context; replay only reconstructs counted profiles.
+pub fn pricing_facts_with_restoration_token(
+    req: &IosPricingRequest<'_>,
+    token: &RestorationToken,
+) -> Result<PricingFacts> {
+    req.validate_work_context()?;
+    if req.provider != crate::restoration::MODEL_ID {
+        return Err(Error::Unsupported("not an Iris restoration replay".into()));
+    }
+    expect_mode(
+        req.mode,
+        &crate::memory_strategy::memory_mode(IrisTask::Restoration),
+    )?;
+    let resources = RestorationResources::from_spec(req.spec, req.provider).map_err(Error::from)?;
+    Ok(restoration(req, Pricing::default(), &resources, Some(token))?.into_facts())
+}
+
+pub fn pricing_facts_with_depth_token(
+    req: &IosPricingRequest<'_>,
+    token: &DepthToken,
+) -> Result<PricingFacts> {
+    req.validate_work_context()?;
+    if req.provider != crate::depth::DEPTH_MODEL_ID {
+        return Err(Error::Unsupported("not an Iris depth replay".into()));
+    }
+    expect_mode(
+        req.mode,
+        &crate::memory_strategy::memory_mode(IrisTask::Depth),
+    )?;
+    let export =
+        TaskExport::from_spec(req.spec, IrisTask::Depth, req.provider).map_err(Error::from)?;
+    Ok(depth(req, Pricing::default(), &export, Some(token))?.into_facts())
 }
 
 /// How [`price`] treats the artifacts and the levers (the prediction's knobs; the public pricing
@@ -128,11 +899,12 @@ impl Default for Pricing {
 }
 
 pub(crate) fn price(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
+    req.validate_work_context()?;
     let spec = req.spec;
     match req.provider {
         crate::model::MODEL_ID => {
             expect_mode(req.mode, &MemoryMode::TextToImage)?;
-            generation(req, opts)
+            generation(req, opts, None)
         }
         crate::restoration::MODEL_ID => {
             expect_mode(
@@ -141,7 +913,7 @@ pub(crate) fn price(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced
             )?;
             let resources = RestorationResources::from_spec(spec, crate::restoration::MODEL_ID)
                 .map_err(Error::from)?;
-            restoration(req, opts, &resources)
+            restoration(req, opts, &resources, None)
         }
         crate::depth::DEPTH_MODEL_ID => {
             expect_mode(
@@ -150,7 +922,7 @@ pub(crate) fn price(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced
             )?;
             let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
                 .map_err(Error::from)?;
-            depth(req, opts, &export)
+            depth(req, opts, &export, None)
         }
         other => Err(Error::Unsupported(format!(
             "{other}: not an Iris-3B MLX memory provider"
@@ -282,11 +1054,67 @@ fn emulate_packed_tower(
     Ok(out)
 }
 
+/// The empty-prompt states as the encoder-free loaders hold them: the `embeddings` tensor decoded
+/// to f32, one allocation (the mask is read to the host).
+fn held_states(path: &Path) -> Result<u64> {
+    let headers = crate::stream::headers(path)?;
+    let embeddings = headers
+        .iter()
+        .find(|h| h.name == "embeddings")
+        .ok_or_else(|| Error::MissingTensor(format!("{}: embeddings", path.display())))?;
+    Ok(allocated(4 * elements(embeddings)))
+}
+
 fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
     headers
         .iter()
         .filter(|h| keep(&h.name))
         .fold(0u64, |a, h| a.saturating_add(h.data_bytes))
+}
+
+/// `(image_and_text_share_parent, text_retains_joined_parent)` after `completed` trunk blocks.
+/// Mirrors `load_block`'s text_out predicate and `single`'s final image-only return. A dropped
+/// final text update can retain the PENULTIMATE joined parent via y while x owns a new buffer.
+fn trunk_parent_layout(model: &IrisModel, completed: usize) -> Result<(bool, bool)> {
+    if completed > model.depth {
+        return Err(Error::Unsupported(
+            "Iris completed trunk index outside actual stack".into(),
+        ));
+    }
+    let joined = completed > model.dual_depth
+        && (completed < model.depth || model.final_block_text == "keep");
+    let previous_joined = completed == model.depth
+        && model.final_block_text != "keep"
+        && completed
+            .checked_sub(1)
+            .is_some_and(|previous| previous > model.dual_depth);
+    Ok((joined, joined || previous_joined))
+}
+
+/// A bounded group of distinct native backing requests at one source entry. `count` is never
+/// a view count: row views retain their original full parent once. These source requests are
+/// payload accounting, not fresh-allocation or physical-footprint evidence; reuse remains
+/// unproved until an actual matching allocator witness establishes it.
+struct NativeHeldRequest {
+    owner: &'static str,
+    bytes: u64,
+    count: u64,
+    birth: &'static str,
+    block: Option<usize>,
+    first_row: u64,
+    liveness: &'static str,
+    reuse: &'static str,
+}
+
+impl NativeHeldRequest {
+    fn priced(&self, page_bytes: u64) -> Result<u64> {
+        mlx_gen::ios_quantum::fresh_metal_allocation_bytes(self.bytes, page_bytes)
+            .and_then(|one| one.checked_mul(self.count))
+            .ok_or_else(|| Error::Unsupported(format!(
+                "Iris backing arithmetic overflow: {} (birth {}, block {:?}, first row {}, live {}, reuse {})",
+                self.owner, self.birth, self.block, self.first_row, self.liveness, self.reuse
+            )))
+    }
 }
 
 /// One backbone checkpoint's facts, from its headers (emulated as packed where the artifact will
@@ -301,6 +1129,7 @@ struct Backbone {
     /// The headers the loaded module is built from (packed where the load is packed).
     headers: std::collections::HashMap<String, Header>,
     inventory: StackInventory,
+    adapter_facts: crate::adapters::ProjectionAdapterFacts,
 }
 
 impl Backbone {
@@ -333,6 +1162,7 @@ impl Backbone {
                 })
                 .collect(),
             inventory,
+            adapter_facts: Default::default(),
         })
     }
 
@@ -390,7 +1220,12 @@ impl Backbone {
                 down_pad: pad,
                 ..g
             };
-            Ok(IrisDiT::dual_block_bytes(&g, unfused))
+            Ok(IrisDiT::dual_block_bytes_with_adapters(
+                &g,
+                unfused,
+                &self.adapter_facts,
+                &format!("blocks.{i}"),
+            ))
         } else {
             let ff = self.rows(&p("mlp.w1"))?;
             let g = TrunkGeometry {
@@ -400,7 +1235,12 @@ impl Backbone {
                 down_pad: self.pad(&p("mlp.w2"), ff)?,
                 ..g
             };
-            Ok(IrisDiT::single_block_bytes(&g, unfused))
+            Ok(IrisDiT::single_block_bytes_with_adapters(
+                &g,
+                unfused,
+                &self.adapter_facts,
+                &format!("blocks.{i}"),
+            ))
         }
     }
 
@@ -418,10 +1258,46 @@ impl Backbone {
         let m = &self.cfg;
         let cw = self.cw;
         let p = m.patch_size as u64;
-        let n = (h / p) * (w / p);
+        if p == 0 || h == 0 || w == 0 || h % p != 0 || w % p != 0 {
+            return Err(Error::Unsupported(
+                "Iris invocation is not on its actual patch grid".into(),
+            ));
+        }
+        let n = (h / p)
+            .checked_mul(w / p)
+            .ok_or_else(|| Error::Unsupported("Iris patch count overflow".into()))?;
         let t = m.text_len as u64;
         let hidden = m.hidden_size as u64;
         let heads = m.num_heads as u64;
+        let patch_batch = b
+            .checked_mul(n)
+            .ok_or_else(|| Error::Unsupported("Iris patch batch overflow".into()))?;
+        if [
+            b,
+            h,
+            w,
+            n,
+            t,
+            hidden,
+            heads,
+            patch_batch,
+            n.saturating_add(t),
+        ]
+        .iter()
+        .any(|&extent| extent > i32::MAX as u64)
+        {
+            return Err(Error::Unsupported(
+                "Iris tensor extent does not fit the backend i32 shape ABI".into(),
+            ));
+        }
+        for dims in [
+            [b, h, w, m.pixel.hidden_size as u64, 4],
+            [b, t, self.layers, m.text_dim as u64, 4],
+        ] {
+            dims.into_iter()
+                .try_fold(1u64, |count, dim| count.checked_mul(dim))
+                .ok_or_else(|| Error::Unsupported("Iris invocation payload overflow".into()))?;
+        }
         let kv_heads = m.num_kv_heads.unwrap_or(m.num_heads) as u64;
         let unfused = crate::retention::unfused();
         let rows = |plan, batch: u64, heads: u64, tokens: u64| {
@@ -435,17 +1311,20 @@ impl Backbone {
             };
         out.push((
             dit_q::EMBED,
-            IrisDiT::embed_bytes(EmbedGeometry {
-                compute_bytes: cw,
-                batch: b,
-                patches: n,
-                patch_in: self.input("s_embedder.proj")?,
-                hidden: self.rows("s_embedder.proj")?,
-                sinusoid: self.input("t_embedder.mlp.0")?,
-                t_hidden: self.rows("t_embedder.mlp.0")?,
-                t_out: self.rows("t_embedder.mlp.2")?,
-                cores,
-            })
+            IrisDiT::embed_bytes_with_adapters(
+                EmbedGeometry {
+                    compute_bytes: cw,
+                    batch: b,
+                    patches: n,
+                    patch_in: self.input("s_embedder.proj")?,
+                    hidden: self.rows("s_embedder.proj")?,
+                    sinusoid: self.input("t_embedder.mlp.0")?,
+                    t_hidden: self.rows("t_embedder.mlp.0")?,
+                    t_out: self.rows("t_embedder.mlp.2")?,
+                    cores,
+                },
+                &self.adapter_facts,
+            )
             .saturating_add(sampler_step_bytes(b * self.input_channels * h * w)),
         ));
         for i in 0..Stack::Layer.depth(m) {
@@ -454,7 +1333,7 @@ impl Backbone {
             let ff = self.rows(&s("mlp.0"))?;
             out.push((
                 dit_q::TEXT_LAYER_BLOCK,
-                IrisDiT::text_block_bytes(
+                IrisDiT::text_block_bytes_with_adapters(
                     TextBlockGeometry {
                         compute_bytes: cw,
                         batch: b * t,
@@ -469,26 +1348,30 @@ impl Backbone {
                         stream_bytes: 4,
                     },
                     unfused,
+                    &self.adapter_facts,
+                    &format!("y_embedder.layer_blocks.{i}"),
                 ),
             ));
         }
         out.push((
             dit_q::TEXT_POOL,
-            IrisDiT::text_pool_bytes(
+            IrisDiT::text_pool_bytes_with_adapters(
                 cw,
                 b,
                 t,
                 self.layers,
                 m.text_dim as u64,
                 self.rows("y_embedder.refiner.proj")?,
+                &self.adapter_facts,
             ),
         ));
+        out.push((dit_q::TEXT_MASK, IrisDiT::text_mask_bytes(b, t)));
         for i in 0..Stack::Refiner.depth(m) {
             let s = |name: &str| format!("y_embedder.refiner.blocks.{i}.{name}");
             let ff = self.rows(&s("mlp.w1"))?;
             out.push((
                 dit_q::TEXT_REFINER_BLOCK,
-                IrisDiT::text_block_bytes(
+                IrisDiT::text_block_bytes_with_adapters(
                     TextBlockGeometry {
                         compute_bytes: cw,
                         batch: b,
@@ -503,6 +1386,8 @@ impl Backbone {
                         stream_bytes: cw,
                     },
                     unfused,
+                    &self.adapter_facts,
+                    &format!("y_embedder.refiner.blocks.{i}"),
                 ),
             ));
         }
@@ -526,21 +1411,20 @@ impl Backbone {
             down_pad: 0,
             img_stream_bytes: 4,
         };
+        out.push((
+            dit_q::TRUNK_POSITIONS,
+            IrisDiT::trunk_entry_bytes(b, n, t, hidden / heads.max(1), hidden),
+        ));
         for i in 0..m.depth {
             let g = TrunkGeometry {
                 img_stream_bytes: if i == 0 { cw } else { 4 },
                 ..trunk
             };
-            let entry = if i == 0 {
-                IrisDiT::trunk_entry_bytes(b, n, t, hidden / heads.max(1), hidden)
-            } else {
-                0
-            };
-            out.push((dit_q::TRUNK_BLOCK, self.trunk(i, g)?.saturating_add(entry)));
+            out.push((dit_q::TRUNK_BLOCK, self.trunk(i, g)?));
         }
         out.push((
             dit_q::PIXEL_EMBED,
-            IrisDiT::pixel_embed_bytes(
+            IrisDiT::pixel_embed_bytes_with_adapters(
                 cw,
                 b,
                 h,
@@ -549,6 +1433,14 @@ impl Backbone {
                 self.input("modulation_cores.adaln_img")?,
                 self.rows("pixel_embedder.proj")?,
                 self.input("pixel_embedder.proj")?,
+                &self.adapter_facts,
+            ),
+        ));
+        out.push((
+            dit_q::PIXEL_POSITIONS,
+            mlx_gen::ios_quantum::rope_table_bytes(
+                n,
+                (m.pixel.attn_hidden_size / m.pixel.num_heads.max(1)) as u64,
             ),
         ));
         let row_b = if by_row { 1 } else { b };
@@ -557,7 +1449,7 @@ impl Backbone {
             let heads = m.pixel.num_heads as u64;
             out.push((
                 dit_q::PIXEL_BLOCK,
-                IrisDiT::pixel_block_bytes(
+                IrisDiT::pixel_block_bytes_with_adapters(
                     PixelBlockGeometry {
                         compute_bytes: cw,
                         batch: row_b,
@@ -573,12 +1465,14 @@ impl Backbone {
                         eval_per_chunk: plan.budget.eval_per_chunk(),
                     },
                     unfused,
+                    &self.adapter_facts,
+                    &format!("pixel_blocks.{i}"),
                 ),
             ));
         }
         out.push((
             dit_q::OUTPUT,
-            IrisDiT::output_bytes(
+            IrisDiT::output_bytes_with_adapters(
                 cw,
                 row_b,
                 n,
@@ -586,6 +1480,7 @@ impl Backbone {
                 self.input("final_layer.linear")?,
                 self.rows("final_layer.linear")?,
                 unfused,
+                &self.adapter_facts,
             ),
         ));
         if by_row {
@@ -594,25 +1489,501 @@ impl Backbone {
                 IrisDiT::output_rows_bytes(b as i32, m.in_channels as i32, h as i32, w as i32),
             ));
         }
-        // The largest carry between quanta: the trunk's image + text streams, or the PiT stage's
-        // pixel stream + per-patch conditioning (+ the finished rows when run per row).
-        let trunk_carry = allocated(4 * b * n * hidden) + allocated(4 * b * t * hidden);
+        // The largest carry between quanta. Held through the whole forward (`forward_impl`'s
+        // locals): the timestep embedding and both modulation cores, and the trunk's image and text
+        // RoPE tables (cos and sin, `[positions, head_dim / 2]` f32). The trunk adds its image and
+        // text streams. The PiT stage adds the trunk's text stream (kept to the end), the pixel
+        // RoPE tables, the per-patch conditioning and the pixel stream — run per row, the first
+        // block's batched input stays allocated until its last row is replaced, beside the `b − 1`
+        // rows already produced — and the finished rows.
+        let rope = |positions: u64, head_dim: u64| 2 * allocated(4 * positions * (head_dim / 2));
+        let head_dim = hidden / heads.max(1);
+        let t_out = self.rows("t_embedder.mlp.2")?;
+        let held = allocated(4 * b * t_out)
+            + allocated(4 * b * self.rows("modulation_cores.adaln_img")?)
+            + if m.dual_depth > 0 {
+                allocated(4 * b * self.rows("modulation_cores.adaln_txt")?)
+            } else {
+                0
+            }
+            + rope(n, head_dim)
+            + rope(t, head_dim);
+        let text_stream = allocated(4 * b * t * hidden);
+        let trunk_carry = held + allocated(4 * b * n * hidden) + text_stream;
         let pixel_width = m.pixel.hidden_size as u64;
-        let pixel_carry = allocated(cw * b * n * p * p * pixel_width)
+        let pixel_head = (m.pixel.attn_hidden_size / m.pixel.num_heads.max(1)) as u64;
+        let pixel_row = allocated(cw * n * p * p * pixel_width);
+        let pixel_carry = held
+            + text_stream
+            + rope(n, pixel_head)
+            + allocated(cw * b * n * p * p * pixel_width)
+            + if by_row { (b - 1) * pixel_row } else { 0 }
             + allocated(4 * b * n * hidden)
             + allocated(4 * b * m.in_channels as u64 * h * w);
         Ok(trunk_carry.max(pixel_carry))
     }
 
-    /// The largest window read and held over the four stacks, at `window` blocks per window.
-    fn stream(&self, window: Option<usize>) -> (u64, u64) {
-        Stack::ALL
-            .into_iter()
-            .map(|stack| {
-                let reads: &[BlockRead] = self.inventory.reads(stack);
-                largest_window(reads, window.unwrap_or(reads.len()))
+    fn weight_window_at(&self, label: &str, index: usize, window: Option<usize>) -> Result<u64> {
+        let stack = match label {
+            dit_q::TEXT_LAYER_BLOCK => Stack::Layer,
+            dit_q::TEXT_REFINER_BLOCK => Stack::Refiner,
+            dit_q::TRUNK_BLOCK => Stack::Trunk,
+            dit_q::PIXEL_BLOCK => Stack::Pixel,
+            _ => return Ok(0),
+        };
+        let reads = self.inventory.reads(stack);
+        if reads.is_empty() || index >= reads.len() {
+            return Err(Error::Unsupported(
+                "Iris source block index outside actual stack".into(),
+            ));
+        }
+        let count = window.unwrap_or(reads.len()).clamp(1, reads.len());
+        let first = index / count * count;
+        Ok(crate::stream::window_held_bytes(
+            &reads[first..(first + count).min(reads.len())],
+        ))
+    }
+
+    /// Named native owners at the actual operator entry, excluding caller solver/conditioning
+    /// owners, cached position table and this operation's scratch. No independent max carry is
+    /// re-used as a coincident lower bound. `row` is the actual per-row PiT/output iteration.
+    #[allow(clippy::too_many_arguments)]
+    fn native_held_requests_at(
+        &self,
+        b: u64,
+        h: u64,
+        w: u64,
+        by_row: bool,
+        label: &str,
+        index: usize,
+        row: u64,
+    ) -> Result<Vec<NativeHeldRequest>> {
+        let m = &self.cfg;
+        let p = m.patch_size as u64;
+        if p == 0 || m.num_heads == 0 || m.pixel.num_heads == 0 || b == 0 || row >= b {
+            return Err(Error::Unsupported(
+                "invalid Iris source backing geometry/row".into(),
+            ));
+        }
+        let bytes = |dimensions: &[u64]| {
+            dimensions
+                .iter()
+                .try_fold(1u64, |size, d| size.checked_mul(*d))
+                .ok_or_else(|| Error::Unsupported("Iris backing request product overflow".into()))
+        };
+        let n = bytes(&[h / p, w / p])?;
+        let t = m.text_len as u64;
+        let hidden = m.hidden_size as u64;
+        let cw = self.cw;
+        if label == dit_q::EMBED {
+            return Ok(Vec::new());
+        }
+        let mut owners = Vec::new();
+        // At most a fixed number of groups. Multiplicity describes DISTINCT native requests,
+        // never row views; reuse/donation has not been certified by these source records.
+        let mut add = |owner, size, count, birth, block, first_row, liveness| {
+            if count != 0 {
+                owners.push(NativeHeldRequest {
+                    owner,
+                    bytes: size,
+                    count,
+                    birth,
+                    block,
+                    first_row,
+                    liveness,
+                    reuse: "unproved; no fresh-allocation certificate",
+                });
+            }
+        };
+        add(
+            "t_emb",
+            bytes(&[cw, b, self.rows("t_embedder.mlp.2")?])?,
+            1,
+            dit_q::EMBED,
+            None,
+            0,
+            "forward lexical t_emb",
+        );
+        add(
+            "core_img",
+            bytes(&[cw, b, self.rows("modulation_cores.adaln_img")?])?,
+            1,
+            dit_q::EMBED,
+            None,
+            0,
+            "forward lexical core_img",
+        );
+        if m.dual_depth > 0 {
+            add(
+                "core_txt",
+                bytes(&[cw, b, self.rows("modulation_cores.adaln_txt")?])?,
+                1,
+                dit_q::EMBED,
+                None,
+                0,
+                "forward lexical core_txt",
+            );
+        }
+        let image_initial = bytes(&[cw, b, n, hidden])?;
+        let image_f32 = bytes(&[4, b, n, hidden])?;
+        let layer_y = bytes(&[4, b, t, self.layers, m.text_dim as u64])?;
+        let text_cw = bytes(&[cw, b, t, hidden])?;
+        let text_f32 = bytes(&[4, b, t, hidden])?;
+        let mask = bytes(&[4, b, t, t])?;
+        let head = hidden / m.num_heads as u64;
+        let rope_image = bytes(&[4, n, head / 2])?;
+        let rope_text = bytes(&[4, t, head / 2])?;
+        let rope_pixel = bytes(&[
+            4,
+            n,
+            (m.pixel.attn_hidden_size / m.pixel.num_heads) as u64 / 2,
+        ])?;
+        let conditioning = bytes(&[if m.depth == 0 { cw } else { 4 }, b, n, hidden])?;
+        let pixels_full = bytes(&[cw, b, h, w, m.pixel.hidden_size as u64])?;
+        let pixels_row = bytes(&[cw, h, w, m.pixel.hidden_size as u64])?;
+        let rgb_row = bytes(&[4, m.in_channels as u64, h, w])?;
+        let joined = bytes(&[
+            4,
+            b,
+            n.checked_add(t)
+                .ok_or_else(|| Error::Unsupported("Iris joined token count overflow".into()))?,
+            hidden,
+        ])?;
+        let layer_depth = Stack::Layer.depth(m);
+        let add_layer = |add: &mut dyn FnMut(
+            &'static str,
+            u64,
+            u64,
+            &'static str,
+            Option<usize>,
+            u64,
+            &'static str,
+        )| {
+            if layer_depth != 0 {
+                add(
+                    "layer_y",
+                    layer_y,
+                    1,
+                    dit_q::TEXT_LAYER_BLOCK,
+                    Some(layer_depth - 1),
+                    0,
+                    "text_adapter_exec shadowed layer-stack output",
+                );
+            }
+            // With zero layer blocks the initial reshape aliases caller-owned text.states.
+        };
+        match label {
+            dit_q::TEXT_LAYER_BLOCK => {
+                add(
+                    "image_initial",
+                    image_initial,
+                    1,
+                    dit_q::EMBED,
+                    None,
+                    0,
+                    "forward s before trunk",
+                );
+                if index != 0 {
+                    add(
+                        "layer_y",
+                        layer_y,
+                        1,
+                        dit_q::TEXT_LAYER_BLOCK,
+                        Some(index - 1),
+                        0,
+                        "current layer-stack carry",
+                    );
+                }
+            }
+            dit_q::TEXT_POOL
+            | dit_q::TEXT_MASK
+            | dit_q::TEXT_REFINER_BLOCK
+            | dit_q::TEXT_OUTPUT => {
+                add(
+                    "image_initial",
+                    image_initial,
+                    1,
+                    dit_q::EMBED,
+                    None,
+                    0,
+                    "forward s before trunk",
+                );
+                add_layer(&mut add);
+                if label != dit_q::TEXT_POOL {
+                    let birth = if label == dit_q::TEXT_REFINER_BLOCK && index != 0
+                        || label == dit_q::TEXT_OUTPUT && Stack::Refiner.depth(m) != 0
+                    {
+                        dit_q::TEXT_REFINER_BLOCK
+                    } else {
+                        dit_q::TEXT_POOL
+                    };
+                    let block = if birth == dit_q::TEXT_REFINER_BLOCK {
+                        Some(if label == dit_q::TEXT_OUTPUT {
+                            Stack::Refiner.depth(m) - 1
+                        } else {
+                            index - 1
+                        })
+                    } else {
+                        None
+                    };
+                    add(
+                        "refiner_y",
+                        text_cw,
+                        1,
+                        birth,
+                        block,
+                        0,
+                        "current refiner input/output binding",
+                    );
+                }
+                if matches!(label, dit_q::TEXT_REFINER_BLOCK | dit_q::TEXT_OUTPUT) {
+                    add(
+                        "key_mask",
+                        mask,
+                        1,
+                        dit_q::TEXT_MASK,
+                        None,
+                        0,
+                        "text_adapter_exec lexical key_mask",
+                    );
+                }
+            }
+            dit_q::TRUNK_POSITIONS => {
+                add(
+                    "image_initial",
+                    image_initial,
+                    1,
+                    dit_q::EMBED,
+                    None,
+                    0,
+                    "forward s before trunk",
+                );
+                add(
+                    "text_base",
+                    text_f32,
+                    1,
+                    dit_q::TEXT_OUTPUT,
+                    None,
+                    0,
+                    "forward lexical text_base",
+                );
+            }
+            dit_q::TRUNK_BLOCK
+            | dit_q::PIXEL_EMBED
+            | dit_q::PIXEL_POSITIONS
+            | dit_q::PIXEL_BLOCK
+            | dit_q::OUTPUT
+            | dit_q::OUTPUT_ROWS => {
+                add(
+                    "image_rope_cos_sin",
+                    rope_image,
+                    2,
+                    dit_q::TRUNK_POSITIONS,
+                    None,
+                    0,
+                    "forward ctx owns two distinct arrays",
+                );
+                add(
+                    "text_rope_cos_sin",
+                    rope_text,
+                    2,
+                    dit_q::TRUNK_POSITIONS,
+                    None,
+                    0,
+                    "forward ctx owns two distinct arrays",
+                );
+                add(
+                    "text_base",
+                    text_f32,
+                    1,
+                    dit_q::TEXT_OUTPUT,
+                    None,
+                    0,
+                    "forward lexical text_base",
+                );
+                let completed = if label == dit_q::TRUNK_BLOCK {
+                    index
+                } else {
+                    m.depth
+                };
+                let (shared, text_parent_joined) = trunk_parent_layout(m, completed)?;
+                let last = completed.checked_sub(1);
+                let text_birth_block = if text_parent_joined && !shared {
+                    completed.checked_sub(2)
+                } else {
+                    last
+                };
+                add(
+                    "trunk_text_parent",
+                    if text_parent_joined { joined } else { text_f32 },
+                    1,
+                    if text_birth_block.is_some() {
+                        dit_q::TRUNK_BLOCK
+                    } else {
+                        dit_q::TRUNK_POSITIONS
+                    },
+                    text_birth_block,
+                    0,
+                    "trunk y / final _y retains full parent, including joined image view",
+                );
+                if matches!(label, dit_q::TRUNK_BLOCK | dit_q::PIXEL_EMBED) && !shared {
+                    add(
+                        "trunk_image_parent",
+                        if completed == 0 {
+                            image_initial
+                        } else {
+                            image_f32
+                        },
+                        1,
+                        if completed == 0 {
+                            dit_q::EMBED
+                        } else {
+                            dit_q::TRUNK_BLOCK
+                        },
+                        last,
+                        0,
+                        "current s; explicitly dropped after pixel embedding",
+                    );
+                }
+                if !matches!(label, dit_q::TRUNK_BLOCK | dit_q::PIXEL_EMBED) {
+                    add(
+                        "s_cond",
+                        conditioning,
+                        1,
+                        dit_q::PIXEL_EMBED,
+                        None,
+                        0,
+                        "conds views retain full s_cond parent",
+                    );
+                    if label != dit_q::PIXEL_POSITIONS {
+                        add(
+                            "pixel_rope_cos_sin",
+                            rope_pixel,
+                            2,
+                            dit_q::PIXEL_POSITIONS,
+                            None,
+                            0,
+                            "forward pctx owns two distinct arrays",
+                        );
+                    }
+                    if by_row {
+                        add(
+                            "pixels_full_parent",
+                            pixels_full,
+                            1,
+                            dit_q::PIXEL_EMBED,
+                            None,
+                            0,
+                            "lexical pixels retained while split views / replaced rows run",
+                        );
+                        let separate = if label == dit_q::PIXEL_BLOCK {
+                            if index == 0 {
+                                row
+                            } else {
+                                b
+                            }
+                        } else if label == dit_q::OUTPUT_ROWS
+                            || label == dit_q::PIXEL_POSITIONS
+                            || m.pixel.depth == 0
+                        {
+                            0
+                        } else {
+                            b
+                        };
+                        // On a later block, processed rows were born in this block and pending
+                        // rows in the previous one. They are different buffers, not parent views.
+                        let current_rows = if label == dit_q::PIXEL_BLOCK {
+                            row.min(separate)
+                        } else {
+                            0
+                        };
+                        add(
+                            "pixel_rows_current",
+                            pixels_row,
+                            current_rows,
+                            dit_q::PIXEL_BLOCK,
+                            Some(index),
+                            0,
+                            "processed row outputs retained in parts",
+                        );
+                        add(
+                            "pixel_rows_previous",
+                            pixels_row,
+                            separate - current_rows,
+                            dit_q::PIXEL_BLOCK,
+                            if label == dit_q::PIXEL_BLOCK {
+                                index.checked_sub(1)
+                            } else {
+                                m.pixel.depth.checked_sub(1)
+                            },
+                            current_rows,
+                            "pending/completed distinct row outputs retained in parts",
+                        );
+                        let outputs = if label == dit_q::OUTPUT {
+                            row
+                        } else if label == dit_q::OUTPUT_ROWS {
+                            b
+                        } else {
+                            0
+                        };
+                        add("rgb_rows", rgb_row, outputs, dit_q::OUTPUT, None, 0,
+                            "outs owns distinct completed RGB arrays; parts dropped before OUTPUT_ROWS");
+                    } else {
+                        let completed_pixel = if label == dit_q::PIXEL_POSITIONS {
+                            0
+                        } else if label == dit_q::PIXEL_BLOCK {
+                            index
+                        } else {
+                            m.pixel.depth
+                        };
+                        add(
+                            "pixels_current_parent",
+                            pixels_full,
+                            1,
+                            if completed_pixel == 0 {
+                                dit_q::PIXEL_EMBED
+                            } else {
+                                dit_q::PIXEL_BLOCK
+                            },
+                            completed_pixel.checked_sub(1),
+                            0,
+                            "one current full-batch parts backing; no extra original after move",
+                        );
+                    }
+                }
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "unknown Iris ownership point {other}"
+                )))
+            }
+        }
+        Ok(owners)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn held_at(
+        &self,
+        b: u64,
+        h: u64,
+        w: u64,
+        by_row: bool,
+        label: &str,
+        index: usize,
+        row: u64,
+    ) -> Result<u64> {
+        self.native_held_requests_at(b, h, w, by_row, label, index, row)?
+            .iter()
+            .try_fold(0u64, |sum, group| {
+                sum.checked_add(group.priced(crate::retention::PAGE_BYTES)?)
+                    .ok_or_else(|| Error::Unsupported("Iris held backing sum overflow".into()))
             })
-            .fold((0, 0), |(r, h), (rr, hh)| (r.max(rr), h.max(hh)))
+    }
+
+    /// The pixel embedder's `[h, w, pixel]` f32 position table: built by the first forward at a
+    /// size and cached by the module (`IrisDiT::pixel_pos`), so resident from then on.
+    fn pixel_table(&self, h: u64, w: u64) -> Result<u64> {
+        Ok(allocated(4 * h * w * self.rows("pixel_embedder.proj")?))
     }
 }
 
@@ -764,14 +2135,96 @@ fn priced_tower(
 pub(crate) struct Priced {
     pub pricing: IosPricing,
     pub quanta: Vec<(IosPhase, &'static str, u64)>,
+    phase_areas: std::collections::BTreeMap<IosPhase, u64>,
 }
 
-/// Fold one phase's quanta into `pricing` at the phase's resident bytes.
-fn take(pricing: &mut Priced, phase: IosPhase, resident: u64, quanta: &[(&'static str, u64)]) {
-    for &(label, scratch) in quanta {
-        debug_assert_eq!(ios_quantum_phase(label), Some(phase), "{label}");
-        pricing.pricing.take(phase, resident, scratch, label);
+/// Basis coordinate of the NEW internal tensor/host allocation helpers. This is a producer-stage
+/// requirement, NOT an actual baseline snapshot; callers attach their real SDK/capture fact.
+pub const INTERNAL_GROWTH_COORDINATE: mlx_gen::ios_pricing::IosMemoryCoordinate =
+    mlx_gen::ios_pricing::IosMemoryCoordinate::BeforeModelLoad;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputStorageFacts {
+    pub width: u32,
+    pub height: u32,
+    pub logical_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+/// Actual provided RGB storage; never an image header fabricated into a zero-filled work item.
+/// At BeforeModelLoad it is a baseline owner; BeforeRequestConstruction requires its real producer.
+pub fn input_storage_facts(req: &IosPricingRequest<'_>) -> Result<Option<InputStorageFacts>> {
+    req.validate_work_context()?;
+    let image = req
+        .transform
+        .map(|work| &work.image)
+        .or_else(|| req.depth.map(|work| &work.image));
+    Ok(image.map(|image| InputStorageFacts {
+        width: image.width,
+        height: image.height,
+        logical_bytes: image.pixels.len() as u64,
+        capacity_bytes: image.pixels.capacity() as u64,
+    }))
+}
+
+/// Actual per-phase binding area, paired with that point's price; not the legacy aggregate/source
+/// geometry. Host buffers and serial outputs are explicit resident terms, not fake forward rows.
+#[derive(Clone, Debug)]
+pub struct PricingFacts {
+    pub pricing: IosPricing,
+    pub phase_areas: std::collections::BTreeMap<IosPhase, u64>,
+}
+
+impl Priced {
+    fn into_facts(self) -> PricingFacts {
+        PricingFacts {
+            pricing: self.pricing,
+            phase_areas: self.phase_areas,
+        }
+    }
+}
+
+/// Record complete coincident points without treating any logical upper as a physical lower.
+/// The argument list mirrors the source ledger: structural components, ambient owners, guard,
+/// actual operands and semantic operation class remain separate until the source bounder runs.
+#[allow(clippy::too_many_arguments)]
+fn take_source_at(
+    pricing: &mut Priced,
+    phase: IosPhase,
+    structural: u64,
+    held: u64,
+    quanta: &[(&'static str, u64)],
+    basis: IosWorkBasis,
+    class: &str,
+    owner: &str,
+    area: u64,
+) {
+    assert!(area > 0, "actual source window area must be positive");
+    for (operator, &(label, scratch)) in quanta.iter().enumerate() {
+        assert_eq!(
+            ios_quantum_phase(label),
+            Some(phase),
+            "source window has wrong phase: {label}"
+        );
+        let total = structural.saturating_add(held);
+        let changed = pricing
+            .pricing
+            .phase(phase)
+            .is_none_or(|old| total.saturating_add(scratch) > old.peak_bytes());
+        pricing.pricing.take_window(IosWindowPrice {
+            phase,
+            class: Some(format!("{class}/{label}/operator{operator}")),
+            label: label.into(),
+            resident_bytes: structural,
+            held_bytes: held,
+            scratch_bytes: scratch,
+            basis: Some(basis.clone()),
+            owner_domain: owner.into(),
+        });
         pricing.quanta.push((phase, label, scratch));
+        if changed {
+            pricing.phase_areas.insert(phase, area);
+        }
     }
 }
 
@@ -813,7 +2266,62 @@ fn token_window(req: &IosPricingRequest<'_>, te_dir: &Path, max_length: u64) -> 
     Ok(prefix + max_length)
 }
 
-fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
+/// Cold/first, first steady, and final positions of the repeated serial/row payload graph.
+/// In these loops intermediate payloads differ only by nonnegative completed-output counts;
+/// solver, CFG, block, cache birth and final-clamp graph transitions are enumerated separately.
+/// This bounded payload envelope does NOT establish physical witness coverage for omitted work.
+fn payload_transition_indices(count: u64) -> impl Iterator<Item = u64> {
+    [
+        count.checked_sub(1).map(|_| 0),
+        (count > 1).then_some(1),
+        count.checked_sub(1).filter(|last| *last > 1),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+struct GenerationEnvelope {
+    params: GenerationParams,
+    plan: mlx_gen::gen_core::iris::DpmSolverPlan,
+    count: u32,
+}
+
+impl GenerationEnvelope {
+    fn epochs(&self) -> impl Iterator<Item = GenerationEpoch> + '_ {
+        let indices = self
+            .plan
+            .epoch_indices(self.params.cfg_scale, self.params.cfg_interval);
+        let rows = self.params.prompts.len() as u64;
+        payload_transition_indices(u64::from(self.count))
+            .map(|serial| serial as u32)
+            .flat_map(move |serial| {
+                indices.clone().into_iter().map(move |index| {
+                    let step = self.plan.step(index).expect("bounded epoch index");
+                    let guided = self.params.cfg_at(&step);
+                    GenerationEpoch {
+                        serial,
+                        index,
+                        step,
+                        guided,
+                        forward_rows: rows * if guided { 2 } else { 1 },
+                        history_rows: if index == 0 { 0 } else { rows },
+                        completed_rows: rows * u64::from(serial),
+                    }
+                })
+            })
+    }
+}
+
+fn generation(
+    req: &IosPricingRequest<'_>,
+    opts: Pricing,
+    token: Option<&SamplingToken>,
+) -> Result<Priced> {
+    if req.transform.is_some() {
+        return Err(Error::Unsupported(
+            "Iris generation cannot carry transform context".into(),
+        ));
+    }
     let spec = req.spec;
     crate::memory_strategy::refuse_streamed_adapters(crate::model::MODEL_ID, spec)
         .map_err(Error::from)?;
@@ -822,18 +2330,38 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
     let resources =
         GenerationResources::from_spec(spec, crate::model::MODEL_ID).map_err(Error::from)?;
     let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
+    let supplied = req.generation.ok_or_else(|| Error::Unsupported(
+        "iris_3b pricing requires the actual generation request (sampling, CFG and serial count)".into()
+    ))?;
+    let (config, replay) = match token {
+        Some(token) => token.apply_to(&config, supplied)?,
+        None => (config, supplied.clone()),
+    };
+    let actual = &replay;
+    let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
+    let recipe = GenerationEnvelope {
+        plan: params.plan_metadata().map_err(Error::from)?,
+        params,
+        count: actual.count,
+    };
+    let prompts = recipe.params.prompts.len() as u64;
+    let total_images = prompts
+        .checked_mul(u64::from(recipe.count))
+        .ok_or_else(|| Error::Msg("Iris total image count overflow".into()))?;
+    if actual.width != req.geometry.width
+        || actual.height != req.geometry.height
+        || total_images != u64::from(req.geometry.batch)
+        || actual.memory.unwrap_or_default() != *req.execution
+    {
+        return Err(Error::Unsupported(
+            "Iris pricing request context disagrees with geometry/execution".into(),
+        ));
+    }
     let streamed = spec.load_shape == LoadShape::DeferredMaterialization;
     let staged = req.execution.stage_residency || spec.offload_policy == OffloadPolicy::Sequential;
-    let mut probe = mlx_gen::GenerationRequest {
-        memory: Some(*req.execution),
-        ..Default::default()
-    };
-    if *req.execution == GenerationMemory::default() {
-        probe.memory = None;
-    }
-    let rungs = crate::model::request_rungs(&probe, streamed)?;
+    let rungs = crate::model::request_rungs(actual, streamed)?;
     let plan = plan_of(req.execution);
-    let bb = priced_backbone(
+    let mut bb = priced_backbone(
         &config,
         &resources
             .backbone_dir
@@ -845,6 +2373,60 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
         config.model.in_channels as u64,
         opts,
     )?;
+    let base_bb_resident = bb.resident;
+    let (adapter_inventory, packed_adapter_hosts) = if spec.adapters.is_empty() {
+        (crate::adapters::AdapterHeaderInventory::default(), 0)
+    } else {
+        let (projections, packed) = crate::adapters::projection_shapes_from_headers(
+            &resources
+                .backbone_dir
+                .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+        )?;
+        (
+            crate::adapters::header_inventory(
+                &spec.adapters,
+                &projections,
+                compute_dtype(spec.precision),
+                IrisTask::Generation,
+                crate::model::MODEL_ID,
+            )?,
+            packed,
+        )
+    };
+    let adapter_loads = adapter_inventory.projection_loads()?;
+    let adapter_files = adapter_inventory.file_read_facts()?;
+    let adapter_resident = adapter_inventory
+        .projections
+        .values()
+        .flatten()
+        .flat_map(mlx_gen::adapters::facts::AdapterFacts::tensors)
+        .try_fold(0u64, |sum, tensor| {
+            let request = tensor.shape.iter().try_fold(
+                mlx_gen::adapters::facts::dtype_width(tensor.dtype),
+                |size, &dim| {
+                    let dim = u64::try_from(dim).map_err(|_| {
+                        Error::Unsupported("negative Iris adapter retained extent".into())
+                    })?;
+                    size.checked_mul(dim).ok_or_else(|| {
+                        Error::Unsupported("Iris adapter retained request overflow".into())
+                    })
+                },
+            )?;
+            let bytes = mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
+                request,
+                crate::retention::PAGE_BYTES,
+            )
+            .ok_or_else(|| {
+                Error::Unsupported("Iris adapter retained allocation overflow".into())
+            })?;
+            sum.checked_add(bytes)
+                .ok_or_else(|| Error::Unsupported("Iris adapter retained sum overflow".into()))
+        })?;
+    bb.resident = bb
+        .resident
+        .checked_add(adapter_resident)
+        .ok_or_else(|| Error::Unsupported("Iris backbone/adapter resident sum overflow".into()))?;
+    bb.facts.adapter_facts = adapter_inventory.projections.clone();
     let te = priced_tower(&resources.text_encoder_dir, spec.quantize, streamed, opts)?;
     let te_cfg = &te.cfg;
     let max_length = config.text_encoder.max_length as u64;
@@ -852,47 +2434,116 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
     let dim = config.text_encoder.dim as u64;
     let deepest = *config.text_encoder.hidden_layers.last().unwrap_or(&0);
     let n = token_window(req, &resources.text_encoder_dir, max_length)?;
-    let prompts = u64::from(req.geometry.batch.max(1));
-    let cond = allocated(tensor_bytes(4, &[max_length, layers, dim]));
+    let cond_elements = max_length * layers * dim;
+    let cond = allocated(tensor_bytes(4, &[cond_elements]));
+    let uncond = u64::from(recipe.params.uses_cfg());
     let (h, w) = (
         u64::from(req.geometry.height),
         u64::from(req.geometry.width),
     );
     let channels = config.model.in_channels as u64;
-    let b = 2 * prompts; // classifier-free guidance doubles the solve
-    let bb_resident = if streamed {
-        bb.resident
-            .saturating_add(bb.facts.stream(rungs.dit_window).1)
-    } else {
-        bb.resident
-    };
     let warm_te = if staged { 0 } else { te.resident };
     // Outside the denoise a streamed backbone holds no window: only its skeleton.
     let warm_bb = if staged { 0 } else { bb.resident };
     let mut pricing = Priced::default();
+    pricing.pricing.phase_not_run(
+        IosPhase::Encode,
+        "Iris text generation has no init-image encoder",
+    );
 
     // Load: the tower, then the backbone (staged: once the conditioning exists; warm: beside the
     // tower), and every adapter file.
-    let mut loads = vec![
-        (te_q::LOAD, te.floor),
-        (crate::model::BACKBONE_LOAD_QUANTUM, bb.floor),
-    ];
-    for adapter in &spec.adapters {
-        loads.push((
-            crate::adapters::ADAPTER_LOAD_QUANTUM,
-            mlx_gen::ios_quantum::load_floor_bytes(std::slice::from_ref(&adapter.path), |_| true)?,
-        ));
+    let load_conditioning = if staged { (prompts + uncond) * cond } else { 0 };
+    let load_tower = if staged { 0 } else { te.resident };
+    take_source_at(
+        &mut pricing,
+        IosPhase::Load,
+        0,
+        0,
+        &[(te_q::LOAD, te.floor)],
+        IosWorkBasis::default(),
+        "iris.generation.load/text",
+        "model::load_model text component closure",
+        1,
+    );
+    take_source_at(
+        &mut pricing,
+        IosPhase::Load,
+        load_tower,
+        load_conditioning,
+        &[(crate::model::BACKBONE_LOAD_QUANTUM, bb.floor)],
+        IosWorkBasis::default(),
+        "iris.generation.load/backbone",
+        "model::load_model backbone component closure",
+        1,
+    );
+    if !spec.adapters.is_empty() {
+        let add = |a: u64, b: u64| {
+            a.checked_add(b).ok_or_else(|| {
+                Error::Unsupported("Iris adapter load ownership sum overflow".into())
+            })
+        };
+        let host = crate::adapters::host_constructor_bytes(packed_adapter_hosts)?;
+        // Conservative load payload upper: source base inventory and its eventual cast parameters
+        // can coexist during build. This is not a coincident physical lower or an anchor credit.
+        let base_upper = add(add(load_tower, base_bb_resident)?, bb.floor)?;
+        take_source_at(
+            &mut pricing,
+            IosPhase::Load,
+            base_upper,
+            load_conditioning,
+            &[(crate::adapters::ADAPTER_HOST_QUANTUM, host)],
+            IosWorkBasis::default(),
+            "iris.generation.load/adapter_host",
+            "adapters::install before ProjectionHost constructors",
+            1,
+        );
+        let mut previous_file_payload = 0u64;
+        for read in &adapter_files {
+            take_source_at(
+                &mut pricing,
+                IosPhase::Load,
+                base_upper,
+                add(add(load_conditioning, host)?, previous_file_payload)?,
+                &[(
+                    crate::adapters::ADAPTER_LOAD_QUANTUM,
+                    read.read_guard_bytes()?,
+                )],
+                IosWorkBasis::default(),
+                "iris.generation.load/adapter_file",
+                "adapters::install ordered strict file read/graph construction",
+                1,
+            );
+            previous_file_payload = add(
+                previous_file_payload,
+                add(read.source_bytes, read.graph_constructor_bytes)?,
+            )?;
+        }
+        for (path, load) in &adapter_loads {
+            // Loader construction order is not BTreeMap order. Keep EVERY OTHER projection's
+            // distinct newly produced parameter as an upper, without subtracting a max or counting
+            // this projection's final output twice beside its reconstruction scratch. File aliases
+            // remain counted in source inventory, not as another new retained allocation.
+            let other_new = adapter_loads
+                .iter()
+                .filter(|(other, _)| *other != path)
+                .try_fold(0u64, |sum, (_, other)| {
+                    add(sum, other.new_retained_bytes()?)
+                })?;
+            let held = add(
+                add(add(load_conditioning, host)?, previous_file_payload)?,
+                other_new,
+            )?;
+            take_source_at(&mut pricing, IosPhase::Load, base_upper, held,
+                &[(crate::adapters::ADAPTER_MATERIALIZE_QUANTUM, load.materialize_scratch_bytes()?)],
+                IosWorkBasis::default(), "iris.generation.load/adapter_materialize",
+                "nn::Loader::linear reconstruction upper; other outputs retained conservatively, not a simultaneous lower", 1);
+        }
     }
-    let load_resident = if staged {
-        (prompts + 1) * cond
-    } else {
-        te.resident
-    };
-    take(&mut pricing, IosPhase::Load, load_resident, &loads);
 
     // Conditioning: every prompt and the CFG null in turn; the conditionings already returned
     // stay resident.
-    let held_conds = prompts * cond;
+    let held_conds = (prompts + uncond - 1) * cond;
     let n_i = n as i32;
     let real_max = (0..=max_length as i32)
         .map(|real| crate::text_encoder::conditioning_bytes(layers, max_length, dim, real))
@@ -900,6 +2551,7 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
         .unwrap_or(0);
     let mut text = vec![(te_q::CONDITIONING, real_max)];
     let mut walk = 0;
+    let mut text_weight_window = 0;
     if streamed {
         let run = deepest.min(te_cfg.num_layers);
         let window = rungs.text_window.unwrap_or(run.max(1));
@@ -913,9 +2565,10 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
             crate::text_encoder::streamed_layer_bytes(te_cfg, n),
         ));
         // The walk's carry and picked states, and the RoPE tables.
+        text_weight_window = largest_window(&te.reads[..run], window).1;
         walk = (layers + 1) * allocated(2 * n * te_cfg.hidden_size.max(0) as u64)
             + 2 * allocated(2 * n * te_cfg.head_dim.max(0) as u64)
-            + largest_window(&te.reads[..run], window).1;
+            + text_weight_window;
     } else {
         let scratch = |k: usize| {
             let (layer, held) = crate::text_encoder::decoder_layer_parts(te_cfg, n_i, k);
@@ -929,43 +2582,253 @@ fn generation(req: &IosPricingRequest<'_>, opts: Pricing) -> Result<Priced> {
             (1..=te_cfg.num_layers).map(scratch).max().unwrap_or(0),
         ));
     }
-    take(
+    take_source_at(
         &mut pricing,
         IosPhase::Conditioning,
-        te.resident + warm_bb + held_conds + walk,
+        te.resident + warm_bb + text_weight_window,
+        held_conds
+            + walk
+                .checked_sub(text_weight_window)
+                .expect("window weight is part of the walk ledger"),
         &text,
+        IosWorkBasis {
+            forward_rows: 1,
+            token_count: n,
+            ..Default::default()
+        },
+        "iris.generation.conditioning",
+        "text_encoder::encode_in source walk and prior conditionings",
+        n,
     );
 
-    // Denoise: the backbone, every conditioning and their CFG batch, the solver state.
-    let mut denoise = Vec::new();
-    let by_row = opts.pixel_rows && rungs.pixel_rows && b > 1;
-    let carry = bb.facts.forward(b, h, w, plan, by_row, &mut denoise)?;
-    denoise.push((
-        crate::solver::STEP_QUANTUM,
-        crate::solver::worst_step_scratch(prompts * channels * h * w),
-    ));
-    if streamed {
-        denoise.push((dit_q::BLOCK_READ, bb.facts.stream(rungs.dit_window).0));
+    // All conditionings remain owned by the outer request. Within EACH serial solve, concatenate
+    // with one input aliases its original buffer; a multi-prompt batch and the CFG batch allocate.
+    let held_batches = if prompts > 1 {
+        allocated(4 * prompts * cond_elements)
+    } else {
+        0
+    } + if uncond != 0 {
+        allocated(4 * 2 * prompts * cond_elements)
+    } else {
+        0
+    };
+    let state_elements = prompts * channels * h * w;
+    let state = allocated(4 * state_elements);
+    let table = bb.facts.pixel_table(h, w)?;
+    let conditioning = (prompts + uncond) * cond;
+    let plan_host = recipe.plan.host_bytes().map_err(Error::from)?;
+    let solve_held = conditioning + held_batches + plan_host;
+
+    // Pointwise epochs: pair this forward's actual rows/binding with the history and completed
+    // outputs alive at THAT evaluation, then maximize. Never subtract independent phase maxima.
+    for epoch in recipe.epochs() {
+        let b = epoch.forward_rows;
+        let mut forward = Vec::new();
+        let by_row = opts.pixel_rows && rungs.pixel_rows && b > 1;
+        // Preserve raw guard formulas, but never reuse their independent maximum carry as a
+        // coincident source owner. Every actual operation gets its own lexical-owner ledger.
+        let _raw_max_carry = bb.facts.forward(b, h, w, plan, by_row, &mut forward)?;
+        // The original noise stays owned by model::generate_impl. First x aliases it; later x and
+        // previous x0 are separate f32 states. Euler also retains previous x0 in the real sampler.
+        let current_history = state + if epoch.index == 0 { 0 } else { 2 * state };
+        let completed = u64::from(epoch.serial) * state;
+        let cfg_input = if epoch.guided {
+            allocated(4 * b * channels * h * w)
+        } else {
+            0
+        };
+        let model_time = allocated(4 * b);
+        for (operator, &(label, scratch)) in forward.iter().enumerate() {
+            let index = forward[..operator]
+                .iter()
+                .filter(|point| point.0 == label)
+                .count();
+            let by_one_row = by_row && matches!(label, dit_q::PIXEL_BLOCK | dit_q::OUTPUT);
+            let area = match label {
+                dit_q::TEXT_LAYER_BLOCK
+                | dit_q::TEXT_POOL
+                | dit_q::TEXT_MASK
+                | dit_q::TEXT_REFINER_BLOCK
+                | dit_q::TEXT_OUTPUT => b * config.model.text_len as u64,
+                dit_q::PIXEL_POSITIONS => {
+                    (h / config.model.patch_size as u64) * (w / config.model.patch_size as u64)
+                }
+                _ if by_one_row => h * w,
+                _ => b * h * w,
+            };
+            let window = if streamed {
+                bb.facts.weight_window_at(label, index, rungs.dit_window)?
+            } else {
+                0
+            };
+            let table_owned = epoch.serial != 0
+                || epoch.index != 0
+                || matches!(
+                    label,
+                    dit_q::PIXEL_POSITIONS
+                        | dit_q::PIXEL_BLOCK
+                        | dit_q::OUTPUT
+                        | dit_q::OUTPUT_ROWS
+                );
+            for row in payload_transition_indices(if by_one_row { b } else { 1 }) {
+                let owned = bb.facts.held_at(b, h, w, by_row, label, index, row)?;
+                take_source_at(&mut pricing, IosPhase::Denoise, bb.resident + warm_te + window,
+                    solve_held + completed + current_history + cfg_input + model_time + owned + if table_owned { table } else { 0 },
+                    &[(label, scratch)], IosWorkBasis {
+                        forward_rows: if by_one_row { 1 } else { b }, token_count: config.model.text_len as u64,
+                        model_width: w as u32, model_height: h as u32, source_plane_bytes: state,
+                        processed_plane_bytes: allocated(4 * b * channels * h * w), output_plane_bytes: completed,
+                        patch_width: config.model.patch_size as u32, patch_height: config.model.patch_size as u32,
+                    }, &format!("iris.gen.forward/op{operator}/guided{}/history{}/first{}/terminal{}/serial{}/row-first{}",
+                        epoch.guided, epoch.index != 0, epoch.index == 0, epoch.index + 1 == recipe.plan.len(), epoch.serial != 0, row == 0),
+                    "pipeline::denoise_in -> solver::sample -> dit::forward_impl exact lexical owners", area);
+            }
+        }
+        if streamed {
+            for (stack, next_label) in [
+                (Stack::Layer, dit_q::TEXT_LAYER_BLOCK),
+                (Stack::Refiner, dit_q::TEXT_REFINER_BLOCK),
+                (Stack::Trunk, dit_q::TRUNK_BLOCK),
+                (Stack::Pixel, dit_q::PIXEL_BLOCK),
+            ] {
+                let reads = bb.facts.inventory.reads(stack);
+                if reads.is_empty() {
+                    continue;
+                } // actual run_stack returns without any read
+                let count = rungs
+                    .dit_window
+                    .unwrap_or(reads.len())
+                    .clamp(1, reads.len());
+                for first in (0..reads.len()).step_by(count) {
+                    let end = (first + count).min(reads.len());
+                    let owned = bb.facts.held_at(b, h, w, by_row, next_label, first, 0)?;
+                    let cache = if epoch.serial != 0 || epoch.index != 0 || stack == Stack::Pixel {
+                        table
+                    } else {
+                        0
+                    };
+                    take_source_at(&mut pricing, IosPhase::Denoise, bb.resident + warm_te,
+                        solve_held + cache + completed + current_history + cfg_input + model_time + owned,
+                        &[(dit_q::BLOCK_READ, crate::stream::window_read_bytes(&reads[first..end]))],
+                        IosWorkBasis { forward_rows: b, token_count: config.model.text_len as u64,
+                            model_width: w as u32, model_height: h as u32, source_plane_bytes: state,
+                            output_plane_bytes: completed, patch_width: config.model.patch_size as u32,
+                            patch_height: config.model.patch_size as u32, ..Default::default() },
+                        &format!("iris.gen.read/{stack:?}/block{first}/guided{}/history{}/terminal{}/serial{}",
+                            epoch.guided, epoch.index != 0, epoch.index + 1 == recipe.plan.len(), epoch.serial != 0),
+                        "dit::run_stack window entry before new block ownership", 1);
+                }
+            }
+        }
+        // Model predictions are already evaluated when the forward returns. CFG's split views
+        // share ONE 2P prediction allocation; the lazy combine materializes in the step quantum.
+        let predictions = allocated(4 * b * channels * h * w);
+        take_source_at(
+            &mut pricing,
+            IosPhase::Denoise,
+            bb.resident + warm_te,
+            solve_held + table + completed + current_history + predictions,
+            &[(
+                crate::solver::STEP_QUANTUM,
+                crate::solver::step_scratch(state_elements, &epoch.step.update),
+            )],
+            IosWorkBasis {
+                forward_rows: prompts,
+                model_width: w as u32,
+                model_height: h as u32,
+                source_plane_bytes: state,
+                processed_plane_bytes: predictions,
+                output_plane_bytes: completed,
+                ..Default::default()
+            },
+            &format!(
+                "iris.gen.solver/update{}/guided{}/history{}/first{}/terminal{}/serial{}",
+                if matches!(
+                    epoch.step.update,
+                    mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
+                ) {
+                    2
+                } else {
+                    1
+                },
+                epoch.guided,
+                epoch.index != 0,
+                epoch.index == 0,
+                epoch.index + 1 == recipe.plan.len(),
+                epoch.serial != 0
+            ),
+            "solver::sample + step_update and lazy cfg_combine",
+            prompts * h * w,
+        );
     }
-    let state = prompts * channels * h * w;
-    let solver = 3 * allocated(4 * state) + allocated(4 * b * channels * h * w);
-    take(
-        &mut pricing,
-        IosPhase::Denoise,
-        bb_resident + warm_te + (prompts + 1) * cond + b * cond + solver + carry,
-        &denoise,
-    );
-
-    // Decode: the RGB8 conversion of the solved batch.
-    take(
-        &mut pricing,
-        IosPhase::Decode,
-        bb.resident + warm_te + (prompts + 1) * cond + allocated(4 * state),
-        &[(
-            crate::model::IMAGE_QUANTUM,
-            crate::model::image_scratch(prompts * 3 * h * w),
-        )],
-    );
+    for serial in payload_transition_indices(u64::from(recipe.count)) {
+        take_source_at(
+            &mut pricing,
+            IosPhase::Denoise,
+            bb.resident + warm_te,
+            conditioning + u64::from(serial) * state + state + if serial == 0 { 0 } else { table },
+            &[(crate::solver::PLAN_QUANTUM, plan_host)],
+            IosWorkBasis {
+                forward_rows: prompts,
+                model_width: w as u32,
+                model_height: h as u32,
+                source_plane_bytes: state,
+                output_plane_bytes: u64::from(serial) * state,
+                ..Default::default()
+            },
+            &format!("iris.gen.plan/serial{}", serial != 0),
+            "pipeline::denoise_in plan/sigma Vec before allocation",
+            1,
+        );
+        // sample has returned, dropping previous x0 BEFORE the final clamp. The original noise,
+        // current solution and solve-local conditioning batches remain alive until clamp finishes.
+        take_source_at(
+            &mut pricing,
+            IosPhase::Denoise,
+            bb.resident + warm_te,
+            solve_held + table + u64::from(serial) * state + 2 * state,
+            &[(
+                crate::solver::FINALIZE_QUANTUM,
+                crate::solver::final_clamp_scratch(state_elements),
+            )],
+            IosWorkBasis {
+                forward_rows: prompts,
+                model_width: w as u32,
+                model_height: h as u32,
+                source_plane_bytes: state,
+                processed_plane_bytes: state,
+                output_plane_bytes: u64::from(serial) * state,
+                ..Default::default()
+            },
+            &format!("iris.gen.final_clamp/serial{}", serial != 0),
+            "pipeline::denoise_in evaluated final clamp after sample history drop",
+            prompts * h * w,
+        );
+        // Decode runs only after ALL serial solves. Their f32 outputs stay resident, while the
+        // solve-local batches and original noises have dropped. Earlier RGB8 results are host bytes.
+        let prior_rgb = u64::from(serial) * prompts * 3 * h * w;
+        take_source_at(
+            &mut pricing,
+            IosPhase::Decode,
+            bb.resident + warm_te,
+            conditioning + u64::from(recipe.count) * state + table + prior_rgb,
+            &[(
+                crate::model::IMAGE_QUANTUM,
+                crate::model::image_scratch(prompts * 3 * h * w, prompts),
+            )],
+            IosWorkBasis {
+                forward_rows: prompts,
+                model_width: w as u32,
+                model_height: h as u32,
+                source_plane_bytes: u64::from(recipe.count) * state,
+                output_plane_bytes: prior_rgb,
+                ..Default::default()
+            },
+            &format!("iris.gen.rgb/serial{}", serial != 0),
+            "model::generate_impl retains every solved batch through serial RGB conversion",
+            prompts * h * w,
+        );
+    }
     Ok(pricing)
 }
 
@@ -975,10 +2838,550 @@ fn export_window(streamed: bool) -> Option<usize> {
     streamed.then_some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RestorationToken(String);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestorationWire {
+    source_width: u32,
+    source_height: u32,
+    source_capacity_bytes: u64,
+    scale_bits: u64,
+    input_sizing: u8,
+    color_fix: bool,
+    tile: u32,
+    patch: u32,
+    sigma_bits: u64,
+    num_train_timesteps: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RestorationMemoryClass {
+    pub budget_applied: bool,
+    pub enlarged: bool,
+    pub single_pass: bool,
+    pub color_fix: bool,
+}
+
+impl RestorationWire {
+    fn plan(&self) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+        let sigma = f64::from_bits(self.sigma_bits);
+        let scale = f64::from_bits(self.scale_bits);
+        let image_bytes = u64::from(self.source_width)
+            .checked_mul(u64::from(self.source_height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| Error::Unsupported("Iris restoration source byte overflow".into()))?;
+        if self.source_capacity_bytes < image_bytes
+            || self.num_train_timesteps == 0
+            || !sigma.is_finite()
+            || sigma <= 0.0
+            || sigma > 1.0
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !(scale as f32).is_finite()
+        {
+            return Err(Error::Unsupported(
+                "invalid normalized Iris restoration metadata".into(),
+            ));
+        }
+        let roundtrip = mlx_gen::gen_core::iris::restoration::request_scale(scale as f32);
+        if roundtrip.to_bits() != self.scale_bits {
+            return Err(Error::Unsupported(
+                "Iris restoration scale is not a canonical request scale".into(),
+            ));
+        }
+        let input_sizing = match self.input_sizing {
+            0 => mlx_gen::InputSizing::Original,
+            1 => mlx_gen::InputSizing::Budgeted,
+            _ => return Err(Error::Unsupported("invalid Iris input sizing".into())),
+        };
+        let plan = mlx_gen::gen_core::iris::restoration::plan_metadata(
+            mlx_gen::gen_core::iris::restoration::Dims::new(self.source_width, self.source_height),
+            &mlx_gen::gen_core::iris::restoration::RestorationOptions {
+                scale,
+                input_sizing,
+                color_fix: self.color_fix,
+            },
+            mlx_gen::gen_core::iris::restoration::TileGeometry {
+                tile: self.tile,
+                patch: self.patch,
+            },
+            crate::restoration::MODEL_ID,
+        )
+        .map_err(Error::from)?;
+        crate::restoration::host_plane_bytes_metadata(&plan)?;
+        Ok(plan)
+    }
+}
+
+pub fn canonical_restoration_token(
+    spec: &mlx_gen::LoadSpec,
+    actual: &mlx_gen::TransformRequest,
+) -> Result<RestorationToken> {
+    let resources =
+        RestorationResources::from_spec(spec, crate::restoration::MODEL_ID).map_err(Error::from)?;
+    let plan = restoration_input_plan(spec, actual)?;
+    let wire = RestorationWire {
+        source_width: actual.image.width,
+        source_height: actual.image.height,
+        source_capacity_bytes: actual.image.pixels.capacity() as u64,
+        scale_bits: plan.scale.to_bits(),
+        input_sizing: if plan.input_sizing == mlx_gen::InputSizing::Original {
+            0
+        } else {
+            1
+        },
+        color_fix: plan.color_fix,
+        tile: plan.tile,
+        patch: plan.patch,
+        sigma_bits: resources.settings.sigma.to_bits(),
+        num_train_timesteps: resources.export.config.flow.num_train_timesteps as u64,
+    };
+    RestorationToken::from_token(&format!(
+        "iris-restoration-v1:{}",
+        serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+    ))
+}
+
+/// Finite actual-source control/topology representatives. No source image is cloned or invented;
+/// every refusal is retained explicitly, and valid plans dedup by semantic class, not exact size.
+pub fn restoration_representatives(
+    spec: &mlx_gen::LoadSpec,
+    carrier: &mlx_gen::TransformRequest,
+) -> Result<Vec<Result<RestorationToken>>> {
+    let actual = canonical_restoration_token(spec, carrier)?;
+    let base = actual.wire()?;
+    let mut classes = std::collections::BTreeSet::from([actual.memory_class()?]);
+    let mut representatives = vec![Ok(actual)];
+    for input_sizing in [0u8, 1] {
+        let source =
+            mlx_gen::gen_core::iris::restoration::Dims::new(base.source_width, base.source_height);
+        let input = if input_sizing == 0 {
+            source
+        } else {
+            mlx_gen::gen_core::iris::restoration::fit_budget_dims(
+                source,
+                mlx_gen::gen_core::iris::restoration::INPUT_BUDGET,
+            )
+        };
+        let short = input.width.min(input.height) as f64;
+        let small = ((base.tile / 2).max(1) as f64 / short) as f32;
+        let large = ((u64::from(base.tile) + u64::from(base.patch)) as f64 / short) as f32;
+        for color_fix in [false, true] {
+            for scale in [
+                f64::from_bits(base.scale_bits) as f32,
+                small.next_up(),
+                large.next_up(),
+            ] {
+                let mut wire = base.clone();
+                wire.input_sizing = input_sizing;
+                wire.color_fix = color_fix;
+                wire.scale_bits =
+                    mlx_gen::gen_core::iris::restoration::request_scale(scale).to_bits();
+                let token = serde_json::to_string(&wire)
+                    .map_err(|e| Error::Msg(e.to_string()))
+                    .and_then(|wire| {
+                        RestorationToken::from_token(&format!("iris-restoration-v1:{wire}"))
+                    });
+                match token {
+                    Ok(token) => {
+                        if classes.insert(token.memory_class()?) {
+                            representatives.push(Ok(token));
+                        }
+                    }
+                    Err(error) => representatives.push(Err(error)),
+                }
+            }
+        }
+    }
+    Ok(representatives)
+}
+
+impl RestorationToken {
+    fn wire(&self) -> Result<RestorationWire> {
+        serde_json::from_str(
+            self.0
+                .strip_prefix("iris-restoration-v1:")
+                .ok_or_else(|| Error::Unsupported("invalid Iris restoration prefix".into()))?,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))
+    }
+    pub fn from_token(token: &str) -> Result<Self> {
+        let wire: RestorationWire = serde_json::from_str(
+            token
+                .strip_prefix("iris-restoration-v1:")
+                .ok_or_else(|| Error::Unsupported("not an Iris restoration token".into()))?,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))?;
+        wire.plan()?;
+        let canonical = format!(
+            "iris-restoration-v1:{}",
+            serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+        );
+        if canonical != token {
+            return Err(Error::Unsupported(
+                "noncanonical Iris restoration token".into(),
+            ));
+        }
+        Ok(Self(canonical))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn to_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.wire()?).map_err(|e| Error::Msg(e.to_string()))
+    }
+    pub fn plan(&self) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+        self.wire()?.plan()
+    }
+    /// Replay actual task controls in place; source RGB ownership/capacity and artifact metadata
+    /// must match. No image, request or config clone and no fabricated source are involved.
+    pub fn apply_runtime_to(
+        &self,
+        spec: &mlx_gen::LoadSpec,
+        carrier: &mut mlx_gen::TransformRequest,
+    ) -> Result<()> {
+        let wire = self.wire()?;
+        wire.plan()?;
+        let resources = RestorationResources::from_spec(spec, crate::restoration::MODEL_ID)
+            .map_err(Error::from)?;
+        let geometry = resources.settings.geometry(&resources.export.config);
+        if (
+            carrier.image.width,
+            carrier.image.height,
+            carrier.image.pixels.capacity() as u64,
+        ) != (
+            wire.source_width,
+            wire.source_height,
+            wire.source_capacity_bytes,
+        ) || geometry.tile != wire.tile
+            || geometry.patch != wire.patch
+            || resources.settings.sigma.to_bits() != wire.sigma_bits
+            || resources.export.config.flow.num_train_timesteps as u64 != wire.num_train_timesteps
+        {
+            return Err(Error::Unsupported(
+                "Iris restoration runtime recipe disagrees with actual source/artifact".into(),
+            ));
+        }
+        let input_sizing = match wire.input_sizing {
+            0 => mlx_gen::InputSizing::Original,
+            1 => mlx_gen::InputSizing::Budgeted,
+            _ => {
+                return Err(Error::Unsupported(
+                    "invalid Iris restoration runtime input sizing".into(),
+                ))
+            }
+        };
+        let previous = (carrier.target, carrier.input_sizing, carrier.color_fix);
+        carrier.target = mlx_gen::TargetSize::Scale(f64::from_bits(wire.scale_bits) as f32);
+        carrier.input_sizing = input_sizing;
+        carrier.color_fix = Some(wire.color_fix);
+        let result = canonical_restoration_token(spec, carrier).and_then(|actual| {
+            if actual == *self {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(
+                    "Iris restoration runtime replay changed canonical identity".into(),
+                ))
+            }
+        });
+        if result.is_err() {
+            (carrier.target, carrier.input_sizing, carrier.color_fix) = previous;
+        }
+        result
+    }
+    pub fn memory_class(&self) -> Result<RestorationMemoryClass> {
+        let plan = self.plan()?;
+        Ok(RestorationMemoryClass {
+            budget_applied: plan.budget_applied,
+            enlarged: plan.enlarged,
+            single_pass: plan.single_pass(),
+            color_fix: plan.color_fix,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DepthToken(String);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepthWire {
+    source_width: u32,
+    source_height: u32,
+    source_capacity_bytes: u64,
+    max_side: u32,
+    patch: u32,
+    num_train_timesteps: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DepthMemoryClass {
+    pub resized: bool,
+}
+
+impl DepthWire {
+    fn plan(&self) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+        let bytes = u64::from(self.source_width)
+            .checked_mul(u64::from(self.source_height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| Error::Unsupported("Iris depth source byte overflow".into()))?;
+        if self.source_capacity_bytes < bytes || self.num_train_timesteps == 0 {
+            return Err(Error::Unsupported(
+                "invalid Iris depth source metadata".into(),
+            ));
+        }
+        let resolution = if self.max_side == 0 {
+            mlx_gen::gen_core::iris::depth::DepthResolution::Native
+        } else {
+            mlx_gen::gen_core::iris::depth::DepthResolution::Capped(self.max_side)
+        };
+        let plan = mlx_gen::gen_core::iris::depth::plan_depth_input(
+            self.source_width,
+            self.source_height,
+            resolution,
+            self.patch as usize,
+        )
+        .map_err(Error::from)?;
+        crate::depth::depth_host_bytes(&plan)?;
+        Ok(plan)
+    }
+}
+
+pub fn canonical_depth_token(
+    spec: &mlx_gen::LoadSpec,
+    actual: &mlx_gen::gen_core::iris::depth::DepthRequest,
+) -> Result<DepthToken> {
+    let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
+        .map_err(Error::from)?;
+    depth_input_plan(spec, actual)?;
+    let wire = DepthWire {
+        source_width: actual.image.width,
+        source_height: actual.image.height,
+        source_capacity_bytes: actual.image.pixels.capacity() as u64,
+        max_side: actual.resolution.max_side(),
+        patch: export.config.model.patch_size as u32,
+        num_train_timesteps: export.config.flow.num_train_timesteps as u64,
+    };
+    DepthToken::from_token(&format!(
+        "iris-depth-v1:{}",
+        serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+    ))
+}
+
+/// Native/current/source-max/patch-cap representatives use the actual source and actual export
+/// patch. Unreachable resize classes are not manufactured with fake media.
+pub fn depth_representatives(
+    spec: &mlx_gen::LoadSpec,
+    carrier: &mlx_gen::gen_core::iris::depth::DepthRequest,
+) -> Result<Vec<Result<DepthToken>>> {
+    let actual = canonical_depth_token(spec, carrier)?;
+    let base = actual.wire()?;
+    let mut classes = std::collections::BTreeSet::from([actual.memory_class()?]);
+    let mut representatives = vec![Ok(actual)];
+    for max_side in [0, base.source_width.max(base.source_height), base.patch] {
+        let mut wire = base.clone();
+        wire.max_side = max_side;
+        let token = serde_json::to_string(&wire)
+            .map_err(|e| Error::Msg(e.to_string()))
+            .and_then(|wire| DepthToken::from_token(&format!("iris-depth-v1:{wire}")));
+        match token {
+            Ok(token) => {
+                if classes.insert(token.memory_class()?) {
+                    representatives.push(Ok(token));
+                }
+            }
+            Err(error) => representatives.push(Err(error)),
+        }
+    }
+    Ok(representatives)
+}
+
+impl DepthToken {
+    fn wire(&self) -> Result<DepthWire> {
+        serde_json::from_str(
+            self.0
+                .strip_prefix("iris-depth-v1:")
+                .ok_or_else(|| Error::Unsupported("invalid Iris depth prefix".into()))?,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))
+    }
+    pub fn from_token(token: &str) -> Result<Self> {
+        let wire: DepthWire = serde_json::from_str(
+            token
+                .strip_prefix("iris-depth-v1:")
+                .ok_or_else(|| Error::Unsupported("not an Iris depth token".into()))?,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))?;
+        wire.plan()?;
+        let canonical = format!(
+            "iris-depth-v1:{}",
+            serde_json::to_string(&wire).map_err(|e| Error::Msg(e.to_string()))?
+        );
+        if canonical != token {
+            return Err(Error::Unsupported("noncanonical Iris depth token".into()));
+        }
+        Ok(Self(canonical))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn to_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.wire()?).map_err(|e| Error::Msg(e.to_string()))
+    }
+    pub fn plan(&self) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+        self.wire()?.plan()
+    }
+    /// Apply max-side/native controls to the real source request without copying its RGB payload.
+    /// Actual source/capacity and export patch/timestep metadata must match the captured token.
+    pub fn apply_runtime_to(
+        &self,
+        spec: &mlx_gen::LoadSpec,
+        carrier: &mut mlx_gen::gen_core::iris::depth::DepthRequest,
+    ) -> Result<()> {
+        let wire = self.wire()?;
+        wire.plan()?;
+        let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
+            .map_err(Error::from)?;
+        if (
+            carrier.image.width,
+            carrier.image.height,
+            carrier.image.pixels.capacity() as u64,
+        ) != (
+            wire.source_width,
+            wire.source_height,
+            wire.source_capacity_bytes,
+        ) || export.config.model.patch_size as u32 != wire.patch
+            || export.config.flow.num_train_timesteps as u64 != wire.num_train_timesteps
+        {
+            return Err(Error::Unsupported(
+                "Iris depth runtime recipe disagrees with actual source/artifact".into(),
+            ));
+        }
+        let previous = carrier.resolution;
+        carrier.resolution = if wire.max_side == 0 {
+            mlx_gen::gen_core::iris::depth::DepthResolution::Native
+        } else {
+            mlx_gen::gen_core::iris::depth::DepthResolution::Capped(wire.max_side)
+        };
+        let result = canonical_depth_token(spec, carrier).and_then(|actual| {
+            if actual == *self {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(
+                    "Iris depth runtime replay changed canonical identity".into(),
+                ))
+            }
+        });
+        if result.is_err() {
+            carrier.resolution = previous;
+        }
+        result
+    }
+    pub fn memory_class(&self) -> Result<DepthMemoryClass> {
+        Ok(DepthMemoryClass {
+            resized: self.plan()?.resized(),
+        })
+    }
+}
+
+/// Provider-owned actual scalar/indexed plans for metadata/capture/anchor basis. No image/tensor
+/// allocation, tile-axis collection or copied global row rule is involved.
+pub fn restoration_input_plan(
+    spec: &mlx_gen::LoadSpec,
+    actual: &mlx_gen::TransformRequest,
+) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+    let resources =
+        RestorationResources::from_spec(spec, crate::restoration::MODEL_ID).map_err(Error::from)?;
+    mlx_gen::gen_core::iris::restoration::plan_request_metadata(
+        actual,
+        resources.settings.geometry(&resources.export.config),
+        crate::restoration::MODEL_ID,
+    )
+    .map_err(Error::from)
+}
+
+pub fn depth_input_plan(
+    spec: &mlx_gen::LoadSpec,
+    actual: &mlx_gen::gen_core::iris::depth::DepthRequest,
+) -> Result<mlx_gen::gen_core::iris::depth::DepthInputPlan> {
+    let export = TaskExport::from_spec(spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
+        .map_err(Error::from)?;
+    mlx_gen::gen_core::iris::depth::validate_depth_request(actual).map_err(Error::from)?;
+    mlx_gen::gen_core::iris::depth::plan_depth_input(
+        actual.image.width,
+        actual.image.height,
+        actual.resolution,
+        export.config.model.patch_size,
+    )
+    .map_err(Error::from)
+}
+
+/// Price the actual original-source/scale/sizing/color-fix plan, not a fabricated processing source.
+fn restoration_priced_plan(
+    req: &IosPricingRequest<'_>,
+    resources: &RestorationResources,
+    token: Option<&RestorationToken>,
+) -> Result<mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata> {
+    if req.generation.is_some() || req.depth.is_some() {
+        return Err(Error::Unsupported(
+            "Iris restoration cannot carry generation/depth context".into(),
+        ));
+    }
+    if let Some(token) = token {
+        let plan = token.plan()?;
+        if plan.patch != resources.export.config.model.patch_size as u32
+            || plan.source.width != req.geometry.width
+            || plan.source.height != req.geometry.height
+            || req.geometry.batch != 1
+            || req.geometry.frames != 1
+            || req.geometry.reference_count != 0
+        {
+            return Err(Error::Unsupported(
+                "Iris restoration replay disagrees with actual architecture/source key".into(),
+            ));
+        }
+        return Ok(plan);
+    }
+    let actual = req.transform.ok_or_else(|| Error::Unsupported(
+        "Iris restoration pricing requires the actual TransformRequest source/scale/sizing/color-fix context".into()
+    ))?;
+    let p = mlx_gen::gen_core::iris::restoration::plan_request_metadata(
+        actual,
+        resources.settings.geometry(&resources.export.config),
+        crate::restoration::MODEL_ID,
+    )
+    .map_err(Error::from)?;
+    if actual.image.width != req.geometry.width
+        || actual.image.height != req.geometry.height
+        || req.geometry.batch != 1
+        || req.geometry.frames != 1
+        || req.geometry.reference_count != 0
+    {
+        return Err(Error::Unsupported(
+            "Iris restoration context disagrees with source geometry".into(),
+        ));
+    }
+    Ok(p)
+}
+
+/// The host-plane bytes a restoration request's Decode resident holds (the planes still allocated
+/// when the last tile returns): host memory, which a device capture's footprint sees and MLX's
+/// active memory does not.
+#[cfg(test)]
+pub(crate) fn restoration_decode_host_bytes(req: &IosPricingRequest<'_>) -> Result<u64> {
+    let resources = RestorationResources::from_spec(req.spec, crate::restoration::MODEL_ID)
+        .map_err(Error::from)?;
+    let p = restoration_priced_plan(req, &resources, None)?;
+    Ok(crate::restoration::host_plane_bytes_metadata(&p)?.live_at_last_tile)
+}
+
 fn restoration(
     req: &IosPricingRequest<'_>,
     opts: Pricing,
     resources: &RestorationResources,
+    token: Option<&RestorationToken>,
 ) -> Result<Priced> {
     let spec = req.spec;
     crate::memory_strategy::refuse_unloadable_quant(crate::restoration::MODEL_ID, spec)
@@ -1002,83 +3405,250 @@ fn restoration(
         config.model.in_channels as u64,
         opts,
     )?;
-    let states = stored(
+    let states = held_states(&resources.export.empty_prompt_path())?;
+    let prompt_floor = stored(
         &crate::stream::headers(&resources.export.empty_prompt_path())?,
         |_| true,
     );
-    // The geometry is the processing size (`restoration_memory_geometry`): priced as an output of
-    // that size with the colour fix on — the largest host planes a plan of it can allocate.
-    let geometry = resources.settings.geometry(config);
-    let p = plan(
-        Dims::new(req.geometry.width, req.geometry.height),
-        &RestorationOptions {
-            scale: 1.0,
-            input_sizing: InputSizing::Original,
-            color_fix: true,
-        },
-        geometry,
-        crate::restoration::MODEL_ID,
-    )
-    .map_err(Error::from)?;
+    let p = restoration_priced_plan(req, resources, token)?;
     let (th, tw) = if p.single_pass() {
         (p.padded.height as u64, p.padded.width as u64)
     } else {
         (p.tile as u64, p.tile as u64)
     };
-    let host = crate::restoration::host_plane_bytes(&p);
+    let host = crate::restoration::host_plane_bytes_metadata(&p)?;
+    let axes = p.axis_bytes().map_err(Error::from)?;
+    let caller_rgb = match token {
+        Some(token) => token.wire()?.source_capacity_bytes,
+        None => req
+            .transform
+            .ok_or_else(|| Error::Unsupported("missing actual restoration context".into()))?
+            .image
+            .pixels
+            .capacity() as u64,
+    };
+    let readback = tensor_bytes(4, &[3, th, tw]);
+    let tile_host_ambient = host
+        .live_at_last_tile
+        .checked_sub(readback)
+        .expect("actual last-tile owner ledger contains its velocity readback");
     let window = export_window(streamed);
     // A streamed backbone holds a window only inside its forward (the tile phase).
     let rb = bb.resident + states;
-    let held_window = if streamed {
-        bb.facts.stream(window).1
-    } else {
-        0
-    };
     let mut pricing = Priced::default();
-    take(
+    pricing.pricing.phase_not_run(
+        IosPhase::Conditioning,
+        "Iris restoration loads shipped empty-prompt states, no text tower",
+    );
+    let basis = IosWorkBasis {
+        forward_rows: 1,
+        token_count: config.model.text_len as u64,
+        model_width: tw as u32,
+        model_height: th as u32,
+        source_plane_bytes: caller_rgb,
+        processed_plane_bytes: tensor_bytes(4, &[3, p.padded.height as u64, p.padded.width as u64]),
+        output_plane_bytes: tensor_bytes(1, &[3, p.output.height as u64, p.output.width as u64]),
+        patch_width: p.patch,
+        patch_height: p.patch,
+    };
+    take_source_at(
         &mut pricing,
         IosPhase::Load,
         0,
-        &[
-            (crate::restoration::quanta::LOAD, bb.floor + states),
-            (crate::model::BACKBONE_LOAD_QUANTUM, bb.floor),
-        ],
+        caller_rgb,
+        &[(crate::restoration::quanta::LOAD, bb.floor + prompt_floor)],
+        basis.clone(),
+        "iris.restoration.load",
+        "restoration::load before export/prompt read",
+        1,
     );
-    take(
+    take_source_at(
+        &mut pricing,
+        IosPhase::Load,
+        0,
+        caller_rgb + states + 4 * config.model.text_len as u64,
+        &[(crate::model::BACKBONE_LOAD_QUANTUM, bb.floor)],
+        basis.clone(),
+        "iris.restoration.backbone_load",
+        "restoration::load holds decoded host empty-prompt before backbone",
+        1,
+    );
+    if axes != 0 {
+        take_source_at(
+            &mut pricing,
+            IosPhase::Encode,
+            rb,
+            caller_rgb,
+            &[(crate::restoration::quanta::PLAN, axes)],
+            basis.clone(),
+            "iris.restoration.axes",
+            "restoration::plan indexed metadata before axis Vec collection",
+            1,
+        );
+    }
+    take_source_at(
         &mut pricing,
         IosPhase::Encode,
         rb,
+        caller_rgb + axes,
         &[(crate::restoration::quanta::HOST_PLANES, host.peak())],
+        basis.clone(),
+        "iris.restoration.host_entry",
+        "restore driver before clone/preprocess/canvas allocations",
+        u64::from(p.processing.width) * u64::from(p.processing.height),
     );
     let tile = crate::restoration::tile_scratch(3 * th * tw);
-    let mut denoise = vec![(crate::restoration::quanta::TILE, tile)];
-    let carry = bb.facts.forward(
+    let mut forward = Vec::new();
+    let _raw_max_carry = bb.facts.forward(
         1,
         th,
         tw,
         mlx_gen::AttentionPlan::UNBOUNDED,
         false,
-        &mut denoise,
+        &mut forward,
     )?;
-    if streamed {
-        denoise.push((dit_q::BLOCK_READ, bb.facts.stream(window).0));
+    let table = bb.facts.pixel_table(th, tw)?;
+    let tiles = p.forward_count().map_err(Error::from)?;
+    let mut representatives = vec![0, tiles - 1];
+    if tiles > 2 {
+        representatives.push(1);
     }
-    take(
-        &mut pricing,
-        IosPhase::Denoise,
-        rb + held_window + host.tile_phase + tile + carry,
-        &denoise,
-    );
-    take(
+    representatives.sort_unstable();
+    representatives.dedup();
+    for tile_index in representatives {
+        let cached_before = tile_index != 0;
+        take_source_at(
+            &mut pricing,
+            IosPhase::Denoise,
+            rb,
+            caller_rgb + axes + tile_host_ambient + if cached_before { table } else { 0 },
+            &[(crate::restoration::quanta::TILE, tile)],
+            basis.clone(),
+            &format!(
+                "iris.restoration.tile/first{}/last{}",
+                tile_index == 0,
+                tile_index + 1 == tiles
+            ),
+            "run_restoration crop before velocity upload/forward/readback",
+            th * tw,
+        );
+        for (operator, &(label, scratch)) in forward.iter().enumerate() {
+            let index = forward[..operator]
+                .iter()
+                .filter(|point| point.0 == label)
+                .count();
+            let weight_window = if streamed {
+                bb.facts.weight_window_at(label, index, window)?
+            } else {
+                0
+            };
+            let owned = bb.facts.held_at(1, th, tw, false, label, index, 0)?;
+            let cached = cached_before
+                || matches!(
+                    label,
+                    dit_q::PIXEL_POSITIONS
+                        | dit_q::PIXEL_BLOCK
+                        | dit_q::OUTPUT
+                        | dit_q::OUTPUT_ROWS
+                );
+            let area = if matches!(
+                label,
+                dit_q::TEXT_LAYER_BLOCK
+                    | dit_q::TEXT_POOL
+                    | dit_q::TEXT_MASK
+                    | dit_q::TEXT_REFINER_BLOCK
+                    | dit_q::TEXT_OUTPUT
+            ) {
+                config.model.text_len as u64
+            } else {
+                th * tw
+            };
+            take_source_at(
+                &mut pricing,
+                IosPhase::Denoise,
+                rb + weight_window,
+                caller_rgb
+                    + axes
+                    + tile_host_ambient
+                    + allocated(readback)
+                    + 4
+                    + owned
+                    + if cached { table } else { 0 },
+                &[(label, scratch)],
+                basis.clone(),
+                &format!(
+                    "iris.restoration.forward/op{operator}/first{}/last{}",
+                    tile_index == 0,
+                    tile_index + 1 == tiles
+                ),
+                "restoration::velocity_body -> dit::forward_impl coincident owners",
+                area,
+            );
+        }
+        if streamed {
+            for (stack, next_label) in [
+                (Stack::Layer, dit_q::TEXT_LAYER_BLOCK),
+                (Stack::Refiner, dit_q::TEXT_REFINER_BLOCK),
+                (Stack::Trunk, dit_q::TRUNK_BLOCK),
+                (Stack::Pixel, dit_q::PIXEL_BLOCK),
+            ] {
+                let reads = bb.facts.inventory.reads(stack);
+                if reads.is_empty() {
+                    continue;
+                }
+                let count = window.unwrap_or(reads.len()).clamp(1, reads.len());
+                for first in (0..reads.len()).step_by(count) {
+                    let end = (first + count).min(reads.len());
+                    let owned = bb.facts.held_at(1, th, tw, false, next_label, first, 0)?;
+                    let cached = cached_before || stack == Stack::Pixel;
+                    take_source_at(
+                        &mut pricing,
+                        IosPhase::Denoise,
+                        rb,
+                        caller_rgb
+                            + axes
+                            + tile_host_ambient
+                            + allocated(readback)
+                            + 4
+                            + owned
+                            + if cached { table } else { 0 },
+                        &[(
+                            dit_q::BLOCK_READ,
+                            crate::stream::window_read_bytes(&reads[first..end]),
+                        )],
+                        basis.clone(),
+                        &format!(
+                            "iris.restoration.read/{stack:?}/block{first}/first{}/last{}",
+                            tile_index == 0,
+                            tile_index + 1 == tiles
+                        ),
+                        "restoration backbone window entry before block read",
+                        1,
+                    );
+                }
+            }
+        }
+    }
+    take_source_at(
         &mut pricing,
         IosPhase::Decode,
-        rb + host.live_at_last_tile,
+        rb,
+        caller_rgb + axes + host.live_at_last_tile + table,
         &[(crate::restoration::quanta::POST_TILE, host.post_tile_new())],
+        basis,
+        "iris.restoration.post_tile",
+        "actual last velocity returned; Gaussian/crop/readback still owned",
+        u64::from(p.output.width) * u64::from(p.output.height),
     );
     Ok(pricing)
 }
 
-fn depth(req: &IosPricingRequest<'_>, opts: Pricing, export: &TaskExport) -> Result<Priced> {
+fn depth(
+    req: &IosPricingRequest<'_>,
+    opts: Pricing,
+    export: &TaskExport,
+    token: Option<&DepthToken>,
+) -> Result<Priced> {
     let spec = req.spec;
     crate::memory_strategy::refuse_unloadable_quant(crate::depth::DEPTH_MODEL_ID, spec)
         .map_err(Error::from)?;
@@ -1102,59 +3672,232 @@ fn depth(req: &IosPricingRequest<'_>, opts: Pricing, export: &TaskExport) -> Res
         input_channels,
         opts,
     )?;
-    let states = stored(
+    let states = held_states(&export.empty_prompt_path())?;
+    let prompt_floor = stored(
         &crate::stream::headers(&export.empty_prompt_path())?,
         |_| true,
     );
     let window = export_window(streamed);
     // A streamed backbone holds a window only inside its forward.
     let db = bb.resident + states;
-    let held_window = if streamed {
-        bb.facts.stream(window).1
+    if req.generation.is_some()
+        || req.transform.is_some()
+        || req.geometry.batch != 1
+        || req.geometry.frames != 1
+        || req.geometry.reference_count != 0
+    {
+        return Err(Error::Unsupported(
+            "Iris depth has an incompatible work context".into(),
+        ));
+    }
+    let input_plan = if let Some(token) = token {
+        let wire = token.wire()?;
+        if wire.patch != config.model.patch_size as u32 {
+            return Err(Error::Unsupported(
+                "Iris depth replay architecture patch mismatch".into(),
+            ));
+        }
+        wire.plan()?
     } else {
-        0
+        let actual = req.depth.ok_or_else(|| {
+            Error::Unsupported(
+                "Iris depth pricing requires actual DepthRequest source/resolution".into(),
+            )
+        })?;
+        depth_input_plan(spec, actual)?
     };
+    if input_plan.source_width != req.geometry.width
+        || input_plan.source_height != req.geometry.height
+    {
+        return Err(Error::Unsupported(
+            "Iris depth context disagrees with source geometry".into(),
+        ));
+    }
     let (h, w) = (
-        u64::from(req.geometry.height),
-        u64::from(req.geometry.width),
+        u64::from(input_plan.model_height),
+        u64::from(input_plan.model_width),
     );
+    let caller_rgb = match token {
+        Some(token) => token.wire()?.source_capacity_bytes,
+        None => req
+            .depth
+            .ok_or_else(|| Error::Unsupported("missing actual depth context".into()))?
+            .image
+            .pixels
+            .capacity() as u64,
+    };
     let mut pricing = Priced::default();
-    take(
+    pricing.pricing.phase_not_run(
+        IosPhase::Conditioning,
+        "Iris depth uses shipped empty prompt, no text tower",
+    );
+    let host = crate::depth::depth_host_bytes(&input_plan)?;
+    let basis = IosWorkBasis {
+        forward_rows: 1,
+        token_count: config.model.text_len as u64,
+        model_width: w as u32,
+        model_height: h as u32,
+        source_plane_bytes: caller_rgb,
+        processed_plane_bytes: host.input_live,
+        output_plane_bytes: tensor_bytes(
+            4,
+            &[
+                u64::from(input_plan.source_width),
+                u64::from(input_plan.source_height),
+            ],
+        ),
+        patch_width: config.model.patch_size as u32,
+        patch_height: config.model.patch_size as u32,
+    };
+    take_source_at(
         &mut pricing,
         IosPhase::Load,
         0,
-        &[(crate::depth::quanta::LOAD, bb.floor + states)],
+        caller_rgb,
+        &[(crate::depth::quanta::LOAD, bb.floor + prompt_floor)],
+        basis.clone(),
+        "iris.depth.load",
+        "depth::load_depth_export source closure",
+        1,
     );
     let input = crate::depth::depth_input_scratch(1, h as i32, w as i32);
-    take(
+    take_source_at(
         &mut pricing,
         IosPhase::Encode,
         db,
-        &[(crate::depth::quanta::INPUT, input)],
+        caller_rgb,
+        &[(crate::depth::quanta::HOST_PREP, host.preprocessing_peak)],
+        basis.clone(),
+        "iris.depth.host_preprocessing",
+        "estimate_with before prepare_depth_input",
+        h * w,
     );
-    let mut denoise = Vec::new();
-    let carry = bb.facts.forward(
+    take_source_at(
+        &mut pricing,
+        IosPhase::Encode,
+        db,
+        caller_rgb + host.input_live,
+        &[(crate::depth::quanta::RGB, host.rgb_copy)],
+        basis.clone(),
+        "iris.depth.rgb_copy",
+        "depth::predict before Array::from_slice",
+        h * w,
+    );
+    take_source_at(
+        &mut pricing,
+        IosPhase::Encode,
+        db,
+        caller_rgb + host.input_live + host.rgb_copy,
+        &[(crate::depth::quanta::INPUT, input)],
+        basis.clone(),
+        "iris.depth.input",
+        "depth_input_body RGB concat plus zero channel",
+        h * w,
+    );
+    let held_input = allocated(4 * input_channels * h * w) + 4;
+    let mut forward = Vec::new();
+    let _raw_max_carry = bb.facts.forward(
         1,
         h,
         w,
         mlx_gen::AttentionPlan::UNBOUNDED,
         false,
-        &mut denoise,
+        &mut forward,
     )?;
-    if streamed {
-        denoise.push((dit_q::BLOCK_READ, bb.facts.stream(window).0));
+    let table = bb.facts.pixel_table(h, w)?;
+    for (operator, &(label, scratch)) in forward.iter().enumerate() {
+        let index = forward[..operator]
+            .iter()
+            .filter(|point| point.0 == label)
+            .count();
+        let weight_window = if streamed {
+            bb.facts.weight_window_at(label, index, window)?
+        } else {
+            0
+        };
+        let owned = bb.facts.held_at(1, h, w, false, label, index, 0)?;
+        let cached = matches!(
+            label,
+            dit_q::PIXEL_POSITIONS | dit_q::PIXEL_BLOCK | dit_q::OUTPUT | dit_q::OUTPUT_ROWS
+        );
+        let area = if matches!(
+            label,
+            dit_q::TEXT_LAYER_BLOCK
+                | dit_q::TEXT_POOL
+                | dit_q::TEXT_MASK
+                | dit_q::TEXT_REFINER_BLOCK
+                | dit_q::TEXT_OUTPUT
+        ) {
+            config.model.text_len as u64
+        } else {
+            h * w
+        };
+        take_source_at(
+            &mut pricing,
+            IosPhase::Denoise,
+            db + weight_window,
+            caller_rgb
+                + host.input_live
+                + host.rgb_copy
+                + held_input
+                + owned
+                + if cached { table } else { 0 },
+            &[(label, scratch)],
+            basis.clone(),
+            &format!("iris.depth.forward/op{operator}"),
+            "depth_forward_body -> dit::forward_impl actual native owners",
+            area,
+        );
     }
-    take(
-        &mut pricing,
-        IosPhase::Denoise,
-        db + held_window + input + carry,
-        &denoise,
-    );
+    if streamed {
+        for (stack, next_label) in [
+            (Stack::Layer, dit_q::TEXT_LAYER_BLOCK),
+            (Stack::Refiner, dit_q::TEXT_REFINER_BLOCK),
+            (Stack::Trunk, dit_q::TRUNK_BLOCK),
+            (Stack::Pixel, dit_q::PIXEL_BLOCK),
+        ] {
+            let reads = bb.facts.inventory.reads(stack);
+            if reads.is_empty() {
+                continue;
+            }
+            let count = window.unwrap_or(reads.len()).clamp(1, reads.len());
+            for first in (0..reads.len()).step_by(count) {
+                let end = (first + count).min(reads.len());
+                let owned = bb.facts.held_at(1, h, w, false, next_label, first, 0)?;
+                take_source_at(
+                    &mut pricing,
+                    IosPhase::Denoise,
+                    db,
+                    caller_rgb
+                        + host.input_live
+                        + host.rgb_copy
+                        + held_input
+                        + owned
+                        + if stack == Stack::Pixel { table } else { 0 },
+                    &[(
+                        dit_q::BLOCK_READ,
+                        crate::stream::window_read_bytes(&reads[first..end]),
+                    )],
+                    basis.clone(),
+                    &format!("iris.depth.read/{stack:?}/block{first}"),
+                    "depth streamed block window before read",
+                    1,
+                );
+            }
+        }
+    }
     let channels = config.model.in_channels as u64;
-    take(
+    // The forward's input (`[1, C + extra, h, w]` f32) and model time stay live to its end.
+    take_source_at(
         &mut pricing,
         IosPhase::Decode,
-        db + allocated(4 * channels * h * w),
+        db,
+        caller_rgb
+            + host.input_live
+            + host.rgb_copy
+            + held_input
+            + table
+            + allocated(4 * channels * h * w),
         &[(
             crate::depth::quanta::REDUCER,
             crate::depth::depth_reducer_bytes(
@@ -1163,13 +3906,528 @@ fn depth(req: &IosPricingRequest<'_>, opts: Pricing, export: &TaskExport) -> Res
                 compute_bytes(spec.precision),
             ),
         )],
+        basis.clone(),
+        "iris.depth.reducer",
+        "depth_forward_body retains input/time/backbone output through reducer",
+        h * w,
     );
+    take_source_at(
+        &mut pricing,
+        IosPhase::Decode,
+        db,
+        caller_rgb + host.input_live + host.rgb_copy + table + allocated(4 * h * w),
+        &[(crate::depth::quanta::HOST_MAP, host.map_copy)],
+        basis.clone(),
+        "iris.depth.host_map",
+        "depth::predict native map and RGB before host to_vec",
+        h * w,
+    );
+    if input_plan.resized() {
+        take_source_at(
+            &mut pricing,
+            IosPhase::Decode,
+            db,
+            caller_rgb + host.input_live + host.map_copy + table,
+            &[(crate::depth::quanta::HOST_POST, host.postprocess_new)],
+            basis,
+            "iris.depth.source_resize",
+            "estimate_with depth_to_source input/prediction/source-output axes",
+            u64::from(input_plan.source_width) * u64::from(input_plan.source_height),
+        );
+    }
     Ok(pricing)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_token_is_pure_lossless_and_replays_its_own_metadata() {
+        let mut config = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap();
+        config.flow.shift = 4.123456789012345;
+        config.flow.prediction = "x".into();
+        config.flow.num_train_timesteps = 777;
+        assert_ne!(config.flow.shift, config.flow.shift as f32 as f64);
+        let mut request = GenerationRequest {
+            prompt: "not in the wire".into(),
+            width: 32,
+            height: 16,
+            seed: Some(42),
+            count: 2,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let original = resolved_generation_recipe(&config, &request, 0).unwrap();
+        let token = canonical_token(&config, &request).unwrap();
+        assert_eq!(SamplingToken::from_token(token.as_str()).unwrap(), token);
+        assert_eq!(token.steps().unwrap(), 4);
+        assert_eq!(
+            token.to_value().unwrap()["flow_shift_bits"]
+                .as_u64()
+                .unwrap(),
+            config.flow.shift.to_bits()
+        );
+        assert!(!token.as_str().contains("not in the wire"));
+        assert!(!token
+            .to_value()
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("seed"));
+        let mut current = config.clone();
+        current.flow.shift = 2.0;
+        current.flow.prediction = "v".into();
+        current.flow.num_train_timesteps = 1000;
+        let mut carrier = request.clone();
+        carrier.seed = Some(7);
+        carrier.steps = Some(1);
+        carrier.guidance = Some(1.0);
+        let (metadata, replay) = token.apply_to(&current, &carrier).unwrap();
+        assert_eq!(
+            metadata.model, current.model,
+            "actual architecture must not be fabricated"
+        );
+        assert_eq!(metadata.flow.shift.to_bits(), config.flow.shift.to_bits());
+        assert_eq!(metadata.flow.prediction, "x");
+        assert_eq!(metadata.flow.num_train_timesteps, 777);
+        assert_eq!(
+            replay.seed,
+            Some(7),
+            "recipe must preserve carrier seed/media"
+        );
+        assert_eq!(
+            replay.scheduler_shift, None,
+            "never round the stored f64 shift to request f32"
+        );
+        let resolved = resolved_generation_recipe(&metadata, &replay, 0).unwrap();
+        assert_eq!(resolved.plan, original.plan);
+        assert_eq!(resolved.params.prediction, original.params.prediction);
+        assert_eq!(resolved.params.cfg_scale, original.params.cfg_scale);
+        let mut forged = token.to_value().unwrap();
+        forged["order"] = serde_json::json!(3);
+        assert!(SamplingToken::from_token(&format!("iris-sampling-v1:{forged}")).is_err());
+        let mut forged = token.to_value().unwrap();
+        forged["claimed_class"] = serde_json::json!("euler-no-history");
+        assert!(SamplingToken::from_token(&format!("iris-sampling-v1:{forged}")).is_err());
+        let mut forged = token.to_value().unwrap();
+        forged["flow_shift_bits"] = serde_json::json!(f64::NAN.to_bits());
+        assert!(SamplingToken::from_token(&format!("iris-sampling-v1:{forged}")).is_err());
+        let short = canonical_token(
+            &config,
+            &GenerationRequest {
+                steps: Some(2),
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert!(!short
+            .memory_class()
+            .unwrap()
+            .epoch_runs
+            .iter()
+            .any(|epoch| epoch[2]));
+        let warm = canonical_token(
+            &config,
+            &GenerationRequest {
+                steps: Some(3),
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert!(warm
+            .memory_class()
+            .unwrap()
+            .epoch_runs
+            .iter()
+            .any(|epoch| epoch[2]));
+        let representatives = sampling_representatives_in_place(&config, &mut request).unwrap();
+        for order in [1, 2] {
+            let classes: Vec<_> = representatives
+                .iter()
+                .map(|token| token.memory_class().unwrap())
+                .filter(|class| class.order == order)
+                .collect();
+            assert!(classes
+                .iter()
+                .any(|class| class.epoch_runs.iter().all(|epoch| !epoch[0])));
+            assert!(classes
+                .iter()
+                .any(|class| class.epoch_runs.iter().all(|epoch| epoch[0])));
+            assert!(classes
+                .iter()
+                .any(|class| class.epoch_runs.iter().any(|epoch| epoch[0])
+                    && class.epoch_runs.iter().any(|epoch| !epoch[0])));
+        }
+    }
+
+    #[test]
+    fn sampling_runtime_replay_uses_actual_config_and_lossless_request_controls() {
+        let mut config = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap();
+        config.flow.shift = 1.000_000_000_1;
+        let mut carrier = GenerationRequest {
+            prompt: "runtime carrier".into(),
+            width: 32,
+            height: 16,
+            steps: Some(3),
+            sampler: Some("euler".into()),
+            guidance: Some(1.0),
+            count: 2,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let token = canonical_token(&config, &carrier).unwrap();
+        let payload = carrier.prompt.as_ptr();
+        carrier.steps = Some(9);
+        token.apply_runtime_to(&config, &mut carrier).unwrap();
+        assert_eq!(canonical_token(&config, &carrier).unwrap(), token);
+        assert_eq!(carrier.prompt.as_ptr(), payload);
+        assert_eq!(
+            (carrier.seed, carrier.count, carrier.scheduler_shift),
+            (Some(7), 2, None)
+        );
+        let saved = SamplingTemplate::from_request(&carrier);
+        let mut incompatible = config.clone();
+        incompatible.flow.shift = 1.000_000_000_2;
+        assert!(token.apply_runtime_to(&incompatible, &mut carrier).is_err());
+        assert_eq!(SamplingTemplate::from_request(&carrier), saved);
+        incompatible = config.clone();
+        incompatible.flow.prediction = if config.flow.prediction == "v" {
+            "x"
+        } else {
+            "v"
+        }
+        .into();
+        assert!(token.apply_runtime_to(&incompatible, &mut carrier).is_err());
+        incompatible = config.clone();
+        incompatible.flow.num_train_timesteps += 1;
+        assert!(token.apply_runtime_to(&incompatible, &mut carrier).is_err());
+        carrier.scheduler_shift = Some(2.5);
+        let overridden = canonical_token(&config, &carrier).unwrap();
+        carrier.scheduler_shift = None;
+        overridden.apply_runtime_to(&config, &mut carrier).unwrap();
+        assert_eq!(carrier.scheduler_shift, Some(2.5));
+        assert_eq!(canonical_token(&config, &carrier).unwrap(), overridden);
+    }
+
+    #[test]
+    fn task_runtime_replay_applies_controls_without_replacing_actual_rgb() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let restore_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+            fixtures.join("tiny-snapshot/upscaler"),
+        ));
+        let depth_spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(fixtures.join("tiny-depth")));
+        let mut restore = mlx_gen::TransformRequest {
+            image: mlx_gen::Image {
+                width: 24,
+                height: 16,
+                pixels: vec![127; 24 * 16 * 3],
+            },
+            target: mlx_gen::TargetSize::Scale(1.25),
+            input_sizing: mlx_gen::InputSizing::Original,
+            color_fix: Some(false),
+            ..Default::default()
+        };
+        let token = canonical_restoration_token(&restore_spec, &restore).unwrap();
+        let rgb = restore.image.pixels.as_ptr();
+        restore.target = mlx_gen::TargetSize::Scale(2.0);
+        restore.input_sizing = mlx_gen::InputSizing::Budgeted;
+        restore.color_fix = Some(true);
+        token.apply_runtime_to(&restore_spec, &mut restore).unwrap();
+        assert_eq!(
+            canonical_restoration_token(&restore_spec, &restore).unwrap(),
+            token
+        );
+        assert_eq!(restore.image.pixels.as_ptr(), rgb);
+        let mut incompatible = token.wire().unwrap();
+        incompatible.sigma_bits = (f64::from_bits(incompatible.sigma_bits) * 0.5).to_bits();
+        let incompatible = RestorationToken::from_token(&format!(
+            "iris-restoration-v1:{}",
+            serde_json::to_string(&incompatible).unwrap()
+        ))
+        .unwrap();
+        assert!(incompatible
+            .apply_runtime_to(&restore_spec, &mut restore)
+            .is_err());
+        let mut depth = mlx_gen::gen_core::iris::depth::DepthRequest {
+            image: restore.image,
+            resolution: mlx_gen::gen_core::iris::depth::DepthResolution::Native,
+            ..Default::default()
+        };
+        let token = canonical_depth_token(&depth_spec, &depth).unwrap();
+        depth.resolution = mlx_gen::gen_core::iris::depth::DepthResolution::Capped(8);
+        token.apply_runtime_to(&depth_spec, &mut depth).unwrap();
+        assert_eq!(canonical_depth_token(&depth_spec, &depth).unwrap(), token);
+        assert_eq!(depth.image.pixels.as_ptr(), rgb);
+        let mut incompatible = token.wire().unwrap();
+        incompatible.num_train_timesteps += 1;
+        let incompatible = DepthToken::from_token(&format!(
+            "iris-depth-v1:{}",
+            serde_json::to_string(&incompatible).unwrap()
+        ))
+        .unwrap();
+        assert!(incompatible
+            .apply_runtime_to(&depth_spec, &mut depth)
+            .is_err());
+    }
+
+    #[test]
+    fn raw_sampling_templates_preserve_unresolved_defaults_and_apply_only_controls_in_place() {
+        let mut config = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap();
+        config.flow.shift = 1.000_000_000_1;
+        let mut carrier = GenerationRequest {
+            prompt: "carrier text is not template payload".into(),
+            negative_prompt: Some("actual negative carrier".into()),
+            width: 32,
+            height: 16,
+            count: 2,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let raw = SamplingTemplate::from_request(&carrier);
+        let wire = raw.to_token().unwrap();
+        assert_eq!(SamplingTemplate::from_token(&wire).unwrap(), raw);
+        assert!(!wire.contains(&carrier.prompt));
+        let value = raw.to_value().unwrap();
+        assert!(value["scheduler_shift_bits"].is_null());
+        assert!(value["steps"].is_null());
+        let templates = sampling_representative_templates(&carrier);
+        assert_eq!(
+            templates.last().unwrap(),
+            &raw,
+            "actual unresolved default carrier must survive listing"
+        );
+        let prompt_backing = carrier.prompt.as_ptr();
+        let token = raw.apply_to(&config, &mut carrier).unwrap();
+        assert_eq!(
+            carrier.prompt.as_ptr(),
+            prompt_backing,
+            "applying controls replaced/cloned payload"
+        );
+        assert_eq!(
+            (carrier.width, carrier.height, carrier.count, carrier.seed),
+            (32, 16, 2, Some(7))
+        );
+        assert_eq!(
+            carrier.scheduler_shift, None,
+            "raw default must not become a lossy f32 shift"
+        );
+        assert_eq!(
+            token.to_value().unwrap()["flow_shift_bits"],
+            serde_json::json!(config.flow.shift.to_bits())
+        );
+        let negative_backing = carrier.negative_prompt.as_ref().unwrap().as_ptr();
+        let representatives = sampling_representatives_in_place(&config, &mut carrier).unwrap();
+        let actual_class = token.memory_class().unwrap();
+        let representative = representatives
+            .iter()
+            .find(|candidate| candidate.memory_class().unwrap() == actual_class)
+            .expect("actual default mechanism class disappeared");
+        assert!(
+            representative.steps().unwrap() < token.steps().unwrap(),
+            "long actual default replaced a valid shorter capture representative"
+        );
+        assert_eq!(
+            representative.to_value().unwrap()["flow_shift_bits"],
+            serde_json::json!(config.flow.shift.to_bits()),
+            "actual-default shift must win equal-length mechanism representatives"
+        );
+        assert_eq!(
+            canonical_token(&config, &carrier).unwrap(),
+            token,
+            "full actual default provenance must still resolve losslessly"
+        );
+        assert_eq!(carrier.prompt.as_ptr(), prompt_backing);
+        assert_eq!(
+            carrier.negative_prompt.as_ref().unwrap().as_ptr(),
+            negative_backing,
+            "configured representatives replaced/dropped negative-prompt ownership"
+        );
+        assert_eq!(SamplingTemplate::from_request(&carrier), raw);
+        let mut forged = raw.to_value().unwrap();
+        forged["claimed_class"] = serde_json::json!("default");
+        assert!(
+            SamplingTemplate::from_token(&format!("iris-sampling-template-v1:{forged}")).is_err()
+        );
+    }
+
+    #[test]
+    fn trunk_parent_layout_tracks_dropped_final_text_and_previous_joined_parent() {
+        let mut model = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap()
+        .model;
+        model.dual_depth = 1;
+        model.depth = 2;
+        model.final_block_text = "drop".into();
+        assert_eq!(trunk_parent_layout(&model, 0).unwrap(), (false, false));
+        assert_eq!(trunk_parent_layout(&model, 1).unwrap(), (false, false));
+        // The only single block drops text: image is new, text is the previous dual output.
+        assert_eq!(trunk_parent_layout(&model, 2).unwrap(), (false, false));
+        model.depth = 3;
+        assert_eq!(trunk_parent_layout(&model, 2).unwrap(), (true, true));
+        // Final image-only update leaves y retaining the whole penultimate joined parent.
+        assert_eq!(trunk_parent_layout(&model, 3).unwrap(), (false, true));
+        model.final_block_text = "keep".into();
+        assert_eq!(trunk_parent_layout(&model, 3).unwrap(), (true, true));
+        assert!(trunk_parent_layout(&model, 4).is_err());
+    }
+
+    #[test]
+    fn repeated_payload_metadata_keeps_cold_steady_final_without_count_sized_vectors() {
+        assert_eq!(
+            payload_transition_indices(0).collect::<Vec<_>>(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(payload_transition_indices(1).collect::<Vec<_>>(), [0]);
+        assert_eq!(payload_transition_indices(2).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(payload_transition_indices(3).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(
+            payload_transition_indices(u64::from(u32::MAX)).collect::<Vec<_>>(),
+            [0, 1, u64::from(u32::MAX) - 1]
+        );
+    }
+
+    #[test]
+    fn grouped_backing_rounds_distinct_requests_before_multiplicity() {
+        let group = NativeHeldRequest {
+            owner: "distinct rows",
+            bytes: 16_385,
+            count: 2,
+            birth: dit_q::PIXEL_BLOCK,
+            block: Some(0),
+            first_row: 0,
+            liveness: "completed row outputs in parts",
+            reuse: "unproved",
+        };
+        assert_eq!(group.priced(16_384).unwrap(), 65_536);
+        assert_ne!(
+            group.priced(16_384).unwrap(),
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(group.bytes * group.count, 16_384)
+                .unwrap()
+        );
+        let overflow = NativeHeldRequest {
+            count: u64::MAX,
+            ..group
+        };
+        assert!(overflow.priced(16_384).is_err());
+    }
+
+    #[test]
+    fn sampling_recipe_matches_iris_orders_guidance_history_and_serial_epochs() {
+        let config = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::model::descriptor().capabilities.samplers,
+            mlx_gen::gen_core::iris::SAMPLERS
+        );
+        for sampler in mlx_gen::gen_core::iris::SAMPLERS {
+            for steps in [1, 2, 4] {
+                for rows in [1usize, 2] {
+                    for count in [1u32, 2] {
+                        for guidance in [1.0f32, 3.0] {
+                            let request = GenerationRequest {
+                                prompt: if rows == 1 {
+                                    "Iris recipe".into()
+                                } else {
+                                    String::new()
+                                },
+                                prompt_batch: if rows == 1 {
+                                    Vec::new()
+                                } else {
+                                    vec!["a".into(), "b".into()]
+                                },
+                                width: 32,
+                                height: 16,
+                                count,
+                                steps: Some(steps),
+                                sampler: Some(sampler.into()),
+                                guidance: Some(guidance),
+                                ..Default::default()
+                            };
+                            let recipe = resolved_generation_recipe(&config, &request, 42).unwrap();
+                            assert_eq!(recipe.params.order, if sampler == "euler" { 1 } else { 2 });
+                            assert_eq!(recipe.plan.len(), steps as usize);
+                            assert_eq!(recipe.plan.last().unwrap().t, 0.0);
+                            assert!(matches!(
+                                recipe.plan.last().unwrap().update,
+                                mlx_gen::gen_core::iris::DpmUpdate::First { cx: 0.0, c0: -1.0 }
+                            ));
+                            let epochs: Vec<_> = recipe.epochs().collect();
+                            assert_eq!(epochs.len(), steps as usize * count as usize);
+                            for epoch in epochs {
+                                assert_eq!(epoch.guided, guidance != 1.0);
+                                assert_eq!(
+                                    epoch.forward_rows,
+                                    rows as u64 * if guidance == 1.0 { 1 } else { 2 }
+                                );
+                                assert_eq!(
+                                    epoch.history_rows,
+                                    if epoch.index == 0 { 0 } else { rows as u64 },
+                                    "Euler must retain actual previous x0 too"
+                                );
+                                assert_eq!(
+                                    epoch.completed_rows,
+                                    u64::from(epoch.serial) * rows as u64
+                                );
+                                assert_eq!(
+                                    matches!(
+                                        epoch.step.update,
+                                        mlx_gen::gen_core::iris::DpmUpdate::Second { .. }
+                                    ),
+                                    sampler == "dpmpp_2m"
+                                        && epoch.index > 0
+                                        && epoch.index + 1 < steps as usize
+                                );
+                            }
+                            let replay =
+                                resolved_generation_recipe(&config, &recipe.replay, 7).unwrap();
+                            assert_eq!(replay.params, recipe.params);
+                            assert_eq!(replay.plan, recipe.plan);
+                            assert_eq!(replay.count, recipe.count);
+                        }
+                    }
+                }
+            }
+        }
+        let mixed = GenerationRequest {
+            prompt: "mixed CFG".into(),
+            width: 32,
+            height: 16,
+            steps: Some(4),
+            guidance: Some(3.0),
+            cfg_interval: Some((0.25, 0.75)),
+            scheduler_shift: Some(1.0),
+            ..Default::default()
+        };
+        let recipe = resolved_generation_recipe(&config, &mixed, 42).unwrap();
+        let epochs: Vec<_> = recipe.epochs().collect();
+        assert!(epochs.iter().any(|e| e.guided) && epochs.iter().any(|e| !e.guided));
+        for epoch in epochs {
+            assert_eq!(epoch.guided, 0.25 < epoch.step.s && epoch.step.s < 0.75);
+        }
+        let empty_interval = GenerationRequest {
+            steps: Some(1),
+            ..mixed
+        };
+        assert!(
+            resolved_generation_recipe(&config, &empty_interval, 42).is_err(),
+            "an interval with no actual guided evaluation remains refused"
+        );
+    }
 
     /// Every quantum label the crate checks is attributed to a phase.
     ///
