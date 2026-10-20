@@ -1655,6 +1655,7 @@ mod tests {
         };
         let mode = request.video_mode.as_deref().unwrap();
         MemoryRunContext {
+            reference_resources: None,
             selection,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Resident,
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,

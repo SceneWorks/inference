@@ -132,7 +132,10 @@ fn first_light_renders_video_and_audio_at_the_smallest_geometry() {
                 observed.push(current);
             }
             Progress::Decoding => decoding = true,
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("real-weight render");
     let wall = started.elapsed();

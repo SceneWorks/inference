@@ -632,6 +632,8 @@ fn routing_policy_is_the_core_llm_policy_plus_device_availability() {
     // A greedy request with a penalty was, and stays, a host request.
     let greedy_penalized = SamplingParams {
         presence_penalty: 0.5,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         ..Default::default()
     };
     assert_eq!(

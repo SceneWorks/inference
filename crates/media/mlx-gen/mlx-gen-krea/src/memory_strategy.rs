@@ -121,6 +121,7 @@ fn selector_tier_token(tier: mlx_gen::gen_core::MemoryContractSurfaceTier) -> &'
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => "q4",
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => "q8",
         mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => "nvfp4",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Fp8Rowwise => "fp8r",
     }
 }
 
@@ -136,6 +137,7 @@ fn spec_tier_token(spec: &LoadSpec) -> &'static str {
         (_, Some(mlx_gen::Quant::Q4)) => "q4",
         (_, Some(mlx_gen::Quant::Q8)) => "q8",
         (_, Some(mlx_gen::Quant::Nvfp4)) => "nvfp4",
+        (_, Some(mlx_gen::Quant::Fp8Rowwise)) => "fp8r",
     }
 }
 pub const DECODE_TILE_EDGE: u32 = 512;
@@ -1174,6 +1176,7 @@ mod tests {
         // gate below still binds exactly, but nothing hands it the q4 evidence key.
         assert_eq!(contract.calibration, None);
         let context_for = |quant| MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

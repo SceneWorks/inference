@@ -139,7 +139,7 @@ pub(crate) fn generate_batch_with_observer(
             seq: seq_ids[ri],
             pad_len: max_prompt - r.prompt_ids.len() as i32,
             rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
-            params: r.sampling,
+            params: r.sampling.for_prompt(r.prompt_ids.len()),
             history: r.prompt_ids.clone(),
             next_token: 0,
         })

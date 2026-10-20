@@ -1056,3 +1056,59 @@ fn mark_sparse_tolerates_a_path_that_does_not_exist() {
     let tmp = tempfile::tempdir().unwrap();
     mark_sparse(&tmp.path().join("no-such-fixture.safetensors"));
 }
+
+#[test]
+fn teacher_forced_logits_validate_both_sides_of_a_narrow_tie() {
+    assert!(!assert_teacher_forced_logit_step(
+        "BF16 tie",
+        0,
+        &[1.2734375, 1.2734375, 1.203125],
+        &[1.265625, 1.2734375, 1.203125],
+        0.02,
+    ));
+    assert!(assert_teacher_forced_logit_step(
+        "wide",
+        1,
+        &[1.0, 1.25, 0.5],
+        &[1.0, 1.2421875, 0.5],
+        0.02,
+    ));
+}
+
+#[test]
+#[should_panic(expected = "wide-margin argmax")]
+fn an_f32_oracle_cannot_stand_in_for_the_native_bf16_tie() {
+    // Captured F32 scores for ids [19,21,24], versus a synthetic BF16 tied row.
+    // This isolates the failing wide-vs-narrow policy, not a claim about native raw logits.
+    assert_teacher_forced_logit_step(
+        "wrong F32 oracle",
+        1,
+        &[1.2458329, 1.3057302, 1.2043916],
+        &[1.2734375, 1.2734375, 1.203125],
+        0.02,
+    );
+}
+
+#[test]
+#[should_panic(expected = "outside the reference narrow margin")]
+fn a_narrow_tie_does_not_admit_an_unrelated_candidate() {
+    assert_teacher_forced_logit_step(
+        "bad candidate",
+        0,
+        &[1.2734375, 1.2734375, 1.203125],
+        &[1.265625, 1.265625, 1.5],
+        0.02,
+    );
+}
+
+#[test]
+fn exact_greedy_tie_accepts_either_cpu_or_device_choice() {
+    assert_exact_greedy_tie(&[1.2734375, 1.2734375, 1.203125], 0);
+    assert_exact_greedy_tie(&[1.2734375, 1.2734375, 1.203125], 1);
+}
+
+#[test]
+#[should_panic(expected = "public greedy token must belong to the exact tie")]
+fn exact_greedy_tie_refuses_a_non_tied_token() {
+    assert_exact_greedy_tie(&[1.2734375, 1.2734375, 1.203125], 2);
+}

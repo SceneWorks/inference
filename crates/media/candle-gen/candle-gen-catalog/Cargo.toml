@@ -14,6 +14,7 @@ candle-gen-chroma = { path = "../candle-gen-chroma" }
 candle-gen-clip = { path = "../candle-gen-clip" }
 candle-gen-flux = { path = "../candle-gen-flux" }
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+candle-gen-flux3 = { path = "../candle-gen-flux3" }
 candle-gen-depth = { path = "../candle-gen-depth" }
 candle-gen-face = { path = "../candle-gen-face" }
 candle-gen-ideogram = { path = "../candle-gen-ideogram" }
@@ -65,6 +66,7 @@ metal = [
     "candle-gen-ideogram/metal",
     "candle-gen-instantid/metal",
     "candle-gen-iris/metal",
+    "candle-gen-flux3/metal",
     "candle-gen-joycaption/metal",
     "candle-gen-kolors/metal",
     "candle-gen-krea/metal",
@@ -103,6 +105,7 @@ cuda = [
     "candle-gen-ideogram/cuda",
     "candle-gen-instantid/cuda",
     "candle-gen-iris/cuda",
+    "candle-gen-flux3/cuda",
     "candle-gen-joycaption/cuda",
     "candle-gen-kolors/cuda",
     "candle-gen-krea/cuda",

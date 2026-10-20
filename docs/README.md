@@ -46,6 +46,10 @@ clause for every term assigned to a licence family.
 - **[Qwen Research License evidence (sc-24108)](licensing/sc-24108-qwen-research-licence-evidence.md)** —
   the primary-source read behind the `qwen-research` family and the `qwen_image_2_1` component row
   (Qwen-Image 2.1). **Draft, unsigned.**
+- **[FLUX Kommunity licence evidence (sc-26234)](licensing/sc-26234-flux-kommunity-licence-evidence.md)** —
+  the primary-source read behind the `flux-kommunity-v1-0` family and the `flux3_image_klein`
+  component row (FLUX 3 Image Klein, epic sc-26233), including the LFS-sha256 identity of the
+  bundled text encoder with `Qwen/Qwen3-VL-4B-Instruct`.
 - **[Qwen-Image 2.1 Turbo licence evidence (sc-25900)](licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md)** —
   the primary-source read behind the `qwen_image_2_1_turbo` component row (same `qwen-research`
   family; the `LICENSE` is byte-identical to the base repository's). **Draft, unsigned.**

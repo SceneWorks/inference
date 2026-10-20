@@ -795,9 +795,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 39 since sc-25689 added the dispatch-only `mlx-iris-curricula-train` job;
         # 40 since sc-25690 added the dispatch-only `mlx-iris-memory-probe` job;
         # 41 since sc-26214 added the dispatch-only `mlx-veda` job;
-        # 42 since sc-24217 added the dispatch-only `mlx-supra2` job.
-        MACOS_HUB_LOCK: 42,
-        # 19 since sc-24214 added the dispatch-only `candle-supra2` job;
+        # 42 since sc-26234 added the dispatch-only `mlx-flux3-klein` job;
+        # 43 since sc-24217 added the dispatch-only `mlx-supra2` job.
+        MACOS_HUB_LOCK: 43,
+        # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
+        # 19 since sc-26235 added the dispatch-only `candle-flux3-klein` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
         # 17 since sc-25690 added the dispatch-only `candle-iris-memory-probe` job;
         # 16 since the sc-25678 follow-up added the dispatch-only `candle-qwen-image-2-1-train` job;
@@ -806,7 +808,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 19,
+        WINDOWS_HUB_LOCK: 20,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1256,6 +1258,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertLess(names.index(reclaim), names.index("Cache Cargo and MLX native build"))
         self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
+    def test_flux3_cuda_profile_stays_dispatch_only_without_new_inputs(self) -> None:
+        workflow = yaml.load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        self.assertLessEqual(len(inputs), 25, "GitHub rejects workflows above the dispatch input cap")
+        self.assertIn("flux3-klein-cuda", inputs["profile"]["options"])
+        self.assertNotIn("flux3_mlx_size", inputs)
+        self.assertNotIn("flux3_mlx_steps", inputs)
+        job = workflow["jobs"]["candle-flux3-klein"]
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-cuda'")
+        self.assertEqual(job["env"]["FLUX3_REAL_SIZE"], "1024")
+        self.assertEqual(job["env"]["FLUX3_REAL_STEPS"], "16")
+
+    def test_flux3_image_and_optional_upsampler_manifest_rows_both_survive(self) -> None:
+        manifest = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
+        models = {row["key"]: row for row in manifest["models"]}
+        image = models["flux3-image-klein-cuda"]
+        self.assertEqual(image["repository"], "black-forest-labs/flux-3-image-klein")
+        self.assertEqual(image["revision"], "8454017f9ebaada30c998fccd9f67a80c7580f68")
+        self.assertTrue(image["requires_auth"])
+        self.assertEqual(image["profiles"], ["flux3-klein-cuda"])
+        self.assertIn("ae.safetensors", image["expected_files"])
+        self.assertIn("text_encoder/model-00002-of-00002.safetensors", image["expected_files"])
+        upsampler = models["flux3-image-klein-pup-mlx"]
+        self.assertEqual(upsampler["repository"], "black-forest-labs/flux-3-image-klein-pup")
+        self.assertEqual(upsampler["revision"], "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed")
+        self.assertEqual(upsampler["profiles"], ["flux3-klein-mlx"])
+        self.assertIn("system_prompts.json", upsampler["expected_files"])
+
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
@@ -1266,14 +1296,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `mlx-iris-curricula-train` and `candle-iris-curricula`; 16 Windows after the sc-25678
         # follow-up added `candle-qwen-image-2-1-train`; 40 macOS / 17 Windows after sc-25690 added
         # `mlx-iris-memory-probe` and `candle-iris-memory-probe`; 18 Windows after sc-25901 added
-        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 19 Windows after
-        # sc-24214 added `candle-supra2`; 42 macOS after sc-24217 added `mlx-supra2`.
+        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 42 macOS after
+        # sc-26234 added `mlx-flux3-klein`; 19 Windows after sc-26235 added `candle-flux3-klein`;
+        # 20 Windows after sc-24214 added `candle-supra2`; 43 macOS after sc-24217 added `mlx-supra2`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 42)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 19)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 43)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 20)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1694,18 +1725,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         shell = self.require_posix_shell()
         native_run = subprocess.run
         script = "for bits in 4 8; do\n  :\ndone\n"
-        def windows_stdin(command, **kwargs):
-            payload = kwargs["input"]
-            if isinstance(payload, str):
-                payload = payload.replace("\n", "\r\n").encode("utf-8")
-            return native_run(command, input=payload, text=False, capture_output=True, check=False)
-        with patch.object(subprocess, "run", side_effect=windows_stdin):
+
+        def binary_transport(command, **kwargs):
+            # Check the real helper's subprocess boundary, not whether this host's Bash
+            # rejects CRLF: some Git for Windows builds accept it even with igncr off.
+            self.assertIsInstance(kwargs["input"], bytes, "syntax input must be binary")
+            self.assertEqual(kwargs["input"], script.encode("utf-8"))
+            self.assertFalse(kwargs.get("text", False), "text mode translates LF on Windows")
+            self.assertNotIn(b"\r", kwargs["input"])
+            return native_run(command, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=binary_transport):
             actual = bash_syntax_check(shell, script)
             self.assertEqual(actual.returncode, 0, actual.stderr)
-            # The previous text-mode implementation must fail the same discriminator.
-            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
-                                    capture_output=True, check=False)
-            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
+            # The old text-stdin implementation must fail the same transport assertion,
+            # independently of the selected shell's carriage-return parsing policy.
+            with self.assertRaisesRegex(AssertionError, "syntax input must be binary"):
+                subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                               capture_output=True, check=False)
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".

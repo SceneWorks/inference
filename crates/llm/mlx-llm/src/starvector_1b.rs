@@ -584,6 +584,8 @@ fn sampling(value: &core_llm::Sampling) -> SamplingParams {
         top_p: value.top_p,
         top_k: value.top_k,
         presence_penalty: value.presence_penalty,
+        presence_penalty_generated_only: value.presence_penalty_generated_only,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: value.repetition_penalty,
         repetition_context: value.repetition_context,
     }

@@ -618,6 +618,7 @@ fn dev_control_fixture(
     tier: MemoryNumericTier,
 ) -> mlx_gen::gen_core::Result<MemoryBehaviorFixture> {
     let context = MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, tier, false)?,
         // The control route intentionally has no measured calibration.  Its staged lifecycle is
         // admitted under the explicit conservative estimate class, never a borrowed Dev/Edit key.
@@ -1121,7 +1122,7 @@ fn surface_selector_matches_spec(
         }
         MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        MemoryContractSurfaceTier::Nvfp4 => false,
+        MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     let plain = surface.spec.adapters.is_empty()
         && surface.spec.control.is_none()
@@ -1560,6 +1561,7 @@ mod tests {
         let calibration = contract.calibration.expect("calibration");
         let bytes = |gb: f64| (gb * 1024.0 * 1024.0 * 1024.0).round() as u64;
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

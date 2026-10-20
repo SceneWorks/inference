@@ -29,7 +29,7 @@ fn calibration_peak_gb(tier: Option<Quant>) -> f64 {
         None => 17.660,
         Some(Quant::Q8) => 10.012,
         Some(Quant::Q4) => 7.868,
-        Some(Quant::Nvfp4) => f64::INFINITY,
+        Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => f64::INFINITY,
     }
 }
 

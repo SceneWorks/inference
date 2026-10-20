@@ -960,6 +960,7 @@ mod tests {
         use_pid: bool,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::BoundedDecode,
                 parameters: MemoryStrategyParameters {

@@ -226,6 +226,8 @@ fn sampled_params() -> SamplingParams {
         top_p: 0.9,
         top_k: 0,
         presence_penalty: 0.0,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: 1.1,
         repetition_context: 16,
     }

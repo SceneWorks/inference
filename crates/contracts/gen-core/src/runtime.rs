@@ -651,6 +651,11 @@ pub enum Quant {
     /// candle-gen catalog only under the `cuda` feature — the MLX/macOS runtime (no FP4 hardware) and
     /// the CPU candle bundle (no FP4 compute) do not offer it.
     Nvfp4,
+    /// FLUX3 source rowwise E4M3 W8A8: per-output weight scales, per-token
+    /// activation scales and one final BF16 rounding. NOT affine integer Q8.
+    /// Providers must explicitly implement/advertise this format; element width
+    /// is not permission to dispatch an existing eight-bit affine quantizer.
+    Fp8Rowwise,
 }
 
 /// YuE2's AR execution mode, separate from the loaded weight tier. Experimental FP8 replaces
@@ -685,11 +690,48 @@ impl Quant {
     /// **not** an MLX-quantizer tier — it carries FP8 block scales + an FP32 per-tensor scale
     /// (~4.5 *effective* bits/weight) and is served by candle-gen's NVFP4 packed path, not the MLX
     /// affine quantizer; do not route `Nvfp4` through an MLX `quantize(bits)` call on this width alone.
+    /// The same rule applies to `Fp8Rowwise` (8-bit E4M3, not Q8). Affine loaders
+    /// must use [`Self::affine_bits`] rather than dispatching on this metadata.
     pub fn bits(self) -> i32 {
         match self {
             Quant::Q4 => 4,
-            Quant::Q8 => 8,
+            Quant::Q8 | Quant::Fp8Rowwise => 8,
             Quant::Nvfp4 => 4,
+        }
+    }
+
+    /// Exact wire/cache tier identity. Equal element widths never alias formats.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Q4 => "q4",
+            Self::Q8 => "q8",
+            Self::Nvfp4 => "nvfp4",
+            Self::Fp8Rowwise => "fp8r",
+        }
+    }
+
+    pub fn from_key(key: &str) -> crate::Result<Self> {
+        match key {
+            "q4" => Ok(Self::Q4),
+            "q8" => Ok(Self::Q8),
+            "nvfp4" => Ok(Self::Nvfp4),
+            "fp8r" => Ok(Self::Fp8Rowwise),
+            _ => Err(crate::Error::Unsupported(format!(
+                "unknown quantization format {key:?}; expected q4, q8, nvfp4 or fp8r"
+            ))),
+        }
+    }
+
+    /// Width accepted by an AFFINE integer quantizer. Packed floating-point
+    /// formats must not reach that quantizer just because their width is 4/8.
+    pub fn affine_bits(self) -> crate::Result<i32> {
+        match self {
+            Self::Q4 => Ok(4),
+            Self::Q8 => Ok(8),
+            _ => Err(crate::Error::Unsupported(format!(
+                "{} is not an affine integer quantization format",
+                self.key()
+            ))),
         }
     }
 }
@@ -2118,11 +2160,12 @@ impl std::fmt::Debug for HdrFrameSink {
 /// The request-local outcome of optional prompt enhancement.
 ///
 /// This is deliberately a small, tensor-free fact rather than a log convention. Consumers use it
-/// to distinguish a prompt that was actually rewritten from a safe fallback and from the identity
-/// path where enhancement was not requested.
+/// to distinguish an enhancer that ran and produced an accepted caption from a safe fallback
+/// and from the identity path where enhancement was not requested. A valid accepted answer can
+/// match an already-rich original prompt; `Enhanced` is not a claim that its bytes must differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptEnhancementOutcome {
-    /// The provider produced and consumed a non-empty rewritten prompt.
+    /// The enhancer ran and the provider consumed its non-empty accepted answer (possibly unchanged).
     Enhanced,
     /// Enhancement was requested, but the provider safely consumed the original prompt instead.
     Fallback,
@@ -2140,6 +2183,15 @@ pub struct PromptEnhancementReport {
     pub effective_prompt: String,
     /// Stable, non-sensitive reason code for a fallback. `None` for enhanced/absent outcomes.
     pub fallback_reason: Option<String>,
+    /// The enhancer's mode, for an enhancer that has several (sc-26238: the FLUX 3 upsampler's
+    /// system-prompt key — `t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`). `None` for single-mode
+    /// enhancers and for the bypass/absent paths.
+    pub mode: Option<String>,
+    /// The locked box annotations the effective prompt was required to preserve, as the exact
+    /// canvas-row JSON text the enhancer was given (sc-26238: `bbox.to_canvas` rows). `None`
+    /// when the request locked nothing. Present on the bypass path too, where the rows are
+    /// appended to the prompt as typed.
+    pub locked_annotations: Option<String>,
 }
 
 impl PromptEnhancementReport {
@@ -2150,6 +2202,8 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2162,6 +2216,8 @@ impl PromptEnhancementReport {
             original_prompt: original_prompt.into(),
             effective_prompt: effective_prompt.into(),
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2172,7 +2228,21 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: Some(reason.into()),
+            mode: None,
+            locked_annotations: None,
         }
+    }
+
+    /// Record the enhancer's mode (see [`mode`](Self::mode)).
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
+    /// Record the locked annotations (see [`locked_annotations`](Self::locked_annotations)).
+    pub fn with_locked_annotations(mut self, rows: impl Into<String>) -> Self {
+        self.locked_annotations = Some(rows.into());
+        self
     }
 }
 
@@ -2210,6 +2280,19 @@ impl std::fmt::Debug for PromptEnhancementSink {
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    /// Optional exact prompt-upsampling decision boundary, before text/reference encoding.
+    /// Emitted once only when enhancement was requested: the final caption is materialized,
+    /// PUP device work synchronized, and any staged owner released/allocator drain completed.
+    /// A completed fallback also emits this event; inspect the prompt-enhancement report for
+    /// its outcome/cause rather than interpreting this as positive inference evidence.
+    /// Resident owners may remain cached. This Rust callback event is not a wire message,
+    /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
+    PromptUpsamplingComplete,
+    /// Optional exact phase boundary: all text and reference conditioning has been materialized
+    /// and its device work successfully synchronized, before the first denoiser forward. Emitted
+    /// once per request by adopting providers, on resident and staged paths. This is not a step,
+    /// loading event or terminal result; consumers that do not price phases may ignore it.
+    ConditioningComplete,
     /// Denoising step `current` of `total` (1-based).
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).
@@ -2220,6 +2303,12 @@ pub enum Progress {
     /// without this the UI would freeze silently while a component streams from disk (F-179). The
     /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
     Loading(LoadPhase),
+    /// The optional prompt-upsampling stage is decoding (sc-26238): `tokens` content tokens of
+    /// at most `max_tokens` generated so far, emitted once at `0` when the stage starts and once
+    /// per streamed token. Fires before any `Step` (it rewrites the prompt the encoder will
+    /// read) and never on a request that did not ask for enhancement, so a consumer that does
+    /// not know it can ignore it without losing the step contract.
+    Upsampling { tokens: u32, max_tokens: u32 },
 }
 
 /// Which component the residency seam is loading when it emits [`Progress::Loading`] (sc-11126). The

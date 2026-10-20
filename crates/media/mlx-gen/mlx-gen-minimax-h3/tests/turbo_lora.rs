@@ -1989,7 +1989,10 @@ fn render_once(recipe: &RenderRecipe<'_>) -> RenderReceipt {
                 ticks.push(now);
             }
             Progress::Decoding => decoding_at = Some(Instant::now()),
-            Progress::Loading(_) => {}
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("generate: {e}"));
     let wall_s = started.elapsed().as_secs_f64();
