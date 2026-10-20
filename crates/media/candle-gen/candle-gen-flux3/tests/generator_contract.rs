@@ -769,3 +769,219 @@ fn callback_cancel_at_conditioning_boundary_stops_before_denoise() {
         );
     }
 }
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn prompt_upsampling_terminal_boundary_native_provider() {
+    for id in [ID, "flux3_klein_base"] {
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let mut loaded = spec(policy);
+            if id != ID {
+                loaded.weights =
+                    WeightsSource::Dir(crate::common::fixtures().join("tiny-base-snapshot"));
+                loaded.components.insert(
+                    TEXT_ENCODER_COMPONENT.into(),
+                    WeightsSource::Dir(tiny_text_encoder()),
+                );
+                loaded.components.insert(
+                    AUTOENCODER_COMPONENT.into(),
+                    WeightsSource::File(tiny_autoencoder()),
+                );
+            }
+            loaded.components.insert(
+                "prompt_upsampler".into(),
+                WeightsSource::Dir(crate::common::fixtures().join("tiny-pup-snapshot")),
+            );
+            let generator = candle_gen_flux3::provider_registry()
+                .unwrap()
+                .load(id, &loaded)
+                .unwrap();
+            let req = GenerationRequest {
+                enhance_prompt: true,
+                enhance_max_tokens: Some(6),
+                steps: Some(1),
+                ..request()
+            };
+            let mut events = Vec::new();
+            generator.generate(&req, &mut |p| events.push(p)).unwrap();
+            let terminal = events
+                .iter()
+                .position(|p| *p == Progress::PromptUpsamplingComplete)
+                .unwrap();
+            let conditioning = events
+                .iter()
+                .position(|p| *p == Progress::ConditioningComplete)
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|p| **p == Progress::PromptUpsamplingComplete)
+                    .count(),
+                1
+            );
+            assert!(terminal < conditioning);
+            assert!(events[..terminal]
+                .iter()
+                .any(|p| matches!(p, Progress::Upsampling { .. })));
+            assert!(!events[terminal + 1..]
+                .iter()
+                .any(|p| matches!(p, Progress::Upsampling { .. })));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|p| matches!(p, Progress::Step { .. }))
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [Progress::Step {
+                    current: 1,
+                    total: 1
+                }]
+            );
+            assert_eq!(events.last(), Some(&Progress::Decoding));
+
+            let bypass = GenerationRequest {
+                enhance_prompt: false,
+                enhance_max_tokens: None,
+                ..req.clone()
+            };
+            events.clear();
+            generator
+                .generate(&bypass, &mut |p| events.push(p))
+                .unwrap();
+            assert!(!events.iter().any(|p| matches!(
+                p,
+                Progress::PromptUpsamplingComplete | Progress::Upsampling { .. }
+            )));
+
+            let cancelled = GenerationRequest {
+                cancel: CancelFlag::new(),
+                ..req.clone()
+            };
+            events.clear();
+            let result = generator.generate(&cancelled, &mut |p| {
+                events.push(p);
+                if matches!(p, Progress::Upsampling { tokens: 1, .. }) {
+                    cancelled.cancel.cancel();
+                }
+            });
+            assert!(matches!(result, Err(CoreError::Canceled)));
+            assert!(!events.iter().any(|p| matches!(
+                p,
+                Progress::PromptUpsamplingComplete
+                    | Progress::ConditioningComplete
+                    | Progress::Step { .. }
+                    | Progress::Decoding
+            )));
+
+            // Native supported fallback: a fully cited answer is a completed PUP decision,
+            // not inferred enhancement. The report retains the actual cause, with no tokens.
+            let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = reports.clone();
+            let fallback = GenerationRequest {
+                prompt: "a balloon <obj_1> [{\"id\": \"obj_1\", \"bbox\": [80, 60, 480, 380], \"desc\": \"b\"}]".into(),
+                prompt_enhancement: candle_gen::gen_core::PromptEnhancementSink::new(move |r| sink.lock().unwrap().push(r)),
+                ..req.clone()
+            };
+            events.clear();
+            generator
+                .generate(&fallback, &mut |p| events.push(p))
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|p| **p == Progress::PromptUpsamplingComplete)
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|p| matches!(p, Progress::Upsampling { .. })));
+            let captured = reports.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0].outcome,
+                candle_gen::gen_core::PromptEnhancementOutcome::Fallback
+            );
+            assert_eq!(
+                captured[0].fallback_reason.as_deref(),
+                Some("finished_answer")
+            );
+            drop(captured);
+
+            let boundary_cancel = GenerationRequest {
+                cancel: CancelFlag::new(),
+                ..req.clone()
+            };
+            events.clear();
+            let result = generator.generate(&boundary_cancel, &mut |p| {
+                events.push(p);
+                if p == Progress::PromptUpsamplingComplete {
+                    boundary_cancel.cancel.cancel();
+                }
+            });
+            assert!(matches!(result, Err(CoreError::Canceled)));
+            assert_eq!(events.last(), Some(&Progress::PromptUpsamplingComplete));
+            assert!(!events.iter().any(|p| matches!(
+                p,
+                Progress::ConditioningComplete
+                    | Progress::Step { .. }
+                    | Progress::Decoding
+                    | Progress::Loading(candle_gen::gen_core::LoadPhase::TextEncoder)
+            )));
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn prompt_upsampling_callback_precedes_even_text_encoder_load_and_reference_encode() {
+    let temporary = tempfile::tempdir().unwrap();
+    let encoder = temporary.path().join("text_encoder");
+    std::fs::create_dir(&encoder).unwrap();
+    for file in std::fs::read_dir(tiny_text_encoder()).unwrap() {
+        let file = file.unwrap();
+        assert!(file.file_type().unwrap().is_file());
+        std::fs::copy(file.path(), encoder.join(file.file_name())).unwrap();
+    }
+    let mut loaded = spec(OffloadPolicy::Sequential);
+    loaded.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(encoder.clone()),
+    );
+    loaded.components.insert(
+        "prompt_upsampler".into(),
+        WeightsSource::Dir(crate::common::fixtures().join("tiny-pup-snapshot")),
+    );
+    let generator = candle_gen_flux3::provider_registry()
+        .unwrap()
+        .load(ID, &loaded)
+        .unwrap();
+    // Sabotage only the test-owned copy after load. Any premature TE load/encode now fails.
+    std::fs::rename(&encoder, temporary.path().join("unavailable_encoder")).unwrap();
+    let req = GenerationRequest {
+        enhance_prompt: true,
+        enhance_max_tokens: Some(6),
+        conditioning: vec![candle_gen::gen_core::Conditioning::Reference {
+            image: candle_gen::gen_core::Image {
+                width: 64,
+                height: 64,
+                pixels: vec![23; 64 * 64 * 3],
+            },
+            strength: None,
+        }],
+        // Already-completed answer avoids invoking the tiny fixture's vision tower.
+        prompt:
+            "a balloon <obj_1> [{\"id\": \"obj_1\", \"bbox\": [80, 60, 480, 380], \"desc\": \"b\"}]"
+                .into(),
+        ..request()
+    };
+    let mut events = Vec::new();
+    let result = generator.generate(&req, &mut |p| {
+        events.push(p);
+        if p == Progress::PromptUpsamplingComplete {
+            req.cancel.cancel();
+        }
+    });
+    assert!(matches!(result, Err(CoreError::Canceled)), "{result:?}");
+    assert_eq!(events, [Progress::PromptUpsamplingComplete]);
+}

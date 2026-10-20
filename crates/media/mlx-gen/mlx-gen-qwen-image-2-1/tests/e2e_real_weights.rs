@@ -773,6 +773,9 @@ fn validation_render_at(
                     let label = match &p {
                         Progress::Loading(phase) => format!("loading {phase:?}"),
                         Progress::Step { current, .. } => format!("step {current} reported"),
+                        Progress::PromptUpsamplingComplete => {
+                            "prompt-upsampling-complete".to_owned()
+                        }
                         Progress::ConditioningComplete => "conditioning-complete".to_owned(),
                         Progress::Decoding => "before decode".to_owned(),
                         Progress::Upsampling { tokens, max_tokens } => {

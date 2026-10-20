@@ -98,6 +98,51 @@ impl<T> PhaseResourceSlot<T> {
         }
     }
 
+    /// Resolve the optional PUP decision and publish its exact terminal phase boundary.
+    /// `run` must return fully materialized host output. Resident success explicitly fences
+    /// the PUP owner; exclusive success uses the release fence and finishes owner drop and
+    /// allocator drain before publishing. Bypass never publishes. A successful fallback is
+    /// still a completed decision, not a claim that inference enhanced the caption.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_prompt_upsampling<Out>(
+        &self,
+        needed: bool,
+        exclusive: bool,
+        cancel: &CancelFlag,
+        load: impl FnOnce() -> Result<T>,
+        run: impl FnOnce(Option<&T>, &mut dyn FnMut(crate::Progress)) -> Result<Out>,
+        fence: impl Fn(&T) -> Result<()>,
+        after_drop: impl FnMut(),
+        progress: &mut dyn FnMut(crate::Progress),
+    ) -> Result<Out> {
+        let output = self.with_request(
+            needed,
+            exclusive,
+            cancel,
+            load,
+            |owner| {
+                let output = run(owner, progress)?;
+                // The release hook alone does not fence a resident success.
+                if needed && !exclusive && !cancel.is_cancelled() {
+                    fence(owner.expect("needed PUP owns its resource"))?;
+                }
+                Ok(output)
+            },
+            &fence,
+            after_drop,
+        )?;
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if needed {
+            progress(crate::Progress::PromptUpsamplingComplete);
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+        }
+        Ok(output)
+    }
+
     /// `needed=false` never calls `load` and evicts any prior cached owner before
     /// bypass. `exclusive=true` evicts a prior resident owner before loading the
     /// bounded instance, then fences/drops it BEFORE the caller's next phase.

@@ -85,8 +85,10 @@ fn generates_via_registry() {
             Progress::Decoding => decoding_seen = true,
             // Sequential-only component-load signal (sc-11126); ideogram runs Resident here, so it
             // never fires — a no-op arm keeps the match exhaustive over the additive `Progress` variant.
-            Progress::Loading(_) | Progress::ConditioningComplete | Progress::Upsampling { .. } => {
-            }
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         })
         .expect("generate");
 

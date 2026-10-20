@@ -59,7 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Progress::Step { current, total } => eprintln!("  step {current}/{total}"),
         Progress::Decoding => eprintln!("  decoding…"),
         Progress::Loading(phase) => eprintln!("  loading {phase:?}"),
-        Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
+        Progress::PromptUpsamplingComplete
+        | Progress::ConditioningComplete
+        | Progress::Upsampling { .. } => {}
     };
 
     let base_req = GenerationRequest {

@@ -392,6 +392,7 @@ fn reference_partition_step_cost_against_base() {
                 }
                 format!("step-{current}/{total}")
             }
+            Progress::PromptUpsamplingComplete => "prompt-upsampling-complete".to_owned(),
             Progress::ConditioningComplete => "conditioning-complete".to_owned(),
             Progress::Decoding => "decode-start".to_owned(),
             Progress::Upsampling { tokens, max_tokens } => {

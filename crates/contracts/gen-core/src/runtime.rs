@@ -2280,6 +2280,14 @@ impl std::fmt::Debug for PromptEnhancementSink {
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    /// Optional exact prompt-upsampling decision boundary, before text/reference encoding.
+    /// Emitted once only when enhancement was requested: the final caption is materialized,
+    /// PUP device work synchronized, and any staged owner released/allocator drain completed.
+    /// A completed fallback also emits this event; inspect the prompt-enhancement report for
+    /// its outcome/cause rather than interpreting this as positive inference evidence.
+    /// Resident owners may remain cached. This Rust callback event is not a wire message,
+    /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
+    PromptUpsamplingComplete,
     /// Optional exact phase boundary: all text and reference conditioning has been materialized
     /// and its device work successfully synchronized, before the first denoiser forward. Emitted
     /// once per request by adopting providers, on resident and staged paths. This is not a step,

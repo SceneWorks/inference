@@ -535,6 +535,7 @@ fn run_case(case: &Case) {
                 Progress::Step { current, total } => seen_steps.push((current, total)),
                 Progress::Decoding => decoding += 1,
                 Progress::Loading(_)
+                | Progress::PromptUpsamplingComplete
                 | Progress::ConditioningComplete
                 | Progress::Upsampling { .. } => {}
             },
@@ -599,6 +600,7 @@ fn run_default_case(case: &Case) {
                 Progress::Step { current, total } => seen_steps.push((current, total)),
                 Progress::Decoding => decoding += 1,
                 Progress::Loading(_)
+                | Progress::PromptUpsamplingComplete
                 | Progress::ConditioningComplete
                 | Progress::Upsampling { .. } => {}
             },

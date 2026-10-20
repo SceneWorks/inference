@@ -1246,7 +1246,10 @@ pub fn check_progress_contract_with(
     g.generate(req, &mut |p| match p {
         Progress::Step { current, total } => steps.push((current, total)),
         Progress::Decoding => decoding_count += 1,
-        Progress::ConditioningComplete | Progress::Loading(_) | Progress::Upsampling { .. } => {}
+        Progress::PromptUpsamplingComplete
+        | Progress::ConditioningComplete
+        | Progress::Loading(_)
+        | Progress::Upsampling { .. } => {}
     })
     .map_err(|e| format!("progress-contract[{id}]: generate() failed on the cheap request: {e}"))?;
 

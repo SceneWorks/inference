@@ -541,7 +541,7 @@ impl Flux3Klein {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationParams> {
-        let outcome=self.prompt_upsampler.with_request(
+        let outcome=self.prompt_upsampler.with_prompt_upsampling(
             req.enhance_prompt,stage_residency_for(&self.spec,req),&req.cancel,
             || {
                 let dir=self.prompt_upsampler_dir.as_ref().ok_or_else(||gen_core::Error::Unsupported(
@@ -549,9 +549,10 @@ impl Flux3Klein {
                 ))?;
                 crate::pup::Flux3PromptUpsampler::load(dir).map_err(gen_core::Error::from)
             },
-            |upsampler|crate::pup::effective_prompt(upsampler,req,on_progress).map_err(gen_core::Error::from),
+            |upsampler, progress|crate::pup::effective_prompt(upsampler,req,progress).map_err(gen_core::Error::from),
             crate::pup::Flux3PromptUpsampler::synchronize_before_release,
             || {}, // Candle storage owns deallocation; unlike MLX there is no allocator-drain hook.
+            on_progress,
         )?;
         Ok(GenerationParams::resolve_caption(
             req,

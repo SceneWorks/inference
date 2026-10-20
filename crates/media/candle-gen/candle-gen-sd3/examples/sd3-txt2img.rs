@@ -160,7 +160,9 @@ fn main() -> Result<()> {
         }
         Progress::Decoding => println!("\n[smoke] decoding"),
         Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
-        Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
+        Progress::PromptUpsamplingComplete
+        | Progress::ConditioningComplete
+        | Progress::Upsampling { .. } => {}
     };
 
     let t = std::time::Instant::now();

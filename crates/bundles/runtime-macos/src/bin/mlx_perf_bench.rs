@@ -1239,8 +1239,10 @@ impl PhaseRecorder {
                     self.decoding_elapsed_nanos = Some(self.elapsed_nanos());
                 }
             }
-            Progress::Loading(_) | Progress::ConditioningComplete | Progress::Upsampling { .. } => {
-            }
+            Progress::Loading(_)
+            | Progress::PromptUpsamplingComplete
+            | Progress::ConditioningComplete
+            | Progress::Upsampling { .. } => {}
         }
     }
 
