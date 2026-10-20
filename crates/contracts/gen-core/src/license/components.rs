@@ -1282,6 +1282,42 @@ pub const Z_IMAGE_TURBO_FUN_CONTROLNET_UNION_2_1: ComponentLicense = ComponentLi
     retrieved: "2026-08-02",
 };
 
+/// `SupraLabs/Supra2-IMG` denoiser (sc-24213); the card at the frozen revision declares
+/// `license: apache-2.0`.
+pub const SUPRA2_IMG: ComponentLicense = ComponentLicense {
+    component: "supra2_img",
+    source_url: "https://huggingface.co/SupraLabs/Supra2-IMG/blob/10dec6e4b4b5d1c44fd1d7d3fe5e50137333da5b/README.md",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Supra2-IMG by SupraLabs — licensed under Apache-2.0"),
+    retrieved: "2026-10-20",
+};
+
+/// `google/flan-t5-base` — Supra2-IMG's text encoder and tokenizer (sc-24213); the card at the
+/// pinned revision declares `license: apache-2.0`.
+pub const FLAN_T5_BASE: ComponentLicense = ComponentLicense {
+    component: "flan_t5_base",
+    source_url: "https://huggingface.co/google/flan-t5-base/blob/7bcac572ce56db69c1ea7c8af255c5d7c9672fc2/README.md",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("FLAN-T5-Base by Google — licensed under Apache-2.0"),
+    retrieved: "2026-10-20",
+};
+
+/// `stabilityai/sd-vae-ft-mse` — Supra2-IMG's VAE decoder (sc-24213); the card at the pinned
+/// revision declares `license: mit`.
+pub const SD_VAE_FT_MSE: ComponentLicense = ComponentLicense {
+    component: "sd_vae_ft_mse",
+    source_url: "https://huggingface.co/stabilityai/sd-vae-ft-mse/blob/31f26fdeee1355a5c34592e401dd41e45d25a493/README.md",
+    gated: false,
+    declared: "mit",
+    family: "mit",
+    attribution: Some("sd-vae-ft-mse © Stability AI — licensed under MIT"),
+    retrieved: "2026-10-20",
+};
+
 /// Official Base bundle; the frozen LICENSE is Apache-2.0.
 pub const MOSS_IMAGE_BASE: ComponentLicense = ComponentLicense {
     component: "moss_image_base",
@@ -1342,6 +1378,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     CONTROLNET_OPENPOSE_SDXL_1_0,
     EVA_CLIP,
     FACEXLIB_PARSING_BISENET,
+    FLAN_T5_BASE,
     FLUX1_DEV,
     FLUX1_DEV_CONTROLNET_UNION_PRO_2_0,
     FLUX1_SCHNELL,
@@ -1389,6 +1426,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     SANA_1600M_1024PX_DIFFUSERS,
     SANA_SPRINT_1_6B_1024PX_DIFFUSERS,
     SCAIL_2,
+    SD_VAE_FT_MSE,
     SDXL_VAE_FP16_FIX,
     SEEDVR2_COMFYUI,
     SENSENOVA_U1_8B_MOT,
@@ -1396,6 +1434,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     STABLE_DIFFUSION_3_5_LARGE,
     STABLE_DIFFUSION_XL_BASE_1_0,
     STABLE_VIDEO_DIFFUSION_IMG2VID_XT,
+    SUPRA2_IMG,
     T5_V1_1_XXL,
     UMT5_XXL,
     WAN2_1_T2V_14B_DIFFUSERS,
@@ -1426,8 +1465,9 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows.
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 83);
+        // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows;
+        // sc-24213 adds Supra2-IMG, Flan-T5-Base and sd-vae-ft-mse: 83 -> 86.
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 86);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1827,7 +1867,9 @@ mod tests {
         // metadata evidence from gated-file authorization). A row carrying any other date is
         // a row whose provenance nobody can re-read.
         // sc-26323 read the frozen MOSS bundles on 2026-10-18; see
-        // docs/licensing/sc-26323-moss-image-licence-evidence.md.
+        // docs/licensing/sc-26323-moss-image-licence-evidence.md. sc-24213 read the Supra2-IMG,
+        // Flan-T5-Base and sd-vae-ft-mse cards on 2026-10-20; see
+        // docs/licensing/sc-24213-supra2-img-licence-evidence.md.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
             "2026-08-12",
@@ -1837,6 +1879,7 @@ mod tests {
             "2026-10-15",
             "2026-10-16",
             "2026-10-18",
+            "2026-10-20",
         ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(

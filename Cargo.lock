@@ -599,6 +599,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-gen-seedvr2",
  "candle-gen-sensenova",
+ "candle-gen-supra2",
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
@@ -1100,6 +1101,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-sdxl",
+ "candle-transformers",
+ "image",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2395,7 +2408,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
- "zip",
 ]
 
 [[package]]
@@ -2492,6 +2504,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-seedvr2",
  "mlx-gen-sensenova",
+ "mlx-gen-supra2",
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
@@ -2948,6 +2961,19 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+ "serde_json",
  "tempfile",
 ]
 
@@ -3736,6 +3762,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]

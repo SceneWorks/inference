@@ -158,7 +158,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -5310,6 +5310,149 @@ jobs:
         with:
           name: iris-cuda-evidence
           path: ${{ runner.temp }}/iris-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-24214 (epic sc-24212) — native Supra2-IMG on Candle/CUDA. DISPATCH-ONLY (`supra2` profile;
+  # never `all`, never the schedule): one CUDA box for a release build plus a few minutes of renders.
+  #
+  # WHAT IT PROVISIONS. The three revision pins of `gen_core::supra2` through
+  # `ensure_model_snapshot.py` into the runner's persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`):
+  #   * `supra2-img-cuda`     SupraLabs/Supra2-IMG @ 10dec6e4…  model_final_ema.pt, ~417 MB
+  #   * `flan-t5-base-cuda`   google/flan-t5-base @ 7bcac572…   ~993 MB
+  #   * `sd-vae-ft-mse-cuda`  stabilityai/sd-vae-ft-mse @ 31f26fde…  ~335 MB
+  # then runs the install-time converter into RUNNER_TEMP (it re-verifies every SHA-256), exactly the
+  # path SceneWorks takes at install time.
+  #
+  # WHAT IT RUNS. `candle-gen-supra2 --features cuda`: the weights-free tiny-DiT parity and sampler
+  # checks (CPU leg + `cuda:0` leg each), and the three `#[ignore]`d real-weight tests on `cuda:0`
+  # against the committed torch golden (`tests/fixtures/supra2_real_golden.safetensors`): Flan-T5,
+  # stored conditioning, DiT and VAE stages, four whole-pipeline trajectories, and the registry
+  # render. One `cargo test` per name with `--exact` and a run-count assertion. `timeout-minutes: 90`
+  # is a runaway guard for a cold `--release --features cuda` build plus a one-time ~1.75 GB fetch.
+  candle-supra2:
+    name: Candle Supra2-IMG real weights (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'supra2'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 90
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      SUPRA2_SOURCE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SupraLabs--Supra2-IMG\snapshots\10dec6e4b4b5d1c44fd1d7d3fe5e50137333da5b
+      SUPRA2_T5_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--google--flan-t5-base\snapshots\7bcac572ce56db69c1ea7c8af255c5d7c9672fc2
+      SUPRA2_VAE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--stabilityai--sd-vae-ft-mse\snapshots\31f26fdeee1355a5c34592e401dd41e45d25a493
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-supra2\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service exports RUSTC_WRAPPER=sccache, whose daemon resets mid-build on heavy
+      # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-supra2\require-operator-provided-models-root-and-initialize-evidenc.cmd
+      # Report-only, like the same step on `candle-qwen-image-2-1`.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%SUPRA2_OUT%\cuda-device-inventory.csv"
+          type "%SUPRA2_OUT%\cuda-device-inventory.csv"
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-supra2\materialize-and-verify-immutable-snapshots.cmd
+      - name: Convert the pinned checkpoint into a bundle
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-supra2\convert-the-pinned-checkpoint-into-a-bundle.cmd
+      - name: Build the Supra2 CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-supra2 --features cuda --test integration --no-run || exit /b 1
+      - name: Run the Supra2 CUDA checks
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-supra2\run-the-supra2-cuda-checks.cmd
+      - name: Keep the Supra2 CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: supra2-cuda-evidence
+          path: ${{ runner.temp }}/supra2-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-24217 (epic sc-24212) — the Apple Silicon twin of `candle-supra2`: native Supra2-IMG on MLX
+  # (Metal). DISPATCH-ONLY on the same `supra2` profile (never `all`, never the schedule), so one
+  # dispatch exercises both backends. `rw-llm` (nax-macos-2; small weight sets, not the dev Mac's
+  # `nax` label) materializes per run: the same three
+  # revision pins (`supra2-img-cuda`, `flan-t5-base-cuda`, `sd-vae-ft-mse-cuda` — the keys are the
+  # pins, shared by both lanes) are materialized into the box's task-owned hub (~1.75 GB), converted
+  # by the install-time converter into RUNNER_TEMP (re-verifying every SHA-256), and the three
+  # `#[ignore]`d `mlx-gen-supra2` real-weight tests run on the GPU against the committed torch
+  # golden the Candle lane uses (`candle-gen-supra2/tests/fixtures/supra2_real_golden.safetensors`).
+  # One invocation per name with `--exact` and a run-count assertion. Run-scoped CARGO_TARGET_DIR,
+  # release profile unstripped (rust-lang/rust#157750).
+  mlx-supra2:
+    name: MLX Supra2-IMG real weights (Metal)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'supra2'
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    timeout-minutes: 60
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      SUPRA2_SOURCE_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--SupraLabs--Supra2-IMG/snapshots/10dec6e4b4b5d1c44fd1d7d3fe5e50137333da5b
+      SUPRA2_T5_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--google--flan-t5-base/snapshots/7bcac572ce56db69c1ea7c8af255c5d7c9672fc2
+      SUPRA2_VAE_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--stabilityai--sd-vae-ft-mse/snapshots/31f26fdeee1355a5c34592e401dd41e45d25a493
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Initialize the Supra2 MLX evidence
+        run: source scripts/ci/real-weights/mlx-supra2/initialize-the-evidence.sh
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT SUPRA2_SOURCE_SNAPSHOT SUPRA2_T5_SNAPSHOT SUPRA2_VAE_SNAPSHOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT SUPRA2_SOURCE_SNAPSHOT SUPRA2_T5_SNAPSHOT SUPRA2_VAE_SNAPSHOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Build the Supra2 MLX test binary
+        run: source scripts/ci/real-weights/mlx-supra2/build-the-test-binary.sh
+      - name: Materialize and verify immutable snapshots
+        run: source scripts/ci/real-weights/mlx-supra2/materialize-and-verify-immutable-snapshots.sh
+      - name: Convert the pinned checkpoint into a bundle
+        run: source scripts/ci/real-weights/mlx-supra2/convert-the-pinned-checkpoint-into-a-bundle.sh
+      - name: Run the Supra2 MLX real-weight checks
+        run: source scripts/ci/real-weights/mlx-supra2/run-the-supra2-mlx-checks.sh
+      - name: Keep the Supra2 MLX evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: supra2-mlx-evidence
+          path: ${{ runner.temp }}/supra2-mlx-evidence
           if-no-files-found: error
           retention-days: 30
 

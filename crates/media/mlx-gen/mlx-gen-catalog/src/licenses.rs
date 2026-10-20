@@ -564,6 +564,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
     },
+    // --- supra2 ------------------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
+    },
     // --- svd ---------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and ViT-H image encoder, all in one ungated snapshot.
     ProviderComponents {
@@ -971,8 +977,9 @@ mod tests {
         // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
         // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
         // sc-26323: both MOSS providers join the union (79 / 69).
-        assert_eq!(registered.len(), 79, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 69);
+        // sc-24213: `supra2_img` registers with its own complete row (80 / 70).
+        assert_eq!(registered.len(), 80, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 70);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1039,11 +1046,12 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            30,
+            31,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239; MOSS Base/SFT in sc-26323)"
+             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239; MOSS Base/SFT in sc-26323; \
+             supra2_img in sc-24213)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
