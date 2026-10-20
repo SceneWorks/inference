@@ -12,7 +12,15 @@ pub fn selected_asset_facts(
     mode: moss_image::MossImageAcceleration,
 ) -> Result<MemoryAssetFacts> {
     let sources = Sources::selected(variant, spec, mode).map_err(Error::from)?;
-    selected_facts(&sources, mode)
+    let mut facts = selected_facts(&sources, mode)?;
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(
+            crate::adapters::estimated_bytes(&spec.adapters, &sources.config)
+                .map_err(Error::from)?,
+        )
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    Ok(facts)
 }
 
 pub(crate) fn facts(s: &Sources) -> Result<MemoryAssetFacts> {
@@ -109,6 +117,26 @@ fn sum_selected_headers(
         .ok_or_else(|| Error::Unsupported("MOSS base bytes overflow".into()))?;
     Ok(f)
 }
+/// One adapter-inclusive fact set supplies both the stored safety contract and the load peak.
+/// Request peaks select their own raw mode facts and add the custom stack once, not this peak.
+pub(crate) fn loaded_admission(
+    v: MossImageVariant,
+    mut facts: MemoryAssetFacts,
+    custom: u64,
+    staging: u64,
+) -> Result<(MemoryProviderContract, u64)> {
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(custom)
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    let peak = facts
+        .base_bytes
+        .checked_add(facts.overlay_bytes)
+        .and_then(|v| v.checked_add(staging))
+        .ok_or_else(|| Error::Unsupported("MOSS load peak overflow".into()))?;
+    Ok((contract_with_facts(v, facts), peak))
+}
+
 pub(crate) fn contract_with_facts(
     v: MossImageVariant,
     f: MemoryAssetFacts,
@@ -138,7 +166,14 @@ pub(crate) fn contract_with_facts(
 }
 pub(crate) fn contract(v: MossImageVariant, spec: &LoadSpec) -> Result<MemoryProviderContract> {
     let s = Sources::prepare(v, spec).map_err(Error::from)?;
-    Ok(contract_with_facts(v, facts(&s)?))
+    let mut facts = facts(&s)?;
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(
+            crate::adapters::estimated_bytes(&spec.adapters, &s.config).map_err(Error::from)?,
+        )
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    Ok(contract_with_facts(v, facts))
 }
 pub(crate) fn fixture(v: MossImageVariant, _: &LoadSpec) -> Result<MemoryProviderContract> {
     // The frozen Base/SFT geometry is known without a snapshot; only byte facts are absent.
@@ -352,5 +387,54 @@ mod cpu_tests {
         assert!(
             request_workspace_bytes(u32::MAX - 15, u32::MAX - 15, usize::MAX, 4096, 3).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod review_loaded_memory_tests {
+    use super::*;
+    #[test]
+    fn loaded_contract_and_peak_include_adapter_stack_once() {
+        let source = MemoryAssetFacts {
+            base_bytes: 2 * 3 * 4,
+            overlay_bytes: 5 * 4,
+            ..Default::default()
+        };
+        let (custom, staging) = (7 * 4, 11 * 4);
+        let (contract, peak) =
+            loaded_admission(MossImageVariant::Base, source, custom, staging).unwrap();
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            source.overlay_bytes + custom
+        );
+        assert_eq!(contract.asset_facts.base_bytes, source.base_bytes);
+        assert_eq!(
+            peak,
+            source.base_bytes + source.overlay_bytes + custom + staging
+        );
+        let (plain, plain_peak) =
+            loaded_admission(MossImageVariant::Base, source, 0, staging).unwrap();
+        assert_eq!(plain.asset_facts, source);
+        assert_eq!(peak - plain_peak, custom);
+        assert!(loaded_admission(
+            MossImageVariant::Base,
+            MemoryAssetFacts {
+                overlay_bytes: u64::MAX,
+                ..source
+            },
+            1,
+            0
+        )
+        .is_err());
+        assert!(loaded_admission(
+            MossImageVariant::Base,
+            MemoryAssetFacts {
+                base_bytes: u64::MAX,
+                ..source
+            },
+            0,
+            0
+        )
+        .is_err());
     }
 }

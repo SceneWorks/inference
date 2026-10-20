@@ -1053,7 +1053,18 @@ mod tests {
         // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
         // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
         // export).
-        assert_eq!(trainers.len(), 20);
+        let unique: BTreeSet<_> = trainers.iter().collect();
+        assert_eq!(
+            unique.len(),
+            trainers.len(),
+            "duplicate native trainer registrations"
+        );
+        for id in ["moss_image_base", "moss_image_sft"] {
+            assert!(
+                trainers.iter().any(|trainer| trainer == id),
+                "missing exact-checkpoint MOSS trainer {id}"
+            );
+        }
         let transforms: BTreeSet<String> = registry
             .transforms()
             .map(|r| (r.descriptor)().id.to_string())

@@ -28,8 +28,15 @@ struct AttemptState<R, P> {
     report: Option<P>,
 }
 impl<R, P> AttemptState<R, P> {
-    fn begin(&mut self) {
+    fn begin(&mut self, pins: &[gen_core::PinnedWeightsFile]) -> Result<()> {
         self.report = None;
+        for pin in pins {
+            if let Err(error) = pin.verify_unchanged() {
+                self.renderer = None;
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
     fn failed(&mut self) {
         self.report = None;
@@ -59,6 +66,8 @@ type State = AttemptState<Transformer, MossImageExecutionReport>;
 /// One lifecycle lock owns validation, mode selection, execution and completed-report publication.
 pub struct MossImage {
     variant: MossImageVariant,
+    custom_adapter_bytes: u64,
+    custom_pins: Vec<gen_core::PinnedWeightsFile>,
     descriptor: ModelDescriptor,
     spec: LoadSpec,
     sources: Sources,
@@ -82,6 +91,7 @@ fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
+            supports_lora: true,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_prompt_batch: true,
@@ -126,11 +136,15 @@ impl MossImage {
         }
         let sources = Sources::prepare(variant, spec)?;
         let facts = memory_strategy::facts(&sources)?;
-        let memory = memory_strategy::contract_with_facts(variant, facts);
-        let load_peak = facts
-            .base_bytes
-            .saturating_add(facts.overlay_bytes)
-            .saturating_add(5_362_224_248);
+        let custom_adapter_bytes =
+            crate::adapters::estimated_bytes(&spec.adapters, &sources.config)?;
+        let (memory, load_peak) =
+            memory_strategy::loaded_admission(variant, facts, custom_adapter_bytes, 5_362_224_248)?;
+        let custom_pins = spec
+            .adapters
+            .iter()
+            .map(|adapter| spec.file_pin_for(&adapter.path))
+            .collect::<gen_core::Result<Vec<_>>>()?;
         if mlx_gen::memory::recommended_working_set_bytes().is_some_and(|cap| load_peak > cap) {
             return Err(Error::Unsupported(format!("MOSS resident load requires approximately {load_peak} bytes including source staging, beyond the admitted MLX working set")));
         }
@@ -165,6 +179,8 @@ impl MossImage {
         sources.ensure_unchanged()?;
         Ok(Self {
             variant,
+            custom_adapter_bytes,
+            custom_pins,
             descriptor: descriptor(variant),
             spec: spec.clone(),
             sources,
@@ -252,6 +268,7 @@ impl MossImage {
         )?
         .checked_add(assets.base_bytes)
         .and_then(|n| n.checked_add(assets.overlay_bytes))
+        .and_then(|n| n.checked_add(self.custom_adapter_bytes))
         .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
     }
     /// Incremental live demand above a caller's committed snapshot. Credit is bounded by this
@@ -296,7 +313,7 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        state.begin();
+        state.begin(&self.custom_pins)?;
         let result = (|| {
             check(&request.cancel)?;
             self.sources.ensure_unchanged()?;
@@ -367,7 +384,15 @@ impl MossImage {
             check(&request.cancel)?;
             state.select(resolved.acceleration, || {
                 mlx_gen::residency::drain_allocator_cache();
-                sources.transformer(resolved.acceleration, &request.cancel)
+                let mut transformer =
+                    sources.transformer(resolved.acceleration, &request.cancel)?;
+                transformer.custom_reports = crate::adapters::apply_pinned(
+                    &mut transformer,
+                    self.variant,
+                    &self.spec.adapters,
+                    &self.custom_pins,
+                )?;
+                Ok(transformer)
             })?;
             let shape = [
                 count as i32,
@@ -514,7 +539,7 @@ impl MossImage {
             .into_iter()
             .map(|(k, v)| (k.into(), v))
             .collect();
-            let mut adapter_reports = Vec::new();
+            let mut adapter_reports = renderer.custom_reports.clone();
             if resolved.acceleration != MossImageAcceleration::Off {
                 for key in [
                     "time_embedding",
@@ -629,7 +654,9 @@ fn footprint(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Per
     let f = memory_strategy::facts(&s)?;
     Ok(PerComponentBytes {
         text_encoder: f.conditioning_bytes,
-        dit: f.transformer_bytes + f.overlay_bytes,
+        dit: f.transformer_bytes
+            + f.overlay_bytes
+            + crate::adapters::estimated_bytes(&spec.adapters, &s.config)?,
         vae: f.decoder_bytes,
     })
 }
@@ -681,7 +708,7 @@ mod cpu_tests {
             (0, 0)
         );
         state.report = Some("completed");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(state.report.is_none());
         assert_eq!(
             *state
@@ -703,7 +730,7 @@ mod cpu_tests {
         );
         assert_eq!(loads, 3);
         state.report = Some("prior completion");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(matches!(
             state.select(on, || Err(Error::Canceled)),
             Err(Error::Canceled)
@@ -714,13 +741,13 @@ mod cpu_tests {
         assert_eq!(*state.select(off, || Ok((0, 0))).unwrap(), (0, 0));
     }
     #[test]
-    fn descriptors_keep_full_native_batch_and_cfg_but_no_reference_or_generic_lora_surface() {
+    fn descriptors_keep_native_batch_cfg_and_transformer_adapters_without_references() {
         for descriptor in [descriptor_base(), descriptor_sft()] {
             assert!(descriptor.capabilities.supports_prompt_batch);
             assert!(descriptor.capabilities.supports_guidance);
             assert!(descriptor.capabilities.supports_negative_prompt);
             assert!(descriptor.capabilities.conditioning.is_empty());
-            assert!(!descriptor.capabilities.supports_lora);
+            assert!(descriptor.capabilities.supports_lora);
             assert!(descriptor
                 .capabilities
                 .validate_request(
@@ -744,5 +771,44 @@ mod cpu_tests {
                 .acceleration,
             MossImageAcceleration::Off
         );
+    }
+}
+
+#[cfg(test)]
+mod review_lifecycle_tests {
+    use super::*;
+    #[test]
+    fn cached_renderer_request_boundary_rejects_replaced_or_removed_adapter() {
+        for remove in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("adapter.safetensors");
+            std::fs::write(&path, b"original adapter source").unwrap();
+            let pins = [gen_core::PinnedWeightsFile::pin(&path).unwrap()];
+            let mut state: AttemptState<u8, ()> = AttemptState {
+                renderer: Some((MossImageAcceleration::Off, 7)),
+                report: Some(()),
+            };
+            state.begin(&pins).unwrap();
+            assert_eq!(
+                *state
+                    .select(MossImageAcceleration::Off, || panic!(
+                        "warm mode must reuse its renderer"
+                    ))
+                    .unwrap(),
+                7
+            );
+            state.report = Some(());
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"replaced adapter source").unwrap();
+            }
+            assert!(
+                state.begin(&pins).is_err(),
+                "cached renderer accepted changed adapter, remove={remove}"
+            );
+            assert!(state.report.is_none());
+            assert!(state.renderer.is_none());
+        }
     }
 }

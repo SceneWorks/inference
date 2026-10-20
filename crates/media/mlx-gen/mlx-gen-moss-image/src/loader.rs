@@ -233,7 +233,6 @@ impl Sources {
             return Err(Error::Unsupported("MOSS supports the resident/eager official BF16 load surface; full-FP32 DMD is selected explicitly through MOSS request controls".into()));
         }
         if spec.quantize.is_some()
-            || !spec.adapters.is_empty()
             || spec.control.is_some()
             || !spec.extra_controls.is_empty()
             || spec.ip_adapter.is_some()

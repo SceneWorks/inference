@@ -7,6 +7,7 @@ license = "Apache-2.0"
 autotests = false
 
 [dependencies]
+image = { workspace = true }
 mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 mlx-llm = { workspace = true }
@@ -15,7 +16,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-image = { workspace = true }
 tempfile = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 
