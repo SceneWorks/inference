@@ -4,9 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::sampling::{self, ContextBatch};
 use mlx_gen::gen_core::supra2::{
-    self as s2, image_seed, initial_noise, quantize_rgb, read_bundle, Supra2Bundle, Supra2Config,
-    Supra2Resolved, Supra2Tokenizer, FLAN_T5_BASE, PROVIDER_ID, SD_VAE,
+    self as s2, image_seed, initial_noise, quantize_rgb, read_pinned_bundle, BundleCheck,
+    Supra2Bundle, Supra2Config, Supra2Resolved, Supra2Tokenizer, FLAN_T5_BASE, PROVIDER_ID, SD_VAE,
     TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen::gen_core::{
@@ -22,7 +23,6 @@ use mlx_gen::{
 use mlx_gen_flux::text_encoder::{T5Geometry, T5TextEncoder};
 use mlx_gen_sdxl::config::VaeConfig;
 use mlx_gen_sdxl::vae::Autoencoder;
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
@@ -76,16 +76,23 @@ fn component_dir(spec: &LoadSpec, id: &str, label: &str) -> Result<PathBuf> {
 }
 
 impl Supra2Sources {
-    /// Resolve and validate every input: the converted bundle (manifest + digests), and the pinned
-    /// component snapshots (exact files and sizes, plus their `config.json` geometry).
+    /// Resolve and validate every input: the converted bundle (manifest + digests + the
+    /// [`read_pinned_bundle`] pin contract), and the pinned component snapshots (exact files and
+    /// sizes, plus their `config.json` geometry).
     pub fn resolve(spec: &LoadSpec) -> Result<Self> {
+        Self::resolve_checked(spec, BundleCheck::Digests)
+    }
+
+    /// [`Self::resolve`] with an explicit bundle check depth: footprint / admission queries use
+    /// [`BundleCheck::SizesOnly`] so they never re-hash the 417 MB denoiser; `load` keeps digests.
+    pub fn resolve_checked(spec: &LoadSpec, check: BundleCheck) -> Result<Self> {
         reject_unknown_components(spec, &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT], PROVIDER_ID)?;
         let WeightsSource::Dir(dir) = &spec.weights else {
             return Err(Error::Unsupported(format!(
                 "{PROVIDER_ID}: weights must be the converted Supra2 bundle directory"
             )));
         };
-        let bundle = read_bundle(dir)?;
+        let bundle = read_pinned_bundle(dir, check)?;
         let text_encoder = component_dir(spec, TEXT_ENCODER_COMPONENT, "Flan-T5-Base")?;
         let vae = component_dir(spec, VAE_COMPONENT, "SD VAE ft-MSE")?;
         FLAN_T5_BASE.check_sizes(&text_encoder)?;
@@ -374,40 +381,8 @@ impl Supra2Image {
         }
     }
 
-    /// One CFG-or-plain velocity evaluation, exactly upstream's loop body.
-    fn velocity(
-        &self,
-        z: &Array,
-        t: f32,
-        cond: (&Array, &Array),
-        uncond: Option<(&Array, &Array)>,
-        guidance: f32,
-    ) -> Result<Array> {
-        let n = z.shape()[0] as usize;
-        match uncond {
-            Some((uctx, umask)) => {
-                let z2 = concatenate_axis(&[z, z], 0)?;
-                let tf = self.dit.timestep_features(&vec![t; 2 * n]);
-                let ctx = concatenate_axis(&[cond.0, uctx], 0)?;
-                let mask = concatenate_axis(&[cond.1, umask], 0)?;
-                let both = self.dit.forward(&z2, &tf, &ctx, &mask)?;
-                let halves = split(&both, 2, 0)?;
-                let (vc, vu) = (&halves[0], &halves[1]);
-                let g = Array::from_f32(guidance);
-                Ok(add(vu, &multiply(&g, &subtract(vc, vu)?)?)?)
-            }
-            None => {
-                let tf = self.dit.timestep_features(&vec![t; n]);
-                self.dit.forward(z, &tf, cond.0, cond.1)
-            }
-        }
-    }
-
     fn broadcast(c: &TextConditioning, n: usize) -> Result<(Array, Array)> {
-        let len = c.mask.len();
-        let ctx = concatenate_axis(&vec![c.context.clone(); n], 0)?;
-        let mask = SupraDit::additive_mask(&c.mask.repeat(n), n, len)?;
-        Ok((ctx, mask))
+        sampling::broadcast(&c.context, &c.mask, n)
     }
 
     /// Full generation. `noise` overrides the seeded initial latents (`count × C×S×S` f32) so a
@@ -451,24 +426,22 @@ impl Supra2Image {
                 .collect(),
         };
         let s = cfg.latent_size as i32;
-        let mut z = Array::from_slice(&z0, &[n as i32, cfg.latent_channels as i32, s, s]);
-        let dt = Array::from_f32(s2::euler_dt(r.steps));
-        for (i, t) in s2::euler_timesteps(r.steps).into_iter().enumerate() {
-            check(&request.cancel)?;
-            let v = self.velocity(
-                &z,
-                t,
-                (&cond_ctx, &cond_mask),
-                uncond.as_ref().map(|(c, m)| (c, m)),
-                r.guidance,
-            )?;
-            z = add(&z, &multiply(&dt, &v)?)?;
-            eval([&z])?;
-            progress(Progress::Step {
-                current: i as u32 + 1,
-                total: r.steps,
-            });
-        }
+        let z0 = Array::from_slice(&z0, &[n as i32, cfg.latent_channels as i32, s, s]);
+        let z = sampling::denoise(
+            &self.dit,
+            z0,
+            r.steps,
+            r.guidance,
+            ContextBatch {
+                context: &cond_ctx,
+                mask: &cond_mask,
+            },
+            uncond
+                .as_ref()
+                .map(|(context, mask)| ContextBatch { context, mask }),
+            &request.cancel,
+            progress,
+        )?;
         check(&request.cancel)?;
         let flat = mlx_gen::array::contiguous(&z)?;
         eval([&flat])?;
@@ -554,7 +527,7 @@ impl Generator for Supra2Image {
 }
 
 fn footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
-    let sources = Supra2Sources::resolve(spec)?;
+    let sources = Supra2Sources::resolve_checked(spec, BundleCheck::SizesOnly)?;
     let f = memory_strategy::facts(&sources)?;
     Ok(PerComponentBytes {
         text_encoder: f.conditioning_bytes,
@@ -570,3 +543,47 @@ pub(crate) const MEMORY: gen_core::MemoryRegistration = gen_core::MemoryRegistra
     contract: memory_strategy::contract,
     safety_check: memory_strategy::safety,
 };
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+
+    /// sd-vae-ft-mse's legacy mid-block attention keys map onto the AutoencoderKL layout; keys
+    /// already in the new layout, and non-attention keys, are left alone. Tensor-free (no eval).
+    #[test]
+    fn legacy_vae_attention_keys_are_renamed_and_new_keys_left_alone() {
+        let t = || Array::from_slice(&[0f32], &[1]);
+        let mut map = std::collections::HashMap::new();
+        for side in ["encoder", "decoder"] {
+            for leaf in ["query", "key", "value", "proj_attn"] {
+                for kind in ["weight", "bias"] {
+                    map.insert(format!("{side}.mid_block.attentions.0.{leaf}.{kind}"), t());
+                }
+            }
+        }
+        map.insert(
+            "decoder.mid_block.attentions.0.group_norm.weight".into(),
+            t(),
+        );
+        map.insert("other.attentions.0.to_q.weight".into(), t());
+        map.insert("decoder.conv_in.weight".into(), t());
+        let mut w = Weights::from_map(map);
+        rename_legacy_vae_attention(&mut w);
+        let mut keys: Vec<&str> = w.keys().collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "decoder.conv_in.weight".to_string(),
+            "decoder.mid_block.attentions.0.group_norm.weight".into(),
+            "other.attentions.0.to_q.weight".into(),
+        ];
+        for side in ["encoder", "decoder"] {
+            for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                for kind in ["weight", "bias"] {
+                    want.push(format!("{side}.mid_block.attentions.0.{leaf}.{kind}"));
+                }
+            }
+        }
+        want.sort_unstable();
+        assert_eq!(keys, want);
+    }
+}

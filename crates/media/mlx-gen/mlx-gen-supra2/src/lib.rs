@@ -13,6 +13,7 @@
 pub mod dit;
 pub mod memory_strategy;
 pub mod model;
+pub mod sampling;
 
 pub use dit::SupraDit;
 pub use model::{descriptor, load, Supra2Image, Supra2Output, Supra2Sources, TextConditioning};
