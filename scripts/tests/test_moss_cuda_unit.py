@@ -33,7 +33,7 @@ class SelectArtifactTests(unittest.TestCase):
         self.target = self.dir / "target"
         (self.target / "debug").mkdir(parents=True)
         self.exe = self.target / "debug" / "candle_gen_moss_image-abc"
-        self.exe.write_text("x")
+        self.exe.write_text("x", encoding="utf-8")
 
     def select(self, *lines):
         return unit.select_artifact("\n".join(lines), self.target)
@@ -48,9 +48,9 @@ class SelectArtifactTests(unittest.TestCase):
 
     def test_every_non_matching_or_ambiguous_artifact_fails_closed(self):
         other = self.target / "debug" / "other"
-        other.write_text("x")
+        other.write_text("x", encoding="utf-8")
         outside = self.dir / "elsewhere"
-        outside.write_text("x")
+        outside.write_text("x", encoding="utf-8")
         cases = {
             "no artifact": [],
             "sibling package": [artifact(self.exe, package="path+file:///r/x#candle-gen-moss-image-extra@0.1.0")],
@@ -140,7 +140,7 @@ class SuperviseTests(unittest.TestCase):
         with self.assertRaisesRegex(unit.UnitFailure, "deadline"):
             self.run_child(body, deadline=3.0)
         self.assertTrue(pid_file.exists(), "grandchild never started; the test proved nothing")
-        self.assert_dead(int(pid_file.read_text()))
+        self.assert_dead(int(pid_file.read_text(encoding="utf-8")))
         self.assertFalse(self.owner.alive())
 
     def test_rss_over_the_cap_kills_the_tree(self):
@@ -316,8 +316,8 @@ class Gpu0OccupancyTests(unittest.TestCase):
              mock.patch.object(unit, "supervise") as supervise:
             record = Path(scratch) / "exe"
             exe = Path(scratch) / "t"
-            exe.write_text("x")
-            record.write_text(str(exe))
+            exe.write_text("x", encoding="utf-8")
+            record.write_text(str(exe), encoding="utf-8")
             with self.assertRaisesRegex(unit.UnitFailure, "busy"):
                 unit.run_command(record)
             supervise.assert_not_called()
@@ -347,7 +347,7 @@ class SmokeGateTests(unittest.TestCase):
         self.assertEqual(unit.main(["smoke"]), 1)
         with tempfile.TemporaryDirectory() as scratch:
             record = Path(scratch) / "exe"
-            record.write_text(sys.executable)
+            record.write_text(sys.executable, encoding="utf-8")
             self.assertEqual(unit.main(["run", "--exe-file", str(record)]), 1)
 
     def test_smoke_names_the_existing_windows_job_tests_and_the_owner_tests(self):
@@ -388,7 +388,7 @@ class FixedCommandTests(unittest.TestCase):
     def test_a_missing_executable_record_fails_the_run_command(self):
         with tempfile.TemporaryDirectory() as scratch:
             record = Path(scratch) / "exe"
-            record.write_text(str(Path(scratch) / "absent"))
+            record.write_text(str(Path(scratch) / "absent"), encoding="utf-8")
             self.assertEqual(unit.main(["run", "--exe-file", str(record)]), 1)
 
 

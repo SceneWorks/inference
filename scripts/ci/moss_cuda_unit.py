@@ -108,7 +108,7 @@ class PosixOwner:
 
     def footprint(self) -> int:
         table = subprocess.run(
-            ["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True, check=True, timeout=10
+            ["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True, encoding="utf-8", check=True, timeout=10
         ).stdout
         total = 0
         for row in table.splitlines():
@@ -230,7 +230,7 @@ def smi_path() -> str:
 def smi_query(*args: str) -> str:
     result = subprocess.run(
         [smi_path(), *args, "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
     )
     if result.returncode != 0:
         raise UnitFailure(f"nvidia-smi {args[0]} exited with {result.returncode}")
