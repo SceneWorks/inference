@@ -14,9 +14,10 @@ use candle_gen::gen_core::supra2::{
     TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use candle_gen::gen_core::{
-    self, CancelFlag, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadShape, LoadSpec, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality,
-    ModelDescriptor, OffloadPolicy, PerComponentBytes, Precision, Progress, SizeFloor,
+    self, CancelFlag, Capabilities, GenerationOutput, GenerationReport, GenerationRequest,
+    Generator, Image, LoadShape, LoadSpec, MemoryAssetFacts, MemoryProviderContract,
+    MemoryRunContext, MemorySafetyDecision, Modality, ModelDescriptor, OffloadPolicy,
+    PerComponentBytes, Precision, Progress, SizeFloor, WeightsSource,
 };
 use candle_gen::{CandleError as Error, Result};
 use candle_gen_sdxl::vae_decoder::SdxlVaeDecoder;
@@ -50,6 +51,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: s2::MAX_IMAGES,
             size_floor: SizeFloor::RangeChecked,
             mac_only: false,
+            max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
             ..Default::default()
         },
     }
@@ -163,7 +165,7 @@ pub fn encode_tokens(
 pub struct Supra2Image {
     descriptor: ModelDescriptor,
     spec: LoadSpec,
-    sources: Supra2Sources,
+    config: Supra2Config,
     device: Device,
     tokenizer: Supra2Tokenizer,
     /// `T5EncoderModel::forward` takes `&mut self`; generation is serialized through this lock.
@@ -216,7 +218,7 @@ impl Supra2Image {
         Ok(Self {
             descriptor: descriptor(),
             spec: spec.clone(),
-            sources,
+            config: sources.bundle.manifest.config,
             device,
             tokenizer,
             text_encoder: Mutex::new(text_encoder),
@@ -227,8 +229,46 @@ impl Supra2Image {
         })
     }
 
+    /// **Test seam** — assemble a generator from already-built parts on a non-published
+    /// `config` (the crate's tiny random-weight `tests/`). The registered provider never reaches
+    /// it: [`load`] builds only through [`Supra2Image::load_on_device`], which reads a pinned
+    /// bundle. The memory contract carries the geometry and no byte facts.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        config: Supra2Config,
+        device: Device,
+        tokenizer: Supra2Tokenizer,
+        text_encoder: T5EncoderModel,
+        dit: SupraDit,
+        vae: SdxlVaeDecoder,
+        stored_unconditional: Option<TextConditioning>,
+    ) -> Self {
+        Self {
+            descriptor: descriptor(),
+            spec: LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::new())),
+            config,
+            device,
+            tokenizer,
+            text_encoder: Mutex::new(text_encoder),
+            dit,
+            vae,
+            stored_unconditional,
+            memory: memory_strategy::contract_with_facts(&config, MemoryAssetFacts::default()),
+        }
+    }
+
+    /// **Test seam** — drop the checkpoint-stored unconditional conditioning so CFG takes
+    /// upstream's empty-string fallback on the real checkpoint (`tests/real_weights.rs`). Not
+    /// reachable from the registered provider, whose pinned bundle always stores one.
+    #[doc(hidden)]
+    pub fn without_stored_unconditional(mut self) -> Self {
+        self.stored_unconditional = None;
+        self
+    }
+
     pub fn config(&self) -> &Supra2Config {
-        &self.sources.bundle.manifest.config
+        &self.config
     }
 
     pub fn device(&self) -> &Device {
@@ -439,8 +479,26 @@ impl Generator for Supra2Image {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(request, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("supra2: the render produced no output".into()))
+    }
+
+    /// The render plus a [`s2::PROMPT_TRUNCATED_WARNING`] when the prompt exceeded the
+    /// [`s2::MAX_PROMPT_TOKENS`]-token context (upstream truncates it and logs a warning) — the
+    /// MLX twin's report, field for field.
+    fn generate_with_report(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
         let out = self.generate_with(request, None, on_progress)?;
-        Ok(GenerationOutput::Images(out.images))
+        let mut report = GenerationReport::from_output(GenerationOutput::Images(out.images));
+        report.warnings.extend(s2::prompt_truncated_warning(
+            out.prompt_tokens,
+            self.config.ctx_len,
+        ));
+        Ok(report)
     }
 
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
@@ -493,6 +551,7 @@ mod tests {
             (256, 256)
         );
         assert_eq!(d.capabilities.max_count, 64);
+        assert_eq!(d.capabilities.max_prompt_tokens, Some(128));
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
     }

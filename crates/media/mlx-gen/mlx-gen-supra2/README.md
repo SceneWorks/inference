@@ -33,19 +33,25 @@ LoadSpec::new(WeightsSource::Dir(bundle_dir))
 ```
 
 Load re-verifies the bundle manifest digests and refuses any bundle not converted from the pinned
-checkpoint with the published geometry and component pins (`read_pinned_bundle`), then checks the
+checkpoint with the published geometry and component pins, or whose converted denoiser and stored
+unconditional conditioning are not the pinned conversion (`read_pinned_bundle`), then checks the
 pinned component file sizes and their `config.json` geometry. Footprint/admission queries read the
 same manifest with a sizes-only check (no re-hash). Requests: prompt, `seed` (default 0; image *i* uses `seed + i` through the
 backend-neutral `initial_noise`), `guidance` (default 3.0; CFG only when `> 1`), `steps` (default
 50, uniform Euler flow), `count` (1–64 individual images). Negative prompts, prompt batches,
 conditioning and other sizes are refused. Prompts longer than 128 tokens are truncated exactly as
-the HF tokenizer does (`</s>` kept).
+the HF tokenizer does (`</s>` kept); `generate_with_report` then carries a `prompt_truncated`
+warning (`prompt_tokens=… ctx_len=…`), and the descriptor advertises the limit as
+`Capabilities::max_prompt_tokens` (with the 256×256 geometry as `min_size`/`max_size`).
 
 ## Tests
 
 * `tiny_dit_parity` (default, MLX CPU device): random-weight upstream `SupraDiT` fixture, ≤ 1e-5 rel.
+* `tiny_generator` (default, MLX CPU device): the `Generator` surface on a tiny random-weight
+  pipeline — the truncation warning and cancellation before and during the denoise.
 * `real_weights::*` (`#[ignore]`d; env vars in the file header): Flan-T5, stored conditioning, DiT,
-  VAE and four whole-pipeline trajectories vs torch CPU references from
-  `tools/dump_supra2_reference.py`, plus the registry-path render. `SUPRA2_TEST_DEVICE=cpu` runs
+  VAE and four whole-pipeline trajectories vs the committed torch CPU golden shared with the
+  Candle twin (`tools/dump_supra2_reference.py`), plus the registry-path render and cancellation.
+  Dispatched on Apple Silicon by the `mlx-supra2` job of `real-weights.yml` (`supra2` profile). `SUPRA2_TEST_DEVICE=cpu` runs
   the exact-f32 structural gate; the default Metal run carries Metal's reduced-precision f32 GEMM
   floor in its declared bounds.

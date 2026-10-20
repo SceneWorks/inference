@@ -3207,6 +3207,15 @@ pub struct Capabilities {
     /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
     /// is `false`; the shared floor refuses a `Some` policy otherwise.
     pub supports_caption_overflow_policy: bool,
+    /// The longest prompt, in the model's own text-encoder tokens, that this model conditions on
+    /// (sc-24217). `None` (the `Default`) advertises no limit.
+    ///
+    /// Advisory, like [`supports_preview`](Self::supports_preview): the shared floor does not read
+    /// it and a longer prompt is not refused. The provider truncates it to this many tokens and
+    /// reports that through [`Generator::generate_with_report`] as a [`GenerationWarning`]
+    /// (Supra2-IMG: code `prompt_truncated`, 128 Flan-T5 tokens). The field exists so a consumer can
+    /// size a prompt control or warn before dispatch without a per-model table of its own.
+    pub max_prompt_tokens: Option<u32>,
     /// Whether this model can emit **RGBA** images with a straight alpha channel through
     /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
     ///
