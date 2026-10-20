@@ -377,6 +377,8 @@ class InventoryTests(unittest.TestCase):
         self.assertNotIn("MUST_NOT_PUBLISH", json.dumps(doc))
         self.assertEqual(doc["status"], "CAPTURED")
         self.assertEqual(doc["machine"], "MICHAEL-TRX50")
+        self.assertEqual(doc["probe_pid"], os.getpid())
+        self.assertEqual(doc["probe_parent_pid"], os.getppid())
         self.assertEqual(doc["gpus"]["rows"][0]["free_memory_mib"], 0)
         self.assertEqual(doc["gpus"]["rows"][1]["free_memory_mib"], "UNKNOWN")
         first, second = doc["compute_processes"]["rows"]

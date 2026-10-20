@@ -342,6 +342,7 @@ def inventory_document(query=inventory_query, process_query=inventory_processes)
     document = {
         "schema": 1, "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "machine": machine, "runner": os.environ.get("RUNNER_NAME") or UNKNOWN,
+        "probe_pid": os.getpid(), "probe_parent_pid": os.getppid(),
         "expected_machine": INVENTORY_MACHINE, "source_sha": os.environ.get("GITHUB_SHA") or UNKNOWN,
         "status": "WRONG_MACHINE", "gpus": {"status": UNKNOWN, "rows": []},
         "compute_processes": {"status": UNKNOWN, "rows": []}, "windows_metadata": {"status": UNKNOWN},
