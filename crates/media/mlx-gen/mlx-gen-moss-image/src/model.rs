@@ -741,13 +741,13 @@ mod cpu_tests {
         assert_eq!(*state.select(off, || Ok((0, 0))).unwrap(), (0, 0));
     }
     #[test]
-    fn descriptors_keep_full_native_batch_and_cfg_but_no_reference_or_generic_lora_surface() {
+    fn descriptors_keep_native_batch_cfg_and_transformer_adapters_without_references() {
         for descriptor in [descriptor_base(), descriptor_sft()] {
             assert!(descriptor.capabilities.supports_prompt_batch);
             assert!(descriptor.capabilities.supports_guidance);
             assert!(descriptor.capabilities.supports_negative_prompt);
             assert!(descriptor.capabilities.conditioning.is_empty());
-            assert!(!descriptor.capabilities.supports_lora);
+            assert!(descriptor.capabilities.supports_lora);
             assert!(descriptor
                 .capabilities
                 .validate_request(
