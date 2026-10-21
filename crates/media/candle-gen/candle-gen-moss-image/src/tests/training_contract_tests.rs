@@ -10,8 +10,23 @@ use candle_gen::train::{
 use candle_gen::CandleError;
 use std::collections::BTreeMap;
 
+fn unit_resources() -> Value {
+    serde_json::from_str(include_str!("cuda_unit_resources.json")).unwrap()
+}
+fn unit_fixture(name: &str) -> Value {
+    let resources = unit_resources();
+    let relative = std::path::Path::new(resources["author_fixture_root"].as_str().unwrap());
+    assert!(!relative.is_absolute());
+    assert!(!relative
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir)));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../");
+    serde_json::from_slice(&std::fs::read(root.join(relative).join(name)).unwrap()).unwrap()
+}
+
 fn data(device: &Device, dtype: DType) -> (Transformer, Weights, Tensor, Tensor) {
-    let d = fixture("fixture.json");
+    let d = unit_fixture("fixture.json");
+    let batch = usize::try_from(unit_resources()["batch"].as_u64().unwrap()).unwrap();
     let base = Weights::from_map(
         d["weights"]
             .as_object()
@@ -31,12 +46,12 @@ fn data(device: &Device, dtype: DType) -> (Transformer, Weights, Tensor, Tensor)
     );
     let model = Transformer::load(&base, geometry(&d), None).unwrap();
     let x = tensor(&d["inputs"]["hidden_states"], DType::F32)
-        .narrow(0, 0, 1)
+        .narrow(0, 0, batch)
         .unwrap()
         .to_device(device)
         .unwrap();
     let context = tensor(&d["inputs"]["encoder_hidden_states"], DType::F32)
-        .narrow(0, 0, 1)
+        .narrow(0, 0, batch)
         .unwrap()
         .to_device(device)
         .unwrap();
@@ -44,10 +59,11 @@ fn data(device: &Device, dtype: DType) -> (Transformer, Weights, Tensor, Tensor)
     (model, base, x, context)
 }
 fn config(network_type: NetworkType, dtype: DType) -> TrainingConfig {
+    let resources = unit_resources();
     TrainingConfig {
-        rank: 3,
+        rank: u32::try_from(resources["rank"].as_u64().unwrap()).unwrap(),
         alpha: 0.7,
-        decompose_factor: 2,
+        decompose_factor: i32::try_from(resources["decompose_factor"].as_i64().unwrap()).unwrap(),
         network_type,
         train_dtype: if dtype == DType::BF16 { "bf16" } else { "f32" }.into(),
         seed: 173,
@@ -55,7 +71,12 @@ fn config(network_type: NetworkType, dtype: DType) -> TrainingConfig {
         batch_size: 2,
         gradient_accumulation: 2,
         gradient_checkpointing: false,
-        lora_target_modules: vec!["q".into(), "ffn_up_gate".into(), "ffn_down".into()],
+        lora_target_modules: resources["target_modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect(),
         ..Default::default()
     }
 }
@@ -188,6 +209,7 @@ fn fixture_lineage(path: &std::path::Path) -> Value {
             include_bytes!("../../../candle-gen/src/train/lora.rs"),
         ),
         ("fixture-producer", include_bytes!("training_contract_tests.rs")),
+        ("unit-resources", include_bytes!("cuda_unit_resources.json")),
     ];
     let mut tree = Sha256::new();
     for (name, source) in sources {
@@ -263,7 +285,8 @@ fn native_graph_cases(device: Device) {
                 let mut cfg = config(network, dtype);
                 if dtype == DType::BF16 {
                     let mut selective =
-                        Transformer::load(&base, geometry(&fixture("fixture.json")), None).unwrap();
+                        Transformer::load(&base, geometry(&unit_fixture("fixture.json")), None)
+                            .unwrap();
                     let mut selected = cfg.clone();
                     selected.lora_target_modules = vec!["o".into()];
                     let factors = selective.training_adapter(&selected).unwrap();
@@ -469,7 +492,8 @@ fn native_graph_cases(device: Device) {
                 let spec = adapter_spec(path.clone(), network == NetworkType::Lokr, 1.);
                 let pin = PinnedWeightsFile::pin(&path).unwrap();
                 let mut reloaded =
-                    Transformer::load(&base, geometry(&fixture("fixture.json")), None).unwrap();
+                    Transformer::load(&base, geometry(&unit_fixture("fixture.json")), None)
+                        .unwrap();
                 let reports =
                     crate::adapters::apply(&mut reloaded, variant, &[spec], &[pin]).unwrap();
                 assert_eq!(reports[0].applied, set.len());
@@ -484,8 +508,8 @@ fn native_graph_cases(device: Device) {
                 if dtype == DType::F32 {
                     export_exchange(variant, network, &path, &reloaded, &x, &context);
                 }
-                let bare =
-                    Transformer::load(&base, geometry(&fixture("fixture.json")), None).unwrap();
+                let bare = Transformer::load(&base, geometry(&unit_fixture("fixture.json")), None)
+                    .unwrap();
                 assert!(
                     values(&sampled)
                         .iter()
@@ -494,7 +518,7 @@ fn native_graph_cases(device: Device) {
                     "saved adapter must affect the actual Euler generation graph"
                 );
                 if variant == MossImageVariant::Sft {
-                    let dm = fixture("dmd_fixture.json");
+                    let dm = unit_fixture("dmd_fixture.json");
                     let replacements = Weights::from_map(
                         dm["replacement_tensors"]
                             .as_object()
@@ -558,7 +582,8 @@ fn native_graph_cases(device: Device) {
                 }
                 for strength in [-0.375, 0.] {
                     let mut target =
-                        Transformer::load(&base, geometry(&fixture("fixture.json")), None).unwrap();
+                        Transformer::load(&base, geometry(&unit_fixture("fixture.json")), None)
+                            .unwrap();
                     crate::adapters::apply(
                         &mut target,
                         variant,
@@ -598,7 +623,7 @@ fn import_mlx_exchange(root: &std::path::Path) {
             assert_eq!(record["base_storage"], "f32");
             assert_eq!(record["variant"], variant.provider_id());
             assert_eq!(record["network_type"], method);
-            let f = fixture("fixture.json");
+            let f = unit_fixture("fixture.json");
             let base = weights(&f["weights"], DType::F32);
             let x = tensor(&record["input"], DType::F32);
             let context = tensor(&record["context"], DType::F32);
@@ -672,12 +697,77 @@ fn committed_mlx_cpu_adapters_generate_portably() {
         .join("../../../contracts/gen-core/tests/fixtures/moss_image/portable_adapters");
     import_mlx_exchange(&root);
 }
+fn cuda_uuid_text(bytes: [u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut text = String::from("GPU-");
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        write!(text, "{byte:02x}").unwrap();
+    }
+    text
+}
+fn verify_cuda_uuid(actual: &str, expected: Option<&str>) -> std::result::Result<(), String> {
+    let canonical = |text: &str| {
+        text.len() == 40
+            && text.starts_with("GPU-")
+            && text.as_bytes()[4..].iter().enumerate().all(|(i, byte)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    };
+    if !canonical(actual) {
+        return Err("actual CUDA UUID is malformed".into());
+    }
+    if let Some(expected) = expected {
+        if !canonical(expected) || !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "actual CUDA context UUID {actual} does not match expected {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+#[test]
+fn cuda_uuid_bytes_use_canonical_order_and_reject_mismatches() {
+    let bytes = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let actual = cuda_uuid_text(bytes);
+    assert_eq!(actual, "GPU-00112233-4455-6677-8899-aabbccddeeff");
+    verify_cuda_uuid(&actual, Some(&actual)).unwrap();
+    verify_cuda_uuid(&actual, None).unwrap(); // Existing manual callers need not set a binding.
+    assert!(verify_cuda_uuid(&actual, Some("GPU-ffeeddcc-bbaa-9988-7766-554433221100")).is_err());
+    assert!(verify_cuda_uuid(&actual, Some("GPU-not-a-uuid")).is_err());
+    assert!(verify_cuda_uuid("unknown", None).is_err());
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload() {
     // This is actual CUDA execution, not a CPU oracle or a fallback. CI's CUDA lane owns the GPU.
     let device = Device::new_cuda(0).expect("CUDA lane requires an actual CUDA device");
     assert!(device.is_cuda());
+    let uuid = device
+        .as_cuda_device()
+        .unwrap()
+        .cuda_stream()
+        .context()
+        .uuid()
+        .expect("actual CUDA context UUID is required");
+    let actual = cuda_uuid_text(uuid.bytes.map(|byte| byte as u8));
+    println!("MOSS_CUDA_CONTEXT_UUID={actual}");
+    let expected = std::env::var_os("MOSS_CUDA_UNIT_EXPECTED_GPU_UUID").map(|value| {
+        value
+            .into_string()
+            .expect("expected CUDA UUID must be UTF-8")
+    });
+    verify_cuda_uuid(&actual, expected.as_deref()).expect("CUDA physical identity binding failed");
     native_graph_cases(device);
 }
 

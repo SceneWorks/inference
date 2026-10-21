@@ -4216,6 +4216,31 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertNotIn("inputs.", compile_step["run"] + execute["run"])
 
+    def test_moss_unit_shares_fixture_controls_and_checks_actual_uuid_before_graph(self) -> None:
+        root = WORKFLOW.parents[2]
+        source = (root / "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs").read_text(encoding="utf-8")
+        self.assertIn('include_str!("cuda_unit_resources.json")', source)
+        self.assertIn('resources["rank"]', source)
+        self.assertIn('resources["target_modules"]', source)
+        self.assertIn('unit_resources()["batch"]', source)
+        self.assertIn('resources["author_fixture_root"]', source)
+        head = source.index("fn cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload")
+        body = source[head:source.index("\n}\n", head)]
+        self.assertIn("Device::new_cuda(0)", body)
+        self.assertRegex(body, r"as_cuda_device\(\).*?", "native context must be used")
+        self.assertRegex(body, r"(?s)\.context\(\)\s*\.uuid\(\)")
+        self.assertIn('println!("MOSS_CUDA_CONTEXT_UUID={actual}")', body)
+        self.assertIn('var_os("MOSS_CUDA_UNIT_EXPECTED_GPU_UUID")', body)
+        self.assertIn('verify_cuda_uuid(&actual, expected.as_deref())', body)
+        check = body.index('verify_cuda_uuid(&actual, expected.as_deref())')
+        self.assertLess(check, body.index("native_graph_cases(device)"))
+        supervisor = (root / "scripts/ci/moss_cuda_unit.py").read_text(encoding="utf-8")
+        admission = supervisor[supervisor.index("def require_gpu0_budget("):supervisor.index("def provenance()")]
+        self.assertNotIn("compute-apps", admission)
+        self.assertNotIn("process_name", admission)
+        self.assertIn("read_unit_resources()", admission)
+        self.assertIn('verify_output(output, admission["uuid"])', supervisor)
+
     def test_moss_cuda_unit_is_selected_only_by_its_own_profile(self) -> None:
         run = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["changes"]["steps"]
         select = next(step for step in run if step.get("id") == "select")["run"]

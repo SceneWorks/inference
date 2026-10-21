@@ -1,6 +1,9 @@
 """CPU-only tests for the MOSS CUDA unit supervisor; no Cargo, GPU or model is started."""
 
 import json
+import copy
+import math
+from unittest import mock
 import os
 import sys
 import tempfile
@@ -68,6 +71,19 @@ class SelectArtifactTests(unittest.TestCase):
 
 
 class VerifyOutputTests(unittest.TestCase):
+    def test_actual_uuid_accepts_prefix_interleaved_or_standalone_but_not_missing_duplicate_wrong(self):
+        uuid = "GPU-00112233-4455-6677-8899-aabbccddeeff"
+        marker = f"MOSS_CUDA_CONTEXT_UUID={uuid}"
+        interleaved = OK_OUTPUT.replace(" ... ok", f" ... {marker}\nok")
+        standalone = OK_OUTPUT.replace(" ... ok", f" ... \n{marker}\nok")
+        for valid in (interleaved, standalone):
+            try:
+                unit.verify_output(valid, uuid)
+            except unit.UnitFailure as error:
+                self.fail(f"valid UUID output form was rejected: {error}")
+        for output in (OK_OUTPUT, interleaved + marker + "\n", interleaved.replace(uuid, "GPU-ffeeddcc-bbaa-9988-7766-554433221100"), interleaved.replace(uuid, "GPU-bad"), interleaved.replace(" ... ", "wrong ... ")):
+            with self.assertRaises(unit.UnitFailure): unit.verify_output(output, uuid)
+
     def test_exact_positive_result_passes_whatever_the_filtered_count(self):
         unit.verify_output(OK_OUTPUT)
         unit.verify_output(OK_OUTPUT.replace("41 filtered", "0 filtered"))
@@ -253,75 +269,101 @@ class WindowsOwnerTests(unittest.TestCase):
         self.assert_exited("r")
 
 
-class Gpu0OccupancyTests(unittest.TestCase):
-    GPUS = "0, GPU-aaa\n1, GPU-bbb\n"
+class Gpu0ResourceTests(unittest.TestCase):
+    UUID = "GPU-00112233-4455-6677-8899-aabbccddeeff"
+    OTHER = "GPU-ffeeddcc-bbaa-9988-7766-554433221100"
 
-    def check(self, gpus=GPUS, apps="", fail=None):
-        def query(*args):
-            if fail:
-                raise fail
-            return gpus if "index,uuid" in args[0] else apps
-        unit.require_gpu0_idle(query)
+    def check(self, gpus=None, failure=None):
+        query = mock.Mock(return_value=gpus or f"0, {self.UUID}, 8192, 16384\n1, {self.OTHER}, N/A, N/A\n", side_effect=failure)
+        result = unit.require_gpu0_budget(query)
+        query.assert_called_once_with("--query-gpu=index,uuid,memory.free,memory.total")
+        return result
 
-    def test_idle_or_other_gpu_only_is_admitted(self):
-        self.check()
-        self.check(apps="GPU-bbb, 4242\n")
+    def test_desktop_processes_do_not_define_admission_and_exact_free_floor_passes(self):
+        # WDDM reports DWM/desktop apps in compute-apps. That table is not consulted at all.
+        try:
+            result = self.check()
+        except unit.UnitFailure as error:
+            self.fail(f"valid desktop-compatible resources were refused: {error}")
+        self.assertEqual(result["uuid"], self.UUID)
+        floor = result["budget"]["required_bytes"] // unit.MIB
+        try:
+            self.check(f"0, {self.UUID}, {floor}, 16384\n")
+        except unit.UnitFailure as error:
+            self.fail(f"exact free-VRAM floor was refused: {error}")
+        with self.assertRaisesRegex(unit.UnitFailure, "below unit requirement"):
+            self.check(f"0, {self.UUID}, {floor - 1}, 16384\n")
 
-    def test_gpu0_process_is_refused_without_signalling_it(self):
-        with self.assertRaisesRegex(unit.UnitFailure, "compute process 7"):
-            self.check(apps="GPU-bbb, 4242\nGPU-aaa, 7\n")
+    def test_unknown_malformed_ambiguous_and_insufficient_resource_fail_closed(self):
+        rows = [" ", f"1, {self.OTHER}, 5000, 6000", f"0, {self.UUID}, 5000, 6000\n0, {self.OTHER}, 5000, 6000",
+                f"0, {self.UUID}, 5000, 6000\n1, {self.UUID}, 5000, 6000", "0, GPU-bad, 5000, 6000",
+                f"0, {self.UUID}, N/A, 6000", f"0, {self.UUID}, nan, 6000", f"0, {self.UUID}, inf, 6000",
+                f"0, {self.UUID}, -1, 6000", f"0, {self.UUID}, 7000, 6000", f"0, {self.UUID}, 5000, inf", f"0, {self.UUID}, 5000, N/A", f"0, {self.UUID}, 5000"]
+        for row in rows:
+            with self.subTest(row=row), self.assertRaises(unit.UnitFailure): self.check(row)
+        for failure in (OSError("denied"), RuntimeError("trusted tool unavailable"), unit.subprocess.TimeoutExpired("nvml", 15)):
+            with self.assertRaises(unit.UnitFailure): self.check(failure=failure)
 
-    def test_unreadable_malformed_or_unknown_occupancy_is_refused(self):
-        cases = {
-            "tool error": dict(fail=unit.UnitFailure("nvidia-smi exited with 9")),
-            "os error": dict(fail=FileNotFoundError("nvidia-smi")),
-            "timeout": dict(fail=unit.subprocess.TimeoutExpired("nvidia-smi", 15)),
-            "no gpus": dict(gpus=""),
-            "gpu0 absent": dict(gpus="1, GPU-bbb\n"),
-            "duplicate index": dict(gpus="0, GPU-aaa\n0, GPU-bbb\n"),
-            "bad uuid": dict(gpus="0, nope\n"),
-            "malformed gpu row": dict(gpus="0\n"),
-            "unknown uuid": dict(apps="GPU-zzz, 5\n"),
-            "N/A pid": dict(apps="GPU-bbb, [N/A]\n"),
-            "short app row": dict(apps="GPU-bbb\n"),
-        }
-        for label, kwargs in cases.items():
-            with self.subTest(label), self.assertRaises(unit.UnitFailure):
-                self.check(**kwargs)
+    def test_nonzero_exit_refused_despite_valid_resource_stdout(self):
+        data = f"0, {self.UUID}, 8192, 16384\n"
+        with mock.patch.object(unit, "smi_path", return_value="trusted-nvml"), mock.patch.object(unit.subprocess, "run", return_value=unit.subprocess.CompletedProcess([], 0, stdout=data)) as run:
+            unit.require_gpu0_budget()
+            run.return_value = unit.subprocess.CompletedProcess([], 9, stdout=data)
+            with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"): unit.require_gpu0_budget()
 
-    def test_nonzero_exit_is_refused_even_with_a_valid_idle_inventory_on_stdout(self):
-        from unittest import mock
+    def test_actual_shared_fixture_defines_monotonic_exact_ledger_and_growth(self):
+        resource, fixture, dmd = unit.read_unit_resources()
+        before = unit.derive_unit_budget(resource, fixture, dmd)
+        a = resource["accounting"]
+        expected_transient = a["intermediates_per_block"] * a["retained_passes"] * a["value_adjoint_slots"] * before["blocks"] * a["case_cache_allowance"] * before["largest_tensor_bytes"]
+        self.assertEqual(before["transient_bytes"], expected_transient)
+        self.assertEqual(before["unrounded_bytes"], expected_transient + before["persistent_bytes"])
+        self.assertGreater(before["unrounded_bytes"], 300 * unit.MIB)
+        self.assertGreaterEqual(before["tensor_bytes"], before["unrounded_bytes"])
+        self.assertEqual(before["tensor_bytes"], 512 * unit.MIB)
+        self.assertEqual(before["required_bytes"], before["tensor_bytes"] + 1024 * unit.MIB)
+        # Change the ACTUAL author-fixture input, preserving every shape/value population and
+        # unchanged model weights/config. Spatial growth is valid for this same transformer.
+        grown = copy.deepcopy(fixture)
+        tensor = grown["inputs"]["hidden_states"]
+        tensor["shape"][2] *= 2; tensor["shape"][3] *= 2
+        tensor["values"] *= 4
+        self.assertEqual(len(tensor["values"]), math.prod(tensor["shape"]))
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "actual-author-input.json"
+            path.write_text(json.dumps(grown), encoding="utf-8")
+            after = unit.derive_unit_budget(resource, json.loads(path.read_text(encoding="utf-8")), dmd)
+        self.assertGreater(after["unrounded_bytes"], before["unrounded_bytes"])
+        self.assertGreater(after["required_bytes"], before["required_bytes"])
+        malformed = copy.deepcopy(fixture); malformed["inputs"]["hidden_states"]["shape"][2] *= 2
+        with self.assertRaises(unit.UnitFailure): unit.derive_unit_budget(resource, malformed, dmd)
+        heavier = copy.deepcopy(fixture)
+        heavier["weights"]["accounted_extra"] = {"shape": [1024], "values": [0.] * 1024}
+        self.assertGreater(unit.derive_unit_budget(resource, heavier, dmd)["unrounded_bytes"], before["unrounded_bytes"])
+        higher_rank = dict(resource, rank=resource["rank"] * 2)
+        self.assertGreater(unit.derive_unit_budget(higher_rank, fixture, dmd)["unrounded_bytes"], before["unrounded_bytes"])
 
-        def completed(returncode):
-            def run(argv, **_):
-                out = "0, GPU-aaa\n" if "index,uuid" in argv[1] else ""
-                return unit.subprocess.CompletedProcess(argv, returncode, stdout=out, stderr="boom")
-            return run
+    def test_budget_refusal_precedes_owner_and_spawn(self):
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt")), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu0_budget", side_effect=unit.UnitFailure("insufficient")), mock.patch.object(unit, "WindowsOwner") as owner, mock.patch.object(unit, "supervise") as supervise:
+            record = Path(scratch) / "exe"; exe = Path(scratch) / "t"
+            exe.write_text("x", encoding="utf-8"); record.write_text(str(exe), encoding="utf-8")
+            with self.assertRaisesRegex(unit.UnitFailure, "insufficient"): unit.run_command(record)
+            supervise.assert_not_called(); owner.assert_not_called()
 
-        with mock.patch.object(unit, "smi_path", return_value="nvidia-smi"):
-            with mock.patch.object(unit.subprocess, "run", completed(0)):
-                unit.require_gpu0_idle()  # the same stdout with exit 0 is admitted
-            with mock.patch.object(unit.subprocess, "run", completed(9)):
-                with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"):
-                    unit.require_gpu0_idle()
+    def test_fresh_uuid_binding_is_child_only_and_overrides_inherited_values(self):
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(unit, "os", types.SimpleNamespace(name="nt", environ=dict(os.environ, CUDA_VISIBLE_DEVICES="stale", CUDA_DEVICE_ORDER="FASTEST_FIRST", MOSS_CUDA_UNIT_EXPECTED_GPU_UUID=self.OTHER))), mock.patch.object(unit, "provenance", return_value="x"), mock.patch.object(unit, "require_gpu0_budget", return_value={"uuid": self.UUID, "free_bytes": 9999999999, "budget": {"required_bytes": 1610612736}}), mock.patch.object(unit, "WindowsOwner"), mock.patch.object(unit, "supervise", return_value=OK_OUTPUT.replace(" ... ok", f" ... MOSS_CUDA_CONTEXT_UUID={self.UUID}\nok")) as supervise:
+            record = Path(scratch) / "exe"; exe = Path(scratch) / "t"
+            exe.write_text("x", encoding="utf-8"); record.write_text(str(exe), encoding="utf-8")
+            before = dict(unit.os.environ)
+            unit.run_command(record)
+            self.assertIn("env", supervise.call_args.kwargs)
+            child = supervise.call_args.kwargs["env"]
+            self.assertEqual(child["CUDA_VISIBLE_DEVICES"], self.UUID)
+            self.assertEqual(child["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+            self.assertEqual(child[unit.EXPECTED_UUID_ENV], self.UUID)
+            self.assertEqual(unit.os.environ, before)
 
-    def test_run_checks_occupancy_before_spawning(self):
-        from unittest import mock
 
-        with tempfile.TemporaryDirectory() as scratch, \
-             mock.patch.object(unit, "os", types.SimpleNamespace(name="nt")), \
-             mock.patch.object(unit, "provenance", return_value="x"), \
-             mock.patch.object(unit, "require_gpu0_idle", side_effect=unit.UnitFailure("busy")), \
-             mock.patch.object(unit, "WindowsOwner") as owner, \
-             mock.patch.object(unit, "supervise") as supervise:
-            record = Path(scratch) / "exe"
-            exe = Path(scratch) / "t"
-            exe.write_text("x", encoding="utf-8")
-            record.write_text(str(exe), encoding="utf-8")
-            with self.assertRaisesRegex(unit.UnitFailure, "busy"):
-                unit.run_command(record)
-            supervise.assert_not_called()
-            owner.assert_not_called()
 
 
 class SmokeGateTests(unittest.TestCase):
