@@ -104,19 +104,28 @@ pub(crate) fn text_pack_facts(
         .ok_or_else(|| Error::Msg("sdxl text pack requires positive bits".into()))?;
     let mut points = Vec::new();
     for (path, has_bias) in quantizable_text_paths(cfg) {
-        let linear = crate::quant::linear_from_headers(headers, &path)?;
-        if linear.source_packed_bits.is_some() {
+        // The actual CLIP constructor accepts arbitrary-rank dense weights. Do not route
+        // them through HeaderLinear's matrix-only adapter geometry. Stored packs still pass
+        // the SAME ordinary packed validator (2-D) inside clip_header_linear before no-op.
+        let linear = clip_header_linear(headers, &path, has_bias)?;
+        if linear.bits.is_some() {
             continue;
         } // Exact existing quantize() no-op.
-        let [output, input] = linear.shape.as_slice() else {
-            return Err(Error::Msg("sdxl text pack requires a matrix".into()));
-        };
-        let (output, input) = (
-            u64::try_from(*output).map_err(|_| overflow())?,
-            u64::try_from(*input).map_err(|_| overflow())?,
-        );
+        let shape = &linear.base.base_shape;
+        if shape.len() < 2 {
+            return Err(Error::Msg(
+                "sdxl text pack requires at least two dimensions".into(),
+            ));
+        }
+        let input = u64::try_from(*shape.last().unwrap()).map_err(|_| overflow())?;
+        let output = shape[..shape.len() - 1].iter().try_fold(1u64, |n, &d| {
+            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
+                .ok_or_else(overflow)
+        })?;
         let group = crate::quant::GROUP_SIZE as u64;
-        if output == 0 || input == 0 || input % group != 0 {
+        // Native 096 checks only group divisibility here, not positive row/input extents.
+        // Zero extents remain front-end shape facts, not a claim of successful evaluation.
+        if input % group != 0 {
             return Err(Error::Msg(
                 "sdxl text pack input is not group-aligned".into(),
             ));
@@ -177,8 +186,10 @@ pub(crate) struct ClipPrice {
 }
 
 fn clip_embeddings_scratch(b: i32, n: i32, dim: i32, dtype: Dtype) -> u64 {
-    3 * mlx_gen::ios_quantum::tensor_bytes(crate::quantum::dtype_bytes(dtype),
-        &[b as u64, n as u64, dim as u64])
+    3 * mlx_gen::ios_quantum::tensor_bytes(
+        crate::quantum::dtype_bytes(dtype),
+        &[b as u64, n as u64, dim as u64],
+    )
 }
 
 struct ClipLayerPrice {
@@ -190,30 +201,52 @@ struct ClipLayerPrice {
 }
 
 pub(crate) fn clip_header_tensor(
-    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], name: &str,
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    name: &str,
 ) -> Result<mlx_gen::adapters::facts::TensorFacts> {
-    let header = headers.iter().find(|h| h.name == name)
+    let header = headers
+        .iter()
+        .find(|h| h.name == name)
         .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
-    let shape = header.shape.iter().map(|&d| i32::try_from(d).map_err(|_| Error::Msg(
-        "sdxl CLIP header dimension exceeds native i32".into()))).collect::<Result<Vec<_>>>()?;
+    let shape = header
+        .shape
+        .iter()
+        .map(|&d| {
+            i32::try_from(d)
+                .map_err(|_| Error::Msg("sdxl CLIP header dimension exceeds native i32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(mlx_gen::adapters::facts::TensorFacts {
-        shape, dtype: crate::quant::loaded_header_dtype(headers, header)?, strides: Vec::new(),
+        shape,
+        dtype: crate::quant::loaded_header_dtype(headers, header)?,
+        strides: Vec::new(),
     })
 }
 
 /// Exact shared quant::lin lookup order: ordinary bias first, scales selector, weight + packed
 /// validator, then affine biases. Dense weights gain no new exact-rank/shape/dtype restriction.
 pub(crate) fn clip_header_linear(
-    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], base: &str, biased: bool,
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    base: &str,
+    biased: bool,
 ) -> Result<crate::quantum::LinearWork> {
     use mlx_gen::adapters::LinearFacts;
-    let bias = if biased { Some(clip_header_tensor(headers, &format!("{base}.bias"))?) } else { None };
+    let bias = if biased {
+        Some(clip_header_tensor(headers, &format!("{base}.bias"))?)
+    } else {
+        None
+    };
     let packed = headers.iter().any(|h| h.name == format!("{base}.scales"));
     let weight = clip_header_tensor(headers, &format!("{base}.weight"))?;
     let (weights, shape, bits) = if packed {
         let scales = clip_header_tensor(headers, &format!("{base}.scales"))?;
         let bits = mlx_gen::quant::packed_bits_from_metadata(
-            &weight.shape, weight.dtype, &scales.shape, scales.dtype, crate::quant::GROUP_SIZE)?;
+            &weight.shape,
+            weight.dtype,
+            &scales.shape,
+            scales.dtype,
+            crate::quant::GROUP_SIZE,
+        )?;
         let offsets = clip_header_tensor(headers, &format!("{base}.biases"))?;
         // The shared validator already checked the exact 2-D native packed geometry and overflow.
         let shape = vec![scales.shape[0], scales.shape[1] * crate::quant::GROUP_SIZE];
@@ -223,10 +256,18 @@ pub(crate) fn clip_header_linear(
         (vec![weight], shape, None)
     };
     Ok(crate::quantum::LinearWork {
-        base: LinearFacts { base_shape: shape, is_quantized: bits.is_some(),
-            has_live_adapters: false, adapter_count: 0,
-            bias_shape: bias.as_ref().map(|b| b.shape.clone()) },
-        weights, bias, residuals: Vec::new(), group_size: crate::quant::GROUP_SIZE, bits,
+        base: LinearFacts {
+            base_shape: shape,
+            is_quantized: bits.is_some(),
+            has_live_adapters: false,
+            adapter_count: 0,
+            bias_shape: bias.as_ref().map(|b| b.shape.clone()),
+        },
+        weights,
+        bias,
+        residuals: Vec::new(),
+        group_size: crate::quant::GROUP_SIZE,
+        bits,
     })
 }
 
@@ -234,9 +275,17 @@ impl ClipLayerPrice {
     fn of(layer: &ClipEncoderLayer) -> Self {
         Self {
             ln1_w: mlx_gen::adapters::facts::TensorFacts::of(&layer.ln1_w),
-            projections: [&layer.q, &layer.k, &layer.v, &layer.out, &layer.linear1, &layer.linear2]
-                .map(crate::quantum::LinearWork::of),
-            num_heads: layer.num_heads, head_dim: layer.head_dim,
+            projections: [
+                &layer.q,
+                &layer.k,
+                &layer.v,
+                &layer.out,
+                &layer.linear1,
+                &layer.linear2,
+            ]
+            .map(crate::quantum::LinearWork::of),
+            num_heads: layer.num_heads,
+            head_dim: layer.head_dim,
         }
     }
 
@@ -250,30 +299,46 @@ impl ClipLayerPrice {
         let act = crate::quantum::dtype_bytes(self.output_dtype(x));
         let casts = if act > crate::quantum::dtype_bytes(x) {
             mlx_gen::ios_quantum::tensor_bytes(
-                act, &[3, b as u64, n as u64, self.ln1_w.shape[0] as u64],
-            ).saturating_add(crate::quantum::page_slack(3))
-        } else { 0 };
+                act,
+                &[3, b as u64, n as u64, self.ln1_w.shape[0] as u64],
+            )
+            .saturating_add(crate::quantum::page_slack(3))
+        } else {
+            0
+        };
         casts.saturating_add(crate::quantum::clip_layer_bytes(
-            b, n, self.ln1_w.shape[0] as u64, self.projections[4].output_width(),
-            self.num_heads, self.head_dim, true, act, crate::quantum::backend(),
+            b,
+            n,
+            self.ln1_w.shape[0] as u64,
+            self.projections[4].output_width(),
+            self.num_heads,
+            self.head_dim,
+            true,
+            act,
+            crate::quantum::backend(),
         ))
     }
 }
 
 fn clip_final_scratch(
-    b: i32, n: i32, dim: i32, input: Dtype,
+    b: i32,
+    n: i32,
+    dim: i32,
+    input: Dtype,
     weight: &mlx_gen::adapters::facts::TensorFacts,
     bias: &mlx_gen::adapters::facts::TensorFacts,
     projection: Option<&crate::quantum::LinearWork>,
 ) -> u64 {
     use crate::quantum as q;
-    let normed = Dtype::from_promoting_types(
-        Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
+    let normed =
+        Dtype::from_promoting_types(Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
     let row = mlx_gen::ios_quantum::tensor_bytes(q::dtype_bytes(normed), &[b as u64, dim as u64]);
     let projection = projection.map_or(0, |p| {
-        p.operand_bytes(&[b, dim], normed) + mlx_gen::ios_quantum::tensor_bytes(
-            q::dtype_bytes(p.output_dtype(normed)), &[b as u64, p.output_width()],
-        )
+        p.operand_bytes(&[b, dim], normed)
+            + mlx_gen::ios_quantum::tensor_bytes(
+                q::dtype_bytes(p.output_dtype(normed)),
+                &[b as u64, p.output_width()],
+            )
     });
     let pool = row * n as u64 + row + b as u64 * 4 + projection;
     q::final_norm_bytes_from_metadata(&[b, n, dim], input, weight, bias).max(pool)
@@ -282,11 +347,14 @@ fn clip_final_scratch(
 impl ClipPrice {
     pub(crate) fn from_headers(
         headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
-        prefix: &str, cfg: &ClipTextConfig,
+        prefix: &str,
+        cfg: &ClipTextConfig,
     ) -> Result<Self> {
         // The native safetensors decoder visits all source dtypes before constructor lookups,
         // even unused keys. This is the same decoder acceptance, not an extra precision policy.
-        for header in headers { crate::quant::header_dtype(header.dtype)?; }
+        for header in headers {
+            crate::quant::header_dtype(header.dtype)?;
+        }
         let tensor = |suffix: &str| clip_header_tensor(headers, &format!("{prefix}.{suffix}"));
         let token_embedding = tensor("embeddings.token_embedding.weight")?;
         let position_embedding = tensor("embeddings.position_embedding.weight")?;
@@ -300,26 +368,54 @@ impl ClipPrice {
             clip_header_tensor(headers, &format!("{layer}.layer_norm1.bias"))?;
             clip_header_tensor(headers, &format!("{layer}.layer_norm2.weight"))?;
             clip_header_tensor(headers, &format!("{layer}.layer_norm2.bias"))?;
-            let linear = |index| clip_header_linear(headers,
-                &format!("{layer}.{}", LAYER_LINEAR_NAMES[index]), true);
-            layers.push(ClipLayerPrice { ln1_w,
-                projections: [linear(0)?, linear(1)?, linear(2)?, linear(3)?, linear(4)?, linear(5)?],
-                num_heads: cfg.num_heads, head_dim });
+            let linear = |index| {
+                clip_header_linear(
+                    headers,
+                    &format!("{layer}.{}", LAYER_LINEAR_NAMES[index]),
+                    true,
+                )
+            };
+            layers.push(ClipLayerPrice {
+                ln1_w,
+                projections: [
+                    linear(0)?,
+                    linear(1)?,
+                    linear(2)?,
+                    linear(3)?,
+                    linear(4)?,
+                    linear(5)?,
+                ],
+                num_heads: cfg.num_heads,
+                head_dim,
+            });
         }
         let final_ln_w = tensor("final_layer_norm.weight")?;
         let final_ln_b = tensor("final_layer_norm.bias")?;
         let text_projection = if cfg.projection_dim.is_some() {
             Some(clip_header_linear(headers, TEXT_PROJECTION, false)?)
-        } else { None };
-        Ok(Self { token_embedding, position_embedding, layers, final_ln_w, final_ln_b, text_projection })
+        } else {
+            None
+        };
+        Ok(Self {
+            token_embedding,
+            position_embedding,
+            layers,
+            final_ln_w,
+            final_ln_b,
+            text_projection,
+        })
     }
 
     /// Both encoder constructors precede this pair's ordered pack, exactly as the actual loader.
     pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         for layer in &mut self.layers {
-            for projection in &mut layer.projections { projection.pack(bits)?; }
+            for projection in &mut layer.projections {
+                projection.pack(bits)?;
+            }
         }
-        if let Some(projection) = &mut self.text_projection { projection.pack(bits)?; }
+        if let Some(projection) = &mut self.text_projection {
+            projection.pack(bits)?;
+        }
         Ok(())
     }
 
@@ -330,23 +426,49 @@ impl ClipPrice {
         }
     }
 
-    pub(crate) fn price_forward(&self, b: i32, n: i32, out: &mut crate::quantum::Quanta) -> (Dtype, Dtype) {
+    pub(crate) fn price_forward(
+        &self,
+        b: i32,
+        n: i32,
+        out: &mut crate::quantum::Quanta,
+    ) -> (Dtype, Dtype) {
         let dim = self.token_embedding.shape[1];
-        out.push((crate::quantum::CLIP_EMBEDDINGS,
-            clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype)));
-        let mut x = Dtype::from_promoting_types(self.token_embedding.dtype, self.position_embedding.dtype);
+        out.push((
+            crate::quantum::CLIP_EMBEDDINGS,
+            clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype),
+        ));
+        let mut x =
+            Dtype::from_promoting_types(self.token_embedding.dtype, self.position_embedding.dtype);
         let mut hidden_states = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             out.push((crate::quantum::CLIP_LAYER, layer.quantum_scratch(b, n, x)));
             x = layer.output_dtype(x);
             hidden_states.push(x);
         }
-        out.push((crate::quantum::CLIP_POOLED, clip_final_scratch(
-            b, n, dim, x, &self.final_ln_w, &self.final_ln_b, self.text_projection.as_ref())));
+        out.push((
+            crate::quantum::CLIP_POOLED,
+            clip_final_scratch(
+                b,
+                n,
+                dim,
+                x,
+                &self.final_ln_w,
+                &self.final_ln_b,
+                self.text_projection.as_ref(),
+            ),
+        ));
         let normed = Dtype::from_promoting_types(
-            Dtype::from_promoting_types(x, self.final_ln_w.dtype), self.final_ln_b.dtype);
-        let pooled = self.text_projection.as_ref().map_or(normed, |p| p.output_dtype(normed));
-        let penultimate = hidden_states.len().checked_sub(2).map_or(x, |i| hidden_states[i]);
+            Dtype::from_promoting_types(x, self.final_ln_w.dtype),
+            self.final_ln_b.dtype,
+        );
+        let pooled = self
+            .text_projection
+            .as_ref()
+            .map_or(normed, |p| p.output_dtype(normed));
+        let penultimate = hidden_states
+            .len()
+            .checked_sub(2)
+            .map_or(x, |i| hidden_states[i]);
         (penultimate, pooled)
     }
 
@@ -355,7 +477,10 @@ impl ClipPrice {
         let mut result = Vec::new();
         for (index, layer) in self.layers.iter().enumerate() {
             for (name, facts) in LAYER_LINEAR_NAMES.iter().zip(&layer.projections) {
-                result.push((format!("text_model.encoder.layers.{index}.{name}"), facts.clone()));
+                result.push((
+                    format!("text_model.encoder.layers.{index}.{name}"),
+                    facts.clone(),
+                ));
             }
         }
         if let Some(projection) = &self.text_projection {
@@ -762,7 +887,10 @@ impl ClipTextEncoder {
             layers: self.layers.iter().map(ClipLayerPrice::of).collect(),
             final_ln_w: TensorFacts::of(&self.final_ln_w),
             final_ln_b: TensorFacts::of(&self.final_ln_b),
-            text_projection: self.text_projection.as_ref().map(crate::quantum::LinearWork::of),
+            text_projection: self
+                .text_projection
+                .as_ref()
+                .map(crate::quantum::LinearWork::of),
         }
     }
 
@@ -770,9 +898,18 @@ impl ClipTextEncoder {
     /// metadata crosses into the common formula; actual normalization/projection graphs are intact.
     fn final_scratch(&self, b: i32, n: i32, input: Dtype) -> u64 {
         use mlx_gen::adapters::facts::TensorFacts;
-        clip_final_scratch(b, n, self.token_embedding.shape()[1], input,
-            &TensorFacts::of(&self.final_ln_w), &TensorFacts::of(&self.final_ln_b),
-            self.text_projection.as_ref().map(crate::quantum::LinearWork::of).as_ref())
+        clip_final_scratch(
+            b,
+            n,
+            self.token_embedding.shape()[1],
+            input,
+            &TensorFacts::of(&self.final_ln_w),
+            &TensorFacts::of(&self.final_ln_b),
+            self.text_projection
+                .as_ref()
+                .map(crate::quantum::LinearWork::of)
+                .as_ref(),
+        )
     }
 
     /// Run the encoder over `input_ids` `[B, N]` (int32). Returns the last hidden state, the
@@ -802,16 +939,17 @@ impl ClipTextEncoder {
 
         // Token + position embeddings. `position_embedding.weight[:N]` broadcast over the batch.
         // Counted: the gathered tokens, the gathered positions and the sum.
-        let mut x = mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, embeddings_scratch, || {
-            let ids_flat = input_ids.reshape(&[b * n])?;
-            let tok = self
-                .token_embedding
-                .take_axis(&ids_flat, 0)?
-                .reshape(&[b, n, dim])?;
-            let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-            let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
-            Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
-        })?;
+        let mut x =
+            mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, embeddings_scratch, || {
+                let ids_flat = input_ids.reshape(&[b * n])?;
+                let tok = self
+                    .token_embedding
+                    .take_axis(&ids_flat, 0)?
+                    .reshape(&[b, n, dim])?;
+                let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+                let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
+                Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
+            })?;
 
         let mask = causal_mask(n, x.dtype())?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
@@ -924,5 +1062,98 @@ mod tests {
         assert_eq!(s[5], -1e9);
         assert_eq!(s[6], 0.0);
         assert_eq!(s[8], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod text_pack_rank_tests {
+    use super::*;
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as Header};
+
+    fn cfg() -> ClipTextConfig {
+        // Isolate the pack inventory to its one bias-free projection. This is a metadata
+        // pack test, NOT a zero-layer full-forward acceptance fixture.
+        ClipTextConfig {
+            num_layers: 0,
+            model_dims: 64,
+            num_heads: 1,
+            max_length: 8,
+            vocab_size: 4,
+            projection_dim: Some(5),
+            hidden_act: ClipActivation::Gelu,
+        }
+    }
+    fn header(name: &str, shape: &[usize], dtype: Stored) -> Header {
+        Header {
+            name: name.into(),
+            shape: shape.to_vec(),
+            dtype,
+            data_bytes: shape.iter().product::<usize>() as u64 * dtype.size() as u64,
+        }
+    }
+    #[test]
+    fn dense_text_pack_preserves_all_leading_axes_in_q4_q8_header_bytes_host() {
+        // Independent literal counts: rank3 rows15*N64; rank4 rows30*N64. Each packed
+        // companion is one BF16 element per64-weight group. No shared pack helper oracle.
+        for (shape, initial, q4_data, q4_retained, q8_data, q8_retained) in [
+            (vec![3, 5, 64], 1920, 2460, 540, 2940, 1020),
+            (vec![2, 3, 5, 64], 3840, 4920, 1080, 5880, 2040),
+            (vec![1, 64, 64], 8192, 10496, 2304, 12544, 4352),
+        ] {
+            let headers = [header("text_projection.weight", &shape, Stored::F32)];
+            for (bits, data, retained) in [(4, q4_data, q4_retained), (8, q8_data, q8_retained)] {
+                let facts = text_pack_facts(&headers, &cfg(), Some(bits)).unwrap();
+                assert_eq!(facts.points.len(), 1);
+                assert_eq!(facts.points[0].before_resident, initial);
+                assert_eq!(
+                    facts.points[0].scratch,
+                    data + 5 * crate::quantum::PAGE_BYTES
+                );
+                assert_eq!(facts.retained, retained);
+            }
+        }
+    }
+    #[test]
+    fn text_pack_rank_generalization_does_not_relax_stored_pack_validator_host() {
+        let cfg = cfg();
+        let bad_rank = [header("text_projection.weight", &[64], Stored::F32)];
+        assert!(text_pack_facts(&bad_rank, &cfg, Some(4))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("at least two"));
+        let bad_group = [header("text_projection.weight", &[2, 3, 65], Stored::F32)];
+        assert!(text_pack_facts(&bad_group, &cfg, Some(8))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("group-aligned"));
+        let stored = [
+            header("text_projection.weight", &[1, 5, 8], Stored::U32),
+            header("text_projection.scales", &[1, 5, 1], Stored::BF16),
+            header("text_projection.biases", &[1, 5, 1], Stored::BF16),
+        ];
+        assert!(text_pack_facts(&stored, &cfg, Some(4))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("2-D"));
+        let stored = [
+            header("text_projection.weight", &[5, 8], Stored::U32),
+            header("text_projection.scales", &[5, 1], Stored::BF16),
+            header("text_projection.biases", &[5, 1], Stored::BF16),
+        ];
+        let facts = text_pack_facts(&stored, &cfg, Some(8)).unwrap();
+        assert!(
+            facts.points.is_empty(),
+            "already-packed ordinary loads remain no-op even when requested bits differ here"
+        );
+        assert_eq!(facts.retained, 180);
+        // Native quantize front-end permits zero group-aligned extents. Do not invent a
+        // metadata refusal before it; CPU/Metal evaluation viability is NOT asserted here.
+        let empty = [header("text_projection.weight", &[5, 0], Stored::F32)];
+        let facts = text_pack_facts(&empty, &cfg, Some(4)).unwrap();
+        assert_eq!(facts.points[0].scratch, 5 * crate::quantum::PAGE_BYTES);
+        assert_eq!(facts.retained, 0);
     }
 }

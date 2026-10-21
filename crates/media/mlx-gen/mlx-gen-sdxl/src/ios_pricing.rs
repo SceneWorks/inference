@@ -1,38 +1,28 @@
-//! SDXL-family header-only iOS pricing (epic 16774): the per-phase COUNTED price of one request —
-//! the component bytes resident in each phase under the request's regime plus the phase's largest
-//! counted quantum — built from the SAME formulas the `ios_quantum` guards check.
+//! SDXL-family source-owned counted/logical iOS pricing (epic16774).
 //!
-//! [`ios_pricing`] constructs CLIP pricing entirely from tensor headers and the load-time cast
-//! policy. UNet/ControlNet/VAE construction and activation walks are also pure metadata; only
-//! the IP image encoder/Resampler still use lazy native weight/model graphs
-//! and walk the request's execution with each module's own guard formulas
-//! (`price_forward` / `price_encode` / `price_decode` beside every guarded forward), over
-//! shape-only activations. Load floors and resident bytes are the loaders' header-only floors
-//! (`loader::cast_load_parts`). So the table a device capture is scaled by and the guards the
-//! runtime checks cannot drift: `quantum_tests::pricing` runs the real pipeline under the CPU
-//! diagnostic observer and asserts, per phase, that the largest checked scratch IS the priced one.
+//! Component constructors and activation walks use header facts, never native shape models.
+//! Directory and collision-equivalent Fused sources retain their distinct load recipes;
+//! normalized Fused headers come from the full actual remapper/IR, not a synthetic directory.
+//! The full source-context replay gate is preserved separately from these pricing mechanisms.
 //!
-//! The regime is the request's [`GenerationMemory`] (the selection's `generation_memory`, as the
-//! catalog writes it onto the request): rung 1 (`stage_residency`) sheds the text encoders before
-//! the heavy load, the IP-Adapter image encoder and Resampler once the image prompt is encoded
-//! (`model::sheds_ip_image_encoder`) and the U-Net / ControlNet / IP state before the decode; rung 2 tiles the decode (and the init-image encode) at its tile
-//! edge; rung 4 streams the U-Net's transformer blocks — and a streamable load (iOS's
-//! `DeferredMaterialization` over a snapshot whose U-Net stays lazy) streams them on EVERY request,
-//! each block read inside its own priced quantum, so the U-Net's resident bytes are its non-block
-//! remainder whichever rung is selected. Guided requests are priced with classifier-free guidance
-//! on (the larger of the two shapes) at the request's CFG batching.
-//!
-//! Beside the components, each phase's resident bytes carry the request tensors it holds: the input
-//! images while their encode runs (and, staged, from their upload after the last load —
-//! `REQUEST_INPUTS`), and across the whole denoise the f32 init latent (inpaint: its noise and
-//! mask), each ControlNet embedding and the residual stack its forward hands the U-Net, and the IP
-//! tokens. The heavy bundle's load-time Q4/Q8 pack is priced per projection
-//! (`quantum::LOAD_QUANTIZE`), and a packed ControlNet's resident bytes page-rounded as the
-//! allocator holds them.
-//!
-//! Not priced (a typed refusal, never a silent under-price): adapter (LoRA/LoKr/LoHa) installs, the
-//! PiD decoder, a fused single-file (LDM) source, and a sealed geometry decode policy.
+//! Logical/source requested work is not native backing size or physical process growth.
+//! Fused source/view transfer remains explicitly unbound. General non-equivalent Fused aliases,
+//! configured adapters, PiD/sealed coverage and complete source-host/physical proofs remain
+//! mandatory same-story work; this module does not certify their completion.
 
+use crate::config::{ClipTextConfig, UNetConfig, VaeConfig};
+use crate::ip_adapter::pricing::{IpImageEncoderFacts, ResamplerFacts, VisionFacts};
+use crate::ip_adapter::ResamplerConfig;
+use crate::quantum::{self as q, Backend, Quanta};
+use crate::sampling::{
+    ReferenceImageFacts, ResolvedSampling, SamplingRecipe, SamplingRoute, SamplingWorkFacts,
+};
+use crate::text_encoder::ClipPrice;
+use crate::unet::pricing::{
+    tensor as price_tensor, tensor_bytes as price_bytes, ControlFacts, FactView, UNetFacts,
+};
+use crate::vae::pricing::AutoencoderFacts;
+use crate::vision_encoder::VisionConfig;
 use mlx_gen::adapters::facts::TensorFacts as PriceTensor;
 use mlx_gen::gen_core::{CfgBatching, GenerationMemory, LoadSpec, MemoryMode, WeightsSource};
 use mlx_gen::ios_pricing::{
@@ -42,17 +32,6 @@ use mlx_gen::ios_pricing::{
 use mlx_gen::{Error, Result};
 use mlx_rs::Dtype;
 use std::path::{Path, PathBuf};
-
-use crate::config::{ClipTextConfig, UNetConfig, VaeConfig};
-use crate::ip_adapter::{IpImageEncoder, ResamplerConfig};
-use crate::quantum::{self as q, Backend, Quanta};
-use crate::sampling::{ResolvedSampling, SamplingRecipe, SamplingRoute, SamplingWorkFacts};
-use crate::text_encoder::ClipPrice;
-use crate::unet::pricing::{
-    tensor as price_tensor, tensor_bytes as price_bytes, ControlFacts, FactView, UNetFacts,
-};
-use crate::vae::pricing::AutoencoderFacts;
-use crate::vision_encoder::VisionConfig;
 
 /// Every quantum label this crate checks (`ios_quantum::{run, before, before_load*}`) and the phase
 /// it runs in. A device capture attributes its kernel peak through [`ios_quantum_phase`].
@@ -393,6 +372,9 @@ pub fn ios_bounder(
     let requested = Regime::from_request(request)?;
     let anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
     let request_inputs = Inputs::from_spec(request.spec, &requested)?;
+    if anchor_inputs.fused.is_some() || request_inputs.fused.is_some() {
+        return Err(Error::Unsupported("sdxl fused source/view native backing transfer remains unbound; logical parents are not physical certificates".into()));
+    }
     if anchor_request.execution != request.execution
         || anchor_request.spec.load_shape != request.spec.load_shape
         || anchor_request.spec.offload_policy != request.spec.offload_policy
@@ -838,6 +820,11 @@ pub(crate) struct Regime {
     pub tiling: Option<mlx_gen::tiling::TilingConfig>,
     /// The text memory's token count (CLIP windows x 77).
     pub context_tokens: i32,
+    /// Raw IP scalar follows actual Reference override/global/default semantics, not init clamp.
+    pub ip_scale: f32,
+    /// Exact actual source facts, never the output/CLIP crop geometry. None only outside IP or
+    /// legacy non-executed contexts; a live/captured IP price requires Some supplied actual facts.
+    pub reference_image: Option<ReferenceImageFacts>,
 }
 
 impl Regime {
@@ -859,21 +846,10 @@ impl Regime {
                 "sdxl pricing generation and admitted geometry/count differ".into(),
             ));
         }
-        // The current descriptor's closed carrier set is Reference/Mask/Control. Unknown
-        // carriers must not be silently scored as zero or reinterpreted as an init reference.
-        if generation.conditioning.iter().any(|role| {
-            !matches!(
-                role,
-                mlx_gen::Conditioning::Reference { .. }
-                    | mlx_gen::Conditioning::Mask { .. }
-                    | mlx_gen::Conditioning::Control { .. }
-            )
-        }) {
-            return Err(Error::Unsupported(
-                "sdxl pricing has an unclassified conditioning carrier".into(),
-            ));
-        }
         let work = SamplingWorkFacts::from_request(generation);
+        // Same source extraction order as generate; metadata only, no media allocation/validation.
+        crate::model::reference_inputs(generation)?;
+        crate::model::mask_input(generation)?;
         if work
             .reference_count
             .checked_add(work.mask_count)
@@ -884,6 +860,8 @@ impl Regime {
                 "sdxl pricing generation and admitted aggregate image counts differ".into(),
             ));
         }
+        // Control Some(x), including0, is multiplied after as_dtype(x.dtype()) with no branch
+        // skip. Its value stays in actual full-work binding; count/shape/dtype determine this cost.
         Self::from_resolved(req, sampling, generation.count, work)
     }
 
@@ -922,6 +900,13 @@ impl Regime {
                 "sdxl pricing count is outside the declared serial-output domain".into(),
             ));
         }
+        crate::model::validate_image_roles(
+            sampling.sampler_name(),
+            sampling.route().is_acceleration(),
+            sampling.route().is_curated(),
+            work.reference_count != 0,
+            work.mask_count != 0,
+        )?;
         let has_reference = work.reference_count != 0;
         let ip = crate::model::uses_ip_reference(
             req.spec.ip_adapter.is_some(),
@@ -946,10 +931,21 @@ impl Regime {
         Route::from_mode(req.mode)?;
         let loaded_controls =
             usize::from(req.spec.control.is_some()) + req.spec.extra_controls.len();
-        if work.control_count != 0 && work.control_count != loaded_controls {
+        if !crate::model::control_count_matches_loaded(work.control_count, loaded_controls) {
             return Err(Error::Unsupported(
                 "sdxl pricing Control conditioning count differs from loaded branches".into(),
             ));
+        }
+        crate::model::validate_control_roles(
+            sampling.sampler_name(),
+            req.generation
+                .map_or(Some(sampling.guidance()), |generation| generation.guidance),
+            work.control_count,
+            loaded_controls,
+            work.mask_count != 0,
+        )?;
+        if route == Route::IpAdapter && work.reference_image.is_none() {
+            return Err(Error::Unsupported("sdxl IP pricing needs actual ReferenceImageFacts; missing legacy source facts are not crop geometry".into()));
         }
         let has_init = has_reference && !ip && !sampling.route().is_acceleration();
         if !req.geometry.width.is_multiple_of(8) || !req.geometry.height.is_multiple_of(8) {
@@ -989,9 +985,12 @@ impl Regime {
             ));
         }
         let windows = (req.token_window as i32).max(77);
+        let ip_scale = sampling.effective_ip_scale();
         Ok(Self {
             route,
             sampling,
+            ip_scale,
+            reference_image: work.reference_image,
             count,
             has_init,
             width: req.geometry.width as i32,
@@ -1062,8 +1061,17 @@ impl Regime {
     }
 }
 
+/// Fused source facts and deferred optional sources. Optional source resolution stays at the
+/// native heavy-loader point, after both CLIP constructors/pack and the U-Net constructor.
+pub(crate) struct FusedInputs {
+    source: crate::ldm::pricing::FusedHeaderSource,
+    vae_fix: Option<WeightsSource>,
+    ip_source: Option<WeightsSource>,
+}
+
 /// The files and load facts one request's components come from.
 pub(crate) struct Inputs {
+    pub fused: Option<FusedInputs>,
     pub arch: Architecture,
     pub te1: PathBuf,
     pub te2: PathBuf,
@@ -1092,10 +1100,16 @@ impl Inputs {
     }
 
     fn from_spec(spec: &LoadSpec, regime: &Regime) -> Result<Self> {
-        let WeightsSource::Dir(root) = &spec.weights else {
-            return Err(Error::Unsupported(
-                "sdxl ios pricing: a fused single-file (LDM) source is not priced".into(),
-            ));
+        let root = match &spec.weights {
+            WeightsSource::Dir(root) => root,
+            WeightsSource::File(file) => {
+                if spec.precision != mlx_gen::gen_core::Precision::Bf16 {
+                    return Err(Error::Msg(
+                        "sdxl: precision override is not wired; the dense path runs fp16".into(),
+                    ));
+                }
+                file
+            }
         };
         if !spec.adapters.is_empty() {
             return Err(Error::Unsupported(
@@ -1125,18 +1139,38 @@ impl Inputs {
                 "sdxl ios pricing: an IP-Adapter request needs a loaded IP-Adapter".into(),
             ));
         }
+        let fused = match &spec.weights {
+            WeightsSource::Dir(_) => None,
+            WeightsSource::File(file) => Some(FusedInputs {
+                source: crate::ldm::pricing::FusedHeaderSource::read(file)?,
+                vae_fix: spec
+                    .components
+                    .get(crate::loader::VAE_FP16_FIX_COMPONENT)
+                    .cloned(),
+                ip_source: spec.ip_adapter.clone(),
+            }),
+        };
         let dtype = crate::model::DTYPE;
-        let resolve =
-            |sub: &str, stem: &str| crate::loader::resolve_weight_file(root, sub, stem, dtype);
-        let vae = match spec.components.get(crate::loader::VAE_FP16_FIX_COMPONENT) {
-            Some(source) => (
-                crate::loader::resolve_vae_fp16_fix_file(source)?,
-                crate::loader::VAE_FP16_FIX_DTYPE,
-            ),
-            None => (
-                crate::loader::resolve_vae_weight_file(root)?,
-                Dtype::Float32,
-            ),
+        let resolve = |sub: &str, stem: &str| {
+            if fused.is_some() {
+                Ok(root.clone())
+            } else {
+                crate::loader::resolve_weight_file(root, sub, stem, dtype)
+            }
+        };
+        let vae = if fused.is_some() {
+            (root.clone(), Dtype::Float32)
+        } else {
+            match spec.components.get(crate::loader::VAE_FP16_FIX_COMPONENT) {
+                Some(source) => (
+                    crate::loader::resolve_vae_fp16_fix_file(source)?,
+                    crate::loader::VAE_FP16_FIX_DTYPE,
+                ),
+                None => (
+                    crate::loader::resolve_vae_weight_file(root)?,
+                    Dtype::Float32,
+                ),
+            }
         };
         let controls = spec
             .control
@@ -1146,20 +1180,27 @@ impl Inputs {
                 WeightsSource::File(path) | WeightsSource::Dir(path) => path.clone(),
             })
             .collect();
-        let ip = match &spec.ip_adapter {
-            Some(WeightsSource::Dir(dir)) => Some(crate::loader::resolve_ip_adapter_files(dir)?),
-            Some(WeightsSource::File(_)) => {
-                return Err(Error::Unsupported(
-                    "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
-                ))
+        let ip = if fused.is_some() {
+            None
+        } else {
+            match &spec.ip_adapter {
+                Some(WeightsSource::Dir(dir)) => {
+                    Some(crate::loader::resolve_ip_adapter_files(dir)?)
+                }
+                Some(WeightsSource::File(_)) => {
+                    return Err(Error::Unsupported(
+                        "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
+                    ))
+                }
+                None => None,
             }
-            None => None,
         };
         Ok(Self {
-            arch: Architecture::sdxl(),
             te1: resolve("text_encoder", "model")?,
             te2: resolve("text_encoder_2", "model")?,
             unet: resolve("unet", "diffusion_pytorch_model")?,
+            fused,
+            arch: Architecture::sdxl(),
             vae,
             controls,
             ip,
@@ -1219,15 +1260,16 @@ fn collect_pack_effect(
     Ok(())
 }
 
-/// Text/UNet/ControlNet/VAE are metadata; IP still has native lazy shape models.
+/// Every served component here is metadata; native execution remains in the actual loaders.
 /// All footprints are header-only. The heavy pack collector
 /// below is metadata-only and never quantizes/evaluates those graphs to discover pricing.
 pub(crate) struct Priced {
+    fused: Option<FusedLoadFacts>,
     te: (ClipPrice, ClipPrice),
     unet: UNetFacts,
     vae: AutoencoderFacts,
     controls: Vec<ControlFacts>,
-    ip: Option<IpImageEncoder>,
+    ip: Option<IpImageEncoderFacts>,
     /// Pre-pack read/cast floors and declared owners, including TE1 while TE2 is loaded.
     pub te_bytes: [Footprint; 2],
     /// Pure-header post-pack declared owners and per-projection coincident raw budgets.
@@ -1257,6 +1299,40 @@ pub(crate) struct Priced {
 fn footprint(files: &[PathBuf], dtype: Dtype, keep: impl Fn(&str) -> bool) -> Result<Footprint> {
     let (resident, floor) = crate::loader::cast_load_parts(files, dtype, true, keep)?;
     Ok(Footprint { resident, floor })
+}
+
+/// Source-parent terms stay logical and unclassified by the Directory physical bounder.
+/// No source/view logical product establishes a native backing size or retirement time.
+struct FusedLoadFacts {
+    text_floor: u64,
+    heavy_floor: u64,
+    text_parents: u64,
+    heavy_parents: u64,
+    external_vae: bool,
+    native_backing: FusedNativeBacking,
+}
+#[derive(Clone, Copy)]
+enum FusedNativeBacking {
+    Unbound,
+}
+fn fused_header_footprint(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    dtype: Dtype,
+    all_cast: bool,
+) -> Result<Footprint> {
+    let mut resident = 0u64;
+    for header in headers {
+        let loaded = if all_cast {
+            dtype
+        } else {
+            crate::quant::loaded_header_dtype(headers, header)?
+        };
+        let bytes = header
+            .materialized_bytes(q::dtype_bytes(loaded))
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        resident = resident.saturating_add(mlx_gen::ios_quantum::allocated_bytes(bytes));
+    }
+    Ok(Footprint { resident, floor: 0 })
 }
 
 /// The sinusoid tables a ControlNet constructor builds beside its file's tensors (the timestep and
@@ -1298,14 +1374,26 @@ impl Priced {
             mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
                 .map_err(|e| Error::Msg(e.to_string()))
         };
-        let te1_headers = headers(&inputs.te1)?;
+        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        let component_headers = |file: &Path, component: C| match &inputs.fused {
+            Some(fused) => Ok(fused.source.headers(component)),
+            None => headers(file),
+        };
+        let te1_headers = component_headers(&inputs.te1, C::ClipL)?;
         let mut te1 = ClipPrice::from_headers(&te1_headers, "text_model", &arch.te1)?;
-        let te2_headers = headers(&inputs.te2)?;
+        let te2_headers = component_headers(&inputs.te2, C::ClipBigG)?;
         let mut te2 = ClipPrice::from_headers(&te2_headers, "text_model", &arch.te2)?;
-        let te_bytes = [
-            footprint(&one(&inputs.te1), dtype, |_| true)?,
-            footprint(&one(&inputs.te2), dtype, |_| true)?,
-        ];
+        let te_bytes = if inputs.fused.is_some() {
+            [
+                fused_header_footprint(&te1_headers, dtype, false)?,
+                fused_header_footprint(&te2_headers, dtype, false)?,
+            ]
+        } else {
+            [
+                footprint(&one(&inputs.te1), dtype, |_| true)?,
+                footprint(&one(&inputs.te2), dtype, |_| true)?,
+            ]
+        };
         let te_pack = [
             crate::text_encoder::text_pack_facts(&te1_headers, &arch.te1, inputs.text_quant_bits)?,
             crate::text_encoder::text_pack_facts(&te2_headers, &arch.te2, inputs.text_quant_bits)?,
@@ -1317,20 +1405,57 @@ impl Priced {
             te2.quantize(bits)?;
         }
 
-        let unet_headers = headers(&inputs.unet)?;
+        let unet_headers = component_headers(&inputs.unet, C::Unet)?;
         let mut unet = UNetFacts::from_headers(&unet_headers, &arch.unet)?;
-        let (resident, floor) = crate::loader::unet_load_parts(
-            &one(&inputs.unet),
-            dtype,
-            true,
-            inputs.streamable,
-            &arch.unet,
-        )?;
-        let unet_bytes = Footprint { resident, floor };
+        let unet_bytes = if inputs.fused.is_some() {
+            let mut load = fused_header_footprint(&unet_headers, dtype, false)?;
+            use crate::unet::SinusoidalPositionalEncoding as Sinusoid;
+            load.resident = load
+                .resident
+                .saturating_add(Sinusoid::timestep_table_bytes(
+                    arch.unet.block_out_channels[0],
+                ))
+                .saturating_add(Sinusoid::timestep_table_bytes(
+                    arch.unet.addition_time_embed_dim.unwrap_or(256),
+                ));
+            load
+        } else {
+            let (resident, floor) = crate::loader::unet_load_parts(
+                &one(&inputs.unet),
+                dtype,
+                true,
+                inputs.streamable,
+                &arch.unet,
+            )?;
+            Footprint { resident, floor }
+        };
 
-        let (vae_file, vae_dtype) = &inputs.vae;
-        let vae = AutoencoderFacts::from_headers(&headers(vae_file)?, &arch.vae, *vae_dtype)?;
-        let vae_bytes = footprint(&one(vae_file), *vae_dtype, |_| true)?;
+        // Fused heavy constructs U-Net, then resolves/materializes its VAE, BEFORE adapters.
+        // An external fix replaces the fused VAE unread; never run a fused VAE constructor first.
+        let external_vae = inputs
+            .fused
+            .as_ref()
+            .and_then(|fused| fused.vae_fix.as_ref());
+        let selected_vae = external_vae
+            .map(crate::loader::resolve_vae_fp16_fix_file)
+            .transpose()?;
+        let vae_file = selected_vae.as_deref().unwrap_or(&inputs.vae.0);
+        let vae_dtype = if external_vae.is_some() {
+            crate::loader::VAE_FP16_FIX_DTYPE
+        } else {
+            inputs.vae.1
+        };
+        let vae_headers = if inputs.fused.is_some() && external_vae.is_none() {
+            component_headers(vae_file, C::Vae)?
+        } else {
+            headers(vae_file)?
+        };
+        let vae = AutoencoderFacts::from_headers(&vae_headers, &arch.vae, vae_dtype)?;
+        let vae_bytes = if inputs.fused.is_some() && external_vae.is_none() {
+            fused_header_footprint(&vae_headers, vae_dtype, true)?
+        } else {
+            footprint(&one(vae_file), vae_dtype, |_| true)?
+        };
 
         // All loads precede the actual ordered heavy pack walk.
         let mut load_quantize = Vec::new();
@@ -1349,18 +1474,33 @@ impl Priced {
         let (mut ip, mut ip_encoder_bytes, mut ip_adapter_bytes) =
             (None, Footprint::default(), Footprint::default());
         let (mut ip_resampler_bytes, mut ip_kv_bytes) = (0, 0);
-        if let Some((encoder_file, ip_file)) = &inputs.ip {
-            let encoder = crate::vision_encoder::ClipVisionEncoder::from_weights(
-                &crate::loader::lazy_weights(&one(encoder_file), dtype, false)?,
+        let fused_ip = match inputs
+            .fused
+            .as_ref()
+            .and_then(|fused| fused.ip_source.as_ref())
+        {
+            Some(WeightsSource::Dir(path)) => Some(crate::loader::resolve_ip_adapter_files(path)?),
+            Some(WeightsSource::File(_)) => {
+                return Err(Error::Msg(
+                    "sdxl ip_adapter expects an h94/IP-Adapter snapshot directory".into(),
+                ))
+            }
+            None => None,
+        };
+        if let Some((encoder_file, ip_file)) = fused_ip.as_ref().or(inputs.ip.as_ref()) {
+            let encoder_headers = headers(encoder_file)?;
+            let encoder = VisionFacts::from_weights(
+                &crate::unet::pricing::HeaderWeights::new(&encoder_headers)?,
                 &arch.vision,
             )?;
-            let ip_w = crate::loader::lazy_weights(&one(ip_file), dtype, false)?;
-            let resampler =
-                crate::ip_adapter::Resampler::from_weights(&ip_w, "image_proj", &arch.resampler)?;
-            unet.install_ip_adapter(crate::unet::pricing::ip_pairs_from_headers(&headers(
-                ip_file,
-            )?)?)?;
-            ip = Some(IpImageEncoder::with_image_size(
+            let ip_headers = headers(ip_file)?;
+            let resampler = ResamplerFacts::from_weights(
+                &crate::unet::pricing::HeaderWeights::new(&ip_headers)?,
+                "image_proj",
+                &arch.resampler,
+            )?;
+            unet.install_ip_adapter(crate::unet::pricing::ip_pairs_from_headers(&ip_headers)?)?;
+            ip = Some(IpImageEncoderFacts::with_image_size(
                 encoder,
                 resampler,
                 arch.vision.image_size as usize,
@@ -1433,7 +1573,34 @@ impl Priced {
         if inputs.streamable {
             unet.arm_block_streams(&unet_headers, dtype, inputs.quant_bits)?;
         }
+        let fused = inputs
+            .fused
+            .as_ref()
+            .map(|fused| {
+                let heavy_components = if fused.vae_fix.is_some() {
+                    &[C::Unet][..]
+                } else {
+                    &[C::Unet, C::Vae][..]
+                };
+                Ok::<_, Error>(FusedLoadFacts {
+                    text_floor: crate::ldm::component_load_floor_from_headers(
+                        &fused.source.raw,
+                        &[C::ClipL, C::ClipBigG],
+                    )?,
+                    heavy_floor: crate::ldm::component_load_floor_from_headers(
+                        &fused.source.raw,
+                        heavy_components,
+                    )?,
+                    text_parents: fused.source.raw_parent_bytes(&[C::ClipL, C::ClipBigG]),
+                    // During U-Net construction even a later-replaced VAE map still exists.
+                    heavy_parents: fused.source.raw_parent_bytes(&[C::Unet, C::Vae]),
+                    external_vae: fused.vae_fix.is_some(),
+                    native_backing: FusedNativeBacking::Unbound,
+                })
+            })
+            .transpose()?;
         Ok(Self {
+            fused,
             te: (te1, te2),
             unet,
             vae,
@@ -1747,6 +1914,124 @@ impl Priced {
         (Dtype::from_promoting_types(h1, h2), pooled)
     }
 
+    /// Actual fused warm/text/heavy load recipe. There are no Directory component-load guards
+    /// on from-weights constructors. Source parents are logical, never a backing-size credit.
+    fn fused_load_points(&self, regime: &Regime) -> Option<Vec<PricedQuantum>> {
+        let fused = self.fused.as_ref()?;
+        let FusedNativeBacking::Unbound = fused.native_backing;
+        let mut points = Vec::new();
+        let mut push = |resident, label, scratch| {
+            points.push(PricedQuantum {
+                phase: IosPhase::Load,
+                resident,
+                label,
+                scratch,
+            })
+        };
+        let warm_text = if regime.staged { 0 } else { self.text() };
+        let all_parents = fused.text_parents.saturating_add(fused.heavy_parents);
+        let text_parents = if regime.staged {
+            fused.text_parents
+        } else {
+            all_parents
+        };
+        push(0, q::LDM_TEXT_LOAD, fused.text_floor);
+        // Warm retains raw U-Net/VAE maps during both CLIP constructors and pair pack.
+        // SequentialText discards sibling maps before those constructors. Both constructors
+        // still precede TE1→TE2 pack; raw source-parent terms grant no release/donation credit.
+        for (encoder, facts) in self.te_pack.iter().enumerate() {
+            let other = if encoder == 0 {
+                self.te_bytes[1].resident
+            } else {
+                self.te_pack[0].retained
+            };
+            for point in &facts.points {
+                push(
+                    text_parents
+                        .saturating_add(other)
+                        .saturating_add(point.before_resident),
+                    q::LOAD_QUANTIZE,
+                    point.scratch,
+                );
+            }
+        }
+        let conditioning = if regime.staged {
+            let mut unused = Quanta::new();
+            let (context, pooled) =
+                self.price_text_conditioning(regime.conditioning_rows(), &mut unused);
+            mlx_gen::ios_quantum::tensor_bytes(
+                q::dtype_bytes(context),
+                &[
+                    regime.conditioning_rows() as u64,
+                    regime.context_tokens as u64,
+                    self.arch.context_dim as u64,
+                ],
+            )
+            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
+                q::dtype_bytes(pooled),
+                &[
+                    regime.conditioning_rows() as u64,
+                    self.te.1.pooled_width() as u64,
+                ],
+            ))
+        } else {
+            0
+        };
+        // SequentialHeavy reopens/re-splits the same file; the warm arm uses its existing maps.
+        // Dropping the staged text handles/evaluating conditioning is not a native backing
+        // retirement certificate. Keep its source-parent term at the heavy-load boundary.
+        push(
+            warm_text
+                .saturating_add(conditioning)
+                .saturating_add(if regime.staged {
+                    fused.text_parents
+                } else {
+                    all_parents
+                }),
+            q::LDM_HEAVY_LOAD,
+            fused.heavy_floor,
+        );
+        let base = warm_text
+            .saturating_add(conditioning)
+            .saturating_add(all_parents);
+        let mut loaded = base.saturating_add(self.unet_bytes.resident);
+        if fused.external_vae {
+            push(loaded, q::VAE_FP16_FIX_LOAD, self.vae_bytes.floor);
+        }
+        loaded = loaded.saturating_add(self.vae_bytes.resident);
+        // FusedHeavy resolves/materializes VAE/fix BEFORE adapters, unlike Directory.
+        for point in &self.adapter_load.quanta {
+            push(
+                base.saturating_add(self.vae_bytes.resident)
+                    .saturating_add(point.resident),
+                point.label,
+                point.scratch,
+            );
+        }
+        loaded = loaded.saturating_add(self.adapter_load.retained_upper());
+        for (load, _) in &self.control_bytes {
+            push(loaded, q::CONTROLNET_LOAD, load.floor);
+            loaded = loaded.saturating_add(load.resident);
+        }
+        if self.ip.is_some() {
+            push(
+                loaded,
+                q::IP_IMAGE_ENCODER_LOAD,
+                self.ip_encoder_bytes.floor,
+            );
+            loaded = loaded.saturating_add(self.ip_encoder_bytes.resident);
+            push(loaded, q::IP_ADAPTER_LOAD, self.ip_adapter_bytes.floor);
+        }
+        for point in &self.load_quantize {
+            push(
+                base.saturating_add(point.before_resident),
+                q::LOAD_QUANTIZE,
+                point.scratch,
+            );
+        }
+        Some(points)
+    }
+
     /// Price `regime`: the per-phase pricing and every `(phase, resident, label, scratch)` quantum.
     pub(crate) fn price(&self, regime: &Regime) -> Result<(IosPricing, Vec<PricedQuantum>)> {
         let mut items: Vec<PricedQuantum> = Vec::new();
@@ -1763,90 +2048,100 @@ impl Priced {
         let staged = regime.staged;
         let warm_text = if staged { 0 } else { self.text() };
 
-        // Load floors in load order: the text encoders (staged: into an empty process), then the
-        // heavy bundle — the U-Net, the VAE, the ControlNets (each at the compute dtype until the
-        // bundle's tier quantization), the IP image encoder and IP weights.
-        take(
-            IosPhase::Load,
-            0,
-            vec![(q::TEXT_ENCODER_1_LOAD, self.te_bytes[0].floor)],
-        );
-        take(
-            IosPhase::Load,
-            self.te_bytes[0].resident,
-            vec![(q::TEXT_ENCODER_2_LOAD, self.te_bytes[1].floor)],
-        );
-        // Runtime packs only AFTER both CLIP loads. At each point retain the other encoder at
-        // its actual current stage (TE2 still unquantized during TE1, finalized TE1 during TE2).
-        // Do not use pre-pack/final maxima interchangeably: tiny page-rounded packs can grow.
-        for (encoder, facts) in self.te_pack.iter().enumerate() {
-            let other = if encoder == 0 {
-                self.te_bytes[1].resident
-            } else {
-                self.te_pack[0].retained
-            };
-            for point in &facts.points {
+        if let Some(points) = self.fused_load_points(regime) {
+            for point in points {
+                take(
+                    point.phase,
+                    point.resident,
+                    vec![(point.label, point.scratch)],
+                );
+            }
+        } else {
+            // Load floors in load order: the text encoders (staged: into an empty process), then the
+            // heavy bundle — the U-Net, the VAE, the ControlNets (each at the compute dtype until the
+            // bundle's tier quantization), the IP image encoder and IP weights.
+            take(
+                IosPhase::Load,
+                0,
+                vec![(q::TEXT_ENCODER_1_LOAD, self.te_bytes[0].floor)],
+            );
+            take(
+                IosPhase::Load,
+                self.te_bytes[0].resident,
+                vec![(q::TEXT_ENCODER_2_LOAD, self.te_bytes[1].floor)],
+            );
+            // Runtime packs only AFTER both CLIP loads. At each point retain the other encoder at
+            // its actual current stage (TE2 still unquantized during TE1, finalized TE1 during TE2).
+            // Do not use pre-pack/final maxima interchangeably: tiny page-rounded packs can grow.
+            for (encoder, facts) in self.te_pack.iter().enumerate() {
+                let other = if encoder == 0 {
+                    self.te_bytes[1].resident
+                } else {
+                    self.te_pack[0].retained
+                };
+                for point in &facts.points {
+                    take(
+                        IosPhase::Load,
+                        other + point.before_resident,
+                        vec![(q::LOAD_QUANTIZE, point.scratch)],
+                    );
+                }
+            }
+            let mut loaded = warm_text;
+            take(
+                IosPhase::Load,
+                loaded,
+                vec![(q::UNET_LOAD, self.unet_bytes.floor)],
+            );
+            loaded += self.unet_bytes.resident;
+            for point in &self.adapter_load.quanta {
                 take(
                     IosPhase::Load,
-                    other + point.before_resident,
+                    warm_text.saturating_add(point.resident),
+                    vec![(point.label, point.scratch)],
+                );
+            }
+            loaded = loaded.saturating_add(self.adapter_load.retained_upper());
+            let vae_label = if self.vae.dtype() == Dtype::Float32 {
+                q::VAE_LOAD
+            } else {
+                q::VAE_FP16_FIX_LOAD
+            };
+            take(
+                IosPhase::Load,
+                loaded,
+                vec![(vae_label, self.vae_bytes.floor)],
+            );
+            loaded += self.vae_bytes.resident;
+            for (load, _) in &self.control_bytes {
+                take(
+                    IosPhase::Load,
+                    loaded,
+                    vec![(q::CONTROLNET_LOAD, load.floor)],
+                );
+                loaded += load.resident;
+            }
+            if self.ip.is_some() {
+                take(
+                    IosPhase::Load,
+                    loaded,
+                    vec![(q::IP_IMAGE_ENCODER_LOAD, self.ip_encoder_bytes.floor)],
+                );
+                loaded += self.ip_encoder_bytes.resident;
+                take(
+                    IosPhase::Load,
+                    loaded,
+                    vec![(q::IP_ADAPTER_LOAD, self.ip_adapter_bytes.floor)],
+                );
+            }
+
+            for point in &self.load_quantize {
+                take(
+                    IosPhase::Load,
+                    warm_text.saturating_add(point.before_resident),
                     vec![(q::LOAD_QUANTIZE, point.scratch)],
                 );
             }
-        }
-        let mut loaded = warm_text;
-        take(
-            IosPhase::Load,
-            loaded,
-            vec![(q::UNET_LOAD, self.unet_bytes.floor)],
-        );
-        loaded += self.unet_bytes.resident;
-        for point in &self.adapter_load.quanta {
-            take(
-                IosPhase::Load,
-                warm_text.saturating_add(point.resident),
-                vec![(point.label, point.scratch)],
-            );
-        }
-        loaded = loaded.saturating_add(self.adapter_load.retained_upper());
-        let vae_label = if self.vae.dtype() == Dtype::Float32 {
-            q::VAE_LOAD
-        } else {
-            q::VAE_FP16_FIX_LOAD
-        };
-        take(
-            IosPhase::Load,
-            loaded,
-            vec![(vae_label, self.vae_bytes.floor)],
-        );
-        loaded += self.vae_bytes.resident;
-        for (load, _) in &self.control_bytes {
-            take(
-                IosPhase::Load,
-                loaded,
-                vec![(q::CONTROLNET_LOAD, load.floor)],
-            );
-            loaded += load.resident;
-        }
-        if self.ip.is_some() {
-            take(
-                IosPhase::Load,
-                loaded,
-                vec![(q::IP_IMAGE_ENCODER_LOAD, self.ip_encoder_bytes.floor)],
-            );
-            loaded += self.ip_encoder_bytes.resident;
-            take(
-                IosPhase::Load,
-                loaded,
-                vec![(q::IP_ADAPTER_LOAD, self.ip_adapter_bytes.floor)],
-            );
-        }
-
-        for point in &self.load_quantize {
-            take(
-                IosPhase::Load,
-                warm_text.saturating_add(point.before_resident),
-                vec![(q::LOAD_QUANTIZE, point.scratch)],
-            );
         }
         let heavy = self.heavy(false);
         let (h, w) = (regime.height, regime.width);
@@ -1895,20 +2190,30 @@ impl Priced {
         let text_resident = self.text() + if staged { 0 } else { heavy };
         take(IosPhase::Conditioning, text_resident, text);
 
+        if let (Some(ip), Route::IpAdapter) = (&self.ip, regime.route) {
+            let source = regime.reference_image.ok_or_else(|| {
+                Error::Unsupported("sdxl IP preprocessing has no actual source facts".into())
+            })?;
+            let geometry = ip.preprocess_geometry(source)?;
+            take(
+                IosPhase::Conditioning,
+                heavy + warm_text + ip_pixels + geometry.source_buffer_bytes,
+                vec![(IP_PREPROCESS_HOST, geometry.host_requested_upper()?)],
+            );
+        }
         let ip_tokens = match (&self.ip, regime.route) {
             (Some(ip), Route::IpAdapter) => {
                 let mut quanta = Quanta::new();
                 let tokens = ip.price_tokens(&mut quanta)?;
                 if rows > 1 {
-                    quanta.push((q::IP_CFG_TOKENS, q::ip_cfg_tokens_bytes(&tokens)));
+                    quanta.push((q::IP_CFG_TOKENS, q::ip_cfg_tokens_bytes_metadata(&tokens)));
                 }
                 take(
                     IosPhase::Conditioning,
                     heavy + warm_text + ip_pixels,
                     quanta,
                 );
-                let t = tokens.shape();
-                Some(price_tensor(&[rows, t[1], t[2]], tokens.dtype())?)
+                Some(crate::ip_adapter::pricing::cfg_pair(&tokens, rows > 1)?)
             }
             _ => None,
         };
@@ -2372,8 +2677,49 @@ impl Priced {
             );
         }
 
+        if let Some(fused) = &self.fused {
+            for item in &mut items {
+                if item.phase != IosPhase::Load || item.label == REQUEST_INPUTS {
+                    let text_only = staged
+                        && matches!(
+                            item.label,
+                            q::CLIP_EMBEDDINGS | q::CLIP_LAYER | q::CLIP_POOLED
+                        );
+                    let parents = fused.text_parents.saturating_add(if text_only {
+                        0
+                    } else {
+                        fused.heavy_parents
+                    });
+                    item.resident = item.resident.saturating_add(parents);
+                }
+            }
+            for window in &mut denoise_windows {
+                window.resident_bytes = window
+                    .resident_bytes
+                    .saturating_add(fused.text_parents)
+                    .saturating_add(fused.heavy_parents);
+                window.class = None;
+                window.owner_domain = format!(
+                    "sdxl/fused/source-parents-logical-v1/{}",
+                    window.owner_domain
+                );
+            }
+        }
         let mut pricing = IosPricing::default();
         for item in &items {
+            if item.label == IP_PREPROCESS_HOST {
+                pricing.take_window(IosWindowPrice {
+                    phase: item.phase,
+                    class: None,
+                    label: item.label.into(),
+                    resident_bytes: item.resident,
+                    held_bytes: 0,
+                    scratch_bytes: item.scratch,
+                    basis: None,
+                    owner_domain: "sdxl/ip/preprocess-host-requested-logical-v1".into(),
+                });
+                continue;
+            }
             if (profiled_discrete || profiled_curated) && item.phase == IosPhase::Denoise {
                 // Forward AND update candidates are recorded at their own coincident epochs,
                 // not the largest input owner combined with another epoch's binding operation.
@@ -2381,7 +2727,20 @@ impl Priced {
                 // mandatory coverage, not permission to certify from a raw scratch upper.
                 continue;
             }
-            pricing.take(item.phase, item.resident, item.scratch, item.label);
+            if self.fused.is_some() {
+                pricing.take_window(IosWindowPrice {
+                    phase: item.phase,
+                    class: None,
+                    label: item.label.into(),
+                    resident_bytes: item.resident,
+                    held_bytes: 0,
+                    scratch_bytes: item.scratch,
+                    basis: None,
+                    owner_domain: "sdxl/fused/source-parents-logical-v1".into(),
+                });
+            } else {
+                pricing.take(item.phase, item.resident, item.scratch, item.label);
+            }
         }
         for window in denoise_windows {
             pricing.take_window(window);
@@ -2499,7 +2858,7 @@ impl Priced {
             encoder_x,
             text_emb,
             control.as_ref(),
-            ip_tokens.map(|t| (t, 1.0)),
+            ip_tokens.map(|t| (t, regime.ip_scale)),
             plan,
             pending_control,
             quanta,

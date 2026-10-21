@@ -146,21 +146,17 @@ impl VisionEncoderLayer {
     /// iOS quantum scratch (sc-26270) of this layer over `x` `[B, N, D]`, from the loaded widths
     /// (hidden from `layer_norm1`, MLP width from `fc1`; [`crate::quantum::clip_layer_bytes`]).
     fn quantum_scratch(&self, x: &Array) -> u64 {
-        let s = x.shape();
-        crate::quantum::clip_layer_bytes(
-            s[0],
-            s[1],
+        crate::ip_adapter::pricing::vision_layer_scratch(
+            &crate::quantum::activation_facts(x),
             self.ln1_w.shape()[0] as u64,
             crate::quantum::linear_out(&self.fc1),
             self.num_heads,
             self.head_dim,
-            false,
-            crate::quantum::element_bytes(x),
-            crate::quantum::backend(),
         )
     }
 
     /// The dtype this layer returns for an `x`-typed input (header-only pricing).
+    #[cfg(test)]
     fn output_dtype(&self, x: Dtype) -> Dtype {
         [&self.q, &self.out, &self.fc1, &self.fc2]
             .iter()
@@ -323,18 +319,12 @@ impl ClipVisionEncoder {
     /// then the class/patch concatenation and the LayerNorm (`[B, tokens, hidden]`;
     /// `quantum::layer_norm_buffers`; the position sum donates the concatenation; measured).
     fn embed_scratch(&self, pixel_values: &Array) -> u64 {
-        let s = pixel_values.shape();
-        let tokens = (s[1] / self.patch) * (s[2] / self.patch) + 1;
-        let act = crate::quantum::element_bytes(pixel_values);
-        let call = crate::quantum::ConvCall::new(s, act, &self.patch_embedding, self.patch, 0);
-        let backend = crate::quantum::backend();
-        let units = 1 + crate::quantum::layer_norm_buffers(backend);
-        crate::quantum::single_conv_bytes(&call, 0, 0, backend)
-            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
-                act,
-                &[units, s[0] as u64, tokens as u64, self.hidden as u64],
-            ))
-            .saturating_add(crate::quantum::page_slack(units))
+        crate::ip_adapter::pricing::vision_embedding_scratch(
+            &crate::quantum::activation_facts(pixel_values),
+            &crate::quantum::activation_facts(&self.patch_embedding),
+            self.patch,
+            self.hidden,
+        )
     }
 
     /// The embedding quantum's price and body (sc-26270 proof tests).
@@ -364,6 +354,7 @@ impl ClipVisionEncoder {
 
     /// Header-only pricing of [`Self::penultimate`] over the shape-only `pixel_values`: every
     /// quantum it checks, in order, with the guards' own formulas. Returns the shape-only output.
+    #[cfg(test)]
     pub(crate) fn price_penultimate(
         &self,
         pixel_values: &Array,

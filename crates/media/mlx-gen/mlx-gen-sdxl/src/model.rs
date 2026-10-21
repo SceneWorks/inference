@@ -1295,56 +1295,26 @@ impl Sdxl {
 
         // Acceleration variants are txt2img-only in v1 (epic 2755 "Image-only v1"); reject an init
         // image rather than silently ignoring it.
-        if is_accel && reference.is_some() {
-            return Err(Error::Msg(format!(
-                "sdxl: the {sampler_name:?} acceleration sampler is txt2img-only (no img2img \
-                 reference) in this build"
-            )));
-        }
-        // Inpaint (Mask) rides the ancestral img2img path and needs an init image to blend against.
-        if mask_img.is_some() {
-            if is_accel {
-                return Err(Error::Msg(
-                    "sdxl: inpaint masks are not supported with the acceleration samplers".into(),
-                ));
-            }
-            if use_curated {
-                return Err(Error::Msg(
-                    "sdxl: curated samplers/schedulers are not supported with an inpaint Mask (its \
-                     per-step blend has no post-step hook in the callback Sampler) — use the default \
-                     euler_ancestral"
-                        .into(),
-                ));
-            }
-            if reference.is_none() {
-                return Err(Error::Msg(
-                    "sdxl: inpaint requires an init image (a Reference) alongside the Mask".into(),
-                ));
-            }
-        }
+        validate_image_roles(
+            sampler_name,
+            is_accel,
+            use_curated,
+            reference.is_some(),
+            mask_img.is_some(),
+        )?;
         // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
         // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
         // summed. The common denoiser correctly carries those residuals through Lightning's one-row,
         // CFG-free loop; LCM/Hyper remain deliberately unsupported until separately characterized.
         // Control still does not combine with an inpaint mask in this build.
         let control_reqs = self.resolve_control(req)?;
-        if !control_reqs.is_empty() {
-            validate_control_acceleration(sampler_name, req.guidance)?;
-            if control_reqs.len() != self.control_count {
-                return Err(Error::Msg(format!(
-                    "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
-                     checkpoint(s) (set LoadSpec::control + extra_controls, one per Control, in order)",
-                    control_reqs.len(),
-                    self.control_count
-                )));
-            }
-            if mask_img.is_some() {
-                return Err(Error::Msg(
-                    "sdxl: combining a ControlNet (Control) with an inpaint Mask is not supported"
-                        .into(),
-                ));
-            }
-        }
+        validate_control_roles(
+            sampler_name,
+            req.guidance,
+            control_reqs.len(),
+            self.control_count,
+            mask_img.is_some(),
+        )?;
 
         // ── Phase A: text encode (epic 10834 Phase 1, sc-10839; sc-11125). Seed-independent (no RNG)
         // — tokenizing above the residency lifecycle, then hoisting the encode above the control/IP
@@ -1443,7 +1413,7 @@ impl Sdxl {
         // The IP scale rides the Reference `strength` field (default 0.6). Tokens are seed-independent
         // → built once, CFG-batched with a zeros uncond row so the negative pass gets no IP signal.
         let ip_mode = uses_ip_reference(heavy_owned.has_ip_adapter()?,reference.is_some(),mask_img.is_some(),control_reqs.len(),is_accel);
-        let ip_scale = reference.and_then(|(_, s)| s).unwrap_or(IP_DEFAULT_SCALE);
+        let ip_scale = ip_reference_scale(reference.and_then(|(_, s)| s));
         let ip_tokens = if ip_mode {
             let (image, _) = reference.expect("reference present in ip_mode");
             Some(heavy_owned.ip_tokens(
@@ -1839,36 +1809,13 @@ impl Sdxl {
         &self,
         req: &'a GenerationRequest,
     ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "sdxl: multiple reference images are not supported (single img2img init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
+        reference_inputs(req)
     }
 
     /// Extract the single inpaint mask from the request's conditioning (sc-3057). White = repaint,
     /// black = keep. SDXL supports one mask; more than one is an error.
     fn resolve_mask<'a>(&self, req: &'a GenerationRequest) -> Result<Option<&'a Image>> {
-        let mut mask = None;
-        for c in &req.conditioning {
-            if let Conditioning::Mask { image } = c {
-                if mask.is_some() {
-                    return Err(Error::Msg(
-                        "sdxl: multiple inpaint masks are not supported".into(),
-                    ));
-                }
-                mask = Some(image);
-            }
-        }
-        Ok(mask)
+        mask_input(req)
     }
 
     /// Collect the ControlNet control images + `conditioning_scale`s (sc-3058; MultiControlNet
@@ -1876,15 +1823,7 @@ impl Sdxl {
     /// `spec.extra_controls`); the count must match (validated in `generate`). A single `Control` is
     /// the common case; more than one runs as MultiControlNet (residuals summed).
     fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<Vec<(&'a Image, f32)>> {
-        let mut controls = Vec::new();
-        for c in &req.conditioning {
-            if let Conditioning::Control { image, scale, .. } = c {
-                // `None` → the diffusers `controlnet_conditioning_scale` default (full strength);
-                // `Some(x)` — including `Some(0.0)` for an inert branch — is used verbatim (F-085).
-                controls.push((image, scale.unwrap_or(DEFAULT_CONTROLNET_SCALE)));
-            }
-        }
-        Ok(controls)
+        control_inputs(req)
     }
 }
 
@@ -2981,4 +2920,124 @@ fn fused_ldm_real_weight_render_is_nonconstant() {
     let min = *image.pixels.iter().min().expect("pixels");
     let max = *image.pixels.iter().max().expect("pixels");
     assert!(max.saturating_sub(min) > 32, "render is nearly constant");
+}
+
+pub(crate) fn reference_inputs<'a>(
+    req: &'a GenerationRequest,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(Error::Msg(
+                    "sdxl: multiple reference images are not supported (single img2img init only)"
+                        .into(),
+                ));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
+}
+
+pub(crate) fn mask_input<'a>(req: &'a GenerationRequest) -> Result<Option<&'a Image>> {
+    let mut mask = None;
+    for c in &req.conditioning {
+        if let Conditioning::Mask { image } = c {
+            if mask.is_some() {
+                return Err(Error::Msg(
+                    "sdxl: multiple inpaint masks are not supported".into(),
+                ));
+            }
+            mask = Some(image);
+        }
+    }
+    Ok(mask)
+}
+
+pub(crate) fn control_inputs<'a>(req: &'a GenerationRequest) -> Result<Vec<(&'a Image, f32)>> {
+    let mut controls = Vec::new();
+    for c in &req.conditioning {
+        if let Conditioning::Control { image, scale, .. } = c {
+            // `None` → the diffusers `controlnet_conditioning_scale` default (full strength);
+            // `Some(x)` — including `Some(0.0)` for an inert branch — is used verbatim (F-085).
+            controls.push((image, scale.unwrap_or(DEFAULT_CONTROLNET_SCALE)));
+        }
+    }
+    Ok(controls)
+}
+
+pub(crate) fn validate_image_roles(
+    sampler_name: &str,
+    is_accel: bool,
+    use_curated: bool,
+    has_reference: bool,
+    has_mask: bool,
+) -> Result<()> {
+    if is_accel && has_reference {
+        return Err(Error::Msg(format!(
+            "sdxl: the {sampler_name:?} acceleration sampler is txt2img-only (no img2img \
+                 reference) in this build"
+        )));
+    }
+    // Inpaint (Mask) rides the ancestral img2img path and needs an init image to blend against.
+    if has_mask {
+        if is_accel {
+            return Err(Error::Msg(
+                "sdxl: inpaint masks are not supported with the acceleration samplers".into(),
+            ));
+        }
+        if use_curated {
+            return Err(Error::Msg(
+                    "sdxl: curated samplers/schedulers are not supported with an inpaint Mask (its \
+                     per-step blend has no post-step hook in the callback Sampler) — use the default \
+                     euler_ancestral"
+                        .into(),
+                ));
+        }
+        if !has_reference {
+            return Err(Error::Msg(
+                "sdxl: inpaint requires an init image (a Reference) alongside the Mask".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The provider allows an unused loaded Control branch, but every actual Control needs a loaded peer.
+pub(crate) fn control_count_matches_loaded(control_count: usize, loaded_count: usize) -> bool {
+    control_count == 0 || control_count == loaded_count
+}
+
+pub(crate) fn validate_control_roles(
+    sampler_name: &str,
+    guidance: Option<f32>,
+    control_count: usize,
+    loaded_count: usize,
+    has_mask: bool,
+) -> Result<()> {
+    if control_count != 0 {
+        validate_control_acceleration(sampler_name, guidance)?;
+        if !control_count_matches_loaded(control_count, loaded_count) {
+            return Err(Error::Msg(format!(
+                    "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
+                     checkpoint(s) (set LoadSpec::control + extra_controls, one per Control, in order)",
+                    control_count,
+                    loaded_count
+                )));
+        }
+        if has_mask {
+            return Err(Error::Msg(
+                "sdxl: combining a ControlNet (Control) with an inpaint Mask is not supported"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// IP strength is a raw image-prompt scalar, NOT the clamped img2img schedule strength.
+pub(crate) fn ip_reference_scale(requested: Option<f32>) -> f32 {
+    requested.unwrap_or(IP_DEFAULT_SCALE)
 }

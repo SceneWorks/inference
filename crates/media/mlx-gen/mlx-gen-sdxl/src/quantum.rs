@@ -20,26 +20,29 @@
 //! (macOS, Linux, the simulator), so nothing here can change host numerics or ordering.
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::Result;
 use mlx_gen::ios_quantum::{
     attention_block_bytes, scores_bytes, tensor_bytes, AttentionBlockGeometry, Scores,
 };
+use mlx_gen::Result;
 // The AutoencoderKL convolution / GroupNorm / tiled-stage kernel accounting is shared with every
 // diffusers VAE on iOS (sc-26433): it lives in `mlx_gen::ios_quantum` and is re-exported here so
 // this crate's call sites and proofs keep their paths.
 pub(crate) use mlx_gen::ios_quantum::{
-    bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes,
-    dtype_bytes, element_bytes, elements, group_norm_buffers, norm_conv_bytes,
-    norm_promotion_units, page_slack, resnet_bytes_from_metadata, single_conv_bytes, tile_bytes,
-    tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall, TileSource,
+    bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes, dtype_bytes,
+    element_bytes, elements, group_norm_buffers, norm_conv_bytes, norm_promotion_units, page_slack,
+    resnet_bytes_from_metadata, single_conv_bytes, tile_bytes, tiled_stage_bytes,
+    tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall, TileSource,
     VAE_ATTENTION_SCORE_ELEMENTS,
 };
 #[cfg(test)]
-pub(crate) use mlx_gen::ios_quantum::{downsample_tile_bytes, resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES};
+pub(crate) use mlx_gen::ios_quantum::{
+    downsample_tile_bytes, resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES,
+};
 // Additive VAE metadata bindings; current native TileSource/callers remain untouched.
-pub(crate) use mlx_gen::ios_quantum::{tile_bytes_from_metadata,
-    downsample_tile_bytes_from_metadata, tiled_stage_f32_accum_from_metadata,
-    decoded_to_image_bytes_from_metadata};
+pub(crate) use mlx_gen::ios_quantum::{
+    decoded_to_image_bytes_from_metadata, downsample_tile_bytes_from_metadata,
+    tile_bytes_from_metadata, tiled_stage_f32_accum_from_metadata,
+};
 use mlx_rs::{Array, Dtype};
 
 #[cfg(test)]
@@ -250,20 +253,43 @@ impl LinearWork {
     pub(crate) fn of(linear: &AdaptableLinear) -> Self {
         use mlx_gen::adapters::facts::{AdapterFacts, TensorFacts};
         let mut base = mlx_gen::adapters::LinearFacts::of(linear);
-        let (weights, bias, group_size, bits) = if let Some((w, scales, offsets, bias, group, bits)) =
-            linear.quantized_params() {
-            // Keep the actual packed operand geometry, including its logical input width.
-            let mut logical = scales.shape().to_vec();
-            if let Some(input) = logical.last_mut() { *input = input.saturating_mul(group); }
-            base.base_shape = logical;
-            (vec![TensorFacts::of(w), TensorFacts::of(scales), TensorFacts::of(offsets)],
-                bias.map(TensorFacts::of), group, Some(bits))
-        } else {
-            let (w, bias) = linear.dense_weight().expect("LinearBase is dense or packed");
-            (vec![TensorFacts::of(w)], bias.map(TensorFacts::of), crate::quant::GROUP_SIZE, None)
-        };
-        Self { base, weights, bias,
-            residuals: linear.adapters().iter().map(AdapterFacts::of).collect(), group_size, bits }
+        let (weights, bias, group_size, bits) =
+            if let Some((w, scales, offsets, bias, group, bits)) = linear.quantized_params() {
+                // Keep the actual packed operand geometry, including its logical input width.
+                let mut logical = scales.shape().to_vec();
+                if let Some(input) = logical.last_mut() {
+                    *input = input.saturating_mul(group);
+                }
+                base.base_shape = logical;
+                (
+                    vec![
+                        TensorFacts::of(w),
+                        TensorFacts::of(scales),
+                        TensorFacts::of(offsets),
+                    ],
+                    bias.map(TensorFacts::of),
+                    group,
+                    Some(bits),
+                )
+            } else {
+                let (w, bias) = linear
+                    .dense_weight()
+                    .expect("LinearBase is dense or packed");
+                (
+                    vec![TensorFacts::of(w)],
+                    bias.map(TensorFacts::of),
+                    crate::quant::GROUP_SIZE,
+                    None,
+                )
+            };
+        Self {
+            base,
+            weights,
+            bias,
+            residuals: linear.adapters().iter().map(AdapterFacts::of).collect(),
+            group_size,
+            bits,
+        }
     }
 
     /// The selected AdaptableLinear path passes x unchanged to the Rust primitive.
@@ -277,19 +303,24 @@ impl LinearWork {
     pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
         if self.bits.is_some() {
             let compute = self.packed_compute_dtype(input);
-            return self.bias.as_ref().map_or(compute, |bias|
-                Dtype::from_promoting_types(compute, bias.dtype));
+            return self.bias.as_ref().map_or(compute, |bias| {
+                Dtype::from_promoting_types(compute, bias.dtype)
+            });
         }
         let weight = self.weights[usize::from(self.bits.is_some())].dtype;
         let out = Dtype::from_promoting_types(input, weight);
-        self.bias.as_ref().map_or(out, |bias| Dtype::from_promoting_types(out, bias.dtype))
+        self.bias
+            .as_ref()
+            .map_or(out, |bias| Dtype::from_promoting_types(out, bias.dtype))
     }
 
     pub(crate) fn output_shape(&self, input: &[i32]) -> Result<Vec<i32>> {
         let mut shape = self.base_output_shape(input)?;
         for residual in self.residuals.iter().filter(|a| !a.disabled()) {
-            shape = crate::adapters::broadcast_shape(&shape,
-                &crate::adapters::adapter_residual_shape(residual, input)?)?;
+            shape = crate::adapters::broadcast_shape(
+                &shape,
+                &crate::adapters::adapter_residual_shape(residual, input)?,
+            )?;
         }
         Ok(shape)
     }
@@ -297,10 +328,16 @@ impl LinearWork {
     fn base_output_shape(&self, input: &[i32]) -> Result<Vec<i32>> {
         let mut transposed = self.base.base_shape.clone();
         if self.bits.is_some() {
-            if transposed.len() < 2 { return Err(mlx_gen::Error::Msg("sdxl packed Linear rank is invalid".into())); }
+            if transposed.len() < 2 {
+                return Err(mlx_gen::Error::Msg(
+                    "sdxl packed Linear rank is invalid".into(),
+                ));
+            }
             let n = transposed.len();
             transposed.swap(n - 1, n - 2);
-        } else { transposed.reverse(); }
+        } else {
+            transposed.reverse();
+        }
         let shape = crate::adapters::matmul_shape(input, &transposed)?;
         match &self.bias {
             Some(bias) => crate::adapters::broadcast_shape(&shape, &bias.shape),
@@ -309,37 +346,64 @@ impl LinearWork {
     }
 
     pub(crate) fn output_width(&self) -> u64 {
-        let axis = if self.bits.is_some() { self.base.base_shape.len().saturating_sub(2) } else { 0 };
+        let axis = if self.bits.is_some() {
+            self.base.base_shape.len().saturating_sub(2)
+        } else {
+            0
+        };
         self.base.base_shape.get(axis).copied().unwrap_or(0).max(0) as u64
     }
 
     pub(crate) fn operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
-        if self.bits.is_some() { return self.packed_operand_bytes(shape, input); }
+        if self.bits.is_some() {
+            return self.packed_operand_bytes(shape, input);
+        }
         let output = self.output_dtype(input);
         let width = dtype_bytes(output);
         let activation = if input != output {
             shape.iter().fold(width, |n, &d| n.saturating_mul(u(d)))
-        } else { 0 };
+        } else {
+            0
+        };
         let weight = if self.bits.is_none() && self.weights[0].dtype != output {
             self.weights[0].elements().saturating_mul(width)
-        } else { 0 };
-        let bias = self.bias.as_ref().map_or(0, |bias| if bias.dtype != output {
-            bias.elements().saturating_mul(width)
-        } else { 0 });
+        } else {
+            0
+        };
+        let bias = self.bias.as_ref().map_or(0, |bias| {
+            if bias.dtype != output {
+                bias.elements().saturating_mul(width)
+            } else {
+                0
+            }
+        });
         let mut accumulated = self.base_output_shape(shape).ok();
-        self.residuals.iter().fold(activation.saturating_add(weight).saturating_add(bias), |n, adapter| {
-            if adapter.disabled() { return n; }
-            accumulated = accumulated.as_ref().and_then(|host|
-                crate::adapters::adapter_residual_shape(adapter, shape).ok().and_then(|residual|
-                    crate::adapters::broadcast_shape(host, &residual).ok()));
-            let add_elements = accumulated.as_ref().map_or(0, |s|
-                s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
-            // Invalid native operands keep their original operator error priority; this numeric
-            // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
-            // host-add geometry, including earlier residuals, not an independent residual maximum.
-            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(adapter,
-                shape, input, output, add_elements))
-        })
+        self.residuals.iter().fold(
+            activation.saturating_add(weight).saturating_add(bias),
+            |n, adapter| {
+                if adapter.disabled() {
+                    return n;
+                }
+                accumulated = accumulated.as_ref().and_then(|host| {
+                    crate::adapters::adapter_residual_shape(adapter, shape)
+                        .ok()
+                        .and_then(|residual| crate::adapters::broadcast_shape(host, &residual).ok())
+                });
+                let add_elements = accumulated
+                    .as_ref()
+                    .map_or(0, |s| s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
+                // Invalid native operands keep their original operator error priority; this numeric
+                // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
+                // host-add geometry, including earlier residuals, not an independent residual maximum.
+                n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(
+                    adapter,
+                    shape,
+                    input,
+                    output,
+                    add_elements,
+                ))
+            },
+        )
     }
 
     fn packed_operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
@@ -348,38 +412,71 @@ impl LinearWork {
         let compute_width = dtype_bytes(compute);
         let output_width = dtype_bytes(output);
         let activation = if input != compute {
-            shape.iter().fold(compute_width, |n, &d| n.saturating_mul(u(d)))
-        } else { 0 };
+            shape
+                .iter()
+                .fold(compute_width, |n, &d| n.saturating_mul(u(d)))
+        } else {
+            0
+        };
         // Compare dtype identities, not widths. Native qmm casts both affine operands,
         // never its packed U32 codes. There is no caller input-to-scales precast.
-        let affine = self.weights[1..3].iter().fold(0u64, |n, tensor| n.saturating_add(
-            if tensor.dtype != compute { tensor.elements().saturating_mul(compute_width) }
-            else { 0 }));
-        let bias = self.bias.as_ref().map_or(0, |bias| if bias.dtype != output {
-            bias.elements().saturating_mul(output_width)
-        } else { 0 });
+        let affine = self.weights[1..3].iter().fold(0u64, |n, tensor| {
+            n.saturating_add(if tensor.dtype != compute {
+                tensor.elements().saturating_mul(compute_width)
+            } else {
+                0
+            })
+        });
+        let bias = self.bias.as_ref().map_or(0, |bias| {
+            if bias.dtype != output {
+                bias.elements().saturating_mul(output_width)
+            } else {
+                0
+            }
+        });
         // A widening ordinary bias add casts the qmm result, BEFORE bias broadcasting.
         // Keep invalid native operands' error priority: this guard adds no validation.
         let post_bias = if compute != output {
             let mut transposed = self.base.base_shape.clone();
-            if transposed.len() < 2 { 0 } else {
+            if transposed.len() < 2 {
+                0
+            } else {
                 let n = transposed.len();
                 transposed.swap(n - 1, n - 2);
-                crate::adapters::matmul_shape(shape, &transposed).ok().map_or(0, |dims|
-                    dims.iter().fold(output_width, |n, &d| n.saturating_mul(u(d))))
+                crate::adapters::matmul_shape(shape, &transposed)
+                    .ok()
+                    .map_or(0, |dims| {
+                        dims.iter()
+                            .fold(output_width, |n, &d| n.saturating_mul(u(d)))
+                    })
             }
-        } else { 0 };
-        let base_casts = activation.saturating_add(affine).saturating_add(bias).saturating_add(post_bias);
+        } else {
+            0
+        };
+        let base_casts = activation
+            .saturating_add(affine)
+            .saturating_add(bias)
+            .saturating_add(post_bias);
         let mut accumulated = self.base_output_shape(shape).ok();
         self.residuals.iter().fold(base_casts, |n, adapter| {
-            if adapter.disabled() { return n; }
-            accumulated = accumulated.as_ref().and_then(|host|
-                crate::adapters::adapter_residual_shape(adapter, shape).ok().and_then(|residual|
-                    crate::adapters::broadcast_shape(host, &residual).ok()));
-            let add_elements = accumulated.as_ref().map_or(0, |s|
-                s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
-            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(adapter,
-                shape, input, output, add_elements))
+            if adapter.disabled() {
+                return n;
+            }
+            accumulated = accumulated.as_ref().and_then(|host| {
+                crate::adapters::adapter_residual_shape(adapter, shape)
+                    .ok()
+                    .and_then(|residual| crate::adapters::broadcast_shape(host, &residual).ok())
+            });
+            let add_elements = accumulated
+                .as_ref()
+                .map_or(0, |s| s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
+            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(
+                adapter,
+                shape,
+                input,
+                output,
+                add_elements,
+            ))
         })
     }
 
@@ -387,18 +484,26 @@ impl LinearWork {
         use crate::adapters::AdapterInstallStorage as S;
         match work.storage {
             S::DenseLinear if self.bits.is_none() => {
-                let weight = work.installed.first().ok_or_else(|| mlx_gen::Error::Msg(
-                    "sdxl selected dense install has no declared output".into()))?;
+                let weight = work.installed.first().ok_or_else(|| {
+                    mlx_gen::Error::Msg("sdxl selected dense install has no declared output".into())
+                })?;
                 self.base.base_shape = weight.shape.clone();
                 self.weights = vec![weight.clone()];
             }
             S::PackedLora | S::PackedDelta | S::StructuredLokr if self.bits.is_some() => {
-                self.residuals.push(work.residual().ok_or_else(|| mlx_gen::Error::Msg(
-                    "sdxl selected packed install has incomplete declared operands".into()))?);
+                self.residuals.push(work.residual().ok_or_else(|| {
+                    mlx_gen::Error::Msg(
+                        "sdxl selected packed install has incomplete declared operands".into(),
+                    )
+                })?);
                 self.base.adapter_count = self.residuals.len();
                 self.base.has_live_adapters = self.residuals.iter().any(|a| !a.disabled());
             }
-            _ => return Err(mlx_gen::Error::Msg("sdxl selected install disagrees with actual target storage".into())),
+            _ => {
+                return Err(mlx_gen::Error::Msg(
+                    "sdxl selected install disagrees with actual target storage".into(),
+                ))
+            }
         }
         Ok(())
     }
@@ -408,28 +513,58 @@ impl LinearWork {
     /// and their disabled owners are deliberately unchanged, exactly as AdaptableLinear::quantize.
     pub(crate) fn pack(&mut self, bits: i32) -> Result<u64> {
         use mlx_gen::adapters::facts::TensorFacts;
-        if self.bits.is_some() { return Ok(0); }
+        if self.bits.is_some() {
+            return Ok(0);
+        }
         let shape = &self.base.base_shape;
         if shape.len() < 2 || !matches!(bits, 4 | 8) {
-            return Err(mlx_gen::Error::Msg("sdxl load-time affine pack metadata is invalid".into()));
+            return Err(mlx_gen::Error::Msg(
+                "sdxl load-time affine pack metadata is invalid".into(),
+            ));
         }
         let input = *shape.last().unwrap();
         if input % crate::quant::GROUP_SIZE != 0 {
-            return Err(mlx_gen::Error::Msg("sdxl load-time affine input is not group-aligned".into()));
+            return Err(mlx_gen::Error::Msg(
+                "sdxl load-time affine input is not group-aligned".into(),
+            ));
         }
         let mut codes = shape.clone();
-        *codes.last_mut().unwrap() = input.checked_mul(bits).and_then(|n| n.checked_div(32))
+        *codes.last_mut().unwrap() = input
+            .checked_mul(bits)
+            .and_then(|n| n.checked_div(32))
             .ok_or_else(|| mlx_gen::Error::Msg("sdxl packed column overflow".into()))?;
         let mut scales = shape.clone();
         *scales.last_mut().unwrap() = input / crate::quant::GROUP_SIZE;
-        let ordinary_bias = self.bias.as_ref().map_or(0, |b| b.elements().saturating_mul(2));
-        let scratch = crate::quant::quantize_bytes_from_metadata(self.weights[0].elements(), ordinary_bias, bits);
+        let ordinary_bias = self
+            .bias
+            .as_ref()
+            .map_or(0, |b| b.elements().saturating_mul(2));
+        let scratch = crate::quant::quantize_bytes_from_metadata(
+            self.weights[0].elements(),
+            ordinary_bias,
+            bits,
+        );
         self.weights = vec![
-            TensorFacts { shape: codes, dtype: Dtype::Uint32, strides: Vec::new() },
-            TensorFacts { shape: scales.clone(), dtype: Dtype::Bfloat16, strides: Vec::new() },
-            TensorFacts { shape: scales, dtype: Dtype::Bfloat16, strides: Vec::new() },
+            TensorFacts {
+                shape: codes,
+                dtype: Dtype::Uint32,
+                strides: Vec::new(),
+            },
+            TensorFacts {
+                shape: scales.clone(),
+                dtype: Dtype::Bfloat16,
+                strides: Vec::new(),
+            },
+            TensorFacts {
+                shape: scales,
+                dtype: Dtype::Bfloat16,
+                strides: Vec::new(),
+            },
         ];
-        if let Some(bias) = &mut self.bias { bias.dtype = Dtype::Bfloat16; bias.strides.clear(); }
+        if let Some(bias) = &mut self.bias {
+            bias.dtype = Dtype::Bfloat16;
+            bias.strides.clear();
+        }
         self.bits = Some(bits);
         self.group_size = crate::quant::GROUP_SIZE;
         self.base.is_quantized = true;
@@ -437,11 +572,19 @@ impl LinearWork {
     }
 
     pub(crate) fn declared_bytes(&self) -> u64 {
-        let payload = |a: &mlx_gen::adapters::facts::TensorFacts| mlx_gen::ios_quantum::allocated_bytes(a.bytes());
-        let base = self.weights.iter().fold(0u64, |n, a| n.saturating_add(payload(a)))
+        let payload = |a: &mlx_gen::adapters::facts::TensorFacts| {
+            mlx_gen::ios_quantum::allocated_bytes(a.bytes())
+        };
+        let base = self
+            .weights
+            .iter()
+            .fold(0u64, |n, a| n.saturating_add(payload(a)))
             .saturating_add(self.bias.as_ref().map_or(0, payload));
-        self.residuals.iter().fold(base, |n, a| a.tensors().iter()
-            .fold(n, |n, tensor| n.saturating_add(payload(tensor))))
+        self.residuals.iter().fold(base, |n, a| {
+            a.tensors()
+                .iter()
+                .fold(n, |n, tensor| n.saturating_add(payload(tensor)))
+        })
     }
 }
 
@@ -462,24 +605,42 @@ pub(crate) struct EffectScope<'a> {
 }
 
 impl<'a> EffectScope<'a> {
-    pub(crate) fn native() -> Self { Self { effects: None, prefix: String::new() } }
+    pub(crate) fn native() -> Self {
+        Self {
+            effects: None,
+            prefix: String::new(),
+        }
+    }
     pub(crate) fn root(effects: &'a LinearEffects) -> Self {
-        Self { effects: Some(effects), prefix: String::new() }
+        Self {
+            effects: Some(effects),
+            prefix: String::new(),
+        }
     }
     pub(crate) fn child(&self, name: &str) -> Self {
-        Self { effects: self.effects, prefix: crate::quant::child_path(&self.prefix, name) }
+        Self {
+            effects: self.effects,
+            prefix: crate::quant::child_path(&self.prefix, name),
+        }
     }
     pub(crate) fn conv(&self, name: &str, native: &mlx_gen::adapters::AdaptableConv2d) -> ConvWork {
         let path = crate::quant::child_path(&self.prefix, name);
-        let weight = self.effects.and_then(|effects| effects.1.get(&path)).cloned()
+        let weight = self
+            .effects
+            .and_then(|effects| effects.1.get(&path))
+            .cloned()
             .unwrap_or_else(|| mlx_gen::adapters::facts::TensorFacts::of(native.weight()));
-        ConvWork { weight, bias: native.bias().map(mlx_gen::adapters::facts::TensorFacts::of) }
+        ConvWork {
+            weight,
+            bias: native.bias().map(mlx_gen::adapters::facts::TensorFacts::of),
+        }
     }
     pub(crate) fn linear(&self, name: &str, native: &AdaptableLinear) -> Result<LinearWork> {
         let path = crate::quant::child_path(&self.prefix, name);
         match self.effects {
-            Some(effects) => effects.0.get(&path).cloned().ok_or_else(||
-                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))),
+            Some(effects) => effects.0.get(&path).cloned().ok_or_else(|| {
+                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))
+            }),
             None => Ok(LinearWork::of(native)),
         }
     }
@@ -504,8 +665,11 @@ pub(crate) fn conv_bias_bytes(
     bias: Option<&Array>,
     output_elements: u64,
 ) -> u64 {
-    ConvWork { weight: mlx_gen::adapters::facts::TensorFacts::of(weight),
-        bias: bias.map(mlx_gen::adapters::facts::TensorFacts::of) }.bias_bytes(input, output_elements)
+    ConvWork {
+        weight: mlx_gen::adapters::facts::TensorFacts::of(weight),
+        bias: bias.map(mlx_gen::adapters::facts::TensorFacts::of),
+    }
+    .bias_bytes(input, output_elements)
 }
 
 /// Dense convolution facts in native OHWI order, at their PRECAST element widths. Source quant
@@ -518,18 +682,33 @@ pub(crate) struct ConvWork {
 
 impl ConvWork {
     pub(crate) fn call(&self, x: &[i32], act: u64, stride: i32, pad: i32) -> ConvCall {
-        ConvCall::from_metadata(x, act, &self.weight.shape, dtype_bytes(self.weight.dtype), stride, pad)
+        ConvCall::from_metadata(
+            x,
+            act,
+            &self.weight.shape,
+            dtype_bytes(self.weight.dtype),
+            stride,
+            pad,
+        )
     }
     pub(crate) fn output_shape(&self, x: &[i32], stride: i32, pad: i32) -> Result<Vec<i32>> {
         if x.len() != 4 || self.weight.shape.len() != 4 || x[3] != self.weight.shape[3] {
-            return Err(mlx_gen::Error::Msg("sdxl selected convolution input/weight axes disagree".into()));
+            return Err(mlx_gen::Error::Msg(
+                "sdxl selected convolution input/weight axes disagree".into(),
+            ));
         }
         let axis = |n: i32, k: i32| -> Result<i32> {
             let result = (i64::from(n) + 2 * i64::from(pad) - i64::from(k)) / i64::from(stride) + 1;
-            i32::try_from(result).map_err(|_| mlx_gen::Error::Msg("sdxl convolution output dimension overflow".into()))
+            i32::try_from(result).map_err(|_| {
+                mlx_gen::Error::Msg("sdxl convolution output dimension overflow".into())
+            })
         };
-        let shape = vec![x[0], axis(x[1], self.weight.shape[1])?,
-            axis(x[2], self.weight.shape[2])?, self.weight.shape[0]];
+        let shape = vec![
+            x[0],
+            axis(x[1], self.weight.shape[1])?,
+            axis(x[2], self.weight.shape[2])?,
+            self.weight.shape[0],
+        ];
         match &self.bias {
             Some(bias) => crate::adapters::broadcast_shape(&shape, &bias.shape),
             None => Ok(shape),
@@ -537,15 +716,27 @@ impl ConvWork {
     }
     pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
         let convolution = Dtype::from_promoting_types(input, self.weight.dtype);
-        self.bias.as_ref().map_or(convolution, |b| Dtype::from_promoting_types(convolution, b.dtype))
+        self.bias.as_ref().map_or(convolution, |b| {
+            Dtype::from_promoting_types(convolution, b.dtype)
+        })
     }
     pub(crate) fn bias_bytes(&self, input: Dtype, output_elements: u64) -> u64 {
-        let Some(bias) = &self.bias else { return 0; };
+        let Some(bias) = &self.bias else {
+            return 0;
+        };
         let convolution = Dtype::from_promoting_types(input, self.weight.dtype);
         let output = Dtype::from_promoting_types(convolution, bias.dtype);
         let width = dtype_bytes(output);
-        let cast = if bias.dtype != output { bias.elements() * width } else { 0 };
-        cast + if convolution != output { output_elements * width } else { 0 }
+        let cast = if bias.dtype != output {
+            bias.elements() * width
+        } else {
+            0
+        };
+        cast + if convolution != output {
+            output_elements * width
+        } else {
+            0
+        }
     }
 }
 
@@ -576,20 +767,24 @@ pub(crate) fn final_norm_bytes(shape: &[i32], input: Dtype, weight: &Array, bias
         trace_layout("final norm bias", bias);
         eprintln!("OPERAND final norm input shape={shape:?} dtype={input:?}");
     }
-    final_norm_bytes_from_metadata(shape, input,
+    final_norm_bytes_from_metadata(
+        shape,
+        input,
         &mlx_gen::adapters::facts::TensorFacts::of(weight),
-        &mlx_gen::adapters::facts::TensorFacts::of(bias))
+        &mlx_gen::adapters::facts::TensorFacts::of(bias),
+    )
 }
 
 /// The identical affine-norm formula over borrowed operand metadata. Native guards above and
 /// header-only CLIP pricing both consume this; metadata carries no backing or allocation identity.
 pub(crate) fn final_norm_bytes_from_metadata(
-    shape: &[i32], input: Dtype,
+    shape: &[i32],
+    input: Dtype,
     weight: &mlx_gen::adapters::facts::TensorFacts,
     bias: &mlx_gen::adapters::facts::TensorFacts,
 ) -> u64 {
-    let output = Dtype::from_promoting_types(
-        Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
+    let output =
+        Dtype::from_promoting_types(Dtype::from_promoting_types(input, weight.dtype), bias.dtype);
     let count = shape.iter().fold(1u64, |n, &v| n.saturating_mul(u(v)));
     let channels = u(*shape.last().expect("LayerNorm has a channel dimension")).max(1);
     let width = dtype_bytes(output);
@@ -623,9 +818,7 @@ pub(crate) fn control_injection_bytes(hidden: &Array, residual: &Array) -> u64 {
         trace_layout("control injection hidden", hidden);
         trace_layout("control injection residual", residual);
     }
-    control_injection_bytes_metadata(
-        &activation_facts(hidden),
-        &activation_facts(residual))
+    control_injection_bytes_metadata(&activation_facts(hidden), &activation_facts(residual))
 }
 
 /// Deferred MultiControlNet sums are graph work, not already-held early-forward tensors. Record
@@ -995,13 +1188,14 @@ pub(crate) fn sampler_step_bytes(latents: &Array, inpaint: bool) -> u64 {
 /// (`IpImageEncoder::zeros_like_tokens` + the concatenation): the f32 zeros, their cast to the
 /// tokens' width (absent at f32) and the `[2, T, D]` pair, each its own buffer.
 pub(crate) fn ip_cfg_tokens_bytes(tokens: &Array) -> u64 {
-    let t = bytes(tokens);
-    let f32_zeros = mlx_gen::ios_quantum::tensor_bytes(4, &[tokens.size() as u64]);
-    let cast = if tokens.dtype() == Dtype::Float32 {
-        0
-    } else {
-        t
-    };
+    ip_cfg_tokens_bytes_metadata(&activation_facts(tokens))
+}
+
+/// Same actual CFG zeros/cast/pair formula over token metadata, never a native tensor factory.
+pub(crate) fn ip_cfg_tokens_bytes_metadata(tokens: &mlx_gen::adapters::facts::TensorFacts) -> u64 {
+    let t = tokens.bytes();
+    let f32_zeros = mlx_gen::ios_quantum::tensor_bytes(4, &[tokens.elements()]);
+    let cast = if tokens.dtype == Dtype::Float32 { 0 } else { t };
     f32_zeros
         .saturating_add(cast)
         .saturating_add(2 * t)
@@ -1091,22 +1285,41 @@ pub(crate) fn cast_load_parts(
     Ok((done, floor.max(done)))
 }
 
-
 impl LinearWork {
     /// A constructor-owned dense metadata base. This does not manufacture a native parameter.
-    pub(crate) fn dense(weight: mlx_gen::adapters::facts::TensorFacts,
-        bias: Option<mlx_gen::adapters::facts::TensorFacts>) -> Self {
-        Self { base: mlx_gen::adapters::LinearFacts {
-            base_shape: weight.shape.clone(), is_quantized: false, has_live_adapters: false,
-            adapter_count: 0, bias_shape: bias.as_ref().map(|b| b.shape.clone()),
-        }, weights: vec![weight], bias, residuals: Vec::new(), group_size: crate::quant::GROUP_SIZE, bits: None }
+    pub(crate) fn dense(
+        weight: mlx_gen::adapters::facts::TensorFacts,
+        bias: Option<mlx_gen::adapters::facts::TensorFacts>,
+    ) -> Self {
+        Self {
+            base: mlx_gen::adapters::LinearFacts {
+                base_shape: weight.shape.clone(),
+                is_quantized: false,
+                has_live_adapters: false,
+                adapter_count: 0,
+                bias_shape: bias.as_ref().map(|b| b.shape.clone()),
+            },
+            weights: vec![weight],
+            bias,
+            residuals: Vec::new(),
+            group_size: crate::quant::GROUP_SIZE,
+            bits: None,
+        }
     }
 }
 impl ConvWork {
-    pub(crate) fn new(weight: mlx_gen::adapters::facts::TensorFacts,
-        bias: Option<mlx_gen::adapters::facts::TensorFacts>) -> Self { Self { weight, bias } }
-    pub(crate) fn weight(&self) -> &mlx_gen::adapters::facts::TensorFacts { &self.weight }
-    pub(crate) fn bias(&self) -> Option<&mlx_gen::adapters::facts::TensorFacts> { self.bias.as_ref() }
+    pub(crate) fn new(
+        weight: mlx_gen::adapters::facts::TensorFacts,
+        bias: Option<mlx_gen::adapters::facts::TensorFacts>,
+    ) -> Self {
+        Self { weight, bias }
+    }
+    pub(crate) fn weight(&self) -> &mlx_gen::adapters::facts::TensorFacts {
+        &self.weight
+    }
+    pub(crate) fn bias(&self) -> Option<&mlx_gen::adapters::facts::TensorFacts> {
+        self.bias.as_ref()
+    }
 }
 impl EffectScope<'_> {
     /// Header-owned constructor defaults replace only the native fallback; selected effect lookup
@@ -1114,20 +1327,30 @@ impl EffectScope<'_> {
     pub(crate) fn linear_metadata(&self, name: &str, base: &LinearWork) -> Result<LinearWork> {
         let path = crate::quant::child_path(&self.prefix, name);
         match self.effects {
-            Some(effects) => effects.0.get(&path).cloned().ok_or_else(||
-                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))),
+            Some(effects) => effects.0.get(&path).cloned().ok_or_else(|| {
+                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))
+            }),
             None => Ok(base.clone()),
         }
     }
     pub(crate) fn shortcut_metadata(&self, name: &str, base: &LinearWork) -> LinearWork {
         let path = crate::quant::child_path(&self.prefix, name);
-        self.effects.and_then(|effects| effects.0.get(&path)).cloned().unwrap_or_else(|| base.clone())
+        self.effects
+            .and_then(|effects| effects.0.get(&path))
+            .cloned()
+            .unwrap_or_else(|| base.clone())
     }
     pub(crate) fn conv_metadata(&self, name: &str, base: &ConvWork) -> ConvWork {
         let path = crate::quant::child_path(&self.prefix, name);
-        let weight = self.effects.and_then(|effects| effects.1.get(&path)).cloned()
+        let weight = self
+            .effects
+            .and_then(|effects| effects.1.get(&path))
+            .cloned()
             .unwrap_or_else(|| base.weight.clone());
-        ConvWork { weight, bias: base.bias.clone() }
+        ConvWork {
+            weight,
+            bias: base.bias.clone(),
+        }
     }
 }
 
@@ -1136,19 +1359,30 @@ pub(crate) fn control_injection_bytes_metadata(
     residual: &mlx_gen::adapters::facts::TensorFacts,
 ) -> u64 {
     let output = Dtype::from_promoting_types(hidden.dtype, residual.dtype);
-    residual.bytes().saturating_add(hidden.elements() * dtype_bytes(output))
+    residual
+        .bytes()
+        .saturating_add(hidden.elements() * dtype_bytes(output))
 }
 impl ControlMergeWork {
-    pub(crate) fn record_outputs_metadata(&mut self,
+    pub(crate) fn record_outputs_metadata(
+        &mut self,
         down: &[mlx_gen::adapters::facts::TensorFacts],
         mid: &mlx_gen::adapters::facts::TensorFacts,
     ) -> Result<()> {
         for output in down {
-            self.down = self.down.checked_add(mlx_gen::ios_quantum::allocated_bytes(output.bytes()))
-                .ok_or_else(|| mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into()))?;
+            self.down = self
+                .down
+                .checked_add(mlx_gen::ios_quantum::allocated_bytes(output.bytes()))
+                .ok_or_else(|| {
+                    mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
+                })?;
         }
-        self.mid = self.mid.checked_add(mlx_gen::ios_quantum::allocated_bytes(mid.bytes()))
-            .ok_or_else(|| mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into()))?;
+        self.mid = self
+            .mid
+            .checked_add(mlx_gen::ios_quantum::allocated_bytes(mid.bytes()))
+            .ok_or_else(|| {
+                mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
+            })?;
         Ok(())
     }
 }
@@ -1159,9 +1393,12 @@ pub(crate) fn sampler_step_bytes_metadata(elements: u64, inpaint: bool) -> u64 {
 /// Borrow only shape/dtype for guard activations. Never query lazy strides, evaluate, retain a
 /// native owner, or claim a layout/backing identity merely to calculate a header-equivalent guard.
 pub(crate) fn activation_facts(array: &Array) -> mlx_gen::adapters::facts::TensorFacts {
-    mlx_gen::adapters::facts::TensorFacts { shape: array.shape().to_vec(), dtype: array.dtype(), strides: Vec::new() }
+    mlx_gen::adapters::facts::TensorFacts {
+        shape: array.shape().to_vec(),
+        dtype: array.dtype(),
+        strides: Vec::new(),
+    }
 }
-
 
 #[cfg(test)]
 mod linear_dtype_cast_tests {
@@ -1169,7 +1406,11 @@ mod linear_dtype_cast_tests {
     use mlx_gen::adapters::facts::TensorFacts;
 
     fn tensor(shape: &[i32], dtype: Dtype) -> TensorFacts {
-        TensorFacts { shape: shape.to_vec(), dtype, strides: Vec::new() }
+        TensorFacts {
+            shape: shape.to_vec(),
+            dtype,
+            strides: Vec::new(),
+        }
     }
 
     #[test]
@@ -1202,31 +1443,55 @@ mod linear_dtype_cast_tests {
         for bits in [4, 8] {
             for (input, scales, offsets, bias, compute, output, cast_bytes) in cases {
                 let work = LinearWork {
-                    base: mlx_gen::adapters::LinearFacts { base_shape: vec![2,64],
-                        is_quantized: true, has_live_adapters: false, adapter_count: 0,
-                        bias_shape: bias.map(|_| vec![2]) },
-                    weights: vec![tensor(&[2, 64 * bits / 32], Dtype::Uint32),
-                        tensor(&[2,1], scales), tensor(&[2,1], offsets)],
-                    bias: bias.map(|dtype| tensor(&[2], dtype)), residuals: Vec::new(),
-                    group_size: 64, bits: Some(bits),
+                    base: mlx_gen::adapters::LinearFacts {
+                        base_shape: vec![2, 64],
+                        is_quantized: true,
+                        has_live_adapters: false,
+                        adapter_count: 0,
+                        bias_shape: bias.map(|_| vec![2]),
+                    },
+                    weights: vec![
+                        tensor(&[2, 64 * bits / 32], Dtype::Uint32),
+                        tensor(&[2, 1], scales),
+                        tensor(&[2, 1], offsets),
+                    ],
+                    bias: bias.map(|dtype| tensor(&[2], dtype)),
+                    residuals: Vec::new(),
+                    group_size: 64,
+                    bits: Some(bits),
                 };
                 assert_eq!(work.packed_compute_dtype(input), compute);
                 assert_eq!(work.output_dtype(input), output);
-                assert_eq!(work.operand_bytes(&[3,64], input), cast_bytes,
-                    "q{bits} input={input:?} scales={scales:?} offsets={offsets:?} bias={bias:?}");
+                assert_eq!(
+                    work.operand_bytes(&[3, 64], input),
+                    cast_bytes,
+                    "q{bits} input={input:?} scales={scales:?} offsets={offsets:?} bias={bias:?}"
+                );
             }
             let work = LinearWork {
-                base: mlx_gen::adapters::LinearFacts { base_shape: vec![2,64],
-                    is_quantized: true, has_live_adapters: false, adapter_count: 0,
-                    bias_shape: Some(vec![3,2]) },
-                weights: vec![tensor(&[2, 64 * bits / 32], Dtype::Uint32),
-                    tensor(&[2,1], H), tensor(&[2,1], H)],
-                bias: Some(tensor(&[3,2], F)), residuals: Vec::new(),
-                group_size: 64, bits: Some(bits),
+                base: mlx_gen::adapters::LinearFacts {
+                    base_shape: vec![2, 64],
+                    is_quantized: true,
+                    has_live_adapters: false,
+                    adapter_count: 0,
+                    bias_shape: Some(vec![3, 2]),
+                },
+                weights: vec![
+                    tensor(&[2, 64 * bits / 32], Dtype::Uint32),
+                    tensor(&[2, 1], H),
+                    tensor(&[2, 1], H),
+                ],
+                bias: Some(tensor(&[3, 2], F)),
+                residuals: Vec::new(),
+                group_size: 64,
+                bits: Some(bits),
             };
-            assert_eq!(work.output_shape(&[1,64]).unwrap(), vec![3,2]);
-            assert_eq!(work.operand_bytes(&[1,64], H), 8,
-                "only two unbroadcast qmm result elements are cast, not six add outputs");
+            assert_eq!(work.output_shape(&[1, 64]).unwrap(), vec![3, 2]);
+            assert_eq!(
+                work.operand_bytes(&[1, 64], H),
+                8,
+                "only two unbroadcast qmm result elements are cast, not six add outputs"
+            );
         }
     }
 
@@ -1242,9 +1507,9 @@ mod linear_dtype_cast_tests {
             (B, B, Some(H), F, 1288),
             (F, F, Some(F), F, 0),
         ] {
-            let work = LinearWork::dense(tensor(&[2,64], weight), bias.map(|d| tensor(&[2], d)));
+            let work = LinearWork::dense(tensor(&[2, 64], weight), bias.map(|d| tensor(&[2], d)));
             assert_eq!(work.output_dtype(input), output);
-            assert_eq!(work.operand_bytes(&[3,64], input), cast_bytes);
+            assert_eq!(work.operand_bytes(&[3, 64], input), cast_bytes);
         }
     }
 }

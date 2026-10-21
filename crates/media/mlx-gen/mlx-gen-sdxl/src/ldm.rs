@@ -1,5 +1,7 @@
 //! In-memory fused SDXL LDM/A1111 checkpoint component split and remap.
 
+pub(crate) mod pricing;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -55,69 +57,29 @@ pub(crate) fn component_headers(
     path: &Path,
     component: SdxlComponent,
 ) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
-    use mlx_gen::gen_core::weightsmeta::{
-        safetensors_path_tensor_headers, SafetensorsTensorHeader,
-    };
-    let mut result = std::collections::BTreeMap::new();
-    for header in safetensors_path_tensor_headers(path).map_err(|e| Error::Msg(e.to_string()))? {
-        let Some(remap) = remap_sdxl_ldm_key(&header.name) else {
-            continue;
-        };
-        let mut insert = |name: String, shape: Vec<usize>| -> Result<()> {
-            let elements = shape.iter().try_fold(1u64, |n, dim| {
-                n.checked_mul(*dim as u64)
-                    .ok_or_else(|| Error::Msg("sdxl LDM header element count overflow".into()))
-            })?;
-            let data_bytes = elements
-                .checked_mul(header.dtype.size() as u64)
-                .ok_or_else(|| Error::Msg("sdxl LDM header byte count overflow".into()))?;
-            let target = SafetensorsTensorHeader {
-                name: name.clone(),
-                dtype: header.dtype,
-                shape,
-                data_bytes,
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|error| Error::Msg(error.to_string()))?;
+    match pricing::order_invariant_projection(&headers)? {
+        pricing::OrderInvariantProjection::Resolved(components) => {
+            let selected = match component {
+                SdxlComponent::Unet => components.unet,
+                SdxlComponent::ClipL => components.clip_l,
+                SdxlComponent::ClipBigG => components.clip_bigg,
+                SdxlComponent::Vae => components.vae,
             };
-            if result.insert(name, target).is_some() {
-                return Err(Error::Unsupported(
-                    "sdxl LDM normalization: ambiguous duplicate remapped target".into(),
-                ));
-            }
-            Ok(())
-        };
-        match remap {
-            TensorRemap::Rename(c, name) if c == component => insert(name, header.shape.clone())?,
-            TensorRemap::Transpose(c, name) if c == component => {
-                let mut shape = header.shape.clone();
-                shape.reverse();
-                insert(name, shape)?;
-            }
-            TensorRemap::Squeeze(c, name) if c == component => {
-                insert(name, squeezed_dimensions(&header.shape))?
-            }
-            TensorRemap::SplitQkv(c, names) if c == component => {
-                let mut shape = header.shape.clone();
-                let Some(rows) = shape.first_mut() else {
-                    return Err(Error::Msg("sdxl LDM QKV source is scalar".into()));
-                };
-                if *rows % 3 != 0 {
-                    return Err(Error::Msg(
-                        "sdxl LDM QKV source does not split evenly".into(),
-                    ));
-                }
-                *rows /= 3;
-                for name in names {
-                    insert(name, shape.clone())?;
-                }
-            }
-            _ => {}
+            Ok(selected.into_values().collect())
+        }
+        pricing::OrderInvariantProjection::NeedsActualOrder {
+            source_indices,
+            transform_failures,
+        } => {
+            // Existing semantic projection cannot certify these source-order-dependent files.
+            // This is an explicit unfinished source-seam dependency, not a new native restriction
+            // or numeric/full-Fused completion. Do not enumerate worlds or select a fake winner.
+            Err(Error::Unsupported(format!("sdxl LDM metadata needs actual correlated source order ({} non-equivalent writes, {} possible transform failures)",
+                source_indices.len(),transform_failures.len())))
         }
     }
-    if result.is_empty() {
-        return Err(Error::Msg(
-            "sdxl LDM component contains no remapped headers".into(),
-        ));
-    }
-    Ok(result.into_values().collect())
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
@@ -195,10 +157,43 @@ pub(crate) fn before_component_load(
     path: &Path,
     components: &[SdxlComponent],
 ) -> Result<()> {
-    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    let floor = component_load_floor_from_headers(&headers, components)?;
+    mlx_gen::ios_quantum::before(label, floor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Dtype;
+
+    #[test]
+    #[ignore = "real fused SDXL checkpoint; set SDXL_LDM_CHECKPOINT"]
+    fn real_checkpoint_builds_all_mlx_components() {
+        let path = std::env::var_os("SDXL_LDM_CHECKPOINT")
+            .map(std::path::PathBuf::from)
+            .expect("set SDXL_LDM_CHECKPOINT");
+        let components = split_ldm_checkpoint(&path).expect("split fused checkpoint");
+        crate::loader::load_text_encoder_1_from_weights(components.clip_l, Dtype::Float16)
+            .expect("build CLIP-L");
+        crate::loader::load_text_encoder_2_from_weights(components.clip_bigg, Dtype::Float16)
+            .expect("build OpenCLIP-bigG");
+        crate::loader::load_unet_from_weights(components.unet, Dtype::Float16).expect("build UNet");
+        crate::loader::load_vae_from_weights(components.vae).expect("build VAE");
+    }
+}
+
+/// Exact source-raw guard floor over every mapped source header in the selected actual component
+/// set, including overwritten aliases and full QKV sources. No model/Array/world enumeration.
+pub(crate) fn component_load_floor_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    components: &[SdxlComponent],
+) -> Result<u64> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     let compute = match crate::model::DTYPE {
         mlx_rs::Dtype::Float32 => (Stored::F32, 4u64),
         mlx_rs::Dtype::Bfloat16 => (Stored::BF16, 2),
@@ -206,9 +201,7 @@ pub(crate) fn before_component_load(
     };
     let mut total = 0u64;
     let mut largest = 0u64;
-    for header in mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
-        .map_err(|e| Error::Msg(e.to_string()))?
-    {
+    for header in headers {
         let component = match remap_sdxl_ldm_key(&header.name) {
             Some(
                 TensorRemap::Rename(component, _)
@@ -238,26 +231,5 @@ pub(crate) fn before_component_load(
             largest = largest.max(cast.saturating_add(header.data_bytes));
         }
     }
-    mlx_gen::ios_quantum::before(label, total.saturating_add(largest))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mlx_rs::Dtype;
-
-    #[test]
-    #[ignore = "real fused SDXL checkpoint; set SDXL_LDM_CHECKPOINT"]
-    fn real_checkpoint_builds_all_mlx_components() {
-        let path = std::env::var_os("SDXL_LDM_CHECKPOINT")
-            .map(std::path::PathBuf::from)
-            .expect("set SDXL_LDM_CHECKPOINT");
-        let components = split_ldm_checkpoint(&path).expect("split fused checkpoint");
-        crate::loader::load_text_encoder_1_from_weights(components.clip_l, Dtype::Float16)
-            .expect("build CLIP-L");
-        crate::loader::load_text_encoder_2_from_weights(components.clip_bigg, Dtype::Float16)
-            .expect("build OpenCLIP-bigG");
-        crate::loader::load_unet_from_weights(components.unet, Dtype::Float16).expect("build UNet");
-        crate::loader::load_vae_from_weights(components.vae).expect("build VAE");
-    }
+    Ok(total.saturating_add(largest))
 }

@@ -66,7 +66,7 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
         let live = Regime::from_request(&req).unwrap();
         req.geometry.reference_count = 1;
         assert!(
-            matches!(Regime::from_request(&req),Err(error) if error.to_string().contains("reference counts differ"))
+            matches!(Regime::from_request(&req),Err(error) if error.to_string().contains("aggregate image counts differ"))
         );
         req.geometry.reference_count = 0;
         assert!(
@@ -88,11 +88,17 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
             ios_pricing_with_recipe(&req, &recipe, SamplingWorkFacts::default())
                 .unwrap_err()
                 .to_string()
-                .contains("reference counts differ")
+                .contains("aggregate image counts differ")
         );
     }
     let recipe = SamplingRecipe::from_request(&request("euler_ancestral")).unwrap();
     let execution = GenerationMemory::default();
+    let actual_ip_image = mlx_gen::media::Image {
+        width: 20,
+        height: 18,
+        pixels: vec![0; 20 * 18 * 3],
+    };
+    let actual_ip_facts = crate::sampling::ReferenceImageFacts::from_image(&actual_ip_image);
     for (mode, work, init) in [
         (
             MemoryMode::ImageToImage,
@@ -124,6 +130,7 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
             MemoryMode::Other("ip_adapter".into()),
             SamplingWorkFacts {
                 reference_count: 1,
+                reference_image: Some(actual_ip_facts),
                 ..Default::default()
             },
             false,
@@ -133,7 +140,9 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
         let mut configured = spec.clone();
         match &mode {
             MemoryMode::Other(name) if name == "control" => {
-                configured.control = Some(WeightsSource::Dir("unused-control-headers".into()))
+                configured.control = Some(WeightsSource::Dir("unused-control-headers".into()));
+                // A configured IP component is NOT an executed IP branch when Control is active.
+                configured.ip_adapter = Some(WeightsSource::Dir("unused-ip-headers".into()));
             }
             MemoryMode::Other(name) if name == "ip_adapter" => {
                 configured.ip_adapter = Some(WeightsSource::Dir("unused-ip-headers".into()))
@@ -149,7 +158,8 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
                 height: 80,
                 batch: 2,
                 frames: 1,
-                reference_count: 1,
+                reference_count: (work.reference_count + work.mask_count + work.control_count)
+                    as u32,
             },
             selection: &selection,
             execution: &execution,
@@ -162,6 +172,20 @@ fn metadata_recipe_pricing_regime_matches_live_controls_and_rejects_conflicting_
             Regime::from_recipe(&req, &recipe, work).unwrap().has_init,
             init
         );
+        if matches!(&mode, MemoryMode::Other(name) if name == "ip_adapter") {
+            let missing = SamplingWorkFacts {
+                reference_image: None,
+                ..work
+            };
+            assert!(
+                Regime::from_recipe(&req, &recipe, missing)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("actual ReferenceImageFacts"),
+                "legacy missing source facts are not a crop default"
+            );
+        }
     }
 }
 

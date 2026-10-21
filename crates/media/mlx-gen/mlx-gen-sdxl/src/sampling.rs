@@ -380,6 +380,11 @@ impl ResolvedSampling {
         self.route.is_curated()
     }
 
+    /// Actual unclamped IP scale; distinct from img2img init strength clamping.
+    pub(crate) fn effective_ip_scale(&self) -> f32 {
+        crate::model::ip_reference_scale(self.recipe.reference_strength.or(self.recipe.strength))
+    }
+
     /// Effective strength ONLY for an actual VAE init. IP image prompts/text pass false and must
     /// not acquire an img2img strength. Reuses production's exact override/default/clamp utility.
     pub fn effective_init_strength(&self, true_init: bool, mask: bool) -> Option<f32> {
