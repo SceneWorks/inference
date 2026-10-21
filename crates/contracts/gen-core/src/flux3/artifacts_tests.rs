@@ -95,7 +95,10 @@ fn explicit_storage_graph_entry_does_not_enable_legacy_dense_misreads() {
         "vae":{"path":"ae.safetensors","dtype":"float32"},
         "sampler":{"steps":16,"guidance":null,"alpha":6.93,"size":[1024,1024]}
     });
-    let parsed = super::super::Flux3Config::parse(&value.to_string()).unwrap();
+    let parsed = super::super::Flux3MetadataConfig::parse(&value.to_string())
+        .unwrap()
+        .for_model(super::super::DISTILLED_MODEL_ID)
+        .unwrap();
     assert_eq!(parsed.quantization.as_deref(), Some("mlx-affine"));
     parsed.validate_native_storage_graph().unwrap();
     assert!(parsed.validate_supported().is_err());

@@ -1,5 +1,6 @@
 use super::*;
 use crate::flux3::conversion::open_conversion;
+use crate::safetensors_path_tensor_headers;
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8,10 +9,23 @@ fn fixture() -> PathBuf {
 
 /// A private copy of the committed tiny dense package plus the license files a real one ships.
 fn source_copy(dir: &Path) -> ConversionSource {
+    source_copy_kind(dir, false)
+}
+fn source_copy_kind(dir: &Path, base: bool) -> ConversionSource {
+    let selected = if base {
+        fixture().parent().unwrap().join("tiny-base-snapshot")
+    } else {
+        fixture()
+    };
     let root = dir.join("source");
     std::fs::create_dir_all(root.join("text_encoder")).unwrap();
     for entry in ["config.json", "model.safetensors", "ae.safetensors"] {
-        std::fs::copy(fixture().join(entry), root.join(entry)).unwrap();
+        let input = if entry == "ae.safetensors" {
+            fixture().join(entry)
+        } else {
+            selected.join(entry)
+        };
+        std::fs::copy(input, root.join(entry)).unwrap();
     }
     for entry in std::fs::read_dir(fixture().join("text_encoder")).unwrap() {
         let entry = entry.unwrap();
@@ -25,8 +39,18 @@ fn source_copy(dir: &Path) -> ConversionSource {
     std::fs::write(root.join("NOTICE.md"), b"notice").unwrap();
     ConversionSource {
         root,
-        repository: crate::flux3::DISTILLED_WEIGHTS_REPO.into(),
-        revision: crate::flux3::DISTILLED_WEIGHTS_REVISION.into(),
+        repository: if base {
+            crate::flux3::BASE_WEIGHTS_REPO
+        } else {
+            crate::flux3::DISTILLED_WEIGHTS_REPO
+        }
+        .into(),
+        revision: if base {
+            crate::flux3::BASE_WEIGHTS_REVISION
+        } else {
+            crate::flux3::DISTILLED_WEIGHTS_REVISION
+        }
+        .into(),
     }
 }
 
@@ -53,7 +77,7 @@ fn affine_conversion_is_deterministic_complete_and_dequantizes_to_the_source() {
             group_size: group,
         };
         assert_eq!(NativeDitStorage::from_package(&one).unwrap(), storage);
-        let cfg = Flux3Config::from_dir(&one).unwrap();
+        let cfg = super::super::resolve_checkpoint(&one).unwrap();
         storage
             .validate_headers(
                 &cfg.dit,
@@ -254,4 +278,67 @@ fn symlinked_snapshot_converts_like_a_plain_copy() {
         &CancelFlag::new()
     )
     .is_err());
+}
+
+#[test]
+fn base_conversion_preserves_absent_metadata_and_binds_receipt_to_header_role() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = source_copy_kind(temp.path(), true);
+    let output = temp.path().join("base-q4");
+    let receipt = convert_affine(&source, 4, 64, &output, &CancelFlag::new()).unwrap();
+    let metadata = crate::flux3::Flux3MetadataConfig::from_dir(&output).unwrap();
+    assert_eq!(
+        metadata.dit.flow_map, None,
+        "conversion must not fabricate an explicit base flag"
+    );
+    let resolved = crate::flux3::resolve_checkpoint(&output).unwrap();
+    resolved
+        .validate_route(crate::flux3::BASE_MODEL_ID)
+        .unwrap();
+    assert_eq!(receipt.source_repository, crate::flux3::BASE_WEIGHTS_REPO);
+    assert_eq!(open_conversion(&output).unwrap(), receipt);
+    let mut mislabeled = receipt;
+    mislabeled.source_repository = crate::flux3::DISTILLED_WEIGHTS_REPO.into();
+    mislabeled.source_revision = crate::flux3::DISTILLED_WEIGHTS_REVISION.into();
+    for component in &mut mislabeled.components {
+        component.source_repository = mislabeled.source_repository.clone();
+        component.source_revision = mislabeled.source_revision.clone();
+    }
+    mislabeled.validate().unwrap(); // Repo/revision are a valid pair, but the WRONG header role.
+    std::fs::write(
+        output.join(crate::flux3::conversion::RECEIPT_FILE),
+        serde_json::to_vec(&mislabeled.to_json().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        matches!(open_conversion(&output),Err(Error::Unsupported(message)) if message.contains("flow_map=false") && message.contains(crate::flux3::BASE_WEIGHTS_REPO))
+    );
+}
+
+#[test]
+fn conversion_refuses_wrong_source_role_before_pack_or_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut source = source_copy(temp.path());
+    source.repository = crate::flux3::BASE_WEIGHTS_REPO.into();
+    source.revision = crate::flux3::BASE_WEIGHTS_REVISION.into();
+    let output = temp.path().join("never-published");
+    let calls = std::cell::Cell::new(0);
+    let result = convert_native(
+        &source,
+        NativeDitStorage::MlxAffine {
+            bits: 4,
+            group_size: 64,
+        },
+        &output,
+        &CancelFlag::new(),
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            panic!("mode/repository must be checked before any tensor packing")
+        },
+    );
+    assert!(
+        matches!(result,Err(Error::Unsupported(message)) if message.contains("flow_map=true") && message.contains(crate::flux3::DISTILLED_WEIGHTS_REPO))
+    );
+    assert_eq!(calls.get(), 0);
+    assert!(!output.exists());
 }

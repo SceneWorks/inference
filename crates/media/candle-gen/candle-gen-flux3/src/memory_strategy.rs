@@ -41,7 +41,9 @@ use std::path::Path;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
 use candle_gen::gen_core::flux3::quantization::DitFormat;
-use candle_gen::gen_core::flux3::{Flux3Config, GenerationResources, TextEncoderConfig};
+use candle_gen::gen_core::flux3::{
+    resolve_checkpoint, Flux3Config, GenerationResources, TextEncoderConfig, BASE_MODEL_ID,
+};
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
     self, Error as CoreError, LoadShape, LoadSpec, MemoryArchitectureFacts, MemoryAssetFacts,
@@ -104,15 +106,28 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 }
 
 /// Refuse the spec axes that would make a contract describe a load that cannot happen.
-fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
-    refuse_deferred_load_shape(MODEL_ID, spec)?;
-    selected_storage(spec.quantize).map(|_| ())
+fn refuse_unloadable_spec(id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    refuse_deferred_load_shape(id, spec)?;
+    selected_storage(id, spec.quantize).map(|_| ())
+}
+
+/// The `'static` registry id of one of this crate's two routes (the request-scope config keeps
+/// it). Anything else is not this provider.
+pub(crate) fn route_id(provider_id: &str) -> CoreResult<&'static str> {
+    match provider_id {
+        MODEL_ID => Ok(MODEL_ID),
+        BASE_MODEL_ID => Ok(BASE_MODEL_ID),
+        other => Err(CoreError::Unsupported(format!(
+            "{other}: not the FLUX 3 Candle memory provider"
+        ))),
+    }
 }
 
 /// The Candle native DiT storage a `LoadSpec::quantize` selects: dense, or the GGML Q4_1 / Q8_0
-/// packages converted from the ORIGINAL dense checkpoint. Publisher FP8R/NVFP4 have no Candle
-/// FLUX3 kernel on this build yet: a typed refusal, never a dequantized or dense substitute.
-pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
+/// packages converted from the ORIGINAL dense checkpoint; on the CUDA build also the publisher
+/// FP8R/NVFP4 artifacts as shipped. Every other format (and FP8R/NVFP4 off CUDA) is a typed
+/// refusal naming `id`, never a dequantized or dense substitute.
+pub fn selected_storage(id: &str, quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
     Ok(match quant {
         None => NativeDitStorage::Publisher(DitFormat::Dense),
         Some(Quant::Q4) => NativeDitStorage::GgmlQ4_1,
@@ -127,7 +142,7 @@ pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
         #[cfg_attr(feature = "cuda", allow(unreachable_patterns))]
         Some(other) => {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: LoadSpec::quantize {} has no Candle FLUX3 kernel on this build; the \
+                "{id}: LoadSpec::quantize {} has no Candle FLUX3 kernel on this build; the \
                  native Candle tiers are q4 (GGML Q4_1) and q8 (GGML Q8_0) converted from the \
                  original dense package",
                 other.key()
@@ -138,8 +153,8 @@ pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
 
 /// The calibration identity of one numeric tier. A packed tier is a different stored footprint
 /// and a different GEMM, so it never inherits the dense tier's identity.
-pub fn tier_fingerprint(base: &str, quant: Option<Quant>) -> CoreResult<String> {
-    Ok(match selected_storage(quant)? {
+pub fn tier_fingerprint(id: &str, base: &str, quant: Option<Quant>) -> CoreResult<String> {
+    Ok(match selected_storage(id, quant)? {
         NativeDitStorage::Publisher(DitFormat::Dense) => base.to_owned(),
         storage => format!("{base}-{}", storage.key()?.replace('_', "-")),
     })
@@ -175,31 +190,34 @@ fn tensor_bytes(header: &SafetensorsTensorHeader, float_width: u64) -> CoreResul
     }
 }
 
-fn checked_sum(parts: impl Iterator<Item = CoreResult<u64>>) -> CoreResult<u64> {
+fn checked_sum(id: &str, parts: impl Iterator<Item = CoreResult<u64>>) -> CoreResult<u64> {
     let mut sum = 0_u64;
     for part in parts {
         sum = sum
             .checked_add(part?)
-            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: component byte sum overflow")))?;
+            .ok_or_else(|| CoreError::Msg(format!("{id}: component byte sum overflow")))?;
     }
     Ok(sum)
 }
 
 /// Resident bytes of the DiT as [`crate::model::load_dit`] holds it: every tensor of rank two or
 /// more at the compute dtype; vectors (the q/k norm scales) in f32.
-pub fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
+pub fn dit_bytes(id: &str, weights: &Path, precision: Precision) -> CoreResult<u64> {
     let compute_width = compute_width(precision) as u64;
     let headers = safetensors_path_tensor_headers(weights)?;
-    checked_sum(headers.iter().map(|header| {
-        tensor_bytes(
-            header,
-            if header.shape.len() >= 2 {
-                compute_width
-            } else {
-                4
-            },
-        )
-    }))
+    checked_sum(
+        id,
+        headers.iter().map(|header| {
+            tensor_bytes(
+                header,
+                if header.shape.len() >= 2 {
+                    compute_width
+                } else {
+                    4
+                },
+            )
+        }),
+    )
 }
 
 /// Resident DiT bytes for an explicit native storage, as `Flux3Dit::load_with_storage` holds it:
@@ -214,51 +232,53 @@ pub fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
 ///   codes, output and padding) at it, and it also bounds candle's grows-only CUDA quantized-matmul
 ///   workspace, which persists after the largest launch. An upper bound, not a measurement.
 pub fn native_dit_bytes(
+    id: &str,
     weights: &Path,
     precision: Precision,
     storage: NativeDitStorage,
     cfg: &gen_core::flux3::DitConfig,
 ) -> CoreResult<u64> {
     if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
-        return dit_bytes(weights, precision);
+        return dit_bytes(id, weights, precision);
     }
     let headers = safetensors_path_tensor_headers(weights)?;
     storage.validate_headers(cfg, &headers)?;
     let targets = storage.packed_targets(cfg)?;
     let compute_width = compute_width(precision) as u64;
-    let weights = checked_sum(headers.iter().map(|header| {
-        if targets.contains(&header.name) {
-            Ok(header.data_bytes)
-        } else if header.name.ends_with(".weight_scale") {
-            let elements = header
-                .shape
-                .iter()
-                .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
-                .ok_or_else(|| {
-                    CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow"))
-                })?;
-            let staged = if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) {
-                4
-            } else {
-                1
-            };
-            elements
-                .checked_mul(staged)
-                .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow")))
-        } else {
-            tensor_bytes(
-                header,
-                if header.shape.len() >= 2 {
-                    compute_width
-                } else {
+    let weights = checked_sum(
+        id,
+        headers.iter().map(|header| {
+            if targets.contains(&header.name) {
+                Ok(header.data_bytes)
+            } else if header.name.ends_with(".weight_scale") {
+                let elements = header
+                    .shape
+                    .iter()
+                    .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+                    .ok_or_else(|| CoreError::Unsupported(format!("{id}: scale size overflow")))?;
+                let staged = if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) {
                     4
-                },
-            )
-        }
-    }))?;
+                } else {
+                    1
+                };
+                elements
+                    .checked_mul(staged)
+                    .ok_or_else(|| CoreError::Unsupported(format!("{id}: scale size overflow")))
+            } else {
+                tensor_bytes(
+                    header,
+                    if header.shape.len() >= 2 {
+                        compute_width
+                    } else {
+                        4
+                    },
+                )
+            }
+        }),
+    )?;
     weights
         .checked_add(gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET)
-        .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: DiT byte overflow")))
+        .ok_or_else(|| CoreError::Unsupported(format!("{id}: DiT byte overflow")))
 }
 
 fn apply_tier_fingerprint(
@@ -266,15 +286,16 @@ fn apply_tier_fingerprint(
     quant: Option<Quant>,
 ) -> CoreResult<()> {
     if let Some(calibration) = &mut contract.calibration {
-        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, quant)?;
+        calibration.fingerprint =
+            tier_fingerprint(&contract.provider_id, &calibration.fingerprint, quant)?;
     }
     Ok(())
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
-pub fn autoencoder_bytes(weights: &Path) -> CoreResult<u64> {
+pub fn autoencoder_bytes(id: &str, weights: &Path) -> CoreResult<u64> {
     let headers = safetensors_path_tensor_headers(weights)?;
-    checked_sum(headers.iter().map(|header| tensor_bytes(header, 4)))
+    checked_sum(id, headers.iter().map(|header| tensor_bytes(header, 4)))
 }
 
 /// Whether [`crate::text_encoder::Flux3TextEncoder::load`] keeps the checkpoint tensor `name`
@@ -287,14 +308,15 @@ pub fn text_encoder_keeps(name: &str, tie_word_embeddings: bool) -> bool {
 
 /// Resident bytes of the text encoder as the loader builds it, at a `tower_width`-byte dtype,
 /// over the exact shard files the loader opens.
-pub fn text_encoder_bytes(dir: &Path, tower_width: u64) -> CoreResult<u64> {
+pub fn text_encoder_bytes(id: &str, dir: &Path, tower_width: u64) -> CoreResult<u64> {
     let tied = candle_llm::ModelConfig::from_dir(dir)
-        .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: text encoder config: {e}")))?
+        .map_err(|e| CoreError::Msg(format!("{id}: text encoder config: {e}")))?
         .tie_word_embeddings;
     let mut total = 0_u64;
     for file in crate::text_encoder::shard_files(dir)? {
         let headers = safetensors_path_tensor_headers(&file)?;
         let part = checked_sum(
+            id,
             headers
                 .iter()
                 .filter(|header| text_encoder_keeps(&header.name, tied))
@@ -302,7 +324,7 @@ pub fn text_encoder_bytes(dir: &Path, tower_width: u64) -> CoreResult<u64> {
         )?;
         total = total
             .checked_add(part)
-            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: text encoder byte sum overflow")))?;
+            .ok_or_else(|| CoreError::Msg(format!("{id}: text encoder byte sum overflow")))?;
     }
     Ok(total)
 }
@@ -345,11 +367,22 @@ fn architecture_facts(
 // Contracts.
 // ================================================================================================
 
+/// The calibration identity of the base CFG route: a distinct graph (no target-time embedder),
+/// never a distilled calibration. CFG's [unconditional, conditional] pack is a FIXED x2
+/// coefficient of the base route (always two rows, any guidance), carried by this separate
+/// identity. It is not a request variable: `count` still renders sequentially, so no BatchCount
+/// axis.
+const BASE_CALIBRATION_FINGERPRINT: &str = "flux3-klein-base-candle-cfg-source-v1";
+
 /// The declaration every surface shares: route shape, calibration identity and strategy
-/// classification, with no asset facts.
-fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryProviderContract {
+/// classification, with no asset facts, for the route `id` names.
+fn base_contract(
+    id: &'static str,
+    precision: Precision,
+    config: Option<&Flux3Config>,
+) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
-        MODEL_ID,
+        id,
         MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
@@ -362,7 +395,11 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.architecture_facts = architecture_facts(config, precision);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        if id == BASE_MODEL_ID {
+            BASE_CALIBRATION_FINGERPRINT
+        } else {
+            MEMORY_CALIBRATION_FINGERPRINT
+        },
         LoadShape::EagerMaterialization,
     ));
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
@@ -411,31 +448,71 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID && provider_id != gen_core::flux3::BASE_MODEL_ID {
-        return Err(CoreError::Unsupported(format!(
-            "{provider_id}: not the FLUX 3 Candle memory provider"
-        )));
-    }
-    refuse_unloadable_spec(spec)?;
+    let id = route_id(provider_id)?;
+    refuse_unloadable_spec(id, spec)?;
     if !spec.adapters.is_empty() {
         return Err(CoreError::Unsupported(
             "flux3: adapters require the real package config for identity/rank admission".into(),
         ));
     }
 
-    let mut contract = base_contract(spec.precision, None);
-    contract.provider_id = provider_id.into();
-    if provider_id == gen_core::flux3::BASE_MODEL_ID {
-        contract.calibration = Some(MemoryCalibrationIdentity::new(
-            "flux3-klein-base-candle-cfg-source-v1",
-            LoadShape::EagerMaterialization,
-        ));
-        // CFG's [unconditional, conditional] pack is a FIXED x2 coefficient of the base route
-        // (always two rows, any guidance), carried by its separate calibration identity. It is
-        // not a request variable: `count` still renders sequentially, so no BatchCount axis.
-    }
+    let mut contract = base_contract(id, spec.precision, None);
     apply_tier_fingerprint(&mut contract, spec.quantize)?;
     Ok(contract)
+}
+
+/// The package root a spec names; a single file is a typed refusal naming the route.
+pub(crate) fn package_dir(id: &str, spec: &LoadSpec) -> CoreResult<std::path::PathBuf> {
+    match &spec.weights {
+        gen_core::WeightsSource::Dir(dir) => Ok(dir.clone()),
+        gen_core::WeightsSource::File(file) => Err(CoreError::Unsupported(format!(
+            "{id}: the weights resource must be the package directory, not {}",
+            file.display()
+        ))),
+    }
+}
+
+/// The header-authoritative checkpoint of the route `id` selects: the package resolved through
+/// [`resolve_checkpoint`] (the mode is the DiT header's, never the metadata's) and refused unless
+/// it IS that route. Runs before any component, adapter or pricing work.
+pub(crate) fn resolve_route_checkpoint(id: &str, package_dir: &Path) -> CoreResult<Flux3Config> {
+    let config = resolve_checkpoint(package_dir)?;
+    config.validate_route(id)?;
+    Ok(config)
+}
+
+/// The DiT storage `spec` selects on a resolved package, preflighted header-only BEFORE any
+/// text-encoder, autoencoder, adapter, memory or device work, for EVERY storage (dense included):
+/// the package marker is exactly the selection (no tier or model fallback), the selection is
+/// legal at the spec's precision, the config's graph is one the native graph implements, and the
+/// selected checkpoint's full physical inventory (names / dtypes / shapes and the `ref_time_in`
+/// pair) is the one that storage and the resolved config imply.
+pub(crate) fn preflight_checkpoint(
+    id: &str,
+    spec: &LoadSpec,
+    package_dir: &Path,
+    config: &Flux3Config,
+) -> CoreResult<NativeDitStorage> {
+    let storage = selected_storage(id, spec.quantize)?;
+    let package_storage = NativeDitStorage::from_package(package_dir)?;
+    if package_storage != storage {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: selected {} but the quantization marker of {} is {}; install or convert the \
+             exact requested native tier (no tier or model fallback)",
+            storage.key()?,
+            package_dir.display(),
+            package_storage.key()?
+        )));
+    }
+    storage.validate_selection(spec.quantize, spec.precision)?;
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        config.validate_supported()?;
+    } else {
+        config.validate_native_storage_graph()?;
+    }
+    let headers = gen_core::flux3::checkpoint_tensor_headers(package_dir)?;
+    crate::dit::validate_checkpoint_headers(&config.dit, storage, &headers)?;
+    Ok(storage)
 }
 
 /// The executable contract for a real load: the declaration plus the resident bytes of what the
@@ -444,61 +521,36 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID && provider_id != gen_core::flux3::BASE_MODEL_ID {
-        return Err(CoreError::Unsupported(format!(
-            "{provider_id}: not the FLUX 3 Candle memory provider"
-        )));
-    }
-    refuse_unloadable_spec(spec)?;
-    let package_dir = match &spec.weights {
-        gen_core::WeightsSource::Dir(dir) => dir.clone(),
-        gen_core::WeightsSource::File(file) => {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: the weights resource must be the package directory, not {}",
-                file.display()
-            )))
-        }
-    };
-    let config = Flux3Config::from_dir(&package_dir)?;
-    let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
-    if config.dit.flow_map == (provider_id == gen_core::flux3::BASE_MODEL_ID) {
-        return Err(CoreError::Unsupported(format!(
-            "{provider_id}: checkpoint flow_map={} does not match selected route",
-            config.dit.flow_map
-        )));
-    }
-    generation_contract(spec, &resources, &config)
+    let id = route_id(provider_id)?;
+    refuse_unloadable_spec(id, spec)?;
+    let package_dir = package_dir(id, spec)?;
+    let config = resolve_route_checkpoint(id, &package_dir)?;
+    preflight_checkpoint(id, spec, &package_dir, &config)?;
+    let resources = GenerationResources::from_spec(spec, &config, id)?;
+    generation_contract(id, spec, &resources, &config)
 }
 
-/// The contract for already-resolved resources (what [`crate::model::load`] holds).
+/// The contract for already-resolved resources (what [`crate::model::load`] holds), for the
+/// route `provider_id` names (already checked against the resolved checkpoint by the caller).
 pub(crate) fn generation_contract(
+    provider_id: &str,
     spec: &LoadSpec,
     resources: &GenerationResources,
     config: &Flux3Config,
 ) -> CoreResult<MemoryProviderContract> {
-    refuse_unloadable_spec(spec)?;
+    let id = route_id(provider_id)?;
+    refuse_unloadable_spec(id, spec)?;
     let precision = spec.precision;
-    let mut contract = base_contract(precision, Some(config));
-    if !config.dit.flow_map {
-        contract.provider_id = gen_core::flux3::BASE_MODEL_ID.into();
-        // Base is a distinct CFG graph (no target-time embedder), never a distilled calibration.
-        contract.calibration = Some(MemoryCalibrationIdentity::new(
-            "flux3-klein-base-candle-cfg-source-v1",
-            LoadShape::EagerMaterialization,
-        ));
-        // CFG's [unconditional, conditional] pack is a FIXED x2 coefficient of the base route
-        // (always two rows, any guidance), carried by its separate calibration identity. It is
-        // not a request variable: `count` still renders sequentially, so no BatchCount axis.
-    }
+    let mut contract = base_contract(id, precision, Some(config));
     for adapter in &spec.adapters {
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let storage = selected_storage(spec.quantize)?;
+    let storage = selected_storage(id, spec.quantize)?;
     let package_storage = NativeDitStorage::from_package(&resources.package_dir)?;
     if package_storage != storage {
         return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: selected {} but the package quantization marker is {}; install the \
+            "{id}: selected {} but the package quantization marker is {}; install the \
              exact requested native tier (no tier or model fallback)",
             storage.key()?,
             package_storage.key()?
@@ -506,16 +558,23 @@ pub(crate) fn generation_contract(
     }
     storage.validate_selection(spec.quantize, precision)?;
     apply_tier_fingerprint(&mut contract, spec.quantize)?;
-    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
+    let transformer = native_dit_bytes(
+        id,
+        &resources.dit_weights(),
+        precision,
+        storage,
+        &config.dit,
+    )?;
     let conditioning = text_encoder_bytes(
+        id,
         &resources.text_encoder_dir,
         production_tower_dtype(&config.text_encoder)?.size_in_bytes() as u64,
     )?;
-    let decoder = autoencoder_bytes(&resources.autoencoder_file)?;
+    let decoder = autoencoder_bytes(id, &resources.autoencoder_file)?;
     let base_bytes = conditioning
         .checked_add(transformer)
         .and_then(|b| b.checked_add(decoder))
-        .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: base component byte sum overflow")))?;
+        .ok_or_else(|| CoreError::Msg(format!("{id}: base component byte sum overflow")))?;
     contract.asset_facts = MemoryAssetFacts {
         base_bytes,
         conditioning_bytes: conditioning,
@@ -525,6 +584,7 @@ pub(crate) fn generation_contract(
     };
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
         account_upsampler(
+            id,
             &mut contract,
             crate::pup::load_memory_bytes(&dir)?,
             upsampler_residency(spec.offload_policy),
@@ -600,13 +660,14 @@ pub(crate) fn upsampler_residency(
 /// load bound (prefix cache and CUDA graphs disabled), NOT measured KV/activation peak memory;
 /// the LLM admits its request-time KV separately.
 fn account_upsampler(
+    id: &str,
     contract: &mut MemoryProviderContract,
     bytes: u64,
     residency: gen_core::MemoryComponentResidency,
 ) -> CoreResult<()> {
     if bytes == 0 {
         return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: prompt_upsampler has no accountable weights; install the complete package"
+            "{id}: prompt_upsampler has no accountable weights; install the complete package"
         )));
     }
     contract.asset_facts.overlay_bytes = bytes;
@@ -637,6 +698,7 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    let id = contract.provider_id.as_str();
     let route_gate = || {
         gen_core::flux3::references::validate_memory_route(
             &context.mode,
@@ -644,12 +706,12 @@ pub fn safety_check(
         )?;
         if context.use_pid {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
+                "{id}: there is no PiD decoder on this route"
             )));
         }
         if context.geometry.frames > 1 {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: a still-image route cannot admit {} frames",
+                "{id}: a still-image route cannot admit {} frames",
                 context.geometry.frames
             )));
         }
@@ -703,12 +765,9 @@ pub(crate) fn registered_begin_request(
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
+    let id = route_id(&contract.provider_id)?;
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
-            gen_core::flux3::BASE_MODEL_ID
-        } else {
-            MODEL_ID
-        },
+        id,
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -719,9 +778,9 @@ pub(crate) fn registered_begin_request(
             .architecture_facts
             .transformer_blocks
             .unwrap_or_default() as usize,
-        |_use_pid, _edge, _overlap| {
+        move |_use_pid, _edge, _overlap| {
             Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: {DECODE_NOT_ENABLED}"
+                "{id}: {DECODE_NOT_ENABLED}"
             )))
         },
     )?;
@@ -748,7 +807,7 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     surfaces
         .into_iter()
         .filter(|surface| {
-            selected_storage(surface.spec.quantize).is_ok()
+            selected_storage(MODEL_ID, surface.spec.quantize).is_ok()
                 && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
@@ -762,7 +821,7 @@ fn reference_workspace_for(
     spec: &LoadSpec,
     facts: &gen_core::MemoryReferenceResourceFacts,
 ) -> CoreResult<u64> {
-    refuse_unloadable_spec(spec)?;
+    refuse_unloadable_spec(route_id(provider_id)?, spec)?;
     let width = if production_device_is_cpu() {
         4
     } else {
@@ -789,7 +848,7 @@ pub fn base_reference_workspace_bytes(
     spec: &LoadSpec,
     facts: &gen_core::MemoryReferenceResourceFacts,
 ) -> CoreResult<u64> {
-    reference_workspace_for(gen_core::flux3::BASE_MODEL_ID, spec, facts)
+    reference_workspace_for(BASE_MODEL_ID, spec, facts)
 }
 
 pub const REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
@@ -867,19 +926,29 @@ mod tests {
         assert_ne!(base.calibration, distilled.calibration);
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
-        let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-snapshot")));
-        let mut config = Flux3Config::from_dir(&fixture.join("tiny-snapshot")).unwrap();
-        config.dit.flow_map = false;
-        config.sampler.guidance = Some(3.5);
-        let resources =
-            GenerationResources::from_spec(&spec, &config, gen_core::flux3::BASE_MODEL_ID).unwrap();
-        let plain = generation_contract(&spec, &resources, &config).unwrap();
+        // The real tiny CFG package (its DiT header carries no `ref_time_in`), with the distilled
+        // package's encoder and autoencoder as components.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-base-snapshot")));
+        spec.components.insert(
+            gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+            WeightsSource::Dir(fixture.join("tiny-snapshot/text_encoder")),
+        );
+        spec.components.insert(
+            gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+            WeightsSource::File(fixture.join("tiny-snapshot/ae.safetensors")),
+        );
+        let config =
+            resolve_route_checkpoint(BASE_MODEL_ID, &fixture.join("tiny-base-snapshot")).unwrap();
+        let resources = GenerationResources::from_spec(&spec, &config, BASE_MODEL_ID).unwrap();
+        let plain = generation_contract(BASE_MODEL_ID, &spec, &resources, &config).unwrap();
+        assert_eq!(plain.provider_id, BASE_MODEL_ID);
+        assert_eq!(plain.calibration, base.calibration);
         spec.adapters.push(gen_core::AdapterSpec::new(
             fixture.join("flux3_base_lora.safetensors"),
             0.4,
             gen_core::AdapterKind::Lora,
         ));
-        let adapted = generation_contract(&spec, &resources, &config).unwrap();
+        let adapted = generation_contract(BASE_MODEL_ID, &spec, &resources, &config).unwrap();
         assert!(adapted.asset_facts.overlay_bytes > 0);
         assert_eq!(adapted.asset_facts.base_bytes, plain.asset_facts.base_bytes);
         for contract in [&plain, &adapted] {
@@ -897,9 +966,9 @@ mod tests {
             gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-pup-snapshot")),
         );
-        let both = generation_contract(&spec, &resources, &config).unwrap();
+        let both = generation_contract(BASE_MODEL_ID, &spec, &resources, &config).unwrap();
         spec.adapters.clear();
-        let pup = generation_contract(&spec, &resources, &config).unwrap();
+        let pup = generation_contract(BASE_MODEL_ID, &spec, &resources, &config).unwrap();
         assert_eq!(
             both.asset_facts.overlay_bytes,
             adapted.asset_facts.overlay_bytes + pup.asset_facts.overlay_bytes
@@ -947,10 +1016,11 @@ mod tests {
     /// `memory_contract_surface_specs`.
     #[test]
     fn optional_upsampler_is_a_separate_whole_render_component() {
-        let mut contract = base_contract(Precision::Bf16, None);
+        let mut contract = base_contract(MODEL_ID, Precision::Bf16, None);
         contract.asset_facts.base_bytes = 113;
         contract.asset_facts.conditioning_bytes = 17;
         account_upsampler(
+            MODEL_ID,
             &mut contract,
             37,
             upsampler_residency(gen_core::OffloadPolicy::Resident),
@@ -981,6 +1051,7 @@ mod tests {
         );
         assert_eq!(contract.auxiliary_resident_bytes(), 37);
         assert!(account_upsampler(
+            MODEL_ID,
             &mut contract,
             0,
             upsampler_residency(gen_core::OffloadPolicy::Resident)
@@ -989,11 +1060,12 @@ mod tests {
 
         // Sequential: the exclusive slot drops PUP before conditioning work, so the bound is the
         // conditioning-phase head only and NO later phase is charged for it.
-        let mut staged = base_contract(Precision::Bf16, None);
+        let mut staged = base_contract(MODEL_ID, Precision::Bf16, None);
         staged.asset_facts.base_bytes = 113;
         staged.asset_facts.conditioning_bytes = 17;
         staged.asset_facts.transformer_bytes = 96;
         account_upsampler(
+            MODEL_ID,
             &mut staged,
             37,
             upsampler_residency(gen_core::OffloadPolicy::Sequential),
@@ -1033,7 +1105,7 @@ mod tests {
     fn publisher_scales_price_at_their_staged_width() {
         use gen_core::flux3::safetensors_stream::{PlannedTensor, SafetensorsStreamWriter};
         use gen_core::weightsmeta::Dtype;
-        let cfg = Flux3Config::from_dir(
+        let cfg = resolve_checkpoint(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
         )
@@ -1085,7 +1157,7 @@ mod tests {
                 .sum::<u64>()
                 + gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET;
             assert_eq!(
-                native_dit_bytes(&path, Precision::Bf16, storage, &cfg).unwrap(),
+                native_dit_bytes(MODEL_ID, &path, Precision::Bf16, storage, &cfg).unwrap(),
                 want,
                 "{format:?}"
             );
@@ -1175,7 +1247,12 @@ mod tests {
             let calibration = contract.calibration.as_ref().unwrap();
             assert_eq!(
                 calibration.fingerprint,
-                tier_fingerprint(MEMORY_CALIBRATION_FINGERPRINT, surface.spec.quantize).unwrap()
+                tier_fingerprint(
+                    MODEL_ID,
+                    MEMORY_CALIBRATION_FINGERPRINT,
+                    surface.spec.quantize
+                )
+                .unwrap()
             );
             gen_core::validate_calibration_fingerprint(&calibration.fingerprint).unwrap();
             assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
@@ -1213,7 +1290,8 @@ mod tests {
         assert!(MEMORY_CALIBRATION_FINGERPRINT.contains("candle"));
     }
 
-    /// *Mutation that reds this:* dropping any arm of `refuse_unloadable_spec`.
+    /// *Mutation that reds this:* dropping any arm of `refuse_unloadable_spec`, or advertising
+    /// the publisher FP8R/NVFP4 tiers off the CUDA build (or refusing them on it).
     #[test]
     fn a_spec_no_loader_opens_has_no_contract() {
         let mut adapters = sentinel();
@@ -1224,16 +1302,76 @@ mod tests {
             pass_scales: None,
             moe_expert: None,
         });
-        for spec in [
-            sentinel().with_quant(Quant::Nvfp4),
-            sentinel().with_quant(Quant::Fp8Rowwise),
+        let mut refused = vec![
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
             adapters,
-        ] {
-            match weights_free_memory_strategy_contract(MODEL_ID, &spec) {
-                Err(CoreError::Unsupported(_)) => {}
-                other => panic!("expected a typed refusal, got {other:?}"),
+        ];
+        let publisher = [
+            sentinel().with_quant(Quant::Nvfp4),
+            sentinel().with_quant(Quant::Fp8Rowwise),
+        ];
+        // The publisher tiers are a CUDA-build capability (loaded as shipped onto their kernels):
+        // a weights-free contract on CUDA, a typed refusal everywhere else.
+        if cfg!(feature = "cuda") {
+            for id in [MODEL_ID, BASE_MODEL_ID] {
+                for spec in &publisher {
+                    let contract = weights_free_memory_strategy_contract(id, spec).unwrap();
+                    assert_eq!(contract.provider_id, id);
+                }
             }
+        } else {
+            refused.extend(publisher);
+        }
+        for id in [MODEL_ID, BASE_MODEL_ID] {
+            for spec in &refused {
+                match weights_free_memory_strategy_contract(id, spec) {
+                    Err(CoreError::Unsupported(_)) => {}
+                    other => panic!("{id}: expected a typed refusal, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The executable contract resolves the checkpoint from its DiT HEADER and refuses the wrong
+    /// route, and a dense package whose physical inventory is not the resolved graph's, BEFORE
+    /// any text-encoder / autoencoder resource is resolved or priced (neither package below names
+    /// one: reaching that step would be a missing-resource `Msg`, not a typed refusal).
+    ///
+    /// *Mutations that red this:* dropping `validate_route`, resolving the route from
+    /// `config.json` (both real packages carry the same metadata), skipping the dense inventory
+    /// preflight, or running it after `GenerationResources::from_spec`.
+    #[test]
+    fn route_and_dense_inventory_are_refused_before_component_work() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
+        for (id, dir) in [
+            (BASE_MODEL_ID, "tiny-snapshot"),
+            (MODEL_ID, "tiny-base-snapshot"),
+        ] {
+            let spec = LoadSpec::new(WeightsSource::Dir(fixtures.join(dir)));
+            match memory_strategy_contract(id, &spec) {
+                Err(CoreError::Unsupported(m)) => assert!(m.contains("flow_map"), "{id}: {m}"),
+                other => panic!("{id} on {dir}: expected a typed route refusal, got {other:?}"),
+            }
+        }
+        // A base package whose DiT lacks one projection the resolved graph needs.
+        let dir = tempfile::tempdir().unwrap();
+        let base = fixtures.join("tiny-base-snapshot");
+        std::fs::copy(base.join("config.json"), dir.path().join("config.json")).unwrap();
+        let mut tensors = candle_gen::candle_core::safetensors::load(
+            base.join("model.safetensors"),
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap();
+        assert!(tensors.remove("final_layer.image.linear.weight").is_some());
+        candle_gen::candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+        match memory_strategy_contract(BASE_MODEL_ID, &spec) {
+            Err(CoreError::Unsupported(m)) => {
+                assert!(m.contains("final_layer.image.linear.weight"), "{m}")
+            }
+            other => panic!("expected a typed inventory refusal, got {other:?}"),
         }
     }
 

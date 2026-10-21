@@ -39,7 +39,9 @@ use crate::{Error, Result};
 pub mod adapters;
 pub mod affine;
 pub mod artifacts;
+mod checkpoint;
 pub mod conversion;
+pub use checkpoint::{checkpoint_tensor_headers, resolve_checkpoint};
 pub mod image_input;
 pub mod layouts;
 pub mod native_convert;
@@ -175,7 +177,7 @@ pub fn chat_text(prompt: &str) -> String {
 
 /// `config.json` `dit` — the DiT widths (`dit.py` module constants of the release).
 #[derive(Clone, Debug, PartialEq)]
-pub struct DitConfig {
+pub struct DitConfig<Flow = bool> {
     pub hidden: usize,
     pub heads: usize,
     /// Per-mode early blocks.
@@ -194,16 +196,35 @@ pub struct DitConfig {
     pub image_rope_scale: f64,
     /// `true`: the checkpoint carries `ref_time_in` and samples without CFG (the distilled
     /// release); `false`: a CFG checkpoint (the base release, sc-26239).
-    pub flow_map: bool,
+    pub flow_map: Flow,
 }
 
-impl DitConfig {
+impl<Flow> DitConfig<Flow> {
     pub fn head_dim(&self) -> usize {
         self.hidden / self.heads
     }
 
     pub fn mlp_hidden(&self) -> usize {
         (self.hidden as f64 * self.mlp_ratio) as usize
+    }
+
+    fn with_flow_map(&self, flow_map: bool) -> DitConfig {
+        DitConfig {
+            hidden: self.hidden,
+            heads: self.heads,
+            depth: self.depth,
+            depth_single: self.depth_single,
+            mlp_ratio: self.mlp_ratio,
+            axes_dim: self.axes_dim.clone(),
+            theta: self.theta,
+            image_in_channels: self.image_in_channels,
+            image_cond_in_channels: self.image_cond_in_channels,
+            text_in_channels: self.text_in_channels,
+            out_modes: self.out_modes.clone(),
+            vec_in_dim: self.vec_in_dim,
+            image_rope_scale: self.image_rope_scale,
+            flow_map,
+        }
     }
 }
 
@@ -249,7 +270,9 @@ pub struct SamplerConfig {
     pub size: [u32; 2],
 }
 
-/// The parsed package `config.json`.
+/// A mode-bound graph: either an explicit catalog PLANNING bind, or a checkpoint resolution.
+/// Only [`resolve_checkpoint`] establishes the actual header mode; a planning bind is never
+/// checkpoint identity. Config-only input is represented by [`Flux3MetadataConfig`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Flux3Config {
     pub format_version: u64,
@@ -263,6 +286,32 @@ pub struct Flux3Config {
     pub sampler: SamplerConfig,
 }
 
+/// Descriptive sampler metadata. Missing mode-dependent values stay unresolved until a
+/// catalog planning bind or an authoritative checkpoint-header resolution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SamplerMetadataConfig {
+    pub steps: Option<u32>,
+    /// Outer `None`: absent; `Some(None)`: explicitly no CFG.
+    pub guidance: Option<Option<f64>>,
+    pub alpha: f64,
+    pub size: [u32; 2],
+}
+
+/// Config-only, pre-download-safe metadata. A missing flow-map flag is UNRESOLVED, never false.
+/// This type is not checkpoint identity. Use [`resolve_checkpoint`] at every actual native
+/// load, identity, memory-admission, conversion and bundle boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Flux3MetadataConfig {
+    pub format_version: u64,
+    pub model: String,
+    pub quantization: Option<String>,
+    pub torch_dtype: String,
+    pub dit: DitConfig<Option<bool>>,
+    pub text_encoder: TextEncoderConfig,
+    pub vae: VaeConfig,
+    pub sampler: SamplerMetadataConfig,
+}
+
 fn field<'a>(v: &'a serde_json::Value, key: &str, path: &str) -> Result<&'a serde_json::Value> {
     v.get(key)
         .ok_or_else(|| Error::Msg(format!("config.json: missing `{path}{key}`")))
@@ -274,6 +323,12 @@ fn usize_of(v: &serde_json::Value, path: &str) -> Result<usize> {
             "config.json: `{path}` is not a non-negative integer"
         ))
     })
+}
+
+fn u32_of(v: &serde_json::Value, path: &str) -> Result<u32> {
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| Error::Msg(format!("config.json: `{path}` is not a u32 integer")))
 }
 
 fn f64_of(v: &serde_json::Value, path: &str) -> Result<f64> {
@@ -296,8 +351,8 @@ fn usize_list(v: &serde_json::Value, path: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
-impl Flux3Config {
-    /// Read `dir/config.json`.
+impl Flux3MetadataConfig {
+    /// Read ONLY `dir/config.json`; no checkpoint, tensor bytes, device or provider is read.
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let path = dir.join(CONFIG_FILE);
         let text = std::fs::read_to_string(&path)
@@ -305,8 +360,8 @@ impl Flux3Config {
         Self::parse(&text).map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))
     }
 
-    /// Parse the JSON text. Every key the native graph depends on is required; nothing is
-    /// defaulted, so a package of another format version fails here by key name.
+    /// Parse descriptive JSON without inventing a flow-map identity. An explicit flag must
+    /// be boolean; omitted mode-dependent sampler values are resolved only at a later bind.
     pub fn parse(text: &str) -> Result<Self> {
         let root: serde_json::Value =
             serde_json::from_str(text).map_err(|e| Error::Msg(format!("config.json: {e}")))?;
@@ -314,15 +369,30 @@ impl Flux3Config {
         let in_channels = field(dit, "in_channels", "dit.")?;
         let te = field(&root, "text_encoder", "")?;
         let vae = field(&root, "vae", "")?;
-        let sampler = field(&root, "sampler", "")?;
-        let size = field(sampler, "size", "sampler.")?
-            .as_array()
-            .filter(|a| a.len() == 2)
-            .ok_or_else(|| Error::Msg("config.json: `sampler.size` is not [w, h]".into()))?;
-        let guidance = match field(sampler, "guidance", "sampler.")? {
-            serde_json::Value::Null => None,
-            v => Some(f64_of(v, "sampler.guidance")?),
+        let empty_sampler = serde_json::json!({});
+        let sampler = root.get("sampler").unwrap_or(&empty_sampler);
+        if !sampler.is_object() {
+            return Err(Error::Msg("config.json: `sampler` is not an object".into()));
+        }
+        let size = match sampler.get("size") {
+            None => [DEFAULT_SIZE, DEFAULT_SIZE],
+            Some(value) => {
+                let size = value.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+                    Error::Msg("config.json: `sampler.size` is not [w, h]".into())
+                })?;
+                [
+                    u32_of(&size[0], "sampler.size")?,
+                    u32_of(&size[1], "sampler.size")?,
+                ]
+            }
         };
+        let guidance = sampler
+            .get("guidance")
+            .map(|v| match v {
+                serde_json::Value::Null => Ok(None),
+                value => f64_of(value, "sampler.guidance").map(Some),
+            })
+            .transpose()?;
         let quantization = match field(&root, "quantization", "")? {
             serde_json::Value::Null => None,
             v if v.is_object() => artifacts::NativeDitStorage::from_marker(v)?
@@ -374,9 +444,14 @@ impl Flux3Config {
                     field(dit, "image_rope_scale", "dit.")?,
                     "dit.image_rope_scale",
                 )?,
-                flow_map: field(dit, "flow_map", "dit.")?.as_bool().ok_or_else(|| {
-                    Error::Msg("config.json: `dit.flow_map` is not a bool".into())
-                })?,
+                flow_map: dit
+                    .get("flow_map")
+                    .map(|v| {
+                        v.as_bool().ok_or_else(|| {
+                            Error::Msg("config.json: `dit.flow_map` is not a bool".into())
+                        })
+                    })
+                    .transpose()?,
             },
             text_encoder: TextEncoderConfig {
                 path: string_of(field(te, "path", "text_encoder.")?, "text_encoder.path")?,
@@ -399,16 +474,99 @@ impl Flux3Config {
                 path: string_of(field(vae, "path", "vae.")?, "vae.path")?,
                 dtype: string_of(field(vae, "dtype", "vae.")?, "vae.dtype")?,
             },
-            sampler: SamplerConfig {
-                steps: usize_of(field(sampler, "steps", "sampler.")?, "sampler.steps")? as u32,
+            sampler: SamplerMetadataConfig {
+                steps: sampler
+                    .get("steps")
+                    .map(|v| u32_of(v, "sampler.steps"))
+                    .transpose()?,
                 guidance,
-                alpha: f64_of(field(sampler, "alpha", "sampler.")?, "sampler.alpha")?,
-                size: [
-                    usize_of(&size[0], "sampler.size")? as u32,
-                    usize_of(&size[1], "sampler.size")? as u32,
-                ],
+                alpha: sampler
+                    .get("alpha")
+                    .map(|v| f64_of(v, "sampler.alpha"))
+                    .transpose()?
+                    .unwrap_or(6.93),
+                size,
             },
         })
+    }
+
+    /// Bind descriptive metadata to an explicit catalog route for planning only. This does
+    /// NOT authenticate a checkpoint. Actual load/identity paths must call [`resolve_checkpoint`].
+    /// Training's fixed base repository/revision and later header + full artifact pins keep the
+    /// pre-download plan and post-download resume identity consistent without changing hashes.
+    pub fn for_model(&self, model_id: &str) -> Result<Flux3Config> {
+        let flow_map = match model_id {
+            DISTILLED_MODEL_ID => true,
+            BASE_MODEL_ID => false,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "flux3: unknown catalog route {other}"
+                )))
+            }
+        };
+        let config = self.resolve_flow_map(flow_map, "catalog planning route")?;
+        config.validate_route(model_id)?;
+        Ok(config)
+    }
+
+    fn resolve_flow_map(&self, flow_map: bool, authority: &str) -> Result<Flux3Config> {
+        if self
+            .dit
+            .flow_map
+            .is_some_and(|declared| declared != flow_map)
+        {
+            return Err(Error::Unsupported(format!(
+                "flux3: optional config.json dit.flow_map {:?} disagrees with {authority} flow_map={flow_map}",
+                self.dit.flow_map
+            )));
+        }
+        let config = Flux3Config {
+            format_version: self.format_version,
+            model: self.model.clone(),
+            quantization: self.quantization.clone(),
+            torch_dtype: self.torch_dtype.clone(),
+            dit: self.dit.with_flow_map(flow_map),
+            text_encoder: self.text_encoder.clone(),
+            vae: self.vae.clone(),
+            sampler: SamplerConfig {
+                steps: self.sampler.steps.unwrap_or(if flow_map {
+                    DEFAULT_STEPS
+                } else {
+                    BASE_DEFAULT_STEPS
+                }),
+                guidance: self.sampler.guidance.unwrap_or(if flow_map {
+                    None
+                } else {
+                    Some(f64::from(BASE_DEFAULT_GUIDANCE))
+                }),
+                alpha: self.sampler.alpha,
+                size: self.sampler.size,
+            },
+        };
+        config.validate_native_storage_graph()?;
+        Ok(config)
+    }
+}
+
+impl Flux3Config {
+    /// Verify a catalog route against the already resolved checkpoint mode. The descriptive
+    /// `model` label is deliberately not used: both real packages carry the same label.
+    pub fn validate_route(&self, model_id: &str) -> Result<()> {
+        let expected = match model_id {
+            DISTILLED_MODEL_ID => true,
+            BASE_MODEL_ID => false,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "flux3: unknown catalog route {other}"
+                )))
+            }
+        };
+        if self.dit.flow_map != expected {
+            return Err(Error::Unsupported(format!(
+                "flux3: route {model_id} requires flow_map={expected}, checkpoint header resolved flow_map={}", self.dit.flow_map
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse any package the native graph does not implement, naming the key — never a silent
@@ -457,9 +615,13 @@ impl Flux3Config {
             ),
             (
                 "dit.axes_dim",
-                d.axes_dim.len() == 4
+                d.heads > 0
+                    && d.axes_dim.len() == 4
                     && d.axes_dim.iter().all(|&a| a > 0 && a.is_multiple_of(2))
-                    && d.axes_dim.iter().sum::<usize>() == d.head_dim(),
+                    && d.axes_dim
+                        .iter()
+                        .try_fold(0usize, |sum, axis| sum.checked_add(*axis))
+                        == Some(d.head_dim()),
                 format!("{:?}", d.axes_dim),
             ),
             (
@@ -574,6 +736,7 @@ impl GenerationResources {
     /// or a directory holding `ae.safetensors`) override the package's bundled copies. Every
     /// missing piece is a load-time error naming the path and the resource it belongs to.
     pub fn from_spec(spec: &LoadSpec, config: &Flux3Config, model_id: &str) -> Result<Self> {
+        config.validate_route(model_id)?;
         crate::control::reject_unknown_components(
             spec,
             &[
@@ -583,15 +746,29 @@ impl GenerationResources {
             ],
             model_id,
         )?;
+        let repository = if model_id == BASE_MODEL_ID {
+            BASE_WEIGHTS_REPO
+        } else {
+            DISTILLED_WEIGHTS_REPO
+        };
         let package_dir = match &spec.weights {
             WeightsSource::Dir(dir) => dir.clone(),
             WeightsSource::File(file) => {
                 return Err(Error::Msg(format!(
-                    "{model_id}: the weights resource must be the {DISTILLED_WEIGHTS_REPO} package \
+                    "{model_id}: the weights resource must be the {repository} package \
                      directory ({CONFIG_FILE} + {DIT_WEIGHTS_FILE}), not the single file {}",
                     file.display()
                 )))
             }
+        };
+        // Publisher variants are DiT-only siblings of the shared repository components,
+        // exactly as frozen BFL dit_path(). Never apply this fallback to converted packages.
+        let shared_root = if spec.components.contains_key(TEXT_ENCODER_COMPONENT)
+            && spec.components.contains_key(AUTOENCODER_COMPONENT)
+        {
+            package_dir.clone()
+        } else {
+            publisher_shared_root(&package_dir, config, model_id)?
         };
         let text_encoder_dir = match spec.components.get(TEXT_ENCODER_COMPONENT) {
             Some(WeightsSource::Dir(dir)) => dir.clone(),
@@ -602,12 +779,12 @@ impl GenerationResources {
                     file.display()
                 )))
             }
-            None => package_dir.join(&config.text_encoder.path),
+            None => shared_root.join(&config.text_encoder.path),
         };
         let autoencoder_file = match spec.components.get(AUTOENCODER_COMPONENT) {
             Some(WeightsSource::File(file)) => file.clone(),
             Some(WeightsSource::Dir(dir)) => dir.join(&config.vae.path),
-            None => package_dir.join(&config.vae.path),
+            None => shared_root.join(&config.vae.path),
         };
         let resources = Self {
             package_dir,
@@ -646,6 +823,33 @@ impl GenerationResources {
     pub fn dit_weights(&self) -> PathBuf {
         self.package_dir.join(DIT_WEIGHTS_FILE)
     }
+}
+
+fn publisher_shared_root(package: &Path, config: &Flux3Config, model_id: &str) -> Result<PathBuf> {
+    let Some(format @ ("fp8r" | "nvfp4")) = config.quantization.as_deref() else {
+        return Ok(package.to_path_buf());
+    };
+    let Some(variants) = package
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "variants"))
+    else {
+        return Ok(package.to_path_buf());
+    };
+    if package.file_name().is_none_or(|name| name != format) {
+        return Err(Error::Unsupported(
+            "flux3: publisher variant directory disagrees with quantization".into(),
+        ));
+    }
+    let root = variants.parent().ok_or_else(|| {
+        Error::Unsupported("flux3: publisher variant has no repository root".into())
+    })?;
+    let shared = Flux3MetadataConfig::from_dir(root)?.for_model(model_id)?;
+    if shared.dit != config.dit {
+        return Err(Error::Unsupported(
+            "flux3: publisher variant and shared repository describe different graphs".into(),
+        ));
+    }
+    Ok(root.to_path_buf())
 }
 
 fn require_dir(dir: &Path, model_id: &str, resource: &str) -> Result<()> {
@@ -1087,7 +1291,10 @@ mod tests {
 }"#;
 
     fn release() -> Flux3Config {
-        Flux3Config::parse(RELEASE_CONFIG).unwrap()
+        Flux3MetadataConfig::parse(RELEASE_CONFIG)
+            .unwrap()
+            .for_model(DISTILLED_MODEL_ID)
+            .unwrap()
     }
 
     #[test]
@@ -1185,15 +1392,17 @@ mod tests {
         for (from, to, key) in cases {
             let text = RELEASE_CONFIG.replacen(from, to, 1);
             assert_ne!(text, RELEASE_CONFIG, "{key}: the mutation applied");
-            let config = Flux3Config::parse(&text).unwrap();
-            match config.validate_supported() {
+            let result = Flux3MetadataConfig::parse(&text)
+                .and_then(|metadata| metadata.for_model(DISTILLED_MODEL_ID))
+                .and_then(|config| config.validate_supported());
+            match result {
                 Err(Error::Unsupported(m)) => assert!(m.contains(key), "{key}: {m}"),
                 other => panic!("{key}: expected a typed refusal, got {other:?}"),
             }
         }
         // A missing key is a parse error naming it.
         let text = RELEASE_CONFIG.replacen("\"pad_multiple\": 80,", "", 1);
-        let err = Flux3Config::parse(&text).unwrap_err().to_string();
+        let err = Flux3MetadataConfig::parse(&text).unwrap_err().to_string();
         assert!(err.contains("text_encoder.pad_multiple"), "{err}");
     }
 
@@ -1518,12 +1727,12 @@ mod tests {
         let config = release();
         let spec = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()));
         // Nothing bundled yet: the autoencoder is named first.
-        let err = GenerationResources::from_spec(&spec, &config, "m")
+        let err = GenerationResources::from_spec(&spec, &config, DISTILLED_MODEL_ID)
             .unwrap_err()
             .to_string();
         assert!(err.contains("ae.safetensors"), "{err}");
         std::fs::write(dir.join("ae.safetensors"), b"x").unwrap();
-        let err = GenerationResources::from_spec(&spec, &config, "m")
+        let err = GenerationResources::from_spec(&spec, &config, DISTILLED_MODEL_ID)
             .unwrap_err()
             .to_string();
         assert!(err.contains("text encoder"), "{err}");
@@ -1532,12 +1741,12 @@ mod tests {
         for name in TEXT_ENCODER_REQUIRED_FILES {
             std::fs::write(te.join(name), b"{}").unwrap();
         }
-        let err = GenerationResources::from_spec(&spec, &config, "m")
+        let err = GenerationResources::from_spec(&spec, &config, DISTILLED_MODEL_ID)
             .unwrap_err()
             .to_string();
         assert!(err.contains("model.safetensors.index.json"), "{err}");
         std::fs::write(te.join("model.safetensors"), b"x").unwrap();
-        let resources = GenerationResources::from_spec(&spec, &config, "m").unwrap();
+        let resources = GenerationResources::from_spec(&spec, &config, DISTILLED_MODEL_ID).unwrap();
         assert_eq!(resources.text_encoder_dir, te);
         assert_eq!(resources.autoencoder_file, dir.join("ae.safetensors"));
         assert_eq!(resources.dit_weights(), dir.join(DIT_WEIGHTS_FILE));
@@ -1561,15 +1770,15 @@ mod tests {
             AUTOENCODER_COMPONENT.into(),
             WeightsSource::File(ae2.clone()),
         );
-        let resources = GenerationResources::from_spec(&spec, &config, "m").unwrap();
+        let resources = GenerationResources::from_spec(&spec, &config, DISTILLED_MODEL_ID).unwrap();
         assert_eq!(resources.text_encoder_dir, te2);
         assert_eq!(resources.autoencoder_file, ae2);
         // An unknown component key and a single-file weights source are refused.
         let mut bad = LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()));
         bad.components
             .insert("upsampler".into(), WeightsSource::Dir(te2));
-        assert!(GenerationResources::from_spec(&bad, &config, "m").is_err());
+        assert!(GenerationResources::from_spec(&bad, &config, DISTILLED_MODEL_ID).is_err());
         let file = LoadSpec::new(WeightsSource::File(dir.join(DIT_WEIGHTS_FILE)));
-        assert!(GenerationResources::from_spec(&file, &config, "m").is_err());
+        assert!(GenerationResources::from_spec(&file, &config, DISTILLED_MODEL_ID).is_err());
     }
 }

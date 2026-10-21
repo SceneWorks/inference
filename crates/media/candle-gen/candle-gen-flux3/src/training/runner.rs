@@ -517,10 +517,8 @@ mod tests {
         session_for(Workflow::PairedEdit)
     }
     fn session_for(workflow: Workflow) -> (CandleSession, gen_core::flux3::Flux3Config) {
-        let config = gen_core::flux3::Flux3Config::parse(
-            &std::fs::read_to_string(fixtures().join("tiny-base-snapshot/config.json")).unwrap(),
-        )
-        .unwrap();
+        let config =
+            gen_core::flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
         let dit = Flux3Dit::load(
             &fixtures().join("tiny-base-snapshot/model.safetensors"),
             &config.dit,

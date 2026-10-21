@@ -1,5 +1,5 @@
 //! Real saved-state continuation on SYNTHETIC tiny weights, on supported MLX hosts only.
-use crate::common::{cpu_process, fixture, fixtures, host_f32, on_cpu, tiny_config};
+use crate::common::{cpu_process, fixture, fixtures, host_f32, on_cpu, tiny_base_config};
 use mlx_gen::gen_core::flux3::{
     training::{
         checkpoint::{ResumePolicy, TrainingCursor},
@@ -31,8 +31,7 @@ fn ids(array: &Array) -> Vec<[f32; 4]> {
         .collect()
 }
 fn graph() -> (TrainingGraph, LoraParams) {
-    let mut config = tiny_config();
-    config.dit.flow_map = false;
+    let config = tiny_base_config();
     let weights =
         Weights::from_file(fixtures().join("tiny-base-snapshot/model.safetensors")).unwrap();
     let dit = Flux3Dit::from_weights(&weights, &config.dit, Dtype::Float32).unwrap();
@@ -176,7 +175,7 @@ fn saved_checkpoint_resumes_corrected_optimizer_and_adapter_reloads_with_effect(
         let g = grads(&mut resumed,&restored,state.cursor.sampler_cursor); resumed_opt.step(&mut restored,&g).unwrap();
         assert_eq!(values(&restored),values(&params));
         let path = export_adapter(&resumed,&restored,&identity,root.path(),"trained.safetensors",&flag).unwrap();
-        let mut config = tiny_config(); config.dit.flow_map=false;
+        let config = tiny_base_config();
         let spec = AdapterSpec::new(path,1.0,AdapterKind::Lora);
         assert_eq!(mlx_gen::gen_core::flux3::adapters::inspect(&spec,&config.dit).unwrap().len(),54);
         let golden=fixture("flux3_training_golden.safetensors"); let get=|key:&str| golden.require(key).unwrap();
@@ -270,8 +269,7 @@ fn export_records_the_configured_alpha_verbatim() {
                 let rank = 7usize;
                 let alpha = 29.0f64;
                 assert_ne!((alpha / rank as f64) * rank as f64, alpha);
-                let mut config = tiny_config();
-                config.dit.flow_map = false;
+                let config = tiny_base_config();
                 let weights =
                     Weights::from_file(fixtures().join("tiny-base-snapshot/model.safetensors"))
                         .unwrap();

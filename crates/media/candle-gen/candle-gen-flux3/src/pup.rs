@@ -204,10 +204,13 @@ mod tests {
 
     #[test]
     fn near_limit_native_layout_caption_reaches_final_parameters_once() {
-        let config = gen_core::flux3::Flux3Config::from_dir(
+        // Config-only planning bind: this test reads no checkpoint.
+        let config = gen_core::flux3::Flux3MetadataConfig::from_dir(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
         )
+        .unwrap()
+        .for_model(gen_core::flux3::DISTILLED_MODEL_ID)
         .unwrap();
         let layout=gen_core::flux3::layouts::Layout::from_json(serde_json::json!({"version":1,"boxes":[{"id":"large","bbox":[0.1,0.2,0.7,0.8],"desc":"x".repeat(9000)}]})).unwrap();
         let req = GenerationRequest {

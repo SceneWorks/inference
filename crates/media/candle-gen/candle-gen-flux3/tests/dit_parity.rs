@@ -143,10 +143,9 @@ fn ordered_reference_edits_match_frozen_source() {
     );
     let ae = load_autoencoder(&tiny_package().join("ae.safetensors"), &dev).unwrap();
     let flow = dit(DType::F32, &dev);
-    let mut cfg = tiny_config();
-    cfg.dit.flow_map = false;
+    let cfg = crate::common::tiny_base_config();
     let base = candle_gen_flux3::load_dit(
-        &crate::common::fixtures().join("tiny-base-snapshot/model.safetensors"),
+        &crate::common::tiny_base_package().join("model.safetensors"),
         &cfg,
         DType::F32,
         &dev,

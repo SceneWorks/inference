@@ -1,5 +1,5 @@
 //! Synthetic CPU PyTorch oracle; executed only on supported MLX hosts.
-use crate::common::{cpu_process, fixture, host_f32, on_cpu, tiny_config, tiny_package};
+use crate::common::{cpu_process, fixture, host_f32, on_cpu, tiny_base_config, tiny_package};
 use mlx_gen::gen_core::flux3::training::lora_targets;
 use mlx_gen::{train::lora::LoraParams, weights::Weights};
 use mlx_gen_flux3::{
@@ -88,8 +88,7 @@ fn all_six_projection_families_match_two_adamw_steps() {
         "training_parity::all_six_projection_families_match_two_adamw_steps",
         || {
             on_cpu(|| {
-                let mut config = tiny_config();
-                config.dit.flow_map = false;
+                let config = tiny_base_config();
                 let mut weights =
                     Weights::from_file(tiny_package().join("model.safetensors")).unwrap();
                 let remove = weights
@@ -192,8 +191,7 @@ fn corrected_adamw_matches_identical_torch_gradients() {
         || {
             on_cpu(|| {
                 let golden = fixture("flux3_training_golden.safetensors");
-                let mut config = tiny_config();
-                config.dit.flow_map = false;
+                let config = tiny_base_config();
                 let mut params = LoraParams::new();
                 for projection in lora_targets(&config.dit, &[]).unwrap() {
                     for suffix in ["lora_A.weight", "lora_B.weight"] {

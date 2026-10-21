@@ -57,9 +57,30 @@ The upsampler is never read from the image package: it is a separate 18.8 GB mod
 resident beside the DiT when loaded, and a request with `enhance_prompt` on a generator loaded
 without it is a typed refusal (never a silent pass-through).
 
-A missing/incomplete resource is a typed load error that names the path and the resource. A
-quantized variant (`variants/fp8r`, `variants/nvfp4`; `config.json` `quantization != null`) is a
-typed refusal until sc-26241.
+A missing/incomplete resource is a typed load error that names the path and the resource.
+
+Quantized variants (sc-26241). The publisher's own `variants/fp8r` and `variants/nvfp4` packages
+(`config.json` `quantization != null`) run only on CUDA, through Candle's source-equivalent
+packed kernels (FP8R on sm_89+, NVFP4 on sm_120+). On MLX they are a typed refusal at load and in
+the memory contract (`NativeDitStorage::check_backend`), never dequantized to dense and never
+matched against a Candle artifact. The native formats are per backend and are not
+interchangeable: MLX loads only its affine q4/q8 tiers (group 32/64/128, `u32` codes plus bf16
+scales/biases) converted from the ORIGINAL dense checkpoint by
+`gen_core::flux3::native_convert::convert_affine`; Candle's GGML q4_1/q8_0 tiers are a different
+artifact. A native package loads only with its conversion receipt, and its exact tensor
+inventory is checked from headers before any weight is read.
+
+Mode authority. Frozen upstream never reads `config.json`: whether a checkpoint is the distilled
+flow map comes from whether its state dict has `ref_time_in` (`checkpoint.FLOW_MAP_KEY`). Both
+released packages carry the same `model` label (`flux-3-image-klein`), and the base `config.json`
+has no `dit.flow_map` key at all. So the port reads the mode the same way. Config-only
+`Flux3MetadataConfig` leaves a missing flag unresolved and binds a mode only to an explicit
+catalog route, for planning (`for_model`). Every load, memory contract and training run calls
+`gen_core::flux3::resolve_checkpoint` first. It takes `flow_map` from the DiT headers' `ref_time_in`
+pair (an explicit config flag must agree with it). Then the selected route is checked against the
+resolved mode (`validate_route`), and the full dense or packed header inventory is checked. All of
+this happens before any text-encoder, autoencoder, adapter or dataset work, so a `Sequential` load
+refuses a malformed package at load time, not on the first request.
 
 ## Coverage table (source → native, S1 = distilled text-to-image)
 

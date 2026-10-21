@@ -128,7 +128,34 @@ fn hash_is_valid(hash: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Bind the frozen source role to HEADER-derived checkpoint mode, not the shared descriptive
+/// model label. Actual source/output checksums remain separate full-byte integrity evidence.
+pub(crate) fn validate_source_mode(repository: &str, revision: &str, flow_map: bool) -> Result<()> {
+    let (expected_repo, expected_revision) = if flow_map {
+        (
+            super::DISTILLED_WEIGHTS_REPO,
+            super::DISTILLED_WEIGHTS_REVISION,
+        )
+    } else {
+        (super::BASE_WEIGHTS_REPO, super::BASE_WEIGHTS_REVISION)
+    };
+    if repository != expected_repo || revision != expected_revision {
+        return Err(invalid(format!(
+            "checkpoint header flow_map={flow_map} requires source {expected_repo}@{expected_revision}, not {repository}@{revision}"
+        )));
+    }
+    Ok(())
+}
+
 impl ConversionReceipt {
+    pub fn validate_checkpoint_mode(&self, config: &super::Flux3Config) -> Result<()> {
+        validate_source_mode(
+            &self.source_repository,
+            &self.source_revision,
+            config.dit.flow_map,
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         let revision = match self.source_repository.as_str() {
             super::DISTILLED_WEIGHTS_REPO => super::DISTILLED_WEIGHTS_REVISION,
@@ -725,6 +752,10 @@ pub fn open_conversion(dir: &Path) -> Result<ConversionReceipt> {
     }
     let value = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
     let receipt = ConversionReceipt::from_json(&value)?;
+    let config = super::resolve_checkpoint(dir)?;
+    receipt.validate_checkpoint_mode(&config)?;
+    // Reject a mislabeled role from bounded metadata before hashing large owned outputs.
+    // Successful opens still authenticate every owned output; loaders separately verify external bytes.
     receipt.verify_outputs(dir)?;
     Ok(receipt)
 }

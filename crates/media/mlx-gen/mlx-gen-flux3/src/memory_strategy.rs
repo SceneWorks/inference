@@ -29,13 +29,14 @@
 //! [`mlx_gen::gen_core::ActivationMemoryRegistration`]: that carrier is measurement-only, and the
 //! epic's terminal campaign owns the anchors.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::flux3::artifacts::NativeDitStorage;
 use mlx_gen::gen_core::flux3::quantization::DitFormat;
 use mlx_gen::gen_core::flux3::{Flux3Config, GenerationResources};
-use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use mlx_gen::gen_core::{
     self, Error as CoreError, LoadShape, MemoryArchitectureFacts, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
@@ -263,19 +264,15 @@ pub fn memory_strategy_contract(
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
         gen_core::WeightsSource::File(file) => {
             return Err(CoreError::Msg(format!(
-                "{MODEL_ID}: the weights resource must be the package directory, not {}",
+                "{provider_id}: the weights resource must be the package directory, not {}",
                 file.display()
             )))
         }
     };
-    let config = Flux3Config::from_dir(&package_dir)?;
-    let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
-    if config.dit.flow_map == (provider_id == gen_core::flux3::BASE_MODEL_ID) {
-        return Err(CoreError::Unsupported(format!(
-            "{provider_id}: checkpoint flow_map={} does not match selected route",
-            config.dit.flow_map
-        )));
-    }
+    // The same header authority as the loader, before any component is priced.
+    let (config, _) =
+        crate::model::resolve_package(&package_dir, provider_id, spec.quantize, spec.precision)?;
+    let resources = GenerationResources::from_spec(spec, &config, provider_id)?;
     generation_contract(spec, &resources, &config)
 }
 
@@ -445,26 +442,53 @@ fn account_upsampler(
     Ok(())
 }
 
-/// Resident bytes of the DiT as [`crate::model::load_dit`] holds it: every tensor of rank two or
-/// more cast to the compute dtype; vectors (the q/k norm scales) as stored.
+/// Resident bytes of the DiT as [`crate::model::load_dit`] holds it, priced from the file's
+/// headers by [`dense_dit_projection`].
 fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
+    projected_safetensors_bytes(weights, dense_dit_projection(precision))
+}
+
+/// What [`crate::model::load_dit`] retains of one dense DiT tensor: every tensor of rank two or
+/// more cast to the compute dtype; vectors (the q/k norm scales) at f32 — `Loader::f32`
+/// materializes them at f32 whatever the file stores. The released packages ship them bf16, so
+/// pricing them as stored would undercharge `2 × (3 × depth + depth_single) × head_dim × 2`
+/// bytes (22,016 on both released checkpoints). Twin of the Candle pricing.
+fn dense_dit_projection(
+    precision: Precision,
+) -> impl Fn(&SafetensorsTensorHeader) -> ResidentProjection {
     let cast = match precision {
         Precision::Bf16 => ResidentProjection::Bfloat16,
         Precision::Fp32 => ResidentProjection::Float32,
     };
-    projected_safetensors_bytes(weights, |header| {
+    move |header| {
         if header.shape.len() >= 2 {
             cast
         } else {
-            ResidentProjection::Stored
+            ResidentProjection::Float32
         }
-    })
+    }
 }
 
-/// Resident DiT bytes for the declared storage, as `load_dit_with_storage` holds it: packed
-/// `u32` codes at their exact stored bytes, their scales/biases and every other matrix at the
-/// compute width, vectors as stored. MLX affine is W4/8A16: `quantized_matmul` reads the compute
-/// input directly and writes the same output a dense GEMM does, so it adds no packed transient.
+/// What `load_dit_with_storage` retains of one tensor of a packed MLX affine DiT: packed `u32`
+/// codes at their exact stored bytes, everything else (their scales/biases, every other matrix,
+/// the f32 norm scales) exactly as [`dense_dit_projection`].
+fn native_dit_projection(
+    precision: Precision,
+    targets: &BTreeSet<String>,
+) -> impl Fn(&SafetensorsTensorHeader) -> ResidentProjection + '_ {
+    let dense = dense_dit_projection(precision);
+    move |header| {
+        if targets.contains(&header.name) {
+            ResidentProjection::Stored
+        } else {
+            dense(header)
+        }
+    }
+}
+
+/// Resident DiT bytes for the declared storage, as `load_dit_with_storage` holds it, priced by
+/// [`native_dit_projection`]. MLX affine is W4/8A16: `quantized_matmul` reads the compute input
+/// directly and writes the same output a dense GEMM does, so it adds no packed transient.
 fn native_dit_bytes(
     weights: &Path,
     precision: Precision,
@@ -475,19 +499,7 @@ fn native_dit_bytes(
         return dit_bytes(weights, precision);
     }
     let targets = storage.packed_targets(cfg)?;
-    let cast = match precision {
-        Precision::Bf16 => ResidentProjection::Bfloat16,
-        Precision::Fp32 => ResidentProjection::Float32,
-    };
-    projected_safetensors_bytes(weights, |header| {
-        if targets.contains(&header.name) {
-            ResidentProjection::Stored
-        } else if header.shape.len() >= 2 {
-            cast
-        } else {
-            ResidentProjection::Stored
-        }
-    })
+    projected_safetensors_bytes(weights, native_dit_projection(precision, &targets))
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
@@ -754,13 +766,49 @@ mod tests {
         assert_ne!(base.provider_id, distilled.provider_id);
         assert_ne!(base.calibration, distilled.calibration);
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-snapshot")));
-        let mut config = Flux3Config::from_dir(&fixture.join("tiny-snapshot")).unwrap();
-        config.dit.flow_map = false;
-        config.sampler.guidance = Some(3.5);
+        // The real base fixture, resolved from its headers — never the distilled package with
+        // `flow_map` hand-flipped. It ships only config + DiT, so the distilled package's
+        // encoder and autoencoder ride in as components.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-base-snapshot")));
+        spec.components.insert(
+            gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+            WeightsSource::Dir(fixture.join("tiny-snapshot/text_encoder")),
+        );
+        spec.components.insert(
+            gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+            WeightsSource::File(fixture.join("tiny-snapshot/ae.safetensors")),
+        );
+        let config =
+            gen_core::flux3::resolve_checkpoint(&fixture.join("tiny-base-snapshot")).unwrap();
+        assert!(!config.dit.flow_map);
         let resources =
             GenerationResources::from_spec(&spec, &config, gen_core::flux3::BASE_MODEL_ID).unwrap();
         let plain = generation_contract(&spec, &resources, &config).unwrap();
+        // The registered entry point resolves the same package to the same contract on the base
+        // route, and refuses the distilled route for it.
+        let registered = memory_strategy_contract(gen_core::flux3::BASE_MODEL_ID, &spec).unwrap();
+        assert_eq!(registered.provider_id, gen_core::flux3::BASE_MODEL_ID);
+        assert_eq!(registered.asset_facts, plain.asset_facts);
+        // Exercise the EARLY resolver directly: a later from_spec route check must not
+        // rescue this test if resolve_package stops validating the route before component work.
+        // Mutation: removing resolve_package's validate_route makes this return Ok.
+        match crate::model::resolve_package(
+            &fixture.join("tiny-base-snapshot"),
+            MODEL_ID,
+            spec.quantize,
+            spec.precision,
+        ) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("flow_map"), "{message}")
+            }
+            other => panic!("the early wrong-route resolver must refuse, got {other:?}"),
+        }
+        match memory_strategy_contract(MODEL_ID, &spec) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("flow_map"), "{message}")
+            }
+            other => panic!("wrong-route contract must retain the typed refusal, got {other:?}"),
+        }
         spec.adapters.push(gen_core::AdapterSpec::new(
             fixture.join("flux3_base_lora.safetensors"),
             0.4,
@@ -817,6 +865,241 @@ mod tests {
 
     fn sentinel() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()))
+    }
+
+    /// The released packages' own `config.json` bodies (pinned snapshots of
+    /// `flux-3-image-klein-base` and `flux-3-image-klein`): the SAME `model` label, and the base
+    /// config carries no `dit.flow_map` at all.
+    const REAL_BASE_CONFIG: &str = r#"{"format_version":1,"model":"flux-3-image-klein","quantization":null,"torch_dtype":"bfloat16","dit":{"hidden":3072,"heads":24,"depth":5,"depth_single":28,"mlp_ratio":3.0,"axes_dim":[32,32,32,32],"theta":10000,"in_channels":{"image":128,"image_cond":128,"text":20480},"out_modes":["image"],"vec_in_dim":null,"image_rope_scale":0.5},"text_encoder":{"path":"text_encoder","tokenizer":"text_encoder","layers":[4,8,12,16,20,24,28,32],"pad_multiple":80,"max_tokens":8192,"dtype":"bfloat16"},"vae":{"path":"ae.safetensors","dtype":"float32"},"sampler":{"steps":50,"guidance":3.5,"alpha":6.93,"size":[1024,1024]}}"#;
+    const REAL_DISTILLED_CONFIG: &str = r#"{"format_version":1,"model":"flux-3-image-klein","quantization":null,"torch_dtype":"bfloat16","dit":{"hidden":3072,"heads":24,"depth":5,"depth_single":28,"mlp_ratio":3.0,"axes_dim":[32,32,32,32],"theta":10000,"in_channels":{"image":128,"image_cond":128,"text":20480},"out_modes":["image"],"vec_in_dim":null,"image_rope_scale":0.5,"flow_map":true},"text_encoder":{"path":"text_encoder","tokenizer":"text_encoder","layers":[4,8,12,16,20,24,28,32],"pad_multiple":80,"max_tokens":8192,"dtype":"bfloat16"},"vae":{"path":"ae.safetensors","dtype":"float32"},"sampler":{"steps":16,"guidance":null,"alpha":6.93,"size":[1024,1024]}}"#;
+
+    /// Header records of the inventory `storage` declares for `cfg`, at their stored bytes —
+    /// for the dense publisher format exactly the released `model.safetensors` inventory
+    /// (names, BF16 dtypes, shapes). No file and no tensor payload is read.
+    fn declared_headers(
+        storage: NativeDitStorage,
+        cfg: &gen_core::flux3::DitConfig,
+    ) -> Vec<SafetensorsTensorHeader> {
+        storage
+            .expected_tensors(cfg)
+            .unwrap()
+            .into_iter()
+            .map(|(name, spec)| SafetensorsTensorHeader {
+                data_bytes: (spec.shape.iter().product::<usize>() * spec.dtype.size()) as u64,
+                name,
+                dtype: spec.dtype,
+                shape: spec.shape,
+            })
+            .collect()
+    }
+
+    /// Pure planning: the real config bodies bind to their catalog route by id, not label, and
+    /// plan the same geometry; the base body (no `flow_map`) never binds the distilled route by
+    /// default, and the explicit distilled flag refuses the base route.
+    #[test]
+    fn real_config_bodies_plan_by_catalog_route_not_label() {
+        let base_meta = gen_core::flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG).unwrap();
+        let distilled_meta =
+            gen_core::flux3::Flux3MetadataConfig::parse(REAL_DISTILLED_CONFIG).unwrap();
+        assert_eq!(base_meta.model, distilled_meta.model);
+        assert_eq!(base_meta.dit.flow_map, None, "absent stays unresolved");
+        assert_eq!(distilled_meta.dit.flow_map, Some(true));
+        let base = base_meta.for_model(gen_core::flux3::BASE_MODEL_ID).unwrap();
+        let distilled = distilled_meta.for_model(MODEL_ID).unwrap();
+        assert!(!base.dit.flow_map && distilled.dit.flow_map);
+        assert_eq!(base.sampler.guidance, Some(3.5));
+        assert_eq!(distilled.sampler.guidance, None);
+        assert!(distilled_meta
+            .for_model(gen_core::flux3::BASE_MODEL_ID)
+            .is_err());
+        base.validate_route(gen_core::flux3::BASE_MODEL_ID).unwrap();
+        assert!(base.validate_route(MODEL_ID).is_err());
+        assert!(distilled
+            .validate_route(gen_core::flux3::BASE_MODEL_ID)
+            .is_err());
+        // Identical architecture facts: the two routes differ only by the target-time embedder.
+        assert_eq!(
+            architecture_facts(Some(&base), Precision::Bf16),
+            architecture_facts(Some(&distilled), Precision::Bf16)
+        );
+    }
+
+    /// The DiT is priced at what the loader HOLDS: matrices at the compute width, the 86 bf16
+    /// `[128]` q/k norm scales of either released checkpoint at f32 (`Loader::f32`), never as
+    /// stored — on the dense publisher inventory and on a packed MLX affine one alike.
+    ///
+    /// *Mutation that reds this:* pricing rank-1 tensors `ResidentProjection::Stored` in
+    /// [`dense_dit_projection`] (the pre-fix undercharge of exactly 22,016 bytes).
+    #[test]
+    fn dit_pricing_charges_norm_scales_at_f32_on_both_real_inventories() {
+        const NORM_SCALES: usize = 2 * (3 * 5 + 28);
+        const UNDERCHARGE: u64 = (NORM_SCALES * 128 * 2) as u64;
+        assert_eq!(UNDERCHARGE, 22_016);
+        let as_stored_vectors = |precision: Precision| {
+            let dense = dense_dit_projection(precision);
+            move |header: &SafetensorsTensorHeader| {
+                if header.shape.len() >= 2 {
+                    dense(header)
+                } else {
+                    ResidentProjection::Stored
+                }
+            }
+        };
+        for (body, id, real_tensor_count, ref_time_bytes) in [
+            (REAL_BASE_CONFIG, gen_core::flux3::BASE_MODEL_ID, 357, 0u64),
+            // `ref_time_in.{in_layer [3072, 256], out_layer [3072, 3072]}`, the only difference.
+            (
+                REAL_DISTILLED_CONFIG,
+                MODEL_ID,
+                359,
+                (3072 * 256 + 3072 * 3072) as u64,
+            ),
+        ] {
+            let cfg = gen_core::flux3::Flux3MetadataConfig::parse(body)
+                .unwrap()
+                .for_model(id)
+                .unwrap()
+                .dit;
+            let dense = declared_headers(NativeDitStorage::Publisher(DitFormat::Dense), &cfg);
+            assert_eq!(
+                dense.len(),
+                real_tensor_count,
+                "{id}: the released inventory"
+            );
+            let vectors: Vec<_> = dense.iter().filter(|h| h.shape.len() < 2).collect();
+            assert_eq!(vectors.len(), NORM_SCALES, "{id}");
+            assert!(vectors.iter().all(|h| h.shape == [128]
+                && h.dtype == gen_core::weightsmeta::Dtype::BF16
+                && (h.name.ends_with(".norm.query_norm.scale")
+                    || h.name.ends_with(".norm.key_norm.scale"))));
+            let matrix_elements: u64 = dense
+                .iter()
+                .filter(|h| h.shape.len() >= 2)
+                .map(|h| h.element_count().unwrap())
+                .sum();
+            let scale_bytes = (NORM_SCALES * 128 * 4) as u64;
+            for (precision, width) in [(Precision::Bf16, 2u64), (Precision::Fp32, 4)] {
+                let priced = mlx_gen::asset_facts::projected_tensor_headers_bytes(
+                    &dense,
+                    dense_dit_projection(precision),
+                )
+                .unwrap();
+                assert_eq!(
+                    priced,
+                    matrix_elements * width + scale_bytes,
+                    "{id} {precision:?}"
+                );
+                let stored = mlx_gen::asset_facts::projected_tensor_headers_bytes(
+                    &dense,
+                    as_stored_vectors(precision),
+                )
+                .unwrap();
+                assert_eq!(priced - stored, UNDERCHARGE, "{id} {precision:?}");
+            }
+            for storage in [
+                NativeDitStorage::MlxAffine {
+                    bits: 4,
+                    group_size: 64,
+                },
+                NativeDitStorage::MlxAffine {
+                    bits: 8,
+                    group_size: 128,
+                },
+            ] {
+                let packed = declared_headers(storage, &cfg);
+                let targets = storage.packed_targets(&cfg).unwrap();
+                assert!(!targets.is_empty());
+                let priced = mlx_gen::asset_facts::projected_tensor_headers_bytes(
+                    &packed,
+                    native_dit_projection(Precision::Bf16, &targets),
+                )
+                .unwrap();
+                let stored = mlx_gen::asset_facts::projected_tensor_headers_bytes(&packed, |h| {
+                    if h.shape.len() < 2 {
+                        ResidentProjection::Stored
+                    } else {
+                        native_dit_projection(Precision::Bf16, &targets)(h)
+                    }
+                })
+                .unwrap();
+                assert_eq!(priced - stored, UNDERCHARGE, "{id} {storage:?}");
+                // Packed codes stay at their exact stored bytes.
+                let codes: u64 = packed
+                    .iter()
+                    .filter(|h| targets.contains(&h.name))
+                    .map(|h| h.data_bytes)
+                    .sum();
+                let rest = mlx_gen::asset_facts::projected_tensor_headers_bytes(
+                    &packed
+                        .iter()
+                        .filter(|h| !targets.contains(&h.name))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    dense_dit_projection(Precision::Bf16),
+                )
+                .unwrap();
+                assert_eq!(priced, codes + rest, "{id} {storage:?}");
+            }
+            let base_cfg = gen_core::flux3::Flux3MetadataConfig::parse(REAL_BASE_CONFIG)
+                .unwrap()
+                .for_model(gen_core::flux3::BASE_MODEL_ID)
+                .unwrap()
+                .dit;
+            let base_dense =
+                declared_headers(NativeDitStorage::Publisher(DitFormat::Dense), &base_cfg);
+            let price = |headers: &[SafetensorsTensorHeader]| {
+                mlx_gen::asset_facts::projected_tensor_headers_bytes(
+                    headers,
+                    dense_dit_projection(Precision::Bf16),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                price(&dense) - price(&base_dense),
+                ref_time_bytes * 2,
+                "{id}"
+            );
+        }
+    }
+
+    /// The tiny fixtures through the real file pricer: every vector the loader holds is charged
+    /// at f32 and every matrix at the compute width, from the file's own headers.
+    #[test]
+    fn file_pricer_matches_the_loader_widths_on_the_tiny_packages() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for dir in ["tiny-snapshot", "tiny-base-snapshot"] {
+            let weights = fixtures.join(dir).join("model.safetensors");
+            let headers = safetensors_path_tensor_headers(&weights).unwrap();
+            let elements = |matrices: bool| -> u64 {
+                headers
+                    .iter()
+                    .filter(|h| (h.shape.len() >= 2) == matrices)
+                    .map(|h| h.element_count().unwrap())
+                    .sum()
+            };
+            let cfg = gen_core::flux3::resolve_checkpoint(&fixtures.join(dir))
+                .unwrap()
+                .dit;
+            let vectors = headers.iter().filter(|h| h.shape.len() < 2).count();
+            assert_eq!(vectors, 2 * (3 * cfg.depth + cfg.depth_single), "{dir}");
+            for (precision, width) in [(Precision::Bf16, 2u64), (Precision::Fp32, 4)] {
+                assert_eq!(
+                    dit_bytes(&weights, precision).unwrap(),
+                    elements(true) * width + elements(false) * 4,
+                    "{dir} {precision:?}"
+                );
+                assert_eq!(
+                    native_dit_bytes(
+                        &weights,
+                        precision,
+                        NativeDitStorage::Publisher(DitFormat::Dense),
+                        &cfg
+                    )
+                    .unwrap(),
+                    dit_bytes(&weights, precision).unwrap()
+                );
+            }
+        }
     }
 
     fn support(contract: &MemoryProviderContract, strategy: MemoryStrategy) -> &'static str {

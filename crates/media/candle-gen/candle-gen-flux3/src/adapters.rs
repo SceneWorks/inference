@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::VarBuilder;
-    use candle_gen::gen_core::{flux3::Flux3Config, AdapterKind};
+    use candle_gen::gen_core::{flux3::resolve_checkpoint, AdapterKind};
 
     fn fixtures() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,7 +79,7 @@ mod tests {
 
     fn base_dit() -> Flux3Dit {
         let device = Device::Cpu;
-        let config = Flux3Config::from_dir(&fixtures().join("tiny-base-snapshot")).unwrap();
+        let config = resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
         let weights = candle_gen::candle_core::safetensors::load(
             fixtures().join("tiny-base-snapshot/model.safetensors"),
             &device,

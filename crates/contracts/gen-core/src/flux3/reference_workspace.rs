@@ -63,7 +63,10 @@ impl ReferenceWorkspaceInputs {
                 )))
             }
         };
-        let config = super::Flux3Config::from_dir(&dir)?;
+        let config = super::resolve_checkpoint(&dir)?;
+        config.validate_route(model_id)?;
+        super::artifacts::NativeDitStorage::from_package(&dir)?
+            .validate_headers(&config.dit, &super::checkpoint_tensor_headers(&dir)?)?;
         let resources = super::GenerationResources::from_spec(spec, &config, model_id)?;
         Self::from_parts(&config, &resources.autoencoder_file, compute_width)
     }
@@ -223,7 +226,7 @@ mod tests {
     fn inputs_come_from_the_package_config_and_autoencoder_header() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../media/mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot");
-        let config = super::super::Flux3Config::from_dir(&dir).unwrap();
+        let config = super::super::resolve_checkpoint(&dir).unwrap();
         let candle =
             ReferenceWorkspaceInputs::from_parts(&config, &dir.join("ae.safetensors"), 4).unwrap();
         let mlx =
