@@ -266,7 +266,20 @@ impl LinearWork {
             residuals: linear.adapters().iter().map(AdapterFacts::of).collect(), group_size, bits }
     }
 
+    /// The selected AdaptableLinear path passes x unchanged to the Rust primitive.
+    /// Native affine qmm promotes scales + quantization offsets, then x; the ordinary
+    /// output bias is added afterward and cannot affect this compute dtype.
+    fn packed_compute_dtype(&self, input: Dtype) -> Dtype {
+        let affine = Dtype::from_promoting_types(self.weights[1].dtype, self.weights[2].dtype);
+        Dtype::from_promoting_types(input, affine)
+    }
+
     pub(crate) fn output_dtype(&self, input: Dtype) -> Dtype {
+        if self.bits.is_some() {
+            let compute = self.packed_compute_dtype(input);
+            return self.bias.as_ref().map_or(compute, |bias|
+                Dtype::from_promoting_types(compute, bias.dtype));
+        }
         let weight = self.weights[usize::from(self.bits.is_some())].dtype;
         let out = Dtype::from_promoting_types(input, weight);
         self.bias.as_ref().map_or(out, |bias| Dtype::from_promoting_types(out, bias.dtype))
@@ -301,6 +314,7 @@ impl LinearWork {
     }
 
     pub(crate) fn operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
+        if self.bits.is_some() { return self.packed_operand_bytes(shape, input); }
         let output = self.output_dtype(input);
         let width = dtype_bytes(output);
         let activation = if input != output {
@@ -323,6 +337,47 @@ impl LinearWork {
             // Invalid native operands keep their original operator error priority; this numeric
             // guard helper adds no new runtime validation. Valid outputs carry the whole ordered
             // host-add geometry, including earlier residuals, not an independent residual maximum.
+            n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(adapter,
+                shape, input, output, add_elements))
+        })
+    }
+
+    fn packed_operand_bytes(&self, shape: &[i32], input: Dtype) -> u64 {
+        let compute = self.packed_compute_dtype(input);
+        let output = self.output_dtype(input);
+        let compute_width = dtype_bytes(compute);
+        let output_width = dtype_bytes(output);
+        let activation = if input != compute {
+            shape.iter().fold(compute_width, |n, &d| n.saturating_mul(u(d)))
+        } else { 0 };
+        // Compare dtype identities, not widths. Native qmm casts both affine operands,
+        // never its packed U32 codes. There is no caller input-to-scales precast.
+        let affine = self.weights[1..3].iter().fold(0u64, |n, tensor| n.saturating_add(
+            if tensor.dtype != compute { tensor.elements().saturating_mul(compute_width) }
+            else { 0 }));
+        let bias = self.bias.as_ref().map_or(0, |bias| if bias.dtype != output {
+            bias.elements().saturating_mul(output_width)
+        } else { 0 });
+        // A widening ordinary bias add casts the qmm result, BEFORE bias broadcasting.
+        // Keep invalid native operands' error priority: this guard adds no validation.
+        let post_bias = if compute != output {
+            let mut transposed = self.base.base_shape.clone();
+            if transposed.len() < 2 { 0 } else {
+                let n = transposed.len();
+                transposed.swap(n - 1, n - 2);
+                crate::adapters::matmul_shape(shape, &transposed).ok().map_or(0, |dims|
+                    dims.iter().fold(output_width, |n, &d| n.saturating_mul(u(d))))
+            }
+        } else { 0 };
+        let base_casts = activation.saturating_add(affine).saturating_add(bias).saturating_add(post_bias);
+        let mut accumulated = self.base_output_shape(shape).ok();
+        self.residuals.iter().fold(base_casts, |n, adapter| {
+            if adapter.disabled() { return n; }
+            accumulated = accumulated.as_ref().and_then(|host|
+                crate::adapters::adapter_residual_shape(adapter, shape).ok().and_then(|residual|
+                    crate::adapters::broadcast_shape(host, &residual).ok()));
+            let add_elements = accumulated.as_ref().map_or(0, |s|
+                s.iter().fold(1u64, |n, &d| n.saturating_mul(u(d))));
             n.saturating_add(crate::adapters::adapter_forward_scratch_at_output(adapter,
                 shape, input, output, add_elements))
         })
@@ -431,7 +486,8 @@ impl<'a> EffectScope<'a> {
 }
 
 /// The dtype `x`-typed activations leave `linear` at: MLX promotes a dense matmul to
-/// `result_type(x, weight)` and a quantized one to `result_type(x, scales)`, so a pre-quantized
+/// `result_type(x, weight)` and a quantized one to `result_type(x, scales, quantization_offsets)`
+/// before its ordinary output-bias add, so a pre-quantized
 /// SceneWorks snapshot's BF16 `.scales` (every packed U-Net / CLIP projection) turn f16 activations
 /// into f32 (measured: `quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks`),
 /// and everything downstream of that projection — residual sums, norms, convolutions — runs at f32.
@@ -495,7 +551,8 @@ impl ConvWork {
 
 /// Operand casts of a dense fused addmm, separate from its single output. In particular an f32
 /// bias promotes BOTH half-precision matrix operands; there is no second bias-add output.
-/// Packed matmul has no dense weight cast; its scales determine its compute promotion.
+/// Packed matmul casts its unchanged x, scales and quantization offsets to their common compute
+/// dtype, never its U32 codes; a widening ordinary bias add casts the qmm output separately.
 pub(crate) fn linear_operand_bytes(linear: &AdaptableLinear, shape: &[i32], input: Dtype) -> u64 {
     #[cfg(test)]
     if let Some((w, b)) = linear.dense_weight() {
@@ -1103,4 +1160,91 @@ pub(crate) fn sampler_step_bytes_metadata(elements: u64, inpaint: bool) -> u64 {
 /// native owner, or claim a layout/backing identity merely to calculate a header-equivalent guard.
 pub(crate) fn activation_facts(array: &Array) -> mlx_gen::adapters::facts::TensorFacts {
     mlx_gen::adapters::facts::TensorFacts { shape: array.shape().to_vec(), dtype: array.dtype(), strides: Vec::new() }
+}
+
+
+#[cfg(test)]
+mod linear_dtype_cast_tests {
+    use super::*;
+    use mlx_gen::adapters::facts::TensorFacts;
+
+    fn tensor(shape: &[i32], dtype: Dtype) -> TensorFacts {
+        TensorFacts { shape: shape.to_vec(), dtype, strides: Vec::new() }
+    }
+
+    #[test]
+    fn packed_compute_and_postbias_casts_follow_independent_literals_host() {
+        use Dtype::{Bfloat16 as B, Float16 as H, Float32 as F};
+        // [3,64] activation =192 elements, affine operands [2,1] =2 each,
+        // qmm result [3,2] =6. Expected byte totals below are literal operation sums,
+        // not calls to the implementation's promotion or byte-budget helpers.
+        // input, scales, quantization offsets, ordinary bias, compute, output, cast bytes.
+        let cases = [
+            (H, H, H, None, H, H, 0),
+            (B, B, B, None, B, B, 0),
+            (F, F, F, Some(F), F, F, 0),
+            // Neither selected AdaptableLinear nor pinned QuantizedLinear Module precasts x.
+            (F, H, H, None, F, F, 16),
+            (B, H, H, None, F, F, 784),
+            (H, H, B, Some(H), F, F, 792),
+            (H, B, H, Some(H), F, F, 792),
+            (B, H, B, Some(B), F, F, 792),
+            (F, H, B, Some(H), F, F, 24),
+            (H, F, H, Some(H), F, F, 784),
+            (H, H, F, Some(H), F, F, 784),
+            (H, H, H, Some(F), H, F, 24),
+            (B, B, B, Some(H), B, F, 32),
+            (H, H, H, Some(B), H, F, 32),
+            (H, H, B, None, F, F, 784),
+            (F, B, B, None, F, F, 16),
+            (H, B, B, None, F, F, 784),
+        ];
+        for bits in [4, 8] {
+            for (input, scales, offsets, bias, compute, output, cast_bytes) in cases {
+                let work = LinearWork {
+                    base: mlx_gen::adapters::LinearFacts { base_shape: vec![2,64],
+                        is_quantized: true, has_live_adapters: false, adapter_count: 0,
+                        bias_shape: bias.map(|_| vec![2]) },
+                    weights: vec![tensor(&[2, 64 * bits / 32], Dtype::Uint32),
+                        tensor(&[2,1], scales), tensor(&[2,1], offsets)],
+                    bias: bias.map(|dtype| tensor(&[2], dtype)), residuals: Vec::new(),
+                    group_size: 64, bits: Some(bits),
+                };
+                assert_eq!(work.packed_compute_dtype(input), compute);
+                assert_eq!(work.output_dtype(input), output);
+                assert_eq!(work.operand_bytes(&[3,64], input), cast_bytes,
+                    "q{bits} input={input:?} scales={scales:?} offsets={offsets:?} bias={bias:?}");
+            }
+            let work = LinearWork {
+                base: mlx_gen::adapters::LinearFacts { base_shape: vec![2,64],
+                    is_quantized: true, has_live_adapters: false, adapter_count: 0,
+                    bias_shape: Some(vec![3,2]) },
+                weights: vec![tensor(&[2, 64 * bits / 32], Dtype::Uint32),
+                    tensor(&[2,1], H), tensor(&[2,1], H)],
+                bias: Some(tensor(&[3,2], F)), residuals: Vec::new(),
+                group_size: 64, bits: Some(bits),
+            };
+            assert_eq!(work.output_shape(&[1,64]).unwrap(), vec![3,2]);
+            assert_eq!(work.operand_bytes(&[1,64], H), 8,
+                "only two unbroadcast qmm result elements are cast, not six add outputs");
+        }
+    }
+
+    #[test]
+    fn dense_fused_addmm_casts_remain_independent_literals_host() {
+        use Dtype::{Bfloat16 as B, Float16 as H, Float32 as F};
+        // Dense [2,64] weights =128 elements, [3,64] input =192, bias =2.
+        for (input, weight, bias, output, cast_bytes) in [
+            (H, H, None, H, 0),
+            (H, B, None, F, 1280),
+            (H, H, Some(F), F, 1280),
+            (F, H, Some(B), F, 520),
+            (B, B, Some(H), F, 1288),
+            (F, F, Some(F), F, 0),
+        ] {
+            let work = LinearWork::dense(tensor(&[2,64], weight), bias.map(|d| tensor(&[2], d)));
+            assert_eq!(work.output_dtype(input), output);
+            assert_eq!(work.operand_bytes(&[3,64], input), cast_bytes);
+        }
+    }
 }

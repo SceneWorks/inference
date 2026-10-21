@@ -3544,10 +3544,11 @@ fn native_free_unet_control_literals_layout_geglu_effects_stream_and_merge_host(
     assert_eq!(pending.down, mlx_gen::ios_quantum::allocated_bytes(10240));
     assert_eq!(pending.mid, pending.down);
     // Independent literal dense read+cast+GEGLU selection budget: 98304 raw +49152 cast
-    // +49152 half-views +two separate page-rounded 192*i32 selections. Not physical allocation.
+    // +49152 half-views +two separate [192] i32 selections below the rounding threshold.
+    // Each selection is 768 bytes, not page-rounded. Not physical allocation.
     let stream = [hierarchy_header("a.transformer_blocks.0.ff.net.0.proj.weight", &[384, 64], Stored::F32)];
     assert_eq!(crate::block_stream::streamed_block_bytes_from_headers(&stream, "a", 1,
-        Dtype::Float16, None).unwrap(), [196608 + 2 * crate::quantum::PAGE_BYTES]);
+        Dtype::Float16, None).unwrap(), [98_304 + 49_152 + 49_152 + 2 * 768]);
     assert!(crate::block_stream::streamed_block_bytes_from_headers(&stream, "a", 1,
         Dtype::Float16, Some(4)).unwrap_err().to_string().contains("not a streamable load"));
 }
