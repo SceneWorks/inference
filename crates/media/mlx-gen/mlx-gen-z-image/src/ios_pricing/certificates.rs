@@ -1,4 +1,4 @@
-//! Z-Image native-active-counter certificates, from the pinned CPU-stream source graph.
+//! Z-Image native-active-counter certificates, from the pinned CPU/Metal source graphs.
 //!
 //! The request side is a checked cumulative sum of source-enumerated allocator requests. The
 //! anchor side subtracts NOTHING: measured nonnegative anchor growth is merely an additive
@@ -14,11 +14,13 @@ use mlx_rs::Dtype;
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "certificates/cpu.rs"]
 mod cpu;
+#[path = "certificates/metal.rs"]
+mod metal;
 #[path = "certificates/vae_graph.rs"]
 mod vae_graph;
 #[path = "certificates/z_graph.rs"]
 mod z_graph;
-use cpu::{add, mul, Graph, Tensor};
+use cpu::{add, count, mul, Graph, Lowering, Tensor};
 
 #[derive(Debug, Default)]
 pub(crate) struct WindowCertificates {
@@ -47,9 +49,9 @@ struct Program {
     ios_quantum_scope: bool,
 }
 impl Program {
-    fn new(page: u64, ios_quantum_scope: bool) -> Result<Self> {
+    fn new(page: u64, ios_quantum_scope: bool, lowering: Lowering) -> Result<Self> {
         Ok(Self {
-            graph: Graph::new(page)?,
+            graph: Graph::with_lowering(page, lowering)?,
             checkpoints: BTreeMap::new(),
             points: BTreeMap::new(),
             ios_quantum_scope,
@@ -94,19 +96,17 @@ pub enum HeavyLoadOrder {
 pub struct CertifiedExecution {
     pub load_order: HeavyLoadOrder,
     pub ios_quantum_scope: bool,
-    /// Every wrapper op of the certified run (incl. stream-less frontend casts) used the CPU stream:
-    /// global default device/stream AND any mlx-rs task-local default override.
+    /// Effective wrapper/default stream family, including task-local overrides: true = CPU,
+    /// false = GPU (Metal). MLX has exactly these two stream families. CPU-default safetensors
+    /// IO and immediate host constructors retain their separate source laws; this flag does
+    /// not claim that the native backend implements Load::eval_gpu.
     pub cpu_stream: bool,
 }
 
-/// The exact refusals for execution facts this producer cannot certify. Shared by the public
-/// provider bounder so it refuses BEFORE reading any snapshot header.
+/// Both MLX stream families are supported: cpu_stream=false selects the Metal lowering.
+/// Refuse only execution scope mismatches here, BEFORE reading any snapshot header. Individual
+/// Metal operations can still return Unsupported for missing shape/layout contracts.
 pub(crate) fn certified_execution_refusal(execution: CertifiedExecution) -> Result<()> {
-    if !execution.cpu_stream {
-        // The pinned CPU lowering (explicit-GEMM conv, composed SDPA/norm fallbacks, native
-        // Quantize, default-stream wrapper casts) is the authority ONLY for a CPU-stream run.
-        return Err(Error::Unsupported("Z certificate CPU lowering requires the certified execution's effective wrapper/default stream to be CPU".into()));
-    }
     if !execution.ios_quantum_scope {
         return Err(Error::Unsupported("Z certificate: canonical request classes price the iOS-quantum-scope graph; an unscoped execution has different VAE graph branches".into()));
     }
@@ -135,7 +135,15 @@ pub(crate) fn window_certificates(
     model
         .vae_sources
         .visit_constructed(model.facts.quant_bits, &mut |vae, owners| {
-            let mut program = Program::new(page, execution.ios_quantum_scope)?;
+            let mut program = Program::new(
+                page,
+                execution.ios_quantum_scope,
+                if execution.cpu_stream {
+                    Lowering::Cpu
+                } else {
+                    Lowering::Metal
+                },
+            )?;
             z_graph::request(
                 &mut program,
                 model,
@@ -202,8 +210,13 @@ fn bind_prefixes(
             }
             let mut witnesses = Vec::new();
             for (capture, observation) in anchor.observations.iter().enumerate() {
-                if observation.domain != IosMemoryDomain::NativeAllocatorGrowth
-                    || observation.coordinate != IosMemoryCoordinate::BeforeModelLoad
+                // The witness only names an ACTUAL anchor check at this coordinate; the bound
+                // stays native. A process-domain anchor can consume it ONLY through an approved
+                // native-to-process premise, which the law's domain check otherwise refuses.
+                if !matches!(
+                    observation.domain,
+                    IosMemoryDomain::NativeAllocatorGrowth | IosMemoryDomain::ProcessGrowth
+                ) || observation.coordinate != IosMemoryCoordinate::BeforeModelLoad
                 {
                     continue;
                 }
@@ -244,7 +257,7 @@ fn bind_prefixes(
             }
         }
         if candidates.is_empty() {
-            result.blocked.push((class.into(),"anchor has no actual same-phase native-growth BeforeModelLoad check with valid nonempty metadata context".into()));
+            result.blocked.push((class.into(),"anchor has no actual same-phase BeforeModelLoad check with valid nonempty metadata context".into()));
         } else {
             result.bounds.push(IosWindowBound::Transfer {
                 domain: IosMemoryDomain::NativeAllocatorGrowth,

@@ -33,20 +33,32 @@ fn synthetic(req: &IosPricingRequest<'_>) -> mlx_gen::Result<IosPricing> {
         "anchor re-pricing must use the ANCHOR load form, not the requesting endpoint's"
     );
     let mut p = IosPricing::default();
-    p.take(Conditioning, 600 * MIB, 10 * MIB, "SDXL CLIP layer");
-    p.take(
+    classed(&mut p, Conditioning, 600 * MIB, 10 * MIB, "SDXL CLIP layer");
+    classed(
+        &mut p,
         Denoise,
         if staged { 1500 } else { 2000 } * MIB,
         mp(300 * MIB),
         "SDXL UNet resnet",
     );
     match req.selection.parameters.decode_tile_edge {
-        Some(_) => p.take(Decode, 200 * MIB, 400 * MIB, "SDXL VAE tiled stage"),
-        None => p.take(Decode, 200 * MIB, mp(1600 * MIB), "SDXL VAE resnet"),
+        Some(_) => classed(&mut p, Decode, 200 * MIB, 400 * MIB, "SDXL VAE tiled stage"),
+        None => classed(&mut p, Decode, 200 * MIB, mp(1600 * MIB), "SDXL VAE resnet"),
     }
     // img2img adds an ENCODE phase the text anchor never ran.
     if *req.mode == mlx_gen::gen_core::MemoryMode::ImageToImage {
-        p.take(Encode, 1500 * MIB, 1500 * MIB, "SDXL VAE encode resnet");
+        classed(
+            &mut p,
+            Encode,
+            1500 * MIB,
+            1500 * MIB,
+            "SDXL VAE encode resnet",
+        );
+    }
+    // The synthetic fixture prices no load phase; text modes run no encode.
+    p.phase_not_run(Load, "synthetic fixture prices no load windows");
+    if *req.mode != mlx_gen::gen_core::MemoryMode::ImageToImage {
+        p.phase_not_run(Encode, "text mode runs no encode");
     }
     Ok(p)
 }
@@ -57,6 +69,213 @@ fn phase_of(_: &str) -> Option<IosPhase> {
 
 fn priced<T>(body: impl FnOnce() -> T) -> T {
     crate::pricing::with_test_pricing(Some((synthetic, phase_of)), body)
+}
+
+/// Every synthetic window is a CLASSED profile (class, basis, owner domain), as the certified law
+/// requires; the classes name the synthetic operation per phase.
+fn classed(p: &mut IosPricing, phase: IosPhase, resident: u64, scratch: u64, label: &str) {
+    p.take_window(mlx_gen::ios_pricing::IosWindowPrice {
+        phase,
+        class: Some(format!("synthetic/{}/{label}", phase.as_key())),
+        label: label.into(),
+        resident_bytes: resident,
+        held_bytes: 0,
+        scratch_bytes: scratch,
+        basis: Some(mlx_gen::ios_pricing::IosWorkBasis::default()),
+        owner_domain: "synthetic-fixture".into(),
+    });
+}
+
+/// The synthetic labels' actual-check stand-ins: every capture records one check per synthetic
+/// (phase, label), carrying the fixture's real metadata mark as its context.
+const SYNTHETIC_CHECKS: [(IosPhase, &str); 5] = [
+    (Conditioning, "SDXL CLIP layer"),
+    (Denoise, "SDXL UNet resnet"),
+    (Decode, "SDXL VAE tiled stage"),
+    (Decode, "SDXL VAE resnet"),
+    (Encode, "SDXL VAE encode resnet"),
+];
+
+fn witnessed(mut row: AnchorRow) -> AnchorRow {
+    if let AnchorOutcome::Completed { captures } = &mut row.outcome {
+        for capture in captures {
+            let coverage = capture.quantum_coverage.as_mut().unwrap();
+            for (phase, label) in SYNTHETIC_CHECKS {
+                coverage.record(Some(phase), label, vec![0]);
+            }
+        }
+    }
+    row
+}
+
+fn window_total(window: &mlx_gen::ios_pricing::IosWindowPrice) -> i128 {
+    i128::from(window.resident_bytes)
+        + i128::from(window.held_bytes)
+        + i128::from(window.scratch_bytes)
+}
+
+/// A synthetic NATIVE-ALLOCATOR bounder for the law/admission fixtures: each request class is
+/// bounded relative to the anchor's same-phase class by the difference of their synthetic window
+/// totals, witnessed by the anchor's actual check of that label. A phase the anchor never ran
+/// refuses the whole request, as a provider bounder must.
+fn synthetic_bounder(
+    _anchor: &IosBoundRequest<'_>,
+    at_anchor: &IosPricing,
+    _request: &IosBoundRequest<'_>,
+    at_request: &IosPricing,
+    _execution: &IosExecutionFacts,
+) -> mlx_gen::Result<IosCertifiedBounds> {
+    use mlx_gen::ios_pricing::{IosAnchorCandidate, IosAnchorWitness};
+    let mut bounds = Vec::new();
+    for window in &at_request.windows {
+        let class = window.class.clone().expect("classed synthetic window");
+        let anchor_window = at_anchor
+            .windows
+            .iter()
+            .find(|candidate| candidate.phase == window.phase)
+            .ok_or_else(|| {
+                mlx_gen::Error::Unsupported(format!("anchor never ran {}", window.phase.as_key()))
+            })?;
+        let mut witnesses = Vec::new();
+        for (capture, observation) in at_anchor.observations.iter().enumerate() {
+            for (check, observed) in observation.checks.iter().enumerate() {
+                if observed.label == anchor_window.label && observed.phase == Some(window.phase) {
+                    witnesses.push(IosAnchorWitness {
+                        capture: capture as u32,
+                        check: check as u32,
+                    });
+                }
+            }
+        }
+        bounds.push(IosWindowBound::Transfer {
+            domain: IosMemoryDomain::NativeAllocatorGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            request_class: class,
+            anchor_candidates: vec![IosAnchorCandidate {
+                anchor_class: anchor_window.class.clone().unwrap(),
+                delta_growth_upper: window_total(window) - window_total(anchor_window),
+                physical_anchor_lower_bound: None,
+                witnesses,
+            }],
+        });
+    }
+    Ok(IosCertifiedBounds::proven(bounds))
+}
+
+fn any_execution(_: &str, _: &IosExecutionFacts) -> mlx_gen::Result<()> {
+    Ok(())
+}
+
+/// Synthetic pricing AND the synthetic native bounder.
+fn certified<T>(body: impl FnOnce() -> T) -> T {
+    priced(|| crate::pricing::with_test_bounder(Some((synthetic_bounder, any_execution)), body))
+}
+
+/// The stated engineering overhead of the fixtures' approved native-to-process model.
+const MODEL_OVERHEAD_MIB: u64 = 8;
+
+fn model() -> IosNativeToProcessModel {
+    IosNativeToProcessModel {
+        overhead_bytes: MODEL_OVERHEAD_MIB * MIB,
+        provenance: "synthetic fixture model, validated by the fixture's two endpoint anchors"
+            .into(),
+    }
+}
+
+/// The explicit, user-approved policy: the model AND its premise id.
+fn approved() -> PremisePolicy {
+    PremisePolicy::approving([NATIVE_TO_PROCESS_PREMISE_ID.to_owned()])
+        .with_native_to_process(model())
+}
+
+fn cpu_scoped() -> IosExecutionFacts {
+    IosExecutionFacts {
+        stream: mlx_gen::ios_pricing::IosExecutionStream::Cpu,
+        ios_quantum_scope: true,
+        analysis_budget_bytes: 1 << 20,
+    }
+}
+
+fn admit_under(
+    registry: &ProviderRegistry,
+    c: &IosCandidate,
+    available_mib: u64,
+    rows: &[AnchorRow],
+    policy: &PremisePolicy,
+) -> AdmissionResult<Admission> {
+    let baseline = IosMemoryBaseline {
+        domain: IosMemoryDomain::ProcessGrowth,
+        coordinate: IosMemoryCoordinate::BeforeModelLoad,
+        bytes: FIXTURE_BML_BYTES,
+        source: "synthetic-test-sdk-before-model-load".into(),
+    };
+    admit_rows_with_facts(
+        registry,
+        std::slice::from_ref(c),
+        DEVICE,
+        budget(available_mib),
+        rows,
+        Some(&baseline),
+        Some(&cpu_scoped()),
+        policy,
+    )
+}
+
+/// The default boundary (no execution facts) and the default policy (no premise approved) both
+/// refuse a derived request exactly; returns the approved admission for further assertions.
+fn admitted_only_with_the_approved_premise(
+    registry: &ProviderRegistry,
+    c: &IosCandidate,
+    available_mib: u64,
+    rows: &[AnchorRow],
+) -> Admission {
+    let refusal = |result: AdmissionResult<Admission>| match result {
+        Err(AdmissionError::Refused(refusal)) => {
+            assert_eq!(refusal.kind, RefusalKind::NoEvidence, "{}", refusal.reason);
+            refusal.reason
+        }
+        Err(AdmissionError::Failed(error)) => panic!("failed: {error}"),
+        Ok(admitted) => panic!("admitted without approval: basis {:?}", admitted.basis()),
+    };
+    assert!(refusal(admit_one_of(registry, c, available_mib, rows))
+        .contains("certified execution facts"));
+    assert!(refusal(admit_under(
+        registry,
+        c,
+        available_mib,
+        rows,
+        &PremisePolicy::default()
+    ))
+    .contains(NATIVE_TO_PROCESS_PREMISE_ID));
+    // Supplying the model WITHOUT approving its premise approves nothing.
+    assert!(refusal(admit_under(
+        registry,
+        c,
+        available_mib,
+        rows,
+        &PremisePolicy::default().with_native_to_process(model()),
+    ))
+    .contains(NATIVE_TO_PROCESS_PREMISE_ID));
+    let admitted = admit_under(registry, c, available_mib, rows, &approved()).unwrap();
+    assert_eq!(admitted.certificate_premises(), &[model().premise()]);
+    assert!(admitted
+        .context()
+        .evidence_revision
+        .ends_with(&format!(";premises={NATIVE_TO_PROCESS_PREMISE_ID}")));
+    admitted
+}
+
+/// The resident endpoint anchor at 1024², measured at `demand_mib`.
+fn resident_anchor(registry: &ProviderRegistry, res: &IosCandidate, demand_mib: u64) -> AnchorRow {
+    witnessed(evidence::fixture::completed(
+        crate::source_work::fixture_key(registry, res, DEVICE),
+        AnchorKind::Resident,
+        AnchorSelection::from_parts(
+            res.context.selection.strategy,
+            &res.context.selection.parameters,
+        ),
+        demand_mib * MIB,
+    ))
 }
 
 fn at(
@@ -83,6 +302,10 @@ fn at(
 /// scratch, tiled decode 200 + 400, text 600 + 10) its unpriced overheads are denoise 700,
 /// decode 300 and conditioning 90 MiB.
 fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow {
+    witnessed(optimized_anchor_measurement(registry, c))
+}
+
+fn optimized_anchor_measurement(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow {
     let base = 300 * MIB;
     let phases = |denoise: u64| {
         [
@@ -193,8 +416,10 @@ fn the_optimized_anchor_admits_its_own_key_at_the_measurement_plus_the_stated_ma
     });
 }
 
-/// Other geometries and rungs are DERIVED by the law (exact arithmetic), upward from the
-/// optimized anchor; a request needing more than the live headroom is a capacity refusal.
+/// Other geometries and rungs are DERIVED only by the certified law: refused exactly at the default
+/// boundary/policy, and admitted — upward from the optimized anchor, or from a same-regime
+/// resident anchor — only with the approved native-to-process premise, validated against BOTH
+/// measured endpoints. A request needing more than the live headroom is a capacity refusal.
 #[test]
 fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exceed_it() {
     let registry = crate::provider_registry().unwrap();
@@ -206,11 +431,20 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
-    let rows = [optimized_anchor(&registry, &opt)];
-    priced(|| {
-        // 512², same selection (derived DOWN, the overhead floored): denoise 1500 + 700 + 300 x
-        // (75/300 of the calibrated formula) = 2275; decode 200 + 300 + 400 = 900; conditioning
-        // 600 + 90 + 10 = 700. Demand 2275.
+    let res = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::Resident,
+        "text_to_image",
+    );
+    let rows = [
+        optimized_anchor(&registry, &opt),
+        resident_anchor(&registry, &res, 3100),
+    ];
+    certified(|| {
+        // 512², same selection: the measured optimized growth (2500) plus the largest certified
+        // class delta (conditioning/decode 0, denoise -225) plus the model's stated overhead.
         let small = at(
             &registry,
             root.path(),
@@ -218,22 +452,22 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
             MemoryStrategy::BoundedDecode,
             "text_to_image",
         );
-        let admitted = admit_one_of(&registry, &small, 4096, &rows).unwrap();
-        assert_eq!(admitted.demand_bytes(), 2275 * MIB);
+        let admitted = admitted_only_with_the_approved_premise(&registry, &small, 4096, &rows);
+        assert_eq!(admitted.demand_bytes(), (2500 + MODEL_OVERHEAD_MIB) * MIB);
         assert_eq!(
             admitted.basis(),
             AdmissionBasis::Derived {
                 from: AnchorKind::Optimized
             }
         );
-        // Intermediate legal mechanisms still derive from the optimized endpoint's actual load
-        // form. No extra measurement grid: these are law/admission fixtures over synthetic prices.
+        // Intermediate legal mechanisms derive from the optimized endpoint's actual load form.
         for strategy in [
             MemoryStrategy::StagedResidency,
             MemoryStrategy::BoundedAttention,
         ] {
             let intermediate = at(&registry, root.path(), 512, strategy, "text_to_image");
-            let admitted = admit_one_of(&registry, &intermediate, 4096, &rows).unwrap();
+            let admitted =
+                admitted_only_with_the_approved_premise(&registry, &intermediate, 4096, &rows);
             assert_eq!(
                 admitted.basis(),
                 AdmissionBasis::Derived {
@@ -242,24 +476,43 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
             );
             assert_eq!(admitted.context().load_shape, intermediate.spec.load_shape);
         }
-        // Resident (rung 0) at 1024²: the U-Net 2000 resident + 700 + 300 = 3000; the untiled
-        // decode is another quantum (κ = 1): 200 + 300 + 1600 = 2100. Demand 3000: upward from the
-        // optimized anchor.
+        // Resident at 512²: from the same-regime resident anchor (3100), all deltas <= 0.
         let resident = at(
             &registry,
             root.path(),
-            1024,
+            512,
             MemoryStrategy::Resident,
             "text_to_image",
         );
-        let derived = admit_one_of(&registry, &resident, 4096, &rows).unwrap();
-        assert_eq!(derived.demand_bytes(), 3000 * MIB);
-        assert!(derived.demand_bytes() > 2500 * MIB);
-        // Live headroom below the derived demand + margin: capacity, typed.
+        let derived = admitted_only_with_the_approved_premise(&registry, &resident, 8192, &rows);
+        assert_eq!(derived.demand_bytes(), (3100 + MODEL_OVERHEAD_MIB) * MIB);
         assert_eq!(
-            kind(admit_one_of(&registry, &resident, 3000 + 31, &rows)),
+            derived.basis(),
+            AdmissionBasis::Derived {
+                from: AnchorKind::Resident
+            }
+        );
+        // Live headroom one MiB below demand + margin: capacity, typed, even when approved.
+        assert_eq!(
+            kind(admit_under(
+                &registry,
+                &resident,
+                derived.required_mib() as u64 - 1,
+                &rows,
+                &approved()
+            )),
             Some(RefusalKind::Capacity)
         );
+        // An approved model cannot be validated by ONE endpoint: no resident anchor, no admission.
+        let one_endpoint = [optimized_anchor(&registry, &opt)];
+        assert!(no_evidence_reason(admit_under(
+            &registry,
+            &small,
+            4096,
+            &one_endpoint,
+            &approved()
+        ))
+        .contains("BOTH"));
     });
 }
 
@@ -267,37 +520,28 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
 fn matching_sampling_class_derives_without_a_float_grid_and_reprices_the_anchor_recipe() {
     use mlx_gen::gen_core::CfgBatching;
     fn context_price(req: &IosPricingRequest<'_>) -> mlx_gen::Result<IosPricing> {
-        let actual = req
-            .generation
-            .expect("actual/faithful generation context is mandatory");
-        let resolved = crate::sdxl::sampling::ResolvedSampling::resolve(actual).unwrap();
-        assert_eq!(resolved.sampler_name(), "euler");
-        assert_eq!(resolved.cfg_batching(), CfgBatching::Batched);
-        assert_eq!(
-            actual.memory.unwrap().cfg_batching,
-            req.execution.cfg_batching
-        );
-        assert_eq!(
-            resolved.guidance(),
-            if req.geometry.width == 1024 {
-                7.0
-            } else {
-                8.25
-            },
-            "price the ANCHOR recipe at anchor geometry, not the request's recipe"
-        );
+        // Anchors are payload-free token replays; only the actual request carries generation.
+        if let Some(actual) = req.generation {
+            let resolved = crate::sdxl::sampling::ResolvedSampling::resolve(actual).unwrap();
+            assert_eq!(resolved.sampler_name(), "euler");
+            assert_eq!(resolved.cfg_batching(), CfgBatching::Batched);
+            assert_eq!(
+                actual.memory.unwrap().cfg_batching,
+                req.execution.cfg_batching
+            );
+            assert_eq!(resolved.guidance(), 8.25, "the request's own recipe");
+        } else {
+            assert_eq!(
+                req.geometry.width, 1024,
+                "the ANCHOR is replayed at anchor geometry"
+            );
+        }
         synthetic(req)
     }
     let registry = crate::provider_registry().unwrap();
     let root = fixture();
-    let make = |edge, guidance| {
-        let c = at(
-            &registry,
-            root.path(),
-            edge,
-            MemoryStrategy::BoundedDecode,
-            "text_to_image",
-        );
+    let make = |edge, guidance, strategy| {
+        let c = at(&registry, root.path(), edge, strategy, "text_to_image");
         let IosWork::Generate(mut request) = c.work else {
             unreachable!()
         };
@@ -309,14 +553,18 @@ fn matching_sampling_class_derives_without_a_float_grid_and_reprices_the_anchor_
             crate::sdxl::SDXL_ID,
             c.spec,
             None,
-            MemoryStrategy::BoundedDecode,
+            strategy,
             IosWork::Generate(request),
         )
         .unwrap()
     };
-    let anchor = make(1024, 7.0);
-    let request = make(512, 8.25);
-    let rows = [optimized_anchor(&registry, &anchor)];
+    let anchor = make(1024, 7.0, MemoryStrategy::BoundedDecode);
+    let resident = make(1024, 7.0, MemoryStrategy::Resident);
+    let request = make(512, 8.25, MemoryStrategy::BoundedDecode);
+    let rows = [
+        optimized_anchor(&registry, &anchor),
+        resident_anchor(&registry, &resident, 3100),
+    ];
     assert_eq!(
         evidence_key(&registry, &anchor, DEVICE)
             .unwrap()
@@ -328,17 +576,20 @@ fn matching_sampling_class_derives_without_a_float_grid_and_reprices_the_anchor_
             .unwrap()
     );
     crate::pricing::with_test_pricing(Some((context_price, phase_of)), || {
-        let admitted = admit_one_of(&registry, &request, 4096, &rows).unwrap();
-        assert_eq!(
-            admitted.basis(),
-            AdmissionBasis::Derived {
-                from: AnchorKind::Optimized
-            }
-        );
-        assert_eq!(
-            admitted.context().selection.strategy,
-            MemoryStrategy::BoundedDecode
-        );
+        crate::pricing::with_test_bounder(Some((synthetic_bounder, any_execution)), || {
+            let admitted =
+                admitted_only_with_the_approved_premise(&registry, &request, 4096, &rows);
+            assert_eq!(
+                admitted.basis(),
+                AdmissionBasis::Derived {
+                    from: AnchorKind::Optimized
+                }
+            );
+            assert_eq!(
+                admitted.context().selection.strategy,
+                MemoryStrategy::BoundedDecode
+            );
+        })
     });
 }
 
@@ -430,15 +681,28 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let key = evidence_key(&registry, &realvis, DEVICE).unwrap();
     assert_eq!(key.architecture_sha256, rows[0].key.architecture_sha256);
     assert_eq!(key.family(), rows[0].key.family());
-    priced(|| {
-        let admitted = admit_one_of(&registry, &realvis, 8192, &rows).unwrap();
+    // Derived only by the certified law with the approved premise and BOTH endpoints measured.
+    let res = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::Resident,
+        "text_to_image",
+    );
+    let endpoints = [
+        optimized_anchor(&registry, &opt),
+        resident_anchor(&registry, &res, 3100),
+    ];
+    certified(|| {
+        let admitted =
+            admitted_only_with_the_approved_premise(&registry, &realvis, 8192, &endpoints);
         assert_eq!(
             admitted.basis(),
             AdmissionBasis::Derived {
                 from: AnchorKind::Optimized
             }
         );
-        assert_eq!(admitted.demand_bytes(), 2500 * MIB);
+        assert_eq!(admitted.demand_bytes(), (2500 + MODEL_OVERHEAD_MIB) * MIB);
     });
     // No pricing: the anchor's own key still admits (a measurement needs no scaling) …
     let big = at(
@@ -480,9 +744,10 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     });
 }
 
-/// The two anchors check each other. A resident anchor the law (from the optimized one)
-/// under-predicts beyond the tolerance fails the family's DERIVATIONS closed; the measured anchors
-/// still admit at their own keys. A refused resident anchor is capacity evidence at its own key.
+/// The two anchors check each other through the certified law and the SAME approved model: a
+/// resident anchor the optimized anchor under-predicts fails the family's DERIVATIONS closed; the
+/// measured anchors still admit at their own keys. A refused resident anchor is capacity evidence
+/// at its own key, and leaves the model with only one endpoint, so nothing is derived.
 #[test]
 fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_capacity() {
     let registry = crate::provider_registry().unwrap();
@@ -508,27 +773,18 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
-    let resident_row = |demand_mib: u64| {
-        evidence::fixture::completed(
-            crate::source_work::fixture_key(&registry, &res, DEVICE),
-            AnchorKind::Resident,
-            AnchorSelection::from_parts(
-                res.context.selection.strategy,
-                &res.context.selection.parameters,
-            ),
-            demand_mib * MIB,
-        )
-    };
-    priced(|| {
-        // The law predicts the resident anchor at 3000 MiB. Measured 3100: within 12.6%.
-        let rows = [optimized_anchor(&registry, &opt), resident_row(3100)];
+    certified(|| {
+        // The certified law predicts the resident endpoint at 2500 + 1200 (decode) + 8 = 3708 MiB.
+        // Measured 3100: covered, so derivation proceeds.
+        let rows = [
+            optimized_anchor(&registry, &opt),
+            resident_anchor(&registry, &res, 3100),
+        ];
         assert_eq!(
-            admit_one_of(&registry, &big, 8192, &rows)
-                .unwrap()
-                .demand_bytes(),
-            2275 * MIB
+            admitted_only_with_the_approved_premise(&registry, &big, 8192, &rows).demand_bytes(),
+            (2500 + MODEL_OVERHEAD_MIB) * MIB
         );
-        // A resident request at another geometry is derived from the same-regime resident anchor.
+        // A resident request at another geometry derives from the same-regime resident anchor.
         let res_big = at(
             &registry,
             root.path(),
@@ -537,18 +793,20 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
             "text_to_image",
         );
         assert_eq!(
-            admit_one_of(&registry, &res_big, 8192, &rows)
-                .unwrap()
-                .basis(),
+            admitted_only_with_the_approved_premise(&registry, &res_big, 8192, &rows).basis(),
             AdmissionBasis::Derived {
                 from: AnchorKind::Resident
             }
         );
-        // Measured 3600: the law under-predicts by 16.7% → every derivation fails closed.
-        let rows = [optimized_anchor(&registry, &opt), resident_row(3600)];
-        assert_eq!(
-            kind(admit_one_of(&registry, &big, 8192, &rows)),
-            Some(RefusalKind::NoEvidence)
+        // Measured 3800 > 3708 predicted: the approved model fails its endpoint validation, so
+        // every derivation fails closed even when approved; own keys still admit.
+        let rows = [
+            optimized_anchor(&registry, &opt),
+            resident_anchor(&registry, &res, 3800),
+        ];
+        assert!(
+            no_evidence_reason(admit_under(&registry, &big, 8192, &rows, &approved()))
+                .contains("under-predicts")
         );
         assert_eq!(
             admit_one_of(&registry, &opt, 8192, &rows)
@@ -560,10 +818,10 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
             admit_one_of(&registry, &res, 8192, &rows)
                 .unwrap()
                 .demand_bytes(),
-            3600 * MIB
+            3800 * MIB
         );
         // A resident anchor refused before allocation: its own key is a typed capacity refusal,
-        // and the family keeps deriving from the optimized anchor.
+        // and with one completed endpoint the approved model cannot be validated.
         let refused = AnchorRow {
             outcome: AnchorOutcome::Refused {
                 refused_quantum: RefusedQuantum {
@@ -575,18 +833,162 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
                 run_id: "r".into(),
                 build_sha: "s".into(),
             },
-            ..resident_row(0)
+            ..resident_anchor(&registry, &res, 0)
         };
         let rows = [optimized_anchor(&registry, &opt), refused];
         assert_eq!(
             kind(admit_one_of(&registry, &res, 8192, &rows)),
             Some(RefusalKind::Capacity)
         );
-        assert_eq!(
-            admit_one_of(&registry, &big, 8192, &rows)
-                .unwrap()
-                .demand_bytes(),
-            2275 * MIB
+        assert!(
+            no_evidence_reason(admit_under(&registry, &big, 8192, &rows, &approved()))
+                .contains("BOTH")
         );
     });
+}
+
+fn admit_with_facts(
+    registry: &ProviderRegistry,
+    c: &IosCandidate,
+    rows: &[AnchorRow],
+    facts: Option<&IosExecutionFacts>,
+) -> AdmissionResult<Admission> {
+    let baseline = IosMemoryBaseline {
+        domain: IosMemoryDomain::ProcessGrowth,
+        coordinate: IosMemoryCoordinate::BeforeModelLoad,
+        bytes: FIXTURE_BML_BYTES,
+        source: "synthetic-test-sdk-before-model-load".into(),
+    };
+    admit_rows_with_facts(
+        registry,
+        std::slice::from_ref(c),
+        DEVICE,
+        budget(4096),
+        rows,
+        Some(&baseline),
+        facts,
+        &PremisePolicy::default(),
+    )
+}
+
+fn no_evidence_reason(result: AdmissionResult<Admission>) -> String {
+    match result {
+        Err(AdmissionError::Refused(refusal)) => {
+            assert_eq!(refusal.kind, RefusalKind::NoEvidence, "{}", refusal.reason);
+            refusal.reason
+        }
+        Err(AdmissionError::Failed(error)) => panic!("failed instead of refusing: {error}"),
+        Ok(admitted) => panic!("admitted: basis {:?}", admitted.basis()),
+    }
+}
+
+/// HOST: derivation away from an anchor's own key consumes ONLY a registered source bounder for
+/// the STATED execution through the certified law. Missing facts, an unaudited stream, an
+/// unscoped execution and an uncertifiable transfer each refuse exactly; the anchor's own key is
+/// still admitted from its measurement without any execution fact.
+#[test]
+fn certified_derivation_refuses_exactly_without_facts_audited_stream_or_certificate() {
+    use mlx_gen::ios_pricing::IosExecutionStream;
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let opt = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let rows = [optimized_anchor(&registry, &opt)];
+    priced(|| {
+        let small = at(
+            &registry,
+            root.path(),
+            512,
+            MemoryStrategy::BoundedDecode,
+            "text_to_image",
+        );
+        let facts = |stream, ios_quantum_scope| IosExecutionFacts {
+            stream,
+            ios_quantum_scope,
+            analysis_budget_bytes: 1 << 20,
+        };
+        assert!(
+            no_evidence_reason(admit_with_facts(&registry, &small, &rows, None))
+                .contains("certified execution facts")
+        );
+        let metal = facts(IosExecutionStream::Metal, true);
+        assert!(
+            no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&metal)))
+                .contains("no audited native-allocation law for the Metal stream")
+        );
+        let unscoped = facts(IosExecutionStream::Cpu, false);
+        assert!(
+            no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&unscoped)))
+                .contains("unscoped execution is not certified")
+        );
+        // A synthetic counted price is not SDXL's source-generated profile: no certificate.
+        let cpu = facts(IosExecutionStream::Cpu, true);
+        // (or the anchor's real SDXL replay over this header-only fixture refuses first).
+        let reason = no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&cpu)));
+        assert!(
+            reason.contains("no transfer certificate") || reason.contains("not derivable"),
+            "{reason}"
+        );
+        let exact = admit_with_facts(&registry, &opt, &rows, None).unwrap();
+        assert_eq!(
+            exact.basis(),
+            AdmissionBasis::Measured(AnchorKind::Optimized)
+        );
+    });
+}
+
+/// HOST: premise-dependent bounds are refused by default, naming the premise; only an explicit
+/// policy approving every named premise accepts them.
+#[test]
+fn premise_dependent_bounds_need_explicit_approval_of_every_premise() {
+    let premise = |id: &str| IosCertificatePremise {
+        id: id.into(),
+        statement: format!("{id} is asserted, not source-proved"),
+    };
+    let premises = [premise("metal-synchronize-retirement"), premise("other")];
+    let refusal = PremisePolicy::default().accept(&premises).unwrap_err();
+    assert!(refusal.contains("metal-synchronize-retirement (") && refusal.contains("other ("));
+    let partial = PremisePolicy::approving(["metal-synchronize-retirement".to_owned()]);
+    let refusal = partial.accept(&premises).unwrap_err();
+    assert!(!refusal.contains("metal-synchronize-retirement") && refusal.contains("other ("));
+    PremisePolicy::approving([
+        "metal-synchronize-retirement".to_owned(),
+        "other".to_owned(),
+    ])
+    .accept(&premises)
+    .unwrap();
+    PremisePolicy::default().accept(&[]).unwrap();
+}
+
+/// HOST: the bounder registry names exactly the providers that expose source-owned bounders.
+#[test]
+fn only_providers_exposing_source_bounders_are_registered() {
+    for provider in [
+        crate::sdxl::SDXL_ID,
+        crate::zimage::Z_IMAGE_TURBO_ID,
+        crate::zimage::Z_IMAGE_TURBO_CONTROL_ID,
+        "iris_3b",
+        IRIS_RESTORE_ID,
+        IRIS_DEPTH_ID,
+    ] {
+        assert!(
+            crate::pricing::provider_bounder(provider).is_some(),
+            "{provider}"
+        );
+    }
+    for provider in [
+        "sana_1600m",
+        "sana_sprint_1600m",
+        crate::anima::ANIMA_TURBO_ID,
+    ] {
+        assert!(
+            crate::pricing::provider_bounder(provider).is_none(),
+            "{provider}"
+        );
+    }
 }

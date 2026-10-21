@@ -71,10 +71,10 @@ pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
 #[cfg(feature = "device-capture")]
 pub use ios_admission::capture_permit;
 pub use ios_admission::{
-    admit, admit_with_baseline, build_candidate, capacity_budget, configured_endpoint,
-    configured_load_form, evidence_key, execution_for, execution_key, tier_label, token_window,
-    validate_actual, work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork,
-    IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+    admit, admit_with_baseline, admit_with_boundary, build_candidate, capacity_budget,
+    configured_endpoint, configured_load_form, evidence_key, execution_for, execution_key,
+    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, AdmissionBasis,
+    IosCandidate, IosWork, PremisePolicy, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
 pub use layout::{
     architecture_digest, artifact_layout_digest, capture_artifact_stem, configured_variant_digest,

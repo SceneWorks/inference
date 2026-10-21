@@ -27,6 +27,9 @@ pub(super) struct Tensor {
     pub strides: Vec<u64>,
     pub data_size: u64,
     pub contiguous: bool,
+    // Metal runtime alternatives can have equal shape/dtype but different layouts. Keep every
+    // descriptor for downstream lowering; CPU descriptors always leave this empty.
+    pub alternatives: Vec<Tensor>,
 }
 impl Tensor {
     pub fn row(shape: &[u64], dtype: Dtype) -> Result<Self> {
@@ -42,7 +45,38 @@ impl Tensor {
             strides,
             data_size: n,
             contiguous: true,
+            alternatives: Vec::new(),
         })
+    }
+    pub fn layouts(&self) -> Vec<Self> {
+        let mut first = self.clone();
+        first.alternatives.clear();
+        let mut layouts = vec![first];
+        layouts.extend(self.alternatives.iter().cloned());
+        layouts
+    }
+    pub fn same_layout(&self, other: &Self) -> bool {
+        self.shape == other.shape
+            && self.dtype == other.dtype
+            && self.strides == other.strides
+            && self.data_size == other.data_size
+            && self.contiguous == other.contiguous
+    }
+    pub fn merge_layouts(&mut self, other: Self) -> Result<()> {
+        if self.shape != other.shape || self.dtype != other.dtype {
+            return Err(Error::Unsupported(
+                "Metal alternative outputs require the same frontend shape and dtype".into(),
+            ));
+        }
+        for mut layout in other.layouts() {
+            layout.alternatives.clear();
+            if !self.same_layout(&layout)
+                && !self.alternatives.iter().any(|x| x.same_layout(&layout))
+            {
+                self.alternatives.push(layout);
+            }
+        }
+        Ok(())
     }
     pub fn elements(&self) -> Result<u64> {
         count(&self.shape)
@@ -77,6 +111,17 @@ impl Tensor {
         true
     }
     pub fn transpose(&self, axes: &[usize]) -> Result<Self> {
+        if !self.alternatives.is_empty() {
+            let mut layouts = self.layouts().into_iter();
+            let mut out = layouts
+                .next()
+                .ok_or_else(|| fail("empty layout alternatives"))?
+                .transpose(axes)?;
+            for layout in layouts {
+                out.merge_layouts(layout.transpose(axes)?)?;
+            }
+            return Ok(out);
+        }
         if axes.len() != self.shape.len()
             || axes.iter().copied().collect::<BTreeSet<_>>() != (0..axes.len()).collect()
         {
@@ -89,6 +134,17 @@ impl Tensor {
         })
     }
     pub fn broadcast(&self, shape: &[u64]) -> Result<Self> {
+        if !self.alternatives.is_empty() {
+            let mut layouts = self.layouts().into_iter();
+            let mut out = layouts
+                .next()
+                .ok_or_else(|| fail("empty layout alternatives"))?
+                .broadcast(shape)?;
+            for layout in layouts {
+                out.merge_layouts(layout.broadcast(shape)?)?;
+            }
+            return Ok(out);
+        }
         if shape.len() < self.shape.len() {
             return Err(fail("broadcast rank"));
         }
@@ -112,6 +168,17 @@ impl Tensor {
     }
     /// Native common Split: no allocation; data_size excludes broadcasted dimensions.
     pub fn split(&self, axis: usize, size: u64) -> Result<Self> {
+        if !self.alternatives.is_empty() {
+            let mut layouts = self.layouts().into_iter();
+            let mut out = layouts
+                .next()
+                .ok_or_else(|| fail("empty layout alternatives"))?
+                .split(axis, size)?;
+            for layout in layouts {
+                out.merge_layouts(layout.split(axis, size)?)?;
+            }
+            return Ok(out);
+        }
         if axis >= self.shape.len() || size > self.shape[axis] {
             return Err(fail("slice extent"));
         }
@@ -133,15 +200,31 @@ impl Tensor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lowering {
+    Cpu,
+    Metal,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Graph {
     pub counter: ActiveCounterRequests,
+    pub lowering: Lowering,
 }
 impl Graph {
     pub fn new(page: u64) -> Result<Self> {
         Ok(Self {
             counter: ActiveCounterRequests::new(page)?,
+            lowering: Lowering::Cpu,
         })
+    }
+    pub fn with_lowering(page: u64, lowering: Lowering) -> Result<Self> {
+        let mut graph = Self::new(page)?;
+        graph.lowering = lowering;
+        Ok(graph)
+    }
+    pub fn is_metal(&self) -> bool {
+        self.lowering == Lowering::Metal
     }
     pub fn upper(&self) -> u64 {
         self.counter.upper()
@@ -172,11 +255,16 @@ impl Graph {
         self.immediate(&[1], dtype, site)
     }
     pub fn load(&mut self, bytes: u64, site: &str) -> Result<()> {
+        // IO wrappers default to CPU independently of the compute default. Under Metal this
+        // also dominates a task-local GPU override: native Load::eval_gpu throws before malloc.
         self.counter
             .charge("backend/common/load.cpp: Load::eval_cpu", site, bytes)
     }
-    /// Native common prepare_reshape, followed by CPU copy ONLY if no shared-buffer layout fits.
+    /// Native common prepare_reshape; the selected backend owns a required copy.
     pub fn reshape(&mut self, x: &Tensor, shape: &[u64], site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_reshape(x, shape, site);
+        }
         if count(shape)? != x.elements()? {
             return Err(fail("reshape element count"));
         }
@@ -235,6 +323,9 @@ impl Graph {
         })
     }
     pub fn cast(&mut self, x: &Tensor, dtype: Dtype, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_cast(x, dtype, site);
+        }
         if x.dtype == dtype {
             return Ok(x.clone());
         }
@@ -256,6 +347,9 @@ impl Graph {
         }
     }
     pub fn unary(&mut self, x: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_unary(x, site);
+        }
         // common/unary.h set_unary_output_data. Donation is not a release or allocation credit.
         if x.contiguous {
             self.counter.charge(
@@ -269,6 +363,9 @@ impl Graph {
         }
     }
     pub fn binary(&mut self, a: &Tensor, b: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_binary(a, b, site);
+        }
         let shape = broadcast_shape(&a.shape, &b.shape)?;
         let dtype = promote(a.dtype, b.dtype)?;
         let a = self.cast(a, dtype, site)?.broadcast(&shape)?;
@@ -300,6 +397,9 @@ impl Graph {
         }
     }
     pub fn concat(&mut self, xs: &[Tensor], axis: usize, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_concat(xs, axis, site);
+        }
         let first = xs.first().ok_or_else(|| fail("empty concatenate"))?;
         if xs.len() == 1 {
             return Ok(first.clone());
@@ -333,6 +433,9 @@ impl Graph {
         )
     }
     pub fn reduce(&mut self, x: &Tensor, axes: &[usize], site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_reduce(x, axes, site);
+        }
         if axes.iter().all(|&axis| x.shape.get(axis) == Some(&1)) {
             return Ok(x.clone());
         }
@@ -349,6 +452,9 @@ impl Graph {
         self.binary(&sum, &inv, site)
     }
     pub fn softmax(&mut self, x: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_softmax(x, site);
+        }
         if x.contiguous && x.strides.last() == Some(&1) {
             self.counter.charge(
                 "cpu/softmax.cpp non-donated data_size output",
@@ -376,6 +482,9 @@ impl Graph {
         bias: Option<&Tensor>,
         site: &str,
     ) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_matrix_product(a, b, bias, site);
+        }
         if a.shape.len() < 2
             || b.shape.len() < 2
             || a.shape[a.shape.len() - 1] != b.shape[b.shape.len() - 2]
@@ -444,6 +553,9 @@ impl Graph {
         bias: Option<&Tensor>,
         site: &str,
     ) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_qmm(x, weight, scales, offsets, bias, site);
+        }
         if weight.shape.len() != 2 || x.shape.is_empty() {
             return Err(fail("Z qmm rank"));
         }
@@ -476,6 +588,9 @@ impl Graph {
         }
     }
     pub fn rms(&mut self, x: &Tensor, weight: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_rms(x, weight, site);
+        }
         // fast.cpp CPU fallback, not a guessed fused normalization kernel.
         let dtype = promote(x.dtype, weight.dtype)?;
         let x32 = self.cast(x, Dtype::Float32, site)?;
@@ -490,6 +605,9 @@ impl Graph {
         self.binary(&norm, &weight, site)
     }
     pub fn layer_norm(&mut self, x: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_layer_norm(x, site);
+        }
         // fast.cpp: affine-free CPU LN still constructs passed weight/bias scalar arrays.
         self.scalar(x.dtype, site)?;
         self.scalar(x.dtype, site)?;
@@ -505,6 +623,9 @@ impl Graph {
         self.cast(&out, x.dtype, site)
     }
     pub fn silu(&mut self, x: &Tensor, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_silu(x, site);
+        }
         // nn::silu eager x*sigmoid(x); compiled CPU allocation is bounded by these source outputs.
         let sigmoid = self.unary(x, site)?;
         self.binary(x, &sigmoid, site)
@@ -517,6 +638,9 @@ impl Graph {
         mask: Option<&Tensor>,
         site: &str,
     ) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_sdpa(q, k, v, mask, site);
+        }
         if q.shape.len() != 4
             || k.shape.len() != 4
             || v.shape.len() != 4
@@ -541,6 +665,9 @@ impl Graph {
         self.matmul(&p, &v, site)
     }
     pub fn normal_f32(&mut self, shape: &[u64], site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_normal_f32(shape, site);
+        }
         // random.cpp explicit key + uniform(-1,1) -> erfinv -> sqrt(2) multiply.
         self.immediate(&[2], Dtype::Uint32, site)?;
         for _ in 0..6 {
@@ -563,6 +690,9 @@ impl Graph {
         Tensor::row(shape, Dtype::Float32)
     }
     pub fn affine_quantize(&mut self, x: &Tensor, bits: u64, site: &str) -> Result<[Tensor; 3]> {
+        if self.is_metal() {
+            return self.metal_affine_quantize(x, bits, site);
+        }
         let mut packed = x.shape.clone();
         let mut groups = packed.clone();
         let last = packed.last_mut().ok_or_else(|| fail("quantize rank"))?;
@@ -608,6 +738,9 @@ impl Graph {
         bits: u64,
         site: &str,
     ) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_affine_dequantize(packed, scales, offsets, bits, site);
+        }
         if !matches!(bits, 4 | 8) || packed.shape.is_empty() {
             return Err(fail("Z dequantize bits/rank"));
         }
@@ -643,6 +776,9 @@ impl Graph {
         self.allocation(&shape, dtype, "ops.cpp affine dequantize offsets add", site)
     }
     pub fn gather_rows(&mut self, x: &Tensor, rows: u64, site: &str) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_gather_rows(x, rows, site);
+        }
         if x.shape.is_empty() {
             return Err(fail("gather source rank"));
         }
@@ -659,6 +795,9 @@ impl Graph {
         padding: u64,
         site: &str,
     ) -> Result<Tensor> {
+        if self.is_metal() {
+            return self.metal_conv2d(x, weight, bias, stride, padding, site);
+        }
         if x.shape.len() != 4
             || weight.shape.len() != 4
             || x.shape[3] != weight.shape[3]

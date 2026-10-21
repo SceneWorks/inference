@@ -363,12 +363,17 @@ fn dit_rope(g: &mut Graph, x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
     let fc = fc.split(4, 1)?;
     let cos = g.reshape(&fc, &[1, n, 1, half], "attention.rs cosine view")?;
     let sin = cos.clone();
-    let ac = g.binary(&real, &cos, "attention.rs rope xr*cos")?;
-    let bs = g.binary(&imag, &sin, "attention.rs rope xi*sin")?;
-    let r = g.binary(&ac, &bs, "attention.rs rope subtract")?;
-    let as_ = g.binary(&real, &sin, "attention.rs rope xr*sin")?;
-    let bc = g.binary(&imag, &cos, "attention.rs rope xi*cos")?;
-    let i = g.binary(&as_, &bc, "attention.rs rope add")?;
+    let (r, i) = if g.is_metal() {
+        g.metal_rope_rotate(&real, &imag, &cos, &sin, "attention.rs rope_rotate")?
+    } else {
+        let ac = g.binary(&real, &cos, "attention.rs rope xr*cos")?;
+        let bs = g.binary(&imag, &sin, "attention.rs rope xi*sin")?;
+        let r = g.binary(&ac, &bs, "attention.rs rope subtract")?;
+        let as_ = g.binary(&real, &sin, "attention.rs rope xr*sin")?;
+        let bc = g.binary(&imag, &cos, "attention.rs rope xi*cos")?;
+        let i = g.binary(&as_, &bc, "attention.rs rope add")?;
+        (r, i)
+    };
     let r = g.reshape(&r, &[b, n, h, half, 1], "attention.rs stack real view")?;
     let i = g.reshape(&i, &[b, n, h, half, 1], "attention.rs stack imag view")?;
     let out = g.concat(&[r, i], 4, "attention.rs stack_axis")?;
@@ -485,10 +490,17 @@ fn block(
         query_rows,
     )?;
     let mut a = norm(g, c, &format!("{p}.attention_norm2.weight"), &a)?;
-    if let Some(m) = &modulation {
-        a = g.binary(&m[1], &a, p)?;
-    }
-    let h = g.binary(x, &a, p)?;
+    let h = if g.is_metal() && modulation.is_some() {
+        let m = modulation
+            .as_ref()
+            .ok_or_else(|| error("gated modulation"))?;
+        g.metal_gated(x, &m[1], &a, p)?
+    } else {
+        if let Some(m) = &modulation {
+            a = g.binary(&m[1], &a, p)?;
+        }
+        g.binary(x, &a, p)?
+    };
     let mut a = norm(g, c, &format!("{p}.ffn_norm1.weight"), &h)?;
     if let Some(m) = &modulation {
         a = g.binary(&a, &m[2], p)?;
@@ -499,6 +511,11 @@ fn block(
     let ff = g.binary(&ff, &other, p)?;
     let ff = c.linear(g, &format!("{p}.feed_forward.w2"), &ff, false)?;
     let mut a = norm(g, c, &format!("{p}.ffn_norm2.weight"), &ff)?;
+    if g.is_metal() {
+        if let Some(m) = &modulation {
+            return g.metal_gated(&h, &m[3], &a, p);
+        }
+    }
     if let Some(m) = &modulation {
         a = g.binary(&m[3], &a, p)?;
     }

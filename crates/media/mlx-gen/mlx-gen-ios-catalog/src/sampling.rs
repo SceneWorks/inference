@@ -545,6 +545,15 @@ pub(crate) fn price_metadata(
             "anchor metadata replay rejects a competing actual work context".into(),
         ));
     }
+    // Crate tests that install a synthetic pricing price the ANCHOR replay with it too, so a
+    // fixture's anchor and request profiles come from the same counted law.
+    #[cfg(test)]
+    if crate::pricing::test_pricing_active() {
+        let (pricer, _) = crate::pricing::provider_pricing(req.provider).ok_or_else(|| {
+            Error::Unsupported("anchor replay under a test pricing that prices nothing".into())
+        })?;
+        return pricer(req);
+    }
     if req.geometry.batch == 0 {
         return Err(Error::Unsupported(
             "anchor metadata replay requires positive output cardinality".into(),

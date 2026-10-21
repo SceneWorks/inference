@@ -185,39 +185,21 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
 }
 
 /// The `mlx_gen::ios_pricing::IosBounder` entry point. That signature carries NO facts about the
-/// execution being certified (backend/stream, iOS quantum scope, heavy load order), and the Z
-/// certificate's audited lowering is the CPU-stream one. A device run uses Metal kernels, for which
-/// no allocation law has been source-audited, so it is refused exactly; a host caller that knows
-/// its execution facts must call [`ios_bounder_with_execution`]. Facts are never sampled from the
-/// thread evaluating this pure function.
+/// execution being certified (backend/stream, iOS quantum scope, heavy load order). Only a physical
+/// iOS device build knows them statically (GPU/Metal stream, inside the quantum scope, production
+/// load order) and is certified through the Metal lowering; every other caller is refused exactly
+/// and must call [`ios_bounder_with_execution`] / [`ios_certified_bounder`] with stated facts.
+/// Facts are never sampled from the thread evaluating this pure function.
 pub fn ios_bounder(
     anchor_request: &IosPricingRequest<'_>,
     anchor_pricing: &IosPricing,
     request: &IosPricingRequest<'_>,
     request_pricing: &IosPricing,
 ) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>> {
-    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
-    {
-        // A physical device always runs inside the iOS quantum scope, on the Metal backend.
-        ios_bounder_with_execution(
-            anchor_request,
-            anchor_pricing,
-            request,
-            request_pricing,
-            CertifiedExecution {
-                load_order: HeavyLoadOrder::VaeBeforeQuantize,
-                ios_quantum_scope: true,
-                cpu_stream: false,
-            },
-        )
-    }
-    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
-    {
-        let _ = (anchor_request, anchor_pricing, request, request_pricing);
-        Err(Error::Unsupported(
-            "z-image transfer certificate: IosBounder carries no certified execution facts (stream, iOS quantum scope, load order); call ios_bounder_with_execution".into(),
-        ))
-    }
+    let _ = (anchor_request, anchor_pricing, request, request_pricing);
+    Err(Error::Unsupported(
+        "z-image transfer certificate: IosBounder carries no certified execution facts (stream, iOS quantum scope, load order) or exact-analysis byte budget; call ios_certified_bounder or ios_bounder_with_execution".into(),
+    ))
 }
 
 /// Source-owned NATIVE-ALLOCATOR transfer certificates for the correlated anchor law, for an
@@ -230,9 +212,104 @@ pub fn ios_bounder_with_execution(
     request: &IosPricingRequest<'_>,
     request_pricing: &IosPricing,
     execution: CertifiedExecution,
+    analysis_budget_bytes: u64,
+) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>> {
+    let side = |pricing| mlx_gen::ios_pricing::IosBoundRequest {
+        pricing,
+        replay: None,
+    };
+    certify_transfer(
+        &side(anchor_request),
+        anchor_pricing,
+        &side(request),
+        request_pricing,
+        execution,
+        analysis_budget_bytes,
+    )
+}
+
+/// One side's EXACT execution resolution: route, windowed execution plan, O(1) controls and the
+/// source-generated pricing it must match. An actual GenerationRequest wins; a payload-free
+/// anchor resolves from its recorded recipe token and typed roles exactly as
+/// `ios_pricing_with_token` does. Neither present refuses.
+fn resolve_bound_side(
+    side: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    analysis_budget_bytes: u64,
+) -> Result<(
+    Route,
+    mlx_gen::sampler::flow_sampling::ResolvedFlowSampling,
+    mlx_gen::sampler::flow_sampling::ResolvedFlowControls,
+    IosPricing,
+)> {
+    let req = side.pricing;
+    if let Some(generation) = req.generation {
+        let (true_refs, _, _) = pricing_roles_from_kinds(
+            generation
+                .conditioning
+                .iter()
+                .map(mlx_gen::Conditioning::kind),
+        )?;
+        let initial_width = crate::sampling::initial_state_width(generation, true_refs == 1)?;
+        let route = Route::from_controls(req, generation.count, initial_width, true_refs)?;
+        let pricing = ios_pricing(req)?;
+        let controls = crate::sampling::resolve_with_init(generation, route.mode.img2img())?;
+        // Bounded EXACT analysis: refuse before the step-dependent schedule is built.
+        controls.check_capture_schedule_bytes(analysis_budget_bytes)?;
+        let sampling = crate::sampling::resolve_actual_with_init(generation, route.mode.img2img())?;
+        return Ok((route, sampling, controls, pricing));
+    }
+    let replay = side.replay.ok_or_else(|| {
+        Error::Unsupported(
+            "z-image transfer certificate needs an actual generation request or a recorded replay token".into(),
+        )
+    })?;
+    let pricing = ios_pricing_with_token(
+        req,
+        replay.token,
+        req.geometry.batch,
+        replay.true_reference_count,
+        replay.mask_count,
+        replay.control_count,
+    )?;
+    let (recipe, _) = pid_work_basis::decode(replay.token, None)?;
+    let controls = mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(
+        &recipe,
+        crate::sampling::defaults(),
+        mlx_gen::TimestepConvention::OneMinusSigma,
+    )?;
+    // SAME init rule as ios_pricing_with_token: the effective (reference-over-global) strength.
+    let active_init = replay.true_reference_count == 1
+        && crate::pipeline::init_time_step(controls.steps(), recipe.effective_strength()) > 0;
+    let route = Route::from_controls(
+        req,
+        req.geometry.batch,
+        if active_init { 4 } else { 2 },
+        replay.true_reference_count,
+    )?;
+    controls.check_capture_schedule_bytes(analysis_budget_bytes)?;
+    // `to_request` carries the effective strength; the actual plan then windows exactly as the
+    // runtime resolver does. The resolved factory must be the token's.
+    let sampling =
+        crate::sampling::resolve_actual_with_init(&recipe.to_request(), route.mode.img2img())?;
+    if sampling.solver() != controls.solver() || sampling.steps() != controls.steps() {
+        return Err(Error::Unsupported(
+            "z-image replay token does not resolve to its own execution plan".into(),
+        ));
+    }
+    Ok((route, sampling, controls, pricing))
+}
+
+/// The shared certificate consumer for both entry points.
+fn certify_transfer(
+    anchor: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &IosPricing,
+    execution: CertifiedExecution,
+    analysis_budget_bytes: u64,
 ) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>> {
     certificates::certified_execution_refusal(execution)?;
-    if anchor_request.provider != request.provider {
+    if anchor.pricing.provider != request.pricing.provider {
         return Err(Error::Unsupported(
             "z-image transfer certificate needs an anchor of the same provider".into(),
         ));
@@ -242,38 +319,29 @@ pub fn ios_bounder_with_execution(
             && expected.windows == supplied.windows
             && expected.absent_phases == supplied.absent_phases
     };
-    if !matches_source(&ios_pricing(anchor_request)?, anchor_pricing)
-        || !matches_source(&ios_pricing(request)?, request_pricing)
+    let (_, _, _, expected_anchor) = resolve_bound_side(anchor, analysis_budget_bytes)?;
+    let (route, sampling, controls, expected_request) =
+        resolve_bound_side(request, analysis_budget_bytes)?;
+    if !matches_source(&expected_anchor, anchor_pricing)
+        || !matches_source(&expected_request, request_pricing)
     {
         return Err(Error::Unsupported(
             "z-image transfer pricing is not the source-generated profile".into(),
         ));
     }
-    // SAME request resolution as `ios_pricing`, but the EXACT windowed execution plan, not the
-    // O(1) controls: the certificate replays every actual solver callback of this request.
-    let generation = mlx_gen::sampler::flow_sampling::require_generation(request.generation)?;
-    let (true_refs, _, _) = pricing_roles_from_kinds(
-        generation
-            .conditioning
-            .iter()
-            .map(mlx_gen::Conditioning::kind),
-    )?;
-    let initial_width = crate::sampling::initial_state_width(generation, true_refs == 1)?;
-    let route = Route::from_controls(request, generation.count, initial_width, true_refs)?;
-    let controls = crate::sampling::resolve_with_init(generation, route.mode.img2img())?;
-    if request.spec.pid.is_some() || pid_sources::requested(&controls)? {
+    let spec = request.pricing.spec;
+    if spec.pid.is_some() || pid_sources::requested(&controls)? {
         return Err(Error::Unsupported(
             "z-image transfer certificate: PiD overlay execution has no certified source graph"
                 .into(),
         ));
     }
-    if !request.spec.adapters.is_empty() {
+    if !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
             "z-image transfer certificate: adapter execution has no certified source graph".into(),
         ));
     }
-    let sampling = crate::sampling::resolve_actual_with_init(generation, route.mode.img2img())?;
-    let model = Model::new(Facts::from_spec(request.provider, request.spec)?)?;
+    let model = Model::new(Facts::from_spec(request.pricing.provider, spec)?)?;
     let certificates = certificates::window_certificates(
         &model,
         &route,
@@ -283,14 +351,13 @@ pub fn ios_bounder_with_execution(
         request_pricing,
     )?;
     if !certificates.blocked.is_empty() {
-        let tier = request
-            .spec
+        let tier = spec
             .quantize
             .map_or_else(|| "dense".to_owned(), |q| format!("{q:?}"));
         return Err(Error::Unsupported(format!(
             "z-image transfer certificate blocked: {}",
             certificates
-                .blocked_failures(request.provider, "public admission", &tier)
+                .blocked_failures(request.pricing.provider, "public admission", &tier)
                 .join("; ")
         )));
     }
@@ -312,11 +379,12 @@ mod production_bounder_tests {
             &IosPricingRequest<'_>,
             &IosPricing,
             CertifiedExecution,
+            u64,
         ) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>> = ios_bounder_with_execution;
         let _ = with_facts;
     }
 
-    /// HOST: missing execution facts are exact refusals, decided before any snapshot I/O.
+    /// HOST: uncertifiable execution facts are exact refusals, decided before any snapshot I/O.
     #[test]
     fn uncertifiable_execution_facts_are_refused_exactly() {
         let facts = |cpu_stream, ios_quantum_scope| CertifiedExecution {
@@ -329,11 +397,38 @@ mod production_bounder_tests {
                 .unwrap_err()
                 .to_string()
         };
-        assert!(refusal(facts(false, true)).contains("stream to be CPU"));
-        assert!(refusal(facts(false, false)).contains("stream to be CPU"));
+        // Both MLX stream families have a source lowering; only the unscoped graph is refused.
+        assert!(refusal(facts(false, false)).contains("iOS-quantum-scope graph"));
         assert!(refusal(facts(true, false)).contains("iOS-quantum-scope graph"));
         certificates::certified_execution_refusal(facts(true, true)).unwrap();
+        certificates::certified_execution_refusal(facts(false, true)).unwrap();
     }
+}
+
+/// The catalog's [`mlx_gen::ios_pricing::IosCertifiedBounder`]. Execution-backend facts come from
+/// the admission boundary; the heavy-load order is the PRODUCTION loader's own fact
+/// (`model::load_heavy` / `model_control::load_control_heavy`: VAE load before quantization).
+pub fn ios_certified_bounder(
+    anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &IosPricing,
+    execution: &mlx_gen::ios_pricing::IosExecutionFacts,
+) -> Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
+    // Z certificates rest on no unproved premise: zero retirement credit, max over branches.
+    certify_transfer(
+        anchor_request,
+        anchor_pricing,
+        request,
+        request_pricing,
+        CertifiedExecution {
+            load_order: HeavyLoadOrder::VaeBeforeQuantize,
+            ios_quantum_scope: execution.ios_quantum_scope,
+            cpu_stream: execution.stream == mlx_gen::ios_pricing::IosExecutionStream::Cpu,
+        },
+        execution.analysis_budget_bytes,
+    )
+    .map(mlx_gen::ios_pricing::IosCertifiedBounds::proven)
 }
 
 /// Payload-free anchor replay. No GenerationRequest or RGB carrier is constructed. The caller

@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "9169439c7c236fb5425cdb76e86bac0a04ecba3a0afffdd18b7f7677452bc3b4",
+  "rust_proof_closure_sha256": "bf988068a9eb86666be6ef1689a3267d5ca97ac14e7b6de0d5d2412dcfe76c73",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -144,7 +144,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
-      "sha256": "ed52e73dffa832e1e382075f6628200c02af675704cfdd8a57f8b051b911ad33"
+      "sha256": "b501beb8c98133c7199335bd0d14e81bdc3f7be64fcaf5186a243b88268a5ec6"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
@@ -164,7 +164,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "09b370fde62ce3f0af835ac8f69f8f853314f999af47066c885d43a0758219c2"
+      "sha256": "f4038f7a396879d2f199f829273906d71106455388e601b274742d6d67102724"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -176,15 +176,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/lib.rs",
-      "sha256": "321395b65e65e469cdb26dfee7eeb24c2a4b24e8a839aa6c1082a96683575c1a"
+      "sha256": "250441a8f407f5a7f77184d48be6383536f04f2c1ef011201e9517a76fc6428d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
-      "sha256": "c98f446603b3e17c142512f91a35836623ece6bc781cddd4eddbf38653ca3e2c"
+      "sha256": "c57e4a86bd3196fd99801962e1a0950e04967922b9858847cf8a4fc5a9dbdc2a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
-      "sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1"
+      "sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
@@ -568,7 +568,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
-      "sha256": "02ac6ae3f5ba87851ba591b6931efafa39ee87710666c07746d60cd5421122f2"
+      "sha256": "41d32842a55f4bdc6408f17afca202bfd32fc450f7fe8788847f390d585d65af"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
@@ -576,19 +576,23 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates.rs",
-      "sha256": "abcb510028fd93a0f46b170fdffa6929617cc7af8ac215f4bfacce4a9ba5aec6"
+      "sha256": "cb116da3882dab8875ee915dafc381fe05eadfbf7385f9608283a5059ba3d04e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/cpu.rs",
-      "sha256": "00d8d9bbdf3dfd05e3aba7660a2e98f82541ffa4364cf2da48186740d15e953d"
+      "sha256": "14c84464ff5015b30586f3d0704cdc467c06658edaa045c95a32fa875c25a305"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/metal.rs",
+      "sha256": "79562ad5771a2d4a0204775ddbd88a39804b16ccbf1a9a34d49042acccbedcef"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/vae_graph.rs",
-      "sha256": "047f3dab89576c05329b7af441f9e3c112733a21d5c5d1d48e93d3be347a4d0c"
+      "sha256": "e0e9a0570b3f1b59dddcbc02dd7cb31d50b09fd2d0b9b32909d516f6d9286fb2"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/z_graph.rs",
-      "sha256": "b4014eb1c05ae40cee2b5a58d26703172efdecb2d287541446c3b2066c65c12b"
+      "sha256": "a7955832930f20b365256ef115da2bad1b6574c0f8e0fb6d30201eff7b2f4845"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
@@ -800,7 +804,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
-      "sha256": "7ad59224cd81a77dd238477b24bbf2046e3b5a34c84a70d6452ded94ab4a7ba2"
+      "sha256": "d14017ee2bf487b2049d27c992af264f165e8903d8e4c53121fdaaab95875f40"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
@@ -1271,7 +1275,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::actual_utf8_basis_roundtrips_without_treating_recipe_projection_as_real_prompt",
-      "source_sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1",
+      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1283,7 +1287,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::strict_apply_checks_real_bytes_and_full_work_binding_still_checks_content",
-      "source_sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1",
+      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1295,7 +1299,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::representative_mints_its_actual_work_basis_but_legacy_replay_does_not_invent_one",
-      "source_sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1",
+      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1307,7 +1311,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::non_pid_control_and_existing_flow_semantics_keep_exact_old_tokens",
-      "source_sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1",
+      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1319,7 +1323,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::private_wire_is_canonical_bounded_and_does_not_cap_the_prompt_dimension",
-      "source_sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1",
+      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1458,11 +1462,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "ab2e3d20615d00f2072d8d489ddbd8fb231b4a723c870a439f14f37cc801bcd5",
-    "classification_sha256": "4261eacc94d122d83bcb5d1bc52abb9ce1214606eb9174e0796123eecf9bf08c",
-    "selected_Rust_FQNs": 115,
-    "HOST_logical": 98,
-    "HOST_expected_PASS_rows": 99,
+    "inventory_sha256": "1822e3a744ce45b1c169b635d78a53b13c0cd99e72a3dfb3d92a9ec005616d21",
+    "classification_sha256": "315f81b0c421e4aa8c50b7202c7cfe023118d175c6baefd00527e7ee07345d9b",
+    "selected_Rust_FQNs": 130,
+    "HOST_logical": 113,
+    "HOST_expected_PASS_rows": 114,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

@@ -5,7 +5,10 @@
 //! without one would still be admitted at its anchors' OWN keys (an exact measurement needs no
 //! scaling), but nothing of it would be derivable: every other configuration refuses `no_evidence`.
 
-use mlx_gen::ios_pricing::{IosPhase, IosPricer, IosQuantumPhase};
+use mlx_gen::ios_pricing::{
+    IosCertifiedBounder, IosExecutionFacts, IosExecutionStream, IosPhase, IosPricer,
+    IosQuantumPhase,
+};
 
 type Pricing = (IosPricer, IosQuantumPhase);
 
@@ -27,6 +30,131 @@ pub(crate) fn with_test_pricing<T>(pricing: Option<Pricing>, body: impl FnOnce()
         }
     }
     let _restore = Restore(TEST_PRICING.with(|slot| slot.replace(Some(pricing))));
+    body()
+}
+
+/// SDXL's public source bounder takes no execution facts. Its native-backing authority
+/// (sc26270 fused-native-backing v2 and the ancestral lifetime proof) was audited for the iOS
+/// CPU-stream build inside the quantum scope only, so every other stated execution is refused
+/// here exactly; a Metal-stream law, when audited, must be added as its own authority.
+fn sdxl_certified_bounder(
+    anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &mlx_gen::ios_pricing::IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &mlx_gen::ios_pricing::IosPricing,
+    execution: &IosExecutionFacts,
+) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
+    certified_cpu_scope(crate::sdxl::SDXL_ID, execution)?;
+    // The canonical SDXL bounder (212a6d6) is proven-only: no premise. Its future premise mode
+    // MUST be mapped through `sdxl_premised` below, never returned as bare bounds.
+    mlx_gen_sdxl::ios_pricing::ios_bounder(
+        anchor_request.pricing,
+        anchor_pricing,
+        request.pricing,
+        request_pricing,
+    )
+    .map(mlx_gen::ios_pricing::IosCertifiedBounds::proven)
+}
+
+/// Iris's canonical source bounder (212a6d6) takes no execution facts. Its certificates are each
+/// request's own cumulative native upper over the LARGER of its CPU- and Metal-stream source
+/// graphs, so both stream families are covered; only the iOS-quantum-scope graph it prices is.
+/// Restoration returns no certificate, so the law refuses it with its exact coverage reason.
+fn iris_certified_bounder(
+    anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &mlx_gen::ios_pricing::IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &mlx_gen::ios_pricing::IosPricing,
+    execution: &IosExecutionFacts,
+) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
+    certified_scope(request.pricing.provider, execution)?;
+    mlx_gen_iris::ios_pricing::ios_bounder(
+        anchor_request.pricing,
+        anchor_pricing,
+        request.pricing,
+        request_pricing,
+    )
+    .map(mlx_gen::ios_pricing::IosCertifiedBounds::proven)
+}
+
+/// The exact refusal shared by providers whose only audited lowering is the scoped CPU stream.
+fn certified_cpu_scope(provider: &str, execution: &IosExecutionFacts) -> mlx_gen::Result<()> {
+    if execution.stream != IosExecutionStream::Cpu {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{provider}: no audited native-allocation law for the {:?} stream; device certificates stay unclosed",
+            execution.stream
+        )));
+    }
+    if !execution.ios_quantum_scope {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{provider}: certificates price the iOS-quantum-scope graph; an unscoped execution is not certified"
+        )));
+    }
+    Ok(())
+}
+
+/// Z-Image certifies BOTH MLX stream families (its CPU lowering and its source-derived Metal
+/// lowering, sc-26270 Metal law table), but only the iOS-quantum-scope graph its pricing prices.
+fn certified_scope(provider: &str, execution: &IosExecutionFacts) -> mlx_gen::Result<()> {
+    if !execution.ios_quantum_scope {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "{provider}: certificates price the iOS-quantum-scope graph; an unscoped execution is not certified"
+        )));
+    }
+    Ok(())
+}
+
+/// A provider's exact gate over the stated execution facts, checked before any anchor/request
+/// repricing so an uncertifiable execution refuses without opening sources.
+pub type ExecutionGate = fn(&str, &IosExecutionFacts) -> mlx_gen::Result<()>;
+
+/// The registered source-owned transfer bounder of a provider, if it exposes one, with the gate of
+/// the executions its source authority covers. Providers without one (Sana, Anima) are admitted
+/// only at their anchors' own keys.
+pub fn provider_bounder(provider: &str) -> Option<(IosCertifiedBounder, ExecutionGate)> {
+    #[cfg(test)]
+    if let Some(bounder) = TEST_BOUNDER.with(std::cell::Cell::get) {
+        return bounder;
+    }
+    match provider {
+        crate::sdxl::SDXL_ID => Some((sdxl_certified_bounder, certified_cpu_scope)),
+        "iris_3b" | crate::ios_admission::IRIS_RESTORE_ID | crate::ios_admission::IRIS_DEPTH_ID => {
+            Some((iris_certified_bounder, certified_scope))
+        }
+        id if crate::zimage::is_z_image(id) => Some((
+            mlx_gen_z_image::ios_pricing::ios_certified_bounder,
+            certified_scope,
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `Some(b)`: every provider bounded by `b` (or by nothing, for `Some(None)`).
+    static TEST_BOUNDER: std::cell::Cell<Option<Option<(IosCertifiedBounder, ExecutionGate)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a crate test installed a synthetic pricing (crate tests only).
+#[cfg(test)]
+pub(crate) fn test_pricing_active() -> bool {
+    TEST_PRICING.with(std::cell::Cell::get).is_some()
+}
+
+/// Run `body` with every provider bounded by `bounder` (crate tests only).
+#[cfg(test)]
+pub(crate) fn with_test_bounder<T>(
+    bounder: Option<(IosCertifiedBounder, ExecutionGate)>,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Option<(IosCertifiedBounder, ExecutionGate)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_BOUNDER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_BOUNDER.with(|slot| slot.replace(Some(bounder))));
     body()
 }
 

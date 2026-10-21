@@ -1,4 +1,4 @@
-//! The Z VAE's evaluated CPU-stream graph, mirrored from `vae/*.rs`, `nn.rs`, and
+//! The Z VAE's evaluated source graph (CPU or Metal lowering), mirrored from `vae/*.rs`, `nn.rs`, and
 //! `vae_tiling.rs`. These are native array descriptors and allocation requests, not
 //! logical convolution/quantum prices. Evaluation, dropping a tile, and finishing a
 //! stage never subtract anything from this graph's cumulative allocator bound.
@@ -59,7 +59,16 @@ fn take_axis(g: &mut Graph, x: &Tensor, axis: usize, len: u64, site: &str) -> Re
     let mut shape = vec![len];
     shape.extend_from_slice(&x.shape);
     shape[axis + 1] = 1;
-    let gathered = g.allocation(&shape, x.dtype, "cpu/indexing.cpp Gather::eval_cpu", site)?;
+    let gathered = g.allocation(
+        &shape,
+        x.dtype,
+        if g.is_metal() {
+            "metal/indexing.cpp:57-68 Gather::eval_gpu"
+        } else {
+            "cpu/indexing.cpp Gather::eval_cpu"
+        },
+        site,
+    )?;
     let mut axes: Vec<usize> = (1..=axis).collect();
     axes.push(0);
     axes.extend(axis + 1..shape.len());
@@ -96,7 +105,11 @@ fn pad_bottom_right(
     g.allocation(
         &[b, add(h, bottom)?, add(w, right)?, c],
         x.dtype,
-        "cpu/primitives.cpp Pad::eval_cpu Scalar copy",
+        if g.is_metal() {
+            "gpu/primitives.cpp:180-200 Pad / gpu/slicing.cpp pad_gpu output"
+        } else {
+            "cpu/primitives.cpp Pad::eval_cpu Scalar copy"
+        },
         site,
     )
 }
@@ -112,6 +125,9 @@ fn group_norm(
 ) -> Result<Tensor> {
     let [b, h, w, c] = nhwc(x)?;
     check_affine(c, weight, bias)?;
+    if g.is_metal() {
+        return g.metal_group_norm(x, weight, bias, GROUPS, site);
+    }
     let spatial = mul(h, w)?;
     let grouped = g.reshape(x, &[b, spatial, GROUPS, c / GROUPS], site)?;
     let grouped = grouped.transpose(&[0, 2, 1, 3])?;
@@ -161,11 +177,15 @@ impl GlobalNorm {
             let deviation = g.binary(&grouped, &var_mean, site)?;
             let squared = g.unary(&deviation, site)?;
             let sum = g.reduce(&squared, &[2, 3, 4], site)?;
-            // Native var casts through at_least_float: the inverted count is f32
-            // even for a bf16 sum, which promotes the variance to f32.
+            // Metal follows ops.cpp:63,2325-2345 at_least_float (BF16 stays BF16).
+            // Keep the pre-existing CPU fixture normalizer unchanged.
             let inverse_count = g.allocation(
                 &[],
-                Dtype::Float32,
+                if g.is_metal() {
+                    grouped.dtype
+                } else {
+                    Dtype::Float32
+                },
                 "common/common.cpp NumberOfElements inverted variance normalizer",
                 site,
             )?;
@@ -363,6 +383,9 @@ fn tiled_conv(
     let out = concat(&mut p.graph, &rows, 1, base)?;
     // vae_tiling calls array::contiguous after assembly. Concatenations are
     // row-major, but a one-input concat preserves its gather-transposed view.
+    if p.graph.is_metal() {
+        return p.graph.metal_contiguous(&out, base);
+    }
     let flat = p.graph.reshape(&out, &[out.elements()?, 1], base)?;
     p.graph.reshape(&flat, &out.shape, base)
 }

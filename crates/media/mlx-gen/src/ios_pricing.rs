@@ -223,6 +223,181 @@ pub type IosBounder = fn(
     request_pricing: &IosPricing,
 ) -> crate::Result<Vec<IosWindowBound>>;
 
+/// The MLX stream family an execution's operations actually ran on. Allocation laws are lowering
+/// specific: a certificate audited for one stream family never certifies another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IosExecutionStream {
+    Cpu,
+    Metal,
+}
+
+/// Facts about the execution being CERTIFIED, stated at the admission boundary by the caller that
+/// owns that execution (SDK/runtime/capture harness). Never sampled from whichever thread happens
+/// to evaluate a pure pricing/bounding function, and never defaulted when absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IosExecutionFacts {
+    /// Effective stream of every wrapper op, including stream-less frontend casts.
+    pub stream: IosExecutionStream,
+    /// Whether the execution runs inside the iOS quantum scope (`ios_quantum::enabled()`), which
+    /// selects graph branches (bounded attention, tiled encode) the pricing assumes.
+    pub ios_quantum_scope: bool,
+    /// Explicit host byte budget for EXACT schedule/epoch analysis (checked with
+    /// `ResolvedFlowControls::check_capture_schedule_bytes` before any schedule is built). A
+    /// request whose schedule exceeds it is refused, never clamped.
+    pub analysis_budget_bytes: u64,
+}
+
+/// A NOT-source-proved premise a provider's bounds depend on (e.g. a retirement ordering asserted
+/// rather than proved). Carried beside the bounds so a consumer can never use them silently.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IosCertificatePremise {
+    /// Stable identifier an explicit, user-approved admission policy names to accept it.
+    pub id: String,
+    /// What is assumed and why it is not proved.
+    pub statement: String,
+}
+
+/// Bounds plus every premise they rest on. Empty `premises` means fully source-proved bounds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IosCertifiedBounds {
+    pub bounds: Vec<IosWindowBound>,
+    pub premises: Vec<IosCertificatePremise>,
+}
+
+impl IosCertifiedBounds {
+    /// Fully source-proved bounds (no premise).
+    pub fn proven(bounds: Vec<IosWindowBound>) -> Self {
+        Self {
+            bounds,
+            premises: Vec::new(),
+        }
+    }
+}
+
+/// The stable id of the activity-26569 native-to-process premise.
+pub const NATIVE_TO_PROCESS_PREMISE_ID: &str = "activity-26569/target-device-native-to-process";
+
+/// Activity 26569's TARGET-DEVICE ENGINEERING MODEL, as an explicit premise and transform, stated
+/// in exactly the ANCHOR-RELATIVE form the transform applies: for the anchor and request of one
+/// transfer (same family, device, build, coordinate), the process (`phys_footprint`) growth delta
+/// is bounded by the native-allocator growth delta plus `overhead_bytes`. A bound on each
+/// execution's process growth by its own native growth does NOT imply this (a native-heavy anchor
+/// can make the native delta small while the process delta is large), so the premise names the
+/// delta form itself. It is NOT source-proved. It is applied only under an explicit,
+/// user-approved policy; it rewrites certificate DELTAS (never measured evidence); its consumer
+/// must validate it against both measured endpoint anchors and still enforce the anchors' stated
+/// margin and the live headroom.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosNativeToProcessModel {
+    /// Stated per-window process overhead beyond native growth, in bytes.
+    pub overhead_bytes: u64,
+    /// Where the model comes from (device/build/capture identities), recorded with the premise.
+    pub provenance: String,
+}
+
+impl IosNativeToProcessModel {
+    /// The premise this model asserts, with its parameters, for policy approval and recording.
+    pub fn premise(&self) -> IosCertificatePremise {
+        IosCertificatePremise {
+            id: NATIVE_TO_PROCESS_PREMISE_ID.into(),
+            statement: format!(
+                "for each transfer of one family: process_growth(request) - process_growth(anchor) \
+                 <= native_growth(request) - native_growth(anchor) + {} B per window \
+                 (anchor-relative engineering model: {})",
+                self.overhead_bytes, self.provenance
+            ),
+        }
+    }
+
+    /// Map native-allocator TRANSFER certificates into the process domain. Process-domain bounds
+    /// pass unchanged; any other domain, a raw native bound, or overflow refuses: a native raw
+    /// total has no anchor-relative form this model is stated for.
+    pub fn to_process(&self, bounds: &[IosWindowBound]) -> crate::Result<Vec<IosWindowBound>> {
+        let overhead = i128::from(self.overhead_bytes);
+        bounds
+            .iter()
+            .map(|bound| match bound {
+                IosWindowBound::Transfer {
+                    domain: IosMemoryDomain::NativeAllocatorGrowth,
+                    coordinate,
+                    request_class,
+                    anchor_candidates,
+                } => Ok(IosWindowBound::Transfer {
+                    domain: IosMemoryDomain::ProcessGrowth,
+                    coordinate: *coordinate,
+                    request_class: request_class.clone(),
+                    anchor_candidates: anchor_candidates
+                        .iter()
+                        .map(|candidate| {
+                            Ok(IosAnchorCandidate {
+                                delta_growth_upper: candidate
+                                    .delta_growth_upper
+                                    .checked_add(overhead)
+                                    .ok_or_else(|| {
+                                        crate::Error::Unsupported(
+                                            "native-to-process delta overflows".into(),
+                                        )
+                                    })?,
+                                // A native lower bound is not a process lower bound.
+                                physical_anchor_lower_bound: None,
+                                ..candidate.clone()
+                            })
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?,
+                }),
+                bound if bound_is_process(bound) => Ok(bound.clone()),
+                _ => Err(crate::Error::Unsupported(
+                    "native-to-process model maps only native TRANSFER certificates".into(),
+                )),
+            })
+            .collect()
+    }
+}
+
+fn bound_is_process(bound: &IosWindowBound) -> bool {
+    matches!(
+        bound,
+        IosWindowBound::Transfer {
+            domain: IosMemoryDomain::ProcessGrowth,
+            ..
+        } | IosWindowBound::RawPhysical {
+            domain: IosMemoryDomain::ProcessGrowth,
+            ..
+        }
+    )
+}
+
+/// The payload-free replay a catalog anchor is priced by (no GenerationRequest carrier): the
+/// recorded canonical recipe token and the anchor's typed conditioning roles.
+#[derive(Clone, Copy, Debug)]
+pub struct IosReplay<'a> {
+    pub token: &'a str,
+    pub true_reference_count: u32,
+    pub mask_count: u32,
+    pub control_count: u32,
+}
+
+/// One side of a transfer: its pricing request plus, for a payload-free anchor, its replay facts.
+/// A bounder resolves its execution plan from `pricing.generation` when present, else from the
+/// replay token; neither absent refuses.
+#[derive(Clone, Copy, Debug)]
+pub struct IosBoundRequest<'a> {
+    pub pricing: &'a IosPricingRequest<'a>,
+    pub replay: Option<IosReplay<'a>>,
+}
+
+/// A provider bounder bound to explicit execution facts. Returning `Err` refuses the request; a
+/// provider that cannot certify the stated facts must refuse exactly, not return partial bounds.
+/// Premise-dependent bounds MUST name their premises; they are consumed only under an explicit
+/// policy approving every named premise.
+pub type IosCertifiedBounder = fn(
+    anchor_request: &IosBoundRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosBoundRequest<'_>,
+    request_pricing: &IosPricing,
+    execution: &IosExecutionFacts,
+) -> crate::Result<IosCertifiedBounds>;
+
 /// Actual boundary snapshot, supplied by SDK/capture/test caller at the declared point, NEVER
 /// read at an arbitrary time by a pure pricing/normalization helper. Bytes alone do not prove
 /// inventory cancellation; provider code must validate source-compatible owner/birth facts.
@@ -390,5 +565,74 @@ mod tests {
         for phase in IosPhase::ALL {
             assert_eq!(IosPhase::from_key(phase.as_key()), Some(phase));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_to_process_tests {
+    use super::*;
+
+    fn transfer(domain: IosMemoryDomain, delta: i128) -> IosWindowBound {
+        IosWindowBound::Transfer {
+            domain,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            request_class: "r".into(),
+            anchor_candidates: vec![IosAnchorCandidate {
+                anchor_class: "a".into(),
+                delta_growth_upper: delta,
+                physical_anchor_lower_bound: Some(7),
+                witnesses: vec![IosAnchorWitness {
+                    capture: 0,
+                    check: 0,
+                }],
+            }],
+        }
+    }
+
+    /// HOST: the model states EXACTLY the anchor-relative delta premise it applies (a per-run
+    /// process <= native bound would not justify transforming a signed delta: anchor 1000/100,
+    /// request 1100/1100 MiB satisfy it yet the native delta 100 under-bounds the process delta
+    /// 1000). Native transfers gain the stated overhead and lose their native lower bound;
+    /// process bounds pass unchanged; a native raw total is refused.
+    #[test]
+    fn the_native_to_process_model_states_and_applies_the_anchor_relative_premise() {
+        let model = IosNativeToProcessModel {
+            overhead_bytes: 8,
+            provenance: "test".into(),
+        };
+        let premise = model.premise();
+        assert_eq!(premise.id, NATIVE_TO_PROCESS_PREMISE_ID);
+        assert!(premise
+            .statement
+            .contains("process_growth(request) - process_growth(anchor)"));
+        assert!(premise
+            .statement
+            .contains("native_growth(request) - native_growth(anchor) + 8 B"));
+        let mapped = model
+            .to_process(&[transfer(IosMemoryDomain::NativeAllocatorGrowth, -3)])
+            .unwrap();
+        let IosWindowBound::Transfer {
+            domain,
+            anchor_candidates,
+            ..
+        } = &mapped[0]
+        else {
+            panic!("transfer expected")
+        };
+        assert_eq!(*domain, IosMemoryDomain::ProcessGrowth);
+        assert_eq!(anchor_candidates[0].delta_growth_upper, 5);
+        assert_eq!(anchor_candidates[0].physical_anchor_lower_bound, None);
+        let process = transfer(IosMemoryDomain::ProcessGrowth, 4);
+        assert_eq!(
+            model.to_process(std::slice::from_ref(&process)).unwrap(),
+            vec![process]
+        );
+        let raw = IosWindowBound::RawPhysical {
+            domain: IosMemoryDomain::NativeAllocatorGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            request_class: "r".into(),
+            growth_upper: 1,
+        };
+        assert!(model.to_process(&[raw]).is_err());
     }
 }

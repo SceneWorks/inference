@@ -10,7 +10,9 @@
 //! 3. prices the request from the single reviewed ANCHOR table ([`crate::evidence`]) by the anchor
 //!    law ([`crate::anchor`]): at an anchor's own key, its measured demand; otherwise the demand
 //!    DERIVED from the family's anchors (the optimized anchor, or a same-regime resident one), after
-//!    the two anchors' self-check. No anchor family, an underivable request, or a self-check
+//!    the two anchors' self-check. Derivation consumes ONLY a registered provider bounder for the
+//!    execution facts stated at the boundary ([`admit_with_boundary`]), through the certified law;
+//!    missing facts, bounders or certificates in the anchors' counter domain refuse exactly. No anchor family, an underivable request, or a self-check
 //!    failure refuses ([`RefusalKind::NoEvidence`]); a measured resident refusal at its own key is
 //!    [`RefusalKind::Capacity`];
 //! 4. checks the execution implements the selected ladder ([`RefusalKind::Strategy`]);
@@ -34,7 +36,9 @@ use mlx_gen::gen_core::{
     Quant, Result, SourceInventory, TransformRequest,
 };
 use mlx_gen::ios_pricing::{
-    IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain, IosPricing, IosPricingRequest,
+    IosBoundRequest, IosCertificatePremise, IosCertifiedBounds, IosExecutionFacts,
+    IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain, IosNativeToProcessModel, IosPricing,
+    IosPricingRequest, IosReplay, IosWindowBound, NATIVE_TO_PROCESS_PREMISE_ID,
 };
 
 use crate::anchor;
@@ -760,6 +764,99 @@ pub struct Admission {
     pub(crate) context: MemoryRunContext,
     pub(crate) binding: [u8; 32],
     pub(crate) key: EvidenceKey,
+    /// Every unproved premise the admitted derivation rests on; non-empty only under an explicit
+    /// policy that approved each of them. Recorded, never implicit.
+    pub(crate) premises: Vec<IosCertificatePremise>,
+}
+
+fn bound_domain(bound: &IosWindowBound) -> IosMemoryDomain {
+    match bound {
+        IosWindowBound::Transfer { domain, .. } | IosWindowBound::RawPhysical { domain, .. } => {
+            *domain
+        }
+    }
+}
+
+/// Bring a provider's certified bounds into the measured anchor's counter domain under the
+/// policy: every provider premise must be approved; native-domain bounds are mapped to process
+/// ONLY through the approved activity-26569 model, whose premise is then recorded. Measured
+/// evidence is never altered; only certificate deltas are transformed.
+fn in_anchor_domain(
+    certified: IosCertifiedBounds,
+    measured: &anchor::MeasuredAnchor,
+    policy: &PremisePolicy,
+) -> std::result::Result<(Vec<IosWindowBound>, Vec<IosCertificatePremise>), String> {
+    policy.accept(&certified.premises)?;
+    let mut premises = certified.premises;
+    if certified
+        .bounds
+        .iter()
+        .all(|bound| bound_domain(bound) == measured.domain)
+    {
+        return Ok((certified.bounds, premises));
+    }
+    if measured.domain != IosMemoryDomain::ProcessGrowth {
+        return Err(format!(
+            "certificates are not in the measured anchor's {:?} domain",
+            measured.domain
+        ));
+    }
+    let model = policy.approved_native_to_process().ok_or_else(|| {
+        format!(
+            "native-allocator certificates do not authorize process-growth admission without the \
+             explicitly approved premise {NATIVE_TO_PROCESS_PREMISE_ID} and its model"
+        )
+    })?;
+    let bounds = model
+        .to_process(&certified.bounds)
+        .map_err(|e| e.to_string())?;
+    premises.push(model.premise());
+    Ok((bounds, premises))
+}
+
+/// Explicit, user-approved acceptance of named certificate premises. The default approves
+/// NOTHING: premise-dependent bounds then refuse exactly, naming each premise.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PremisePolicy {
+    approved: std::collections::BTreeSet<String>,
+    /// The activity-26569 engineering model; consulted only if its premise id is ALSO approved.
+    native_to_process: Option<IosNativeToProcessModel>,
+}
+
+impl PremisePolicy {
+    /// Approve exactly these premise ids (the caller records the user approval that justifies it).
+    pub fn approving(ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            approved: ids.into_iter().collect(),
+            native_to_process: None,
+        }
+    }
+    /// Supply the target-device native-to-process model. It takes effect only when
+    /// [`NATIVE_TO_PROCESS_PREMISE_ID`] is also approved; supplying it alone approves nothing.
+    pub fn with_native_to_process(mut self, model: IosNativeToProcessModel) -> Self {
+        self.native_to_process = Some(model);
+        self
+    }
+    fn approved_native_to_process(&self) -> Option<&IosNativeToProcessModel> {
+        self.native_to_process
+            .as_ref()
+            .filter(|_| self.approved.contains(NATIVE_TO_PROCESS_PREMISE_ID))
+    }
+    fn accept(&self, premises: &[IosCertificatePremise]) -> std::result::Result<(), String> {
+        let unapproved: Vec<_> = premises
+            .iter()
+            .filter(|premise| !self.approved.contains(&premise.id))
+            .map(|premise| format!("{} ({})", premise.id, premise.statement))
+            .collect();
+        if unapproved.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "bounds rest on unapproved premise(s): {}",
+                unapproved.join("; ")
+            ))
+        }
+    }
 }
 
 impl Admission {
@@ -802,6 +899,11 @@ impl Admission {
     pub fn evidence_key(&self) -> &EvidenceKey {
         &self.key
     }
+    /// The approved, unproved premises this admission's derivation rests on (empty when fully
+    /// source-proved or measured at the anchor's own key).
+    pub fn certificate_premises(&self) -> &[IosCertificatePremise] {
+        &self.premises
+    }
     /// Whether this is an evidence-collection capture permit rather than a product admission.
     pub fn is_capture(&self) -> bool {
         self.basis == AdmissionBasis::CapturePermit
@@ -826,14 +928,66 @@ fn mode_from_key(key: &str) -> MemoryMode {
     }
 }
 
-/// Count the ANCHOR's own resolved recipe/roles, selection, load form and geometry on the
-/// matched artifact/configured semantic graph. A mode label never decides which configured
-/// overlay is loaded: the actual provider factory/pricer owns that interpretation.
-fn price_anchor(
+/// The ANCHOR's own resolved selection, load form, geometry and replay recipe, retained so the
+/// SAME request both prices the anchor and is handed to a provider bounder.
+struct AnchorContext<'row> {
+    provider: &'row str,
+    spec: LoadSpec,
+    mode: MemoryMode,
+    geometry: MemoryGeometry,
+    selection: MemorySelection,
+    execution: GenerationMemory,
+    token_window: u32,
+    token: &'row str,
+    mask_count: u32,
+    control_count: u32,
+    recorded_source: Option<&'row mlx_gen_sdxl::sampling::SamplingSourceFacts>,
+}
+
+impl AnchorContext<'_> {
+    /// The ANCHOR's replay side for a provider bounder: `request` (from [`Self::request`]) plus
+    /// the recorded token and typed roles, so a bounder resolves its exact execution plan.
+    fn bound<'a>(
+        &'a self,
+        request: &'a IosPricingRequest<'a>,
+    ) -> AdmissionResult<IosBoundRequest<'a>> {
+        Ok(IosBoundRequest {
+            pricing: request,
+            replay: Some(IosReplay {
+                token: self.token,
+                true_reference_count: crate::pricing::reference_role_count(
+                    self.geometry.reference_count,
+                    self.mask_count,
+                    self.control_count,
+                )
+                .map_err(pricing_error)?,
+                mask_count: self.mask_count,
+                control_count: self.control_count,
+            }),
+        })
+    }
+    /// The ANCHOR's own payload-free replay request (no GenerationRequest carrier).
+    fn request(&self) -> IosPricingRequest<'_> {
+        IosPricingRequest {
+            provider: self.provider,
+            spec: &self.spec,
+            mode: &self.mode,
+            geometry: self.geometry,
+            selection: &self.selection,
+            execution: &self.execution,
+            token_window: self.token_window,
+            generation: None,
+            transform: None,
+            depth: None,
+        }
+    }
+}
+
+fn anchor_context<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
-    row: &AnchorRow,
-) -> AdmissionResult<IosPricing> {
+    row: &'row AnchorRow,
+) -> AdmissionResult<AnchorContext<'row>> {
     let (Some(strategy), Some(parameters)) = (row.selection.strategy(), row.selection.parameters())
     else {
         return Err(no_evidence(format!(
@@ -890,29 +1044,40 @@ fn price_anchor(
             "{provider} anchor missing resolved execution recipe"
         ))
     })?;
-    crate::sampling::price_metadata(
-        &IosPricingRequest {
-            provider,
-            spec: &spec,
-            mode: &mode_from_key(&row.key.mode),
-            geometry,
-            selection: &selection,
-            execution: &execution,
-            token_window: row.key.token_window,
-            generation: None,
-            transform: None,
-            depth: None,
-        },
+    Ok(AnchorContext {
+        provider,
+        spec,
+        mode: mode_from_key(&row.key.mode),
+        geometry,
+        selection,
+        execution,
+        token_window: row.key.token_window,
         token,
-        row.key.mask_count,
-        row.key.control_count,
+        mask_count: row.key.mask_count,
+        control_count: row.key.control_count,
         recorded_source,
-    )
-    .map_err(pricing_error)
-    .and_then(|mut pricing| {
-        anchor::attach_observations(&mut pricing, row).map_err(no_evidence)?;
-        Ok(pricing)
     })
+}
+
+/// Count the ANCHOR's own resolved recipe/roles, selection, load form and geometry on the
+/// matched artifact/configured semantic graph. A mode label never decides which configured
+/// overlay is loaded: the actual provider factory/pricer owns that interpretation.
+fn price_anchor<'row>(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    row: &'row AnchorRow,
+) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
+    let context = anchor_context(registry, candidate, row)?;
+    let mut pricing = crate::sampling::price_metadata(
+        &context.request(),
+        context.token,
+        context.mask_count,
+        context.control_count,
+        context.recorded_source,
+    )
+    .map_err(pricing_error)?;
+    anchor::attach_observations(&mut pricing, row).map_err(no_evidence)?;
+    Ok((context, pricing))
 }
 
 /// A provider's pricing that declines a configuration (`Unsupported`: an adapter stack, a PiD
@@ -933,7 +1098,15 @@ fn anchored_demand(
     key: &EvidenceKey,
     rows: &[AnchorRow],
     request_baseline: Option<&IosMemoryBaseline>,
-) -> AdmissionResult<(u64, u64, AdmissionBasis, Calibration)> {
+    execution_facts: Option<&IosExecutionFacts>,
+    premise_policy: &PremisePolicy,
+) -> AdmissionResult<(
+    u64,
+    u64,
+    AdmissionBasis,
+    Calibration,
+    Vec<IosCertificatePremise>,
+)> {
     if let Some(row) = evidence::lookup(rows, key) {
         return match &row.outcome {
             evidence::AnchorOutcome::Completed { .. } => {
@@ -950,7 +1123,7 @@ fn anchored_demand(
                 // or measured repeat variability. Retain the original pre-request ledger separately.
                 let (demand, margin) = row.exact_growth_and_margin_at(IosMemoryCoordinate::BeforeModelLoad)
                     .map_err(|error| no_evidence(format!("exact measured key lacks accurate SDK-coordinate peaks: {error}")))?;
-                Ok((demand, margin, AdmissionBasis::Measured(row.anchor_kind), row.quantum_calibration()))
+                Ok((demand, margin, AdmissionBasis::Measured(row.anchor_kind), row.quantum_calibration(), Vec::new()))
             },
             evidence::AnchorOutcome::Refused { refused_quantum, .. } => {
                 Err(AdmissionError::refused(
@@ -994,7 +1167,7 @@ fn anchored_demand(
             candidate.provider
         )));
     };
-    let mut request = pricer(&IosPricingRequest {
+    let request_context = IosPricingRequest {
         provider: &candidate.provider,
         spec: &candidate.spec,
         mode: &candidate.context.mode,
@@ -1014,8 +1187,8 @@ fn anchored_demand(
             IosWork::Depth(request) => Some(request),
             _ => None,
         },
-    })
-    .map_err(pricing_error)?;
+    };
+    let mut request = pricer(&request_context).map_err(pricing_error)?;
     // A fact from the SDK boundary, not an inferred budget/zero or a process-transfer proof.
     request.request_baseline = request_baseline.cloned();
     let resident = resident.filter(|r| completed(r));
@@ -1025,28 +1198,90 @@ fn anchored_demand(
         Some(r) if r.key.execution == key.execution => r,
         _ => optimized,
     };
+    // Certified derivation (sc-26270). The ONLY derivation authority is a registered source-owned
+    // provider bounder for the STATED execution, consumed by the complete certified law. Legacy
+    // logical derive/consistency carry no authority and are not consulted. Measured anchors are
+    // ProcessGrowth; native-allocator certificates reach that domain ONLY through the explicitly
+    // approved activity-26569 engineering premise, validated against both endpoint anchors.
+    let execution_facts = execution_facts.ok_or_else(|| {
+        no_evidence(format!(
+            "{key:?}: derivation away from an anchor key requires the actual certified execution \
+             facts (stream, iOS quantum scope) at the admission boundary"
+        ))
+    })?;
+    let Some((bounder, gate)) = crate::pricing::provider_bounder(&candidate.provider) else {
+        return Err(no_evidence(format!(
+            "{}: no source-owned transfer bounder, so only its anchors' own keys are admitted",
+            candidate.provider
+        )));
+    };
+    gate(&candidate.provider, execution_facts)
+        .map_err(|e| no_evidence(format!("{key:?}: execution not certifiable: {e}")))?;
     let measured = anchor::measured_anchor(base).map_err(no_evidence)?;
-    let at_base = price_anchor(registry, candidate, base)?;
-    let derived = anchor::derive(
-        &measured,
+    let (base_context, at_base) = price_anchor(registry, candidate, base)?;
+    let request_side = IosBoundRequest {
+        pricing: &request_context,
+        replay: None,
+    };
+    let base_request = base_context.request();
+    let certified = bounder(
+        &base_context.bound(&base_request)?,
         &at_base,
+        &request_side,
         &request,
-        anchor::area(key.width, key.height, key.batch),
+        execution_facts,
     )
     .map_err(|e| {
         no_evidence(format!(
-            "{key:?} is not derivable from its {:?} anchor: {e}",
+            "{key:?}: no transfer certificate from its {:?} anchor: {e}",
             base.anchor_kind
         ))
     })?;
-    // The two anchors check each other: a law that under-predicts a measured anchor beyond the
-    // measured recapture spread fails the whole family's derivations closed.
+    let (bounds, mut premises) = in_anchor_domain(certified, &measured, premise_policy)
+        .map_err(|e| no_evidence(format!("{key:?}: {e}")))?;
+    let mapped = premises
+        .iter()
+        .any(|premise| premise.id == NATIVE_TO_PROCESS_PREMISE_ID);
+    if mapped && resident.is_none() {
+        return Err(no_evidence(format!(
+            "{family:?}: the native-to-process engineering model must be validated against BOTH \
+             measured endpoint anchors; this family has no completed resident anchor"
+        )));
+    }
+    let derived =
+        anchor::derive_certified(&measured, &at_base, &request, &bounds).map_err(|e| {
+            no_evidence(format!(
+                "{key:?} is not derivable from its {:?} anchor: {e}",
+                base.anchor_kind
+            ))
+        })?;
+    // The two endpoints check each other through the SAME certified consumer (and, when mapped,
+    // the SAME approved model): an under-prediction of the measured resident anchor fails the
+    // whole family's derivations closed. This is the model's two-endpoint validation.
     if let Some(resident) = resident {
-        let check = anchor::consistency(
-            &anchor::measured_anchor(optimized).map_err(no_evidence)?,
-            &price_anchor(registry, candidate, optimized)?,
+        let (optimized_context, at_optimized) = price_anchor(registry, candidate, optimized)?;
+        let (resident_context, at_resident) = price_anchor(registry, candidate, resident)?;
+        let optimized_request = optimized_context.request();
+        let resident_request = resident_context.request();
+        let endpoint = bounder(
+            &optimized_context.bound(&optimized_request)?,
+            &at_optimized,
+            &resident_context.bound(&resident_request)?,
+            &at_resident,
+            execution_facts,
+        )
+        .map_err(|e| no_evidence(format!("{family:?}: no endpoint transfer certificate: {e}")))?;
+        let optimized_measured = anchor::measured_anchor(optimized).map_err(no_evidence)?;
+        let (endpoint_bounds, endpoint_premises) =
+            in_anchor_domain(endpoint, &optimized_measured, premise_policy)
+                .map_err(|e| no_evidence(format!("{family:?} endpoint check: {e}")))?;
+        premises.extend(endpoint_premises);
+        let check = anchor::consistency_certified(
+            &optimized_measured,
+            &at_optimized,
             &anchor::measured_anchor(resident).map_err(no_evidence)?,
-            &price_anchor(registry, candidate, resident)?,
+            &at_resident,
+            &endpoint_bounds,
         )
         .map_err(|e| no_evidence(format!("{family:?}: anchors not mutually derivable: {e}")))?;
         if check.fails_closed() {
@@ -1071,6 +1306,11 @@ fn anchored_demand(
             from: base.anchor_kind,
         },
         base.quantum_calibration(),
+        {
+            premises.sort();
+            premises.dedup();
+            premises
+        },
     ))
 }
 
@@ -1083,6 +1323,8 @@ fn admit_one(
     budget: MemoryBudget,
     rows: Option<&[AnchorRow]>,
     request_baseline: Option<&IosMemoryBaseline>,
+    execution_facts: Option<&IosExecutionFacts>,
+    premise_policy: &PremisePolicy,
 ) -> AdmissionResult<Admission> {
     validate_actual(registry, candidate)?;
     let route = route_of(candidate)?;
@@ -1163,11 +1405,24 @@ fn admit_one(
                 "actual execution does not implement the selected ladder",
             ));
         }
-        let (demand_bytes, margin_bytes, basis, calibration) = match rows {
-            None => (0, 0, AdmissionBasis::CapturePermit, Calibration::new()),
-            Some(rows) => {
-                anchored_demand(registry, candidate, &contract, &key, rows, request_baseline)?
-            }
+        let (demand_bytes, margin_bytes, basis, calibration, premises) = match rows {
+            None => (
+                0,
+                0,
+                AdmissionBasis::CapturePermit,
+                Calibration::new(),
+                Vec::new(),
+            ),
+            Some(rows) => anchored_demand(
+                registry,
+                candidate,
+                &contract,
+                &key,
+                rows,
+                request_baseline,
+                execution_facts,
+                premise_policy,
+            )?,
         };
         let required_bytes = anchor::with_margin(demand_bytes, margin_bytes).map_err(|error| {
             no_evidence(format!("complete admitted envelope arithmetic: {error}"))
@@ -1179,6 +1434,12 @@ fn admit_one(
             // holds is the budget's committed bytes and is never credited as reusable.
             context.predicted_peak_bytes = required_bytes;
             context.evidence_revision = format!("ios-device-anchor:{}", key.layout_sha256);
+            if !premises.is_empty() {
+                // The approved premises are part of the admitted evidence identity, not hidden.
+                let ids: Vec<_> = premises.iter().map(|premise| premise.id.as_str()).collect();
+                context.evidence_revision =
+                    format!("{};premises={}", context.evidence_revision, ids.join(","));
+            }
             if let MemorySafetyDecision::Reject { reason } =
                 (registration.safety_check)(&candidate.spec, &contract, &context)
             {
@@ -1205,6 +1466,7 @@ fn admit_one(
             context,
             binding: work_binding(&candidate.work),
             key,
+            premises,
         })
     })
 }
@@ -1231,6 +1493,30 @@ pub(crate) fn admit_rows_at_boundary(
     rows: &[AnchorRow],
     request_baseline: Option<&IosMemoryBaseline>,
 ) -> AdmissionResult<Admission> {
+    admit_rows_with_facts(
+        registry,
+        candidates,
+        machine,
+        budget,
+        rows,
+        request_baseline,
+        None,
+        &PremisePolicy::default(),
+    )
+}
+
+/// The complete SDK boundary: the process baseline AND the certified execution facts. Absent
+/// facts never default; derivation then refuses exactly while exact anchor keys still admit.
+pub(crate) fn admit_rows_with_facts(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    rows: &[AnchorRow],
+    request_baseline: Option<&IosMemoryBaseline>,
+    execution_facts: Option<&IosExecutionFacts>,
+    premise_policy: &PremisePolicy,
+) -> AdmissionResult<Admission> {
     if let Some(baseline) = request_baseline {
         if baseline.domain != IosMemoryDomain::ProcessGrowth
             || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
@@ -1254,6 +1540,8 @@ pub(crate) fn admit_rows_at_boundary(
             budget,
             Some(rows),
             request_baseline,
+            execution_facts,
+            premise_policy,
         ) {
             Ok(admitted) => return Ok(admitted),
             Err(AdmissionError::Refused(r)) => {
@@ -1318,6 +1606,32 @@ pub fn admit_with_baseline(
     )
 }
 
+/// Admission with the full real SDK boundary: the BeforeModelLoad process snapshot and the facts
+/// of the execution that will run (stream family, iOS quantum scope). Derivation away from an
+/// anchor's own key requires a registered provider bounder that certifies those facts AND
+/// certificates in the measured anchors' counter domain; otherwise it refuses exactly.
+pub fn admit_with_boundary(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    request_baseline: &IosMemoryBaseline,
+    execution_facts: &IosExecutionFacts,
+    premise_policy: &PremisePolicy,
+) -> AdmissionResult<Admission> {
+    let rows = evidence::rows().map_err(no_evidence)?;
+    admit_rows_with_facts(
+        registry,
+        candidates,
+        machine,
+        budget,
+        rows,
+        Some(request_baseline),
+        Some(execution_facts),
+        premise_policy,
+    )
+}
+
 /// Explicitly-labelled capture permit. NOT admission: no evidence row is required (that would be
 /// circular) and none is created. Granted only where `mlx_gen::ios_quantum` bounds every quantum of
 /// this model by live OS headroom BEFORE its graph is constructed; a refusal at quantum k of size N
@@ -1348,6 +1662,8 @@ pub fn capture_permit(
         },
         None,
         None,
+        None,
+        &PremisePolicy::default(),
     )
 }
 
