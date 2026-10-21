@@ -489,22 +489,24 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
                 from: AnchorKind::Optimized
             }
         );
-        // Intermediate legal mechanisms derive from the optimized endpoint's actual load form.
-        for strategy in [
+        // StagedResidency is this fixture's supported NON-endpoint mechanism. SDXL's
+        // measured-and-rejected attention input stays covered in the separate test below.
+        let intermediate = at(
+            &registry,
+            root.path(),
+            512,
             MemoryStrategy::StagedResidency,
-            MemoryStrategy::BoundedAttention,
-        ] {
-            let intermediate = at(&registry, root.path(), 512, strategy, "text_to_image");
-            let admitted =
-                admitted_only_with_the_approved_premise(&registry, &intermediate, 4096, &rows);
-            assert_eq!(
-                admitted.basis(),
-                AdmissionBasis::Derived {
-                    from: AnchorKind::Optimized
-                }
-            );
-            assert_eq!(admitted.context().load_shape, intermediate.spec.load_shape);
-        }
+            "text_to_image",
+        );
+        let admitted =
+            admitted_only_with_the_approved_premise(&registry, &intermediate, 4096, &rows);
+        assert_eq!(
+            admitted.basis(),
+            AdmissionBasis::Derived {
+                from: AnchorKind::Optimized
+            }
+        );
+        assert_eq!(admitted.context().load_shape, intermediate.spec.load_shape);
         // Resident at 512²: from the same-regime resident anchor (3100), all deltas <= 0.
         let resident = at(
             &registry,
@@ -543,6 +545,86 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
         ))
         .contains("BOTH"));
     });
+}
+
+/// The historical SDXL attention capability is deliberately Missing: it failed the measured
+/// memory/bit-exactness bar, not the anchor law. Keep that original input as a precise negative
+/// obligation, and verify the REAL endpoint selector never promotes it or stages the resident end.
+#[test]
+fn sdxl_missing_attention_is_rejected_and_literal_endpoints_select_only_supported_mechanisms() {
+    use mlx_gen::gen_core::{LoadShape, OffloadPolicy};
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let c = candidate(
+        &registry,
+        root.path(),
+        "sdxl",
+        512,
+        Some(Quant::Q4),
+        "text_to_image",
+    );
+    let mut spec = c.spec.clone();
+    AnchorKind::Optimized.apply_load_form(&mut spec);
+    let contract = registry
+        .memory_strategy_contract(crate::sdxl::SDXL_ID, &spec)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        contract
+            .capability(MemoryStrategy::BoundedAttention)
+            .unwrap()
+            .support,
+        MemoryStrategySupport::Missing
+    );
+    match build_candidate(
+        &registry,
+        crate::sdxl::SDXL_ID,
+        spec.clone(),
+        None,
+        MemoryStrategy::BoundedAttention,
+        c.work,
+    ) {
+        Err(AdmissionError::Failed(Error::Unsupported(reason))) => {
+            assert_eq!(reason, "sdxl cannot execute BoundedAttention: Missing");
+        }
+        Err(error) => panic!("wrong bounded-attention rejection: {error}"),
+        Ok(_) => panic!("SDXL admitted its explicitly Missing attention strategy"),
+    }
+    let (resident, resident_strategy) =
+        configured_endpoint(&registry, crate::sdxl::SDXL_ID, &spec, AnchorKind::Resident).unwrap();
+    assert_eq!(resident_strategy, MemoryStrategy::Resident);
+    assert_eq!(
+        (resident.offload_policy, resident.load_shape),
+        (OffloadPolicy::Resident, LoadShape::EagerMaterialization)
+    );
+    let (optimized, optimized_strategy) = configured_endpoint(
+        &registry,
+        crate::sdxl::SDXL_ID,
+        &spec,
+        AnchorKind::Optimized,
+    )
+    .unwrap();
+    // This q4-on-dense source fixture cannot leave quantized blocks lazy, so rung 4 is Missing;
+    // the selector must pass both Missing rungs and retain the actual fully optimized decode end.
+    assert_eq!(optimized_strategy, MemoryStrategy::BoundedDecode);
+    assert_eq!(
+        (optimized.offload_policy, optimized.load_shape),
+        (
+            OffloadPolicy::Sequential,
+            LoadShape::DeferredMaterialization
+        )
+    );
+    let optimized_contract = registry
+        .memory_strategy_contract(crate::sdxl::SDXL_ID, &optimized)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        optimized_contract
+            .capability(optimized_strategy)
+            .unwrap()
+            .support,
+        MemoryStrategySupport::Implemented
+    );
 }
 
 #[test]
@@ -862,7 +944,15 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
                 run_id: "r".into(),
                 build_sha: "s".into(),
             },
-            ..resident_anchor(&registry, &res, 0)
+            // A refused endpoint has no completed capture or demand. Construct it directly;
+            // a zero-growth completed intermediate is invalid even if its outcome is replaced.
+            key: crate::source_work::fixture_key(&registry, &res, DEVICE),
+            anchor_kind: AnchorKind::Resident,
+            selection: AnchorSelection::from_parts(
+                res.context.selection.strategy,
+                &res.context.selection.parameters,
+            ),
+            evidence_class: DEVICE_CAPTURE_CLASS.into(),
         };
         let rows = [optimized_anchor(&registry, &opt), refused];
         assert_eq!(
