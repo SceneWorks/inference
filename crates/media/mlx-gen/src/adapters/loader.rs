@@ -2345,7 +2345,9 @@ pub fn configured_adapter_facts(
         files.push(json!({"format":format_name,"loaded_sources":sources,"installed":installed}));
     }
     if !specs.is_empty() && batch_applied == 0 {
-        return Err(Error::Msg("adapter batch matched no actual projection".into()));
+        return Err(Error::Msg(
+            "adapter batch matched no actual projection".into(),
+        ));
     }
     Ok((
         json!({"schema":"unfused_adapter_semantic_graph_v1","files":files}),

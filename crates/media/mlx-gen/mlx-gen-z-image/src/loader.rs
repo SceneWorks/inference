@@ -382,7 +382,9 @@ pub(crate) fn transformer_header_origins(
         mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
     >,
 ) -> std::collections::BTreeMap<String, String> {
-    let mut origins = headers.keys().map(|key| (key.clone(), key.clone()))
+    let mut origins = headers
+        .keys()
+        .map(|key| (key.clone(), key.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
     for (from, to) in TRANSFORMER_KEY_ALIASES {
         for suffix in [".weight", ".bias", ".scales", ".biases"] {
@@ -478,7 +480,11 @@ pub(crate) fn vae_remap_step(source: &str, encoder: bool) -> Option<VaeRemapStep
     let (suffix, transpose) = vae_key_target(rest, sampler);
     Some(VaeRemapStep {
         source: source.to_owned(),
-        target: if encoder { format!("{prefix}{suffix}") } else { suffix },
+        target: if encoder {
+            format!("{prefix}{suffix}")
+        } else {
+            suffix
+        },
         transpose,
     })
 }
@@ -511,11 +517,14 @@ fn remap_vae_keys(
     for k in keys {
         // The wrappers still supply the original unsorted snapshot and native phase order.
         debug_assert!(k.starts_with(prefix));
-        debug_assert_eq!(sampler_substr, if keep_prefix {
-            ".downsamplers.0.conv."
-        } else {
-            ".upsamplers.0.conv."
-        });
+        debug_assert_eq!(
+            sampler_substr,
+            if keep_prefix {
+                ".downsamplers.0.conv."
+            } else {
+                ".upsamplers.0.conv."
+            }
+        );
         let step = vae_remap_step(&k, keep_prefix).expect("phase snapshot key");
         let transpose = step.transpose;
         let target = step.target;

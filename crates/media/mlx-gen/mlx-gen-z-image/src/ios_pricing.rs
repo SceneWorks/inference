@@ -199,7 +199,10 @@ pub fn ios_pricing_with_token(
         mask_count,
         control_count,
     )?;
-    let (recipe,pid_work)=pid_work_basis::decode(token,req.generation.map(pid_work_basis::PidWorkBasis::actual))?;
+    let (recipe, pid_work) = pid_work_basis::decode(
+        token,
+        req.generation.map(pid_work_basis::PidWorkBasis::actual),
+    )?;
     let sampling = mlx_gen::sampler::flow_sampling::ResolvedFlowControls::from_recipe(
         &recipe,
         crate::sampling::defaults(),
@@ -218,18 +221,32 @@ fn price_request_controls(
     sampling: mlx_gen::sampler::flow_sampling::ResolvedFlowControls,
     initial_width: u64,
 ) -> Result<IosPricing> {
-    price_request_controls_with_pid_work(req,route,sampling,initial_width,req.generation.map(pid_work_basis::PidWorkBasis::actual))
+    price_request_controls_with_pid_work(
+        req,
+        route,
+        sampling,
+        initial_width,
+        req.generation.map(pid_work_basis::PidWorkBasis::actual),
+    )
 }
 
 fn price_request_controls_with_pid_work(
-    req:&IosPricingRequest<'_>,route:Route,
-    sampling:mlx_gen::sampler::flow_sampling::ResolvedFlowControls,initial_width:u64,
-    pid_work:Option<pid_work_basis::PidWorkBasis>,
-)->Result<IosPricing> {
+    req: &IosPricingRequest<'_>,
+    route: Route,
+    sampling: mlx_gen::sampler::flow_sampling::ResolvedFlowControls,
+    initial_width: u64,
+    pid_work: Option<pid_work_basis::PidWorkBasis>,
+) -> Result<IosPricing> {
     if req.spec.pid.is_some() || pid_sources::requested(&sampling)? {
         // Original overlay spec/validated controls reach the fixed PiD source consumer BEFORE
         // Facts' legacy overlay refusal. Adapter-refused cases never open later PiD files.
-        return pid_sources::price_before_existing_guard(req,&route,&sampling,initial_width,pid_work);
+        return pid_sources::price_before_existing_guard(
+            req,
+            &route,
+            &sampling,
+            initial_width,
+            pid_work,
+        );
     }
     if !req.spec.adapters.is_empty() {
         // Reach the real source-case consumer before the legacy Facts adapter guard. Base-only
@@ -267,7 +284,9 @@ fn price_request_controls_with_pid_work(
         Ok(())
     })?;
     let mut pricing = IosPricing::default();
-    for window in envelope.into_values() { pricing.take_window(window); }
+    for window in envelope.into_values() {
+        pricing.take_window(window);
+    }
     pricing.absent_phases = absent;
     Ok(pricing)
 }
@@ -688,11 +707,8 @@ fn configured_z_quantization_parents(
         .into_iter()
         .map(|(_, header)| (header, false))
         .collect::<Vec<_>>();
-    let (_, conversions) = source.load_quantized_with_bias(
-        &targets,
-        bits,
-        crate::quant::dit_quantization_has_bias,
-    )?;
+    let (_, conversions) =
+        source.load_quantized_with_bias(&targets, bits, crate::quant::dit_quantization_has_bias)?;
     conversions
         .into_iter()
         .map(|(path, old, _, casts)| {
@@ -1103,9 +1119,9 @@ impl Component {
                 })
                 .unwrap_or_else(|| canonical.clone());
             let weight_key = format!("{module_base}.weight");
-            let weight_source = origins.get(&weight_key).ok_or_else(|| {
-                Error::Msg(format!("missing quantization source {weight_key}"))
-            })?;
+            let weight_source = origins
+                .get(&weight_key)
+                .ok_or_else(|| Error::Msg(format!("missing quantization source {weight_key}")))?;
             let base = weight_source.strip_suffix(".weight").ok_or_else(|| {
                 Error::Msg("native quantization weight has no weight suffix".into())
             })?;
@@ -1267,15 +1283,21 @@ impl Component {
         &self,
         accessed: impl IntoIterator<Item = String>,
     ) -> Result<std::collections::BTreeMap<String, String>> {
-        let headers = self.headers.iter().map(|h| (h.name.clone(), h.clone()))
+        let headers = self
+            .headers
+            .iter()
+            .map(|h| (h.name.clone(), h.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
         let origins = crate::loader::transformer_header_origins(&headers);
-        accessed.into_iter().map(|key| {
-            let source = origins.get(&key).cloned().ok_or_else(|| {
-                Error::Msg(format!("missing constructed DiT source origin {key}"))
-            })?;
-            Ok((key, source))
-        }).collect()
+        accessed
+            .into_iter()
+            .map(|key| {
+                let source = origins.get(&key).cloned().ok_or_else(|| {
+                    Error::Msg(format!("missing constructed DiT source origin {key}"))
+                })?;
+                Ok((key, source))
+            })
+            .collect()
     }
 
     /// Source-logical materialized module payload subtotal only. Constructor correspondence keeps
@@ -1286,7 +1308,9 @@ impl Component {
         constructed: &std::collections::BTreeMap<String, String>,
         streamed: bool,
     ) -> u64 {
-        let sources = constructed.values().map(String::as_str)
+        let sources = constructed
+            .values()
+            .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
         self.resident(|name| {
             sources.contains(name) && crate::loader::dit_load_keeps(streamed, name)
@@ -1455,21 +1479,35 @@ impl QuantizationCursor {
             }
             self.decode_started = true;
         }
-        let (mut resident, mut created, mut pending) = facts.quantization_owner_window_for_components(
-            phase, label, if label == q::DIT_EMBED { 0 } else { point },
-            structural, staged, &mut self.seen, vae.is_none(),
-        )?;
+        let (mut resident, mut created, mut pending) = facts
+            .quantization_owner_window_for_components(
+                phase,
+                label,
+                if label == q::DIT_EMBED { 0 } else { point },
+                structural,
+                staged,
+                &mut self.seen,
+                vae.is_none(),
+            )?;
         // No VAE module exists before its load guard. Staging never removes the VAE from heavy
         // encode/denoise/decode; it removes it only while conditioning the text encoder.
         let vae_present = match phase {
-            IosPhase::Load => !matches!(label, q::TE_LOAD | q::DIT_LOAD | q::CONTROL_LOAD | q::VAE_LOAD),
+            IosPhase::Load => !matches!(
+                label,
+                q::TE_LOAD | q::DIT_LOAD | q::CONTROL_LOAD | q::VAE_LOAD
+            ),
             IosPhase::Conditioning => !staged,
             _ => true,
         };
         if let Some(vae) = vae.filter(|_| vae_present) {
-            let (entry, outputs, cold) = vae.window(facts, phase, label, point, &mut self.seen[2])?;
-            resident = resident.checked_add(entry).ok_or_else(|| Error::Msg("VAE entry owner overflow".into()))?;
-            created = created.checked_add(outputs).ok_or_else(|| Error::Msg("VAE created owner overflow".into()))?;
+            let (entry, outputs, cold) =
+                vae.window(facts, phase, label, point, &mut self.seen[2])?;
+            resident = resident
+                .checked_add(entry)
+                .ok_or_else(|| Error::Msg("VAE entry owner overflow".into()))?;
+            created = created
+                .checked_add(outputs)
+                .ok_or_else(|| Error::Msg("VAE created owner overflow".into()))?;
             pending |= cold;
         }
         Ok(Some((resident, created, pending)))
@@ -1673,7 +1711,9 @@ impl Facts {
         staged: bool,
         seen: &mut [std::collections::BTreeSet<String>; 3],
     ) -> Result<(u64, u64, bool)> {
-        self.quantization_owner_window_for_components(phase, label, point, structural, staged, seen, true)
+        self.quantization_owner_window_for_components(
+            phase, label, point, structural, staged, seen, true,
+        )
     }
 
     fn quantization_owner_window_for_components(
@@ -1911,7 +1951,10 @@ struct VaeRemapFrame {
 
 enum VaeRemapOutcome {
     Complete(VaeRemapHistory),
-    Refused { prefix: VaeRemapHistory, step: crate::loader::VaeRemapStep },
+    Refused {
+        prefix: VaeRemapHistory,
+        step: crate::loader::VaeRemapStep,
+    },
 }
 
 /// ONE component's lazy insert/undo iterator. Both phase DFS depths live on the heap, not the
@@ -1924,11 +1967,21 @@ struct VaeComponentHistories {
 
 impl VaeComponentHistories {
     fn new(current: std::collections::BTreeMap<String, VaeSourceValue>) -> Self {
-        let decoder = current.keys().filter_map(|key| crate::loader::vae_remap_step(key, false)).collect();
+        let decoder = current
+            .keys()
+            .filter_map(|key| crate::loader::vae_remap_step(key, false))
+            .collect();
         Self {
-            state: VaeRemapHistory { current, reads: Vec::new() },
+            state: VaeRemapHistory {
+                current,
+                reads: Vec::new(),
+            },
             remaining: [decoder, Vec::new()],
-            frames: vec![VaeRemapFrame { encoder: false, next: 0, undo: None }],
+            frames: vec![VaeRemapFrame {
+                encoder: false,
+                next: 0,
+                undo: None,
+            }],
         }
     }
 
@@ -1937,8 +1990,12 @@ impl VaeComponentHistories {
         if let Some((index, step, overwritten)) = frame.undo {
             self.state.reads.pop();
             match overwritten {
-                Some(old) => { self.state.current.insert(step.target.clone(), old); }
-                None => { self.state.current.remove(&step.target); }
+                Some(old) => {
+                    self.state.current.insert(step.target.clone(), old);
+                }
+                None => {
+                    self.state.current.remove(&step.target);
+                }
             }
             self.remaining[usize::from(frame.encoder)].insert(index, step);
         }
@@ -1962,10 +2019,18 @@ impl Iterator for VaeComponentHistories {
                 if frame.next == 0 {
                     frame.next = 1;
                     // EXACT completed-state snapshot: decoder.encoder.* may have inserted keys.
-                    let next = self.state.current.keys()
-                        .filter_map(|key| crate::loader::vae_remap_step(key, true)).collect();
+                    let next = self
+                        .state
+                        .current
+                        .keys()
+                        .filter_map(|key| crate::loader::vae_remap_step(key, true))
+                        .collect();
                     self.remaining[1] = next;
-                    self.frames.push(VaeRemapFrame { encoder: true, next: 0, undo: None });
+                    self.frames.push(VaeRemapFrame {
+                        encoder: true,
+                        next: 0,
+                        undo: None,
+                    });
                 } else {
                     self.backtrack();
                 }
@@ -1980,7 +2045,10 @@ impl Iterator for VaeComponentHistories {
             let step = self.remaining[phase].remove(index);
             let state = &mut self.state;
             let read = state.current.get(&step.source).cloned();
-            let Some(mut value) = read.clone().filter(|v| !step.transpose || v.header.shape.len() == 4) else {
+            let Some(mut value) = read
+                .clone()
+                .filter(|v| !step.transpose || v.header.shape.len() == 4)
+            else {
                 let prefix = state.clone();
                 self.remaining[phase].insert(index, step.clone());
                 return Some(VaeRemapOutcome::Refused { prefix, step });
@@ -1993,10 +2061,16 @@ impl Iterator for VaeComponentHistories {
             value.path.push(step.clone());
             let overwritten = state.current.insert(step.target.clone(), value);
             state.reads.push(VaeRemapRead {
-                encoder, step: step.clone(), read: read.expect("checked require"),
+                encoder,
+                step: step.clone(),
+                read: read.expect("checked require"),
                 overwritten: overwritten.clone(),
             });
-            self.frames.push(VaeRemapFrame { encoder, next: 0, undo: Some((index, step, overwritten)) });
+            self.frames.push(VaeRemapFrame {
+                encoder,
+                next: 0,
+                undo: Some((index, step, overwritten)),
+            });
         }
     }
 }
@@ -2014,17 +2088,27 @@ struct VaeSourceInventory {
 
 impl VaeSourceInventory {
     fn new(source: &Component) -> Result<Self> {
-        let mut domain = source.headers.iter().map(|h| h.name.clone())
+        let mut domain = source
+            .headers
+            .iter()
+            .map(|h| h.name.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        let decoder = domain.iter().filter_map(|k| crate::loader::vae_remap_step(k, false))
+        let decoder = domain
+            .iter()
+            .filter_map(|k| crate::loader::vae_remap_step(k, false))
             .collect::<Vec<_>>();
         domain.extend(decoder.iter().map(|op| op.target.clone()));
-        let encoder = domain.iter().filter_map(|k| crate::loader::vae_remap_step(k, true))
+        let encoder = domain
+            .iter()
+            .filter_map(|k| crate::loader::vae_remap_step(k, true))
             .collect::<Vec<_>>();
-        let mut supports = domain.into_iter().map(|k| std::collections::BTreeSet::from([k]))
+        let mut supports = domain
+            .into_iter()
+            .map(|k| std::collections::BTreeSet::from([k]))
             .collect::<Vec<_>>();
         for op in decoder.iter().chain(&encoder) {
-            let mut joined = std::collections::BTreeSet::from([op.source.clone(), op.target.clone()]);
+            let mut joined =
+                std::collections::BTreeSet::from([op.source.clone(), op.target.clone()]);
             let mut i = 0;
             while i < supports.len() {
                 if !supports[i].is_disjoint(&joined) {
@@ -2037,22 +2121,35 @@ impl VaeSourceInventory {
             }
             supports.push(joined);
         }
-        let mut inventory = Self { raw: source.clone(), supports, seeds: Vec::new() };
+        let mut inventory = Self {
+            raw: source.clone(),
+            supports,
+            seeds: Vec::new(),
+        };
         for index in 0..inventory.supports.len() {
             let mut seed = None;
             let mut first_refusal = None;
-            inventory.visit_component(index, &mut |world| {
-                seed = Some(world.clone());
-                Ok(true)
-            }, &mut |failure| {
-                first_refusal.get_or_insert_with(|| format!(
-                    "VAE native remap refused {} after {} reads",
-                    failure.step.source, failure.prefix.reads.len(),
-                ));
-                Ok(())
-            })?;
+            inventory.visit_component(
+                index,
+                &mut |world| {
+                    seed = Some(world.clone());
+                    Ok(true)
+                },
+                &mut |failure| {
+                    first_refusal.get_or_insert_with(|| {
+                        format!(
+                            "VAE native remap refused {} after {} reads",
+                            failure.step.source,
+                            failure.prefix.reads.len(),
+                        )
+                    });
+                    Ok(())
+                },
+            )?;
             inventory.seeds.push(seed.ok_or_else(|| {
-                Error::Msg(first_refusal.unwrap_or_else(|| "VAE remap has no successful order".into()))
+                Error::Msg(
+                    first_refusal.unwrap_or_else(|| "VAE remap has no successful order".into()),
+                )
             })?);
         }
         Ok(inventory)
@@ -2060,9 +2157,22 @@ impl VaeSourceInventory {
 
     fn component_histories(&self, index: usize) -> VaeComponentHistories {
         let support = &self.supports[index];
-        let current = self.raw.headers.iter().filter(|h| support.contains(&h.name)).map(|h| {
-            (h.name.clone(), VaeSourceValue { raw: h.name.clone(), path: Vec::new(), header: h.clone() })
-        }).collect();
+        let current = self
+            .raw
+            .headers
+            .iter()
+            .filter(|h| support.contains(&h.name))
+            .map(|h| {
+                (
+                    h.name.clone(),
+                    VaeSourceValue {
+                        raw: h.name.clone(),
+                        path: Vec::new(),
+                        header: h.clone(),
+                    },
+                )
+            })
+            .collect();
         VaeComponentHistories::new(current)
     }
 
@@ -2078,10 +2188,15 @@ impl VaeSourceInventory {
         for outcome in self.component_histories(index) {
             match outcome {
                 VaeRemapOutcome::Complete(world) => {
-                    if complete(&world)? { return Ok(true); }
+                    if complete(&world)? {
+                        return Ok(true);
+                    }
                 }
                 VaeRemapOutcome::Refused { prefix, step } => {
-                    refused(VaeRemapRefusal { prefix: &prefix, step: &step })?;
+                    refused(VaeRemapRefusal {
+                        prefix: &prefix,
+                        step: &step,
+                    })?;
                 }
             }
         }
@@ -2096,28 +2211,44 @@ impl VaeSourceInventory {
         keys: &std::collections::BTreeSet<String>,
         consumer: &mut dyn FnMut(&VaeRemapHistory) -> Result<()>,
     ) -> Result<()> {
-        let selected = self.supports.iter().enumerate().filter_map(|(i, support)| {
-            (!support.is_disjoint(keys)).then_some(i)
-        }).collect::<Vec<_>>();
+        let selected = self
+            .supports
+            .iter()
+            .enumerate()
+            .filter_map(|(i, support)| (!support.is_disjoint(keys)).then_some(i))
+            .collect::<Vec<_>>();
         // Lazy odometer: one iterator and one chosen COMPLETE effect per demanded component.
         // Independent component count does not nest visit_component/consumer native call frames.
         // Replacing a chosen effect is the joint-frame undo; no global world product is stored.
         let mut worlds = self.seeds.clone();
-        let mut frames = (0..selected.len()).map(|_| None).collect::<Vec<Option<VaeComponentHistories>>>();
+        let mut frames = (0..selected.len())
+            .map(|_| None)
+            .collect::<Vec<Option<VaeComponentHistories>>>();
         let mut depth = 0;
         loop {
             if depth == selected.len() {
-                let mut reads = worlds.iter().enumerate().filter(|(i, _)| !selected.contains(i))
-                    .flat_map(|(_, world)| world.reads.clone()).collect::<Vec<_>>();
-                for &index in &selected { reads.extend(worlds[index].reads.clone()); }
+                let mut reads = worlds
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !selected.contains(i))
+                    .flat_map(|(_, world)| world.reads.clone())
+                    .collect::<Vec<_>>();
+                for &index in &selected {
+                    reads.extend(worlds[index].reads.clone());
+                }
                 // SAME canonical interleaving as before: unselected then selected local effects,
                 // stable by phase. This is not a captured native HashMap-order claim.
                 reads.sort_by_key(|read| read.encoder);
                 consumer(&VaeRemapHistory {
-                    current: worlds.iter().flat_map(|world| world.current.clone()).collect(),
+                    current: worlds
+                        .iter()
+                        .flat_map(|world| world.current.clone())
+                        .collect(),
                     reads,
                 })?;
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 depth -= 1;
                 continue;
             }
@@ -2130,10 +2261,14 @@ impl VaeSourceInventory {
             if let Some(world) = next {
                 worlds[index] = world;
                 depth += 1;
-                if depth < selected.len() { frames[depth] = None; }
+                if depth < selected.len() {
+                    frames[depth] = None;
+                }
             } else {
                 frames[depth] = None;
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 depth -= 1;
             }
         }
@@ -2143,7 +2278,10 @@ impl VaeSourceInventory {
 
 impl VaeSourceInventory {
     fn component(world: &VaeRemapHistory) -> Component {
-        Component { files: Vec::new(), headers: world.current.values().map(|v| v.header.clone()).collect() }
+        Component {
+            files: Vec::new(),
+            headers: world.current.values().map(|v| v.header.clone()).collect(),
+        }
     }
 
     /// Discover dependencies with the SAME constructor, including reads preceding a genuine failed
@@ -2165,13 +2303,19 @@ impl VaeSourceInventory {
                 accessed.extend(view.accessed_entries().into_iter().map(|(key, _)| key));
                 Ok(())
             })?;
-            if accessed == demanded { break; }
+            if accessed == demanded {
+                break;
+            }
             demanded = accessed;
         }
-        let targets = ["", "encoder."].into_iter().flat_map(|prefix| {
-            crate::vae::attention::QUANTIZATION_LINEAR_PATHS.into_iter()
-                .map(move |leaf| (format!("{prefix}mid_block.attentions.0.{leaf}"), false))
-        }).collect::<Vec<_>>();
+        let targets = ["", "encoder."]
+            .into_iter()
+            .flat_map(|prefix| {
+                crate::vae::attention::QUANTIZATION_LINEAR_PATHS
+                    .into_iter()
+                    .map(move |leaf| (format!("{prefix}mid_block.attentions.0.{leaf}"), false))
+            })
+            .collect::<Vec<_>>();
         let mut accepted = 0usize;
         let mut first_refusal = None;
         self.visit_selected(&demanded, &mut |world| {
@@ -2181,7 +2325,11 @@ impl VaeSourceInventory {
             let view = source.view()?;
             let view = Weights::from_map(view.into_tensors());
             let raw = crate::loader::build_remapped_vae(&view);
-            let constructed = view.accessed_entries().into_iter().map(|(key, _)| key).collect();
+            let constructed = view
+                .accessed_entries()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
             let attempt = (|| {
                 let raw = raw?;
                 let (effective, conversions) = if let Some(bits) = bits {
@@ -2189,10 +2337,16 @@ impl VaeSourceInventory {
                 } else {
                     (source, Vec::new())
                 };
-                let owners = std::sync::Arc::new(VaeOwnerHistory::from_constructed(world, &constructed, &conversions)?);
+                let owners = std::sync::Arc::new(VaeOwnerHistory::from_constructed(
+                    world,
+                    &constructed,
+                    &conversions,
+                )?);
                 // The SAME closed native selector sees the WHOLE effective tuple, never separate
                 // maxima for weight/bias/scales/offset. Conversion follows successful raw discovery.
-                let effective_vae = if conversions.is_empty() { raw } else {
+                let effective_vae = if conversions.is_empty() {
+                    raw
+                } else {
                     crate::loader::build_remapped_vae(&effective.view()?)?
                 };
                 Ok((effective_vae, owners))
@@ -2202,12 +2356,18 @@ impl VaeSourceInventory {
                     accepted += 1;
                     consumer(&vae, owners)?;
                 }
-                Err(error) => { if first_refusal.is_none() { first_refusal = Some(error); } }
+                Err(error) => {
+                    if first_refusal.is_none() {
+                        first_refusal = Some(error);
+                    }
+                }
             }
             Ok(())
         })?;
         if accepted == 0 {
-            return Err(first_refusal.unwrap_or_else(|| Error::Msg("VAE has no successful constructor history".into())));
+            return Err(first_refusal.unwrap_or_else(|| {
+                Error::Msg("VAE has no successful constructor history".into())
+            }));
         }
         Ok(())
     }
@@ -2247,21 +2407,40 @@ impl VaeOwnerHistory {
                 if let Some(value) = remap.current.get(&key) {
                     if suffix == "weight" || value.header.dtype != HeaderDtype::BF16 {
                         converted.insert(key);
-                        parents.insert(value.raw.clone(), mlx_gen::ios_quantum::allocated_bytes(value.header.data_bytes));
+                        parents.insert(
+                            value.raw.clone(),
+                            mlx_gen::ios_quantum::allocated_bytes(value.header.data_bytes),
+                        );
                     }
                 }
             }
             owners.push(VaeConversionOwners {
-                path: if base.starts_with("encoder.") { base.clone() } else { format!("decoder.{base}") },
-                parents, outputs: *outputs, casts: *casts,
+                path: if base.starts_with("encoder.") {
+                    base.clone()
+                } else {
+                    format!("decoder.{base}")
+                },
+                parents,
+                outputs: *outputs,
+                casts: *casts,
             });
         }
         let mut unchanged = std::collections::BTreeMap::new();
         for key in constructed.difference(&converted) {
-            let value = remap.current.get(key).ok_or_else(|| Error::Msg(format!("missing constructed VAE source {key}")))?;
-            unchanged.insert(value.raw.clone(), mlx_gen::ios_quantum::allocated_bytes(value.header.data_bytes));
+            let value = remap
+                .current
+                .get(key)
+                .ok_or_else(|| Error::Msg(format!("missing constructed VAE source {key}")))?;
+            unchanged.insert(
+                value.raw.clone(),
+                mlx_gen::ios_quantum::allocated_bytes(value.header.data_bytes),
+            );
         }
-        Ok(Self { remap: remap.clone(), unchanged, conversions: owners })
+        Ok(Self {
+            remap: remap.clone(),
+            unchanged,
+            conversions: owners,
+        })
     }
 
     fn window(
@@ -2276,7 +2455,10 @@ impl VaeOwnerHistory {
         let mut outputs = 0u64;
         let mut created = 0u64;
         let mut pending = false;
-        let add = |a: u64, b: u64| a.checked_add(b).ok_or_else(|| Error::Msg("VAE source owners overflow".into()));
+        let add = |a: u64, b: u64| {
+            a.checked_add(b)
+                .ok_or_else(|| Error::Msg("VAE source owners overflow".into()))
+        };
         for conversion in &self.conversions {
             if seen.contains(&conversion.path) {
                 outputs = add(outputs, conversion.outputs)?;
@@ -2289,7 +2471,9 @@ impl VaeOwnerHistory {
                 }
             }
         }
-        let resident = entry.values().try_fold(outputs, |sum, bytes| add(sum, *bytes))?;
+        let resident = entry
+            .values()
+            .try_fold(outputs, |sum, bytes| add(sum, *bytes))?;
         Ok((resident, created, pending))
     }
 }
@@ -2332,8 +2516,11 @@ impl Model {
             let _ordinary_constructor =
                 TextEncoder::from_weights(&initial_te_view, "model", &te_cfg)?;
         }
-        let te_constructor_keys = initial_te_view.accessed_entries().into_iter()
-            .map(|(key, _)| key).collect::<std::collections::BTreeSet<_>>();
+        let te_constructor_keys = initial_te_view
+            .accessed_entries()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<std::collections::BTreeSet<_>>();
         let raw_te = facts
             .load_components
             .as_ref()
@@ -2366,9 +2553,9 @@ impl Model {
         let mut dit_view = facts.dit.view()?;
         crate::loader::remap_transformer_keys(&mut dit_view);
         let base = ZImageTransformer::from_weights(&dit_view, "", facts.dit_cfg.clone())?;
-        let dit_constructor_origins = facts.dit.dit_constructed_origins(
-            dit_view.accessed_entries().into_iter().map(|(key, _)| key),
-        )?;
+        let dit_constructor_origins = facts
+            .dit
+            .dit_constructed_origins(dit_view.accessed_entries().into_iter().map(|(key, _)| key))?;
         let mut block_view = facts.dit.view()?;
         let mut block_load_view = raw_dit.view()?;
         let dit_blocks = (0..facts.dit_cfg.n_layers)
@@ -2390,7 +2577,10 @@ impl Model {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let raw_vae = facts.load_components.as_ref().map_or(&facts.vae, |raw| &raw[2]);
+        let raw_vae = facts
+            .load_components
+            .as_ref()
+            .map_or(&facts.vae, |raw| &raw[2]);
         let vae_sources = VaeSourceInventory::new(raw_vae)?;
 
         let (dit, control) =
@@ -2502,10 +2692,10 @@ impl Model {
     /// the shell roots; raw extra/overwritten keys remain on Facts, and local streamed-i read/pack
     /// payload is counted independently. This is NOT a native/physical lower bound or release credit.
     pub(crate) fn dit_resident(&self) -> u64 {
-        self.facts.dit.dit_materialized_module_bytes(
-            &self.dit_constructor_origins,
-            self.facts.streamable,
-        ) + self.dit.base().rope.resident_bytes()
+        self.facts
+            .dit
+            .dit_materialized_module_bytes(&self.dit_constructor_origins, self.facts.streamable)
+            + self.dit.base().rope.resident_bytes()
     }
 
     #[cfg(test)]
@@ -2556,7 +2746,10 @@ impl Model {
     #[cfg(test)]
     pub(crate) fn quanta(&self, route: &Route, backend: Backend) -> Result<Vec<Priced>> {
         let mut out = Vec::new();
-        self.visit_quanta(route, backend, &mut |world| { out.extend_from_slice(world); Ok(()) })?;
+        self.visit_quanta(route, backend, &mut |world| {
+            out.extend_from_slice(world);
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -2566,9 +2759,10 @@ impl Model {
         backend: Backend,
         consumer: &mut dyn FnMut(&[Priced]) -> Result<()>,
     ) -> Result<()> {
-        self.vae_sources.visit_constructed(self.facts.quant_bits, &mut |vae, owners| {
-            consumer(&self.quanta_for_vae(route, backend, vae, owners)?)
-        })
+        self.vae_sources
+            .visit_constructed(self.facts.quant_bits, &mut |vae, owners| {
+                consumer(&self.quanta_for_vae(route, backend, vae, owners)?)
+            })
     }
 
     fn quanta_for_vae(
@@ -2596,7 +2790,8 @@ impl Model {
             "z_image_turbo",
         )?;
 
-        let te_res = f.te.resident(|name| self.te_constructor_keys.contains(name));
+        let te_res =
+            f.te.resident(|name| self.te_constructor_keys.contains(name));
         let dit_res = self.dit_resident();
         // This baseline EXCLUDES VAE fields by component identity. The cursor adds their complete
         // same-history owner union; no effective payload upper is later subtracted as if exact.
@@ -2644,8 +2839,10 @@ impl Model {
         // Correspondence only, not native evidence: the winning envelope window names the SAME
         // complete raw/remap/constructor/conversion history used by its forward and replay.
         use sha2::Digest;
-        let vae_owner_domain = format!("z-image/source-logical-owners-v1/vae-history-{:x}",
-            sha2::Sha256::digest(format!("{vae_owners:?}").as_bytes()));
+        let vae_owner_domain = format!(
+            "z-image/source-logical-owners-v1/vae-history-{:x}",
+            sha2::Sha256::digest(format!("{vae_owners:?}").as_bytes())
+        );
         let mut out = Vec::new();
         let mut points = std::collections::BTreeMap::<&str, usize>::new();
         let operation_extent = std::cell::Cell::new((route.height, route.width));
@@ -2667,7 +2864,11 @@ impl Model {
                 IosPhase::Conditioning => te_res + if staged { 0 } else { heavy },
                 IosPhase::Encode | IosPhase::Denoise => heavy + if staged { 0 } else { te_res },
                 IosPhase::Decode => {
-                    if staged { 0 } else { te_res + dit_res + ctrl_res }
+                    if staged {
+                        0
+                    } else {
+                        te_res + dit_res + ctrl_res
+                    }
                 }
             };
             // `resident` is the SAME operation's source sum; this split does not subtract two
@@ -2686,8 +2887,15 @@ impl Model {
             let point = points.entry(label).or_default();
             let source_structural = structural;
             let source_point = *point;
-            let Some((structural, quant_created, quant_pending)) =
-                quant_cursor.window_with_vae(f, phase, label, *point, structural, staged, Some(&vae_owners))?
+            let Some((structural, quant_created, quant_pending)) = quant_cursor.window_with_vae(
+                f,
+                phase,
+                label,
+                *point,
+                structural,
+                staged,
+                Some(&vae_owners),
+            )?
             else {
                 return Ok(());
             };
@@ -3056,11 +3264,10 @@ impl Model {
 
         // ---- Decode: staged, only the VAE stays (the DiT and ControlNet shed). ----
         let decode_res = if staged {
-                0
-            } else {
-                te_res + dit_res + ctrl_res
-            }
-            + latent * u64::from(route.count);
+            0
+        } else {
+            te_res + dit_res + ctrl_res
+        } + latent * u64::from(route.count);
         let tiling = crate::pipeline::decode_tiling_for(
             Some(route.execution),
             route.width,
@@ -3531,30 +3738,63 @@ mod load_quantization_header_tests {
         let a = "decoder.conv_in.weight";
         let c = "decoder.decoder.conv_in.weight";
         let target = "conv_in.conv.weight";
-        let source = Component { files: Vec::new(), headers: vec![
-            header(a, HeaderDtype::F16, &[2, 3, 5, 7], 2),
-            header(c, HeaderDtype::F32, &[11, 13, 17, 19], 4),
-            header(target, HeaderDtype::F16, &[23, 29, 31, 37], 2),
-        ] };
+        let source = Component {
+            files: Vec::new(),
+            headers: vec![
+                header(a, HeaderDtype::F16, &[2, 3, 5, 7], 2),
+                header(c, HeaderDtype::F32, &[11, 13, 17, 19], 4),
+                header(target, HeaderDtype::F16, &[23, 29, 31, 37], 2),
+            ],
+        };
         let inventory = VaeSourceInventory::new(&source).unwrap();
         let mut results = Vec::new();
-        inventory.visit_selected(&std::collections::BTreeSet::from([target.into()]), &mut |world| {
-            let value = &world.current[target];
-            results.push((value.raw.clone(), value.header.shape.clone(), value.header.dtype,
-                value.path.iter().map(|op| op.source.clone()).collect::<Vec<_>>(),
-                world.current[a].raw.clone()));
-            Ok(())
-        }).unwrap();
+        inventory
+            .visit_selected(
+                &std::collections::BTreeSet::from([target.into()]),
+                &mut |world| {
+                    let value = &world.current[target];
+                    results.push((
+                        value.raw.clone(),
+                        value.header.shape.clone(),
+                        value.header.dtype,
+                        value
+                            .path
+                            .iter()
+                            .map(|op| op.source.clone())
+                            .collect::<Vec<_>>(),
+                        world.current[a].raw.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
         results.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(results, vec![
-            (a.into(), vec![2, 5, 7, 3], HeaderDtype::F16, vec![a.into()], c.into()),
-            (c.into(), vec![11, 17, 19, 13], HeaderDtype::F32, vec![c.into(), a.into()], c.into()),
-        ], "VAE-HOST-JOINT-OVERWRITE: no initial-target, repeated-op or impossible field world");
+        assert_eq!(
+            results,
+            vec![
+                (
+                    a.into(),
+                    vec![2, 5, 7, 3],
+                    HeaderDtype::F16,
+                    vec![a.into()],
+                    c.into()
+                ),
+                (
+                    c.into(),
+                    vec![11, 17, 19, 13],
+                    HeaderDtype::F32,
+                    vec![c.into(), a.into()],
+                    c.into()
+                ),
+            ],
+            "VAE-HOST-JOINT-OVERWRITE: no initial-target, repeated-op or impossible field world"
+        );
 
         let generated = "decoder.encoder.conv_in.weight";
-        let source = Component { files: Vec::new(), headers: vec![
-            header(generated, HeaderDtype::F16, &[2, 3, 5, 7], 2),
-        ] };
+        let source = Component {
+            files: Vec::new(),
+            headers: vec![header(generated, HeaderDtype::F16, &[2, 3, 5, 7], 2)],
+        };
         let inventory = VaeSourceInventory::new(&source).unwrap();
         let mut generated_worlds = 0;
         inventory.visit_selected(&std::collections::BTreeSet::from(["encoder.conv_in.conv.weight".into()]), &mut |world| {
@@ -3569,32 +3809,69 @@ mod load_quantization_header_tests {
         }).unwrap();
         assert_eq!(generated_worlds, 1);
 
-        let source = Component { files: Vec::new(), headers: vec![
-            header(a, HeaderDtype::F16, &[2, 3], 2),
-            header(c, HeaderDtype::F32, &[11, 13, 17, 19], 4),
-        ] };
+        let source = Component {
+            files: Vec::new(),
+            headers: vec![
+                header(a, HeaderDtype::F16, &[2, 3], 2),
+                header(c, HeaderDtype::F32, &[11, 13, 17, 19], 4),
+            ],
+        };
         let inventory = VaeSourceInventory::new(&source).unwrap();
-        let component = inventory.supports.iter().position(|s| s.contains(target)).unwrap();
+        let component = inventory
+            .supports
+            .iter()
+            .position(|s| s.contains(target))
+            .unwrap();
         let (mut successes, mut failures) = (0, 0);
-        inventory.visit_component(component, &mut |world| {
-            assert_eq!(world.current[target].raw, c, "VAE-HOST-SUCCESS-AFTER-SHADOW");
-            successes += 1;
-            Ok(false)
-        }, &mut |failure| {
-            assert_eq!((failure.step.source.as_str(), failure.prefix.reads.len(), failure.prefix.current[a].header.shape.len()),
-                (a, 0, 2), "VAE-HOST-NATIVE-FAILURE-PREFIX");
-            failures += 1;
-            Ok(())
-        }).unwrap();
+        inventory
+            .visit_component(
+                component,
+                &mut |world| {
+                    assert_eq!(
+                        world.current[target].raw, c,
+                        "VAE-HOST-SUCCESS-AFTER-SHADOW"
+                    );
+                    successes += 1;
+                    Ok(false)
+                },
+                &mut |failure| {
+                    assert_eq!(
+                        (
+                            failure.step.source.as_str(),
+                            failure.prefix.reads.len(),
+                            failure.prefix.current[a].header.shape.len()
+                        ),
+                        (a, 0, 2),
+                        "VAE-HOST-NATIVE-FAILURE-PREFIX"
+                    );
+                    failures += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert_eq!((successes, failures), (1, 1), "VAE-HOST-NO-BLANKET-REFUSAL");
     }
 
     fn empty_vae_facts() -> Facts {
-        let empty = Component { files: Vec::new(), headers: Vec::new() };
-        Facts { te_cfg: ZTextEncoderConfig::z_image(), dit_cfg: ZImageTransformerConfig::turbo(),
-            te: empty.clone(), dit: empty.clone(), vae: empty, control: None,
-            window_tokens: 1, caption_tokens: 1, quant_bits: Some(4), streamable: false,
-            load_components: None, quant_conversions: std::array::from_fn(|_| Vec::new()), te_quant_bits: None }
+        let empty = Component {
+            files: Vec::new(),
+            headers: Vec::new(),
+        };
+        Facts {
+            te_cfg: ZTextEncoderConfig::z_image(),
+            dit_cfg: ZImageTransformerConfig::turbo(),
+            te: empty.clone(),
+            dit: empty.clone(),
+            vae: empty,
+            control: None,
+            window_tokens: 1,
+            caption_tokens: 1,
+            quant_bits: Some(4),
+            streamable: false,
+            load_components: None,
+            quant_conversions: std::array::from_fn(|_| Vec::new()),
+            te_quant_bits: None,
+        }
     }
 
     #[test]
@@ -3604,80 +3881,217 @@ mod load_quantization_header_tests {
         let c = format!("decoder.decoder.{base}.weight");
         let bias = format!("{base}.bias");
         let untouched = "conv_norm_out.norm.weight";
-        let source = Component { files: Vec::new(), headers: vec![
-            header(&a, HeaderDtype::F16, &[4, 64], 2),
-            header(&c, HeaderDtype::F32, &[4, 64], 4),
-            header(&bias, HeaderDtype::F32, &[4], 4),
-            header(untouched, HeaderDtype::BF16, &[4], 2),
-        ] };
+        let source = Component {
+            files: Vec::new(),
+            headers: vec![
+                header(&a, HeaderDtype::F16, &[4, 64], 2),
+                header(&c, HeaderDtype::F32, &[4, 64], 4),
+                header(&bias, HeaderDtype::F32, &[4], 4),
+                header(untouched, HeaderDtype::BF16, &[4], 2),
+            ],
+        };
         let facts = empty_vae_facts();
         let inventory = VaeSourceInventory::new(&source).unwrap();
-        let keys = std::collections::BTreeSet::from([format!("{base}.weight"), bias.clone(), untouched.into()]);
+        let keys = std::collections::BTreeSet::from([
+            format!("{base}.weight"),
+            bias.clone(),
+            untouched.into(),
+        ]);
         let mut cases = Vec::new();
-        inventory.visit_selected(&keys, &mut |world| {
-            let component = VaeSourceInventory::component(world);
-            let (effective, records) = component.load_quantized_with_bias(&[(base.into(), false)], 4, |_| true)?;
-            let owners = VaeOwnerHistory::from_constructed(world, &keys, &records)?;
-            let old = world.current[&format!("{base}.weight")].header.data_bytes + 16;
-            let mut cursor = QuantizationCursor::new(QuantizationHistory::RequestFirst, false);
-            assert_eq!(cursor.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_IN, 0, 0, true, Some(&owners))?,
-                Some((old + 8, 0, true)), "VAE-HOST-ADDITIVE-COLD: unrelated owners are not subtracted uppers");
-            assert_eq!(cursor.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_ATTENTION, 0, 0, true, Some(&owners))?,
-                Some((old + 8, 152 + 512, true)), "VAE-HOST-SAME-HISTORY-CONVERSION");
-            assert_eq!(cursor.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_OUT, 0, 0, true, Some(&owners))?,
-                Some((152 + 8, 0, false)), "VAE-HOST-RECURRENT-OUTPUTS");
-            let mut late = QuantizationCursor::new(QuantizationHistory::NoModelForward, true);
-            assert_eq!(late.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_IN, 0, 0, false, Some(&owners))?,
-                Some((160, 0, false)), "VAE-HOST-LATE-SERIAL-DECODE");
-            assert_eq!(effective.headers.iter().find(|h| h.name == format!("{base}.weight")).unwrap().shape, vec![4, 8],
-                "VAE-HOST-ACTUAL-PACKED-SHAPE");
-            cases.push((world.current[&format!("{base}.weight")].raw.clone(), old));
-            Ok(())
-        }).unwrap();
+        inventory
+            .visit_selected(&keys, &mut |world| {
+                let component = VaeSourceInventory::component(world);
+                let (effective, records) =
+                    component.load_quantized_with_bias(&[(base.into(), false)], 4, |_| true)?;
+                let owners = VaeOwnerHistory::from_constructed(world, &keys, &records)?;
+                let old = world.current[&format!("{base}.weight")].header.data_bytes + 16;
+                let mut cursor = QuantizationCursor::new(QuantizationHistory::RequestFirst, false);
+                assert_eq!(
+                    cursor.window_with_vae(
+                        &facts,
+                        IosPhase::Decode,
+                        q::VAE_DECODE_IN,
+                        0,
+                        0,
+                        true,
+                        Some(&owners)
+                    )?,
+                    Some((old + 8, 0, true)),
+                    "VAE-HOST-ADDITIVE-COLD: unrelated owners are not subtracted uppers"
+                );
+                assert_eq!(
+                    cursor.window_with_vae(
+                        &facts,
+                        IosPhase::Decode,
+                        q::VAE_DECODE_ATTENTION,
+                        0,
+                        0,
+                        true,
+                        Some(&owners)
+                    )?,
+                    Some((old + 8, 152 + 512, true)),
+                    "VAE-HOST-SAME-HISTORY-CONVERSION"
+                );
+                assert_eq!(
+                    cursor.window_with_vae(
+                        &facts,
+                        IosPhase::Decode,
+                        q::VAE_DECODE_OUT,
+                        0,
+                        0,
+                        true,
+                        Some(&owners)
+                    )?,
+                    Some((152 + 8, 0, false)),
+                    "VAE-HOST-RECURRENT-OUTPUTS"
+                );
+                let mut late = QuantizationCursor::new(QuantizationHistory::NoModelForward, true);
+                assert_eq!(
+                    late.window_with_vae(
+                        &facts,
+                        IosPhase::Decode,
+                        q::VAE_DECODE_IN,
+                        0,
+                        0,
+                        false,
+                        Some(&owners)
+                    )?,
+                    Some((160, 0, false)),
+                    "VAE-HOST-LATE-SERIAL-DECODE"
+                );
+                assert_eq!(
+                    effective
+                        .headers
+                        .iter()
+                        .find(|h| h.name == format!("{base}.weight"))
+                        .unwrap()
+                        .shape,
+                    vec![4, 8],
+                    "VAE-HOST-ACTUAL-PACKED-SHAPE"
+                );
+                cases.push((world.current[&format!("{base}.weight")].raw.clone(), old));
+                Ok(())
+            })
+            .unwrap();
         cases.sort();
         let mut expected = vec![(a, 528), (c, 1040)];
         expected.sort();
-        assert_eq!(cases, expected, "VAE-HOST-CONVERSION-AFTER-ORIGIN-DISCOVERY");
+        assert_eq!(
+            cases, expected,
+            "VAE-HOST-CONVERSION-AFTER-ORIGIN-DISCOVERY"
+        );
     }
 
     fn complete_vae_history_headers() -> Component {
         fn resnet(headers: &mut Vec<SafetensorsTensorHeader>, prefix: &str) {
             for norm in ["norm1", "norm2"] {
-                for suffix in ["weight", "bias"] { headers.push(header(&format!("{prefix}.{norm}.{suffix}"), HeaderDtype::BF16, &[64], 2)); }
+                for suffix in ["weight", "bias"] {
+                    headers.push(header(
+                        &format!("{prefix}.{norm}.{suffix}"),
+                        HeaderDtype::BF16,
+                        &[64],
+                        2,
+                    ));
+                }
             }
             for conv in ["conv1", "conv2"] {
-                headers.push(header(&format!("{prefix}.{conv}.weight"), HeaderDtype::BF16, &[64, 64, 3, 3], 2));
-                headers.push(header(&format!("{prefix}.{conv}.bias"), HeaderDtype::BF16, &[64], 2));
+                headers.push(header(
+                    &format!("{prefix}.{conv}.weight"),
+                    HeaderDtype::BF16,
+                    &[64, 64, 3, 3],
+                    2,
+                ));
+                headers.push(header(
+                    &format!("{prefix}.{conv}.bias"),
+                    HeaderDtype::BF16,
+                    &[64],
+                    2,
+                ));
             }
         }
         let mut headers = Vec::new();
         for side in ["decoder", "encoder"] {
             let encoder = side == "encoder";
-            for (conv, input, output) in [("conv_in", if encoder { 3 } else { 16 }, 64), ("conv_out", 64, if encoder { 32 } else { 3 })] {
-                headers.push(header(&format!("{side}.{conv}.weight"), HeaderDtype::BF16, &[output, input, 3, 3], 2));
-                headers.push(header(&format!("{side}.{conv}.bias"), HeaderDtype::BF16, &[output], 2));
+            for (conv, input, output) in [
+                ("conv_in", if encoder { 3 } else { 16 }, 64),
+                ("conv_out", 64, if encoder { 32 } else { 3 }),
+            ] {
+                headers.push(header(
+                    &format!("{side}.{conv}.weight"),
+                    HeaderDtype::BF16,
+                    &[output, input, 3, 3],
+                    2,
+                ));
+                headers.push(header(
+                    &format!("{side}.{conv}.bias"),
+                    HeaderDtype::BF16,
+                    &[output],
+                    2,
+                ));
             }
             for suffix in ["weight", "bias"] {
-                headers.push(header(&format!("{side}.conv_norm_out.{suffix}"), HeaderDtype::BF16, &[64], 2));
-                headers.push(header(&format!("{side}.mid_block.attentions.0.group_norm.{suffix}"), HeaderDtype::BF16, &[64], 2));
+                headers.push(header(
+                    &format!("{side}.conv_norm_out.{suffix}"),
+                    HeaderDtype::BF16,
+                    &[64],
+                    2,
+                ));
+                headers.push(header(
+                    &format!("{side}.mid_block.attentions.0.group_norm.{suffix}"),
+                    HeaderDtype::BF16,
+                    &[64],
+                    2,
+                ));
             }
             for leaf in crate::vae::attention::QUANTIZATION_LINEAR_PATHS {
-                headers.push(header(&format!("{side}.mid_block.attentions.0.{leaf}.weight"), HeaderDtype::BF16, &[64, 64], 2));
-                headers.push(header(&format!("{side}.mid_block.attentions.0.{leaf}.bias"), HeaderDtype::BF16, &[64], 2));
+                headers.push(header(
+                    &format!("{side}.mid_block.attentions.0.{leaf}.weight"),
+                    HeaderDtype::BF16,
+                    &[64, 64],
+                    2,
+                ));
+                headers.push(header(
+                    &format!("{side}.mid_block.attentions.0.{leaf}.bias"),
+                    HeaderDtype::BF16,
+                    &[64],
+                    2,
+                ));
             }
-            for index in 0..2 { resnet(&mut headers, &format!("{side}.mid_block.resnets.{index}")); }
+            for index in 0..2 {
+                resnet(&mut headers, &format!("{side}.mid_block.resnets.{index}"));
+            }
             for block in 0..4 {
                 let direction = if encoder { "down" } else { "up" };
                 for layer in 0..if encoder { 2 } else { 3 } {
-                    resnet(&mut headers, &format!("{side}.{direction}_blocks.{block}.resnets.{layer}"));
+                    resnet(
+                        &mut headers,
+                        &format!("{side}.{direction}_blocks.{block}.resnets.{layer}"),
+                    );
                 }
                 if block < 3 {
-                    headers.push(header(&format!("{side}.{direction}_blocks.{block}.{direction}samplers.0.conv.weight"), HeaderDtype::BF16, &[64, 64, 3, 3], 2));
-                    headers.push(header(&format!("{side}.{direction}_blocks.{block}.{direction}samplers.0.conv.bias"), HeaderDtype::BF16, &[64], 2));
+                    headers.push(header(
+                        &format!(
+                            "{side}.{direction}_blocks.{block}.{direction}samplers.0.conv.weight"
+                        ),
+                        HeaderDtype::BF16,
+                        &[64, 64, 3, 3],
+                        2,
+                    ));
+                    headers.push(header(
+                        &format!(
+                            "{side}.{direction}_blocks.{block}.{direction}samplers.0.conv.bias"
+                        ),
+                        HeaderDtype::BF16,
+                        &[64],
+                        2,
+                    ));
                 }
             }
         }
-        Component { files: Vec::new(), headers }
+        Component {
+            files: Vec::new(),
+            headers,
+        }
     }
 
     #[test]
@@ -3687,7 +4101,9 @@ mod load_quantization_header_tests {
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1").status().unwrap();
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
             assert!(status.success(), "VAE history CPU child failed");
             return;
         }
@@ -3696,9 +4112,18 @@ mod load_quantization_header_tests {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         assert!(crate::test_metal_guard::forbid_metal());
         assert!(crate::test_metal_guard::metal_forbidden());
-        assert_eq!(mlx_rs::Device::try_default().unwrap(), mlx_rs::Device::cpu());
-        assert_eq!(unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) }, 0);
-        assert_eq!(mlx_rs::Stream::new().get_index().unwrap(), mlx_rs::Stream::cpu().get_index().unwrap());
+        assert_eq!(
+            mlx_rs::Device::try_default().unwrap(),
+            mlx_rs::Device::cpu()
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         eprintln!("ZIMAGE_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1");
         let normal_end = std::cell::Cell::new(false);
         let completed = std::cell::Cell::new(0u8);
@@ -3834,9 +4259,16 @@ mod load_quantization_header_tests {
             Ok(())
         }).unwrap();
         assert!(normal_end.get(), "actual VAE history body incomplete");
-        assert_eq!(completed.get(), 0b1111_1111, "actual VAE history full mechanism mask");
+        assert_eq!(
+            completed.get(),
+            0b1111_1111,
+            "actual VAE history full mechanism mask"
+        );
         let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
-        assert_eq!(sync, 0, "VAE CPU synchronization after owners/Scope drop failed");
+        assert_eq!(
+            sync, 0,
+            "VAE CPU synchronization after owners/Scope drop failed"
+        );
         eprintln!("ZIMAGE_VAE_HISTORY_NATIVE_BODY_COMPLETED_V1 mechanisms=8 fixture_owners_dropped=1 cpu_sync=0");
     }
 
@@ -4290,9 +4722,15 @@ mod load_quantization_header_tests {
         }
         assert_eq!(
             kinds,
-            ["adaLN", "attention", "control-projection", "feed-forward", "global"]
-                .into_iter()
-                .collect(),
+            [
+                "adaLN",
+                "attention",
+                "control-projection",
+                "feed-forward",
+                "global"
+            ]
+            .into_iter()
+            .collect(),
         );
     }
 
@@ -4311,34 +4749,106 @@ mod load_quantization_header_tests {
                 (true, true, true, true),
             ] {
                 let mut headers = vec![
-                    header(&format!("{to}.weight"), if source_weight { HeaderDtype::F32 } else { HeaderDtype::F16 }, &[if source_weight { 8 } else { 4 }, 64], if source_weight { 4 } else { 2 }),
-                    header(&format!("{to}.bias"), if source_bias { HeaderDtype::F16 } else { HeaderDtype::F32 }, &[4], if source_bias { 2 } else { 4 }),
+                    header(
+                        &format!("{to}.weight"),
+                        if source_weight {
+                            HeaderDtype::F32
+                        } else {
+                            HeaderDtype::F16
+                        },
+                        &[if source_weight { 8 } else { 4 }, 64],
+                        if source_weight { 4 } else { 2 },
+                    ),
+                    header(
+                        &format!("{to}.bias"),
+                        if source_bias {
+                            HeaderDtype::F16
+                        } else {
+                            HeaderDtype::F32
+                        },
+                        &[4],
+                        if source_bias { 2 } else { 4 },
+                    ),
                 ];
                 if source_weight {
-                    headers.push(header(&format!("{from}.weight"), if packed { HeaderDtype::U32 } else { HeaderDtype::F16 }, &[4, if packed { 64 * bits as usize / 32 } else { 64 }], if packed { 4 } else { 2 }));
+                    headers.push(header(
+                        &format!("{from}.weight"),
+                        if packed {
+                            HeaderDtype::U32
+                        } else {
+                            HeaderDtype::F16
+                        },
+                        &[4, if packed { 64 * bits as usize / 32 } else { 64 }],
+                        if packed { 4 } else { 2 },
+                    ));
                 }
                 if source_bias {
                     headers.push(header(&format!("{from}.bias"), HeaderDtype::F32, &[4], 4));
                 }
                 if packed {
-                    headers.push(header(&format!("{to}.scales"), HeaderDtype::BF16, &[4, 1], 2));
-                    headers.push(header(&format!("{to}.biases"), HeaderDtype::BF16, &[4, 1], 2));
+                    headers.push(header(
+                        &format!("{to}.scales"),
+                        HeaderDtype::BF16,
+                        &[4, 1],
+                        2,
+                    ));
+                    headers.push(header(
+                        &format!("{to}.biases"),
+                        HeaderDtype::BF16,
+                        &[4, 1],
+                        2,
+                    ));
                     if source_scales {
-                        headers.push(header(&format!("{from}.scales"), HeaderDtype::BF16, &[4, 1], 2));
+                        headers.push(header(
+                            &format!("{from}.scales"),
+                            HeaderDtype::BF16,
+                            &[4, 1],
+                            2,
+                        ));
                     }
                 }
-                let raw = Component { files: Vec::new(), headers };
-                let signature = |c: &Component| c.headers.iter().map(|h| (h.name.clone(), h.dtype, h.shape.clone(), h.data_bytes)).collect::<Vec<_>>();
+                let raw = Component {
+                    files: Vec::new(),
+                    headers,
+                };
+                let signature = |c: &Component| {
+                    c.headers
+                        .iter()
+                        .map(|h| (h.name.clone(), h.dtype, h.shape.clone(), h.data_bytes))
+                        .collect::<Vec<_>>()
+                };
                 let original = signature(&raw);
-                let (effective, records) = raw.load_quantized_with_bias(
-                    &[(from.into(), false)], bits, crate::quant::dit_quantization_has_bias,
-                ).unwrap();
-                let mut module = effective.headers.iter().map(|h| (h.name.clone(), h.clone())).collect();
+                let (effective, records) = raw
+                    .load_quantized_with_bias(
+                        &[(from.into(), false)],
+                        bits,
+                        crate::quant::dit_quantization_has_bias,
+                    )
+                    .unwrap();
+                let mut module = effective
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.clone()))
+                    .collect();
                 crate::loader::remap_transformer_header_keys(&mut module);
-                let bias_origin = if source_bias { format!("{from}.bias") } else { format!("{to}.bias") };
-                let winner = effective.headers.iter().find(|h| h.name == bias_origin).unwrap();
-                let expected_bias = if packed { HeaderDtype::F32 } else { HeaderDtype::BF16 };
-                let expected_records = if packed { Vec::new() } else {
+                let bias_origin = if source_bias {
+                    format!("{from}.bias")
+                } else {
+                    format!("{to}.bias")
+                };
+                let winner = effective
+                    .headers
+                    .iter()
+                    .find(|h| h.name == bias_origin)
+                    .unwrap();
+                let expected_bias = if packed {
+                    HeaderDtype::F32
+                } else {
+                    HeaderDtype::BF16
+                };
+                let expected_records = if packed {
+                    Vec::new()
+                } else {
                     vec![(from.into(), 528, 4 * 64 * bits as u64 / 8 + 24, 512)]
                 };
                 assert_eq!(
@@ -4354,8 +4864,16 @@ mod load_quantization_header_tests {
                     "per-suffix source={source_weight}/{source_bias}, packed={packed}/{source_scales} Q{bits}",
                 );
                 if source_bias {
-                    let shadow = effective.headers.iter().find(|h| h.name == format!("{to}.bias")).unwrap();
-                    assert_eq!(shadow.dtype, HeaderDtype::F16, "shadowed target bias is not the converted source");
+                    let shadow = effective
+                        .headers
+                        .iter()
+                        .find(|h| h.name == format!("{to}.bias"))
+                        .unwrap();
+                    assert_eq!(
+                        shadow.dtype,
+                        HeaderDtype::F16,
+                        "shadowed target bias is not the converted source"
+                    );
                 }
             }
         }
@@ -4369,15 +4887,33 @@ mod load_quantization_header_tests {
                 header("t_embedder.mlp.0.weight", HeaderDtype::F16, &[4, 64], 2),
                 header("t_embedder.linear1.weight", HeaderDtype::F32, &[8, 64], 4),
                 header("t_embedder.linear1.bias", HeaderDtype::F32, &[4], 4),
-                header("layers.0.attention.to_q.weight", HeaderDtype::F16, &[4, 64], 2),
-                header("layers.1.attention.to_q.weight", HeaderDtype::F16, &[4, 64], 2),
+                header(
+                    "layers.0.attention.to_q.weight",
+                    HeaderDtype::F16,
+                    &[4, 64],
+                    2,
+                ),
+                header(
+                    "layers.1.attention.to_q.weight",
+                    HeaderDtype::F16,
+                    &[4, 64],
+                    2,
+                ),
                 header("unconsumed_matrix.weight", HeaderDtype::F32, &[2, 4096], 4),
             ],
         };
-        let constructed = raw.dit_constructed_origins([
-            "t_embedder.linear1.weight", "t_embedder.linear1.bias",
-            "layers.0.attention.to_q.weight", "layers.1.attention.to_q.weight",
-        ].into_iter().map(str::to_owned)).unwrap();
+        let constructed = raw
+            .dit_constructed_origins(
+                [
+                    "t_embedder.linear1.weight",
+                    "t_embedder.linear1.bias",
+                    "layers.0.attention.to_q.weight",
+                    "layers.1.attention.to_q.weight",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap();
         assert_eq!(
             (
                 constructed["t_embedder.linear1.weight"].as_str(),

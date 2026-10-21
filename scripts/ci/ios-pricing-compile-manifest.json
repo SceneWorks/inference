@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "88026bcfc6b8cef7d19506c22b54d090c4a5eb33231e3ced4a0cc3e53c4811a4",
+  "rust_proof_closure_sha256": "aadb7a008248e79a66400613bee406db5c1fe988a1e9dc39b0fdeace12bbc1c1",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -380,7 +380,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
-      "sha256": "19a2bdab391b1f1b31059444547eaa275ec57c71e64c3d3c3595a5b355643848"
+      "sha256": "fe15b4991f585cf1e30f8f4520d4fb46747d0c7a216c474f27a1285a279c5409"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
@@ -416,7 +416,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "afd510233e80834223ec61f82c32752ec9a23da0314fe99f10aa2b220de397c0"
+      "sha256": "07ceb2a912dd5afff776087f44f6c93152bbf4661f87dddce55dc757d1984edc"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -460,7 +460,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/pricing.rs",
-      "sha256": "9b880b902eece4be7c5c9ed87ee61c72481c149d3203c88b6d86898b7b37c37b"
+      "sha256": "75e0c46efddfd992196f2a3c6d2730ead8be9f8d9e8a975fc39b127240ca6a82"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
@@ -496,7 +496,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/block_stream.rs",
-      "sha256": "6144c7ebf23d76e37adda43ce8b7d94a01d6f225448c47710b013bcbac3c4c69"
+      "sha256": "d18ad88e7f4b3b7900a9649efc6492b5b0ae08297b376eaeadcffc257a4ebee0"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/comfyui.rs",
@@ -508,7 +508,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer.rs",
-      "sha256": "6bc8c32702fda3b13b60951a052810551517657cb0faf17b24c69c79ee78c604"
+      "sha256": "af9fb43ea97d88445d408ee5d8b607deb48f0d3def90fa0cce643469333b6bc8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer_block.rs",
@@ -520,7 +520,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/feed_forward.rs",
-      "sha256": "d9467e212e75167a650ae1f03c15eb23033e041002f8153cc8a7e9c874852d77"
+      "sha256": "b952eef6a98eb9183eb628a8215cf78815a214c104bb39532c3db53cd146c897"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/final_layer.rs",
@@ -528,27 +528,27 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs",
-      "sha256": "0ad2075671844c0a942797c63bb084f6e826cb0a0fcd4120de6405c01bf7a2f8"
+      "sha256": "6e8141db818fa06e0a3096ad6c368a3c93558e4af25a8bdc2fec957f247642f4"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
-      "sha256": "ffb8fc0dc0920438a95596619482da84ffeca6fec8a40b0e604c0d3095296e24"
+      "sha256": "b129ab4c5b432ceb6b909e35f4bb70171a820c9fe298935ddd68a84c22ea77bc"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
-      "sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1"
+      "sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
-      "sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2"
+      "sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
-      "sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e"
+      "sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing_tests.rs",
-      "sha256": "a0b0fc97622700744da3e5e5f1fbe7773b0d272075542e1116706e79f27b80b1"
+      "sha256": "7c74c6fbff9926cb876c8690292f0b3b265eec9070d49a5c6a9bce9c9dd1f191"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/lib.rs",
@@ -556,7 +556,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/loader.rs",
-      "sha256": "d74534de5aabdd38b13f77b59d6adc8439614b9d15b2c8695fadc4896e6f67a3"
+      "sha256": "d24c95e4f5de94549f180d8545c00dcdd0918f55bb91d5c306d42537c334c5b3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/memory_strategy.rs",
@@ -636,7 +636,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/stream.rs",
-      "sha256": "6493e0bcb60305449957e66f128bf6c68d5009e45ce78e05d23ea9d6e36d7d37"
+      "sha256": "637c2a0b3f5764f2ce66928635b754a6d34643c1c34396d63bcc6c568942c69f"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/timestep_embedder.rs",
@@ -716,11 +716,11 @@
     },
     {
       "path": "crates/media/mlx-gen/src/adapters/loader.rs",
-      "sha256": "7d15f5441c19aa215772e7995c9e071f49a4238ed66dfa0c04ee05d79f0de757"
+      "sha256": "6527abe32bc9ad04c55318c05f0ec7b0a0b0080bb28a537a0b3b9c85a7059ed3"
     },
     {
       "path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs",
-      "sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c"
+      "sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e"
     },
     {
       "path": "crates/media/mlx-gen/src/array.rs",
@@ -740,15 +740,15 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_anchor_law.rs",
-      "sha256": "8f9c03f34095ea5dbaa403eaef5f4b706b395811e04eaa9289598ead4eac6889"
+      "sha256": "ec52f13db70590eb691c2e39e5601bf5212a439a140619389a7e1f8b351b4d97"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
-      "sha256": "8a979e53efa1c92d91deab6bb71254d67cf4604a6dad7fe6772a8c07eee29556"
+      "sha256": "7ad59224cd81a77dd238477b24bbf2046e3b5a34c84a70d6452ded94ab4a7ba2"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
-      "sha256": "853b7ff598afb0b16ffe821dcd33188b5ea4eeaa27d0e032c2c1db4ddf5df869"
+      "sha256": "996ad5e4ba1937fa5ab6ffccde0bfd152ecbea445ad28cd23b5837df59f5ac36"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum_budget.rs",
@@ -756,7 +756,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum_kernels.rs",
-      "sha256": "bbbd80d25558d3766d27077aff2450948ed95825a4fdbf01d5e74eb0ff87f5d9"
+      "sha256": "358e9de0249af3431b670963a4a1a3bf1973c613c07db7a58ac5551da88c1505"
     },
     {
       "path": "crates/media/mlx-gen/src/lib.rs",
@@ -864,7 +864,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm/pricing.rs",
-      "sha256": "75d7895f7f597380d9b70e3c27331ea0800909bfa032149a666e2276a6372c71"
+      "sha256": "a85fee0f2d5a0f5528ce94c36174787ca3380174655aa67996a6790d3d88e13d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources/native_allocations.rs",
@@ -875,7 +875,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::family_validates_actual_stop_order_and_action_multiplicity_not_only_sets",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -887,7 +887,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::callback_error_preserves_same_nonempty_prefix_once_without_replay",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -899,7 +899,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::future_file_io_cannot_preempt_an_earlier_known_parse_failure",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -911,7 +911,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::repeated_literal_paths_keep_file_epochs_and_global_same_target_slots",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -923,7 +923,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::full_alpha_vector_cast_and_orphan_raw_materialization_survive_in_source_work",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -935,7 +935,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::every_existing_unfused_family_produces_and_materializes_its_exact_source_keys",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -947,7 +947,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::packed_tucker_probe_and_full_factor_precedence_keep_shadow_raw_sources",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -959,7 +959,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::sequential_naive_products_preserve_integer_intermediate_and_local_shapes",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -971,7 +971,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::operator_refusals_preserve_only_reached_casts_and_no_successful_output",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -983,7 +983,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::failed_raw_materialization_is_consumed_once_before_any_future_file_observation",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -995,7 +995,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::aggregate_zero_relaxation_does_not_change_successful_semantic_v1_json_or_unknown_targets",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1007,7 +1007,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::enumerator_abort_keeps_actual_pending_prefix_before_any_callback_delivery",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1019,7 +1019,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::same_width_f16_bf16_cast_is_conversion_work_not_source_clone",
-      "source_sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c",
+      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1031,7 +1031,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::actual_utf8_input_bytes_roundtrip_without_prompt_or_synthetic_replay_request",
-      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
+      "source_sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1043,7 +1043,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::missing_is_not_empty_or_fixed300_and_old_successful_non_pid_token_is_identical",
-      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
+      "source_sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1055,7 +1055,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::canonical_a_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec",
-      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
+      "source_sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1067,7 +1067,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::outer_decode_bound_is_inner_limit_plus_tuple_u64_not_a_prompt_cap",
-      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
+      "source_sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1079,7 +1079,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::malformed_outer_tokens_preserve_prefix_lowerhex_tuple_and_version_checks",
-      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
+      "source_sha256": "b10617733e6755327b7da2a8ea6adf88dc95339832c4a53566df2410ce8f548a",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1091,7 +1091,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::same_cache_endpoint_survives_steps_and_count_but_geometry_config_and_domain_do_not_alias",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1103,7 +1103,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::lazy_caption_keeps_full_hidden_parent_and_frozen_old_window_survives_later_graph_detach",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1115,7 +1115,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::initial_noise_and_all_eps_are_distinct_full_resolution_source_factories",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1127,7 +1127,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::row_strip_full_accumulator_and_full_normalizer_remain_coincident_not_tile_sized",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1139,7 +1139,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::composite_consumer_abort_keeps_same_prefix_and_prior_whole_case_only_once",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1151,7 +1151,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::raw_union_is_by_epoch_key_but_alpha_and_constructor_work_is_by_action",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1163,7 +1163,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::operation_identity_never_falls_back_to_first_same_label",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1175,7 +1175,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::retained_endpoint_requires_the_exact_epoch_constructor_and_global_slot",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1187,7 +1187,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::same_global_slot_consumes_cold_recurrent_zero_late_and_serial_history_owners",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1199,7 +1199,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_callback_abort_preserves_prefix_and_previous_whole_windows_once",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1211,7 +1211,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::global_abort_and_all_refused_keep_prior_prices_without_valid_envelope",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1223,7 +1223,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_legacy_listener_enabled_and_disabled_preserves_typed_causes",
-      "source_sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1",
+      "source_sha256": "bf09fda091bd437ed6fdde46526286e10a35a69594bda8ebd8a4f7307267bf72",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 2,
       "expected_logical_targets": 1,
@@ -1303,7 +1303,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_gathered_affine_preserves_actual_batch_rank_layout_and_single_output_source",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,
@@ -1315,7 +1315,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_affine_shape_only_or_wrong_slot_provenance_is_not_a_layout_certificate",
-      "source_sha256": "e472633a6a0da75014b65929001cd871a4235552dfa083addd2290cdfed6deb2",
+      "source_sha256": "f7b3d2773762ec73089efa0e6f6815891932bb5e7e905afaa1ed15b9bb0165fc",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,
@@ -1430,8 +1430,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "c32b87d09c235e03e6c1c25b1db291332c6a3692569b9f9e7cbf9f74999d5a47",
-    "classification_sha256": "672e1e7c1454be9d65a04d04fcf12f777975ca0e9a35de65611c072843401a2a",
+    "inventory_sha256": "d67b14d6bc772502a6a4b210a58b91ba06c5d8048e5d9fcfa0d28fd87ad105c5",
+    "classification_sha256": "55e75040d1002aceb7457ef0861bdf4b4e1b339d862bcac4091d282c048abc33",
     "selected_Rust_FQNs": 97,
     "HOST_logical": 84,
     "HOST_expected_PASS_rows": 85,

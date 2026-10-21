@@ -140,7 +140,12 @@ impl ConvCall {
     /// The same call geometry from actual OHWI axes and PRECAST weight bytes PER ELEMENT.
     /// This constructs no Array and preserves the native constructor's arithmetic/dispatch.
     pub fn from_metadata(
-        x: &[i32], act: u64, w: &[i32], weight_element_bytes: u64, stride: i32, pad: i32,
+        x: &[i32],
+        act: u64,
+        w: &[i32],
+        weight_element_bytes: u64,
+        stride: i32,
+        pad: i32,
     ) -> Self {
         let out = |n: i32, k: i32| u((n + 2 * pad - k) / stride.max(1) + 1);
         Self {
@@ -342,18 +347,40 @@ pub fn resnet_bytes(
     backend: Backend,
 ) -> u64 {
     resnet_bytes_from_metadata(
-        x, act_in, act_out, conv1.shape(), element_bytes(conv1),
-        conv2.shape(), element_bytes(conv2), backend,
+        x,
+        act_in,
+        act_out,
+        ConvOperandMetadata {
+            shape: conv1.shape(),
+            element_bytes: element_bytes(conv1),
+        },
+        ConvOperandMetadata {
+            shape: conv2.shape(),
+            element_bytes: element_bytes(conv2),
+        },
+        backend,
     )
+}
+
+/// A convolution weight's actual OHWI geometry and PRECAST bytes per element (metadata only).
+#[derive(Clone, Copy, Debug)]
+pub struct ConvOperandMetadata<'a> {
+    pub shape: &'a [i32],
+    pub element_bytes: u64,
 }
 
 /// Exact resnet_bytes formula over actual OHWI geometry and PRECAST bytes PER ELEMENT.
 /// Metadata is not backing identity, a physical/RSS bound or a new shape-validation policy.
 pub fn resnet_bytes_from_metadata(
-    x: &[i32], act_in: u64, act_out: u64,
-    conv1_shape: &[i32], conv1_element_bytes: u64,
-    conv2_shape: &[i32], conv2_element_bytes: u64, backend: Backend,
+    x: &[i32],
+    act_in: u64,
+    act_out: u64,
+    conv1: ConvOperandMetadata<'_>,
+    conv2: ConvOperandMetadata<'_>,
+    backend: Backend,
 ) -> u64 {
+    let (conv1_shape, conv1_element_bytes) = (conv1.shape, conv1.element_bytes);
+    let (conv2_shape, conv2_element_bytes) = (conv2.shape, conv2.element_bytes);
     let (cin, cout) = (conv1_shape[conv1_shape.len() - 1], conv1_shape[0]);
     let act_out = act_out.max(act_in);
     let input = [x[0], x[1], x[2], cin];
@@ -487,15 +514,27 @@ pub fn tile_bytes(
     f32_accum: bool,
     backend: Backend,
 ) -> u64 {
-    tile_bytes_from_metadata(tile, source, act, weight.shape(), element_bytes(weight), f32_accum, backend)
+    tile_bytes_from_metadata(
+        tile,
+        source,
+        act,
+        weight.shape(),
+        element_bytes(weight),
+        f32_accum,
+        backend,
+    )
 }
 
 /// The identical existing raw guard formula over exact operand metadata; no native graph,
 /// new rank/cap/policy, allocation identity or physical-transfer certificate.
 pub fn tile_bytes_from_metadata(
-    tile: &[i32], source: TileSource, act: u64,
-    weight_shape: &[i32], weight_element_bytes: u64,
-    f32_accum: bool, backend: Backend,
+    tile: &[i32],
+    source: TileSource,
+    act: u64,
+    weight_shape: &[i32],
+    weight_element_bytes: u64,
+    f32_accum: bool,
+    backend: Backend,
 ) -> u64 {
     let conv_act = if f32_accum { 4 } else { act };
     let call = ConvCall::from_metadata(tile, conv_act, weight_shape, weight_element_bytes, 1, 1);
@@ -558,7 +597,11 @@ pub fn downsample_tile_bytes(crop: &[i32], act: u64, weight: &Array, backend: Ba
 /// The identical existing raw guard formula over exact operand metadata; no native graph,
 /// new rank/cap/policy, allocation identity or physical-transfer certificate.
 pub fn downsample_tile_bytes_from_metadata(
-    crop: &[i32], act: u64, weight_shape: &[i32], weight_element_bytes: u64, backend: Backend,
+    crop: &[i32],
+    act: u64,
+    weight_shape: &[i32],
+    weight_element_bytes: u64,
+    backend: Backend,
 ) -> u64 {
     let call = ConvCall::from_metadata(crop, act, weight_shape, weight_element_bytes, 2, 0);
     single_conv_bytes(&call, 1, 0, backend)
@@ -575,7 +618,11 @@ pub fn tiled_stage_f32_accum(out: &[i32], weight: &Array, bias: &Array, act: u64
 /// The identical existing raw guard formula over exact operand metadata; no native graph,
 /// new rank/cap/policy, allocation identity or physical-transfer certificate.
 pub fn tiled_stage_f32_accum_from_metadata(
-    out: &[i32], weight_shape: &[i32], weight_elements: u64, bias_elements: u64, act: u64,
+    out: &[i32],
+    weight_shape: &[i32],
+    weight_elements: u64,
+    bias_elements: u64,
+    act: u64,
 ) -> u64 {
     let (cin, cout) = (weight_shape[weight_shape.len() - 1], weight_shape[0]);
     tiled_stage_bytes(out, cin, cout, act, false)
@@ -596,269 +643,403 @@ pub fn decoded_to_image_bytes_from_metadata(decoded_elements: u64) -> u64 {
     super::elementwise_bytes(decoded_elements, 1).saturating_add(page_slack(1))
 }
 
-
 #[cfg(all(test, target_os = "macos"))]
 mod metadata_constructor_tests {
     use super::*;
     // Independent OLD A6224 literal math, NOT the new helper used as its own oracle.
     const OLD_GROUP_NORM_BUFFERS: u64 = 5;
     const OLD_PAGE_BYTES: u64 = 16 * 1024;
-fn old_u(v: i32) -> u64 {
-    v.max(0) as u64
-}
-
-fn old_product(values: &[u64]) -> u64 {
-    values.iter().fold(1u64, |a, b| a.saturating_mul(*b))
-}
-
-pub fn old_tensor_bytes(element_bytes: u64, dims: &[u64]) -> u64 {
-    old_product(&[old_product(dims), element_bytes])
-}
-
-pub fn old_norm_promotion_units(backend: Backend, act: u64) -> u64 {
-    match backend {
-        Backend::Cpu if act < 4 => 3 * 4 / act.max(1),
-        _ => 0,
+    fn old_u(v: i32) -> u64 {
+        v.max(0) as u64
     }
-}
 
-pub fn old_group_norm_buffers(backend: Backend, act: u64) -> u64 {
-    OLD_GROUP_NORM_BUFFERS + old_norm_promotion_units(backend, act)
-}
+    fn old_product(values: &[u64]) -> u64 {
+        values.iter().fold(1u64, |a, b| a.saturating_mul(*b))
+    }
 
-pub fn old_page_slack(buffers: u64) -> u64 {
-    buffers.saturating_mul(OLD_PAGE_BYTES)
-}
+    pub fn old_tensor_bytes(element_bytes: u64, dims: &[u64]) -> u64 {
+        old_product(&[old_product(dims), element_bytes])
+    }
 
-fn old_conv_channels(s: &[i32]) -> (i32, i32) { (s[s.len() - 1], s[0]) }
-
-#[derive(Clone, Copy)]
-struct OldConvCall {
-    batch: u64, in_h: u64, in_w: u64, cin: u64,
-    out_h: u64, out_w: u64, cout: u64, kh: u64, kw: u64,
-    stride: u64, pad: u64, act: u64, weight: u64,
-}
-
-impl OldConvCall {
-    /// `x`: the convolution's NHWC input shape; `weight`: the `[out, kH, kW, in]` weight it runs.
-    fn new(x: &[i32], act: u64, w: &[i32], weight_width: u64, stride: i32, pad: i32) -> Self {
-        let out = |n: i32, k: i32| old_u((n + 2 * pad - k) / stride.max(1) + 1);
-        Self {
-            batch: old_u(x[0]),
-            in_h: old_u(x[1]),
-            in_w: old_u(x[2]),
-            cin: old_u(w[3]),
-            out_h: out(x[1], w[1]),
-            out_w: out(x[2], w[2]),
-            cout: old_u(w[0]),
-            kh: old_u(w[1]),
-            kw: old_u(w[2]),
-            stride: old_u(stride),
-            pad: old_u(pad),
-            act,
-            weight: weight_width,
+    pub fn old_norm_promotion_units(backend: Backend, act: u64) -> u64 {
+        match backend {
+            Backend::Cpu if act < 4 => 3 * 4 / act.max(1),
+            _ => 0,
         }
     }
 
-    /// Bytes of the call's input at its activation width.
-    pub fn in_bytes(&self) -> u64 {
-        old_tensor_bytes(self.act, &[self.batch, self.in_h, self.in_w, self.cin])
+    pub fn old_group_norm_buffers(backend: Backend, act: u64) -> u64 {
+        OLD_GROUP_NORM_BUFFERS + old_norm_promotion_units(backend, act)
     }
 
-    /// Bytes of the call's output at its activation width.
-    pub fn out_bytes(&self) -> u64 {
-        old_tensor_bytes(self.act, &[self.batch, self.out_h, self.out_w, self.cout])
+    pub fn old_page_slack(buffers: u64) -> u64 {
+        buffers.saturating_mul(OLD_PAGE_BYTES)
     }
 
-    /// Elements of the call's `[out, kH, kW, in]` weight.
-    pub fn weight_elements(&self) -> u64 {
-        [self.cout, self.kh, self.kw, self.cin]
-            .iter()
-            .fold(1u64, |a, b| a.saturating_mul(*b))
+    fn old_conv_channels(s: &[i32]) -> (i32, i32) {
+        (s[s.len() - 1], s[0])
     }
-
-    /// Whether MLX's Metal `dispatch_conv_2D_gpu` routes this call to `winograd_conv_2D_gpu`
-    /// (a 3x3, stride-1, ungrouped, unflipped call with 32-aligned channels, `N·H·W ≥ 4096` and
-    /// `C + O ≥ 256`).
-    pub fn winograd(&self) -> bool {
-        self.kh == 3
-            && self.kw == 3
-            && self.stride == 1
-            && self.cin.is_multiple_of(32)
-            && self.cout.is_multiple_of(32)
-            && self.batch * self.in_h * self.in_w >= 4096
-            && self.cin + self.cout >= 256
-    }
-
-    /// The bytes this call's kernel allocates beside its input and output, on `backend`:
-    ///
-    /// * Metal (`conv_2D_gpu`): `ensure_row_contiguous(wt)` copies the weight, which a diffusers
-    ///   VAE holds as an NHWC transposed VIEW of its NCHW checkpoint tensor — at the activation
-    ///   promoted width. The frontend dtype cast preserves dense transposed strides, so it is
-    ///   counted separately from this layout preparation; Winograd (`winograd_conv_2D_gpu`) adds the
-    ///   zero-padded input `[N, 6⌈(H+2p−2)/6⌉+2, …, C]`, the transformed input `[64, tiles, C]`,
-    ///   output `[64, tiles, O]` and filter `[64, C, O]` (`tiles = N⌈oH/6⌉⌈oW/6⌉`).
-    /// * CPU (`explicit_gemm_conv_ND_cpu`): an f32 padded input, the f32 im2col
-    ///   `[N·oH·oW, kH·kW·C]`, an f32 weight copy (non-contiguous or non-f32), and an f32 GEMM
-    ///   output when the activation is narrower.
-    pub fn transient(&self, backend: Backend) -> u64 {
-        let weight_copy = |width: u64| self.weight_elements().saturating_mul(width);
-        let promoted = self.act.max(self.weight);
-        // CPU and GPU AsType both preserve a dense transposed input's strides (Vector copy).
-        // The frontend cast is therefore NOT the backend's later row-contiguous preparation.
-        let frontend = if self.weight < promoted {
-            weight_copy(promoted)
-        } else {
-            0
-        } + if self.act < promoted {
-            old_tensor_bytes(promoted, &[self.batch, self.in_h, self.in_w, self.cin])
-        } else {
-            0
-        };
-        let kernel = match backend {
-            Backend::Metal => {
-                let mut bytes = weight_copy(self.weight.max(self.act));
-                if self.winograd() {
-                    let padded = |n: u64| 6 * (n + 2 * self.pad).saturating_sub(2).div_ceil(6) + 2;
-                    let tiles = self.batch * self.out_h.div_ceil(6) * self.out_w.div_ceil(6);
-                    bytes = bytes
-                        .saturating_add(old_tensor_bytes(
-                            promoted,
-                            &[self.batch, padded(self.in_h), padded(self.in_w), self.cin],
-                        ))
-                        .saturating_add(old_tensor_bytes(promoted, &[64, tiles, self.cin]))
-                        .saturating_add(old_tensor_bytes(promoted, &[64, tiles, self.cout]))
-                        .saturating_add(old_tensor_bytes(promoted, &[64, self.cin, self.cout]));
-                }
-                bytes
-            }
-            Backend::Cpu => {
-                let rows = self.batch * self.out_h * self.out_w;
-                let mut bytes = old_tensor_bytes(
-                    4,
-                    &[
-                        self.batch,
-                        self.in_h + 2 * self.pad,
-                        self.in_w + 2 * self.pad,
-                        self.cin,
-                    ],
-                )
-                .saturating_add(old_tensor_bytes(4, &[rows, self.kh * self.kw * self.cin]))
-                .saturating_add(weight_copy(4));
-                if promoted != 4 {
-                    bytes = bytes.saturating_add(old_tensor_bytes(4, &[rows, self.cout]));
-                }
-                bytes
-            }
-        };
-        kernel.saturating_add(frontend)
-    }
-}
-fn old_resnet(x: &[i32], act_in: u64, act_out: u64, conv1: &[i32], width1: u64, conv2: &[i32], width2: u64, backend: Backend) -> u64 {
-    let (cin, cout) = old_conv_channels(conv1);
-    let act_out = act_out.max(act_in);
-    let input = [x[0], x[1], x[2], cin];
-    let c1 = OldConvCall::new(&input, act_in, conv1, width1, 1, 1);
-    let mid = [x[0], x[1], x[2], old_conv_channels(conv2).0];
-    let c2 = OldConvCall::new(&mid, act_out, conv2, width2, 1, 1);
-    let concat = u64::from(cin != x[3]);
-    let shortcut = u64::from(cin != cout);
-    let widened = u64::from(act_out > act_in);
-    let in_units = concat + old_group_norm_buffers(backend, act_in) + 1;
-    let narrow_out = 1 + shortcut;
-    let wide_out = widened + old_group_norm_buffers(backend, act_out) + 1 + 1;
-    let out = |width: u64, units: u64| {
-        old_tensor_bytes(width, &[old_u(x[0]), old_u(x[1]), old_u(x[2]), old_u(cout)]).saturating_mul(units)
-    };
-    let buffers = in_units + narrow_out + wide_out + 10;
-    c1.in_bytes()
-        .saturating_mul(in_units)
-        .saturating_add(out(act_in, narrow_out))
-        .saturating_add(out(act_out, wide_out))
-        .saturating_add(c1.transient(backend))
-        .saturating_add(c2.transient(backend))
-        .saturating_add(old_page_slack(buffers))
-}
 
     #[derive(Clone, Copy)]
-    struct Case { x: [i32; 4], c1: [i32; 4], c2: [i32; 4] }
+    struct OldConvCall {
+        batch: u64,
+        in_h: u64,
+        in_w: u64,
+        cin: u64,
+        out_h: u64,
+        out_w: u64,
+        cout: u64,
+        kh: u64,
+        kw: u64,
+        stride: u64,
+        pad: u64,
+        act: u64,
+        weight: u64,
+    }
+
+    impl OldConvCall {
+        /// `x`: the convolution's NHWC input shape; `weight`: the `[out, kH, kW, in]` weight it runs.
+        fn new(x: &[i32], act: u64, w: &[i32], weight_width: u64, stride: i32, pad: i32) -> Self {
+            let out = |n: i32, k: i32| old_u((n + 2 * pad - k) / stride.max(1) + 1);
+            Self {
+                batch: old_u(x[0]),
+                in_h: old_u(x[1]),
+                in_w: old_u(x[2]),
+                cin: old_u(w[3]),
+                out_h: out(x[1], w[1]),
+                out_w: out(x[2], w[2]),
+                cout: old_u(w[0]),
+                kh: old_u(w[1]),
+                kw: old_u(w[2]),
+                stride: old_u(stride),
+                pad: old_u(pad),
+                act,
+                weight: weight_width,
+            }
+        }
+
+        /// Bytes of the call's input at its activation width.
+        pub fn in_bytes(&self) -> u64 {
+            old_tensor_bytes(self.act, &[self.batch, self.in_h, self.in_w, self.cin])
+        }
+
+        /// Bytes of the call's output at its activation width.
+        pub fn out_bytes(&self) -> u64 {
+            old_tensor_bytes(self.act, &[self.batch, self.out_h, self.out_w, self.cout])
+        }
+
+        /// Elements of the call's `[out, kH, kW, in]` weight.
+        pub fn weight_elements(&self) -> u64 {
+            [self.cout, self.kh, self.kw, self.cin]
+                .iter()
+                .fold(1u64, |a, b| a.saturating_mul(*b))
+        }
+
+        /// Whether MLX's Metal `dispatch_conv_2D_gpu` routes this call to `winograd_conv_2D_gpu`
+        /// (a 3x3, stride-1, ungrouped, unflipped call with 32-aligned channels, `N·H·W ≥ 4096` and
+        /// `C + O ≥ 256`).
+        pub fn winograd(&self) -> bool {
+            self.kh == 3
+                && self.kw == 3
+                && self.stride == 1
+                && self.cin.is_multiple_of(32)
+                && self.cout.is_multiple_of(32)
+                && self.batch * self.in_h * self.in_w >= 4096
+                && self.cin + self.cout >= 256
+        }
+
+        /// The bytes this call's kernel allocates beside its input and output, on `backend`:
+        ///
+        /// * Metal (`conv_2D_gpu`): `ensure_row_contiguous(wt)` copies the weight, which a diffusers
+        ///   VAE holds as an NHWC transposed VIEW of its NCHW checkpoint tensor — at the activation
+        ///   promoted width. The frontend dtype cast preserves dense transposed strides, so it is
+        ///   counted separately from this layout preparation; Winograd (`winograd_conv_2D_gpu`) adds the
+        ///   zero-padded input `[N, 6⌈(H+2p−2)/6⌉+2, …, C]`, the transformed input `[64, tiles, C]`,
+        ///   output `[64, tiles, O]` and filter `[64, C, O]` (`tiles = N⌈oH/6⌉⌈oW/6⌉`).
+        /// * CPU (`explicit_gemm_conv_ND_cpu`): an f32 padded input, the f32 im2col
+        ///   `[N·oH·oW, kH·kW·C]`, an f32 weight copy (non-contiguous or non-f32), and an f32 GEMM
+        ///   output when the activation is narrower.
+        pub fn transient(&self, backend: Backend) -> u64 {
+            let weight_copy = |width: u64| self.weight_elements().saturating_mul(width);
+            let promoted = self.act.max(self.weight);
+            // CPU and GPU AsType both preserve a dense transposed input's strides (Vector copy).
+            // The frontend cast is therefore NOT the backend's later row-contiguous preparation.
+            let frontend = if self.weight < promoted {
+                weight_copy(promoted)
+            } else {
+                0
+            } + if self.act < promoted {
+                old_tensor_bytes(promoted, &[self.batch, self.in_h, self.in_w, self.cin])
+            } else {
+                0
+            };
+            let kernel = match backend {
+                Backend::Metal => {
+                    let mut bytes = weight_copy(self.weight.max(self.act));
+                    if self.winograd() {
+                        let padded =
+                            |n: u64| 6 * (n + 2 * self.pad).saturating_sub(2).div_ceil(6) + 2;
+                        let tiles = self.batch * self.out_h.div_ceil(6) * self.out_w.div_ceil(6);
+                        bytes = bytes
+                            .saturating_add(old_tensor_bytes(
+                                promoted,
+                                &[self.batch, padded(self.in_h), padded(self.in_w), self.cin],
+                            ))
+                            .saturating_add(old_tensor_bytes(promoted, &[64, tiles, self.cin]))
+                            .saturating_add(old_tensor_bytes(promoted, &[64, tiles, self.cout]))
+                            .saturating_add(old_tensor_bytes(promoted, &[64, self.cin, self.cout]));
+                    }
+                    bytes
+                }
+                Backend::Cpu => {
+                    let rows = self.batch * self.out_h * self.out_w;
+                    let mut bytes = old_tensor_bytes(
+                        4,
+                        &[
+                            self.batch,
+                            self.in_h + 2 * self.pad,
+                            self.in_w + 2 * self.pad,
+                            self.cin,
+                        ],
+                    )
+                    .saturating_add(old_tensor_bytes(4, &[rows, self.kh * self.kw * self.cin]))
+                    .saturating_add(weight_copy(4));
+                    if promoted != 4 {
+                        bytes = bytes.saturating_add(old_tensor_bytes(4, &[rows, self.cout]));
+                    }
+                    bytes
+                }
+            };
+            kernel.saturating_add(frontend)
+        }
+    }
+    fn old_resnet(
+        x: &[i32],
+        act_in: u64,
+        act_out: u64,
+        conv1: &[i32],
+        width1: u64,
+        conv2: &[i32],
+        width2: u64,
+        backend: Backend,
+    ) -> u64 {
+        let (cin, cout) = old_conv_channels(conv1);
+        let act_out = act_out.max(act_in);
+        let input = [x[0], x[1], x[2], cin];
+        let c1 = OldConvCall::new(&input, act_in, conv1, width1, 1, 1);
+        let mid = [x[0], x[1], x[2], old_conv_channels(conv2).0];
+        let c2 = OldConvCall::new(&mid, act_out, conv2, width2, 1, 1);
+        let concat = u64::from(cin != x[3]);
+        let shortcut = u64::from(cin != cout);
+        let widened = u64::from(act_out > act_in);
+        let in_units = concat + old_group_norm_buffers(backend, act_in) + 1;
+        let narrow_out = 1 + shortcut;
+        let wide_out = widened + old_group_norm_buffers(backend, act_out) + 1 + 1;
+        let out = |width: u64, units: u64| {
+            old_tensor_bytes(width, &[old_u(x[0]), old_u(x[1]), old_u(x[2]), old_u(cout)])
+                .saturating_mul(units)
+        };
+        let buffers = in_units + narrow_out + wide_out + 10;
+        c1.in_bytes()
+            .saturating_mul(in_units)
+            .saturating_add(out(act_in, narrow_out))
+            .saturating_add(out(act_out, wide_out))
+            .saturating_add(c1.transient(backend))
+            .saturating_add(c2.transient(backend))
+            .saturating_add(old_page_slack(buffers))
+    }
+
+    #[derive(Clone, Copy)]
+    struct Case {
+        x: [i32; 4],
+        c1: [i32; 4],
+        c2: [i32; 4],
+    }
     const CASES: [Case; 5] = [
-        Case { x: [1,7,9,32], c1: [32,3,3,32], c2: [32,3,3,32] },
-        Case { x: [1,7,9,32], c1: [64,3,3,64], c2: [64,3,3,64] },
-        Case { x: [1,7,9,32], c1: [64,3,3,32], c2: [64,3,3,64] },
-        Case { x: [1,7,9,32], c1: [96,3,3,64], c2: [96,3,3,96] },
-        Case { x: [1,64,64,128], c1: [128,3,3,128], c2: [128,3,3,128] },
+        Case {
+            x: [1, 7, 9, 32],
+            c1: [32, 3, 3, 32],
+            c2: [32, 3, 3, 32],
+        },
+        Case {
+            x: [1, 7, 9, 32],
+            c1: [64, 3, 3, 64],
+            c2: [64, 3, 3, 64],
+        },
+        Case {
+            x: [1, 7, 9, 32],
+            c1: [64, 3, 3, 32],
+            c2: [64, 3, 3, 64],
+        },
+        Case {
+            x: [1, 7, 9, 32],
+            c1: [96, 3, 3, 64],
+            c2: [96, 3, 3, 96],
+        },
+        Case {
+            x: [1, 64, 64, 128],
+            c1: [128, 3, 3, 128],
+            c2: [128, 3, 3, 128],
+        },
     ];
     const GEOMETRIES: [([i32; 4], [i32; 4], i32, i32); 3] = [
-        ([1,7,9,32], [64,1,1,32], 1, 0),
-        ([1,7,9,32], [64,3,3,32], 2, 1),
-        ([1,9,11,32], [64,5,3,32], 2, 0),
+        ([1, 7, 9, 32], [64, 1, 1, 32], 1, 0),
+        ([1, 7, 9, 32], [64, 3, 3, 32], 2, 1),
+        ([1, 9, 11, 32], [64, 5, 3, 32], 2, 0),
     ];
 
     #[test]
     fn old_literal_formula_matches_metadata_and_preserves_last_axis() {
         for case in CASES {
-            for (wi, wo) in [(2,2), (2,4), (4,2), (4,4)] {
-                for (ai, ao) in [(2,2), (2,4), (4,2), (4,4)] {
+            for (wi, wo) in [(2, 2), (2, 4), (4, 2), (4, 4)] {
+                for (ai, ao) in [(2, 2), (2, 4), (4, 2), (4, 4)] {
                     for backend in [Backend::Cpu, Backend::Metal] {
                         // Defect map: lost concat/shortcut/widen/norm/transient/page formula term.
-                        let expected = old_resnet(&case.x, ai, ao, &case.c1, wi, &case.c2, wo, backend);
-                        assert_eq!(resnet_bytes_from_metadata(&case.x, ai, ao, &case.c1, wi, &case.c2, wo, backend), expected,
+                        let expected =
+                            old_resnet(&case.x, ai, ao, &case.c1, wi, &case.c2, wo, backend);
+                        assert_eq!(resnet_bytes_from_metadata(&case.x, ai, ao, ConvOperandMetadata { shape: &case.c1, element_bytes: wi }, ConvOperandMetadata { shape: &case.c2, element_bytes: wo }, backend), expected,
                             "ROOT_OLD_LITERAL_RESNET x={:?} weights={wi}/{wo} activation={ai}/{ao} backend={backend:?}", case.x);
                     }
                 }
             }
         }
         for (x, w, stride, pad) in GEOMETRIES {
-            for (act, width) in [(2,2), (2,4), (4,2), (4,4)] {
+            for (act, width) in [(2, 2), (2, 4), (4, 2), (4, 4)] {
                 let old = OldConvCall::new(&x, act, &w, width, stride, pad);
                 let actual = ConvCall::from_metadata(&x, act, &w, width, stride, pad);
-                assert_eq!(actual.in_bytes(), old.in_bytes(), "ROOT_OLD_LITERAL_CONV_INPUT");
-                assert_eq!(actual.out_bytes(), old.out_bytes(), "ROOT_OLD_LITERAL_CONV_OUTPUT");
-                assert_eq!(actual.weight_elements(), old.weight_elements(), "ROOT_OLD_LITERAL_CONV_WEIGHT");
-                assert_eq!(actual.winograd(), old.winograd(), "ROOT_OLD_LITERAL_DISPATCH");
+                assert_eq!(
+                    actual.in_bytes(),
+                    old.in_bytes(),
+                    "ROOT_OLD_LITERAL_CONV_INPUT"
+                );
+                assert_eq!(
+                    actual.out_bytes(),
+                    old.out_bytes(),
+                    "ROOT_OLD_LITERAL_CONV_OUTPUT"
+                );
+                assert_eq!(
+                    actual.weight_elements(),
+                    old.weight_elements(),
+                    "ROOT_OLD_LITERAL_CONV_WEIGHT"
+                );
+                assert_eq!(
+                    actual.winograd(),
+                    old.winograd(),
+                    "ROOT_OLD_LITERAL_DISPATCH"
+                );
                 for backend in [Backend::Cpu, Backend::Metal] {
-                    assert_eq!(actual.transient(backend), old.transient(backend), "ROOT_OLD_LITERAL_TRANSIENT");
+                    assert_eq!(
+                        actual.transient(backend),
+                        old.transient(backend),
+                        "ROOT_OLD_LITERAL_TRANSIENT"
+                    );
                 }
             }
         }
-        let x = [1,7,9,32];
-        let c1 = [64,3,3,32,64];
-        let c2 = [64,3,3,64,32];
+        let x = [1, 7, 9, 32];
+        let c1 = [64, 3, 3, 32, 64];
+        let c2 = [64, 3, 3, 64, 32];
         assert_eq!(old_conv_channels(&c1).0, 64, "ROOT_OLD_LAST_AXIS");
-        assert_eq!(ConvCall::from_metadata(&x, 2, &c1, 2, 1, 1).cin, 32, "ROOT_CONVCALL_AXIS3");
+        assert_eq!(
+            ConvCall::from_metadata(&x, 2, &c1, 2, 1, 1).cin,
+            32,
+            "ROOT_CONVCALL_AXIS3"
+        );
         for backend in [Backend::Cpu, Backend::Metal] {
             let expected = old_resnet(&x, 2, 4, &c1, 2, &c2, 4, backend);
-            assert_eq!(resnet_bytes_from_metadata(&x, 2, 4, &c1, 2, &c2, 4, backend), expected,
-                "ROOT_ODD_METADATA_LAST_AXIS_NOT_AXIS3");
-            let wrong1 = [64,3,3,32,32];
-            let wrong2 = [64,3,3,64,64];
-            assert_ne!(expected, old_resnet(&x, 2, 4, &wrong1, 2, &wrong2, 4, backend),
-                "ROOT_ODD_CASE_MUST_DISCRIMINATE_AXIS3");
+            assert_eq!(
+                resnet_bytes_from_metadata(
+                    &x,
+                    2,
+                    4,
+                    ConvOperandMetadata {
+                        shape: &c1,
+                        element_bytes: 2
+                    },
+                    ConvOperandMetadata {
+                        shape: &c2,
+                        element_bytes: 4
+                    },
+                    backend
+                ),
+                expected,
+                "ROOT_ODD_METADATA_LAST_AXIS_NOT_AXIS3"
+            );
+            let wrong1 = [64, 3, 3, 32, 32];
+            let wrong2 = [64, 3, 3, 64, 64];
+            assert_ne!(
+                expected,
+                old_resnet(&x, 2, 4, &wrong1, 2, &wrong2, 4, backend),
+                "ROOT_ODD_CASE_MUST_DISCRIMINATE_AXIS3"
+            );
         }
         let c = CASES[0];
         let correct = old_resnet(&c.x, 4, 4, &c.c1, 2, &c.c2, 2, Backend::Cpu);
-        assert_ne!(correct, resnet_bytes_from_metadata(&c.x, 4, 4, &c.c1, 4, &c.c2, 4, Backend::Cpu),
-            "ROOT_PRECAST_NOT_PROMOTED_WIDTH");
+        assert_ne!(
+            correct,
+            resnet_bytes_from_metadata(
+                &c.x,
+                4,
+                4,
+                ConvOperandMetadata {
+                    shape: &c.c1,
+                    element_bytes: 4
+                },
+                ConvOperandMetadata {
+                    shape: &c.c2,
+                    element_bytes: 4
+                },
+                Backend::Cpu
+            ),
+            "ROOT_PRECAST_NOT_PROMOTED_WIDTH"
+        );
         let nbytes = old_u(c.c1[0]) * old_u(c.c1[1]) * old_u(c.c1[2]) * old_u(c.c1[3]) * 2;
-        assert_ne!(correct, resnet_bytes_from_metadata(&c.x, 4, 4, &c.c1, nbytes, &c.c2, nbytes, Backend::Cpu),
-            "ROOT_ITEM_WIDTH_NOT_NBYTES");
+        assert_ne!(
+            correct,
+            resnet_bytes_from_metadata(
+                &c.x,
+                4,
+                4,
+                ConvOperandMetadata {
+                    shape: &c.c1,
+                    element_bytes: nbytes
+                },
+                ConvOperandMetadata {
+                    shape: &c.c2,
+                    element_bytes: nbytes
+                },
+                Backend::Cpu
+            ),
+            "ROOT_ITEM_WIDTH_NOT_NBYTES"
+        );
     }
 
     const CHILD: &str = "MLX_ROOT_METADATA_CPU_CHILD";
     const DONE: &str = "MLX_ROOT_METADATA_CPU_DONE";
     const FQN: &str = "ios_quantum::kernels::metadata_constructor_tests::actual_precast_weights_match_old_literal_formula_cpu_child";
     const CASE_MASK: u64 = (1u64 << 36) - 1;
-    struct Completion { cases: u64, geometry: u8 }
+    struct Completion {
+        cases: u64,
+        geometry: u8,
+    }
     impl Drop for Completion {
         fn drop(&mut self) {
             if !std::thread::panicking() {
                 assert_eq!(self.cases, CASE_MASK, "ROOT_NATIVE_CASE_MASK");
                 assert_eq!(self.geometry, 7, "ROOT_NATIVE_GEOMETRY_MASK");
-                assert_eq!(unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) }, 0,
-                    "ROOT_METADATA_FINAL_CPU_SYNC");
-                eprintln!("ROOT_METADATA_BODY_COMPLETED_V1 native_cases=36 geometries=3 cpu_sync=0");
-                std::fs::write(std::env::var(DONE).expect("ROOT_METADATA_PARENT_DONE"), b"ok").unwrap();
+                assert_eq!(
+                    unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+                    0,
+                    "ROOT_METADATA_FINAL_CPU_SYNC"
+                );
+                eprintln!(
+                    "ROOT_METADATA_BODY_COMPLETED_V1 native_cases=36 geometries=3 cpu_sync=0"
+                );
+                std::fs::write(
+                    std::env::var(DONE).expect("ROOT_METADATA_PARENT_DONE"),
+                    b"ok",
+                )
+                .unwrap();
             }
         }
     }
@@ -866,31 +1047,66 @@ fn old_resnet(x: &[i32], act_in: u64, act_out: u64, conv1: &[i32], width1: u64, 
         if std::env::var_os(CHILD).is_none() {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join("done");
-            assert!(marker.is_absolute() && !marker.exists(), "ROOT_METADATA_FRESH_PARENT_DONE");
+            assert!(
+                marker.is_absolute() && !marker.exists(),
+                "ROOT_METADATA_FRESH_PARENT_DONE"
+            );
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1").env(DONE, &marker).status().unwrap();
+                .env(CHILD, "1")
+                .env(DONE, &marker)
+                .status()
+                .unwrap();
             assert!(status.success(), "ROOT_METADATA_CHILD_STATUS");
             assert!(marker.is_file(), "ROOT_METADATA_CHILD_BODY_MISSING");
-            assert_eq!(std::fs::read(marker).unwrap().as_slice(), b"ok", "ROOT_METADATA_CHILD_DONE_CONTENT");
+            assert_eq!(
+                std::fs::read(marker).unwrap().as_slice(),
+                b"ok",
+                "ROOT_METADATA_CHILD_DONE_CONTENT"
+            );
             return false;
         }
-        let marker = std::path::PathBuf::from(std::env::var(DONE).expect("ROOT_METADATA_REQUIRES_PARENT_DONE"));
+        let marker = std::path::PathBuf::from(
+            std::env::var(DONE).expect("ROOT_METADATA_REQUIRES_PARENT_DONE"),
+        );
         assert!(marker.is_absolute(), "ROOT_METADATA_DONE_ABSOLUTE");
         assert!(!marker.exists(), "ROOT_METADATA_DONE_FRESH");
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
-        assert_eq!(mlx_rs::Device::try_default().unwrap(), mlx_rs::Device::cpu(), "ROOT_METADATA_CPU_DEVICE");
-        assert_eq!(unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) }, 0, "ROOT_METADATA_CPU_DEFAULT_STREAM");
-        assert_eq!(mlx_rs::Stream::new().get_index().unwrap(), mlx_rs::Stream::cpu().get_index().unwrap(), "ROOT_METADATA_CPU_STREAM_READBACK");
-        assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal(), "ROOT_METADATA_METAL_TRAP");
-        assert!(crate::ios_quantum::quantum_metal_guard::metal_forbidden(), "ROOT_METADATA_METAL_TRAP_READBACK");
-        eprintln!("ROOT_METADATA_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1");
+        assert_eq!(
+            mlx_rs::Device::try_default().unwrap(),
+            mlx_rs::Device::cpu(),
+            "ROOT_METADATA_CPU_DEVICE"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0,
+            "ROOT_METADATA_CPU_DEFAULT_STREAM"
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap(),
+            "ROOT_METADATA_CPU_STREAM_READBACK"
+        );
+        assert!(
+            crate::ios_quantum::quantum_metal_guard::forbid_metal(),
+            "ROOT_METADATA_METAL_TRAP"
+        );
+        assert!(
+            crate::ios_quantum::quantum_metal_guard::metal_forbidden(),
+            "ROOT_METADATA_METAL_TRAP_READBACK"
+        );
+        eprintln!(
+            "ROOT_METADATA_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1"
+        );
         true
     }
     const MAX_ELEMENTS: usize = 200_000;
     const MAX_CASE_SOURCE_BYTES: usize = 16 * 1024 * 1024;
     fn count(shape: &[i32]) -> usize {
-        shape.iter().try_fold(1usize, |n, d| n.checked_mul(usize::try_from(*d).unwrap())).unwrap()
+        shape
+            .iter()
+            .try_fold(1usize, |n, d| n.checked_mul(usize::try_from(*d).unwrap()))
+            .unwrap()
     }
     fn fixture(shape: &[i32], dtype: Dtype) -> Array {
         let n = count(shape);
@@ -910,35 +1126,89 @@ fn old_resnet(x: &[i32], act_in: u64, act_out: u64, conv1: &[i32], width1: u64, 
     #[test]
     fn actual_precast_weights_match_old_literal_formula_cpu_child() {
         let mut completion: Option<Completion> = None;
-        if !strict_cpu_child() { return; }
+        if !strict_cpu_child() {
+            return;
+        }
         let mut cases = 0u64;
         let mut index = 0;
         {
             // Four SMALL valid rank4 geometries only. Winograd's threshold geometry is HOST math.
             for case in &CASES[..4] {
-                for (d1, d2) in [(Dtype::Float16,Dtype::Bfloat16), (Dtype::Bfloat16,Dtype::Float32), (Dtype::Float32,Dtype::Float16)] {
-                    for (ai, ao) in [(Dtype::Float16,Dtype::Bfloat16), (Dtype::Float16,Dtype::Float32), (Dtype::Float32,Dtype::Bfloat16)] {
-                        let mid_shape = [case.x[0],case.x[1],case.x[2],case.c2[3]];
-                        let source_work = (count(&case.x) + count(&mid_shape) + count(&case.c1) + count(&case.c2)).checked_mul(12).unwrap();
-                        assert!(source_work <= MAX_CASE_SOURCE_BYTES, "ROOT_METADATA_STATIC_CASE_BYTE_WORK");
+                for (d1, d2) in [
+                    (Dtype::Float16, Dtype::Bfloat16),
+                    (Dtype::Bfloat16, Dtype::Float32),
+                    (Dtype::Float32, Dtype::Float16),
+                ] {
+                    for (ai, ao) in [
+                        (Dtype::Float16, Dtype::Bfloat16),
+                        (Dtype::Float16, Dtype::Float32),
+                        (Dtype::Float32, Dtype::Bfloat16),
+                    ] {
+                        let mid_shape = [case.x[0], case.x[1], case.x[2], case.c2[3]];
+                        let source_work = (count(&case.x)
+                            + count(&mid_shape)
+                            + count(&case.c1)
+                            + count(&case.c2))
+                        .checked_mul(12)
+                        .unwrap();
+                        assert!(
+                            source_work <= MAX_CASE_SOURCE_BYTES,
+                            "ROOT_METADATA_STATIC_CASE_BYTE_WORK"
+                        );
                         let input = fixture(&case.x, ai);
                         let mid = fixture(&mid_shape, ao);
                         let w1 = fixture(&case.c1, d1);
                         let w2 = fixture(&case.c2, d2);
                         let wi = w1.item_size() as u64;
                         let wo = w2.item_size() as u64;
-                        assert_eq!((wi,wo), (expected_width(d1),expected_width(d2)), "ROOT_NATIVE_ACTUAL_PRECAST_WIDTH");
+                        assert_eq!(
+                            (wi, wo),
+                            (expected_width(d1), expected_width(d2)),
+                            "ROOT_NATIVE_ACTUAL_PRECAST_WIDTH"
+                        );
                         assert_eq!(w1.shape(), &case.c1, "ROOT_NATIVE_WEIGHT1_SHAPE");
                         assert_eq!(w2.shape(), &case.c2, "ROOT_NATIVE_WEIGHT2_SHAPE");
                         let ain = input.item_size() as u64;
                         let aout = mid.item_size() as u64;
-                        assert_eq!((ain,aout), (expected_width(ai),expected_width(ao)), "ROOT_NATIVE_ACTIVATION_WIDTH");
+                        assert_eq!(
+                            (ain, aout),
+                            (expected_width(ai), expected_width(ao)),
+                            "ROOT_NATIVE_ACTIVATION_WIDTH"
+                        );
                         for backend in [Backend::Cpu, Backend::Metal] {
-                            let expected = old_resnet(input.shape(), ain, aout, &case.c1, expected_width(d1), &case.c2, expected_width(d2), backend);
-                            assert_eq!(resnet_bytes(input.shape(), ain, aout, &w1, &w2, backend), expected,
-                                "ROOT_NATIVE_WRAPPER_OLD_LITERAL case={index} backend={backend:?}");
-                            assert_eq!(resnet_bytes_from_metadata(input.shape(), ain, aout, w1.shape(), wi, w2.shape(), wo, backend), expected,
-                                "ROOT_NATIVE_METADATA_OLD_LITERAL case={index} backend={backend:?}");
+                            let expected = old_resnet(
+                                input.shape(),
+                                ain,
+                                aout,
+                                &case.c1,
+                                expected_width(d1),
+                                &case.c2,
+                                expected_width(d2),
+                                backend,
+                            );
+                            assert_eq!(
+                                resnet_bytes(input.shape(), ain, aout, &w1, &w2, backend),
+                                expected,
+                                "ROOT_NATIVE_WRAPPER_OLD_LITERAL case={index} backend={backend:?}"
+                            );
+                            assert_eq!(
+                                resnet_bytes_from_metadata(
+                                    input.shape(),
+                                    ain,
+                                    aout,
+                                    ConvOperandMetadata {
+                                        shape: w1.shape(),
+                                        element_bytes: wi
+                                    },
+                                    ConvOperandMetadata {
+                                        shape: w2.shape(),
+                                        element_bytes: wo
+                                    },
+                                    backend
+                                ),
+                                expected,
+                                "ROOT_NATIVE_METADATA_OLD_LITERAL case={index} backend={backend:?}"
+                            );
                         }
                         eprintln!("ROOT_METADATA_NATIVE_CASE_V1 index={index} weights={d1:?}/{d2:?} activation={ai:?}/{ao:?} source_work={source_work}");
                         cases |= 1u64 << index;
@@ -952,19 +1222,36 @@ fn old_resnet(x: &[i32], act_in: u64, act_out: u64, conv1: &[i32], width1: u64, 
         {
             for (i, (x, shape, stride, pad)) in GEOMETRIES.into_iter().enumerate() {
                 let input = fixture(&x, Dtype::Float32);
-                let weight = fixture(&shape, [Dtype::Float16,Dtype::Bfloat16,Dtype::Float32][i]);
+                let weight = fixture(&shape, [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32][i]);
                 let width = weight.item_size() as u64;
-                let old = OldConvCall::new(input.shape(), 4, &shape, expected_width(weight.dtype()), stride, pad);
+                let old = OldConvCall::new(
+                    input.shape(),
+                    4,
+                    &shape,
+                    expected_width(weight.dtype()),
+                    stride,
+                    pad,
+                );
                 let actual = ConvCall::new(input.shape(), 4, &weight, stride, pad);
-                assert_eq!(actual.out_bytes(), old.out_bytes(), "ROOT_NATIVE_CONVCALL_OUTPUT_GEOMETRY");
-                assert_eq!(actual.weight, width, "ROOT_NATIVE_CONVCALL_PRECAST_NOT_NBYTES");
+                assert_eq!(
+                    actual.out_bytes(),
+                    old.out_bytes(),
+                    "ROOT_NATIVE_CONVCALL_OUTPUT_GEOMETRY"
+                );
+                assert_eq!(
+                    actual.weight, width,
+                    "ROOT_NATIVE_CONVCALL_PRECAST_NOT_NBYTES"
+                );
                 for backend in [Backend::Cpu, Backend::Metal] {
-                    assert_eq!(actual.transient(backend), old.transient(backend), "ROOT_NATIVE_CONVCALL_OLD_LITERAL_TRANSIENT");
+                    assert_eq!(
+                        actual.transient(backend),
+                        old.transient(backend),
+                        "ROOT_NATIVE_CONVCALL_OLD_LITERAL_TRANSIENT"
+                    );
                 }
                 geometry |= 1u8 << i;
             }
         }
         let _ = completion.replace(Completion { cases, geometry });
     }
-
 }

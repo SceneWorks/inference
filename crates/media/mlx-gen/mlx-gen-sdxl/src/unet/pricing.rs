@@ -276,8 +276,14 @@ pub(crate) fn quantum_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tens
         let conv2 = effects.conv_metadata("conv2", &self.conv2);
         Ok(crate::quantum::resnet_bytes_from_metadata(
             x.shape(), act_in, act_out,
-            &conv1.weight.shape, crate::quantum::dtype_bytes(conv1.weight.dtype),
-            &conv2.weight.shape, crate::quantum::dtype_bytes(conv2.weight.dtype),
+            mlx_gen::ios_quantum::ConvOperandMetadata {
+                shape: &conv1.weight.shape,
+                element_bytes: crate::quantum::dtype_bytes(conv1.weight.dtype),
+            },
+            mlx_gen::ios_quantum::ConvOperandMetadata {
+                shape: &conv2.weight.shape,
+                element_bytes: crate::quantum::dtype_bytes(conv2.weight.dtype),
+            },
             crate::quantum::backend(),
         )
         .saturating_add(self.promotion_scratch_with_effects(x, temb, effects)?))

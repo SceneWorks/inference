@@ -376,7 +376,7 @@ impl FusedHeaderSource {
                 // failing transform fails in every source order: a certain native failure.
                 if let Some((_, error)) = transform_failures.first() {
                     return Err(Error::Msg(format!(
-                        "sdxl LDM fused source transform fails in every source order: {error}"
+                        "sdxl LDM fused source transform failure in every source order: {error}"
                     )));
                 }
                 // Remaining: writers whose shape or loaded dtype differ, so the priced program

@@ -75,7 +75,7 @@ pub(crate) fn component_headers(
         } => {
             if let Some((_, error)) = transform_failures.first() {
                 return Err(Error::Msg(format!(
-                    "sdxl LDM fused source transform fails in every source order: {error}"
+                    "sdxl LDM fused source transform failure in every source order: {error}"
                 )));
             }
             // Existing semantic projection cannot certify these source-order-dependent files.

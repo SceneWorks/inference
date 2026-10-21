@@ -4381,19 +4381,22 @@ fn price_request_using(
             attempted_case_id: None,
             adapter_attempted_case_id: None,
         }),
-        Err(AdapterSourceFailure {
-            error,
-            prefix,
-            attempted_case_id,
-            ..
-        }) => Err(PidFailure {
-            error,
-            adapter_prefix: prefix,
-            source: unified.pending,
-            committed: unified.pricing.windows,
-            attempted_case_id: unified.attempted_case_id,
-            adapter_attempted_case_id: attempted_case_id,
-        }),
+        Err(failure) => {
+            let AdapterSourceFailure {
+                error,
+                prefix,
+                attempted_case_id,
+                ..
+            } = *failure;
+            Err(PidFailure {
+                error,
+                adapter_prefix: prefix,
+                source: unified.pending,
+                committed: unified.pricing.windows,
+                attempted_case_id: unified.attempted_case_id,
+                adapter_attempted_case_id: attempted_case_id,
+            })
+        }
     }
 }
 

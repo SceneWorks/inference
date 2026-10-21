@@ -158,32 +158,24 @@ pub struct IosAnchorWitness {
 
 /// Memory-counter domain of a certificate/measurement. Native allocator proofs do not include
 /// Rust/host/process allocator/driver demand and MUST NOT authorize process-growth admission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IosMemoryDomain {
+    #[default]
     Unspecified,
     ProcessGrowth,
     NativeAllocatorGrowth,
     NativeAllocatorAbsolute,
 }
-impl Default for IosMemoryDomain {
-    fn default() -> Self {
-        Self::Unspecified
-    }
-}
 
 /// Baseline coordinate is part of the certificate, not an implicit zero/foreign-inventory credit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IosMemoryCoordinate {
+    #[default]
     Unspecified,
     Absolute,
     BeforeRequestConstruction,
     BeforeModelLoad,
     WindowEntry,
-}
-impl Default for IosMemoryCoordinate {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 /// A provider-certified correspondence candidate. The signed upper must hold at EVERY matched

@@ -1740,10 +1740,14 @@ fn adapter_world_prefix_forward_and_conv_consumer() {
                 &[1, 7, 9, 16],
                 2,
                 4,
-                &[64, 3, 3, 32],
-                2,
-                &[64, 3, 3, 64],
-                4,
+                mlx_gen::ios_quantum::ConvOperandMetadata {
+                    shape: &[64, 3, 3, 32],
+                    element_bytes: 2,
+                },
+                mlx_gen::ios_quantum::ConvOperandMetadata {
+                    shape: &[64, 3, 3, 64],
+                    element_bytes: 4,
+                },
                 backend,
             );
             assert_eq!(

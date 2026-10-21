@@ -39,7 +39,10 @@ impl Drop for CpuChildCompletion {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
-            assert_eq!(sync, 0, "native CPU synchronization after endpoint fixture owners dropped failed");
+            assert_eq!(
+                sync, 0,
+                "native CPU synchronization after endpoint fixture owners dropped failed"
+            );
             std::fs::write(
                 std::env::var(DONE).expect("CPU child completion path"),
                 b"ok",
@@ -50,7 +53,8 @@ impl Drop for CpuChildCompletion {
 }
 
 fn legacy_final_arm_target(name: &str) -> bool {
-    matches!(name,
+    matches!(
+        name,
         "text_pricing_equals_the_observed_quanta"
             | "reference_pricing_equals_the_observed_quanta"
             | "untiled_reference_pricing_equals_the_observed_quanta"
@@ -95,7 +99,9 @@ fn in_cpu_child(name: &str) -> bool {
         );
         if legacy_final_arm_target(name) {
             assert_eq!(
-                std::fs::read(&marker).expect("CPU child normal completion marker").as_slice(),
+                std::fs::read(&marker)
+                    .expect("CPU child normal completion marker")
+                    .as_slice(),
                 b"ok",
                 "CPU child for {name} did not write its current normal completion marker"
             );
@@ -103,9 +109,16 @@ fn in_cpu_child(name: &str) -> bool {
         return false;
     }
     if legacy_final_arm_target(name) {
-        let marker = PathBuf::from(std::env::var(DONE).expect("CPU child requires parent DONE path"));
-        assert!(marker.is_absolute(), "CPU child DONE path must be the absolute parent path");
-        assert!(!marker.exists(), "CPU child requires a fresh parent completion path");
+        let marker =
+            PathBuf::from(std::env::var(DONE).expect("CPU child requires parent DONE path"));
+        assert!(
+            marker.is_absolute(),
+            "CPU child DONE path must be the absolute parent path"
+        );
+        assert!(
+            !marker.exists(),
+            "CPU child requires a fresh parent completion path"
+        );
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     assert_eq!(
@@ -542,15 +555,23 @@ pub(crate) fn image(edge: u32, seed: u32) -> mlx_gen::Image {
 /// The booleans report only Rust model-handle presence; absence is never a physical release claim.
 fn fixture_phase(phase: IosPhase, te: bool, dit: bool, vae: bool) {
     let phase = match phase {
-        IosPhase::Load => 0, IosPhase::Conditioning => 1, IosPhase::Encode => 2,
-        IosPhase::Denoise => 3, IosPhase::Decode => 4,
+        IosPhase::Load => 0,
+        IosPhase::Conditioning => 1,
+        IosPhase::Encode => 2,
+        IosPhase::Denoise => 3,
+        IosPhase::Decode => 4,
     };
-    mlx_gen::ios_quantum::diagnostic_metadata("z_image_fixture", "phase", &[
-        ("schema", 1), ("phase", phase),
-        ("te_rust_handle_present", u64::from(te)),
-        ("dit_rust_handle_present", u64::from(dit)),
-        ("vae_rust_handle_present", u64::from(vae)),
-    ]);
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "z_image_fixture",
+        "phase",
+        &[
+            ("schema", 1),
+            ("phase", phase),
+            ("te_rust_handle_present", u64::from(te)),
+            ("dit_rust_handle_present", u64::from(dit)),
+            ("vae_rust_handle_present", u64::from(vae)),
+        ],
+    );
 }
 
 /// Run one request's production phases on the snapshot, in the staged generators' order
@@ -648,13 +669,24 @@ pub(crate) fn run_request(
         .unwrap();
     // Actual boundary after source validation and BEFORE the first fixture model is loaded.
     // No pricing replay or allocator lower/cancellation claim is attached to these source facts.
-    mlx_gen::ios_quantum::diagnostic_metadata("z_image_fixture", "before_model_load", &[
-        ("schema", 1), ("width", u64::from(route.width)), ("height", u64::from(route.height)),
-        ("serial_count", u64::from(route.count)), ("control", u64::from(mode.control())),
-        ("reference", u64::from(mode.img2img())), ("streamable", u64::from(streamable)),
-        ("staged", u64::from(staged)), ("requested_bits", quant_bits.unwrap_or(0) as u64),
-        ("te_rust_handle_present", 0), ("dit_rust_handle_present", 0), ("vae_rust_handle_present", 0),
-    ]);
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "z_image_fixture",
+        "before_model_load",
+        &[
+            ("schema", 1),
+            ("width", u64::from(route.width)),
+            ("height", u64::from(route.height)),
+            ("serial_count", u64::from(route.count)),
+            ("control", u64::from(mode.control())),
+            ("reference", u64::from(mode.img2img())),
+            ("streamable", u64::from(streamable)),
+            ("staged", u64::from(staged)),
+            ("requested_bits", quant_bits.unwrap_or(0) as u64),
+            ("te_rust_handle_present", 0),
+            ("dit_rust_handle_present", 0),
+            ("vae_rust_handle_present", 0),
+        ],
+    );
     let te = if streamable {
         crate::loader::load_validated_text_encoder_streamable_with(&source, &snap.te_cfg)?
     } else {
@@ -760,7 +792,12 @@ pub(crate) fn run_request(
     let ids: Vec<i32> = (0..WINDOW).map(|i| 3 + i * 7).collect();
     let mask: Vec<i32> = (0..WINDOW).map(|i| i32::from(i < VALID)).collect();
     let window = crate::pipeline::EncoderWindow::resolve(&req, te.is_streamable(), id)?;
-    fixture_phase(IosPhase::Conditioning, true, heavy.is_some(), heavy.is_some());
+    fixture_phase(
+        IosPhase::Conditioning,
+        true,
+        heavy.is_some(),
+        heavy.is_some(),
+    );
     let cap = crate::pipeline::encode_tokens(
         &te,
         &Array::from_slice(&ids, &[1, WINDOW]),
@@ -1444,7 +1481,11 @@ fn a_deferred_control_load_packs_only_its_resident_blocks() {
     );
     for (label, formula, measured) in [
         ("eager control load residency", eager_formula, eager_bytes),
-        ("deferred control load residency", deferred_formula, deferred_bytes),
+        (
+            "deferred control load residency",
+            deferred_formula,
+            deferred_bytes,
+        ),
     ] {
         assert!(
             measured > 0,
@@ -1536,8 +1577,9 @@ fn constructor_bias_ownership_matches_actual_native_packing() {
                 let dense_bias = linear.bias().map(|b| b.dtype());
                 linear.quantize(bits, None)?;
                 linear.materialize_weights()?;
-                let (codes, scales, offsets, _, group, packed_bits) =
-                    linear.quantized_params().expect("actual packed native leaf");
+                let (codes, scales, offsets, _, group, packed_bits) = linear
+                    .quantized_params()
+                    .expect("actual packed native leaf");
                 assert_eq!(
                     (
                         dense_bias,
@@ -1574,10 +1616,16 @@ fn constructor_bias_ownership_matches_actual_native_packing() {
         Ok(())
     })
     .unwrap();
-    assert!(normal_end.get(), "native bias diagnostic body did not complete");
+    assert!(
+        normal_end.get(),
+        "native bias diagnostic body did not complete"
+    );
     assert_eq!(completed.get(), 0b1111, "missing native bias mechanism");
     let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
-    assert_eq!(sync, 0, "native bias CPU synchronization after scope drop failed");
+    assert_eq!(
+        sync, 0,
+        "native bias CPU synchronization after scope drop failed"
+    );
     eprintln!(
         "ZIMAGE_BIAS_NATIVE_BODY_COMPLETED_V1 mechanisms=4 fixture_owners_dropped=1 cpu_sync=0"
     );
@@ -1597,9 +1645,9 @@ fn encoder_carry_matches_ordinary_and_streamed_run_finish_chronology() {
     with_cpu_diagnostic_headroom(AMPLE, || {
         let _scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let snap = snapshot();
-        let selected = snap.te_contract.validate_source(&WeightsSource::Dir(
-            snap.root.join("text_encoder"),
-        ))?;
+        let selected = snap
+            .te_contract
+            .validate_source(&WeightsSource::Dir(snap.root.join("text_encoder")))?;
         let ids = Array::from_slice(
             &(0..WINDOW).map(|i| 3 + i * 7).collect::<Vec<_>>(),
             &[1, WINDOW],
@@ -1661,10 +1709,16 @@ fn encoder_carry_matches_ordinary_and_streamed_run_finish_chronology() {
                 width: 16,
                 height: 16,
                 count: 1,
-                execution: if streamed { execution() } else { GenerationMemory::default() },
+                execution: if streamed {
+                    execution()
+                } else {
+                    GenerationMemory::default()
+                },
             };
             let priced = model.quanta(&route, Backend::Cpu)?;
-            let layers = priced.iter().filter(|p| p.label == crate::quantum::TE_LAYER);
+            let layers = priced
+                .iter()
+                .filter(|p| p.label == crate::quantum::TE_LAYER);
             let carries = layers.map(|p| p.window.held_bytes).collect::<Vec<_>>();
             let ab = crate::quantum::ab;
             let hidden = ab(4, &[1, WINDOW as u64, snap.te_cfg.hidden_size as u64]);
@@ -1696,10 +1750,16 @@ fn encoder_carry_matches_ordinary_and_streamed_run_finish_chronology() {
         Ok(())
     })
     .unwrap();
-    assert!(normal_end.get(), "native encoder diagnostic body did not complete");
+    assert!(
+        normal_end.get(),
+        "native encoder diagnostic body did not complete"
+    );
     assert_eq!(completed.get(), 0b11, "missing native encoder mechanism");
     let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
-    assert_eq!(sync, 0, "native encoder CPU synchronization after scope drop failed");
+    assert_eq!(
+        sync, 0,
+        "native encoder CPU synchronization after scope drop failed"
+    );
     eprintln!(
         "ZIMAGE_ENCODER_CARRY_NATIVE_BODY_COMPLETED_V1 mechanisms=2 fixture_owners_dropped=1 cpu_sync=0"
     );
@@ -1723,10 +1783,15 @@ fn dit_alias_suffixes_match_actual_native_constructor_and_quantizer() {
                 (false, true, false, false),
                 (true, false, true, false),
                 (true, true, true, true),
-            ].into_iter().enumerate() {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let dense = Array::ones::<f32>(&[4, 64])?.as_dtype(Dtype::Float16)?;
                 let seed = mlx_gen::weights::Weights::from_map(
-                    [("seed.weight".into(), dense.clone())].into_iter().collect(),
+                    [("seed.weight".into(), dense.clone())]
+                        .into_iter()
+                        .collect(),
                 );
                 let mut packed_seed = crate::quant::lin(&seed, "seed", false)?;
                 packed_seed.quantize(bits, None)?;
@@ -1735,15 +1800,28 @@ fn dit_alias_suffixes_match_actual_native_constructor_and_quantizer() {
                 let from = "t_embedder.mlp.0";
                 let to = "t_embedder.linear1";
                 let mut tensors = std::collections::HashMap::new();
-                tensors.insert(format!("{to}.weight"), if source_weight {
-                    Array::ones::<f32>(&[8, 64])?
-                } else { dense.clone() });
+                tensors.insert(
+                    format!("{to}.weight"),
+                    if source_weight {
+                        Array::ones::<f32>(&[8, 64])?
+                    } else {
+                        dense.clone()
+                    },
+                );
                 let target_bias = Array::ones::<f32>(&[4])?;
-                tensors.insert(format!("{to}.bias"), if source_bias {
-                    target_bias.as_dtype(Dtype::Float16)?
-                } else { target_bias });
+                tensors.insert(
+                    format!("{to}.bias"),
+                    if source_bias {
+                        target_bias.as_dtype(Dtype::Float16)?
+                    } else {
+                        target_bias
+                    },
+                );
                 if source_weight {
-                    tensors.insert(format!("{from}.weight"), if packed { codes.clone() } else { dense });
+                    tensors.insert(
+                        format!("{from}.weight"),
+                        if packed { codes.clone() } else { dense },
+                    );
                 }
                 if source_bias {
                     tensors.insert(format!("{from}.bias"), Array::ones::<f32>(&[4])?);
@@ -1778,10 +1856,20 @@ fn dit_alias_suffixes_match_actual_native_constructor_and_quantizer() {
                     ),
                     (
                         Some(Dtype::Float32),
-                        Some(if packed { Dtype::Float32 } else { Dtype::Bfloat16 }),
-                        vec![4, 64], vec![4, 64 * bits / 32], bits,
+                        Some(if packed {
+                            Dtype::Float32
+                        } else {
+                            Dtype::Bfloat16
+                        }),
+                        vec![4, 64],
+                        vec![4, 64 * bits / 32],
+                        bits,
                         vec![if source_weight { 8 } else { 4 }, 64],
-                        if source_bias { Dtype::Float16 } else { Dtype::Float32 },
+                        if source_bias {
+                            Dtype::Float16
+                        } else {
+                            Dtype::Float32
+                        },
                     ),
                     "actual per-suffix alias case={index} Q{bits}",
                 );
@@ -1792,7 +1880,8 @@ fn dit_alias_suffixes_match_actual_native_constructor_and_quantizer() {
         }
         normal_end.set(true);
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert!(normal_end.get(), "actual alias diagnostic body incomplete");
     assert_eq!(completed.get(), 0b11_1111_1111, "missing actual alias case");
     let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
@@ -1803,7 +1892,9 @@ fn dit_alias_suffixes_match_actual_native_constructor_and_quantizer() {
 
 #[test]
 fn dit_constructor_inventory_matches_actual_accesses_and_retains_deferred_shells() {
-    if !in_cpu_child("dit_constructor_inventory_matches_actual_accesses_and_retains_deferred_shells") {
+    if !in_cpu_child(
+        "dit_constructor_inventory_matches_actual_accesses_and_retains_deferred_shells",
+    ) {
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
@@ -1870,10 +1961,20 @@ fn dit_constructor_inventory_matches_actual_accesses_and_retains_deferred_shells
         normal_end.set(true);
         Ok(())
     }).unwrap();
-    assert!(normal_end.get(), "actual constructor inventory diagnostic body incomplete");
-    assert_eq!(completed.get(), 0b11, "missing constructor inventory mechanism");
+    assert!(
+        normal_end.get(),
+        "actual constructor inventory diagnostic body incomplete"
+    );
+    assert_eq!(
+        completed.get(),
+        0b11,
+        "missing constructor inventory mechanism"
+    );
     let sync = unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) };
-    assert_eq!(sync, 0, "inventory CPU synchronization after scope drop failed");
+    assert_eq!(
+        sync, 0,
+        "inventory CPU synchronization after scope drop failed"
+    );
     eprintln!("ZIMAGE_DIT_INVENTORY_NATIVE_BODY_COMPLETED_V1 mechanisms=2 fixture_owners_dropped=1 cpu_sync=0");
     let _ = parent_completion.replace(CpuChildCompletion);
 }
@@ -1882,7 +1983,10 @@ fn dit_constructor_inventory_matches_actual_accesses_and_retains_deferred_shells
 // dependency on the catalog; catalog unit tests include the same engine/core-only source.
 #[cfg(target_os = "macos")]
 pub(crate) mod original_execution_sidecar {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/original_z_execution_sidecar.rs"));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/original_z_execution_sidecar.rs"
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -1912,29 +2016,55 @@ impl Snapshot {
         let window_request = route.request();
         let streamable = spec.load_shape == LoadShape::DeferredMaterialization;
         let te_window = crate::pipeline::resolve_encoder_window(
-            &window_request, streamable, crate::model::MODEL_ID)?;
+            &window_request,
+            streamable,
+            crate::model::MODEL_ID,
+        )?;
         let dit_window = crate::pipeline::resolve_block_window(
-            &window_request, streamable, crate::model::MODEL_ID)?;
+            &window_request,
+            streamable,
+            crate::model::MODEL_ID,
+        )?;
         let cfg = dit_cfg();
         original_execution_sidecar::project(Inputs {
-            provider: if route.mode.control() { crate::model_control::MODEL_ID } else { crate::model::MODEL_ID },
-            mode, position, original_spec: spec,
+            provider: if route.mode.control() {
+                crate::model_control::MODEL_ID
+            } else {
+                crate::model::MODEL_ID
+            },
+            mode,
+            position,
+            original_spec: spec,
             actual_text_source: &self.root.join("text_encoder"),
             actual_control_source: &self.control,
-            width: route.width, height: route.height, count: route.count, execution: route.execution,
+            width: route.width,
+            height: route.height,
+            count: route.count,
+            execution: route.execution,
             hint: hint.clone(),
             init: route.mode.img2img().then(|| image(route.width, 2)),
             control_kind: kind,
-            original_factory_source: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ios_pricing_tests.rs")),
+            original_factory_source: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/ios_pricing_tests.rs"
+            )),
             actual_vocab_size: self.te_cfg.vocab_size,
-            configurations: [format!("{:?}", self.te_cfg), format!("{cfg:?}"),
+            configurations: [
+                format!("{:?}", self.te_cfg),
+                format!("{cfg:?}"),
                 format!("{:?}", crate::vae::VaeEncoderConfig::default_z_image()),
-                format!("{:?}", crate::vae::VaeDecoderConfig::default_z_image())],
+                format!("{:?}", crate::vae::VaeDecoderConfig::default_z_image()),
+            ],
             te_explicit_window: te_window,
-            te_full_cover_fallback: (streamable && te_window.is_none()).then_some(self.te_cfg.n_layers),
+            te_full_cover_fallback: (streamable && te_window.is_none())
+                .then_some(self.te_cfg.n_layers),
             dit_selector_window: dit_window,
-            actual_te_layers: self.te_cfg.n_layers, actual_base_blocks: cfg.n_layers,
-            actual_control_blocks: route.mode.control().then_some(crate::control_transformer::CONTROL_LAYERS_PLACES.len()),
+            actual_te_layers: self.te_cfg.n_layers,
+            actual_base_blocks: cfg.n_layers,
+            actual_control_blocks: route
+                .mode
+                .control()
+                .then_some(crate::control_transformer::CONTROL_LAYERS_PLACES.len()),
         })
     }
 }
@@ -1949,24 +2079,51 @@ fn original_sidecar_describes_manual_inputs_without_default_dto_facts() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("metadata-only");
     let te_contract = mlx_gen::gen_core::EncoderContract {
-        num_hidden_layers: 3, loaded_hidden_layers: 3, selected_hidden_layers: &[2],
+        num_hidden_layers: 3,
+        loaded_hidden_layers: 3,
+        selected_hidden_layers: &[2],
         ..crate::bounded_encoder_contract()
     };
-    gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), te_contract).unwrap();
+    gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), te_contract)
+        .unwrap();
     let te_cfg = ZTextEncoderConfig {
-        vocab_size: te_contract.vocab_size as i32, hidden_size: te_contract.hidden_size as i32,
-        n_layers: te_contract.num_hidden_layers, n_heads: te_contract.num_attention_heads as i32,
-        n_kv_heads: te_contract.num_key_value_heads as i32, head_dim: te_contract.head_dim as i32,
-        intermediate_size: te_contract.intermediate_size as i32, rope_theta: 1_000_000.0, rms_norm_eps: 1e-6,
+        vocab_size: te_contract.vocab_size as i32,
+        hidden_size: te_contract.hidden_size as i32,
+        n_layers: te_contract.num_hidden_layers,
+        n_heads: te_contract.num_attention_heads as i32,
+        n_kv_heads: te_contract.num_key_value_heads as i32,
+        head_dim: te_contract.head_dim as i32,
+        intermediate_size: te_contract.intermediate_size as i32,
+        rope_theta: 1_000_000.0,
+        rms_norm_eps: 1e-6,
     };
     let control = dir.path().join("actual-control.safetensors");
-    let snap = Snapshot { _dir: dir, root, control, te_cfg, te_contract };
+    let snap = Snapshot {
+        _dir: dir,
+        root,
+        control,
+        te_cfg,
+        te_contract,
+    };
     let tier_root = snap.root.join("q8-literal-source");
     let spec = endpoint_spec(&tier_root, Some(8), false);
-    let route = Route { mode: Mode::Control, width: EDGE, height: EDGE, count: 1,
-        execution: GenerationMemory::default() };
+    let route = Route {
+        mode: Mode::Control,
+        width: EDGE,
+        height: EDGE,
+        count: 1,
+        execution: GenerationMemory::default(),
+    };
     let hint = image(EDGE, 1);
-    let actual = snap.original_execution_sidecar(&spec, &route, &hint, ControlKind::Pose, Position::Intermediate).unwrap();
+    let actual = snap
+        .original_execution_sidecar(
+            &spec,
+            &route,
+            &hint,
+            ControlKind::Pose,
+            Position::Intermediate,
+        )
+        .unwrap();
     let wrong = route.request();
     assert!(spec.control.is_none());
     assert!(actual.described_spec.control.is_some());
@@ -1977,20 +2134,47 @@ fn original_sidecar_describes_manual_inputs_without_default_dto_facts() {
     assert_eq!(actual.request.steps, Some(3));
     assert_eq!(actual.request.seed, Some(7));
     assert_eq!(actual.request.scheduler_shift, None);
-    assert_eq!(actual.program["manual_flow"]["shift_bits"], 3.0_f32.to_bits());
+    assert_eq!(
+        actual.program["manual_flow"]["shift_bits"],
+        3.0_f32.to_bits()
+    );
     let controls = crate::sampling::resolve(&actual.request).unwrap();
     assert_eq!(controls.steps(), 3);
     assert_eq!(controls.solver(), mlx_gen::Solver::Euler);
     crate::ios_pricing::validate_pricing_roles(crate::model_control::MODEL_ID, 1, 0, 0, 1).unwrap();
-    assert_eq!(actual.program["actual_sources"]["control"], snap.control.to_str().unwrap());
-    assert_eq!(actual.program["actual_sources"]["text_encoder"], snap.root.join("text_encoder").to_str().unwrap());
-    assert_eq!(actual.program["actual_sources"]["vae"], tier_root.join("vae").to_str().unwrap());
-    assert_eq!(actual.program["position"], "intermediate_deferred_full_cover_unstaged");
+    assert_eq!(
+        actual.program["actual_sources"]["control"],
+        snap.control.to_str().unwrap()
+    );
+    assert_eq!(
+        actual.program["actual_sources"]["text_encoder"],
+        snap.root.join("text_encoder").to_str().unwrap()
+    );
+    assert_eq!(
+        actual.program["actual_sources"]["vae"],
+        tier_root.join("vae").to_str().unwrap()
+    );
+    assert_eq!(
+        actual.program["position"],
+        "intermediate_deferred_full_cover_unstaged"
+    );
     assert_eq!(actual.program["manual_flow"]["start"], 0);
-    assert_eq!(actual.program["manual_flow"]["control_scale_bits"], 0.8_f32.to_bits());
-    assert_eq!(actual.program["windows"]["TE_full_cover_fallback"], te_cfg.n_layers);
-    assert_eq!(actual.program["windows"]["DIT_selector"], crate::transformer::ZImageTransformerConfig::turbo().n_layers);
-    assert_eq!(actual.program["actual_load_form"]["TE_load_quant"], serde_json::Value::Null);
+    assert_eq!(
+        actual.program["manual_flow"]["control_scale_bits"],
+        0.8_f32.to_bits()
+    );
+    assert_eq!(
+        actual.program["windows"]["TE_full_cover_fallback"],
+        te_cfg.n_layers
+    );
+    assert_eq!(
+        actual.program["windows"]["DIT_selector"],
+        crate::transformer::ZImageTransformerConfig::turbo().n_layers
+    );
+    assert_eq!(
+        actual.program["actual_load_form"]["TE_load_quant"],
+        serde_json::Value::Null
+    );
     let tokens = &actual.program["tokens"];
     assert_eq!(tokens["window"], WINDOW);
     assert_eq!(tokens["valid_tokens"], VALID);
@@ -2000,19 +2184,44 @@ fn original_sidecar_describes_manual_inputs_without_default_dto_facts() {
     assert_eq!(tokens["attention_mask"]["dtype"], "i32");
     assert_eq!(tokens["vocabulary"]["size"], te_cfg.vocab_size);
     let ids = (0..WINDOW).map(|i| 3 + i * 7).collect::<Vec<i32>>();
-    let mask = (0..WINDOW).map(|i| i32::from(i < VALID)).collect::<Vec<i32>>();
+    let mask = (0..WINDOW)
+        .map(|i| i32::from(i < VALID))
+        .collect::<Vec<i32>>();
     assert_eq!(tokens["input_ids"]["values"], serde_json::json!(ids));
     assert_eq!(tokens["attention_mask"]["values"], serde_json::json!(mask));
-    assert_eq!(tokens["input_ids"]["values_sha256"], original_execution_sidecar::source_i32_values_hash(&ids));
-    assert_eq!(tokens["attention_mask"]["values_sha256"], original_execution_sidecar::source_i32_values_hash(&mask));
+    assert_eq!(
+        tokens["input_ids"]["values_sha256"],
+        original_execution_sidecar::source_i32_values_hash(&ids)
+    );
+    assert_eq!(
+        tokens["attention_mask"]["values_sha256"],
+        original_execution_sidecar::source_i32_values_hash(&mask)
+    );
     assert_eq!(tokens["padding"]["masked_tail_count"], WINDOW - VALID);
-    assert_eq!(tokens["padding"]["pad_token_id_applied"], serde_json::Value::Null);
-    let reference = Route { mode: Mode::Reference, ..route };
-    let reference = snap.original_execution_sidecar(&spec, &reference, &hint, ControlKind::Pose, Position::Intermediate).unwrap();
+    assert_eq!(
+        tokens["padding"]["pad_token_id_applied"],
+        serde_json::Value::Null
+    );
+    let reference = Route {
+        mode: Mode::Reference,
+        ..route
+    };
+    let reference = snap
+        .original_execution_sidecar(
+            &spec,
+            &reference,
+            &hint,
+            ControlKind::Pose,
+            Position::Intermediate,
+        )
+        .unwrap();
     assert_eq!(reference.program["manual_flow"]["start"], 1);
     assert_eq!(reference.request.strength, None);
-    assert_eq!(crate::pipeline::init_time_step(3, reference.request.strength), 0,
-        "manual start is an additional input, never an invented public strength");
+    assert_eq!(
+        crate::pipeline::init_time_step(3, reference.request.strength),
+        0,
+        "manual start is an additional input, never an invented public strength"
+    );
     // Position names are descriptions, not self-certifying endpoint grants; actual endpoint
     // selection/flags/family/work bindings are tested through the catalog's real helpers.
     let _ = [Position::ResidentEndpoint, Position::OptimizedEndpoint];

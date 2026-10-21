@@ -56,21 +56,9 @@ impl FeedForward {
         // Packed-detect (sc-8670): the three SwiGLU projections load packed from a pre-quantized
         // snapshot or dense otherwise. No biases.
         Ok(Self {
-            w1: crate::quant::lin(
-                w,
-                &format!("{prefix}.w1"),
-                crate::quant::DIT_FFN_HAS_BIAS,
-            )?,
-            w2: crate::quant::lin(
-                w,
-                &format!("{prefix}.w2"),
-                crate::quant::DIT_FFN_HAS_BIAS,
-            )?,
-            w3: crate::quant::lin(
-                w,
-                &format!("{prefix}.w3"),
-                crate::quant::DIT_FFN_HAS_BIAS,
-            )?,
+            w1: crate::quant::lin(w, &format!("{prefix}.w1"), crate::quant::DIT_FFN_HAS_BIAS)?,
+            w2: crate::quant::lin(w, &format!("{prefix}.w2"), crate::quant::DIT_FFN_HAS_BIAS)?,
+            w3: crate::quant::lin(w, &format!("{prefix}.w3"), crate::quant::DIT_FFN_HAS_BIAS)?,
         })
     }
 

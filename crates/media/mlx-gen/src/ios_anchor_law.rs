@@ -385,10 +385,10 @@ pub fn derive_phase_certified(
     }
     if classes.is_empty() {
         if request.phases.iter().any(|price| price.phase == phase)
-            || !request
+            || request
                 .absent_phases
                 .get(&phase)
-                .is_some_and(|reason| !reason.is_empty())
+                .is_none_or(|reason| reason.is_empty())
         {
             return Err(NotDerivable::Coverage(phase.as_key().into()));
         }

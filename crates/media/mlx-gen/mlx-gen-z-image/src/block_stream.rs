@@ -342,8 +342,11 @@ mod capacity_proofs {
     impl Drop for Completion {
         fn drop(&mut self) {
             if !std::thread::panicking() {
-                assert_eq!(unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) }, 0,
-                    "block source-capacity CPU synchronization after fixture owners dropped");
+                assert_eq!(
+                    unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+                    0,
+                    "block source-capacity CPU synchronization after fixture owners dropped"
+                );
                 std::fs::write(std::env::var(DONE).expect("fresh completion path"), b"ok")
                     .expect("write block source-capacity completion");
             }
@@ -351,7 +354,11 @@ mod capacity_proofs {
     }
 
     #[derive(Clone, Copy)]
-    enum Role { Base, ControlFirst, ControlLater }
+    enum Role {
+        Base,
+        ControlFirst,
+        ControlLater,
+    }
     impl Role {
         fn prefix(self) -> &'static str {
             match self {
@@ -360,7 +367,9 @@ mod capacity_proofs {
                 Self::ControlLater => "control_layers.1",
             }
         }
-        fn before(self) -> bool { matches!(self, Self::ControlFirst) }
+        fn before(self) -> bool {
+            matches!(self, Self::ControlFirst)
+        }
         fn label(self) -> &'static str {
             match self {
                 Self::Base => crate::quantum::DIT_BLOCK,
@@ -369,9 +378,17 @@ mod capacity_proofs {
         }
     }
 
-    enum Block { Base(ZImageTransformerBlock), Control(crate::control_transformer_block::ZImageControlBlock) }
+    enum Block {
+        Base(ZImageTransformerBlock),
+        Control(crate::control_transformer_block::ZImageControlBlock),
+    }
     impl Block {
-        fn counted(view: &mut Weights, role: Role, cfg: ZImageBlockConfig, bits: Option<i32>) -> Result<(Self, u64)> {
+        fn counted(
+            view: &mut Weights,
+            role: Role,
+            cfg: ZImageBlockConfig,
+            bits: Option<i32>,
+        ) -> Result<(Self, u64)> {
             match role {
                 Role::Base => base_block_counted(view, role.prefix(), cfg, bits)
                     .map(|(block, read)| (Self::Base(block), read)),
@@ -381,10 +398,16 @@ mod capacity_proofs {
         }
         fn from_headers(view: &Weights, role: Role, cfg: ZImageBlockConfig) -> Result<Self> {
             match role {
-                Role::Base => ZImageTransformerBlock::from_weights(view, role.prefix(), cfg).map(Self::Base),
+                Role::Base => {
+                    ZImageTransformerBlock::from_weights(view, role.prefix(), cfg).map(Self::Base)
+                }
                 _ => crate::control_transformer_block::ZImageControlBlock::from_weights(
-                    view, role.prefix(), cfg, role.before(),
-                ).map(Self::Control),
+                    view,
+                    role.prefix(),
+                    cfg,
+                    role.before(),
+                )
+                .map(Self::Control),
             }
         }
         fn scratch(&self, x: &Array, freqs: &Array) -> u64 {
@@ -393,7 +416,8 @@ mod capacity_proofs {
             match self {
                 // Include the actual hinted-base caller's allowance ONCE. Its output slack is
                 // unchanged and cannot be repurposed as a source-key capacity correction.
-                Self::Base(block) => block.quantum_scratch(x, freqs, plan, backend)
+                Self::Base(block) => block
+                    .quantum_scratch(x, freqs, plan, backend)
                     .saturating_add(crate::control_transformer::add_hint_bytes(x)),
                 // This already includes the real 1/3-output Control page_slack term.
                 Self::Control(block) => block.quantum_scratch(x, x, freqs, plan, backend),
@@ -401,11 +425,33 @@ mod capacity_proofs {
         }
     }
 
-    struct Tensor { shape: Vec<usize>, dtype: &'static str, width: u64, selected: bool }
+    struct Tensor {
+        shape: Vec<usize>,
+        dtype: &'static str,
+        width: u64,
+        selected: bool,
+    }
     type Headers = BTreeMap<String, Tensor>;
 
-    fn tensor(headers: &mut Headers, key: String, shape: Vec<usize>, dtype: &'static str, width: u64, selected: bool) {
-        assert!(headers.insert(key, Tensor { shape, dtype, width, selected }).is_none());
+    fn tensor(
+        headers: &mut Headers,
+        key: String,
+        shape: Vec<usize>,
+        dtype: &'static str,
+        width: u64,
+        selected: bool,
+    ) {
+        assert!(headers
+            .insert(
+                key,
+                Tensor {
+                    shape,
+                    dtype,
+                    width,
+                    selected
+                }
+            )
+            .is_none());
     }
 
     /// A small, valid constructor geometry, not production catalog dimensions. Each file contains
@@ -416,42 +462,117 @@ mod capacity_proofs {
         let mut out = Headers::new();
         let mut projections = Vec::new();
         let mut shapes = vec![
-            ("attention.to_q", d, d, false), ("attention.to_k", d, d, false),
-            ("attention.to_v", d, d, false), ("attention.to_out.0", d, d, false),
-            ("feed_forward.w1", d, d, false), ("feed_forward.w2", d, d, false),
-            ("feed_forward.w3", d, d, false), ("adaLN_modulation.0", 4 * d, d, true),
+            ("attention.to_q", d, d, false),
+            ("attention.to_k", d, d, false),
+            ("attention.to_v", d, d, false),
+            ("attention.to_out.0", d, d, false),
+            ("feed_forward.w1", d, d, false),
+            ("feed_forward.w2", d, d, false),
+            ("feed_forward.w3", d, d, false),
+            ("adaLN_modulation.0", 4 * d, d, true),
         ];
-        if !matches!(role, Role::Base) { shapes.push(("after_proj", d, d, true)); }
-        if role.before() { shapes.push(("before_proj", d, d, true)); }
+        if !matches!(role, Role::Base) {
+            shapes.push(("after_proj", d, d, true));
+        }
+        if role.before() {
+            shapes.push(("before_proj", d, d, true));
+        }
         for (path, rows, cols, bias) in shapes {
             let base = format!("{prefix}.{path}");
             projections.push(base.clone());
             if let Some(bits) = stored {
-                tensor(&mut out, format!("{base}.weight"), vec![rows, cols * bits as usize / 32], "U32", 4, true);
+                tensor(
+                    &mut out,
+                    format!("{base}.weight"),
+                    vec![rows, cols * bits as usize / 32],
+                    "U32",
+                    4,
+                    true,
+                );
                 for suffix in ["scales", "biases"] {
-                    tensor(&mut out, format!("{base}.{suffix}"), vec![rows, cols / crate::quant::GROUP_SIZE as usize], "BF16", 2, true);
+                    tensor(
+                        &mut out,
+                        format!("{base}.{suffix}"),
+                        vec![rows, cols / crate::quant::GROUP_SIZE as usize],
+                        "BF16",
+                        2,
+                        true,
+                    );
                 }
             } else {
-                tensor(&mut out, format!("{base}.weight"), vec![rows, cols], "BF16", 2, true);
+                tensor(
+                    &mut out,
+                    format!("{base}.weight"),
+                    vec![rows, cols],
+                    "BF16",
+                    2,
+                    true,
+                );
             }
-            if bias { tensor(&mut out, format!("{base}.bias"), vec![rows], "BF16", 2, true); }
+            if bias {
+                tensor(
+                    &mut out,
+                    format!("{base}.bias"),
+                    vec![rows],
+                    "BF16",
+                    2,
+                    true,
+                );
+            }
         }
         for (path, width) in [
             ("attention.norm_q.weight", d / cfg.n_heads as usize),
             ("attention.norm_k.weight", d / cfg.n_heads as usize),
-            ("attention_norm1.weight", d), ("attention_norm2.weight", d),
-            ("ffn_norm1.weight", d), ("ffn_norm2.weight", d),
+            ("attention_norm1.weight", d),
+            ("attention_norm2.weight", d),
+            ("ffn_norm1.weight", d),
+            ("ffn_norm2.weight", d),
         ] {
-            tensor(&mut out, format!("{prefix}.{path}"), vec![width], "BF16", 2, true);
+            tensor(
+                &mut out,
+                format!("{prefix}.{path}"),
+                vec![width],
+                "BF16",
+                2,
+                true,
+            );
         }
         for key in ["attention.to_q.bias", "feed_forward.w1.bias", "unused"] {
-            tensor(&mut out, format!("{prefix}.{key}"), vec![d], "BF16", 2, false);
+            tensor(
+                &mut out,
+                format!("{prefix}.{key}"),
+                vec![d],
+                "BF16",
+                2,
+                false,
+            );
         }
-        tensor(&mut out, "unrelated.weight".into(), vec![1], "BF16", 2, false);
+        tensor(
+            &mut out,
+            "unrelated.weight".into(),
+            vec![1],
+            "BF16",
+            2,
+            false,
+        );
         if matches!(role, Role::ControlLater) {
             // Presence in the dictionary does not turn a later block into the block-0 constructor.
-            tensor(&mut out, format!("{prefix}.before_proj.weight"), vec![d, d], "BF16", 2, false);
-            tensor(&mut out, format!("{prefix}.before_proj.bias"), vec![d], "BF16", 2, false);
+            tensor(
+                &mut out,
+                format!("{prefix}.before_proj.weight"),
+                vec![d, d],
+                "BF16",
+                2,
+                false,
+            );
+            tensor(
+                &mut out,
+                format!("{prefix}.before_proj.bias"),
+                vec![d],
+                "BF16",
+                2,
+                false,
+            );
         }
         (out, projections)
     }
@@ -460,13 +581,22 @@ mod capacity_proofs {
         let mut json = serde_json::Map::new();
         let mut offset = 0u64;
         for (key, t) in headers {
-            let bytes = t.shape.iter().try_fold(t.width, |n, &dim| n.checked_mul(dim as u64)).unwrap();
-            json.insert(key.clone(), serde_json::json!({"dtype": t.dtype, "shape": t.shape,
-                "data_offsets": [offset, offset + bytes]}));
+            let bytes = t
+                .shape
+                .iter()
+                .try_fold(t.width, |n, &dim| n.checked_mul(dim as u64))
+                .unwrap();
+            json.insert(
+                key.clone(),
+                serde_json::json!({"dtype": t.dtype, "shape": t.shape,
+                "data_offsets": [offset, offset + bytes]}),
+            );
             offset += bytes;
         }
         let mut bytes = serde_json::to_vec(&json).unwrap();
-        while bytes.len() % 8 != 0 { bytes.push(b' '); }
+        while bytes.len() % 8 != 0 {
+            bytes.push(b' ');
+        }
         let path = root.join(format!("{name}.safetensors"));
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
@@ -477,7 +607,11 @@ mod capacity_proofs {
 
     fn capacity(bytes: u64) -> u64 {
         let page = mlx_gen::ios_quantum::PAGE_BYTES;
-        if bytes > page { bytes.div_ceil(page) * page } else { bytes }
+        if bytes > page {
+            bytes.div_ceil(page) * page
+        } else {
+            bytes
+        }
     }
 
     /// Independent DECLARED future pack capacity, never an observed allocation. BF16 sources and
@@ -485,15 +619,25 @@ mod capacity_proofs {
     /// argument; this is NOT acceptance of a production stored/requested tier mismatch.
     fn declared_pack(
         parsed: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
-        projections: &[String], stored: Option<i32>, replay: Option<i32>,
+        projections: &[String],
+        stored: Option<i32>,
+        replay: Option<i32>,
     ) -> u64 {
-        let Some(bits) = replay.filter(|_| stored.is_none()) else { return 0; };
-        projections.iter().map(|base| {
-            let weight = parsed.iter().find(|h| h.name == format!("{base}.weight")).unwrap();
-            let (rows, cols) = (weight.shape[0] as u64, weight.shape[1] as u64);
-            capacity(rows * cols * bits as u64 / 8)
-                + 2 * capacity(rows * (cols / crate::quant::GROUP_SIZE as u64) * 2)
-        }).sum()
+        let Some(bits) = replay.filter(|_| stored.is_none()) else {
+            return 0;
+        };
+        projections
+            .iter()
+            .map(|base| {
+                let weight = parsed
+                    .iter()
+                    .find(|h| h.name == format!("{base}.weight"))
+                    .unwrap();
+                let (rows, cols) = (weight.shape[0] as u64, weight.shape[1] as u64);
+                capacity(rows * cols * bits as u64 / 8)
+                    + 2 * capacity(rows * (cols / crate::quant::GROUP_SIZE as u64) * 2)
+            })
+            .sum()
     }
 
     #[test]
@@ -504,18 +648,35 @@ mod capacity_proofs {
             let marker = dir.path().join("done");
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1").env(DONE, &marker).status().unwrap();
+                .env(CHILD, "1")
+                .env(DONE, &marker)
+                .status()
+                .unwrap();
             assert!(status.success(), "block source-capacity CPU child failed");
-            assert_eq!(std::fs::read(marker).expect("fresh normal-completion marker").as_slice(), b"ok");
+            assert_eq!(
+                std::fs::read(marker)
+                    .expect("fresh normal-completion marker")
+                    .as_slice(),
+                b"ok"
+            );
             return;
         }
         // BEFORE any source file, Array, or block constructor. No inherited device/stream trusted.
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         assert!(crate::test_metal_guard::forbid_metal());
         assert!(crate::test_metal_guard::metal_forbidden());
-        assert_eq!(mlx_rs::Device::try_default().unwrap(), mlx_rs::Device::cpu());
-        assert_eq!(unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) }, 0);
-        assert_eq!(mlx_rs::Stream::new().get_index().unwrap(), mlx_rs::Stream::cpu().get_index().unwrap());
+        assert_eq!(
+            mlx_rs::Device::try_default().unwrap(),
+            mlx_rs::Device::cpu()
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+            0
+        );
+        assert_eq!(
+            mlx_rs::Stream::new().get_index().unwrap(),
+            mlx_rs::Stream::cpu().get_index().unwrap()
+        );
         eprintln!("ZIMAGE_CPU_GUARDS_READY_V1 device=cpu native_stream=cpu fatal_metal_trap=1");
         let formats = [None, Some(4), Some(8)];
         let roles = [Role::Base, Role::ControlFirst, Role::ControlLater];
@@ -525,42 +686,101 @@ mod capacity_proofs {
         let mut completed = 0u64;
         {
             let dir = tempfile::tempdir().unwrap();
-            let cfg = ZImageBlockConfig { dim: 192, n_heads: 3, norm_eps: 1e-5 };
+            let cfg = ZImageBlockConfig {
+                dim: 192,
+                n_heads: 3,
+                norm_eps: 1e-5,
+            };
             let mut inputs = Headers::new();
-            tensor(&mut inputs, "x".into(), vec![1, 32, cfg.dim as usize], "F32", 4, true);
-            tensor(&mut inputs, "freqs".into(), vec![32, (cfg.dim / cfg.n_heads) as usize], "F32", 4, true);
-            let inputs = Weights::from_file(sparse_file(dir.path(), "scratch-input-metadata", &inputs)).unwrap();
-            let (x, freqs) = (inputs.require("x").unwrap(), inputs.require("freqs").unwrap());
+            tensor(
+                &mut inputs,
+                "x".into(),
+                vec![1, 32, cfg.dim as usize],
+                "F32",
+                4,
+                true,
+            );
+            tensor(
+                &mut inputs,
+                "freqs".into(),
+                vec![32, (cfg.dim / cfg.n_heads) as usize],
+                "F32",
+                4,
+                true,
+            );
+            let inputs =
+                Weights::from_file(sparse_file(dir.path(), "scratch-input-metadata", &inputs))
+                    .unwrap();
+            let (x, freqs) = (
+                inputs.require("x").unwrap(),
+                inputs.require("freqs").unwrap(),
+            );
             for (format_index, stored) in formats.into_iter().enumerate() {
                 for (role_index, role) in roles.into_iter().enumerate() {
                     let (source_headers, projections) = headers(role, cfg, stored);
-                    let path = sparse_file(dir.path(), &format!("source-{format_index}-{role_index}"), &source_headers);
-                    let parsed = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path).unwrap();
-                    let selected = source_headers.iter().filter(|(_, t)| t.selected).map(|(k, _)| k.clone()).collect::<BTreeSet<_>>();
-                    let untouched = source_headers.iter().filter(|(_, t)| !t.selected).map(|(k, _)| k.clone()).collect::<BTreeSet<_>>();
-                    let selected_headers = parsed.iter().filter(|h| selected.contains(&h.name)).collect::<Vec<_>>();
-                    assert_eq!(selected_headers.iter().map(|h| h.name.clone()).collect::<BTreeSet<_>>(), selected);
+                    let path = sparse_file(
+                        dir.path(),
+                        &format!("source-{format_index}-{role_index}"),
+                        &source_headers,
+                    );
+                    let parsed =
+                        mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path)
+                            .unwrap();
+                    let selected = source_headers
+                        .iter()
+                        .filter(|(_, t)| t.selected)
+                        .map(|(k, _)| k.clone())
+                        .collect::<BTreeSet<_>>();
+                    let untouched = source_headers
+                        .iter()
+                        .filter(|(_, t)| !t.selected)
+                        .map(|(k, _)| k.clone())
+                        .collect::<BTreeSet<_>>();
+                    let selected_headers = parsed
+                        .iter()
+                        .filter(|h| selected.contains(&h.name))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        selected_headers
+                            .iter()
+                            .map(|h| h.name.clone())
+                            .collect::<BTreeSet<_>>(),
+                        selected
+                    );
                     let source_raw = selected_headers.iter().map(|h| h.data_bytes).sum::<u64>();
-                    let source_capacity = selected_headers.iter().map(|h| capacity(h.data_bytes)).sum::<u64>();
-                    assert!(source_capacity > source_raw, "derived file geometry must discriminate source capacity");
+                    let source_capacity = selected_headers
+                        .iter()
+                        .map(|h| capacity(h.data_bytes))
+                        .sum::<u64>();
+                    assert!(
+                        source_capacity > source_raw,
+                        "derived file geometry must discriminate source capacity"
+                    );
                     for (replay_index, replay) in replays.into_iter().enumerate() {
-                        let index = (format_index * roles.len() + role_index) * replays.len() + replay_index;
+                        let index = (format_index * roles.len() + role_index) * replays.len()
+                            + replay_index;
                         let mut view = Weights::from_file(&path).unwrap(); // FRESH file-factory epoch
                         let key = format!("{}.attention_norm1.weight", role.prefix());
                         view.require(&key).unwrap();
                         view.require(&key).unwrap(); // repeated SAME KEY, not arbitrary ArrayDesc aliases
                         let (module, read) = Block::counted(&mut view, role, cfg, replay).unwrap();
-                        assert_eq!(view.keys().map(str::to_owned).collect::<BTreeSet<_>>(), untouched,
-                            "BLOCK-CAPACITY-EXACT-DRAIN: preserve every unaccessed source key");
+                        assert_eq!(
+                            view.keys().map(str::to_owned).collect::<BTreeSet<_>>(),
+                            untouched,
+                            "BLOCK-CAPACITY-EXACT-DRAIN: preserve every unaccessed source key"
+                        );
                         assert!(view.accessed_entries().is_empty());
                         let packing = declared_pack(&parsed, &projections, stored, replay);
                         let scratch = if stored.is_none() && replay.is_some() {
                             // A future EFFECTIVE metadata proxy for the actual forward's dtype/shape,
                             // not a second loaded production module or evaluated quantization graph.
                             let (effective, _) = headers(role, cfg, replay);
-                            let path = sparse_file(dir.path(), &format!("effective-{index}"), &effective);
+                            let path =
+                                sparse_file(dir.path(), &format!("effective-{index}"), &effective);
                             let effective = Weights::from_file(path).unwrap();
-                            Block::from_headers(&effective, role, cfg).unwrap().scratch(x, freqs)
+                            Block::from_headers(&effective, role, cfg)
+                                .unwrap()
+                                .scratch(x, freqs)
                         } else {
                             module.scratch(x, freqs)
                         };
@@ -586,7 +806,10 @@ mod capacity_proofs {
                 }
             }
         } // ALL model/source/input/effective-metadata owners and file scopes dropped before arm.
-        assert_eq!(completed, expected_mask, "all declared block source-capacity cases completed");
+        assert_eq!(
+            completed, expected_mask,
+            "all declared block source-capacity cases completed"
+        );
         eprintln!("ZIMAGE_BLOCK_SOURCE_CAPACITY_BODY_COMPLETED_V1 cases={cases} fullmask={expected_mask} payload_eval=0");
         let _ = completion.replace(Completion);
     }
