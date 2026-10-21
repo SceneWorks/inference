@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "e6d899fb55313c5a982cbe603b6cf9d98311724834d28c755f5c55d1096235ce",
+  "rust_proof_closure_sha256": "a3bee497e846cf3763001feb56b6fc220760607af3f689f46594c2af1afbf9e7",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -124,7 +124,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-anima/src/sampling.rs",
-      "sha256": "ace8d84fe28fd86f12409f6e5143cdd407a8f46c2603b266845e4dada7620fd6"
+      "sha256": "6ca327bac279af0867b76890c50773901bcb30c7a76e8f25eca9c5d0bf5f405e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-anima/src/text_encoder.rs",
@@ -204,7 +204,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_facts_tests.rs",
-      "sha256": "2bf7d81c812628288fc3909baf697320281e34fa7b54d7c526cc15b765b43967"
+      "sha256": "8f7213dc7bbf9b6876821c8bc1fabdd0299333d752a6f81c8b1ded7a03e51ea7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_load.rs",
@@ -1434,8 +1434,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "a9e441e3ddd69030f32fd1a36ca9257b855aeb9c3e5fbb5b8adfb3253d576906",
-    "classification_sha256": "33169fd1572052872a6ce11d84d7f3ed57c48aa60c68d4a09c8e308feda81181",
+    "inventory_sha256": "97f6d2a23965ee361def742c9944c323cbf943dad974ef52cc6149902ab0ad77",
+    "classification_sha256": "6b09bfd510de0701e09aa83e327b32bd892d8214ddcc2e12e0efd961cb9dc998",
     "selected_Rust_FQNs": 99,
     "HOST_logical": 86,
     "HOST_expected_PASS_rows": 87,

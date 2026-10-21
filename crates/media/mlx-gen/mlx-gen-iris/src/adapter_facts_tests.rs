@@ -697,7 +697,7 @@ fn actual_file_guard_covers_full_alpha_cast_before_read() {
                             let installed = super::install(
                                 &mut weights,
                                 Dtype::Bfloat16,
-                                &[spec.clone()],
+                                std::slice::from_ref(&spec),
                                 IrisTask::Generation,
                                 "iris_3b",
                             )?;
@@ -733,7 +733,7 @@ fn actual_materialization_guard_covers_lazy_reconstruction_peak() {
         for variant in ["peft","mixed_lora","lokr","lokr_vector_peft","lokr_batched","lokr_full","lokr_tucker","lokr_tucker_scalar","loha","loha_lone_t1","loha_lone_t2","loha_tucker","lokr_mixed_broadcast"] {
             let spec=file(temp.path(),variant,Dtype::Float16,193,0.75);
             let mut weights=base(Dtype::Bfloat16);
-            let (installed,_)=super::install(&mut weights,Dtype::Bfloat16,&[spec.clone()],IrisTask::Generation,"iris_3b").unwrap().unwrap();
+            let (installed,_)=super::install(&mut weights,Dtype::Bfloat16,std::slice::from_ref(&spec),IrisTask::Generation,"iris_3b").unwrap().unwrap();
             let checked=Rc::new(Cell::new(None));
             let witness=checked.clone();
             let measured=mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1<<34,|| {
