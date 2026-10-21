@@ -68,8 +68,34 @@ fn iris_certified_bounder(
     execution: &IosExecutionFacts,
 ) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
     certified_scope(request.pricing.provider, execution)?;
-    mlx_gen_iris::ios_pricing::ios_bounder(
+    // A payload-free catalog anchor resolves from its recorded token, exactly as its token-replay
+    // pricing did. Iris tasks take no reference/mask/control roles; a replay carrying any is not
+    // an Iris anchor and refuses rather than being reinterpreted.
+    let replay = match anchor_request.replay {
+        None => None,
+        Some(replay) => {
+            if (
+                replay.true_reference_count,
+                replay.mask_count,
+                replay.control_count,
+            ) != (0, 0, 0)
+            {
+                return Err(mlx_gen::Error::Unsupported(format!(
+                    "{}: Iris anchor replay carries conditioning roles the task does not take",
+                    anchor_request.pricing.provider
+                )));
+            }
+            Some(crate::sampling::IrisAnchorReplay::parse(
+                anchor_request.pricing.provider,
+                replay.token,
+            )?)
+        }
+    };
+    mlx_gen_iris::ios_pricing::ios_bounder_with_replay(
         anchor_request.pricing,
+        replay
+            .as_ref()
+            .map(crate::sampling::IrisAnchorReplay::as_replay),
         anchor_pricing,
         request.pricing,
         request_pricing,
@@ -993,5 +1019,98 @@ mod host_integration {
             }
         }
         println!("{checked} fully optimized cells priced through the catalog dispatch");
+    }
+
+    /// HOST: an Iris anchor replay is parsed only under its own task's recipe prefix, and one
+    /// carrying conditioning roles an Iris task never takes refuses exactly, before any source is
+    /// opened or the replay is reinterpreted (no files exist under this spec).
+    #[test]
+    fn iris_anchor_replay_resolves_only_its_own_token_and_no_roles() {
+        use crate::sampling::IrisAnchorReplay;
+        use mlx_gen::gen_core::{
+            GenerationMemory, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
+            MemoryStrategy,
+        };
+        use mlx_gen::ios_pricing::{
+            IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
+            IosReplay,
+        };
+        use mlx_gen::LoadSpec;
+        for (provider, foreign) in [
+            ("iris_3b", "iris-depth1-00"),
+            (crate::ios_admission::IRIS_DEPTH_ID, "iris1-00"),
+            (crate::ios_admission::IRIS_RESTORE_ID, "iris-depth1-00"),
+        ] {
+            assert!(
+                IrisAnchorReplay::parse(provider, foreign).is_err(),
+                "{provider}"
+            );
+        }
+        assert!(IrisAnchorReplay::parse("sana_1600m", "iris1-00").is_err());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(scratch.path().join("absent")));
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+        };
+        let execution = GenerationMemory::default();
+        let mode = MemoryMode::TextToImage;
+        let req = IosPricingRequest {
+            provider: "iris_3b",
+            spec: &spec,
+            mode: &mode,
+            geometry: MemoryGeometry {
+                width: 32,
+                height: 16,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            selection: &selection,
+            execution: &execution,
+            generation: None,
+            transform: None,
+            depth: None,
+            token_window: 0,
+        };
+        let facts = IosExecutionFacts {
+            stream: IosExecutionStream::Metal,
+            ios_quantum_scope: true,
+            analysis_budget_bytes: 1 << 20,
+        };
+        let request = IosBoundRequest {
+            pricing: &req,
+            replay: None,
+        };
+        for roles in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            let anchor = IosBoundRequest {
+                pricing: &req,
+                replay: Some(IosReplay {
+                    token: "iris1-00",
+                    true_reference_count: roles.0,
+                    mask_count: roles.1,
+                    control_count: roles.2,
+                }),
+            };
+            match super::iris_certified_bounder(
+                &anchor,
+                &IosPricing::default(),
+                &request,
+                &IosPricing::default(),
+                &facts,
+            ) {
+                Err(mlx_gen::Error::Unsupported(reason)) => assert_eq!(
+                    reason,
+                    "iris_3b: Iris anchor replay carries conditioning roles the task does not take"
+                ),
+                other => panic!("{roles:?}: {other:?}"),
+            }
+        }
     }
 }

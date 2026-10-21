@@ -59,6 +59,43 @@ fn value<T: serde::Serialize>(recipe: &T) -> Result<Value> {
 fn safe_token(prefix: &str, raw: &str) -> String {
     format!("{prefix}{}", crate::hex(raw.as_bytes()))
 }
+/// An Iris payload-free anchor's recorded native replay token, parsed exactly as
+/// [`price_metadata`] parses it for the same provider.
+pub(crate) enum IrisAnchorReplay {
+    Generation(mlx_gen_iris::ios_pricing::SamplingToken),
+    Restoration(mlx_gen_iris::ios_pricing::RestorationToken),
+    Depth(mlx_gen_iris::ios_pricing::DepthToken),
+}
+
+impl IrisAnchorReplay {
+    pub(crate) fn parse(provider: &str, token: &str) -> Result<Self> {
+        Ok(match provider {
+            "iris_3b" => Self::Generation(mlx_gen_iris::ios_pricing::SamplingToken::from_token(
+                &native_token("iris1-", token)?,
+            )?),
+            crate::ios_admission::IRIS_RESTORE_ID => {
+                Self::Restoration(mlx_gen_iris::ios_pricing::RestorationToken::from_token(
+                    &native_token("iris-restore1-", token)?,
+                )?)
+            }
+            crate::ios_admission::IRIS_DEPTH_ID => {
+                Self::Depth(mlx_gen_iris::ios_pricing::DepthToken::from_token(
+                    &native_token("iris-depth1-", token)?,
+                )?)
+            }
+            _ => return Err(unsupported(provider)),
+        })
+    }
+
+    pub(crate) fn as_replay(&self) -> mlx_gen_iris::ios_pricing::IrisReplay<'_> {
+        match self {
+            Self::Generation(token) => mlx_gen_iris::ios_pricing::IrisReplay::Generation(token),
+            Self::Restoration(token) => mlx_gen_iris::ios_pricing::IrisReplay::Restoration(token),
+            Self::Depth(token) => mlx_gen_iris::ios_pricing::IrisReplay::Depth(token),
+        }
+    }
+}
+
 fn native_token(prefix: &str, token: &str) -> Result<String> {
     let hex = token
         .strip_prefix(prefix)

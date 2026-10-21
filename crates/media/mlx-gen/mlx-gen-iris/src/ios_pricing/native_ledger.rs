@@ -1539,32 +1539,27 @@ fn preview(l: &mut NativeLedger, h: u64, w: u64, patch: u64) -> Result<()> {
     Ok(())
 }
 
-fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> {
-    let actual = req.generation.ok_or_else(|| {
-        Error::Unsupported(
-            "Iris native generation recipe requires actual sampling/prompt/count context".into(),
-        )
-    })?;
+fn generation_upper(
+    req: &IosPricingRequest<'_>,
+    token: Option<&SamplingToken>,
+    l: &mut NativeLedger,
+) -> Result<()> {
     let resources =
         GenerationResources::from_spec(req.spec, crate::model::MODEL_ID).map_err(Error::from)?;
-    let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
-    let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
-    let plan = params.plan_metadata().map_err(Error::from)?;
-    let b = params.prompts.len() as u64;
-    let h = params.height as u64;
-    let w = params.width as u64;
-    if b == 0
-        || actual.count == 0
-        || p!(b, actual.count) != req.geometry.batch as u64
-        || h != req.geometry.height as u64
-        || w != req.geometry.width as u64
-        || actual.memory.unwrap_or_default() != *req.execution
-    {
+    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+    // The SAME side resolution as the pricing: an actual request, or a recorded token replay.
+    let work = generation_work(req, token, &resources, streamed)?;
+    let config = &work.config;
+    let plan = work.envelope.plan;
+    let b = work.envelope.rows;
+    let count = u64::from(work.envelope.count);
+    let h = u64::from(req.geometry.height);
+    let w = u64::from(req.geometry.width);
+    if b == 0 || count == 0 {
         return Err(Error::Unsupported(
             "Iris native generation work/geometry mismatch".into(),
         ));
     }
-    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
     let staged =
         req.execution.stage_residency || req.spec.offload_policy == OffloadPolicy::Sequential;
     let path = resources
@@ -1573,7 +1568,7 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
     crate::memory_strategy::refuse_streamed_adapters(crate::model::MODEL_ID, req.spec)
         .map_err(Error::from)?;
     let mut bb = priced_backbone(
-        &config,
+        config,
         &path,
         "",
         req.spec.precision,
@@ -1641,29 +1636,54 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
     let suffix = tokenizer
         .encode_ids(mlx_gen::gen_core::iris::PROMPT_SUFFIX, false)
         .map_err(Error::from)?;
-    // Tokenize the ACTUAL prompts/negative independently: no guessed full-window or longest-row
-    // multiplication hides per-call work. Header-only/pure host operation, no MLX execution.
-    for prompt in params
-        .prompts
-        .iter()
-        .map(String::as_str)
-        .chain(params.uses_cfg().then_some(params.negative_prompt.as_str()))
-    {
-        let caption = tokenizer.encode_ids(prompt, false).map_err(Error::from)?;
-        let window = mlx_gen::gen_core::iris::assemble_window(
-            &prefix,
-            &caption,
-            &suffix,
-            config.text_encoder.max_length,
-        )
-        .map_err(Error::from)?;
-        tower.encode(
-            l,
-            window.input_ids.len() as u64,
-            window.window_tokens() as u64,
-            &config,
-            streamed,
-        )?;
+    let encodes = p!(b, 1) + u64::from(work.envelope.uses_cfg());
+    match &work.prompts {
+        // Tokenize the ACTUAL prompts/negative independently: no guessed full-window or
+        // longest-row multiplication hides per-call work. Pure host operation, no MLX execution.
+        Some((prompts, negative)) => {
+            for prompt in prompts
+                .iter()
+                .map(String::as_str)
+                .chain(work.envelope.uses_cfg().then_some(negative.as_str()))
+            {
+                let caption = tokenizer.encode_ids(prompt, false).map_err(Error::from)?;
+                let window = mlx_gen::gen_core::iris::assemble_window(
+                    &prefix,
+                    &caption,
+                    &suffix,
+                    config.text_encoder.max_length,
+                )
+                .map_err(Error::from)?;
+                tower.encode(
+                    l,
+                    window.input_ids.len() as u64,
+                    window.window_tokens() as u64,
+                    config,
+                    streamed,
+                )?;
+            }
+        }
+        // A payload-free token replay records rows/CFG but no caption tokens. Each encode is
+        // bounded by assemble_window's largest window: the prefix, a caption cut to
+        // `max_length - suffix`, and the suffix (`prefix + max_length` real ids, `max_length`
+        // window tokens). Every charged extent in `encode` is nondecreasing in both counts.
+        None => {
+            let max_length = config.text_encoder.max_length;
+            if max_length <= suffix.len() {
+                return Err(Error::Unsupported(
+                    "Iris text window leaves no room for a caption".into(),
+                ));
+            }
+            for _ in 0..encodes {
+                tower.encode(
+                    l,
+                    plus(prefix.len() as u64, max_length as u64)?,
+                    max_length as u64,
+                    config,
+                    streamed,
+                )?;
+            }
+        }
     }
     let cond = p!(
         config.text_encoder.max_length,
@@ -1672,12 +1692,12 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
     );
     let state = p!(b, config.model.in_channels, h, w);
     let attention = plan_of(req.execution);
-    let rungs = crate::model::request_rungs(actual, streamed)?;
+    let rungs = work.rungs;
     let mut first_forward = true;
-    for _serial in 0..actual.count {
+    for _serial in 0..count {
         noise(l, b, config.model.in_channels as u64, h, w)?;
         l.concat(4, p!(b, cond), b)?;
-        if params.uses_cfg() {
+        if work.envelope.uses_cfg() {
             l.concat(4, p!(2, b, cond), p!(2, b))?;
         }
         // Full indexed plan, not GenerationEnvelope's finite transition representatives.
@@ -1685,7 +1705,7 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
             let step = plan
                 .step(index)
                 .ok_or_else(|| Error::Unsupported("invalid Iris actual solver epoch".into()))?;
-            let guided = params.cfg_at(&step);
+            let guided = work.envelope.cfg_at(&step);
             let rows = p!(b, if guided { 2 } else { 1 });
             if guided {
                 l.concat(4, p!(2, state), 2)?;
@@ -1707,17 +1727,18 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
                 attention,
             )?;
             first_forward = false;
-            solver_update(l, state, params.prediction, &step.update, guided)?;
+            solver_update(l, state, work.prediction, &step.update, guided)?;
             // Preview throttling is temporal, not a recipe proof. Charge the actual preview graph
             // at EVERY eligible solver callback when its sink is active (source-conditional upper).
-            if actual.preview.is_active() {
+            // A token replay does not record its preview sink: charge it (upper).
+            if work.preview_active.unwrap_or(true) {
                 preview(l, h, w, config.model.patch_size as u64)?;
             }
         }
         l.repeated(4, 1, 2)?; // final clamp bounds
         l.repeated(4, state, 2)?; // maximum, minimum
     }
-    for _ in 0..p!(b, actual.count) {
+    for _ in 0..p!(b, count) {
         image(l, p!(3, h, w))?;
     }
     Ok(())
@@ -1833,7 +1854,7 @@ pub(super) fn cumulative_native_upper(
     }
     let mut ledger = NativeLedger::new(page, backend)?;
     match req.provider {
-        crate::model::MODEL_ID => generation_upper(req, &mut ledger)?,
+        crate::model::MODEL_ID => generation_upper(req, None, &mut ledger)?,
         crate::depth::DEPTH_MODEL_ID => depth_upper(req, &mut ledger)?,
         _ => {
             return Err(Error::Unsupported(

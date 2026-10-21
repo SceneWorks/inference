@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "bf988068a9eb86666be6ef1689a3267d5ca97ac14e7b6de0d5d2412dcfe76c73",
+  "rust_proof_closure_sha256": "b4ceef367cf5af43768763296747a5c96bf4de4dcb84f064e9806e4d01dc9694",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -180,11 +180,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
-      "sha256": "c57e4a86bd3196fd99801962e1a0950e04967922b9858847cf8a4fc5a9dbdc2a"
+      "sha256": "6262657feb6f5aefded5ca5f72af30a8648293b93c393a00a12e537fc01c81ed"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
-      "sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20"
+      "sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
@@ -216,7 +216,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
-      "sha256": "4734353a31a00f24f8436f80d151e7670939eb62c9cbe9901249833d96f00660"
+      "sha256": "6d90828c918773d02a49460f5fb8bf8477aa90bec63151692a0b0caebc1bcb38"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
@@ -228,15 +228,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "dfa8b37eae36f4feb9fedeb8c2db8071e30211ae0724e4997068aca3e4badae3"
+      "sha256": "384f36605ab08445b7c6e0b3943d74e940ea8533c7244226114807497896de5b"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
-      "sha256": "1b0100bc65d1e3281eed6c649ac709a38b23e50fbe4369fc40d3745c11b8aa01"
+      "sha256": "f714ec2325caa5041944bb4dd00af7af804693fbb06d9bde1caa12f766e7b6c8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/native_ledger.rs",
-      "sha256": "dcd14d2df75d43fe0cb705cd6cc783a3996e98253860d25115f7c6bcbe14a77c"
+      "sha256": "3253ba2850b21384b7ca60e99408aac0be661c2db5fe9b3f56e6cd4d060c41ce"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
@@ -244,7 +244,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/model.rs",
-      "sha256": "b3be1d754c434f7409a05c99d865af9f3ee2400b030fb3ab444acedeb46feee6"
+      "sha256": "17c1a8acca8d24facf68230056aa86570646dfe1efa04e66f04ce962abf1744a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/nn.rs",
@@ -1275,7 +1275,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::actual_utf8_basis_roundtrips_without_treating_recipe_projection_as_real_prompt",
-      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
+      "source_sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1287,7 +1287,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::strict_apply_checks_real_bytes_and_full_work_binding_still_checks_content",
-      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
+      "source_sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1299,7 +1299,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::representative_mints_its_actual_work_basis_but_legacy_replay_does_not_invent_one",
-      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
+      "source_sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1311,7 +1311,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::non_pid_control_and_existing_flow_semantics_keep_exact_old_tokens",
-      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
+      "source_sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1323,7 +1323,7 @@
     {
       "binary_binding": "mlx_gen_ios_catalog",
       "fqn": "sampling::z_pid_work_token_tests::private_wire_is_canonical_bounded_and_does_not_cap_the_prompt_dimension",
-      "source_sha256": "cf7b93b4555f8fd42094a85d9ef503c1dce3e8e3d257eb721d097db53226cc20",
+      "source_sha256": "6ab93caed1f11528835b3c4ad8a0d26bbadd6204cfa70582c00cb6188db8be8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1462,11 +1462,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "1822e3a744ce45b1c169b635d78a53b13c0cd99e72a3dfb3d92a9ec005616d21",
-    "classification_sha256": "315f81b0c421e4aa8c50b7202c7cfe023118d175c6baefd00527e7ee07345d9b",
-    "selected_Rust_FQNs": 130,
-    "HOST_logical": 113,
-    "HOST_expected_PASS_rows": 114,
+    "inventory_sha256": "6cec420a623a57370a9b3482d681d3e70e32eb7574811ad295dafd636b378d4c",
+    "classification_sha256": "e2c21aca0b0153ace11c7eefacf3619e06a3b7d710f53160811453130d7bffa3",
+    "selected_Rust_FQNs": 131,
+    "HOST_logical": 114,
+    "HOST_expected_PASS_rows": 115,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

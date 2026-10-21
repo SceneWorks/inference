@@ -575,8 +575,17 @@ pub(crate) struct RequestRungs {
 /// Resolve a request's admitted `GenerationMemory` against the load: rung 4 only on a
 /// deferred-materialization load (`streamed`), at a published window and component scope.
 pub(crate) fn request_rungs(req: &GenerationRequest, streamed: bool) -> Result<RequestRungs> {
-    let budget = attention_budget(req)?;
-    let Some(memory) = req.memory else {
+    memory_rungs(req.memory, streamed)
+}
+
+/// [`request_rungs`] from the admitted `GenerationMemory` alone: the only request field the rungs
+/// read, so a payload-free metadata replay resolves exactly the rungs its actual request did.
+pub(crate) fn memory_rungs(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    streamed: bool,
+) -> Result<RequestRungs> {
+    let budget = attention_budget_of(memory)?;
+    let Some(memory) = memory else {
         return Ok(RequestRungs {
             budget,
             pixel_rows: false,
@@ -629,10 +638,17 @@ pub(crate) fn request_rungs(req: &GenerationRequest, streamed: bool) -> Result<R
 /// ignored: there is no decoder to tile (pixel space). Staged residency, bounded attention and
 /// (on a deferred load) the transformer window are request-scoped controls ([`request_rungs`]).
 pub(crate) fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
-    let Some(memory) = req.memory else {
+    refuse_unhonored_memory_of(req.memory)
+}
+
+/// [`refuse_unhonored_memory`] from the admitted `GenerationMemory` alone.
+pub(crate) fn refuse_unhonored_memory_of(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+) -> Result<()> {
+    let Some(memory) = memory else {
         return Ok(());
     };
-    attention_budget(req)?;
+    attention_budget_of(Some(memory))?;
     let refusals = [("tile_vae_decode", memory.tile_vae_decode)];
     for (control, set) in refusals {
         if set {
@@ -646,8 +662,10 @@ pub(crate) fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 /// Resolve only the provider's published parameter; never silently accept another budget.
-fn attention_budget(req: &GenerationRequest) -> Result<mlx_gen::AttentionBudget> {
-    match req.memory {
+fn attention_budget_of(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+) -> Result<mlx_gen::AttentionBudget> {
+    match memory {
         Some(m) if m.chunk_attention => {
             let size = m
                 .attention_chunk_size

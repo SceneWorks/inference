@@ -50,7 +50,7 @@ use crate::text_encoder::{quanta as te_q, LANGUAGE_TOWER_PREFIX};
 
 mod bounder;
 mod native_ledger;
-pub use bounder::ios_bounder;
+pub use bounder::{ios_bounder, ios_bounder_with_replay, IrisReplay};
 
 /// Canonical Iris sampling recipe. Normalization is exclusively the production
 /// `GenerationParams::resolve` + `plan`; this is not the generic diffusion solver factory.
@@ -2283,24 +2283,58 @@ fn payload_transition_indices(count: u64) -> impl Iterator<Item = u64> {
     .flatten()
 }
 
+/// The executed solve's graph-shaping controls: prompt rows, CFG gate, solver plan, serial count.
+/// Built from the resolved actual request, or exactly from a recorded sampling token's normalized
+/// wire (the same values `SamplingToken::apply_to` writes into a request before resolution).
 struct GenerationEnvelope {
-    params: GenerationParams,
+    rows: u64,
+    cfg_scale: f32,
+    cfg_interval: (f64, f64),
     plan: mlx_gen::gen_core::iris::DpmSolverPlan,
     count: u32,
 }
 
 impl GenerationEnvelope {
+    fn of_params(params: &GenerationParams, count: u32) -> Result<Self> {
+        Ok(Self {
+            rows: params.prompts.len() as u64,
+            cfg_scale: params.cfg_scale,
+            cfg_interval: params.cfg_interval,
+            plan: params.plan_metadata().map_err(Error::from)?,
+            count,
+        })
+    }
+
+    fn of_wire(wire: &SamplingWire) -> Result<Self> {
+        Ok(Self {
+            rows: u64::from(wire.prompt_rows),
+            cfg_scale: f32::from_bits(wire.guidance_bits),
+            cfg_interval: (
+                f32::from_bits(wire.interval_bits[0]) as f64,
+                f32::from_bits(wire.interval_bits[1]) as f64,
+            ),
+            plan: wire.checked_plan()?,
+            count: wire.serial_count,
+        })
+    }
+
+    fn uses_cfg(&self) -> bool {
+        self.cfg_scale != 1.0
+    }
+
+    fn cfg_at(&self, step: &DpmStep) -> bool {
+        mlx_gen::gen_core::iris::cfg_active(self.cfg_scale, step.s, self.cfg_interval)
+    }
+
     fn epochs(&self) -> impl Iterator<Item = GenerationEpoch> + '_ {
-        let indices = self
-            .plan
-            .epoch_indices(self.params.cfg_scale, self.params.cfg_interval);
-        let rows = self.params.prompts.len() as u64;
+        let indices = self.plan.epoch_indices(self.cfg_scale, self.cfg_interval);
+        let rows = self.rows;
         payload_transition_indices(u64::from(self.count))
             .map(|serial| serial as u32)
             .flat_map(move |serial| {
                 indices.clone().into_iter().map(move |index| {
                     let step = self.plan.step(index).expect("bounded epoch index");
-                    let guided = self.params.cfg_at(&step);
+                    let guided = self.cfg_at(&step);
                     GenerationEpoch {
                         serial,
                         index,
@@ -2313,6 +2347,90 @@ impl GenerationEnvelope {
                 })
             })
     }
+}
+
+/// One generation side's executed controls, resolved without inventing a request.
+struct GenerationWork {
+    config: IrisConfig,
+    envelope: GenerationEnvelope,
+    rungs: crate::model::RequestRungs,
+    prediction: Prediction,
+    /// The ACTUAL prompts and CFG negative, `None` for a payload-free token replay: its caption
+    /// tokens are not recorded, so callers bound each window by `assemble_window`'s full cap.
+    prompts: Option<(Vec<String>, String)>,
+    /// The actual request's preview sink state, `None` (unknown) for a token replay.
+    preview_active: Option<bool>,
+}
+
+/// Resolve one generation side: an actual `GenerationRequest` (optionally replayed through its
+/// recorded token), or, for a payload-free catalog anchor, the recorded token alone, with the
+/// work cardinality, geometry and admitted `GenerationMemory` taken from the pricing request.
+/// Neither present refuses exactly; no request is constructed.
+fn generation_work(
+    req: &IosPricingRequest<'_>,
+    token: Option<&SamplingToken>,
+    resources: &GenerationResources,
+    streamed: bool,
+) -> Result<GenerationWork> {
+    let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
+    let work = match (req.generation, token) {
+        (Some(supplied), token) => {
+            let (config, replay) = match token {
+                Some(token) => token.apply_to(&config, supplied)?,
+                None => (config, supplied.clone()),
+            };
+            let actual = &replay;
+            let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
+            if actual.width != req.geometry.width
+                || actual.height != req.geometry.height
+                || actual.memory.unwrap_or_default() != *req.execution
+            {
+                return Err(Error::Unsupported(
+                    "Iris pricing request context disagrees with geometry/execution".into(),
+                ));
+            }
+            GenerationWork {
+                envelope: GenerationEnvelope::of_params(&params, actual.count)?,
+                rungs: crate::model::request_rungs(actual, streamed)?,
+                prediction: params.prediction,
+                prompts: Some((params.prompts.clone(), params.negative_prompt.clone())),
+                preview_active: Some(actual.preview.is_active()),
+                config,
+            }
+        }
+        (None, Some(token)) => {
+            let wire = token.wire()?;
+            let config = wire.metadata_config(&config)?;
+            let memory = Some(*req.execution);
+            crate::model::refuse_unhonored_memory_of(memory)?;
+            GenerationWork {
+                envelope: GenerationEnvelope::of_wire(&wire)?,
+                rungs: crate::model::memory_rungs(memory, streamed)?,
+                prediction: config.prediction().map_err(Error::from)?,
+                prompts: None,
+                preview_active: None,
+                config,
+            }
+        }
+        (None, None) => {
+            return Err(Error::Unsupported(
+                "iris_3b pricing requires the actual generation request or its recorded sampling \
+                 token (sampling, CFG and serial count)"
+                    .into(),
+            ))
+        }
+    };
+    let total_images = work
+        .envelope
+        .rows
+        .checked_mul(u64::from(work.envelope.count))
+        .ok_or_else(|| Error::Msg("Iris total image count overflow".into()))?;
+    if total_images != u64::from(req.geometry.batch) {
+        return Err(Error::Unsupported(
+            "Iris pricing request context disagrees with geometry/execution".into(),
+        ));
+    }
+    Ok(work)
 }
 
 fn generation(
@@ -2332,37 +2450,15 @@ fn generation(
         .map_err(Error::from)?;
     let resources =
         GenerationResources::from_spec(spec, crate::model::MODEL_ID).map_err(Error::from)?;
-    let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
-    let supplied = req.generation.ok_or_else(|| Error::Unsupported(
-        "iris_3b pricing requires the actual generation request (sampling, CFG and serial count)".into()
-    ))?;
-    let (config, replay) = match token {
-        Some(token) => token.apply_to(&config, supplied)?,
-        None => (config, supplied.clone()),
-    };
-    let actual = &replay;
-    let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
-    let recipe = GenerationEnvelope {
-        plan: params.plan_metadata().map_err(Error::from)?,
-        params,
-        count: actual.count,
-    };
-    let prompts = recipe.params.prompts.len() as u64;
-    let total_images = prompts
-        .checked_mul(u64::from(recipe.count))
-        .ok_or_else(|| Error::Msg("Iris total image count overflow".into()))?;
-    if actual.width != req.geometry.width
-        || actual.height != req.geometry.height
-        || total_images != u64::from(req.geometry.batch)
-        || actual.memory.unwrap_or_default() != *req.execution
-    {
-        return Err(Error::Unsupported(
-            "Iris pricing request context disagrees with geometry/execution".into(),
-        ));
-    }
     let streamed = spec.load_shape == LoadShape::DeferredMaterialization;
+    let GenerationWork {
+        config,
+        envelope: recipe,
+        rungs,
+        ..
+    } = generation_work(req, token, &resources, streamed)?;
+    let prompts = recipe.rows;
     let staged = req.execution.stage_residency || spec.offload_policy == OffloadPolicy::Sequential;
-    let rungs = crate::model::request_rungs(actual, streamed)?;
     let plan = plan_of(req.execution);
     let mut bb = priced_backbone(
         &config,
@@ -2439,7 +2535,7 @@ fn generation(
     let n = token_window(req, &resources.text_encoder_dir, max_length)?;
     let cond_elements = max_length * layers * dim;
     let cond = allocated(tensor_bytes(4, &[cond_elements]));
-    let uncond = u64::from(recipe.params.uses_cfg());
+    let uncond = u64::from(recipe.uses_cfg());
     let (h, w) = (
         u64::from(req.geometry.height),
         u64::from(req.geometry.width),

@@ -21,10 +21,39 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::native_ledger::cumulative_native_upper_any;
 
+/// A payload-free catalog anchor's recorded native replay token, the exact one its token-replay
+/// pricing (`ios_pricing_with_token` / `pricing_facts_with_*_token`) consumes.
+#[derive(Clone, Copy, Debug)]
+pub enum IrisReplay<'a> {
+    Generation(&'a super::SamplingToken),
+    Restoration(&'a super::RestorationToken),
+    Depth(&'a super::DepthToken),
+}
+
 /// Source-owned bounder for `iris_3b` generation and `iris_3b_depth`. Its signature is
-/// [`mlx_gen::ios_pricing::IosBounder`].
+/// [`mlx_gen::ios_pricing::IosBounder`]; the anchor must carry its actual work context.
 pub fn ios_bounder(
     anchor_request: &IosPricingRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> Result<Vec<IosWindowBound>> {
+    ios_bounder_with_replay(
+        anchor_request,
+        None,
+        anchor_pricing,
+        request,
+        request_pricing,
+    )
+}
+
+/// [`ios_bounder`] for an anchor that is either an actual request or a payload-free token replay:
+/// the anchor's execution plan, source profile and witness identity resolve from its recorded
+/// token exactly as its token-replay pricing does. The request side is always actual work (its
+/// cumulative native upper is the certificate delta). An anchor with neither refuses exactly.
+pub fn ios_bounder_with_replay(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_replay: Option<IrisReplay<'_>>,
     anchor_pricing: &IosPricing,
     request: &IosPricingRequest<'_>,
     request_pricing: &IosPricing,
@@ -46,20 +75,21 @@ pub fn ios_bounder(
     }
     // Profiles must be exactly the source-generated ones: a caller-edited window set must not
     // borrow this certificate.
-    let matches_source = |req: &IosPricingRequest<'_>, supplied: &IosPricing| -> Result<bool> {
-        let expected = super::ios_pricing(req)?;
-        Ok(expected.phases == supplied.phases
+    let matches_source = |expected: IosPricing, supplied: &IosPricing| {
+        expected.phases == supplied.phases
             && expected.windows == supplied.windows
-            && expected.absent_phases == supplied.absent_phases)
+            && expected.absent_phases == supplied.absent_phases
     };
-    if !matches_source(anchor_request, anchor_pricing)?
-        || !matches_source(request, request_pricing)?
+    if !matches_source(
+        anchor_source_pricing(anchor_request, anchor_replay)?,
+        anchor_pricing,
+    ) || !matches_source(super::ios_pricing(request)?, request_pricing)
     {
         return Err(Error::Unsupported(
             "Iris transfer pricing is not the source-generated profile".into(),
         ));
     }
-    let identity = AnchorIdentity::of(anchor_request)?;
+    let identity = AnchorIdentity::of(anchor_request, anchor_replay)?;
     // Every source-matched anchor check, keyed by its actual label and phase.
     let mut witnesses: BTreeMap<(String, Option<mlx_gen::ios_pricing::IosPhase>), Vec<_>> =
         BTreeMap::new();
@@ -151,6 +181,29 @@ fn overflow() -> Error {
     Error::Unsupported("Iris native witness index overflow".into())
 }
 
+/// The anchor's source-generated profile: its actual work context, else its recorded token
+/// through the SAME token-replay pricing the catalog priced it with.
+fn anchor_source_pricing(
+    req: &IosPricingRequest<'_>,
+    replay: Option<IrisReplay<'_>>,
+) -> Result<IosPricing> {
+    match (req.provider, replay) {
+        (_, None) => super::ios_pricing(req),
+        (crate::model::MODEL_ID, Some(IrisReplay::Generation(token))) => {
+            super::ios_pricing_with_token(req, token)
+        }
+        (crate::depth::DEPTH_MODEL_ID, Some(IrisReplay::Depth(token))) => {
+            Ok(super::pricing_facts_with_depth_token(req, token)?.pricing)
+        }
+        (crate::restoration::MODEL_ID, Some(IrisReplay::Restoration(token))) => {
+            Ok(super::pricing_facts_with_restoration_token(req, token)?.pricing)
+        }
+        (provider, Some(_)) => Err(Error::Unsupported(format!(
+            "{provider}: Iris replay token belongs to another task"
+        ))),
+    }
+}
+
 /// The anchor run's actual execution identity, as its production code emits it.
 enum AnchorIdentity {
     Generation {
@@ -167,30 +220,49 @@ enum AnchorIdentity {
 }
 
 impl AnchorIdentity {
-    fn of(req: &IosPricingRequest<'_>) -> Result<Self> {
+    fn of(req: &IosPricingRequest<'_>, replay: Option<IrisReplay<'_>>) -> Result<Self> {
         if req.provider == crate::model::MODEL_ID {
-            let actual = req.generation.ok_or_else(|| {
-                Error::Unsupported("Iris anchor needs its actual generation request".into())
-            })?;
+            let token = match replay {
+                None => None,
+                Some(IrisReplay::Generation(token)) => Some(token),
+                Some(_) => {
+                    return Err(Error::Unsupported(
+                        "iris_3b anchor replay is not a sampling token".into(),
+                    ))
+                }
+            };
             let resources = mlx_gen::gen_core::iris::GenerationResources::from_spec(
                 req.spec,
                 crate::model::MODEL_ID,
             )
             .map_err(Error::from)?;
-            let config = mlx_gen::gen_core::iris::IrisConfig::from_dir(&resources.backbone_dir)
-                .map_err(Error::from)?;
-            let recipe =
-                super::resolved_generation_recipe(&config, actual, actual.seed.unwrap_or(0))?;
+            // The SAME side resolution as the anchor's pricing (actual request or token alone).
+            let work = super::generation_work(
+                req,
+                token,
+                &resources,
+                req.spec.load_shape == mlx_gen::gen_core::LoadShape::DeferredMaterialization,
+            )?;
             Ok(Self::Generation {
-                serial_count: u64::from(recipe.count),
-                prompt_rows: recipe.params.prompts.len() as u64,
-                steps: recipe.params.steps as u64,
+                serial_count: u64::from(work.envelope.count),
+                prompt_rows: work.envelope.rows,
+                steps: work.envelope.plan.len() as u64,
             })
         } else {
-            let actual = req.depth.ok_or_else(|| {
-                Error::Unsupported("Iris depth anchor needs its actual depth request".into())
-            })?;
-            let plan = super::depth_input_plan(req.spec, actual)?;
+            let plan =
+                match (req.depth, replay) {
+                    (Some(actual), None) => super::depth_input_plan(req.spec, actual)?,
+                    (None, Some(IrisReplay::Depth(token))) => token.wire()?.plan()?,
+                    (Some(_), Some(_)) => {
+                        return Err(Error::Unsupported(
+                            "Iris depth anchor carries both an actual request and a replay".into(),
+                        ))
+                    }
+                    _ => return Err(Error::Unsupported(
+                        "Iris depth anchor needs its actual depth request or depth replay token"
+                            .into(),
+                    )),
+                };
             Ok(Self::Depth {
                 source_width: u64::from(plan.source_width),
                 source_height: u64::from(plan.source_height),

@@ -322,6 +322,58 @@ fn certify(
     )
 }
 
+/// A payload-free token-replay anchor (the catalog form: no work carrier, only its recorded
+/// token) must price the same source profile as its actual-request anchor and receive the SAME
+/// certificates from the same captured marks; without its token it refuses with `missing`.
+fn assert_replay_anchor_certifies(
+    name: &str,
+    anchor_run: &Captured,
+    actual: (&IosPricingRequest<'_>, &IosPricing),
+    free: (
+        &IosPricingRequest<'_>,
+        crate::ios_pricing::IrisReplay<'_>,
+        &IosPricing,
+    ),
+    request: (&IosPricingRequest<'_>, &IosPricing),
+    missing: &str,
+) {
+    let (actual_ctx, at_anchor) = actual;
+    let (free_ctx, replay, replayed) = free;
+    let (request_ctx, priced) = request;
+    assert!(
+        replayed.phases == at_anchor.phases
+            && replayed.windows == at_anchor.windows
+            && replayed.absent_phases == at_anchor.absent_phases,
+        "{name}: the token replay priced a different anchor profile"
+    );
+    let witness = |pricing: &IosPricing| {
+        let mut witnessed = pricing.clone();
+        witnessed.observations = anchor_run.observations.clone();
+        witnessed
+    };
+    let (witnessed, replay_witnessed) = (witness(at_anchor), witness(replayed));
+    let actual_bounds =
+        crate::ios_pricing::ios_bounder(actual_ctx, &witnessed, request_ctx, priced)
+            .unwrap_or_else(|e| panic!("{name}: actual anchor refused: {e}"));
+    let replay_bounds = crate::ios_pricing::ios_bounder_with_replay(
+        free_ctx,
+        Some(replay),
+        &replay_witnessed,
+        request_ctx,
+        priced,
+    )
+    .unwrap_or_else(|e| panic!("{name}: token-replay anchor refused: {e}"));
+    assert!(!replay_bounds.is_empty(), "{name}: no certificate");
+    assert_eq!(
+        replay_bounds, actual_bounds,
+        "{name}: the token-replay anchor certified differently"
+    );
+    match crate::ios_pricing::ios_bounder(free_ctx, &replay_witnessed, request_ctx, priced) {
+        Err(mlx_gen::Error::Unsupported(reason)) => assert_eq!(reason, missing, "{name}"),
+        other => panic!("{name}: a carrier-free anchor without its token was {other:?}"),
+    }
+}
+
 fn check(
     name: String,
     anchor: (&Captured, &IosPricingRequest<'_>, &IosPricing),
@@ -830,6 +882,31 @@ fn prompt_batch_checks(scaling: BatchScaling) -> PromptBatchChecks {
                 scaling.priced_batch,
                 &batched,
             );
+            let batched_priced = ios_pricing(&batched_ctx).unwrap();
+            // The catalog's payload-free anchor: the same context with no carrier, plus the
+            // anchor's recorded canonical sampling token.
+            let token = crate::ios_pricing::canonical_token(
+                &crate::ios_pricing::generation_metadata_config(&spec).unwrap(),
+                &anchor_request,
+            )
+            .unwrap();
+            let free_ctx = IosPricingRequest {
+                generation: None,
+                ..anchor_ctx
+            };
+            assert_replay_anchor_certifies(
+                &format!("iris_3b replay anchor→batch2 {tier} {rung}"),
+                &anchor,
+                (&anchor_ctx, &at_anchor),
+                (
+                    &free_ctx,
+                    crate::ios_pricing::IrisReplay::Generation(&token),
+                    &crate::ios_pricing::ios_pricing_with_token(&free_ctx, &token).unwrap(),
+                ),
+                (&batched_ctx, &batched_priced),
+                "iris_3b pricing requires the actual generation request or its recorded sampling \
+                 token (sampling, CFG and serial count)",
+            );
             out.batches.push((
                 check(
                     format!("iris_3b text→batch2 {tier} {rung}"),
@@ -837,7 +914,7 @@ fn prompt_batch_checks(scaling: BatchScaling) -> PromptBatchChecks {
                     (
                         &measure_generation(&spec, &batched, resident, expected_stream),
                         &batched_ctx,
-                        &ios_pricing(&batched_ctx).unwrap(),
+                        &batched_priced,
                     ),
                 ),
                 single,
@@ -1476,6 +1553,26 @@ fn downstream_body() {
                 crate::ios_pricing::ios_bounder(&anchor_ctx, &at_anchor, &request_ctx, &priced)
                     .is_err(),
                 "{tier} {rung}: an unwitnessed depth anchor was certified"
+            );
+            // The catalog's payload-free depth anchor: no DepthRequest, only its recorded token.
+            let token = crate::ios_pricing::canonical_depth_token(&spec, &first_request).unwrap();
+            let free_ctx = IosPricingRequest {
+                depth: None,
+                ..anchor_ctx
+            };
+            assert_replay_anchor_certifies(
+                &format!("iris_3b_depth replay anchor 24x16→48x32 {tier} {rung}"),
+                &anchor,
+                (&anchor_ctx, &at_anchor),
+                (
+                    &free_ctx,
+                    crate::ios_pricing::IrisReplay::Depth(&token),
+                    &crate::ios_pricing::pricing_facts_with_depth_token(&free_ctx, &token)
+                        .unwrap()
+                        .pricing,
+                ),
+                (&request_ctx, &priced),
+                "Iris depth pricing requires actual DepthRequest source/resolution",
             );
             checks.push(check(
                 format!("iris_3b_depth 24x16→48x32 {tier} {rung}"),
