@@ -28,7 +28,7 @@ def sha(path):
     return h.hexdigest()
 
 def process_rows():
-    text = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid=,rss=,command="], text=True)
+    text = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid=,rss=,command="], text=True, encoding="utf-8")
     return {int(f[0]): (int(f[1]), int(f[2]) * 1024, f[3])
             for line in text.splitlines() if len(f := line.strip().split(None, 3)) == 4}
 
@@ -125,7 +125,7 @@ def prerequisite_probe(manifest, report, deadline):
         if time.monotonic() >= deadline:
             raise RuntimeError("STOPNEXT finite admission expired before xcrun")
         command = ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"]
-        child = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         return {"argv": command, "exit": child.returncode, "stdout": child.stdout[:4096],
                 "stderr": child.stderr[:4096], "output_truncated": len(child.stdout) > 4096 or len(child.stderr) > 4096}
     xcrun = check("xcrun", xcrun_sdk, lambda v: v["exit"] == 0 and not v["output_truncated"]
@@ -175,7 +175,7 @@ def prerequisite_probe(manifest, report, deadline):
     def fingerprint():
         if native is None or not native.is_absolute():
             raise ValueError("missing absolute PMETAL_MLX_PREBUILT_DIR")
-        text = (native / "pmetal-mlx-prebuilt.txt").read_text()
+        text = (native / "pmetal-mlx-prebuilt.txt").read_text(encoding="utf-8")
         expected = "fingerprint=096020673cabac7c1cfda2faee80393c5902a41e6d2f004e7e70f27debe4357c"
         return {"expected": expected, "present": expected in text}
     check("native_fingerprint", fingerprint, lambda v: v["present"])
@@ -208,7 +208,7 @@ def main():
                "phase": args.phase, "steps": [], "binaries": {}, "complete": False,
                "signals_sent": False, "owned_jobs_remaining": 0, "no_automatic_next": True}
     def save():
-        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     started = time.monotonic()
     deadline = started + args.seconds
     receipt["start_UTC"] = datetime.now(timezone.utc).isoformat()
@@ -217,7 +217,7 @@ def main():
         assert platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
         assert sys.version_info[:2] == (3, 12), "preinstalled Python3.12 required"
         assert sha(manifest_path) == manifest_sha
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["state"] == "CANONICAL_OWNER_SOURCE_BOUND", "not an actual owner-bound source manifest"
         assert manifest["compiler_packages"] == [p for p, _ in PACKAGES]
         assert manifest["artifact_features"] == {name: [] for _, name in PACKAGES}, "no silent capture/training feature"
@@ -227,8 +227,8 @@ def main():
         (report / "source-manifest.json").write_bytes(manifest_path.read_bytes())
         def inputs(source_only=False):
             assert sha(manifest_path) == manifest_sha
-            assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == source_sha
-            assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"], text=True).strip(), "dirty/untracked remote checkout"
+            assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip() == source_sha
+            assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"], text=True, encoding="utf-8").strip(), "dirty/untracked remote checkout"
             for item in manifest["files"]:
                 relative = Path(item["path"])
                 assert not relative.is_absolute() and ".." not in relative.parts
@@ -241,7 +241,7 @@ def main():
             assert time.monotonic() < deadline, "STOPNEXT finite admission expired before probe"
             probe = prerequisite_probe(manifest, report, deadline)
             probe_path = report / "prerequisite-probe.json"
-            probe_path.write_text(json.dumps(probe, indent=2) + "\n")
+            probe_path.write_text(json.dumps(probe, indent=2) + "\n", encoding="utf-8")
             receipt["prerequisite_probe"] = {"path": str(probe_path), "sha256": sha(probe_path),
                                              "all_named_prerequisites_ok": probe["all_named_prerequisites_ok"],
                                              "discovery_complete": probe["discovery_complete"]}
@@ -264,7 +264,7 @@ def main():
         assert native.is_absolute() and metallib.is_absolute() and metallib == native / "mlx.metallib"
         for item in manifest["native_files"]:
             assert sha(native / item["name"]) == item["sha256"], "preprovisioned native096 artifact mismatch"
-        assert "fingerprint=096020673cabac7c1cfda2faee80393c5902a41e6d2f004e7e70f27debe4357c" in (native / "pmetal-mlx-prebuilt.txt").read_text()
+        assert "fingerprint=096020673cabac7c1cfda2faee80393c5902a41e6d2f004e7e70f27debe4357c" in (native / "pmetal-mlx-prebuilt.txt").read_text(encoding="utf-8")
         target = report / "cargo-target"
         temporary = report / "tmp"
         assert not target.exists() and not temporary.exists(), "unique outside-checkout target/TMPDIR required"
@@ -307,7 +307,7 @@ def main():
                     time.sleep(0.25)
                 row["exit"] = child.wait()  # Natural completion only: no deadline/signal inside command.
             row["seconds"] = time.monotonic() - began; row["log_sha256"] = sha(log)
-            text = log.read_text(errors="replace")
+            text = log.read_text(encoding="utf-8", errors="replace")
             messages, warnings, errors, plain, rust = parse_log(text)
             row.update(warnings=warnings, errors=errors, plain_diagnostics=plain, Rust_rows=rust)
             receipt["owned_jobs_remaining"] = 0; save()  # Raw results BEFORE qualifier assertions.

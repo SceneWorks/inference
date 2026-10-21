@@ -418,18 +418,22 @@ fn unet_forward_is_bounded_identical_and_refuses_before_construction() {
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
     assert_well_ordered(&events);
     assert_unet_counts(&events, &unet, &cfg);
-    // The stem is `conv_in` (output, bias add, CPU kernel transient) + the time embedding MLPs +
-    // the three latent-sized lazy buffers of the forward's input, all from the loaded weights.
+    // The stem is `conv_in` (output, bias add, CPU kernel transient) + the three latent-sized lazy
+    // buffers of the forward's input, from the loaded weights; plus the time and add embedding
+    // MLPs. Independent arithmetic for those MLPs: dense f32 weights over f32 inputs need no
+    // operand casts, and each MLP holds three hidden planes (linear_1 out, SiLU, linear_2 in) and
+    // one output plane of [batch, time_embed_dim] f32, plus four buffers' page slack.
+    let mlp = 4
+        * x.shape()[0] as u64
+        * cfg.time_embed_dim() as u64
+        * crate::quantum::dtype_bytes(Dtype::Float32)
+        + 4 * crate::quantum::PAGE_BYTES;
     assert_eq!(
         checked(&events, UNET_STEM),
-        [crate::unet::stem_bytes(
-            &x,
-            &ctx,
-            unet.conv_in_weight(),
-            None,
-            0,
-            Backend::Cpu
-        )]
+        [
+            crate::unet::stem_bytes(&x, &ctx, unet.conv_in_weight(), None, 0, Backend::Cpu)
+                + 2 * mlp
+        ]
     );
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
@@ -2116,12 +2120,13 @@ mod proofs {
             )
             .unwrap();
             let predicted = flow
-                .fresh_native_bytes(
+                .native_bytes(
                     elements(state),
                     parent_elements,
                     crate::model::DTYPE,
                     rows,
                     page,
+                    mlx_gen::ios_quantum::fresh_metal_allocation_bytes,
                 )
                 .expect("source-known fresh full parent and outputs");
             let before = active();
@@ -2844,6 +2849,11 @@ mod proofs {
             resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Cpu)
                 // packed temb bias, norm2 weight/bias, conv2 bias: four promoted channel vectors.
                 + 4 * c2.shape()[0] as u64 * dtype_bytes(Dtype::Float32)
+                // native qmm casts the packed BF16 scales and offsets ([out, in/group] each) of
+                // `time_emb_proj` to its f32 compute dtype.
+                + 2 * (c2.shape()[0] as u64)
+                    * (temb32.shape()[1] / crate::quant::GROUP_SIZE) as u64
+                    * dtype_bytes(Dtype::Float32)
         );
         assert!(
             resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Metal)

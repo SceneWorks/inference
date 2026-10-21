@@ -325,7 +325,7 @@ impl FusedSourceIr {
         // Per-component packed flag from target NAMES only: identical in every source order.
         let packed = self.packed_components();
         let mut result = FusedHeaders::default();
-        let mut ambiguous = vec![false; self.operations.len()];
+        let mut order_dependent = false;
         let mut transform_failures = Vec::new();
         for operation in &self.operations {
             if let Some(error) = &operation.transform_failure {
@@ -351,25 +351,13 @@ impl FusedSourceIr {
                     ambiguous_target = true;
                 }
             }
-            if ambiguous_target {
-                for writer in writers {
-                    ambiguous[writer.source] = true;
-                }
-            }
+            order_dependent |= ambiguous_target;
             result
                 .map(value.component)
                 .insert(value.header.name.clone(), value.header.clone());
         }
-        let source_indices = ambiguous
-            .into_iter()
-            .enumerate()
-            .filter_map(|(source, ambiguous)| ambiguous.then_some(source))
-            .collect::<Vec<_>>();
-        if !source_indices.is_empty() || !transform_failures.is_empty() {
-            return Ok(OrderInvariantProjection::NeedsActualOrder {
-                source_indices,
-                transform_failures,
-            });
+        if order_dependent || !transform_failures.is_empty() {
+            return Ok(OrderInvariantProjection::NeedsActualOrder { transform_failures });
         }
         result.require_components()?;
         Ok(OrderInvariantProjection::Resolved(result))
@@ -402,7 +390,6 @@ fn pricing_equivalent(
 pub(crate) enum OrderInvariantProjection {
     Resolved(FusedHeaders),
     NeedsActualOrder {
-        source_indices: Vec<usize>,
         transform_failures: Vec<(usize, String)>,
     },
 }
@@ -459,10 +446,7 @@ impl FusedHeaderSource {
                 ir,
                 aliases: Vec::new(),
             }),
-            OrderInvariantProjection::NeedsActualOrder {
-                source_indices,
-                transform_failures,
-            } => {
+            OrderInvariantProjection::NeedsActualOrder { transform_failures } => {
                 // Native split transforms EVERY mapped source before any component check, so a
                 // failing transform fails in every source order: a certain native failure.
                 if let Some((_, error)) = transform_failures.first() {
@@ -470,21 +454,9 @@ impl FusedHeaderSource {
                         "sdxl LDM fused source transform failure in every source order: {error}"
                     )));
                 }
+                // Every order-dependent alias group (text, UNet and VAE) is priced exactly by
+                // the ios_pricing witness worlds, including failing native prefixes.
                 let (components, aliases) = ir.pricing_aliases()?;
-                // Text-encoder aliases are priced exactly (ios_pricing witness worlds). UNet/VAE
-                // aliases are a later slice: not a native restriction or Fused completion.
-                let heavy = aliases
-                    .iter()
-                    .filter(|alias| {
-                        matches!(alias.component, SdxlComponent::Unet | SdxlComponent::Vae)
-                    })
-                    .count();
-                if heavy > 0 {
-                    return Err(Error::Unsupported(format!(
-                        "sdxl fused pricing for order-dependent UNet/VAE source aliases remains incomplete ({heavy} alias groups over {} sources)",
-                        source_indices.len()
-                    )));
-                }
                 Ok(Self {
                     raw,
                     components,
@@ -746,6 +718,19 @@ fn realizable(targets: &[&[WriterId]], choice: &[usize]) -> bool {
 #[cfg(test)]
 mod source_ir_tests {
     use super::*;
+
+    /// The operation indices writing an alias group's targets (exact writer identity).
+    fn alias_writer_sources(ir: &FusedSourceIr, targets: &[String]) -> Vec<usize> {
+        let mut sources = ir
+            .target_writers
+            .iter()
+            .filter(|((_, name), _)| targets.contains(name))
+            .flat_map(|(_, writers)| writers.iter().map(|writer| writer.source))
+            .collect::<Vec<_>>();
+        sources.sort_unstable();
+        sources.dedup();
+        sources
+    }
     use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
 
     fn header(name: &str, shape: &[usize], dtype: Stored) -> SafetensorsTensorHeader {
@@ -912,20 +897,40 @@ mod source_ir_tests {
             &[4, 1],
             Stored::BF16,
         ));
-        let OrderInvariantProjection::NeedsActualOrder {
-            source_indices,
-            transform_failures,
-        } = FusedSourceIr::from_headers(&headers)
-            .unwrap()
-            .project_equivalent()
-            .unwrap()
+        let OrderInvariantProjection::NeedsActualOrder { transform_failures } =
+            FusedSourceIr::from_headers(&headers)
+                .unwrap()
+                .project_equivalent()
+                .unwrap()
         else {
             panic!("loaded-dtype difference must not be collapsed");
         };
-        assert_eq!(source_indices, [6, 7]);
         assert!(transform_failures.is_empty());
-        let error = FusedHeaderSource::from_headers(headers).err().unwrap();
-        assert!(matches!(&error, Error::Unsupported(text) if text.contains("order-dependent")));
+        let ir = FusedSourceIr::from_headers(&headers).unwrap();
+        let source = FusedHeaderSource::from_headers(headers).unwrap();
+        assert_eq!(
+            source.aliases.len(),
+            1,
+            "both companion writers stay one priced group"
+        );
+        let alias = &source.aliases[0];
+        assert_eq!(alias.component, SdxlComponent::Unet);
+        assert_eq!(alias.targets, ["up_blocks.0.upsamplers.0.conv.scales"]);
+        assert_eq!(
+            alias_writer_sources(&ir, &alias.targets),
+            [6, 7],
+            "exactly the two conflicting source writers"
+        );
+        // One realizable world per native winner, each the exact stored-dtype companion header.
+        let worlds = alias
+            .assignments
+            .iter()
+            .map(|world| (world[0].shape.clone(), world[0].dtype))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            worlds,
+            [(vec![4, 1], Stored::F16), (vec![4, 1], Stored::BF16)]
+        );
     }
 
     #[test]
@@ -1036,14 +1041,23 @@ mod source_ir_tests {
             Stored::F32,
         ));
         let ir = FusedSourceIr::from_headers(&headers).unwrap();
-        let OrderInvariantProjection::NeedsActualOrder {
-            source_indices,
-            transform_failures,
-        } = ir.project_equivalent().unwrap()
+        let OrderInvariantProjection::NeedsActualOrder { transform_failures } =
+            ir.project_equivalent().unwrap()
         else {
             panic!("do not choose a source-order world");
         };
-        assert_eq!(source_indices, [2, 6]);
+        let (_, aliases) = ir.pricing_aliases().unwrap();
+        assert_eq!(
+            aliases.len(),
+            1,
+            "the split-vs-direct writer pair is the one priced group"
+        );
+        assert_eq!(
+            alias_writer_sources(&ir, &aliases[0].targets),
+            [2, 6],
+            "exactly the split parent and the direct writer are ambiguous"
+        );
+        assert_eq!(aliases[0].assignments.len(), 2);
         assert_eq!(transform_failures.len(), 1);
         assert_eq!(transform_failures[0].0, 7);
         assert!(transform_failures[0].1.contains("split evenly"));

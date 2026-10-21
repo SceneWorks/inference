@@ -91,6 +91,52 @@ pub(crate) fn with_backend<T>(backend: Backend, body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// One forward module's output signature in a header-only pricing walk: `(module path, shape,
+/// dtype)`. Recorded only inside [`with_module_trace`]; elsewhere [`trace_module`] is inert.
+pub(crate) type ModuleOutput = (String, Vec<i32>, Dtype);
+
+thread_local! {
+    static MODULE_TRACE: std::cell::RefCell<Option<Vec<ModuleOutput>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record a U-Net/VAE module output while a trace is active (pricing only, never native code).
+pub(crate) fn trace_module(path: &str, output: &mlx_gen::adapters::facts::TensorFacts) {
+    MODULE_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push((path.to_owned(), output.shape.clone(), output.dtype));
+        }
+    });
+}
+
+/// Run `body` recording every [`trace_module`] call; the previous trace state is restored.
+pub(crate) fn with_module_trace<T>(body: impl FnOnce() -> T) -> (T, Vec<ModuleOutput>) {
+    struct Restore(Option<Vec<ModuleOutput>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MODULE_TRACE.with(|trace| *trace.borrow_mut() = self.0.take());
+        }
+    }
+    let restore = Restore(MODULE_TRACE.with(|trace| trace.borrow_mut().replace(Vec::new())));
+    let result = body();
+    let recorded = MODULE_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default());
+    drop(restore);
+    (result, recorded)
+}
+
+/// Run `body` without recording (ControlNet branches reuse U-Net module paths).
+pub(crate) fn without_module_trace<T>(body: impl FnOnce() -> T) -> T {
+    let saved = MODULE_TRACE.with(|trace| trace.borrow_mut().take());
+    struct Restore(Option<Vec<ModuleOutput>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MODULE_TRACE.with(|trace| *trace.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(saved);
+    body()
+}
+
 /// The counted quanta one header-only pricing walk checks, in execution order: `(label, scratch)`.
 pub(crate) type Quanta = Vec<(&'static str, u64)>;
 
@@ -111,6 +157,71 @@ pub(crate) fn shaped(shape: &[i32], dtype: Dtype) -> mlx_gen::Result<Array> {
 }
 
 /// U-Net stem: Kolors context projection, timestep/`text_time` embedding and `conv_in`.
+/// Prefix of the native-order shape checks the metadata CLIP/VAE forwards reproduce.
+pub(crate) const NATIVE_SHAPE_CHECK: &str = "sdxl native op shape validation: ";
+
+/// The exact messages of metadata ops that reproduce a NATIVE op's own shape validation:
+/// matmul/broadcast/add, convolution, reshape, take and quantize alignment/rank. A world that
+/// fails one of these fails natively at that op, so its admitted prefix is a real native ledger.
+/// Every other pricing error (Unsupported, missing tensors, pricer invariants) is not recoverable.
+const NATIVE_SHAPE_FAILURES: &[&str] = &[
+    NATIVE_SHAPE_CHECK,
+    "sdxl adapter operands do not broadcast",
+    "sdxl adapter matmul operand is scalar",
+    "sdxl adapter matmul inner dimensions differ",
+    "sdxl load-time affine input is not group-aligned",
+    "sdxl selected convolution input/weight axes disagree",
+    "sdxl metadata reshape element counts differ",
+    "sdxl metadata take row index out of bounds",
+    "sdxl resnet skip concat axes disagree",
+    "sdxl text pack input is not group-aligned",
+    "sdxl text pack requires at least two dimensions",
+];
+
+pub(crate) fn is_native_shape_failure(error: &mlx_gen::Error) -> bool {
+    matches!(error, mlx_gen::Error::Msg(message)
+        if NATIVE_SHAPE_FAILURES.iter().any(|known| message.starts_with(known)))
+}
+
+/// A native-order shape check the metadata forward reproduces (see [`NATIVE_SHAPE_CHECK`]).
+pub(crate) fn native_shape_failure(detail: &str) -> mlx_gen::Error {
+    mlx_gen::Error::Msg(format!("{NATIVE_SHAPE_CHECK}{detail}"))
+}
+
+/// Whether `a` and `b` broadcast under the native rule (trailing axes equal or one of them 1).
+pub(crate) fn broadcasts(a: &[i32], b: &[i32]) -> bool {
+    a.iter()
+        .rev()
+        .zip(b.iter().rev())
+        .all(|(&x, &y)| x == y || x == 1 || y == 1)
+}
+
+/// Native dense GroupNorm broadcasts its affine operands; GlobalGroupNorm (tiled VAE)
+/// requires exact channel vectors before the tiled convolution starts.
+pub(crate) fn validate_group_norm(
+    shape: &[i32],
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: &mlx_gen::adapters::facts::TensorFacts,
+    global: bool,
+) -> Result<()> {
+    let Some(&channels) = shape.last() else {
+        return Err(native_shape_failure("GroupNorm input is scalar"));
+    };
+    if shape.len() < 2 || channels % 32 != 0 {
+        return Err(native_shape_failure(
+            "GroupNorm channel count is not divisible by groups",
+        ));
+    }
+    for operand in [weight, bias] {
+        if (global && operand.shape != [channels]) || !broadcasts(shape, &operand.shape) {
+            return Err(native_shape_failure(
+                "GroupNorm affine operands differ from its channels",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) const UNET_STEM: &str = "SDXL UNet stem";
 /// One U-Net / ControlNet `ResnetBlock2D` (including its up-path skip concatenation).
 pub(crate) const UNET_RESNET: &str = "SDXL UNet resnet";
@@ -513,16 +624,29 @@ impl LinearWork {
     /// The SAME post-adapter base-only pack decision exposed by the actual private quant walk.
     /// No tensor is manufactured or evaluated. Existing stored packs remain untouched; residuals
     /// and their disabled owners are deliberately unchanged, exactly as AdaptableLinear::quantize.
+    /// The native load-time pack guard's budget over this base, admitted BEFORE the quantize
+    /// op validates rank/group alignment (`quant::quantize_linear`).
+    pub(crate) fn pack_scratch(&self, bits: i32) -> u64 {
+        let ordinary_bias = self
+            .bias
+            .as_ref()
+            .map_or(0, |b| b.elements().saturating_mul(2));
+        crate::quant::quantize_bytes_from_metadata(self.weights[0].elements(), ordinary_bias, bits)
+    }
+
     pub(crate) fn pack(&mut self, bits: i32) -> Result<u64> {
         use mlx_gen::adapters::facts::TensorFacts;
         if self.bits.is_some() {
             return Ok(0);
         }
         let shape = &self.base.base_shape;
-        if shape.len() < 2 || !matches!(bits, 4 | 8) {
+        if !matches!(bits, 4 | 8) {
             return Err(mlx_gen::Error::Msg(
                 "sdxl load-time affine pack metadata is invalid".into(),
             ));
+        }
+        if shape.len() < 2 {
+            return Err(native_shape_failure("quantize weight rank is below two"));
         }
         let input = *shape.last().unwrap();
         if input % crate::quant::GROUP_SIZE != 0 {
@@ -618,6 +742,10 @@ impl<'a> EffectScope<'a> {
             effects: Some(effects),
             prefix: String::new(),
         }
+    }
+    /// This scope's module path (`""` at the root).
+    pub(crate) fn path(&self) -> &str {
+        &self.prefix
     }
     pub(crate) fn child(&self, name: &str) -> Self {
         Self {
@@ -923,16 +1051,18 @@ impl ForwardInputOwnership {
         owned
     }
 
-    /// Physical native-counter size ONLY when source proves every nonzero request was freshly
-    /// allocated under cache-zero. A pre-scope/cached/external parent cannot use this path merely
-    /// because its current view is contiguous or a scope is active now.
-    pub(crate) fn fresh_native_bytes(
+    /// Native-counter charge of every nonzero request under `charge`: the exact fresh malloc
+    /// length ([`mlx_gen::ios_quantum::fresh_metal_allocation_bytes`]) as a certain lower bound,
+    /// or the Metal buffer-cache reuse upper ([`metal_reuse_upper_bytes`]). A pre-scope/cached/
+    /// external parent cannot use this path merely because its current view is contiguous.
+    pub(crate) fn native_bytes(
         self,
         elements: u64,
         state_parent_elements: u64,
         compute: Dtype,
         cfg_rows: u64,
         page_bytes: u64,
+        charge: fn(u64, u64) -> Option<u64>,
     ) -> Option<u64> {
         if cfg_rows == 0 || (elements != 0 && state_parent_elements == 0) {
             return None;
@@ -940,11 +1070,22 @@ impl ForwardInputOwnership {
         self.unique_allocation_requests(elements, state_parent_elements, compute, cfg_rows)
             .into_iter()
             .try_fold(0u64, |sum, request| {
-                sum.checked_add(mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
-                    request, page_bytes,
-                )?)
+                sum.checked_add(charge(request, page_bytes)?)
             })
     }
+}
+
+/// MLX Metal `malloc` upper on `active_memory` for one request when the buffer cache may hold
+/// buffers: `malloc` aligns a request above one page to whole pages (exact length at or below a
+/// page), then `BufferCache::reuse_from_cache` may return a cached buffer of length L with
+/// `size <= L < min(2*size, size + 2*page)` (immutable MLX `backend/metal/allocator.cpp` malloc,
+/// `backend/common/buffer_cache.h` reuse_from_cache). A zero request allocates nothing.
+pub(crate) fn metal_reuse_upper_bytes(request_bytes: u64, page_bytes: u64) -> Option<u64> {
+    let size = mlx_gen::ios_quantum::fresh_metal_allocation_bytes(request_bytes, page_bytes)?;
+    Some(
+        size.checked_mul(2)?
+            .min(size.checked_add(page_bytes.checked_mul(2)?)?),
+    )
 }
 
 /// A matched execution-epoch envelope, not difference-of-maxima: max(H+request)-max(H+base)

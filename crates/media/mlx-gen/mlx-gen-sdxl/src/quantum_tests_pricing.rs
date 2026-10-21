@@ -4850,7 +4850,10 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
     crate::quantum::with_backend(Backend::Cpu, || {
         let mut quanta = Vec::new();
         assert_eq!(
-            price.price_forward(2, 8, &mut quanta),
+            price
+                .price_forward_with_hidden(2, 8, &mut quanta)
+                .map(|(h, p)| (h.dtype, p))
+                .unwrap(),
             (Dtype::Float16, Dtype::Float16)
         );
         // Independent literals for embedding extent and CPU final norm's competing live sets:
@@ -4882,7 +4885,10 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
         crate::quantum::with_backend(Backend::Cpu, || {
             let mut quanta = Vec::new();
             assert_eq!(
-                packed.price_forward(2, 8, &mut quanta),
+                packed
+                    .price_forward_with_hidden(2, 8, &mut quanta)
+                    .map(|(h, p)| (h.dtype, p))
+                    .unwrap(),
                 (Dtype::Float32, Dtype::Float32)
             );
             // CPU final norm at F32: 1024*12 + 3*16*4 + 2*64*4 affine casts.
@@ -5190,7 +5196,10 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
                 }
                 let mut quanta = Vec::new();
                 let dtypes = crate::quantum::with_backend(Backend::Cpu, || {
-                    expected.price_forward(2, 8, &mut quanta)
+                    expected
+                        .price_forward_with_hidden(2, 8, &mut quanta)
+                        .map(|(h, p)| (h.dtype, p))
+                        .unwrap()
                 });
                 let ids = clip_ids(8);
                 let (output, events) = observe(PLENTY, || native.forward(&ids));
@@ -5235,7 +5244,7 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
         let (one, two) = native.unwrap();
         let mut quanta = Vec::new();
         let dtypes = crate::quantum::with_backend(Backend::Cpu, || {
-            priced.price_text_conditioning(2, &mut quanta)
+            priced.price_text_conditioning(2, &mut quanta).unwrap()
         });
         let observed: Vec<_> = events
             .iter()
@@ -5951,6 +5960,76 @@ fn vae_literal_headers() -> (
     vae_literal_conv(&mut headers, "quant_conv", 8, 8, 1);
     vae_literal_conv(&mut headers, "post_quant_conv", 4, 4, 1);
     (headers, cfg)
+}
+
+#[test]
+fn native_free_vae_shape_failures_keep_exact_guard_prefixes_host() {
+    use crate::quantum as q;
+    use crate::unet::pricing::tensor;
+    use crate::vae::pricing::AutoencoderFacts;
+    for (target, shape, dense_last, tiled_last) in [
+        (
+            "decoder.conv_in.weight",
+            vec![32, 5, 3, 3],
+            q::VAE_DECODE_IN,
+            q::VAE_DECODE_IN,
+        ),
+        (
+            "decoder.mid_block.resnets.0.conv1.weight",
+            vec![32, 31, 3, 3],
+            q::VAE_RESNET,
+            q::VAE_RESNET,
+        ),
+        (
+            "decoder.up_blocks.0.resnets.0.norm1.weight",
+            vec![31],
+            q::VAE_RESNET,
+            q::VAE_TILED_STAGE,
+        ),
+        (
+            "decoder.conv_norm_out.weight",
+            vec![31],
+            q::VAE_DECODE_OUT,
+            q::VAE_TILED_STAGE,
+        ),
+    ] {
+        let (mut headers, cfg) = vae_literal_headers();
+        let changed = headers.iter_mut().find(|h| h.name == target).unwrap();
+        changed.data_bytes = 4 * shape.iter().product::<usize>() as u64;
+        changed.shape = shape;
+        let model = AutoencoderFacts::from_headers(&headers, &cfg, Dtype::Float32).unwrap();
+        for tiled in [false, true] {
+            let tiling = tiled.then(|| mlx_gen::tiling::TilingConfig::spatial_only(3, 0));
+            let mut prefix = Vec::new();
+            let error = q::with_backend(Backend::Cpu, || {
+                model.price_decode(
+                    &tensor(&[1, 4, 5, 4], Dtype::Float32).unwrap(),
+                    tiling.as_ref(),
+                    &mut prefix,
+                )
+            })
+            .expect_err("malformed native operand must fail");
+            assert!(q::is_native_shape_failure(&error), "{target}: {error}");
+            assert_eq!(
+                prefix.last().unwrap().0,
+                if tiled { tiled_last } else { dense_last },
+                "{target} tiled={tiled}"
+            );
+            if target == "decoder.conv_in.weight" {
+                assert_eq!(
+                    prefix.len(),
+                    1,
+                    "first convolution's guard precedes its op failure"
+                );
+            }
+            if target == "decoder.up_blocks.0.resnets.0.norm1.weight" && tiled {
+                assert!(
+                    !prefix.iter().any(|(label, _)| *label == q::VAE_TILE),
+                    "GlobalGroupNorm rejects before the first tile guard"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -7331,82 +7410,87 @@ fn write_header_only_sparse(
 fn fused_text_alias_witness_envelope_equals_every_world_host() {
     use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     use mlx_gen::gen_core::{LoadSpec, Quant, WeightsSource};
-    let directory = tempfile::tempdir().unwrap();
-    let file = directory.path().join("alias.safetensors");
-    let (mut raw, arch) = fused_skeleton_headers();
-    // Two order-dependent OpenCLIP aliases with different priced facts: a third Q writer (the
-    // fixture already carries an equal-facts `attn.q_proj` alias) beside the split in_proj
-    // (layer 0), and a direct fc1 writer beside c_fc (layer 1) whose wider output changes the
-    // layer quantum and the pack point.
-    raw.push(hierarchy_header(
-        "conditioner.embedders.1.model.transformer.resblocks.0.self_attn.q_proj.weight",
-        &[32, 64],
-        Stored::F32,
-    ));
-    raw.push(hierarchy_header(
-        "conditioner.embedders.1.model.transformer.resblocks.1.mlp.fc1.weight",
-        &[256, 64],
-        Stored::F32,
-    ));
-    write_header_only_sparse(&file, &raw);
-    for (staged, quantized) in [(false, false), (true, true), (false, true)] {
-        let mut spec = LoadSpec::new(WeightsSource::File(file.clone()));
-        spec.quantize = quantized.then_some(Quant::Q4);
-        let mut r = regime(Route::Text);
-        r.staged = staged;
-        r.tiling = None;
-        let mut input = Inputs::from_spec_for_test(&spec, &r).unwrap();
-        input.arch = arch.clone();
-        let (witness, every, base) = crate::quantum::with_backend(Backend::Cpu, || {
-            let witness =
-                crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), false)
-                    .unwrap();
-            let every =
-                crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), true)
-                    .unwrap();
-            let base = Priced::build_configured(&input, &spec)
-                .unwrap()
-                .price(&r)
-                .unwrap()
-                .0;
-            (witness, every, base)
-        });
-        let peaks = |pricing: &mlx_gen::ios_pricing::IosPricing| {
-            pricing
-                .windows
-                .iter()
-                .map(|w| {
-                    (
+    for (case, q_shape) in [
+        ("attention-head-reshape", [32, 64]),
+        ("pack-alignment", [64, 63]),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("alias.safetensors");
+        let (mut raw, arch) = fused_skeleton_headers();
+        // Two order-dependent OpenCLIP aliases with different priced facts: a third Q writer (the
+        // fixture already carries an equal-facts `attn.q_proj` alias) beside the split in_proj
+        // (layer 0), and a direct fc1 writer beside c_fc (layer 1) whose wider output changes the
+        // layer quantum and the pack point.
+        raw.push(hierarchy_header(
+            "conditioner.embedders.1.model.transformer.resblocks.0.self_attn.q_proj.weight",
+            &q_shape,
+            Stored::F32,
+        ));
+        raw.push(hierarchy_header(
+            "conditioner.embedders.1.model.transformer.resblocks.1.mlp.fc1.weight",
+            &[256, 64],
+            Stored::F32,
+        ));
+        write_header_only_sparse(&file, &raw);
+        for (staged, quantized) in [(false, false), (true, true), (false, true)] {
+            let mut spec = LoadSpec::new(WeightsSource::File(file.clone()));
+            spec.quantize = quantized.then_some(Quant::Q4);
+            let mut r = regime(Route::Text);
+            r.staged = staged;
+            r.tiling = None;
+            let mut input = Inputs::from_spec_for_test(&spec, &r).unwrap();
+            input.arch = arch.clone();
+            let (witness, every, base) = crate::quantum::with_backend(Backend::Cpu, || {
+                let witness =
+                    crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), false)
+                        .unwrap();
+                let every =
+                    crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), true)
+                        .unwrap();
+                let base = Priced::build_configured(&input, &spec)
+                    .unwrap()
+                    .price(&r)
+                    .unwrap()
+                    .0;
+                (witness, every, base)
+            });
+            let peaks = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+                pricing
+                    .windows
+                    .iter()
+                    .map(|w| {
                         (
-                            w.phase,
-                            w.class.clone(),
-                            w.label.clone(),
-                            w.owner_domain.clone(),
-                        ),
-                        w.logical_peak_bytes(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let phases = |pricing: &mlx_gen::ios_pricing::IosPricing| {
-            pricing
-                .phases
-                .iter()
-                .map(|phase| (phase.phase, phase.peak_bytes()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
+                            (
+                                w.phase,
+                                w.class.clone(),
+                                w.label.clone(),
+                                w.owner_domain.clone(),
+                            ),
+                            w.logical_peak_bytes(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let phases = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+                pricing
+                    .phases
+                    .iter()
+                    .map(|phase| (phase.phase, phase.peak_bytes()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
             peaks(&witness),
             peaks(&every),
-            "witness worlds reach every window maximum over all realizable worlds staged={staged} quantized={quantized}"
+            "witness worlds reach every window maximum over all realizable worlds case={case} staged={staged} quantized={quantized}"
         );
-        assert_eq!(phases(&witness), phases(&every));
-        assert_eq!(witness.absent_phases, every.absent_phases);
-        assert_ne!(
-            peaks(&every),
-            peaks(&base),
-            "the aliases change priced windows; a single world is not the envelope"
-        );
+            assert_eq!(phases(&witness), phases(&every));
+            assert_eq!(witness.absent_phases, every.absent_phases);
+            assert_ne!(
+                peaks(&every),
+                peaks(&base),
+                "the aliases change priced windows; a single world is not the envelope"
+            );
+        }
     }
 }
 
@@ -7723,4 +7807,583 @@ fn fused_external_fix_replaces_unconstructed_vae_after_unet_host() {
         error.contains("conv_in.weight"),
         "UNet constructor beats later fix lookup: {error}"
     );
+}
+
+#[test]
+fn transfer_certificates_refuse_unproven_capture_retirement_and_charge_metal_reuse_host() {
+    use crate::ios_pricing::SdxlRetirementPremise as P;
+    // ProvenOnly uses the cumulative producer, not the optional retirement gate.
+    // Header-only fixture: without actual observations, the certificate must refuse
+    // for the real missing-witness reason, never for unproven retirement.
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("proven-only-no-witness.safetensors");
+    let (raw, arch) = fused_skeleton_headers();
+    write_header_only_sparse(&file, &raw);
+    let spec = mlx_gen::gen_core::LoadSpec::new(mlx_gen::gen_core::WeightsSource::File(file));
+    let r = regime(Route::Text);
+    let mut inputs = Inputs::from_spec_for_test(&spec, &r).unwrap();
+    inputs.arch = arch;
+    let profile = crate::ios_pricing::source_pricing_for_test(&mut inputs, &r).unwrap();
+    let error = crate::ios_pricing::certified_request_bounds_for_test(
+        &inputs, &r, &profile, &inputs, &r, &profile,
+    )
+    .unwrap_err();
+    assert!(matches!(error, mlx_gen::Error::Unsupported(ref message)
+        if message == "SDXL native certificate has no actual source-matched anchor witness"));
+    // Do not invoke or authorize MetalSynchronizeRetirement here. Actual witnessed
+    // ProvenOnly success is exercised by the strict native CPU-child additivity tests.
+    assert_ne!(P::ProvenOnly.id(), P::MetalSynchronizeRetirement.id());
+    // Independent literals of MLX Metal malloc + BufferCache::reuse_from_cache at a 16 KiB page.
+    let page = 16384;
+    let upper = |n| crate::quantum::metal_reuse_upper_bytes(n, page).unwrap();
+    let fresh = |n| mlx_gen::ios_quantum::fresh_metal_allocation_bytes(n, page).unwrap();
+    assert_eq!(
+        (fresh(0), upper(0)),
+        (0, 0),
+        "malloc(0) allocates no buffer"
+    );
+    assert_eq!(
+        (fresh(100), upper(100)),
+        (100, 200),
+        "sub-page: exact length, reuse < 2x"
+    );
+    assert_eq!((fresh(16385), upper(16385)), (32768, 65536));
+    assert_eq!(
+        (fresh(1_000_000), upper(1_000_000)),
+        (1_015_808, 1_048_576),
+        "reuse bounded by size + 2 pages"
+    );
+}
+
+/// The fused skeleton with a two-block U-Net: block 0 downsamples and its up twin upsamples, so
+/// the actual LDM slot aliases `output_blocks.2.{1,2}.conv` both reach `up_blocks.0.upsamplers.0`.
+fn fused_two_block_headers() -> (
+    Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+    Architecture,
+) {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let (mut raw, mut arch) = fused_skeleton_headers();
+    raw.retain(|h| !h.name.starts_with("model.diffusion_model."));
+    let mut cfg = arch.unet.clone();
+    cfg.block_out_channels = vec![64, 64];
+    cfg.layers_per_block = vec![1, 1];
+    cfg.transformer_layers_per_block = vec![1, 1];
+    cfg.num_attention_heads = vec![1, 1];
+    cfg.cross_attention_dim = vec![128, 128];
+    cfg.down_block_types = vec!["DownBlock2D".into(), "DownBlock2D".into()];
+    cfg.up_block_types = vec!["UpBlock2D".into(), "UpBlock2D".into()];
+    arch.unet = cfg;
+    let (single, _) = fused_skeleton_unet_headers();
+    let mut put = |name: String, shape: &[usize]| {
+        raw.push(hierarchy_header(
+            &format!("model.diffusion_model.{name}"),
+            shape,
+            Stored::F32,
+        ))
+    };
+    // Unchanged single-block leaves under their actual LDM names.
+    for header in &single {
+        let name = &header.name;
+        let ldm = [
+            ("time_embedding.linear_1.", "time_embed.0."),
+            ("time_embedding.linear_2.", "time_embed.2."),
+            ("add_embedding.linear_1.", "label_emb.0.0."),
+            ("add_embedding.linear_2.", "label_emb.0.2."),
+            ("conv_in.", "input_blocks.0.0."),
+            ("conv_norm_out.", "out.0."),
+            ("conv_out.", "out.2."),
+            ("mid_block.resnets.0.", "middle_block.0."),
+            ("mid_block.resnets.1.", "middle_block.2."),
+            ("mid_block.attentions.0.", "middle_block.1."),
+        ]
+        .iter()
+        .find_map(|(to, from)| name.strip_prefix(to).map(|rest| format!("{from}{rest}")));
+        if let Some(ldm) = ldm {
+            let shape = header.shape.clone();
+            put(ldm, &shape);
+        }
+    }
+    let resnet = |put: &mut dyn FnMut(String, &[usize]), prefix: &str, input: usize| {
+        for (name, channels) in [("in_layers.0", input), ("out_layers.0", 64)] {
+            put(format!("{prefix}.{name}.weight"), &[channels]);
+            put(format!("{prefix}.{name}.bias"), &[channels]);
+        }
+        put(format!("{prefix}.in_layers.2.weight"), &[64, input, 3, 3]);
+        put(format!("{prefix}.in_layers.2.bias"), &[64]);
+        put(format!("{prefix}.out_layers.3.weight"), &[64, 64, 3, 3]);
+        put(format!("{prefix}.out_layers.3.bias"), &[64]);
+        put(format!("{prefix}.emb_layers.1.weight"), &[64, 256]);
+        put(format!("{prefix}.emb_layers.1.bias"), &[64]);
+        if input != 64 {
+            put(
+                format!("{prefix}.skip_connection.weight"),
+                &[64, input, 1, 1],
+            );
+            put(format!("{prefix}.skip_connection.bias"), &[64]);
+        }
+    };
+    // Down: input_blocks.1 (block 0 resnet), .3.0.op (block 0 sampler), .4 (block 1 resnet).
+    resnet(&mut put, "input_blocks.1.0", 64);
+    put("input_blocks.3.0.op.weight".into(), &[64, 64, 3, 3]);
+    put("input_blocks.3.0.op.bias".into(), &[64]);
+    resnet(&mut put, "input_blocks.4.0", 64);
+    // Up: every resnet concatenates a 64-channel skip; slot 1 carries block 0's upsampler.
+    for index in [0, 1, 3, 4] {
+        resnet(&mut put, &format!("output_blocks.{index}.0"), 128);
+    }
+    put("output_blocks.2.1.conv.weight".into(), &[64, 64, 3, 3]);
+    put("output_blocks.2.1.conv.bias".into(), &[64]);
+    (raw, arch)
+}
+
+/// Production witness worlds must reproduce the every-realizable-world envelope exactly in every
+/// pricing cell, and the aliases must change at least one window (else the case proves nothing).
+fn assert_alias_witnesses_equal_every_world(
+    raw: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    arch: &Architecture,
+    routes: &[Route],
+    case: &str,
+) {
+    use mlx_gen::gen_core::{LoadSpec, Quant, WeightsSource};
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("alias.safetensors");
+    write_header_only_sparse(&file, raw);
+    let peaks = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+        pricing
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    (
+                        w.phase,
+                        w.class.clone(),
+                        w.label.clone(),
+                        w.owner_domain.clone(),
+                    ),
+                    w.logical_peak_bytes(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let phases = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+        pricing
+            .phases
+            .iter()
+            .map(|phase| (phase.phase, phase.peak_bytes()))
+            .collect::<Vec<_>>()
+    };
+    let mut changed = false;
+    for &route in routes {
+        for (staged, quantized, tiled) in [
+            (false, false, false),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            let mut spec = LoadSpec::new(WeightsSource::File(file.clone()));
+            spec.quantize = quantized.then_some(Quant::Q4);
+            let mut r = regime(route);
+            r.staged = staged;
+            if !tiled {
+                r.tiling = None;
+            }
+            let mut input = Inputs::from_spec_for_test(&spec, &r).unwrap();
+            input.arch = arch.clone();
+            let (witness, every, base) = crate::quantum::with_backend(Backend::Cpu, || {
+                let witness =
+                    crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), false)
+                        .unwrap();
+                let every =
+                    crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), true)
+                        .unwrap();
+                let base = Priced::build_configured(&input, &spec)
+                    .unwrap()
+                    .price(&r)
+                    .unwrap()
+                    .0;
+                (witness, every, base)
+            });
+            let cell =
+                format!("{case} {route:?} staged={staged} quantized={quantized} tiled={tiled}");
+            assert_eq!(peaks(&witness), peaks(&every), "{cell}: per-window maxima");
+            assert_eq!(phases(&witness), phases(&every), "{cell}: phase peaks");
+            assert_eq!(witness.absent_phases, every.absent_phases, "{cell}");
+            changed |= peaks(&every) != peaks(&base);
+        }
+    }
+    assert!(
+        changed,
+        "{case}: the aliases change priced windows somewhere"
+    );
+}
+
+#[test]
+fn fused_unet_upsampler_aliases_match_every_world_host() {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    // (case, slot-2 weight shape, slot-2 bias shape): a self-failing input-channel mismatch with a
+    // broadcast-neutral bias, and a diverging out-channel change that fails only downstream.
+    for (case, weight, bias) in [
+        (
+            "upsampler failing-own + neutral bias",
+            [64, 32, 3, 3],
+            vec![1],
+        ),
+        ("upsampler diverging out channels", [32, 64, 3, 3], vec![32]),
+    ] {
+        let (mut raw, arch) = fused_two_block_headers();
+        raw.push(hierarchy_header(
+            "model.diffusion_model.output_blocks.2.2.conv.weight",
+            &weight,
+            Stored::F32,
+        ));
+        raw.push(hierarchy_header(
+            "model.diffusion_model.output_blocks.2.2.conv.bias",
+            &bias,
+            Stored::F32,
+        ));
+        let source = crate::ldm::pricing::FusedHeaderSource::from_headers(raw.clone()).unwrap();
+        assert_eq!(
+            source
+                .aliases
+                .iter()
+                .filter(|a| a.component == mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet)
+                .count(),
+            2,
+            "{case}: weight and bias are separate realizable groups"
+        );
+        assert_alias_witnesses_equal_every_world(&raw, &arch, &[Route::Text], case);
+    }
+}
+
+/// Source fact: no realizable heavy alias can promote activations. U-Net aliases arise only on
+/// sampler convolutions (`sdxl_ldm::unet`); their float leaves load cast to the model dtype and
+/// their packed companions are never read by a convolution consumer (`ConvWork` reads only
+/// `weight`/`bias`). So a companion-dtype alias changes loaded bytes only, never a window's scratch.
+#[test]
+fn fused_unet_conv_companion_dtype_alias_is_unread_and_matches_every_world_host() {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let (mut raw, arch) = fused_two_block_headers();
+    raw.push(hierarchy_header(
+        "model.diffusion_model.output_blocks.2.2.conv.weight",
+        &[64, 64, 3, 3],
+        Stored::F32,
+    ));
+    for (slot, dtype) in [(1, Stored::F32), (2, Stored::BF16)] {
+        raw.push(hierarchy_header(
+            &format!("model.diffusion_model.output_blocks.2.{slot}.conv.scales"),
+            &[64, 1],
+            dtype,
+        ));
+    }
+    let source = crate::ldm::pricing::FusedHeaderSource::from_headers(raw.clone()).unwrap();
+    let companion = source
+        .aliases
+        .iter()
+        .position(|a| {
+            a.targets
+                .iter()
+                .any(|t| t.ends_with("upsamplers.0.conv.scales"))
+        })
+        .expect("the stored-dtype companion is an order-dependent group");
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("companion.safetensors");
+    write_header_only_sparse(&file, &raw);
+    let spec = mlx_gen::gen_core::LoadSpec::new(mlx_gen::gen_core::WeightsSource::File(file));
+    let mut r = regime(Route::Text);
+    r.tiling = None;
+    let mut input = Inputs::from_spec_for_test(&spec, &r).unwrap();
+    input.arch = arch.clone();
+    let worlds = (0..2)
+        .map(|assignment| {
+            crate::ios_pricing::price_world_for_test(&mut input, &r, vec![(companion, assignment)])
+        })
+        .collect::<Vec<_>>();
+    let scratch = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+        pricing
+            .windows
+            .iter()
+            .map(|w| (w.label.clone(), w.scratch_bytes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        scratch(&worlds[0]),
+        scratch(&worlds[1]),
+        "no consumer reads the convolution companion: identical kernels in both winners"
+    );
+    assert_alias_witnesses_equal_every_world(&raw, &arch, &[Route::Text], "conv companion dtype");
+}
+
+#[test]
+fn fused_vae_attention_aliases_match_every_world_host() {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let (mut raw, arch) = fused_skeleton_headers();
+    // Actual remap collisions: `.to_q.`/`.q.` and `.group_norm.`/`.norm.` reach the same targets.
+    // A narrower query fails the attention's head reshape; a [1] group-norm scale broadcasts in
+    // the dense decode but is refused by the tiled GlobalGroupNorm.
+    raw.push(hierarchy_header(
+        "first_stage_model.decoder.mid.attn_1.to_q.weight",
+        &[16, 32, 1, 1],
+        Stored::F32,
+    ));
+    raw.push(hierarchy_header(
+        "first_stage_model.decoder.mid.attn_1.group_norm.weight",
+        &[1],
+        Stored::F32,
+    ));
+    let source = crate::ldm::pricing::FusedHeaderSource::from_headers(raw.clone()).unwrap();
+    assert_eq!(
+        source
+            .aliases
+            .iter()
+            .filter(|a| a.component == mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Vae)
+            .count(),
+        2
+    );
+    assert_alias_witnesses_equal_every_world(
+        &raw,
+        &arch,
+        &[Route::Text, Route::Reference],
+        "vae attention",
+    );
+}
+
+#[test]
+fn fused_text_and_heavy_aliases_combine_to_every_world_host() {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let (mut raw, arch) = fused_two_block_headers();
+    // A failing layer-0 query alias, an encoder-global final-norm alias, a U-Net upsampler alias
+    // and a VAE attention alias in one source.
+    raw.push(hierarchy_header(
+        "conditioner.embedders.1.model.transformer.resblocks.0.self_attn.q_proj.weight",
+        &[32, 64],
+        Stored::F32,
+    ));
+    raw.push(hierarchy_header(
+        "conditioner.embedders.1.model.transformer.text_model.final_layer_norm.weight",
+        &[1],
+        Stored::F32,
+    ));
+    raw.push(hierarchy_header(
+        "model.diffusion_model.output_blocks.2.2.conv.bias",
+        &[1],
+        Stored::F32,
+    ));
+    raw.push(hierarchy_header(
+        "first_stage_model.decoder.mid.attn_1.to_out.0.bias",
+        &[1],
+        Stored::F32,
+    ));
+    let source = crate::ldm::pricing::FusedHeaderSource::from_headers(raw.clone()).unwrap();
+    assert!(
+        source.aliases.len() >= 4,
+        "every collision is its own priced group"
+    );
+    assert_alias_witnesses_equal_every_world(&raw, &arch, &[Route::Text], "text + heavy");
+}
+
+/// Source proof of where heavy aliases can come from: over the LDM key grammar the remapper
+/// recognizes, every U-Net/VAE target reached by two distinct source keys is a sampler convolution
+/// (`output_blocks.N.{1,2}.conv` upsampler slots, layer-agnostic `input_blocks.N.0.op`
+/// downsamplers) or a VAE attention/shortcut spelling variant. With U-Net float
+/// leaves cast to the model dtype, VAE leaves all cast to the VAE dtype and convolution companions
+/// unread, a realizable heavy alias changes shapes or loaded bytes, never an activation dtype.
+#[test]
+fn ldm_heavy_remap_collisions_are_upsampler_slots_and_vae_spellings_host() {
+    use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent as C, TensorRemap};
+    let leaves = ["weight", "bias", "scales", "biases"];
+    let mut keys = Vec::new();
+    let unet_parts = [
+        "in_layers.0",
+        "in_layers.2",
+        "out_layers.0",
+        "out_layers.3",
+        "emb_layers.1",
+        "skip_connection",
+        "op",
+        "conv",
+        "norm",
+        "proj_in",
+        "proj_out",
+        "transformer_blocks.0.attn1.to_q",
+        "transformer_blocks.0.attn2.to_k",
+        "transformer_blocks.0.ff.net.0.proj",
+        "transformer_blocks.0.norm1",
+    ];
+    for i in 0..13 {
+        for part in unet_parts {
+            for leaf in leaves {
+                for slot in 0..3 {
+                    for stack in ["input_blocks", "output_blocks"] {
+                        keys.push(format!(
+                            "model.diffusion_model.{stack}.{i}.{slot}.{part}.{leaf}"
+                        ));
+                    }
+                }
+                keys.push(format!(
+                    "model.diffusion_model.middle_block.{i}.{part}.{leaf}"
+                ));
+            }
+        }
+    }
+    for part in [
+        "time_embed.0",
+        "time_embed.2",
+        "label_emb.0.0",
+        "label_emb.0.2",
+        "out.0",
+        "out.2",
+    ] {
+        for leaf in leaves {
+            keys.push(format!("model.diffusion_model.{part}.{leaf}"));
+        }
+    }
+    for side in ["encoder", "decoder"] {
+        for part in [
+            "norm",
+            "group_norm",
+            "q",
+            "to_q",
+            "k",
+            "to_k",
+            "v",
+            "to_v",
+            "proj_out",
+            "to_out.0",
+        ] {
+            for leaf in leaves {
+                keys.push(format!("first_stage_model.{side}.mid.attn_1.{part}.{leaf}"));
+            }
+        }
+        let resnet_parts = [
+            "conv1",
+            "conv2",
+            "norm1",
+            "norm2",
+            "nin_shortcut",
+            "conv_shortcut",
+        ];
+        for part in resnet_parts {
+            for leaf in leaves {
+                for block in [1, 2] {
+                    keys.push(format!(
+                        "first_stage_model.{side}.mid.block_{block}.{part}.{leaf}"
+                    ));
+                }
+                for i in 0..4 {
+                    for j in 0..3 {
+                        for stack in ["down", "up"] {
+                            keys.push(format!(
+                                "first_stage_model.{side}.{stack}.{i}.block.{j}.{part}.{leaf}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for part in ["conv_in", "conv_out", "norm_out", "conv_norm_out"] {
+            for leaf in leaves {
+                keys.push(format!("first_stage_model.{side}.{part}.{leaf}"));
+            }
+        }
+        for i in 0..4 {
+            for (stack, sampler) in [("down", "downsample"), ("up", "upsample")] {
+                for leaf in leaves {
+                    keys.push(format!(
+                        "first_stage_model.{side}.{stack}.{i}.{sampler}.conv.{leaf}"
+                    ));
+                }
+            }
+        }
+    }
+    let mut writers = std::collections::BTreeMap::<(String, String), Vec<String>>::new();
+    for key in keys {
+        let targets = match remap_sdxl_ldm_key(&key) {
+            Some(
+                TensorRemap::Rename(c, t)
+                | TensorRemap::Squeeze(c, t)
+                | TensorRemap::Transpose(c, t),
+            ) => {
+                vec![(c, t)]
+            }
+            Some(TensorRemap::SplitQkv(c, ts)) => ts.into_iter().map(|t| (c, t)).collect(),
+            None => Vec::new(),
+        };
+        for (component, target) in targets {
+            if matches!(component, C::Unet | C::Vae) {
+                writers
+                    .entry((format!("{component:?}"), target))
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+    }
+    let collisions = writers
+        .iter()
+        .filter(|(_, keys)| keys.len() > 1)
+        .collect::<Vec<_>>();
+    let mut seen = (false, false);
+    for ((component, target), keys) in &collisions {
+        if component == "Unet" {
+            seen.0 = true;
+            // Upsampler slots, and the layer-agnostic `input_blocks.N.0.op` downsampler spelling.
+            let leaf = ["up_blocks.", "down_blocks."]
+                .iter()
+                .find_map(|stack| target.strip_prefix(stack))
+                .and_then(|rest| {
+                    rest.split_once(".upsamplers.0.conv.")
+                        .or_else(|| rest.split_once(".downsamplers.0.conv."))
+                })
+                .map(|(_, leaf)| leaf);
+            assert!(
+                leaf.is_some_and(|leaf| leaves.contains(&leaf)),
+                "U-Net collision outside the sampler convolutions: {target} <- {keys:?}"
+            );
+        } else {
+            seen.1 = true;
+            assert!(
+                target.contains(".mid_block.attentions.0.") || target.contains(".conv_shortcut."),
+                "VAE collision outside attention/shortcut spellings: {target} <- {keys:?}"
+            );
+        }
+    }
+    assert_eq!(
+        seen,
+        (true, true),
+        "both component families have realizable collisions"
+    );
+}
+
+#[test]
+fn fused_adapter_selected_headers_are_normalized_host() {
+    use mlx_gen::gen_core::{LoadSpec, WeightsSource};
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("adapter-normalized.safetensors");
+    let (raw, arch) = fused_skeleton_headers();
+    assert!(raw
+        .iter()
+        .any(|h| h.name == "model.diffusion_model.time_embed.0.weight"));
+    assert!(!raw
+        .iter()
+        .any(|h| h.name == "time_embedding.linear_1.weight"));
+    write_header_only_sparse(&file, &raw);
+    let spec = LoadSpec::new(WeightsSource::File(file.clone()));
+    let r = regime(Route::Text);
+    let mut inputs = Inputs::from_spec_for_test(&spec, &r).unwrap();
+    inputs.arch = arch;
+    let priced = Priced::build_configured(&inputs, &spec).unwrap();
+    // This is the SAME selector price_configured_observing passes to adapter routing.
+    // Reading the raw file here reproduces the old bug and fails this discriminator.
+    let selected = priced.configured_source_headers(&file).unwrap();
+    assert!(selected
+        .iter()
+        .any(|h| h.name == "time_embedding.linear_1.weight"));
+    assert!(!selected
+        .iter()
+        .any(|h| h.name.starts_with("model.diffusion_model.")));
+    let expected = inputs
+        .fused
+        .as_ref()
+        .unwrap()
+        .source
+        .headers_with(mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet, &[]);
+    assert_eq!(selected, expected);
 }

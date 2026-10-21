@@ -33,6 +33,8 @@ use mlx_gen::{Error, Result};
 use mlx_rs::Dtype;
 use std::path::{Path, PathBuf};
 
+mod heavy_alias;
+mod native_ledger;
 mod text_alias;
 
 /// Every quantum label this crate checks (`ios_quantum::{run, before, before_load*}`) and the phase
@@ -61,6 +63,8 @@ const PHASES: &[(&str, IosPhase)] = &[
     (q::RESAMPLER_PROJ_OUT, IosPhase::Conditioning),
     (q::IP_CFG_TOKENS, IosPhase::Conditioning),
     (REQUEST_INPUTS, IosPhase::Load),
+    // Pricing-only host work priced inside the IP route's conditioning (no guard checks it).
+    (IP_PREPROCESS_HOST, IosPhase::Conditioning),
     (q::VAE_ENCODE_IN, IosPhase::Encode),
     (q::VAE_ENCODE_RESNET, IosPhase::Encode),
     (q::VAE_ENCODE_ATTENTION, IosPhase::Encode),
@@ -157,7 +161,7 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
     {
         return Ok(serde_json::Value::Null);
     }
-    let (form, unet_headers) = match &spec.weights {
+    let (form, unet_headers, alternatives) = match &spec.weights {
         WeightsSource::Dir(root) => {
             if let Some(quant) = spec.quantize {
                 mlx_gen::quant::needs_load_time_quant(
@@ -171,6 +175,7 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
             (
                 "diffusers",
                 safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))?,
+                Vec::new(),
             )
         }
         WeightsSource::File(file) => {
@@ -178,13 +183,37 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
             for h in safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))? {
                 crate::quant::header_dtype(h.dtype)?;
             }
-            (
-                "fused_ldm",
-                crate::ldm::component_headers(
-                    file,
-                    mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet,
-                )?,
-            )
+            let source = crate::ldm::component_header_source(file)?;
+            use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+            // The identity is a function of the source, not of one native order: every
+            // order-dependent UNet group lists each realizable winner's layouts and adapter facts.
+            let mut groups = Vec::new();
+            for (group, alias) in source.aliases.iter().enumerate() {
+                if alias.component != C::Unet {
+                    continue;
+                }
+                let mut assignments = Vec::new();
+                for assignment in 0..alias.assignments.len() {
+                    let world = source.headers_with(C::Unet, &[(group, assignment)]);
+                    let mut layouts = std::collections::BTreeMap::new();
+                    for target in &alias.targets {
+                        let h = world
+                            .iter()
+                            .find(|h| &h.name == target)
+                            .ok_or_else(|| Error::MissingTensor(target.clone()))?;
+                        layouts.insert(target.clone(), json!({"shape":h.shape,
+                            "loaded_dtype":format!("{:?}",crate::quant::loaded_header_dtype(&world,h)?)}));
+                    }
+                    let adapters = if spec.adapters.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        crate::adapters::configured_adapter_semantic_facts(spec, &world)?
+                    };
+                    assignments.push(json!({"layouts":layouts,"adapter_graph":adapters}));
+                }
+                groups.push(json!({"targets":alias.targets,"assignments":assignments}));
+            }
+            ("fused_ldm", source.headers(C::Unet), groups)
         }
     };
     let base_layouts = configured_component_layouts(&unet_headers)?;
@@ -274,10 +303,13 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
         let headers=safetensors_path_tensor_headers(file).map_err(|e|Error::Msg(e.to_string()))?;
         Ok::<_,Error>(json!({"installed":"fp16_fix_vae","loaded_source_layouts":configured_component_layouts(&headers)?}))
     }).transpose()?;
-    Ok(
-        json!({"provider":"sdxl","load_form":form,"load_quantization_after_adapters_and_ip":spec.quantize.map(|q|q.bits()),
-        "base_loaded_source_layouts":base_layouts,"adapter_graph":adapter_facts,"controls":controls,"ip_adapter":ip,"vae_overlay":vae_overlay}),
-    )
+    let mut identity = json!({"provider":"sdxl","load_form":form,"load_quantization_after_adapters_and_ip":spec.quantize.map(|q|q.bits()),
+        "base_loaded_source_layouts":base_layouts,"adapter_graph":adapter_facts,"controls":controls,"ip_adapter":ip,"vae_overlay":vae_overlay});
+    // Present only for order-dependent fused UNet sources: alias-free identities are unchanged.
+    if !alternatives.is_empty() {
+        identity["order_dependent_unet_aliases"] = json!(alternatives);
+    }
+    Ok(identity)
 }
 
 fn projection_semantic_fact(
@@ -362,16 +394,33 @@ fn price_regime(
     })
 }
 
-/// The exact pricer over every witness world of the source's order-dependent text aliases
-/// ([`text_alias`]), kept as one whole-candidate window envelope. A source without aliases has
-/// the single base world and returns its ledger unchanged.
+/// The exact pricer over every witness world of the source's order-dependent aliases (text
+/// [`text_alias`], UNet/VAE [`heavy_alias`]), kept as one whole-candidate window envelope. A
+/// source without aliases has the single base world and returns its ledger unchanged.
 fn price_inputs(
     inputs: &mut Inputs,
     regime: &Regime,
     configured: Option<&LoadSpec>,
 ) -> Result<IosPricing> {
-    let worlds = text_alias::witness_worlds(inputs, regime)?;
-    price_worlds(inputs, regime, configured, worlds)
+    let worlds = text_alias::witness_worlds(inputs, regime, configured)?;
+    let mut pricing = price_worlds(inputs, regime, configured, worlds)?;
+    native_ledger::classify_windows(&mut pricing, regime)?;
+    Ok(pricing)
+}
+
+/// The unchanged exact pricer over the currently selected source world.
+fn price_world(
+    inputs: &Inputs,
+    regime: &Regime,
+    configured: Option<&LoadSpec>,
+) -> Result<IosPricing> {
+    match configured {
+        Some(spec) => {
+            let mut priced = Priced::build_configured(inputs, spec)?;
+            priced.price_configured(spec, &inputs.unet, inputs.quant_bits, regime)
+        }
+        None => Ok(Priced::build(inputs)?.price(regime)?.0),
+    }
 }
 
 fn price_worlds(
@@ -380,35 +429,18 @@ fn price_worlds(
     configured: Option<&LoadSpec>,
     worlds: Vec<text_alias::Picks>,
 ) -> Result<IosPricing> {
-    let price_world = |inputs: &Inputs| -> Result<IosPricing> {
-        match configured {
-            Some(spec) => {
-                let mut priced = Priced::build_configured(inputs, spec)?;
-                priced.price_configured(spec, &inputs.unet, inputs.quant_bits, regime)
-            }
-            None => Ok(Priced::build(inputs)?.price(regime)?.0),
-        }
-    };
     if worlds.len() == 1 && worlds[0].is_empty() {
-        return price_world(inputs);
+        return price_world(inputs, regime, configured);
     }
     let mut envelope = WindowEnvelope::new();
     let mut absent = None;
     for world in worlds {
-        inputs
-            .fused
-            .as_mut()
-            .expect("text alias worlds are fused")
-            .world = world;
-        let pricing = price_world(inputs)?;
+        inputs.fused.as_mut().expect("alias worlds are fused").world = world;
+        let pricing = price_world(inputs, regime, configured)?;
         absent.get_or_insert_with(|| pricing.absent_phases.clone());
         merge_envelope(&mut envelope, pricing);
     }
-    inputs
-        .fused
-        .as_mut()
-        .expect("text alias worlds are fused")
-        .world = Vec::new();
+    inputs.fused.as_mut().expect("alias worlds are fused").world = Vec::new();
     let mut pricing = IosPricing::default();
     for (_, window) in envelope {
         pricing.take_window(window);
@@ -417,8 +449,13 @@ fn price_worlds(
     Ok(pricing)
 }
 
-/// Test oracle: the same envelope over EVERY realizable text-alias world (the full product of
-/// each group's realizable assignments), or over the production witness worlds.
+#[cfg(test)]
+pub(crate) use native_ledger::{
+    certified_request_bounds_for_test, resolve_bound_side_for_test, source_pricing_for_test,
+};
+
+/// Test oracle: the same envelope over EVERY realizable alias world (the full product of each
+/// group's realizable assignments), or over the production witness worlds.
 #[cfg(test)]
 pub(crate) fn alias_envelope_for_test(
     inputs: &mut Inputs,
@@ -448,9 +485,22 @@ pub(crate) fn alias_envelope_for_test(
         }
         worlds
     } else {
-        text_alias::witness_worlds(inputs, regime)?
+        text_alias::witness_worlds(inputs, regime, configured)?
     };
     price_worlds(inputs, regime, configured, worlds)
+}
+
+/// Test access: the unchanged exact pricer over one selected alias world (CPU kernels).
+#[cfg(test)]
+pub(crate) fn price_world_for_test(
+    inputs: &mut Inputs,
+    regime: &Regime,
+    world: text_alias::Picks,
+) -> IosPricing {
+    inputs.fused.as_mut().expect("fused alias fixture").world = world;
+    let pricing = q::with_backend(Backend::Cpu, || price_world(inputs, regime, None)).unwrap();
+    inputs.fused.as_mut().expect("fused alias fixture").world = Vec::new();
+    pricing
 }
 
 type WindowEnvelope =
@@ -483,16 +533,93 @@ fn merge_envelope(envelope: &mut WindowEnvelope, pricing: IosPricing) {
     }
 }
 
-/// Source-owned NATIVE-ALLOCATOR matched-window certificates for the correlated anchor law.
-/// The typed domain forbids using these as process-growth authority. The law must check
-/// coverage of ALL requested windows; an unreturned class is not permission to ignore that work.
-/// In particular, a new Encode phase is never certified from a logical VAE scratch sum here.
+/// How a transfer certificate treats Metal command-buffer captures (completed-handler-held input,
+/// sibling and encoder-temporary `Data`) that MLX `eval` does not retire on return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdxlRetirementPremise {
+    /// Default. A capture is retired only by proven completed-handler/`Data` destruction. No
+    /// immutable MLX source establishes that point (`mlx_synchronize` waits for command
+    /// completion, not for handler destruction), and every certified forward window follows
+    /// earlier command buffers, so SDXL transfer certificates are refused.
+    ProvenOnly,
+    /// Named platform premise, disabled by default: a command buffer's captures are retired once
+    /// `mlx_synchronize` (`waitUntilCompleted`) returns. It may be enabled only with explicit
+    /// approval of this physical/platform premise alongside activity 26569; certificates carry
+    /// its identifier.
+    MetalSynchronizeRetirement,
+}
+
+impl SdxlRetirementPremise {
+    /// The transfer refusal of [`Self::ProvenOnly`]; the named premise admits certification.
+    pub(crate) fn admit(self) -> Result<()> {
+        match self {
+            Self::ProvenOnly => Err(Error::Unsupported(format!(
+                "sdxl transfer certificate refused under {}: every certified forward window \
+                 follows earlier command buffers whose captured Metal buffers retire only by \
+                 completed-handler/Data destruction, which no source proves; the {} premise is \
+                 disabled without approval",
+                self.id(),
+                Self::MetalSynchronizeRetirement.id()
+            ))),
+            Self::MetalSynchronizeRetirement => Ok(()),
+        }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ProvenOnly => "sdxl/metal-capture-retirement/proven-only-v1",
+            Self::MetalSynchronizeRetirement => {
+                "sdxl/metal-capture-retirement/wait-until-completed-premise-v1"
+            }
+        }
+    }
+}
+
+/// Transfer certificates together with the retirement premise every one of them assumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdxlPremisedBounds {
+    pub premise: &'static str,
+    pub bounds: Vec<IosWindowBound>,
+}
+
+/// Source-owned NATIVE-ALLOCATOR matched-window certificates for the correlated anchor law, under
+/// the default [`SdxlRetirementPremise::ProvenOnly`]: cumulative native growth receives no retirement credit.
 pub fn ios_bounder(
     anchor_request: &IosPricingRequest<'_>,
     anchor_pricing: &IosPricing,
     request: &IosPricingRequest<'_>,
     request_pricing: &IosPricing,
 ) -> Result<Vec<IosWindowBound>> {
+    ios_bounder_with_premise(
+        SdxlRetirementPremise::ProvenOnly,
+        anchor_request,
+        anchor_pricing,
+        request,
+        request_pricing,
+    )
+    .map(|premised| premised.bounds)
+}
+
+/// [`ios_bounder`] under an explicit retirement premise. The typed domain forbids using these as
+/// process-growth authority. The law must check coverage of ALL requested windows; an unreturned
+/// class is not permission to ignore that work. A new Encode phase is never certified from a
+/// logical VAE scratch sum here.
+pub fn ios_bounder_with_premise(
+    premise: SdxlRetirementPremise,
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> Result<SdxlPremisedBounds> {
+    if premise == SdxlRetirementPremise::ProvenOnly {
+        return proven_only_bounds(
+            anchor_request,
+            None,
+            anchor_pricing,
+            request,
+            request_pricing,
+        );
+    }
     let anchor = Regime::from_request(anchor_request)?;
     let requested = Regime::from_request(request)?;
     let mut anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
@@ -541,12 +668,18 @@ pub fn ios_bounder(
                 "sdxl transfer pricing is not the source-generated profile".into(),
             ));
         }
+        premise.admit()?;
+        let states = [
+            Priced::build(&anchor_inputs)?.ancestral_states(&anchor)?,
+            Priced::build(&request_inputs)?.ancestral_states(&requested)?,
+        ];
         let mut bounds = bound_ancestral_forward_windows(
             &anchor,
             anchor_pricing,
             &requested,
             request_pricing,
             anchor_inputs.arch.latent_scale,
+            states,
         )?;
         for bound in &mut bounds {
             if let IosWindowBound::Transfer {
@@ -560,7 +693,67 @@ pub fn ios_bounder(
                 }
             }
         }
-        Ok(bounds)
+        Ok(SdxlPremisedBounds {
+            premise: premise.id(),
+            bounds,
+        })
+    })
+}
+
+/// Typed payload-free catalog anchor facts. Counts are actual input roles, not the aggregate
+/// geometry reference count. Source facts are mandatory for source-dependent IP geometry.
+pub struct SdxlReplay<'a> {
+    pub token: &'a str,
+    pub true_reference_count: usize,
+    pub mask_count: usize,
+    pub control_count: usize,
+    pub source: Option<&'a crate::sampling::SamplingSourceFacts>,
+}
+
+/// Full native request certificate from either an actual-request anchor or its typed replay.
+/// An actual GenerationRequest takes precedence; no request or image facts are synthesized.
+pub fn ios_bounder_with_replay(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_replay: Option<SdxlReplay<'_>>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> Result<Vec<IosWindowBound>> {
+    proven_only_bounds(
+        anchor_request,
+        anchor_replay,
+        anchor_pricing,
+        request,
+        request_pricing,
+    )
+    .map(|premised| premised.bounds)
+}
+
+fn proven_only_bounds(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_replay: Option<SdxlReplay<'_>>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+) -> Result<SdxlPremisedBounds> {
+    let bounds = match anchor_replay {
+        None => native_ledger::certified_request_bounds(
+            anchor_request,
+            anchor_pricing,
+            request,
+            request_pricing,
+        )?,
+        replay => native_ledger::certified_request_bounds_with_replay(
+            anchor_request,
+            replay,
+            anchor_pricing,
+            request,
+            request_pricing,
+        )?,
+    };
+    Ok(SdxlPremisedBounds {
+        premise: SdxlRetirementPremise::ProvenOnly.id(),
+        bounds,
     })
 }
 
@@ -574,6 +767,7 @@ pub(crate) fn bound_ancestral_forward_windows(
     request: &Regime,
     request_pricing: &IosPricing,
     latent_scale: i32,
+    states: [(Dtype, Dtype); 2],
 ) -> Result<Vec<IosWindowBound>> {
     if anchor.sampling.route() != SamplingRoute::Ancestral
         || request.sampling.route() != SamplingRoute::Ancestral
@@ -613,8 +807,13 @@ pub(crate) fn bound_ancestral_forward_windows(
             {
                 continue;
             }
-            let witnesses =
-                ancestral_forward_witnesses(anchor, anchor_pricing, at_anchor, latent_scale)?;
+            let witnesses = ancestral_forward_witnesses(
+                anchor,
+                anchor_pricing,
+                at_anchor,
+                latent_scale,
+                states[0],
+            )?;
             if witnesses.is_empty() {
                 continue;
             }
@@ -629,10 +828,25 @@ pub(crate) fn bound_ancestral_forward_windows(
                     .ok_or_else(|| {
                         Error::Unsupported("sdxl native input extent overflow".into())
                     })?;
-                let anchor_owned =
-                    fresh_ancestral_forward_inputs(anchor, at_anchor, elements, page)?;
-                let request_owned =
-                    fresh_ancestral_forward_inputs(request, requested, elements, page)?;
+                // Anchor: certainly-live owners at their exact fresh length (a cached buffer is
+                // never shorter). Request: every owner at the buffer-cache reuse upper, since a
+                // foreign cache-limit change can refill the cache inside the generation scope.
+                let anchor_owned = ancestral_forward_owners(
+                    anchor,
+                    at_anchor,
+                    elements,
+                    page,
+                    states[0],
+                    mlx_gen::ios_quantum::fresh_metal_allocation_bytes,
+                )?;
+                let request_owned = ancestral_forward_owners(
+                    request,
+                    requested,
+                    elements,
+                    page,
+                    states[1],
+                    q::metal_reuse_upper_bytes,
+                )?;
                 candidates.push(IosAnchorCandidate {
                     anchor_class: class.into(),
                     delta_growth_upper: i128::from(request_owned) - i128::from(anchor_owned),
@@ -691,11 +905,17 @@ fn witnessed_cache_zero_page(pricing: &IosPricing, witness: &IosAnchorWitness) -
         .ok_or_else(invalid)
 }
 
-fn fresh_ancestral_forward_inputs(
+/// The forward-input owners alive through a certified (non-stem) ancestral forward window, each
+/// charged by `charge`. Under the synchronize-retirement premise the stem quantum's own pending
+/// graph (the first epoch's prior/noise draw, CFG concatenation and cast) is retired with the
+/// stem command buffer, leaving only these Rust-held outputs.
+fn ancestral_forward_owners(
     regime: &Regime,
     window: &IosWindowPrice,
     elements: u64,
     page: u64,
+    (first, steady): (Dtype, Dtype),
+    charge: fn(u64, u64) -> Option<u64>,
 ) -> Result<u64> {
     let invalid = || {
         Error::Unsupported("sdxl native owner allocation provenance/extent is unverified".into())
@@ -705,29 +925,26 @@ fn fresh_ancestral_forward_inputs(
         .and_then(|class| class.rsplit(':').nth(2))
         .ok_or_else(invalid)?;
     let state = match epoch {
-        "first" => regime.initial_state_dtype(),
-        "steady" => Dtype::Float32,
+        "first" => first,
+        "steady" => steady,
         _ => return Err(invalid()),
     };
-    // These sampler states are full-span outputs, not arbitrary caller-provided views. The
-    // generation's outer checked Scope encloses their construction and existing eval barriers.
+    // These sampler states are full-span outputs, not arbitrary caller-provided views.
     // Init/noise/mask are separate retained owners; never round their combined logical sum.
     let mut owned = regime
         .forward_owners(state)
-        .fresh_native_bytes(
+        .native_bytes(
             elements,
             elements,
             crate::model::DTYPE,
             regime.model_rows() as u64,
             page,
+            charge,
         )
         .ok_or_else(invalid)?;
     let mut add = |bytes| -> Result<()> {
         owned = owned
-            .checked_add(
-                mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, page)
-                    .ok_or_else(invalid)?,
-            )
+            .checked_add(charge(bytes, page).ok_or_else(invalid)?)
             .ok_or_else(invalid)?;
         Ok(())
     };
@@ -752,6 +969,7 @@ fn ancestral_forward_witnesses(
     pricing: &IosPricing,
     window: &IosWindowPrice,
     latent_scale: i32,
+    (first_state, steady_state): (Dtype, Dtype),
 ) -> Result<Vec<IosAnchorWitness>> {
     let malformed = || Error::Unsupported("sdxl malformed source forward window".into());
     let mut parts = window.profile_class().ok_or_else(malformed)?.rsplit(':');
@@ -791,11 +1009,7 @@ fn ancestral_forward_witnesses(
         .and_then(|n| n.checked_mul(latent_w))
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(malformed)?;
-    let state = if first {
-        regime.initial_state_dtype()
-    } else {
-        Dtype::Float32
-    };
+    let state = if first { first_state } else { steady_state };
     let mut witnesses = Vec::new();
     for (capture_index, capture) in pricing.observations.iter().enumerate() {
         if capture.domain != IosMemoryDomain::NativeAllocatorGrowth
@@ -1292,11 +1506,6 @@ impl Inputs {
                 file
             }
         };
-        if !spec.adapters.is_empty() {
-            return Err(Error::Unsupported(
-                "sdxl ios pricing: adapter (LoRA/LoKr/LoHa) installs are not priced".into(),
-            ));
-        }
         if spec.pid.is_some() {
             return Err(Error::Unsupported(
                 "sdxl ios pricing: the PiD decoder overlay is not priced".into(),
@@ -1400,6 +1609,17 @@ pub(crate) struct Footprint {
     pub floor: u64,
 }
 
+fn take(items: &mut Vec<PricedQuantum>, phase: IosPhase, resident: u64, quanta: Quanta) {
+    for (label, scratch) in quanta {
+        items.push(PricedQuantum {
+            phase,
+            resident,
+            label,
+            scratch,
+        });
+    }
+}
+
 /// One complete source-logical pack point, never a scratch maximum paired with a different
 /// stage's retained maximum. Pre-pack roots remain charged; no physical release is inferred.
 pub(crate) struct LoadPackPoint {
@@ -1418,11 +1638,12 @@ fn collect_pack_effect(
 ) -> Result<()> {
     let mut work = linear.clone();
     if work.bits.is_none() {
-        let scratch = work.pack(bits)?;
+        // The native pack guard is admitted before the quantize op validates the base.
         points.push(LoadPackPoint {
             before_resident: *retained,
-            scratch,
+            scratch: work.pack_scratch(bits),
         });
+        work.pack(bits)?;
         // Only the base changes. Residual factors/deltas stay in their original owner set.
         let base_outputs = work
             .weights
@@ -1445,7 +1666,17 @@ fn collect_pack_effect(
 /// Every served component here is metadata; native execution remains in the actual loaders.
 /// All footprints are header-only. The heavy pack collector
 /// below is metadata-only and never quantizes/evaluates those graphs to discover pricing.
+/// The native shape failure that ends a build-stage pack walk; `price` then emits exactly the
+/// admitted native prefix through the failing pack guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeFailure {
+    TextPack,
+    HeavyPack,
+}
+
 pub(crate) struct Priced {
+    configured_unet_headers: Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+    native_failure: Option<NativeFailure>,
     fused: Option<FusedLoadFacts>,
     te: (ClipPrice, ClipPrice),
     unet: UNetFacts,
@@ -1535,6 +1766,19 @@ pub(crate) fn initial_heavy_pack(
 }
 
 impl Priced {
+    /// Exact normalized source graph used by adapter target selection in this alias world.
+    pub(crate) fn configured_source_headers(
+        &self,
+        unet_file: &Path,
+    ) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+        if self.fused.is_some() {
+            Ok(self.configured_unet_headers.clone())
+        } else {
+            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(unet_file)
+                .map_err(|e| Error::Msg(e.to_string()))
+        }
+    }
+
     pub(crate) fn build(inputs: &Inputs) -> Result<Self> {
         Self::build_with_pack_timing(inputs, None)
     }
@@ -1571,11 +1815,21 @@ impl Priced {
                 footprint(&one(&inputs.te2), dtype, |_| true)?,
             ]
         };
-        let te_pack = [
-            crate::text_encoder::text_pack_facts(&te1_headers, &arch.te1, inputs.text_quant_bits)?,
-            crate::text_encoder::text_pack_facts(&te2_headers, &arch.te2, inputs.text_quant_bits)?,
-        ];
-        if let Some(bits) = inputs.text_quant_bits {
+        let mut native_failure = None;
+        // TE1 then TE2 pack in order; a native quantize shape failure stops the pair there.
+        let (first_pack, first_failure) =
+            crate::text_encoder::text_pack_prefix(&te1_headers, &arch.te1, inputs.text_quant_bits)?;
+        let (second_pack, second_failure) = if first_failure.is_none() {
+            crate::text_encoder::text_pack_prefix(&te2_headers, &arch.te2, inputs.text_quant_bits)?
+        } else {
+            // TE2 never packs after TE1's failing pack: its unpacked retained owners only.
+            let unpacked = crate::text_encoder::text_pack_facts(&te2_headers, &arch.te2, None)?;
+            (unpacked, None)
+        };
+        let te_pack = [first_pack, second_pack];
+        if first_failure.is_some() || second_failure.is_some() {
+            native_failure = Some(NativeFailure::TextPack);
+        } else if let Some(bits) = inputs.text_quant_bits {
             // Both header constructors precede the actual pair's ordered base-only metadata pack.
             // No native CLIP/Weights/Array, quantizer interception or readiness query is involved.
             te1.quantize(bits)?;
@@ -1710,7 +1964,7 @@ impl Priced {
                 let mut outputs = 0;
                 // This is the ACTUAL ordered module walk, with a pure metadata visitor. The borrowed
                 // constructor facts stay untouched: no quantize_linear, Array creation, eval or read.
-                unet.quantize_using(bits, &mut |path, linear, bits| {
+                let packed = unet.quantize_using(bits, &mut |path, linear, bits| {
                     collect_pack_effect(
                         path,
                         linear,
@@ -1720,13 +1974,21 @@ impl Priced {
                         &mut load_quantize,
                         &mut effects,
                     )
-                })?;
+                });
+                if let Err(error) = packed {
+                    if !q::is_native_shape_failure(&error) {
+                        return Err(error);
+                    }
+                    // Native fails inside this pack walk: later control packs never run.
+                    native_failure = Some(NativeFailure::HeavyPack);
+                    return Ok(());
+                }
                 unet_retained = unet_retained.saturating_add(outputs);
                 unet_effects = Some(effects);
                 for (index, control) in controls.iter_mut().enumerate() {
                     let mut effects = q::LinearEffects::default();
                     let mut outputs = 0;
-                    control.quantize_using(bits, &mut |path, linear, bits| {
+                    let packed = control.quantize_using(bits, &mut |path, linear, bits| {
                         collect_pack_effect(
                             path,
                             linear,
@@ -1736,7 +1998,14 @@ impl Priced {
                             &mut load_quantize,
                             &mut effects,
                         )
-                    })?;
+                    });
+                    if let Err(error) = packed {
+                        if !q::is_native_shape_failure(&error) {
+                            return Err(error);
+                        }
+                        native_failure = Some(NativeFailure::HeavyPack);
+                        return Ok(());
+                    }
                     control_bytes[index].1 =
                         control_bytes[index].0.resident.saturating_add(outputs);
                     control_effects.push(Some(effects));
@@ -1776,6 +2045,8 @@ impl Priced {
             })
             .transpose()?;
         Ok(Self {
+            configured_unet_headers: unet_headers,
+            native_failure,
             fused,
             te: (te1, te2),
             unet,
@@ -1833,8 +2104,7 @@ impl Priced {
         if spec.adapters.is_empty() {
             return Ok(self.price(regime)?.0);
         }
-        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(unet_file)
-            .map_err(|e| Error::Msg(e.to_string()))?;
+        let headers = self.configured_source_headers(unet_file)?;
         let config = self.arch.unet.clone();
         let mut envelope = WindowEnvelope::new();
         let mut accepted = false;
@@ -1892,6 +2162,7 @@ impl Priced {
                 let saved_packs = std::mem::take(&mut self.load_quantize);
                 let saved_adapter = std::mem::replace(&mut self.adapter_load, ledger);
                 let saved_retained = self.unet_retained;
+                let saved_failure = self.native_failure;
                 let saved_control_resident: Vec<_> =
                     self.control_bytes.iter().map(|(_, r)| *r).collect();
                 let selected = (|| -> Result<IosPricing> {
@@ -1957,18 +2228,19 @@ impl Priced {
                         .saturating_add(self.ip_encoder_bytes.resident)
                         .saturating_add(self.ip_adapter_bytes.resident);
                     if let Some(bits) = bits {
-                        self.unet.quantize_using(bits, &mut |path, _, bits| {
+                        let packed = self.unet.quantize_using(bits, &mut |path, _, bits| {
                             let projection = effects.0.get_mut(path).ok_or_else(|| {
                                 Error::Msg(format!(
                                     "sdxl selected world missing ordered pack target: {path}"
                                 ))
                             })?;
                             if projection.bits.is_none() {
-                                let scratch = projection.pack(bits)?;
+                                // The native pack guard precedes the quantize op's validation.
                                 self.load_quantize.push(LoadPackPoint {
                                     before_resident: retained,
-                                    scratch,
+                                    scratch: projection.pack_scratch(bits),
                                 });
+                                projection.pack(bits)?;
                                 // Whole declared projection, including unchanged residual owners,
                                 // remains an upper. No upper subtraction or backing release credit.
                                 let outputs = projection.declared_bytes();
@@ -1976,7 +2248,19 @@ impl Priced {
                                 self.unet_retained = self.unet_retained.saturating_add(outputs);
                             }
                             Ok(())
-                        })?;
+                        });
+                        // A native quantize shape failure ends this world inside the heavy pack:
+                        // its admitted prefix is priced, no later control pack or forward.
+                        if let Err(error) = packed {
+                            if !q::is_native_shape_failure(&error) {
+                                return Err(error);
+                            }
+                            self.native_failure = Some(NativeFailure::HeavyPack);
+                            self.unet_effects = Some(effects);
+                            let candidate = self.price(regime)?.0;
+                            observe(&outcome, self, &self.adapter_load, &candidate)?;
+                            return Ok(candidate);
+                        }
                         for (index, control) in self.controls.iter_mut().enumerate() {
                             let mut control_effects = q::LinearEffects::default();
                             let mut outputs = 0;
@@ -2009,6 +2293,7 @@ impl Priced {
                 self.load_quantize = saved_packs;
                 self.adapter_load = saved_adapter;
                 self.unet_retained = saved_retained;
+                self.native_failure = saved_failure;
                 for ((_, resident), saved) in
                     self.control_bytes.iter_mut().zip(saved_control_resident)
                 {
@@ -2058,10 +2343,64 @@ impl Priced {
 
     /// The actual encoder pair's header-only conditioning flow after its ordered metadata finalize.
     /// No fixed tier/compute dtype substitutes for packed projection promotion.
-    pub(crate) fn price_text_conditioning(&self, rows: i32, out: &mut Quanta) -> (Dtype, Dtype) {
-        let (h1, _) = self.te.0.price_forward(rows, self.arch.text_tokens, out);
-        let (h2, pooled) = self.te.1.price_forward(rows, self.arch.text_tokens, out);
-        (Dtype::from_promoting_types(h1, h2), pooled)
+    /// Both towers in native order. A native shape failure returns `Err` with the admitted
+    /// quanta (through the failing layer's guard) already in `out`.
+    /// The ancestral sampler state dtypes of the first and steady epochs. `EulerSampler::step`
+    /// computes in the U-Net output's dtype and joins it with x_t, and `price_step` casts its input
+    /// to the model dtype first, so the steady state is the first state joined with eps.
+    pub(crate) fn ancestral_states(&self, regime: &Regime) -> Result<(Dtype, Dtype)> {
+        let rows = regime.conditioning_rows();
+        let (conditioning, pooled) = self.price_text_conditioning(rows, &mut Quanta::new())?;
+        let encoder_x = price_tensor(
+            &[rows, regime.context_tokens, self.arch.context_dim],
+            conditioning,
+        )?;
+        let text_emb = price_tensor(&[rows, self.te.1.pooled_width()], pooled)?;
+        let sequential = regime.sampling.guidance() > 1.0 && !regime.cfg_batching.is_batched();
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED
+            .with_cfg_batching(regime.cfg_batching)
+            .with_cfg_row(sequential.then_some(0));
+        let first = regime.initial_state_dtype();
+        let (lh, lw) = (
+            regime.height / self.arch.latent_scale,
+            regime.width / self.arch.latent_scale,
+        );
+        let eps = self.price_step(
+            regime,
+            price_tensor(&[regime.model_rows(), lh, lw, 4], first)?,
+            &encoder_x,
+            &text_emb,
+            &[],
+            None,
+            plan,
+            &mut Quanta::new(),
+            &mut Vec::new(),
+        )?;
+        Ok((first, Dtype::from_promoting_types(first, eps)))
+    }
+
+    pub(crate) fn price_text_conditioning(
+        &self,
+        rows: i32,
+        out: &mut Quanta,
+    ) -> Result<(Dtype, Dtype)> {
+        let (h1, _) = self
+            .te
+            .0
+            .price_forward_with_hidden(rows, self.arch.text_tokens, out)?;
+        let (h2, pooled) = self
+            .te
+            .1
+            .price_forward_with_hidden(rows, self.arch.text_tokens, out)?;
+        // Native pipeline::text_conditioning concatenates the two penultimate states on -1.
+        if h1.shape.len() != h2.shape.len()
+            || h1.shape[..h1.shape.len() - 1] != h2.shape[..h2.shape.len() - 1]
+        {
+            return Err(q::native_shape_failure(
+                "CLIP penultimate states do not concatenate",
+            ));
+        }
+        Ok((Dtype::from_promoting_types(h1.dtype, h2.dtype), pooled))
     }
 
     /// Actual fused warm/text/heavy load recipe. There are no Directory component-load guards
@@ -2104,10 +2443,15 @@ impl Priced {
                 );
             }
         }
-        let conditioning = if regime.staged {
-            let mut unused = Quanta::new();
-            let (context, pooled) =
-                self.price_text_conditioning(regime.conditioning_rows(), &mut unused);
+        // A natively failing staged conditioning never reaches the heavy load; `price` drops these
+        // heavy points in that world, so its unknown conditioning bytes are never read.
+        let conditioned = if regime.staged {
+            self.price_text_conditioning(regime.conditioning_rows(), &mut Quanta::new())
+                .ok()
+        } else {
+            None
+        };
+        let conditioning = if let Some((context, pooled)) = conditioned {
             mlx_gen::ios_quantum::tensor_bytes(
                 q::dtype_bytes(context),
                 &[
@@ -2184,22 +2528,19 @@ impl Priced {
     /// Price `regime`: the per-phase pricing and every `(phase, resident, label, scratch)` quantum.
     pub(crate) fn price(&self, regime: &Regime) -> Result<(IosPricing, Vec<PricedQuantum>)> {
         let mut items: Vec<PricedQuantum> = Vec::new();
-        let mut take = |phase: IosPhase, resident: u64, quanta: Quanta| {
-            for (label, scratch) in quanta {
-                items.push(PricedQuantum {
-                    phase,
-                    resident,
-                    label,
-                    scratch,
-                });
-            }
-        };
         let staged = regime.staged;
         let warm_text = if staged { 0 } else { self.text() };
 
+        let text_stage_end;
         if let Some(points) = self.fused_load_points(regime) {
+            // Native chronology: the text load and text packs precede the heavy load guard.
+            text_stage_end = points
+                .iter()
+                .position(|point| point.label == q::LDM_HEAVY_LOAD)
+                .unwrap_or(points.len());
             for point in points {
                 take(
+                    &mut items,
                     point.phase,
                     point.resident,
                     vec![(point.label, point.scratch)],
@@ -2210,11 +2551,13 @@ impl Priced {
             // heavy bundle — the U-Net, the VAE, the ControlNets (each at the compute dtype until the
             // bundle's tier quantization), the IP image encoder and IP weights.
             take(
+                &mut items,
                 IosPhase::Load,
                 0,
                 vec![(q::TEXT_ENCODER_1_LOAD, self.te_bytes[0].floor)],
             );
             take(
+                &mut items,
                 IosPhase::Load,
                 self.te_bytes[0].resident,
                 vec![(q::TEXT_ENCODER_2_LOAD, self.te_bytes[1].floor)],
@@ -2230,14 +2573,17 @@ impl Priced {
                 };
                 for point in &facts.points {
                     take(
+                        &mut items,
                         IosPhase::Load,
                         other + point.before_resident,
                         vec![(q::LOAD_QUANTIZE, point.scratch)],
                     );
                 }
             }
+            text_stage_end = items.len();
             let mut loaded = warm_text;
             take(
+                &mut items,
                 IosPhase::Load,
                 loaded,
                 vec![(q::UNET_LOAD, self.unet_bytes.floor)],
@@ -2245,6 +2591,7 @@ impl Priced {
             loaded += self.unet_bytes.resident;
             for point in &self.adapter_load.quanta {
                 take(
+                    &mut items,
                     IosPhase::Load,
                     warm_text.saturating_add(point.resident),
                     vec![(point.label, point.scratch)],
@@ -2257,6 +2604,7 @@ impl Priced {
                 q::VAE_FP16_FIX_LOAD
             };
             take(
+                &mut items,
                 IosPhase::Load,
                 loaded,
                 vec![(vae_label, self.vae_bytes.floor)],
@@ -2264,6 +2612,7 @@ impl Priced {
             loaded += self.vae_bytes.resident;
             for (load, _) in &self.control_bytes {
                 take(
+                    &mut items,
                     IosPhase::Load,
                     loaded,
                     vec![(q::CONTROLNET_LOAD, load.floor)],
@@ -2272,12 +2621,14 @@ impl Priced {
             }
             if self.ip.is_some() {
                 take(
+                    &mut items,
                     IosPhase::Load,
                     loaded,
                     vec![(q::IP_IMAGE_ENCODER_LOAD, self.ip_encoder_bytes.floor)],
                 );
                 loaded += self.ip_encoder_bytes.resident;
                 take(
+                    &mut items,
                     IosPhase::Load,
                     loaded,
                     vec![(q::IP_ADAPTER_LOAD, self.ip_adapter_bytes.floor)],
@@ -2286,11 +2637,34 @@ impl Priced {
 
             for point in &self.load_quantize {
                 take(
+                    &mut items,
                     IosPhase::Load,
                     warm_text.saturating_add(point.before_resident),
                     vec![(q::LOAD_QUANTIZE, point.scratch)],
                 );
             }
+        }
+        let loads_end = items.len();
+        if let Some(failure) = self.native_failure {
+            // A build-stage pack failure: the admitted native prefix ends at its pack guard.
+            if failure == NativeFailure::TextPack {
+                items.truncate(text_stage_end);
+            } else if staged {
+                // SequentialText ran the conditioning before the heavy load that failed.
+                let mut text = Quanta::new();
+                let conditioned =
+                    self.price_text_conditioning(regime.conditioning_rows(), &mut text);
+                take(&mut items, IosPhase::Conditioning, self.text(), text);
+                if let Err(error) = conditioned {
+                    if !q::is_native_shape_failure(&error) {
+                        return Err(error);
+                    }
+                    let mut kept = items[..text_stage_end].to_vec();
+                    kept.extend(items[loads_end..].iter().cloned());
+                    items = kept;
+                }
+            }
+            return Ok(self.finish(regime, items, Vec::new(), false, false));
         }
         let heavy = self.heavy(false);
         let (h, w) = (regime.height, regime.width);
@@ -2326,6 +2700,7 @@ impl Priced {
         let inputs = init_image + control_images + ip_pixels;
         if inputs > 0 {
             take(
+                &mut items,
                 IosPhase::Load,
                 heavy + warm_text + inputs,
                 vec![(REQUEST_INPUTS, 0)],
@@ -2335,9 +2710,27 @@ impl Priced {
         // time (each window is its own forward).
         let rows = regime.conditioning_rows();
         let mut text = Quanta::new();
-        let (conditioning_dtype, pooled) = self.price_text_conditioning(rows, &mut text);
+        let conditioned = self.price_text_conditioning(rows, &mut text);
         let text_resident = self.text() + if staged { 0 } else { heavy };
-        take(IosPhase::Conditioning, text_resident, text);
+        take(&mut items, IosPhase::Conditioning, text_resident, text);
+        let (conditioning_dtype, pooled) = match conditioned {
+            Ok(dtypes) => dtypes,
+            Err(error) if q::is_native_shape_failure(&error) => {
+                if staged {
+                    // SequentialText: the failing conditioning precedes every heavy load.
+                    let mut kept = items[..text_stage_end].to_vec();
+                    kept.extend(
+                        items[loads_end..]
+                            .iter()
+                            .filter(|item| item.phase == IosPhase::Conditioning)
+                            .cloned(),
+                    );
+                    items = kept;
+                }
+                return Ok(self.finish(regime, items, Vec::new(), false, false));
+            }
+            Err(error) => return Err(error),
+        };
 
         if let (Some(ip), Route::IpAdapter) = (&self.ip, regime.route) {
             let source = regime.reference_image.ok_or_else(|| {
@@ -2345,6 +2738,7 @@ impl Priced {
             })?;
             let geometry = ip.preprocess_geometry(source)?;
             take(
+                &mut items,
                 IosPhase::Conditioning,
                 heavy + warm_text + ip_pixels + geometry.source_buffer_bytes,
                 vec![(IP_PREPROCESS_HOST, geometry.host_requested_upper()?)],
@@ -2358,6 +2752,7 @@ impl Priced {
                     quanta.push((q::IP_CFG_TOKENS, q::ip_cfg_tokens_bytes_metadata(&tokens)));
                 }
                 take(
+                    &mut items,
                     IosPhase::Conditioning,
                     heavy + warm_text + ip_pixels,
                     quanta,
@@ -2376,12 +2771,24 @@ impl Priced {
                 .as_ref()
                 .and_then(|cfg| cfg.spatial.as_ref().map(|s| s.tile_px))
                 .unwrap_or(crate::vae::IOS_ENCODE_TILE_PX);
-            self.vae.price_encode(
+            let encoded = self.vae.price_encode(
                 &price_tensor(&[1, h, w, 3], Dtype::Float32)?,
                 tile,
                 &mut quanta,
-            )?;
-            take(IosPhase::Encode, heavy + warm_text + init_image, quanta);
+            );
+            take(
+                &mut items,
+                IosPhase::Encode,
+                heavy + warm_text + init_image,
+                quanta,
+            );
+            if let Err(error) = encoded {
+                if !q::is_native_shape_failure(&error) {
+                    return Err(error);
+                }
+                // The init encode failed natively after its admitted tile quanta.
+                return Ok(self.finish(regime, items, Vec::new(), false, false));
+            }
         }
         if regime.route == Route::Control {
             let mut quanta = Quanta::new();
@@ -2395,6 +2802,7 @@ impl Priced {
             // its embedding exists) and every branch's embedding beside each embedding quantum.
             let embeds: u64 = cond_embeds.iter().map(price_bytes).sum();
             take(
+                &mut items,
                 IosPhase::Encode,
                 heavy + warm_text + control_images + embeds,
                 quanta,
@@ -2468,12 +2876,14 @@ impl Priced {
         let mut quanta = Quanta::new();
         let mut step_dtype = latent;
         let mut epoch = 0;
+        let mut native_failed = false;
         loop {
             if discrete_steps == Some(0) {
                 break;
             }
             let mut forward = Quanta::new();
-            let (eps, coincident_control) = self.price_step(
+            let mut coincident_control = Vec::new();
+            let stepped = self.price_step(
                 regime,
                 price_tensor(&[batch, lh, lw, 4], step_dtype)?,
                 &encoder_x,
@@ -2482,7 +2892,20 @@ impl Priced {
                 ip_tokens.as_ref(),
                 plan,
                 &mut forward,
-            )?;
+                &mut coincident_control,
+            );
+            // A native shape failure inside the first forward's first half ends the world after
+            // that half's admitted quanta: no second half, sampler update, later epoch or decode.
+            let (eps, failed) = match stepped {
+                Ok(eps) => (eps, false),
+                Err(error)
+                    if q::is_native_shape_failure(&error)
+                        && coincident_control.len() == forward.len() =>
+                {
+                    (step_dtype, true)
+                }
+                Err(error) => return Err(error),
+            };
             let next = Dtype::from_promoting_types(step_dtype, eps);
             if let Some(steps) = discrete_steps.filter(|_| profiled_discrete) {
                 let elements = (lh as u64) * (lw as u64) * 4;
@@ -2494,13 +2917,18 @@ impl Priced {
                 let fixed = regime.initial_fixed_inputs(elements);
                 let addons = cond_embeds.iter().map(price_bytes).sum::<u64>()
                     + ip_tokens.as_ref().map_or(0, price_bytes);
-                let completed = elements * q::dtype_bytes(next) * u64::from(regime.count - 1);
+                // A failing first forward has no completed earlier serial latent.
+                let completed = if failed {
+                    0
+                } else {
+                    elements * q::dtype_bytes(next) * u64::from(regime.count - 1)
+                };
                 // Both conditioning tensors and model::generate's f32 [rows,6] time_ids remain
                 // owned in the enclosing generation scope (pipeline::text_time_ids).
                 let conditioning = price_bytes(&encoder_x)
                     + price_bytes(&text_emb)
                     + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
-                let halves = if sequential { 2 } else { 1 };
+                let halves = if sequential && !failed { 2 } else { 1 };
                 let shed_ip = crate::model::sheds_ip_image_encoder(staged)
                     && regime.route == Route::IpAdapter;
                 let structural = self.heavy(shed_ip) + warm_text;
@@ -2596,6 +3024,11 @@ impl Priced {
                     }),
                     owner_domain: format!("sdxl/{epoch_family}/sampler-update-logical-v1"),
                 };
+                if failed {
+                    quanta.extend(forward);
+                    native_failed = true;
+                    break;
+                }
                 if let Some(families) = &acceleration_families {
                     let mut represented = false;
                     for family in families.iter().filter(|f| f.first_step == (epoch == 0)) {
@@ -2656,8 +3089,11 @@ impl Priced {
                     let conditioning = price_bytes(&encoder_x)
                         + price_bytes(&text_emb)
                         + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
-                    let completed =
-                        elements * q::dtype_bytes(Dtype::Float32) * u64::from(regime.count - 1);
+                    let completed = if failed {
+                        0
+                    } else {
+                        elements * q::dtype_bytes(Dtype::Float32) * u64::from(regime.count - 1)
+                    };
                     let shed_ip = crate::model::sheds_ip_image_encoder(staged)
                         && regime.route == Route::IpAdapter;
                     let structural = self.heavy(shed_ip) + warm_text;
@@ -2683,7 +3119,7 @@ impl Priced {
                             + scaled
                             + cast
                             + cfg_pair;
-                        for half in 0..if sequential { 2 } else { 1 } {
+                        for half in 0..if sequential && !failed { 2 } else { 1 } {
                             for (ordinal, &(label, scratch)) in forward.iter().enumerate() {
                                 let overlap = if label == q::UNET_STEM || label == q::CONTROL_STEM {
                                     cast * batch as u64
@@ -2728,6 +3164,9 @@ impl Priced {
                                 });
                             }
                         }
+                        if failed {
+                            continue;
+                        }
                         denoise_windows.push(IosWindowPrice {
                             phase: IosPhase::Denoise,
                             class: (!unclassified_control_ip).then(|| {
@@ -2757,6 +3196,10 @@ impl Priced {
                     }
                 }
                 quanta.extend(forward);
+                if failed {
+                    native_failed = true;
+                    break;
+                }
                 if next == step_dtype {
                     break;
                 }
@@ -2764,17 +3207,20 @@ impl Priced {
             }
         }
         let latents = price_tensor(&[1, lh, lw, 4], step_dtype)?;
-        if regime.sampling.route().is_curated() {
-            quanta.push((
-                mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
-                mlx_gen::ios_quantum::sampler_step_bytes(latents.size() as u64),
-            ));
-        } else if ancestral_steps != Some(0) {
-            // Acceleration and bespoke ancestral both run the actual SDXL denoise_core guard.
-            quanta.push((
-                q::SAMPLER_STEP,
-                q::sampler_step_bytes_metadata(latents.elements(), regime.route == Route::Mask),
-            ));
+        // A failing forward never reached the sampler update.
+        if !native_failed {
+            if regime.sampling.route().is_curated() {
+                quanta.push((
+                    mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
+                    mlx_gen::ios_quantum::sampler_step_bytes(latents.size() as u64),
+                ));
+            } else if ancestral_steps != Some(0) {
+                // Acceleration and bespoke ancestral both run the actual SDXL denoise_core guard.
+                quanta.push((
+                    q::SAMPLER_STEP,
+                    q::sampler_step_bytes_metadata(latents.elements(), regime.route == Route::Mask),
+                ));
+            }
         }
         let shed_ip =
             crate::model::sheds_ip_image_encoder(staged) && regime.route == Route::IpAdapter;
@@ -2786,20 +3232,38 @@ impl Priced {
             + cond_embeds.iter().map(price_bytes).sum::<u64>()
             + ip_tokens.as_ref().map_or(0, price_bytes);
         take(
+            &mut items,
             IosPhase::Denoise,
             self.heavy(shed_ip) + warm_text + held,
             quanta,
         );
+        if native_failed {
+            return Ok(self.finish(
+                regime,
+                items,
+                denoise_windows,
+                profiled_discrete || profiled_curated,
+                ancestral_steps == Some(0),
+            ));
+        }
 
         // Decode: the staged decode holds the VAE alone; a warm one decodes beside everything.
         let mut quanta = Quanta::new();
         let decoded = self
             .vae
-            .price_decode(&latents, regime.tiling.as_ref(), &mut quanta)?;
-        quanta.push((
-            q::DECODED_TO_IMAGE,
-            q::decoded_to_image_bytes_from_metadata(decoded.elements()),
-        ));
+            .price_decode(&latents, regime.tiling.as_ref(), &mut quanta);
+        if let Err(error) = &decoded {
+            if !q::is_native_shape_failure(error) {
+                return Err(decoded.expect_err("checked decode error"));
+            }
+        }
+        // A native decode shape failure keeps the decode quanta admitted before it.
+        if let Ok(decoded) = &decoded {
+            quanta.push((
+                q::DECODED_TO_IMAGE,
+                q::decoded_to_image_bytes_from_metadata(decoded.elements()),
+            ));
+        }
         let decode_resident = if staged {
             self.vae_bytes.resident
         } else {
@@ -2818,6 +3282,7 @@ impl Priced {
                 cast
             };
             take(
+                &mut items,
                 IosPhase::Decode,
                 // `finals` owns EVERY completed serial latent throughout the decode loop; the
                 // borrowed/clone caller handle aliases its entry, not a second latent allocation.
@@ -2826,6 +3291,26 @@ impl Priced {
             );
         }
 
+        Ok(self.finish(
+            regime,
+            items,
+            denoise_windows,
+            profiled_discrete || profiled_curated,
+            ancestral_steps == Some(0),
+        ))
+    }
+
+    /// Fused source-parent residency, the window/summary assembly and the regime's not-run phases,
+    /// shared by complete ledgers and native-failure prefixes.
+    fn finish(
+        &self,
+        regime: &Regime,
+        mut items: Vec<PricedQuantum>,
+        mut denoise_windows: Vec<IosWindowPrice>,
+        profiled: bool,
+        ancestral_zero: bool,
+    ) -> (IosPricing, Vec<PricedQuantum>) {
+        let staged = regime.staged;
         if let Some(fused) = &self.fused {
             for item in &mut items {
                 if item.phase != IosPhase::Load || item.label == REQUEST_INPUTS {
@@ -2869,7 +3354,7 @@ impl Priced {
                 });
                 continue;
             }
-            if (profiled_discrete || profiled_curated) && item.phase == IosPhase::Denoise {
+            if (profiled) && item.phase == IosPhase::Denoise {
                 // Forward AND update candidates are recorded at their own coincident epochs,
                 // not the largest input owner combined with another epoch's binding operation.
                 // Update/pending windows remain unverified physical domains; their presence is
@@ -2894,7 +3379,7 @@ impl Priced {
         for window in denoise_windows {
             pricing.take_window(window);
         }
-        if ancestral_steps == Some(0) {
+        if ancestral_zero {
             pricing.phase_not_run(
                 IosPhase::Denoise,
                 "actual ancestral strength schedule has zero steps",
@@ -2903,7 +3388,7 @@ impl Priced {
         if !regime.has_init && regime.route != Route::Control {
             pricing.phase_not_run(IosPhase::Encode, "no init or active ControlNet encode");
         }
-        Ok((pricing, items))
+        (pricing, items)
     }
 
     /// One guided denoise forward's quanta over the shape-only latent `x` (the ControlNet branches
@@ -2920,13 +3405,13 @@ impl Priced {
         ip_tokens: Option<&PriceTensor>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         quanta: &mut Quanta,
-    ) -> Result<(Dtype, Vec<u64>)> {
+        owners: &mut Vec<u64>,
+    ) -> Result<Dtype> {
         let first_quantum = quanta.len();
         let x = price_tensor(x.shape(), crate::model::DTYPE)?;
         let batch = x.shape()[0];
         let mut control: Option<(Vec<PriceTensor>, PriceTensor)> = None;
         let mut pending_control = q::ControlMergeWork::default();
-        let mut owners = Vec::new();
         let (mut raw_down, mut raw_mid, mut selected_rows) = (0u64, 0u64, 0u64);
         if regime.route == Route::Control {
             for (branch_index, (branch, embed)) in self.controls.iter().zip(cond_embeds).enumerate()
@@ -2942,18 +3427,21 @@ impl Priced {
                 let effects = self.control_effects[branch_index]
                     .as_ref()
                     .map_or_else(q::EffectScope::native, q::EffectScope::root);
-                let (down, mid) = branch.price_forward_with_effects(
-                    &x,
-                    crate::unet::pricing::ControlConditioning {
-                        cond_embed: &row,
-                        encoder_x,
-                        text_emb,
-                    },
-                    plan,
-                    quanta,
-                    Some(&mut owners),
-                    &effects,
-                )?;
+                // ControlNet branches reuse U-Net module paths; only the U-Net/VAE walk traces.
+                let (down, mid) = q::without_module_trace(|| {
+                    branch.price_forward_with_effects(
+                        &x,
+                        crate::unet::pricing::ControlConditioning {
+                            cond_embed: &row,
+                            encoder_x,
+                            text_emb,
+                        },
+                        plan,
+                        quanta,
+                        Some(&mut *owners),
+                        &effects,
+                    )
+                })?;
                 for (index, held) in owners[first_owner..].iter_mut().enumerate() {
                     // Prior branch payloads are kept by the unevaluated sum DAG. The new branch's
                     // final residual stack does NOT yet exist at its early-forward quanta.
@@ -3004,7 +3492,7 @@ impl Priced {
             .unet_effects
             .as_ref()
             .map_or_else(q::EffectScope::native, q::EffectScope::root);
-        let eps = self.unet.price_forward_with_effects(
+        let forward = self.unet.price_forward_with_effects(
             &x,
             crate::unet::pricing::UNetConditioning {
                 encoder_x,
@@ -3016,7 +3504,8 @@ impl Priced {
             pending_control,
             quanta,
             &effects,
-        )?;
+        );
+        // Owners for every admitted U-Net quantum, including a failing forward's prefix.
         let (mut down_complete, mut mid_complete) = (false, false);
         for (label, _) in &quanta[unet_first..] {
             // Only the ACTUAL existing injection finish may replace raw source parents with the
@@ -3034,12 +3523,13 @@ impl Priced {
                 mid_complete = true;
             }
         }
+        let eps = forward?;
         if owners.len() != quanta.len() - first_quantum {
             return Err(Error::Unsupported(
                 "sdxl control coincident-owner ledger is incomplete".into(),
             ));
         }
-        Ok((eps, owners))
+        Ok(eps)
     }
 }
 

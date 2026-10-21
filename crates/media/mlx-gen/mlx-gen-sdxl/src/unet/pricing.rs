@@ -248,104 +248,104 @@ impl StreamFacts {
 
 #[derive(Clone)]
 pub(crate) struct ResnetFacts {
-    pub(super) norm1_w: Tensor,
-    pub(super) norm1_b: Tensor,
-    pub(super) conv1: q::ConvWork,
-    pub(super) norm2_w: Tensor,
-    pub(super) norm2_b: Tensor,
-    pub(super) conv2: q::ConvWork,
-    pub(super) time_emb_proj: Option<q::LinearWork>,
-    pub(super) shortcut: Option<q::LinearWork>,
+    pub(crate) norm1_w: Tensor,
+    pub(crate) norm1_b: Tensor,
+    pub(crate) conv1: q::ConvWork,
+    pub(crate) norm2_w: Tensor,
+    pub(crate) norm2_b: Tensor,
+    pub(crate) conv2: q::ConvWork,
+    pub(crate) time_emb_proj: Option<q::LinearWork>,
+    pub(crate) shortcut: Option<q::LinearWork>,
 }
 #[derive(Clone)]
 pub(crate) struct TimeFacts {
-    pub(super) linear1: q::LinearWork,
-    pub(super) linear2: q::LinearWork,
+    pub(crate) linear1: q::LinearWork,
+    pub(crate) linear2: q::LinearWork,
 }
 #[derive(Clone)]
 pub(crate) struct AttentionFacts {
-    pub(super) q: q::LinearWork,
-    pub(super) k: q::LinearWork,
-    pub(super) v: q::LinearWork,
-    pub(super) out: q::LinearWork,
-    pub(super) num_heads: i32,
-    pub(super) head_dim: i32,
-    pub(super) to_k_ip: Option<q::LinearWork>,
-    pub(super) to_v_ip: Option<q::LinearWork>,
+    pub(crate) q: q::LinearWork,
+    pub(crate) k: q::LinearWork,
+    pub(crate) v: q::LinearWork,
+    pub(crate) out: q::LinearWork,
+    pub(crate) num_heads: i32,
+    pub(crate) head_dim: i32,
+    pub(crate) to_k_ip: Option<q::LinearWork>,
+    pub(crate) to_v_ip: Option<q::LinearWork>,
 }
 #[derive(Clone)]
 pub(crate) struct TransformerBlockFacts {
-    pub(super) norm1_w: Tensor,
-    pub(super) norm1_b: Tensor,
-    pub(super) norm2_w: Tensor,
-    pub(super) norm2_b: Tensor,
-    pub(super) norm3_w: Tensor,
-    pub(super) norm3_b: Tensor,
-    pub(super) attn1: AttentionFacts,
-    pub(super) attn2: AttentionFacts,
-    pub(super) linear1: q::LinearWork,
-    pub(super) linear2: q::LinearWork,
-    pub(super) linear3: q::LinearWork,
+    pub(crate) norm1_w: Tensor,
+    pub(crate) norm1_b: Tensor,
+    pub(crate) norm2_w: Tensor,
+    pub(crate) norm2_b: Tensor,
+    pub(crate) norm3_w: Tensor,
+    pub(crate) norm3_b: Tensor,
+    pub(crate) attn1: AttentionFacts,
+    pub(crate) attn2: AttentionFacts,
+    pub(crate) linear1: q::LinearWork,
+    pub(crate) linear2: q::LinearWork,
+    pub(crate) linear3: q::LinearWork,
 }
 #[derive(Clone)]
 pub(crate) struct TransformerFacts {
-    pub(super) norm_w: Tensor,
-    pub(super) norm_b: Tensor,
-    pub(super) proj_in: q::LinearWork,
-    pub(super) blocks: Vec<TransformerBlockFacts>,
-    pub(super) proj_out: q::LinearWork,
+    pub(crate) norm_w: Tensor,
+    pub(crate) norm_b: Tensor,
+    pub(crate) proj_in: q::LinearWork,
+    pub(crate) blocks: Vec<TransformerBlockFacts>,
+    pub(crate) proj_out: q::LinearWork,
     pub(super) block_stream: Option<StreamFacts>,
 }
 #[derive(Clone)]
 pub(crate) struct BlockFacts {
-    pub(super) resnets: Vec<ResnetFacts>,
-    pub(super) attentions: Option<Vec<TransformerFacts>>,
-    pub(super) downsample: Option<q::ConvWork>,
-    pub(super) upsample: Option<q::ConvWork>,
+    pub(crate) resnets: Vec<ResnetFacts>,
+    pub(crate) attentions: Option<Vec<TransformerFacts>>,
+    pub(crate) downsample: Option<q::ConvWork>,
+    pub(crate) upsample: Option<q::ConvWork>,
 }
 pub(crate) struct UNetFacts {
-    pub(super) conv_in: q::ConvWork,
+    pub(crate) conv_in: q::ConvWork,
     _timesteps: SinusoidFacts,
-    pub(super) time_embedding: TimeFacts,
+    pub(crate) time_embedding: TimeFacts,
     _add_time_proj: SinusoidFacts,
-    pub(super) add_embedding: TimeFacts,
-    pub(super) down_blocks: Vec<BlockFacts>,
-    pub(super) mid_resnet0: ResnetFacts,
-    pub(super) mid_transformer: TransformerFacts,
-    pub(super) mid_resnet1: ResnetFacts,
-    pub(super) up_blocks: Vec<BlockFacts>,
-    pub(super) conv_norm_out_w: Tensor,
-    pub(super) conv_norm_out_b: Tensor,
-    pub(super) conv_out: q::ConvWork,
-    pub(super) encoder_hid_proj: Option<q::LinearWork>,
+    pub(crate) add_embedding: TimeFacts,
+    pub(crate) down_blocks: Vec<BlockFacts>,
+    pub(crate) mid_resnet0: ResnetFacts,
+    pub(crate) mid_transformer: TransformerFacts,
+    pub(crate) mid_resnet1: ResnetFacts,
+    pub(crate) up_blocks: Vec<BlockFacts>,
+    pub(crate) conv_norm_out_w: Tensor,
+    pub(crate) conv_norm_out_b: Tensor,
+    pub(crate) conv_out: q::ConvWork,
+    pub(crate) encoder_hid_proj: Option<q::LinearWork>,
 }
 #[derive(Clone)]
 pub(crate) struct ConvFacts {
-    pub(super) weight: Tensor,
-    pub(super) bias: Tensor,
-    pub(super) stride: i32,
-    pub(super) pad: i32,
+    pub(crate) weight: Tensor,
+    pub(crate) bias: Tensor,
+    pub(crate) stride: i32,
+    pub(crate) pad: i32,
 }
 #[derive(Clone)]
 pub(crate) struct CondFacts {
-    pub(super) conv_in: ConvFacts,
-    pub(super) blocks: Vec<ConvFacts>,
-    pub(super) conv_out: ConvFacts,
+    pub(crate) conv_in: ConvFacts,
+    pub(crate) blocks: Vec<ConvFacts>,
+    pub(crate) conv_out: ConvFacts,
 }
 pub(crate) struct ControlFacts {
-    pub(super) conv_in: ConvFacts,
+    pub(crate) conv_in: ConvFacts,
     _timesteps: SinusoidFacts,
-    pub(super) time_embedding: TimeFacts,
+    pub(crate) time_embedding: TimeFacts,
     _add_time_proj: SinusoidFacts,
-    pub(super) add_embedding: TimeFacts,
-    pub(super) down_blocks: Vec<BlockFacts>,
-    pub(super) mid_resnet0: ResnetFacts,
-    pub(super) mid_transformer: TransformerFacts,
-    pub(super) mid_resnet1: ResnetFacts,
-    pub(super) cond_embedding: CondFacts,
-    pub(super) down_zero: Vec<ConvFacts>,
-    pub(super) mid_zero: ConvFacts,
-    pub(super) encoder_hid_proj: Option<q::LinearWork>,
+    pub(crate) add_embedding: TimeFacts,
+    pub(crate) down_blocks: Vec<BlockFacts>,
+    pub(crate) mid_resnet0: ResnetFacts,
+    pub(crate) mid_transformer: TransformerFacts,
+    pub(crate) mid_resnet1: ResnetFacts,
+    pub(crate) cond_embedding: CondFacts,
+    pub(crate) down_zero: Vec<ConvFacts>,
+    pub(crate) mid_zero: ConvFacts,
+    pub(crate) encoder_hid_proj: Option<q::LinearWork>,
 }
 
 impl ResnetFacts {
@@ -554,9 +554,11 @@ impl ResnetFacts {
                 .checked_add(skip[3])
                 .ok_or_else(|| mlx_gen::Error::Msg("sdxl resnet concat width overflow".into()))?;
         }
+        q::validate_group_norm(&input, &self.norm1_w, &self.norm1_b, false)?;
         let first = effects
             .conv_metadata("conv1", &self.conv1)
             .output_shape(&input, 1, 1)?;
+        q::validate_group_norm(&first, &self.norm2_w, &self.norm2_b, false)?;
         let output = effects
             .conv_metadata("conv2", &self.conv2)
             .output_shape(&first, 1, 1)?;
@@ -1333,17 +1335,15 @@ impl BlockFacts {
                 None => None,
             };
             let resnet = &self.resnets[i];
+            let scratch = resnet.quantum_scratch_with_effects(
+                &x,
+                Some(temb),
+                &effects.child(&format!("resnets.{i}")),
+            )?;
             if let Some(owners) = owners.as_deref_mut() {
                 owners.push(outer_held + output_states.iter().map(tensor_bytes).sum::<u64>());
             }
-            out.push((
-                crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(
-                    &x,
-                    Some(temb),
-                    &effects.child(&format!("resnets.{i}")),
-                )?,
-            ));
+            out.push((crate::quantum::UNET_RESNET, scratch));
             let input = skip.as_ref().map_or(x.dtype(), |s| {
                 Dtype::from_promoting_types(x.dtype(), s.dtype())
             });
@@ -1360,6 +1360,7 @@ impl BlockFacts {
                     &effects.child(&format!("resnets.{i}")),
                 )?,
             )?;
+            q::trace_module(effects.child(&format!("resnets.{i}")).path(), &x);
             if let Some(attns) = &self.attentions {
                 let first = out.len();
                 // The caller's resnet output remains borrowed for the whole attention call;
@@ -1367,17 +1368,19 @@ impl BlockFacts {
                 let held = outer_held
                     + output_states.iter().map(tensor_bytes).sum::<u64>()
                     + tensor_bytes(&x);
-                x = attns[i].price_forward_with_effects(
+                let forward = attns[i].price_forward_with_effects(
                     &x,
                     encoder_x,
                     ip,
                     plan,
                     out,
                     &effects.child(&format!("attentions.{i}")),
-                )?;
+                );
                 if let Some(owners) = owners.as_deref_mut() {
                     owners.extend(std::iter::repeat_n(held, out.len() - first));
                 }
+                x = forward?;
+                q::trace_module(effects.child(&format!("attentions.{i}")).path(), &x);
             }
             output_states.push(x.clone());
         }
@@ -1394,6 +1397,7 @@ impl BlockFacts {
                 &conv.output_shape(x.shape(), 2, 1)?,
                 conv.output_dtype(x.dtype()),
             )?;
+            q::trace_module(effects.child("downsamplers").path(), &x);
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
@@ -1411,6 +1415,7 @@ impl BlockFacts {
                 &conv.output_shape(&input, 1, 1)?,
                 conv.output_dtype(x.dtype()),
             )?;
+            q::trace_module(effects.child("upsamplers").path(), &x);
             output_states.push(x.clone());
         }
         Ok((x, output_states))
@@ -1605,6 +1610,9 @@ impl UNetFacts {
             &conv_in.output_shape(x.shape(), 1, 1)?,
             conv_in.output_dtype(dtype),
         )?;
+        q::trace_module("stem", &x);
+        q::trace_module("stem.temb", &temb);
+        q::trace_module("stem.context", encoder_x);
         let mut residuals: Vec<Tensor> = vec![x.clone()];
         for (index, block) in self.down_blocks.iter().enumerate() {
             let (o, res) = block.price_forward_with_effects(
@@ -1668,6 +1676,7 @@ impl UNetFacts {
                     &effects.child(&format!("mid_block.resnets.{index}")),
                 )?,
             )?;
+            q::trace_module(&format!("mid_block.resnets.{index}"), &x);
             if let Some(attention) = attention {
                 x = attention.price_forward_with_effects(
                     &x,
@@ -1677,6 +1686,7 @@ impl UNetFacts {
                     out,
                     &effects.child("mid_block.attentions.0"),
                 )?;
+                q::trace_module("mid_block.attentions.0", &x);
             }
         }
         if let Some((_, mid)) = control {
@@ -1716,12 +1726,21 @@ impl UNetFacts {
                 crate::quantum::backend(),
             ),
         ));
-        // Validate the final biased convolution's actual broadcast geometry, not its old base shape.
-        conv_out.output_shape(x.shape(), 1, 1)?;
-        Ok(conv_out.output_dtype(promote(
+        // Native order: GroupNorm over conv_norm_out, then the final biased convolution's actual
+        // broadcast geometry, not its old base shape.
+        q::validate_group_norm(
+            x.shape(),
+            &self.conv_norm_out_w,
+            &self.conv_norm_out_b,
+            false,
+        )?;
+        let shape = conv_out.output_shape(x.shape(), 1, 1)?;
+        let eps = conv_out.output_dtype(promote(
             x.dtype(),
             &[&self.conv_norm_out_w, &self.conv_norm_out_b],
-        )))
+        ));
+        q::trace_module("out", &tensor(&shape, eps)?);
+        Ok(eps)
     }
 
     pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
@@ -2027,17 +2046,18 @@ impl ControlFacts {
                 let first = out.len();
                 let held =
                     fixed + residuals.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&x);
-                x = attention.price_forward_with_effects(
+                let forward = attention.price_forward_with_effects(
                     &x,
                     encoder_x,
                     None,
                     plan,
                     out,
                     &effects.child("mid_block.attentions.0"),
-                )?;
+                );
                 if let Some(owners) = owners.as_deref_mut() {
                     owners.extend(std::iter::repeat_n(held, out.len() - first));
                 }
+                x = forward?;
             }
         }
         check_residual_zero_pairing(residuals.len(), self.down_zero.len())?;
@@ -2482,6 +2502,14 @@ impl ResnetFacts {
         self.output_dtype_with_effects(input, temb, &q::EffectScope::native())
             .expect("constructor metadata projection facts are infallible")
     }
+    pub(crate) fn validate_vae(&self, input: &[i32]) -> Result<Vec<i32>> {
+        q::validate_group_norm(input, &self.norm1_w, &self.norm1_b, false)?;
+        let mid = self.conv1.output_shape(input, 1, 1)?;
+        q::validate_group_norm(&mid, &self.norm2_w, &self.norm2_b, false)?;
+        self.conv2.output_shape(&mid, 1, 1)?;
+        self.output_shape_with_effects(input, None, &q::EffectScope::native())
+    }
+
     pub(crate) fn price_tiled_vae(
         &self,
         x: &Tensor,
@@ -2513,14 +2541,18 @@ impl ResnetFacts {
                 crate::quantum::backend(),
             )
         };
+        q::validate_group_norm(s, &self.norm1_w, &self.norm1_b, true)?;
+        crate::vae::pricing::validate_tiled_weight(self.conv1.weight())?;
         out.push((
             labels.tile,
             tile(s, s[3], element_bytes(x), self.conv1.weight()),
         ));
+        let mid = self.conv1.output_shape(s, 1, 1)?;
+        q::validate_group_norm(&mid, &self.norm2_w, &self.norm2_b, true)?;
+        crate::vae::pricing::validate_tiled_weight(self.conv2.weight())?;
         let mut conv1 = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
         conv1.extend(self.conv1.bias());
         let y = promote(x.dtype(), &conv1);
-        let mid = [s[0], s[1], s[2], self.conv2.weight().shape()[3]];
         out.push((
             labels.tile,
             tile(
@@ -2530,10 +2562,8 @@ impl ResnetFacts {
                 self.conv2.weight(),
             ),
         ));
-        tensor(
-            &[s[0], s[1], s[2], cout],
-            self.output_dtype(x.dtype(), None),
-        )
+        let shape = self.output_shape_with_effects(s, None, &q::EffectScope::native())?;
+        tensor(&shape, self.output_dtype(x.dtype(), None))
     }
 }
 

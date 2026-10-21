@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "b4ceef367cf5af43768763296747a5c96bf4de4dcb84f064e9806e4d01dc9694",
+  "UTC": "2026-10-21T10:58:52.123334+00:00",
+  "rust_proof_closure_sha256": "6b2fb795a4c11902be4214da6e46e82b3e5e5c7b61a5040d4ed58e6a23bd1964",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -392,11 +392,19 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "971fd01e57858252badc441433c91f44f32d48e09dee6088a5944582b8b072ea"
+      "sha256": "f7a0efc3588535221285850747185d8a639608287b438e0316118faafa805e22"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing/heavy_alias.rs",
+      "sha256": "04f7aeedf113e4255e49751c523b68892f842979c4136caff60da9be2f2242d6"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing/native_ledger.rs",
+      "sha256": "8401ff4ac407df4181ea37c69d68e0c3bd71b9e8e713c08d368b45b59547eb3f"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing/text_alias.rs",
-      "sha256": "e92240ba2f66621d99ef26f68ff54b3159290ea5140d1813de66cb2ba3917105"
+      "sha256": "0c2f98c833405a6b7018df3abe7182e96075537ac7f3703ce338aacefb0135e8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -404,15 +412,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter/pricing.rs",
-      "sha256": "3f68a0fdea244a0c3eb479ff76c24b3fcce19a5395bccd44790539c5f5ec79b4"
+      "sha256": "a898415936720de0e0e88ca5a7c3815bdd1c38e39c939bff3ad3528a9c1a8a48"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
-      "sha256": "c4972e51ca2476f276fbc9cb65848fec86b2d7d1c714c3c671ade38f5d0f2f42"
+      "sha256": "bad42cb707fa5f50187e29d6f27ae18c759a47e1d6ad21a8512310d6cccbbd64"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm/pricing.rs",
-      "sha256": "5b66f904bd8baf582a357dd1ad67ddcb430fa7c62fa305e9980dc6b51f0b31bc"
+      "sha256": "da9c0e6ce1aa1bed690c0bde4ed1cddb1b3660214f8b49e6eb950ffc8089b118"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
@@ -436,19 +444,19 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum.rs",
-      "sha256": "c7a06bacf99c81e67a7ad12d53c7e64ac1f76736e7bcb5c7886b226474ffa4e9"
+      "sha256": "f9bfcf6dc462e33a1cc1d3f01072ce4260de9607d62b850bd137186424fb845a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
-      "sha256": "da220f2d210b4a5bb233a6598d8df464a21d68fa031745243ade6a67f0164023"
+      "sha256": "cbbb251b21298265e11f4fdfd2d614bd53cd9bdc57e77ebede4e8f85c01009b6"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs",
-      "sha256": "63c51ee8c784018068f0fb0bea860c7e7c51a50ef89c240156a70168b83d2eae"
+      "sha256": "6f3ac68098816f640b2a137986b0326eba03833304b0cf66d399262ff9c07d6f"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "259e0dbb8c2c65bcce502287b470e983b3053f3d73a3c547b62b392e60f3b1e0"
+      "sha256": "cb1e874738e0048763eaf7e548cc28d2a9021a647b11b821b92bfe3c14d3d0f6"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -476,7 +484,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/text_encoder.rs",
-      "sha256": "bbe87ca5f50105dbfd9fcf6907a5ea81d6fcda25bd9f514756551440f956c0b7"
+      "sha256": "95e244ced646573fb1a5bc573bfff749def5d6fbaf042efd65bcc84523d19362"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
@@ -496,7 +504,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/pricing.rs",
-      "sha256": "5602ce2a1ec08c3ba1bb1585cbfaf1b1dd0b626ef062cc29ad895f00b512e249"
+      "sha256": "32170a3cebb1ec6fb4aa55f9a3f0c70e4d37f0276dc51cbc539bf472fa2258b9"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
@@ -512,7 +520,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae/pricing.rs",
-      "sha256": "8a9d628ae4ad47e52866a72966d5d10d1e0c9622abb020ad22d5bed9f7c94273"
+      "sha256": "1accac532c61e4aad127a1d179395f33b8dc933e852c26aa4555fc9f918491d3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
@@ -892,7 +900,7 @@
     },
     {
       "path": "scripts/ci/ios_pricing_compile_only.py",
-      "sha256": "ab6dae583547be63916cb2bb4529c3e5fcc81bd0bb45e0ce51aace3b2470d05c"
+      "sha256": "56bd4b2b2b6c0568dc8985e84e5e6e78d65ad37510d3ca3ba7ec79c5477b6054"
     },
     {
       "path": "scripts/ios/campaign.py",
@@ -1462,13 +1470,13 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "6cec420a623a57370a9b3482d681d3e70e32eb7574811ad295dafd636b378d4c",
-    "classification_sha256": "e2c21aca0b0153ace11c7eefacf3619e06a3b7d710f53160811453130d7bffa3",
-    "selected_Rust_FQNs": 131,
-    "HOST_logical": 114,
-    "HOST_expected_PASS_rows": 115,
-    "native_logical": 13,
-    "native_expected_PASS_rows": 26,
+    "inventory_sha256": "09ac9218a3c29edfa374c867cac77aedb91da4102e72b97bd99f957f8a0b67d3",
+    "classification_sha256": "41b6eac8492ff2e5e48a84f50ef22b2e15b61668c1176756f1aba56536fbc594",
+    "selected_Rust_FQNs": 150,
+    "HOST_logical": 128,
+    "HOST_expected_PASS_rows": 129,
+    "native_logical": 22,
+    "native_expected_PASS_rows": 44,
     "Python_exact_tests": 1,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true

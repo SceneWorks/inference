@@ -63,6 +63,7 @@ pub(crate) struct TextPackPoint {
 pub(crate) struct TextPackFacts {
     pub retained: u64,
     pub points: Vec<TextPackPoint>,
+    pub failures: Vec<usize>,
 }
 
 /// Header-only post-pack declared owners and EACH coincident raw pack budget. Never combine an
@@ -75,6 +76,33 @@ pub(crate) fn text_pack_facts(
     cfg: &ClipTextConfig,
     bits: Option<i32>,
 ) -> Result<TextPackFacts> {
+    let (facts, failure) = text_pack_prefix(headers, cfg, bits)?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(facts),
+    }
+}
+
+/// [`text_pack_facts`] that stops at a native quantize shape failure (rank or group alignment),
+/// returning the pack points admitted before it with that failure. Other errors still abort.
+pub(crate) fn text_pack_prefix(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    cfg: &ClipTextConfig,
+    bits: Option<i32>,
+) -> Result<(TextPackFacts, Option<Error>)> {
+    text_pack_accounting(headers, cfg, bits, true)
+}
+
+/// Algebraic pack terms for witness selection only. After a failed pack the original weight is
+/// left in the additive sum; subsequent terms are not an execution ledger. The selector may use
+/// a point only when every group's chosen assignment reaches it. Only `text_pack_prefix` feeds
+/// the exact world pricer, which never emits those unreachable terms.
+pub(crate) fn text_pack_accounting(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    cfg: &ClipTextConfig,
+    bits: Option<i32>,
+    stop_at_failure: bool,
+) -> Result<(TextPackFacts, Option<Error>)> {
     use mlx_gen::ios_quantum::allocated_bytes;
     let overflow = || Error::Msg("sdxl text pack header byte extent overflow".into());
     let resident = |h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| -> Result<u64> {
@@ -95,16 +123,22 @@ pub(crate) fn text_pack_facts(
             .ok_or_else(overflow)?;
     }
     let Some(bits) = bits else {
-        return Ok(TextPackFacts {
-            retained,
-            points: Vec::new(),
-        });
+        return Ok((
+            TextPackFacts {
+                retained,
+                points: Vec::new(),
+                failures: Vec::new(),
+            },
+            None,
+        ));
     };
     let bit_width = u64::try_from(bits)
         .ok()
         .filter(|b| *b != 0)
         .ok_or_else(|| Error::Msg("sdxl text pack requires positive bits".into()))?;
     let mut points = Vec::new();
+    let mut first_failure = None;
+    let mut failures = Vec::new();
     for (path, has_bias) in quantizable_text_paths(cfg) {
         // The actual CLIP constructor accepts arbitrary-rank dense weights. Do not route
         // them through HeaderLinear's matrix-only adapter geometry. Stored packs still pass
@@ -114,24 +148,6 @@ pub(crate) fn text_pack_facts(
             continue;
         } // Exact existing quantize() no-op.
         let shape = &linear.base.base_shape;
-        if shape.len() < 2 {
-            return Err(Error::Msg(
-                "sdxl text pack requires at least two dimensions".into(),
-            ));
-        }
-        let input = u64::try_from(*shape.last().unwrap()).map_err(|_| overflow())?;
-        let output = shape[..shape.len() - 1].iter().try_fold(1u64, |n, &d| {
-            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
-                .ok_or_else(overflow)
-        })?;
-        let group = crate::quant::GROUP_SIZE as u64;
-        // Native 096 checks only group divisibility here, not positive row/input extents.
-        // Zero extents remain front-end shape facts, not a claim of successful evaluation.
-        if input % group != 0 {
-            return Err(Error::Msg(
-                "sdxl text pack input is not group-aligned".into(),
-            ));
-        }
         let weight_name = format!("{path}.weight");
         let weight = headers
             .iter()
@@ -148,12 +164,57 @@ pub(crate) fn text_pack_facts(
         } else {
             0
         };
-        let elements = output.checked_mul(input).ok_or_else(overflow)?;
+        // The native guard (quantize_bytes over the actual weight) is admitted BEFORE the
+        // quantize op checks rank and group alignment, so a failing projection's point counts.
+        let elements = shape.iter().try_fold(1u64, |n, &d| {
+            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
+                .ok_or_else(overflow)
+        })?;
         points.push(TextPackPoint {
             path: path.clone(),
             before_resident: retained,
             scratch: crate::quant::quantize_bytes_from_metadata(elements, bias_bytes, bits),
         });
+        if shape.len() < 2 {
+            let error = Error::Msg("sdxl text pack requires at least two dimensions".into());
+            failures.push(points.len() - 1);
+            if stop_at_failure {
+                return Ok((
+                    TextPackFacts {
+                        retained,
+                        points,
+                        failures,
+                    },
+                    Some(error),
+                ));
+            }
+            first_failure.get_or_insert(error);
+            continue;
+        }
+        let input = u64::try_from(*shape.last().unwrap()).map_err(|_| overflow())?;
+        let output = shape[..shape.len() - 1].iter().try_fold(1u64, |n, &d| {
+            n.checked_mul(u64::try_from(d).map_err(|_| overflow())?)
+                .ok_or_else(overflow)
+        })?;
+        let group = crate::quant::GROUP_SIZE as u64;
+        // Native 096 checks only group divisibility here, not positive row/input extents.
+        // Zero extents remain front-end shape facts, not a claim of successful evaluation.
+        if input % group != 0 {
+            let error = Error::Msg("sdxl text pack input is not group-aligned".into());
+            failures.push(points.len() - 1);
+            if stop_at_failure {
+                return Ok((
+                    TextPackFacts {
+                        retained,
+                        points,
+                        failures,
+                    },
+                    Some(error),
+                ));
+            }
+            first_failure.get_or_insert(error);
+            continue;
+        }
         // QuantizedLinear's codes plus separate BF16 scales/affine biases, each page-rounded.
         let code_row = input
             .checked_mul(bit_width)
@@ -174,7 +235,14 @@ pub(crate) fn text_pack_facts(
             .and_then(|n| n.checked_add(allocated_bytes(companion)))
             .ok_or_else(overflow)?;
     }
-    Ok(TextPackFacts { retained, points })
+    Ok((
+        TextPackFacts {
+            retained,
+            points,
+            failures,
+        },
+        first_failure,
+    ))
 }
 
 /// Complete CLIP pricing component, built from file headers without a native weight/model graph.
@@ -197,6 +265,8 @@ fn clip_embeddings_scratch(b: i32, n: i32, dim: i32, dtype: Dtype) -> u64 {
 
 struct ClipLayerPrice {
     ln1_w: mlx_gen::adapters::facts::TensorFacts,
+    /// `layer_norm1.bias`, `layer_norm2.weight`, `layer_norm2.bias`: native layer_norm operands.
+    norms: [mlx_gen::adapters::facts::TensorFacts; 3],
     // Actual constructor/pack order: q, k, v, out, fc1, fc2.
     projections: [crate::quantum::LinearWork; 6],
     num_heads: i32,
@@ -278,6 +348,8 @@ impl ClipLayerPrice {
     fn of(layer: &ClipEncoderLayer) -> Self {
         Self {
             ln1_w: mlx_gen::adapters::facts::TensorFacts::of(&layer.ln1_w),
+            norms: [&layer.ln1_b, &layer.ln2_w, &layer.ln2_b]
+                .map(mlx_gen::adapters::facts::TensorFacts::of),
             projections: [
                 &layer.q,
                 &layer.k,
@@ -290,6 +362,34 @@ impl ClipLayerPrice {
             num_heads: layer.num_heads,
             head_dim: layer.head_dim,
         }
+    }
+
+    /// Native op order, including arbitrary-rank dense `.t()` matmul and residual broadcasts.
+    fn validate(&self, shape: &[i32], mask_tokens: i32) -> Result<Vec<i32>> {
+        let width = *shape
+            .last()
+            .ok_or_else(|| crate::quantum::native_shape_failure("CLIP hidden state is scalar"))?;
+        layer_norm_operands(&self.ln1_w, &self.norms[0], width)?;
+        let (b, n) = (shape[0], shape[1]);
+        let heads = self.num_heads * self.head_dim;
+        for projection in &self.projections[..3] {
+            let projected = projection.output_shape(shape)?;
+            same_elements(&projected, &[b, n, heads])?;
+        }
+        if !crate::quantum::broadcasts(
+            &[b, self.num_heads, n, n],
+            &[1, 1, mask_tokens, mask_tokens],
+        ) {
+            return Err(crate::quantum::native_shape_failure(
+                "CLIP causal mask does not broadcast over attention",
+            ));
+        }
+        let attended = self.projections[3].output_shape(&[b, n, heads])?;
+        let residual = crate::adapters::broadcast_shape(shape, &attended)?;
+        layer_norm_operands(&self.norms[1], &self.norms[2], *residual.last().unwrap())?;
+        let hidden = self.projections[4].output_shape(&residual)?;
+        let mlp = self.projections[5].output_shape(&hidden)?;
+        crate::adapters::broadcast_shape(&residual, &mlp)
     }
 
     fn output_dtype(&self, x: Dtype) -> Dtype {
@@ -321,6 +421,45 @@ impl ClipLayerPrice {
             crate::quantum::backend(),
         ))
     }
+}
+
+/// Native `layer_norm`: weight/bias are 1-D with the input's last-axis size.
+fn layer_norm_operands(
+    weight: &mlx_gen::adapters::facts::TensorFacts,
+    bias: &mlx_gen::adapters::facts::TensorFacts,
+    width: i32,
+) -> Result<()> {
+    for operand in [weight, bias] {
+        if operand.shape.len() != 1 || operand.shape[0] != width {
+            return Err(crate::quantum::native_shape_failure(
+                "layer_norm operand does not match the input's last axis",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The output width of the native matmul/bias broadcast, including dense reverse-axis transpose.
+pub(crate) fn linear_output(linear: &crate::quantum::LinearWork, width: i32) -> Result<i32> {
+    linear
+        .output_shape(&[width])?
+        .last()
+        .copied()
+        .ok_or_else(|| crate::quantum::native_shape_failure("linear output is scalar"))
+}
+
+fn same_elements(from: &[i32], to: &[i32]) -> Result<()> {
+    let elements = |shape: &[i32]| {
+        shape
+            .iter()
+            .fold(1i128, |n, &d| n.saturating_mul(i128::from(d)))
+    };
+    if elements(from) != elements(to) {
+        return Err(crate::quantum::native_shape_failure(
+            "CLIP reshape element counts differ",
+        ));
+    }
+    Ok(())
 }
 
 fn clip_final_scratch(
@@ -366,11 +505,12 @@ impl ClipPrice {
             let layer = format!("{prefix}.encoder.layers.{index}");
             let head_dim = cfg.model_dims / cfg.num_heads;
             let ln1_w = clip_header_tensor(headers, &format!("{layer}.layer_norm1.weight"))?;
-            // These native constructor requirements remain authoritative even though their shapes
-            // are not consumed by the existing layer budget. Never price a missing norm silently.
-            clip_header_tensor(headers, &format!("{layer}.layer_norm1.bias"))?;
-            clip_header_tensor(headers, &format!("{layer}.layer_norm2.weight"))?;
-            clip_header_tensor(headers, &format!("{layer}.layer_norm2.bias"))?;
+            // Native constructor requirements, and the native-order layer_norm operands.
+            let norms = [
+                clip_header_tensor(headers, &format!("{layer}.layer_norm1.bias"))?,
+                clip_header_tensor(headers, &format!("{layer}.layer_norm2.weight"))?,
+                clip_header_tensor(headers, &format!("{layer}.layer_norm2.bias"))?,
+            ];
             let linear = |index| {
                 clip_header_linear(
                     headers,
@@ -380,6 +520,7 @@ impl ClipPrice {
             };
             layers.push(ClipLayerPrice {
                 ln1_w,
+                norms,
                 projections: [
                     linear(0)?,
                     linear(1)?,
@@ -422,6 +563,24 @@ impl ClipPrice {
         Ok(())
     }
 
+    /// Pack each independent projection for symbolic witness scoring. Invalid projections stay
+    /// unchanged; selectors exclude their assignments from every post-pack execution state.
+    pub(crate) fn pack_witness_terms(&mut self, bits: i32) -> Result<()> {
+        let projections = self
+            .layers
+            .iter_mut()
+            .flat_map(|layer| &mut layer.projections)
+            .chain(self.text_projection.iter_mut());
+        for projection in projections {
+            if let Err(error) = projection.pack(bits) {
+                if !crate::quantum::is_native_shape_failure(&error) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn pooled_width(&self) -> i32 {
         match &self.text_projection {
             Some(projection) => projection.output_width() as i32,
@@ -429,36 +588,64 @@ impl ClipPrice {
         }
     }
 
-    pub(crate) fn price_forward(
+    /// Every admitted quantum's scratch is pushed BEFORE that quantum's native op checks run, as
+    /// the native guard precedes its graph: a native shape failure returns `Err` with the admitted
+    /// prefix already in `out`.
+    pub(crate) fn price_forward_with_hidden(
         &self,
         b: i32,
         n: i32,
         out: &mut crate::quantum::Quanta,
-    ) -> (Dtype, Dtype) {
-        let (embeddings, mut x) = self.embeddings_quantum(b, n);
+    ) -> Result<(mlx_gen::adapters::facts::TensorFacts, Dtype)> {
+        let (embeddings, entered) = self.embeddings_quantum(b, n);
         out.push((crate::quantum::CLIP_EMBEDDINGS, embeddings));
+        let (mut x, mut shape) = entered?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
         for index in 0..self.layers.len() {
-            let (scratch, next) = self.layer_quantum(index, b, n, x);
+            let (scratch, next) = self.layer_quantum(index, b, n, x, &shape);
             out.push((crate::quantum::CLIP_LAYER, scratch));
-            x = next;
-            hidden_states.push(x);
+            (x, shape) = next?;
+            hidden_states.push((x, shape.clone()));
         }
-        let (pooled_scratch, pooled) = self.pooled_quantum(b, n, x);
+        let (pooled_scratch, pooled) = self.pooled_quantum(b, n, x, &shape);
         out.push((crate::quantum::CLIP_POOLED, pooled_scratch));
-        let penultimate = hidden_states
+        let pooled = pooled?;
+        let (dtype, shape) = hidden_states
             .len()
             .checked_sub(2)
-            .map_or(x, |i| hidden_states[i]);
-        (penultimate, pooled)
+            .map_or((x, shape), |i| hidden_states[i].clone());
+        Ok((
+            mlx_gen::adapters::facts::TensorFacts {
+                shape,
+                dtype,
+                strides: Vec::new(),
+            },
+            pooled,
+        ))
     }
 
-    /// The embeddings quantum's scratch and the dtype it hands the first layer.
-    pub(crate) fn embeddings_quantum(&self, b: i32, n: i32) -> (u64, Dtype) {
+    /// The embeddings quantum's scratch, then (after its native ops: token gather reshaped to
+    /// `[b, n, dim]`, positions reshaped to `[1, n, dim]`, add) the first layer's input dtype/shape.
+    pub(crate) fn embeddings_quantum(&self, b: i32, n: i32) -> (u64, Result<(Dtype, Vec<i32>)>) {
         let dim = self.token_embedding.shape[1];
+        let scratch = clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype);
+        if self.position_embedding.shape.len() != 2 || self.position_embedding.shape[1] != dim {
+            return (
+                scratch,
+                Err(crate::quantum::native_shape_failure(
+                    "CLIP position embedding does not reshape to the token width",
+                )),
+            );
+        }
         (
-            clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype),
-            Dtype::from_promoting_types(self.token_embedding.dtype, self.position_embedding.dtype),
+            scratch,
+            Ok((
+                Dtype::from_promoting_types(
+                    self.token_embedding.dtype,
+                    self.position_embedding.dtype,
+                ),
+                vec![b, n, dim],
+            )),
         )
     }
 
@@ -466,15 +653,35 @@ impl ClipPrice {
         self.layers.len()
     }
 
-    /// Layer `index`'s quantum scratch for an `x`-typed input, and its output dtype.
-    pub(crate) fn layer_quantum(&self, index: usize, b: i32, n: i32, x: Dtype) -> (u64, Dtype) {
+    /// Layer `index`'s quantum scratch for an `x`-typed, shaped input, then (after its native
+    /// op checks) its output dtype and residual shape.
+    pub(crate) fn layer_quantum(
+        &self,
+        index: usize,
+        b: i32,
+        n: i32,
+        x: Dtype,
+        shape: &[i32],
+    ) -> (u64, Result<(Dtype, Vec<i32>)>) {
         let layer = &self.layers[index];
-        (layer.quantum_scratch(b, n, x), layer.output_dtype(x))
+        let scratch = layer.quantum_scratch(b, n, x);
+        (
+            scratch,
+            layer
+                .validate(shape, n)
+                .map(|shape| (layer.output_dtype(x), shape)),
+        )
     }
 
-    /// The final norm/pool/projection quantum for an `x`-typed last hidden state, and the pooled
-    /// output's dtype.
-    pub(crate) fn pooled_quantum(&self, b: i32, n: i32, x: Dtype) -> (u64, Dtype) {
+    /// The final norm/pool/projection quantum for an `x`-typed, `width`-wide last hidden state,
+    /// then (after the final layer_norm and projection checks) the pooled output's dtype.
+    pub(crate) fn pooled_quantum(
+        &self,
+        b: i32,
+        n: i32,
+        x: Dtype,
+        shape: &[i32],
+    ) -> (u64, Result<Dtype>) {
         let dim = self.token_embedding.shape[1];
         let scratch = clip_final_scratch(
             b,
@@ -485,6 +692,15 @@ impl ClipPrice {
             &self.final_ln_b,
             self.text_projection.as_ref(),
         );
+        let checked =
+            layer_norm_operands(&self.final_ln_w, &self.final_ln_b, *shape.last().unwrap())
+                .and_then(|()| {
+                    same_elements(shape, &[b * n, dim])?;
+                    match &self.text_projection {
+                        Some(projection) => projection.output_shape(&[b, dim]).map(|_| ()),
+                        None => Ok(()),
+                    }
+                });
         let normed = Dtype::from_promoting_types(
             Dtype::from_promoting_types(x, self.final_ln_w.dtype),
             self.final_ln_b.dtype,
@@ -493,7 +709,7 @@ impl ClipPrice {
             .text_projection
             .as_ref()
             .map_or(normed, |p| p.output_dtype(normed));
-        (scratch, pooled)
+        (scratch, checked.map(|()| pooled))
     }
 
     #[cfg(test)]

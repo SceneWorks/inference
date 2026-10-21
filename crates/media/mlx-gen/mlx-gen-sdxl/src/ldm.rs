@@ -51,28 +51,13 @@ fn squeeze_linear(value: Array) -> Result<Array> {
     }
 }
 
-/// Normalize a fused component's headers through the SAME key-remap producer as the actual load.
+/// Normalize a fused file through the SAME key-remap producer as the actual load, keeping every
+/// order-dependent alias group (each realizable native winner) beside the assignment-0 world.
 /// Transpose/squeeze/split are shape-only here; no source payload or Array is constructed.
-pub(crate) fn component_headers(
-    path: &Path,
-    component: SdxlComponent,
-) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+pub(crate) fn component_header_source(path: &Path) -> Result<pricing::FusedHeaderSource> {
     let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
         .map_err(|error| Error::Msg(error.to_string()))?;
-    // Alias-free and text-only alias files expose one invariant component header set here; a
-    // requested component that itself carries order-dependent aliases is not certified.
-    let source = pricing::FusedHeaderSource::from_headers(headers)?;
-    let aliased = source
-        .aliases
-        .iter()
-        .filter(|alias| alias.component == component)
-        .count();
-    if aliased > 0 {
-        return Err(Error::Unsupported(format!(
-            "sdxl LDM metadata needs actual correlated source order ({aliased} order-dependent alias groups)"
-        )));
-    }
-    Ok(source.headers(component))
+    pricing::FusedHeaderSource::from_headers(headers)
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {

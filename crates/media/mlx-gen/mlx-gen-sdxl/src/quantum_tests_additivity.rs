@@ -1,12 +1,7 @@
-//! Epic 16774: SDXL iOS admission anchors the TEXT mode only. Every other mode (`image_to_image`,
-//! `edit`, `control`, `ip_adapter`) is DERIVED from the text-mode anchor by the anchor law
-//! (`mlx_gen::ios_anchor_law::derive`): its extra resident components through `C_req`, its extra
-//! ENCODE phase through its counted formula plus the anchor's largest unpriced overhead. That holds
-//! only if each mode is COMPONENT-ADDITIVE, which these tests prove on the tiny CPU fixtures: per
-//! mode, at the fully optimized and literally resident endpoints, on dense, q8 and q4 snapshots,
-//! the measured mode run never exceeds the demand derived from the measured text run — overall and
-//! in every phase both ran. A mode that fails is listed in
-//! [`crate::ios_pricing::ios_non_additive_modes`] (its own anchor family).
+//! Epic 16774: additive SDXL modes require complete source-owned native certificates over an
+//! actually captured text anchor. Dense/q8/q4, both literal load endpoints, whole-run and every
+//! measured phase must satisfy `derive_certified` without empirical noise margins. These tiny CPU
+//! fixtures establish native-allocator growth only, never process growth or physical-device proof.
 //!
 //! Each run is the production request lifecycle on the fixture's components: the shared
 //! `Residency::run_staged_request_scoped` seam (rung 0: the warm pair; rung 1: text → drop → heavy →
@@ -16,7 +11,7 @@
 use super::*;
 use crate::ios_pricing::ios_non_additive_modes;
 use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryMode, MemorySelection};
-use mlx_gen::ios_anchor_law::{area, derive, measure_phases, Derivation, MeasuredRun};
+use mlx_gen::ios_anchor_law::{area, derive_certified, measure_phases, Derivation, MeasuredRun};
 use mlx_gen::ios_pricing::{IosPricing, IosPricingRequest};
 
 /// Output edge of every fixture request (pixels).
@@ -87,8 +82,19 @@ fn regime(
     selection: &MemorySelection,
     memory: &GenerationMemory,
 ) -> Regime {
+    regime_with_count(spec, mode, selection, memory, 1)
+}
+
+fn regime_with_count(
+    spec: &mlx_gen::LoadSpec,
+    mode: &MemoryMode,
+    selection: &MemorySelection,
+    memory: &GenerationMemory,
+    count: u32,
+) -> Regime {
     let route = Route::from_mode(mode).unwrap();
-    let generation = generation_request(route, PX as u32, PX as u32, memory);
+    let mut generation = generation_request(route, PX as u32, PX as u32, memory);
+    generation.count = count;
     let mut regime = Regime::from_request(&IosPricingRequest {
         provider: "sdxl",
         spec,
@@ -96,7 +102,7 @@ fn regime(
         geometry: MemoryGeometry {
             width: PX as u32,
             height: PX as u32,
-            batch: 1,
+            batch: count,
             frames: 1,
             reference_count: generation.memory_reference_count(),
         },
@@ -597,239 +603,83 @@ fn denoise(
     denoised
 }
 
-/// Captures per measurement. An anchor is the LARGEST growth across repeats, per phase
-/// (`MeasuredAnchor`); a mode run is measured the same way, so neither side is one lucky capture.
+/// Repeated actual native captures per source-profile fixture.
 const REPEATS: usize = 4;
 
-/// One cell's [`REPEATS`] captures: the largest growth per phase and overall (the measurement), and
-/// the same-cell RECAPTURE SPREAD (largest − smallest). MLX frees a primitive's inputs when its CPU
-/// task completes, so one capture's peak moves with the scheduler's timing — measured here at up
-/// to ~7% of a phase between captures of the identical request.
-struct Measured {
-    worst: MeasuredRun,
-    spread: MeasuredRun,
-}
-
-/// One measured request: [`REPEATS`] fresh loads and generates.
-fn measure(files: &Files, regime: &Regime, memory: &GenerationMemory) -> Measured {
-    let runs: Vec<MeasuredRun> = (0..REPEATS)
-        .map(|_| {
-            with_cpu_diagnostic_headroom(PLENTY, || {
-                measure_phases(ios_quantum_phase, || run(files, regime, memory))
-            })
-            .unwrap()
-            .1
-        })
-        .collect();
-    let fold = |pick: fn(u64, u64) -> u64, start: u64| MeasuredRun {
-        demand: runs.iter().map(|r| r.demand).fold(start, pick),
-        phases: runs[0]
-            .phases
-            .keys()
-            .map(|phase| {
-                let v = runs
-                    .iter()
-                    .map(|r| r.phases.get(phase).copied().unwrap_or(0))
-                    .fold(start, pick);
-                (*phase, v)
-            })
-            .collect(),
-    };
-    let (max, min) = (fold(u64::max, 0), fold(u64::min, u64::MAX));
-    let spread = MeasuredRun {
-        demand: max.demand - min.demand,
-        phases: max
-            .phases
-            .iter()
-            .map(|(p, v)| (*p, v - min.phases[p]))
-            .collect(),
-    };
-    Measured { worst: max, spread }
-}
-
-/// One mode's proof at one selection and tier.
-struct Proof {
-    label: String,
-    mode: String,
-    measured: MeasuredRun,
-    derived: Derivation,
-    /// The larger same-cell recapture spread of the two cells compared (the text anchor's, the
-    /// mode's), per phase and overall (under `demand`).
-    spread: MeasuredRun,
-}
-
-/// The noise allowance of a set of proofs (one tier, both selections), per phase and overall: the
-/// largest same-cell recapture spread any of their cells measured — the fixture's own measurement
-/// of what the law's `CONSISTENCY_TOLERANCE` states for the desktop lane ("a law prediction off by
-/// more than the measurement's own spread is the law failing, not noise"). Pooled because four
-/// captures of one cell under-sample its spread: a phase whose computation is identical across
-/// modes (a staged decode is the VAE alone) was measured to move by a page-multiple outlier in one
-/// cell's captures and not in another's.
-fn pooled_noise(proofs: &[Proof]) -> MeasuredRun {
-    let mut noise = MeasuredRun {
+/// Production source pricing, with observations added ONLY by actual loaded-fixture execution.
+fn captured_source_profile(
+    snapshot: &Snapshot,
+    regime: &Regime,
+    memory: &GenerationMemory,
+) -> (MeasuredRun, IosPricing) {
+    let mut inputs = endpoint_inputs(snapshot, regime);
+    let mut profile = crate::ios_pricing::source_pricing_for_test(&mut inputs, regime).unwrap();
+    let files = Files::of(snapshot);
+    with_cpu_diagnostic_headroom(PLENTY, || run(&files, regime, memory)).unwrap();
+    let mut worst = MeasuredRun {
         demand: 0,
         phases: Default::default(),
     };
-    for proof in proofs {
-        noise.demand = noise.demand.max(proof.spread.demand);
-        for (phase, bytes) in &proof.spread.phases {
-            let slot = noise.phases.entry(*phase).or_insert(0);
-            *slot = (*slot).max(*bytes);
+    for _ in 0..REPEATS {
+        let mut baseline = None;
+        let (result, mut observation) = observe_actual_marks(|| {
+            with_cpu_diagnostic_headroom(PLENTY, || {
+                measure_phases(ios_quantum_phase, || {
+                    baseline = Some(checked_native_active_bytes());
+                    run(&files, regime, memory)
+                })
+            })
+        });
+        let (_, measured) = result.unwrap();
+        let baseline = baseline.expect("actual pre-load native baseline");
+        assert!(measured.demand > 0 && !measured.phases.is_empty());
+        assert!(!observation.checks.is_empty() && !observation.metadata.is_empty());
+        observation.baseline_bytes = baseline;
+        profile.observations.push(observation);
+        profile.request_baseline = Some(mlx_gen::ios_pricing::IosMemoryBaseline {
+            domain: mlx_gen::ios_pricing::IosMemoryDomain::NativeAllocatorGrowth,
+            coordinate: mlx_gen::ios_pricing::IosMemoryCoordinate::BeforeModelLoad,
+            bytes: baseline,
+            source: "checked mlx_get_active_memory before native fixture load/generate".into(),
+        });
+        worst.demand = worst.demand.max(measured.demand);
+        for (phase, bytes) in measured.phases {
+            let slot = worst.phases.entry(phase).or_insert(0);
+            *slot = (*slot).max(bytes);
         }
     }
-    noise
+    (worst, profile)
 }
 
-impl Proof {
-    /// `(phase, measured, derived)` of every comparison the measurement exceeds beyond the `noise`
-    /// allowance ([`pooled_noise`]; `None` phase: the whole-run demand).
-    fn violations(&self, noise: &MeasuredRun) -> Violations {
-        let mut out = Vec::new();
-        if self.measured.demand > self.derived.demand + noise.demand {
-            out.push((None, self.measured.demand, self.derived.demand));
-        }
-        for phase in &self.derived.phases {
-            if let Some(&m) = self.measured.phases.get(&phase.phase) {
-                let noise = noise.phases.get(&phase.phase).copied().unwrap_or(0);
-                if m > phase.bytes + noise {
-                    out.push((Some(phase.phase), m, phase.bytes));
-                }
-            }
-        }
-        out
-    }
-
-    fn print(&self, noise: &MeasuredRun) {
-        let verdict = if self.violations(noise).is_empty() {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        let phases: Vec<String> = self
-            .derived
+/// No spread, empirical margin or missing-phase default may conceal an underprediction.
+fn assert_certified_native_run(measured: &MeasuredRun, derived: &Derivation, label: &str) {
+    assert_eq!(
+        derived.domain,
+        mlx_gen::ios_pricing::IosMemoryDomain::NativeAllocatorGrowth
+    );
+    assert_eq!(
+        derived.coordinate,
+        mlx_gen::ios_pricing::IosMemoryCoordinate::BeforeModelLoad
+    );
+    assert!(
+        measured.demand <= derived.demand,
+        "{label}: whole-run native growth {} exceeds certified {}",
+        measured.demand,
+        derived.demand
+    );
+    assert_eq!(derived.phases.len(), IosPhase::ALL.len());
+    for (&phase, &bytes) in &measured.phases {
+        let upper = derived
             .phases
             .iter()
-            .map(|p| {
-                format!(
-                    "{} {}/{} ±{}",
-                    p.phase.as_key(),
-                    self.measured
-                        .phases
-                        .get(&p.phase)
-                        .map_or("-".into(), u64::to_string),
-                    p.bytes,
-                    noise.phases.get(&p.phase).copied().unwrap_or(0)
-                )
-            })
-            .collect();
-        eprintln!(
-            "ADDITIVITY {} {}: measured {} B vs derived {} B ±{} {verdict} [{}]",
-            self.label,
-            self.mode,
-            self.measured.demand,
-            self.derived.demand,
-            noise.demand,
-            phases.join(", ")
+            .find(|candidate| candidate.phase == phase)
+            .expect("every measured phase requires a certified bound");
+        assert!(
+            bytes <= upper.bytes,
+            "{label}: {phase:?} native growth {bytes} exceeds certified {}",
+            upper.bytes
         );
     }
-}
-
-/// Measure the text anchor and every derived mode (or `only` one) at `which` on `s`, each mode's
-/// request priced by `price` ([`pricing`] for the proof itself).
-fn proofs(
-    s: &Snapshot,
-    tier: &str,
-    which: Selection,
-    only: Option<Route>,
-    price: &dyn Fn(&Snapshot, &Regime) -> IosPricing,
-) -> Vec<Proof> {
-    let files = Files::of(s);
-    let text_spec = spec(s, Route::Text, which);
-    let (text_selection, text_memory) = selection(&text_spec, which);
-    let text_regime = regime(
-        &text_spec,
-        &MemoryMode::TextToImage,
-        &text_selection,
-        &text_memory,
-    );
-    // The text request's spec carries no ControlNet or IP-Adapter source.
-    assert!(text_spec.control.is_none() && text_spec.ip_adapter.is_none());
-    let at_anchor = pricing(s, &text_regime);
-    let requests: Vec<(MemoryMode, Regime, GenerationMemory)> = modes()
-        .into_iter()
-        .filter(|(_, route, _)| only.is_none_or(|o| o == *route))
-        .map(|(mode, route, _)| {
-            let mode_spec = spec(s, route, which);
-            let (mode_selection, mode_memory) = selection(&mode_spec, which);
-            // The same selection the anchor ran.
-            assert_eq!(
-                (mode_selection.strategy, mode_memory),
-                (text_selection.strategy, text_memory),
-                "{tier} {which:?} {}: the mode's selection is not the anchor's",
-                mode.as_key()
-            );
-            let r = regime(&mode_spec, &mode, &mode_selection, &mode_memory);
-            assert_eq!(r.route, route);
-            (mode, r, mode_memory)
-        })
-        .collect();
-    // Warm-up: one unmeasured run of every request first, so no measured run pays (or is credited
-    // with) a process-wide first-use cache another run then reuses — each run is measured warm.
-    run_all_once(&files, &text_regime, &text_memory, &requests);
-    let text = measure(&files, &text_regime, &text_memory);
-    let anchor = text.worst.anchor(area(PX as u32, PX as u32, 1));
-    let label = format!("{tier} {which:?} ({:?})", text_selection.strategy);
-    eprintln!(
-        "ADDITIVITY {label} text anchor: measured {} B {:?} spread {:?}",
-        text.worst.demand, text.worst.phases, text.spread.phases
-    );
-    requests
-        .into_iter()
-        .map(|(mode, r, memory)| {
-            let measured = measure(&files, &r, &memory);
-            let request = price(s, &r);
-            let derived = derive(&anchor, &at_anchor, &request, area(PX as u32, PX as u32, 1))
-                .unwrap_or_else(|e| panic!("{label} {}: {e}", mode.as_key()));
-            let larger = |a: &MeasuredRun, b: &MeasuredRun| MeasuredRun {
-                demand: a.demand.max(b.demand),
-                phases: a
-                    .phases
-                    .keys()
-                    .chain(b.phases.keys())
-                    .map(|p| {
-                        let v = |r: &MeasuredRun| r.phases.get(p).copied().unwrap_or(0);
-                        (*p, v(a).max(v(b)))
-                    })
-                    .collect(),
-            };
-            Proof {
-                label: label.clone(),
-                mode: mode.as_key().to_owned(),
-                spread: larger(&text.spread, &measured.spread),
-                measured: measured.worst,
-                derived,
-            }
-        })
-        .collect()
-}
-
-/// `(phase or None for the whole run, measured, derived)` beyond the noise allowance.
-type Violations = Vec<(Option<IosPhase>, u64, u64)>;
-
-/// `proofs`' verdicts under their [`pooled_noise`], printed: `(mode, label, violations)`.
-fn judged(proofs: &[Proof]) -> Vec<(String, String, Violations)> {
-    let noise = pooled_noise(proofs);
-    proofs
-        .iter()
-        .map(|proof| {
-            proof.print(&noise);
-            (
-                proof.mode.clone(),
-                proof.label.clone(),
-                proof.violations(&noise),
-            )
-        })
-        .collect()
 }
 
 fn run_all_once(
@@ -847,14 +697,6 @@ fn run_all_once(
     })
     .unwrap();
     mlx_gen::residency::drain_allocator_cache();
-}
-
-/// Every proof of one tier: the snapshot at the fully optimized selection and at rung 0.
-fn tier_proofs(tier: &str, snap: &Snapshot) -> Vec<Proof> {
-    [Selection::Optimized, Selection::Rung0]
-        .into_iter()
-        .flat_map(|which| proofs(snap, tier, which, None, &pricing))
-        .collect()
 }
 
 /// Record the SAME marks the production capture listener consumes. This fixture collector owns
@@ -1942,7 +1784,7 @@ fn actual_text_finalize_points_match_headers_and_native_transients() {
             expected_load.push((UNET_LOAD,after[0].1+after[1].1,priced.unet_bytes.floor));
             let actual_load=ledger.iter().filter(|point|point.phase==IosPhase::Load).take(expected_load.len()).map(|point|(point.label,point.resident,point.scratch)).collect::<Vec<_>>();
             assert_eq!(actual_load,expected_load,"actual pricing load ledger retains raw TE1 for TE2, each coincident pack owner, and finalized text beside heavy load bits={bits:?} stored={stored}");
-            let predicted=priced.price_text_conditioning(2,&mut quanta);
+            let predicted=priced.price_text_conditioning(2,&mut quanta)?;
             let (conditioning,pooled)=crate::pipeline::encode_conditioning(&te1,&te2,&ids())?;
             mlx_rs::transforms::eval([&conditioning,&pooled])?;
             assert_eq!((conditioning.dtype(),pooled.dtype(),conditioning.shape().to_vec(),pooled.shape().to_vec()),(predicted.0,predicted.1,vec![2,TOKENS,snapshot.context],vec![2,snapshot.te2.projection_dim.unwrap()]),"actual post-pack CLIP conditioning dtype/layout follows actual models, never tier-fixed bits={bits:?} stored={stored}");
@@ -2326,12 +2168,21 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
                                 "checked mlx_get_active_memory before native fixture load/generate"
                                     .into(),
                         });
+                    // The production premise-mode states: steady = first state joined with eps.
+                    let states = [anchor_regime, &r].map(|regime| {
+                        crate::quantum::with_backend(Backend::Cpu, || {
+                            Priced::build(&endpoint_inputs(snap, regime))
+                                .and_then(|priced| priced.ancestral_states(regime))
+                        })
+                        .unwrap()
+                    });
                     let bounds = crate::ios_pricing::bound_ancestral_forward_windows(
                         anchor_regime,
                         anchor_profile,
                         &r,
                         &request_profile,
                         VAE_SCALE,
+                        states,
                     )
                     .unwrap();
                     let model_windows = request_profile
@@ -2468,45 +2319,338 @@ fn endpoints_use_literal_resident_and_streamed_load_ownership() {
     }
 }
 
-/// THE claim and its exceptions, from one set of measurements: every SDXL mode outside
-/// [`ios_non_additive_modes`] is component-additive over the text anchor — its measured run never
-/// exceeds the demand the anchor law derives from the measured text run (beyond the cells' measured
-/// recapture spread), overall and per phase, at both selections and all three tiers — and every listed
-/// mode still FAILS that proof in at least one cell (so the exception stays explicit, and a mode
-/// that became additive is taken off the list).
+/// Complete certified derivation over real text-anchor marks, every declared additive mode,
+/// both literal load endpoints and all served storage tiers. No uncertified fallback is accepted.
 #[test]
 fn every_additive_mode_is_derived_from_the_text_anchor() {
-    if !cpu_child("pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor") {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor",
+    ) else {
         return;
-    }
-    let mut failures = Vec::new();
-    for (tier, snap) in [
+    };
+    for (tier, snapshot) in [
         ("bf16", Snapshot::new(2)),
         ("q8", Snapshot::packed(8)),
         ("q4", Snapshot::packed(4)),
     ] {
-        let mut failing = std::collections::BTreeSet::new();
-        for (mode, label, violations) in judged(&tier_proofs(tier, &snap)) {
-            if violations.is_empty() {
-                continue;
-            }
-            if !ios_non_additive_modes(tier).contains(&mode.as_str()) {
-                failures.push(format!("{label} {mode}: {violations:?}"));
-            }
-            failing.insert(mode);
-        }
-        for listed in ios_non_additive_modes(tier) {
-            if !failing.contains(*listed) {
-                failures.push(format!(
-                    "{tier} {listed} passes: remove the unproven exception"
-                ));
+        for which in [Selection::Optimized, Selection::Rung0] {
+            let text_spec = spec(&snapshot, Route::Text, which);
+            let (sel, memory) = selection(&text_spec, which);
+            let text = regime(&text_spec, &MemoryMode::TextToImage, &sel, &memory);
+            let (measured_text, at_anchor) = captured_source_profile(&snapshot, &text, &memory);
+            let anchor = measured_text.anchor(area(PX as u32, PX as u32, 1));
+            let text_inputs = endpoint_inputs(&snapshot, &text);
+            for (mode, route, _) in modes() {
+                if ios_non_additive_modes(tier).contains(&mode.as_key()) {
+                    continue;
+                }
+                let mode_spec = spec(&snapshot, route, which);
+                let (mode_sel, mode_memory) = selection(&mode_spec, which);
+                assert_eq!((mode_sel.strategy, mode_memory), (sel.strategy, memory));
+                let request = regime(&mode_spec, &mode, &mode_sel, &mode_memory);
+                let (measured, profile) =
+                    captured_source_profile(&snapshot, &request, &mode_memory);
+                let request_inputs = endpoint_inputs(&snapshot, &request);
+                let bounds = crate::ios_pricing::certified_request_bounds_for_test(
+                    &text_inputs,
+                    &text,
+                    &at_anchor,
+                    &request_inputs,
+                    &request,
+                    &profile,
+                )
+                .unwrap_or_else(|error| panic!("{tier} {which:?} {}: {error}", mode.as_key()));
+                let derived = derive_certified(&anchor, &at_anchor, &profile, &bounds)
+                    .unwrap_or_else(|error| panic!("{tier} {which:?} {}: {error}", mode.as_key()));
+                assert_certified_native_run(
+                    &measured,
+                    &derived,
+                    &format!("{tier} {which:?} {}", mode.as_key()),
+                );
+                let mut unwitnessed = at_anchor.clone();
+                unwitnessed.observations.clear();
+                assert!(
+                    crate::ios_pricing::certified_request_bounds_for_test(
+                        &text_inputs,
+                        &text,
+                        &unwitnessed,
+                        &request_inputs,
+                        &request,
+                        &profile,
+                    )
+                    .is_err(),
+                    "{tier} {which:?} {}: planned windows without actual marks are not witnesses",
+                    mode.as_key()
+                );
+                let mut forged = profile.clone();
+                forged.windows[0].scratch_bytes += 1;
+                assert!(
+                    crate::ios_pricing::certified_request_bounds_for_test(
+                        &text_inputs,
+                        &text,
+                        &at_anchor,
+                        &request_inputs,
+                        &request,
+                        &forged,
+                    )
+                    .is_err(),
+                    "fixture adapter must retain production source-profile equality"
+                );
             }
         }
     }
+    completion.body_completed = true;
+}
+
+/// Count two retains the real first latent while executing the second output, not a batch-one
+/// assertion relabeled as batching. Production request reconstruction rejects mismatched geometry.
+#[test]
+fn serial_count_two_uses_real_geometry_and_complete_native_bounds() {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds",
+    ) else {
+        return;
+    };
+    let snapshot = Snapshot::packed(4);
+    let sp = spec(&snapshot, Route::Text, Selection::Rung0);
+    let (sel, memory) = selection(&sp, Selection::Rung0);
+    let text = regime_with_count(&sp, &MemoryMode::TextToImage, &sel, &memory, 1);
+    let request = regime_with_count(&sp, &MemoryMode::TextToImage, &sel, &memory, 2);
+    assert_eq!((text.count, request.count), (1, 2));
+    let (measured_text, at_anchor) = captured_source_profile(&snapshot, &text, &memory);
+    let (measured, profile) = captured_source_profile(&snapshot, &request, &memory);
+    let starts = |profile: &IosPricing| {
+        profile.observations[0]
+            .metadata
+            .iter()
+            .filter(|mark| mark.provider == "sdxl" && mark.kind == "serial-output-start")
+            .map(|mark| {
+                (
+                    mark.fields["output"],
+                    mark.fields["completed_latents"],
+                    mark.fields["completed_latent_bytes"],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(starts(&at_anchor), [(0, 0, 0)]);
+    let serial = starts(&profile);
+    assert_eq!(serial.len(), 2);
+    assert_eq!(serial[0], (0, 0, 0));
+    assert_eq!((serial[1].0, serial[1].1), (1, 1));
     assert!(
-        failures.is_empty(),
-        "additivity/exception proof failures: {failures:?}"
+        serial[1].2 > 0,
+        "second output must retain an actual first latent owner"
     );
+    let forwards = |profile: &IosPricing| {
+        profile.observations[0]
+            .metadata
+            .iter()
+            .filter(|mark| mark.provider == "sdxl" && mark.kind == "forward-input-before-cast")
+            .count()
+    };
+    assert!(forwards(&at_anchor) > 0);
+    assert_eq!(forwards(&profile), 2 * forwards(&at_anchor));
+    assert_ne!(
+        profile.windows, at_anchor.windows,
+        "count two must change source work/ownership"
+    );
+    let anchor_inputs = endpoint_inputs(&snapshot, &text);
+    let request_inputs = endpoint_inputs(&snapshot, &request);
+    let bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &anchor_inputs,
+        &text,
+        &at_anchor,
+        &request_inputs,
+        &request,
+        &profile,
+    )
+    .unwrap();
+    let derived = derive_certified(
+        &measured_text.anchor(area(PX as u32, PX as u32, 1)),
+        &at_anchor,
+        &profile,
+        &bounds,
+    )
+    .unwrap();
+    assert_certified_native_run(&measured, &derived, "q4 resident serial count two");
+    let single_bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &anchor_inputs,
+        &text,
+        &at_anchor,
+        &anchor_inputs,
+        &text,
+        &at_anchor,
+    )
+    .unwrap();
+    let single = derive_certified(
+        &measured_text.anchor(area(PX as u32, PX as u32, 1)),
+        &at_anchor,
+        &at_anchor,
+        &single_bounds,
+    )
+    .unwrap();
+    assert_certified_native_run(&measured_text, &single, "q4 resident serial count one");
+    assert!(
+        derived.demand > single.demand,
+        "count-two certified cumulative upper {} must exceed count-one {}",
+        derived.demand,
+        single.demand
+    );
+    let mut generation = generation_request(Route::Text, PX as u32, PX as u32, &memory);
+    generation.count = 2;
+    assert!(
+        Regime::from_request(&IosPricingRequest {
+            provider: "sdxl",
+            spec: &sp,
+            mode: &MemoryMode::TextToImage,
+            geometry: MemoryGeometry {
+                width: PX as u32,
+                height: PX as u32,
+                batch: 1,
+                frames: 1,
+                reference_count: generation.memory_reference_count(),
+            },
+            selection: &sel,
+            execution: &memory,
+            generation: Some(&generation),
+            transform: None,
+            depth: None,
+            token_window: 0,
+        })
+        .is_err(),
+        "count-two execution cannot be admitted under batch-one geometry"
+    );
+    completion.body_completed = true;
+}
+
+/// Payload-free source replay resolves the same work as the actual text request, but never
+/// manufactures observations. Actual captured marks are retained unchanged for certification.
+#[test]
+fn payload_free_text_anchor_replay_preserves_native_certificates() {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates",
+    ) else {
+        return;
+    };
+    let snapshot = Snapshot::packed(4);
+    let sp = spec(&snapshot, Route::Text, Selection::Rung0);
+    let (sel, memory) = selection(&sp, Selection::Rung0);
+    let generation = generation_request(Route::Text, PX as u32, PX as u32, &memory);
+    let mode = MemoryMode::TextToImage;
+    let mut req = IosPricingRequest {
+        provider: "sdxl",
+        spec: &sp,
+        mode: &mode,
+        geometry: MemoryGeometry {
+            width: PX as u32,
+            height: PX as u32,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        },
+        selection: &sel,
+        execution: &memory,
+        generation: Some(&generation),
+        transform: None,
+        depth: None,
+        token_window: 0,
+    };
+    let mut actual = Regime::from_request(&req).unwrap();
+    let identity = |regime: &Regime| {
+        (
+            regime.route,
+            regime.sampling.route(),
+            regime.count,
+            regime.has_init,
+            regime.width,
+            regime.height,
+            regime.staged,
+            regime.cfg_batching,
+            regime.context_tokens,
+            regime.ip_scale.to_bits(),
+            regime.reference_image.is_none(),
+            regime.tiling.is_none(),
+        )
+    };
+    let token = actual.sampling.recipe().canonical_token();
+    let precedence = crate::ios_pricing::resolve_bound_side_for_test(
+        &req,
+        Some(crate::ios_pricing::SdxlReplay {
+            token: "not-an-sdxl-token",
+            true_reference_count: usize::MAX,
+            mask_count: usize::MAX,
+            control_count: usize::MAX,
+            source: None,
+        }),
+    )
+    .unwrap();
+    assert_eq!(identity(&precedence), identity(&actual));
+    assert_eq!(precedence.sampling.recipe().canonical_token(), token);
+    req.generation = None;
+    let missing = crate::ios_pricing::resolve_bound_side_for_test(&req, None);
+    assert!(
+        matches!(missing, Err(mlx_gen::Error::Unsupported(ref message))
+            if message == "SDXL native certificate: payload-free side requires an SDXL sampling replay token"),
+        "payload-free anchor without replay must return the exact source refusal"
+    );
+    let mut replayed = crate::ios_pricing::resolve_bound_side_for_test(
+        &req,
+        Some(crate::ios_pricing::SdxlReplay {
+            token: &token,
+            true_reference_count: 0,
+            mask_count: 0,
+            control_count: 0,
+            source: None,
+        }),
+    )
+    .unwrap();
+    assert_eq!(identity(&replayed), identity(&actual));
+    assert_eq!(replayed.sampling.recipe().canonical_token(), token);
+    assert!(actual.reference_image.is_none() && actual.tiling.is_none());
+    // Both production resolutions above use the ordinary CLIP window. Only the tiny fixture's
+    // loaded text architecture below substitutes its real eight-token table, identically on both.
+    actual.context_tokens = TOKENS;
+    replayed.context_tokens = TOKENS;
+    let (measured, at_anchor) = captured_source_profile(&snapshot, &actual, &memory);
+    let actual_inputs = endpoint_inputs(&snapshot, &actual);
+    let mut replayed_inputs = endpoint_inputs(&snapshot, &replayed);
+    let mut replayed_profile =
+        crate::ios_pricing::source_pricing_for_test(&mut replayed_inputs, &replayed).unwrap();
+    assert_eq!(replayed_profile.phases, at_anchor.phases);
+    assert_eq!(replayed_profile.windows, at_anchor.windows);
+    assert_eq!(replayed_profile.absent_phases, at_anchor.absent_phases);
+    assert!(replayed_profile.observations.is_empty());
+    replayed_profile.observations = at_anchor.observations.clone();
+    replayed_profile.request_baseline = at_anchor.request_baseline.clone();
+    let actual_bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &actual_inputs,
+        &actual,
+        &at_anchor,
+        &actual_inputs,
+        &actual,
+        &at_anchor,
+    )
+    .unwrap();
+    let replayed_bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &replayed_inputs,
+        &replayed,
+        &replayed_profile,
+        &actual_inputs,
+        &actual,
+        &at_anchor,
+    )
+    .unwrap();
+    assert_eq!(replayed_bounds, actual_bounds);
+    let derived = derive_certified(
+        &measured.anchor(area(PX as u32, PX as u32, 1)),
+        &replayed_profile,
+        &at_anchor,
+        &replayed_bounds,
+    )
+    .unwrap();
+    assert_certified_native_run(&measured, &derived, "q4 resident payload-free text anchor");
+    completion.body_completed = true;
 }
 
 /// Every listed exception is a mode key this crate prices.
@@ -2522,45 +2666,76 @@ fn every_listed_non_additive_mode_is_a_priced_mode() {
     }
 }
 
-/// Mutation: drop the ControlNet from the control request's `C_req` (the law then derives the mode
-/// as if the branch were not resident) on the q4 tier, where the control mode passes its proof at
-/// both selections — and the proof turns RED at both, so a pass depends on the component term.
+/// Honest Control certifies; deleting its actual resident component from C_req must fail
+/// source-profile validation rather than manufacture a lower certified demand.
 #[test]
 fn dropping_the_controlnet_from_c_req_fails_the_proof() {
-    if !cpu_child("pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof") {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof",
+    ) else {
         return;
-    }
-    /// The request priced with its ControlNet branch weighing nothing (load and packed resident).
-    fn drop_controlnet(s: &Snapshot, regime: &Regime) -> IosPricing {
-        assert_eq!(regime.route, Route::Control);
-        crate::quantum::with_backend(Backend::Cpu, || {
-            let mut priced = Priced::build(&endpoint_inputs(s, regime)).unwrap();
+    };
+    let snapshot = Snapshot::packed(4);
+    for which in [Selection::Optimized, Selection::Rung0] {
+        let text_spec = spec(&snapshot, Route::Text, which);
+        let (sel, memory) = selection(&text_spec, which);
+        let text = regime(&text_spec, &MemoryMode::TextToImage, &sel, &memory);
+        let control_spec = spec(&snapshot, Route::Control, which);
+        let (control_sel, control_memory) = selection(&control_spec, which);
+        let control = regime(
+            &control_spec,
+            &MemoryMode::Other("control".into()),
+            &control_sel,
+            &control_memory,
+        );
+        let (measured_text, at_anchor) = captured_source_profile(&snapshot, &text, &memory);
+        let (measured, profile) = captured_source_profile(&snapshot, &control, &control_memory);
+        let anchor_inputs = endpoint_inputs(&snapshot, &text);
+        let request_inputs = endpoint_inputs(&snapshot, &control);
+        let bounds = crate::ios_pricing::certified_request_bounds_for_test(
+            &anchor_inputs,
+            &text,
+            &at_anchor,
+            &request_inputs,
+            &control,
+            &profile,
+        )
+        .unwrap();
+        let derived = derive_certified(
+            &measured_text.anchor(area(PX as u32, PX as u32, 1)),
+            &at_anchor,
+            &profile,
+            &bounds,
+        )
+        .unwrap();
+        assert_certified_native_run(&measured, &derived, &format!("q4 {which:?} Control"));
+        let mutated = crate::quantum::with_backend(Backend::Metal, || {
+            let mut priced = Priced::build(&request_inputs).unwrap();
+            assert!(!priced.control_bytes.is_empty());
             for (load, resident) in &mut priced.control_bytes {
                 load.resident = 0;
                 *resident = 0;
             }
-            priced.price(regime).unwrap().0
-        })
-    }
-    let snap = Snapshot::packed(4);
-    for which in [Selection::Optimized, Selection::Rung0] {
-        let honest = judged(&proofs(&snap, "q4", which, Some(Route::Control), &pricing));
-        assert!(
-            honest[0].2.is_empty(),
-            "the unmutated q4 control proof must pass"
+            priced.price(&control).unwrap().0
+        });
+        assert_ne!(
+            mutated.windows, profile.windows,
+            "ControlNet removal must change the ledger"
         );
-        let mutated = judged(&proofs(
-            &snap,
-            "q4 (C_req without the ControlNet)",
-            which,
-            Some(Route::Control),
-            &drop_controlnet,
-        ));
         assert!(
-            !mutated[0].2.is_empty(),
-            "{which:?}: dropping the ControlNet from C_req must fail the proof"
+            crate::ios_pricing::certified_request_bounds_for_test(
+                &anchor_inputs,
+                &text,
+                &at_anchor,
+                &request_inputs,
+                &control,
+                &mutated,
+            )
+            .is_err(),
+            "{which:?}: dropping the ControlNet from C_req must fail source validation"
         );
     }
+    completion.body_completed = true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2866,4 +3041,127 @@ fn ios_boundary_casts_preserve_full_request_rgb() {
             }
         }
     }
+}
+
+/// Recorded IP source facts travel with payload-free catalog anchors. The same real
+/// capture is used on both sides; replay never synthesizes execution observations.
+#[test]
+fn payload_free_ip_anchor_replay_preserves_native_certificates() {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates",
+    ) else {
+        return;
+    };
+    use crate::sampling::{SamplingSourceFacts, SamplingSourceView, SourceRequestBudget};
+    let snapshot = Snapshot::packed(4);
+    let sp = spec(&snapshot, Route::IpAdapter, Selection::Rung0);
+    let (sel, memory) = selection(&sp, Selection::Rung0);
+    let generation = generation_request(Route::IpAdapter, PX as u32, PX as u32, &memory);
+    let mut budget = SourceRequestBudget::bounded(1 << 20);
+    let source =
+        SamplingSourceFacts::capture(SamplingSourceView::from_request(&generation), &mut budget)
+            .unwrap();
+    source.validate_roles().unwrap();
+    let work = source.work();
+    assert_eq!(
+        (work.reference_count, work.mask_count, work.control_count),
+        (1, 0, 0)
+    );
+    assert!(work.reference_image.is_some());
+    let mode = MemoryMode::Other("ip_adapter".into());
+    let mut req = IosPricingRequest {
+        provider: "sdxl",
+        spec: &sp,
+        mode: &mode,
+        geometry: MemoryGeometry {
+            width: PX as u32,
+            height: PX as u32,
+            batch: 1,
+            frames: 1,
+            reference_count: generation.memory_reference_count(),
+        },
+        selection: &sel,
+        execution: &memory,
+        generation: Some(&generation),
+        transform: None,
+        depth: None,
+        token_window: 0,
+    };
+    let mut actual = Regime::from_request(&req).unwrap();
+    let token = actual.sampling.recipe().canonical_token();
+    req.generation = None;
+    let missing_source = crate::ios_pricing::resolve_bound_side_for_test(
+        &req,
+        Some(crate::ios_pricing::SdxlReplay {
+            token: &token,
+            true_reference_count: 1,
+            mask_count: 0,
+            control_count: 0,
+            source: None,
+        }),
+    );
+    assert!(
+        matches!(missing_source, Err(mlx_gen::Error::Unsupported(ref message))
+        if message == "sdxl IP pricing needs actual ReferenceImageFacts; missing legacy source facts are not crop geometry")
+    );
+    let mut replayed = crate::ios_pricing::resolve_bound_side_for_test(
+        &req,
+        Some(crate::ios_pricing::SdxlReplay {
+            token: &token,
+            true_reference_count: 1,
+            mask_count: 0,
+            control_count: 0,
+            source: Some(&source),
+        }),
+    )
+    .unwrap();
+    assert_eq!(replayed.route, Route::IpAdapter);
+    assert_eq!(replayed.reference_image, actual.reference_image);
+    assert_eq!(replayed.sampling.recipe().canonical_token(), token);
+    assert_eq!(replayed.cfg_batching, actual.cfg_batching);
+    assert_eq!(
+        (replayed.width, replayed.height, replayed.count),
+        (actual.width, actual.height, actual.count)
+    );
+    actual.context_tokens = TOKENS;
+    replayed.context_tokens = TOKENS;
+    let (measured, actual_profile) = captured_source_profile(&snapshot, &actual, &memory);
+    let actual_inputs = endpoint_inputs(&snapshot, &actual);
+    let mut replayed_inputs = endpoint_inputs(&snapshot, &replayed);
+    let mut replayed_profile =
+        crate::ios_pricing::source_pricing_for_test(&mut replayed_inputs, &replayed).unwrap();
+    assert_eq!(replayed_profile.phases, actual_profile.phases);
+    assert_eq!(replayed_profile.windows, actual_profile.windows);
+    assert_eq!(replayed_profile.absent_phases, actual_profile.absent_phases);
+    assert!(replayed_profile.observations.is_empty());
+    replayed_profile.observations = actual_profile.observations.clone();
+    replayed_profile.request_baseline = actual_profile.request_baseline.clone();
+    let actual_bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &actual_inputs,
+        &actual,
+        &actual_profile,
+        &actual_inputs,
+        &actual,
+        &actual_profile,
+    )
+    .unwrap();
+    let replayed_bounds = crate::ios_pricing::certified_request_bounds_for_test(
+        &replayed_inputs,
+        &replayed,
+        &replayed_profile,
+        &actual_inputs,
+        &actual,
+        &actual_profile,
+    )
+    .unwrap();
+    assert_eq!(replayed_bounds, actual_bounds);
+    let derived = derive_certified(
+        &measured.anchor(area(PX as u32, PX as u32, 1)),
+        &replayed_profile,
+        &actual_profile,
+        &replayed_bounds,
+    )
+    .unwrap();
+    assert_certified_native_run(&measured, &derived, "q4 resident recorded-source IP replay");
+    completion.body_completed = true;
 }

@@ -1,65 +1,61 @@
-//! Exact pricing of order-dependent fused text-encoder source aliases.
+//! Exact text-alias witnesses, including worlds whose native execution ends at a shape check.
 //!
-//! A text alias group's winner changes only its own encoder's component headers. Every SDXL
-//! pricing consumer reads those headers through three channels, each proved by the code it names:
-//!
-//! - **Additive resident terms.** `text_pack_facts` retained/`before_resident` and the fused
-//!   footprint are sums of per-target terms; pack-point existence is fixed by `.scales` target
-//!   NAMES, so every world has the same pack points. Groups share no target, hence each group's
-//!   contribution is its delta against the base world, independent of every other group.
-//! - **Local kernels.** A CLIP layer quantum reads only its own layer's facts plus the incoming
-//!   activation dtype (`ClipPrice::layer_quantum`); a pack point's scratch reads only its own
-//!   projection. Every alias group lies in exactly one encoder layer.
-//! - **Encoder outcome.** Everything downstream (UNet/conditioning windows) reads the encoders only
-//!   through the penultimate/pooled dtypes and the retained text bytes.
-//!
-//! So each window's maximum over all realizable worlds is attained by a witness built from one
-//! dynamic program over activation dtypes: upstream groups through the state, local groups by
-//! their small product, downstream and non-local groups at their own additive maximum. Every
-//! witness is a real realizable world priced by the unchanged exact pricer; the caller keeps the
-//! whole-candidate envelope. No global product, independent maxima or heuristic bound is used.
+//! Independent groups contribute additive loaded/retained owners. Layer-local products drive a
+//! finite (dtype, width, penultimate dtype) program. A failing local transition contributes its
+//! admitted guard but has no successor. Packing uses the same rule: assignments failing at point
+//! p are eligible through p, never after p. Symbolic accounting terms after an invalid pack are
+//! used only to compute independent deltas; the exact world pricer emits only native prefixes.
 use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
-use mlx_gen::{Error, Result};
+use mlx_gen::Result;
 use mlx_rs::Dtype;
 
 use super::{fused_header_footprint, Inputs, Regime};
 use crate::config::ClipTextConfig;
-use crate::text_encoder::{text_pack_facts, ClipPrice};
+use crate::text_encoder::{text_pack_accounting, ClipPrice};
 
-/// Alias-group assignments selecting one realizable world (`(group, assignment)`).
 pub(super) type Picks = Vec<(usize, usize)>;
 
-/// One world's text-encoder facts on the three channels above.
+/// One encoder outcome: penultimate (dtype, shape), pooled dtype, best retained delta, picks.
+type Outcome = ((Dtype, Vec<i32>), Dtype, i128, Picks);
+
 struct WorldFacts {
     retained: u64,
     bytes: u64,
     points: Vec<(String, u64, u64)>,
+    failures: Vec<usize>,
     clip: ClipPrice,
 }
-
 struct Encoder<'a> {
     component: C,
     cfg: &'a ClipTextConfig,
     groups: Vec<usize>,
     layer: Vec<usize>,
+    /// The current assignment of this encoder's encoder-global groups (embeddings, final norm,
+    /// projection or multi-layer groups). They are enumerated: every witness carries one.
+    fixed: Picks,
 }
-
-/// One valid group assignment: (assignment, retained delta, footprint delta, per-point
-/// before-resident deltas), each against the base world.
-type Alternative = (usize, i128, i128, Vec<i128>);
-
-struct Alternatives {
-    // Per encoder group: (assignment, retained delta, bytes delta, per-point before delta).
-    valid: Vec<Vec<Alternative>>,
+struct Alternative {
+    assignment: usize,
+    retained: i128,
+    bytes: i128,
+    before: Vec<i128>,
+    failure: Option<usize>,
 }
-
-/// One state of the activation-dtype program: its incoming dtype, the penultimate hidden dtype
-/// once known, the best additive retained delta reaching it, and that path's assignments.
 struct State {
     x: Dtype,
-    penultimate: Option<Dtype>,
+    shape: Vec<i32>,
+    penultimate: Option<(Dtype, Vec<i32>)>,
     value: i128,
     picks: Picks,
+}
+#[derive(Default)]
+struct EncoderWitnesses {
+    kernels: Vec<Picks>,
+    packs: Vec<Picks>,
+    outcomes: Vec<Picks>,
+    retained_max: Vec<Picks>,
+    successful_max: Vec<Picks>,
+    bytes_max: Vec<Picks>,
 }
 
 fn layer_of(target: &str) -> Option<usize> {
@@ -70,18 +66,23 @@ fn layer_of(target: &str) -> Option<usize> {
         .parse()
         .ok()
 }
-
 fn facts(inputs: &Inputs, encoder: &Encoder<'_>, picks: &[(usize, usize)]) -> Result<WorldFacts> {
     let source = &inputs
         .fused
         .as_ref()
         .expect("text aliases are fused")
         .source;
-    let headers = source.headers_with(encoder.component, picks);
+    let picks = encoder
+        .fixed
+        .iter()
+        .chain(picks)
+        .copied()
+        .collect::<Picks>();
+    let headers = source.headers_with(encoder.component, &picks);
     let mut clip = ClipPrice::from_headers(&headers, "text_model", encoder.cfg)?;
-    let pack = text_pack_facts(&headers, encoder.cfg, inputs.text_quant_bits)?;
+    let (pack, _) = text_pack_accounting(&headers, encoder.cfg, inputs.text_quant_bits, false)?;
     if let Some(bits) = inputs.text_quant_bits {
-        clip.quantize(bits)?;
+        clip.pack_witness_terms(bits)?;
     }
     let bytes = fused_header_footprint(&headers, crate::model::DTYPE, false)?.resident;
     Ok(WorldFacts {
@@ -90,49 +91,52 @@ fn facts(inputs: &Inputs, encoder: &Encoder<'_>, picks: &[(usize, usize)]) -> Re
         points: pack
             .points
             .into_iter()
-            .map(|point| (point.path, point.before_resident, point.scratch))
+            .map(|p| (p.path, p.before_resident, p.scratch))
             .collect(),
+        failures: pack.failures,
         clip,
     })
 }
-
-fn best(values: &[Alternative], key: impl Fn(&Alternative) -> i128) -> (usize, i128) {
+fn reaches(value: &Alternative, point: usize) -> bool {
+    value.failure.is_none_or(|failure| failure >= point)
+}
+fn best(
+    values: &[Alternative],
+    point: usize,
+    key: impl Fn(&Alternative) -> i128,
+) -> Option<(usize, i128)> {
     values
         .iter()
-        .map(|value| (value.0, key(value)))
-        .max_by_key(|(_, delta)| *delta)
-        .expect("every group keeps a valid assignment")
+        .filter(|v| reaches(v, point))
+        .map(|v| (v.assignment, key(v)))
+        .max_by_key(|(_, v)| *v)
 }
-
-/// Every local assignment product over `groups` (indices into the encoder's group list).
 fn local_products(
-    alternatives: &Alternatives,
+    alternatives: &[Vec<Alternative>],
     encoder: &Encoder<'_>,
     groups: &[usize],
+    point: usize,
 ) -> Vec<(Picks, i128)> {
-    let mut result: Vec<(Picks, i128)> = vec![(Vec::new(), 0)];
+    let mut result = vec![(Vec::new(), 0)];
     for &local in groups {
         let mut next = Vec::new();
         for (picks, delta) in &result {
-            for (assignment, retained, _, _) in &alternatives.valid[local] {
+            for value in alternatives[local].iter().filter(|v| reaches(v, point)) {
                 let mut picks = picks.clone();
-                picks.push((encoder.groups[local], *assignment));
-                next.push((picks, delta + retained));
+                picks.push((encoder.groups[local], value.assignment));
+                next.push((picks, delta + value.retained));
             }
         }
         result = next;
     }
     result
 }
-
-/// Per encoder: the witness worlds of its own windows (CLIP kernels, pack points, outcomes) and
-/// its additive argmax worlds for the retained and footprint channels.
-struct EncoderWitnesses {
-    kernels: Vec<Picks>,
-    packs: Vec<Picks>,
-    outcomes: Vec<Picks>,
-    retained_max: Picks,
-    bytes_max: Picks,
+fn recover<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if crate::quantum::is_native_shape_failure(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn encoder_witnesses(
@@ -141,186 +145,227 @@ fn encoder_witnesses(
     encoder: &Encoder<'_>,
 ) -> Result<EncoderWitnesses> {
     let base = facts(inputs, encoder, &[])?;
-    let mut alternatives = Alternatives { valid: Vec::new() };
-    for &group in &encoder.groups {
-        let source = &inputs
-            .fused
-            .as_ref()
-            .expect("text aliases are fused")
-            .source;
-        let mut valid = Vec::new();
-        let mut first_error = None;
-        for assignment in 0..source.aliases[group].assignments.len() {
-            match facts(inputs, encoder, &[(group, assignment)]) {
-                Ok(world) => {
-                    let points = world
-                        .points
-                        .iter()
-                        .zip(&base.points)
-                        .map(|((path, before, _), (base_path, base_before, _))| {
-                            debug_assert_eq!(path, base_path, "pack points are name-invariant");
-                            i128::from(*before) - i128::from(*base_before)
-                        })
-                        .collect();
-                    valid.push((
-                        assignment,
-                        i128::from(world.retained) - i128::from(base.retained),
-                        i128::from(world.bytes) - i128::from(base.bytes),
-                        points,
-                    ));
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        if valid.is_empty() {
-            // Every native winner of this group fails its own constructor/pack: certain failure.
-            return Err(first_error.expect("an alias group has at least one assignment"));
-        }
-        alternatives.valid.push(valid);
-    }
-    let all = |key: &dyn Fn(&Alternative) -> i128| -> (Picks, i128) {
-        let mut picks = Vec::new();
-        let mut total = 0;
-        for (local, valid) in alternatives.valid.iter().enumerate() {
-            let (assignment, delta) = best(valid, key);
-            picks.push((encoder.groups[local], assignment));
-            total += delta;
-        }
-        (picks, total)
+    let source = &inputs
+        .fused
+        .as_ref()
+        .expect("text aliases are fused")
+        .source;
+    let owns = |local: usize, point: usize| {
+        let prefix = format!("{}.", base.points[point].0);
+        source.aliases[encoder.groups[local]]
+            .targets
+            .iter()
+            .any(|target| target.starts_with(&prefix))
     };
-    let retained_max = all(&|value| value.1).0;
-    let bytes_max = all(&|value| value.2).0;
-
-    let (b, n) = (regime.conditioning_rows(), inputs.arch.text_tokens);
-    let layers = base.clip.layer_count();
-    let mut kernels = vec![retained_max.clone()];
-    let mut states = vec![State {
-        x: base.clip.embeddings_quantum(b, n).1,
-        penultimate: None,
-        value: 0,
-        picks: Vec::new(),
-    }];
-    for layer in 0..layers {
-        let local = (0..encoder.groups.len())
-            .filter(|&group| encoder.layer[group] == layer)
-            .collect::<Vec<_>>();
-        let mut suffix = Vec::new();
-        let mut suffix_value = 0;
-        for (group, valid) in alternatives.valid.iter().enumerate() {
-            if encoder.layer[group] > layer {
-                let (assignment, delta) = best(valid, |value| value.1);
-                suffix.push((encoder.groups[group], assignment));
-                suffix_value += delta;
-            }
+    let fixed_failure = base
+        .failures
+        .iter()
+        .copied()
+        .filter(|&point| !(0..encoder.groups.len()).any(|g| owns(g, point)))
+        .min();
+    let mut alternatives = Vec::new();
+    for (local, &group) in encoder.groups.iter().enumerate() {
+        let mut values = Vec::new();
+        for assignment in 0..source.aliases[group].assignments.len() {
+            let world = facts(inputs, encoder, &[(group, assignment)])?;
+            let before = world
+                .points
+                .iter()
+                .zip(&base.points)
+                .map(|((path, before, _), (base_path, base_before, _))| {
+                    debug_assert_eq!(path, base_path, "pack points are name-invariant");
+                    i128::from(*before) - i128::from(*base_before)
+                })
+                .collect();
+            values.push(Alternative {
+                assignment,
+                retained: i128::from(world.retained) - i128::from(base.retained),
+                bytes: i128::from(world.bytes) - i128::from(base.bytes),
+                before,
+                failure: world
+                    .failures
+                    .iter()
+                    .copied()
+                    .filter(|&point| owns(local, point))
+                    .min(),
+            });
         }
-        let mut window: Option<(i128, Picks)> = None;
-        let mut next: Vec<State> = Vec::new();
-        for (combo, delta) in local_products(&alternatives, encoder, &local) {
-            let local_facts;
-            let clip = if combo.is_empty() {
-                &base.clip
-            } else {
-                local_facts = facts(inputs, encoder, &combo)?;
-                &local_facts.clip
-            };
-            for state in &states {
-                let (scratch, x) = clip.layer_quantum(layer, b, n, state.x);
-                let candidate = state.value + delta + i128::from(scratch) + suffix_value;
-                if window.as_ref().is_none_or(|(value, _)| candidate > *value) {
-                    let mut picks = state.picks.clone();
-                    picks.extend(combo.iter().copied());
-                    picks.extend(suffix.iter().copied());
-                    window = Some((candidate, picks));
+        alternatives.push(values);
+    }
+    let all = |point: usize, key: &dyn Fn(&Alternative) -> i128| -> Option<Picks> {
+        if fixed_failure.is_some_and(|failure| failure < point) {
+            return None;
+        }
+        alternatives
+            .iter()
+            .enumerate()
+            .map(|(local, values)| {
+                best(values, point, key).map(|(assignment, _)| (encoder.groups[local], assignment))
+            })
+            .collect()
+    };
+    let retained_max = all(usize::MAX, &|v| v.retained);
+    // Before packing, even a future shape-failing assignment is a real loaded owner.
+    let bytes_max = alternatives
+        .iter()
+        .enumerate()
+        .map(|(local, values)| {
+            let value = values
+                .iter()
+                .max_by_key(|v| v.bytes)
+                .expect("realizable group");
+            (encoder.groups[local], value.assignment)
+        })
+        .collect();
+    let mut kernels = Vec::new();
+    // Keyed by the penultimate (dtype, shape) the native TE1/TE2 concat reads, and pooled dtype.
+    let mut outcomes: Vec<Outcome> = Vec::new();
+    if let Some(retained_max) = &retained_max {
+        kernels.push(retained_max.clone());
+        let (b, n) = (regime.conditioning_rows(), inputs.arch.text_tokens);
+        let layers = base.clip.layer_count();
+        let mut states = match recover(base.clip.embeddings_quantum(b, n).1)? {
+            Some((x, shape)) => vec![State {
+                x,
+                shape,
+                penultimate: None,
+                value: 0,
+                picks: Vec::new(),
+            }],
+            None => Vec::new(),
+        };
+        for layer in 0..layers {
+            let local = (0..encoder.groups.len())
+                .filter(|&g| encoder.layer[g] == layer)
+                .collect::<Vec<_>>();
+            let mut suffix = Vec::new();
+            let mut suffix_value = 0;
+            for (group, values) in alternatives.iter().enumerate() {
+                if encoder.layer[group] > layer {
+                    let (assignment, delta) =
+                        best(values, usize::MAX, |v| v.retained).expect("post-pack path exists");
+                    suffix.push((encoder.groups[group], assignment));
+                    suffix_value += delta;
                 }
-                let penultimate = if layer + 2 == layers {
-                    Some(x)
-                } else {
-                    state.penultimate
-                };
-                let value = state.value + delta;
-                match next
-                    .iter_mut()
-                    .find(|other| other.x == x && other.penultimate == penultimate)
-                {
-                    Some(other) if other.value >= value => {}
-                    Some(other) => {
-                        other.value = value;
-                        other.picks = state.picks.iter().chain(&combo).copied().collect();
+            }
+            let mut window: Option<(i128, Picks)> = None;
+            let mut next: Vec<State> = Vec::new();
+            for (combo, delta) in local_products(&alternatives, encoder, &local, usize::MAX) {
+                let world = facts(inputs, encoder, &combo)?;
+                for state in &states {
+                    let (scratch, output) =
+                        world.clip.layer_quantum(layer, b, n, state.x, &state.shape);
+                    let candidate = state.value + delta + i128::from(scratch) + suffix_value;
+                    if window.as_ref().is_none_or(|(value, _)| candidate > *value) {
+                        window = Some((
+                            candidate,
+                            state
+                                .picks
+                                .iter()
+                                .chain(&combo)
+                                .chain(&suffix)
+                                .copied()
+                                .collect(),
+                        ));
                     }
-                    None => next.push(State {
-                        x,
-                        penultimate,
-                        value,
-                        picks: state.picks.iter().chain(&combo).copied().collect(),
-                    }),
+                    // The guard above counts even when its native operation fails. Such a world
+                    // has no later layer, pool, heavy-stage (staged), denoise or decode outcome.
+                    let Some((x, shape)) = recover(output)? else {
+                        continue;
+                    };
+                    let penultimate = if layer + 2 == layers {
+                        Some((x, shape.clone()))
+                    } else {
+                        state.penultimate.clone()
+                    };
+                    let value = state.value + delta;
+                    let picks = state.picks.iter().chain(&combo).copied().collect();
+                    match next.iter_mut().find(|other| {
+                        other.x == x && other.shape == shape && other.penultimate == penultimate
+                    }) {
+                        Some(other) if other.value >= value => {}
+                        Some(other) => {
+                            other.value = value;
+                            other.picks = picks;
+                        }
+                        None => next.push(State {
+                            x,
+                            shape,
+                            penultimate,
+                            value,
+                            picks,
+                        }),
+                    }
+                }
+            }
+            if let Some((_, picks)) = window {
+                kernels.push(picks);
+            }
+            states = next;
+        }
+        let mut pooled: Option<(i128, Picks)> = None;
+        for state in &states {
+            let (scratch, result) = base.clip.pooled_quantum(b, n, state.x, &state.shape);
+            let candidate = state.value + i128::from(scratch);
+            if pooled.as_ref().is_none_or(|(value, _)| candidate > *value) {
+                pooled = Some((candidate, state.picks.clone()));
+            }
+            let Some(pooled_dtype) = recover(result)? else {
+                continue;
+            };
+            let penultimate = state
+                .penultimate
+                .clone()
+                .unwrap_or_else(|| (state.x, state.shape.clone()));
+            match outcomes
+                .iter_mut()
+                .find(|(p, q, _, _)| *p == penultimate && *q == pooled_dtype)
+            {
+                Some(outcome) if outcome.2 >= state.value => {}
+                Some(outcome) => {
+                    outcome.2 = state.value;
+                    outcome.3 = state.picks.clone();
+                }
+                None => {
+                    outcomes.push((penultimate, pooled_dtype, state.value, state.picks.clone()))
                 }
             }
         }
-        if let Some((_, picks)) = window {
+        if let Some((_, picks)) = pooled {
             kernels.push(picks);
         }
-        states = next;
     }
-    // The pooled kernel and every downstream window read the final state and retained bytes.
-    let mut pooled: Option<(i128, Picks)> = None;
-    let mut outcomes: Vec<(Dtype, Dtype, i128, Picks)> = Vec::new();
-    for state in &states {
-        let (scratch, pooled_dtype) = base.clip.pooled_quantum(b, n, state.x);
-        let candidate = state.value + i128::from(scratch);
-        if pooled.as_ref().is_none_or(|(value, _)| candidate > *value) {
-            pooled = Some((candidate, state.picks.clone()));
-        }
-        let penultimate = state.penultimate.unwrap_or(state.x);
-        match outcomes
-            .iter_mut()
-            .find(|(p, q, _, _)| *p == penultimate && *q == pooled_dtype)
-        {
-            Some(outcome) if outcome.2 >= state.value => {}
-            Some(outcome) => {
-                outcome.2 = state.value;
-                outcome.3 = state.picks.clone();
-            }
-            None => outcomes.push((penultimate, pooled_dtype, state.value, state.picks.clone())),
-        }
-    }
-    if let Some((_, picks)) = pooled {
-        kernels.push(picks);
-    }
-    // Pack points: the local projection's groups by product, every other group at its own
-    // additive before-resident maximum for THIS point.
+    let successful_max = outcomes
+        .iter()
+        .max_by_key(|outcome| outcome.2)
+        .map(|outcome| outcome.3.clone());
     let mut packs = Vec::new();
-    for (index, (path, _, _)) in base.points.iter().enumerate() {
-        let prefix = format!("{path}.");
-        let source = &inputs
-            .fused
-            .as_ref()
-            .expect("text aliases are fused")
-            .source;
+    for (index, _) in base.points.iter().enumerate() {
+        if fixed_failure.is_some_and(|failure| failure < index) {
+            break;
+        }
         let local = (0..encoder.groups.len())
-            .filter(|&group| {
-                source.aliases[encoder.groups[group]]
-                    .targets
-                    .iter()
-                    .any(|target| target.starts_with(&prefix))
-            })
+            .filter(|&g| owns(g, index))
             .collect::<Vec<_>>();
         let mut others = Vec::new();
-        for (group, valid) in alternatives.valid.iter().enumerate() {
+        let mut reachable = true;
+        for (group, values) in alternatives.iter().enumerate() {
             if !local.contains(&group) {
-                let (assignment, _) = best(valid, |value| value.3[index]);
-                others.push((encoder.groups[group], assignment));
+                if let Some((assignment, _)) = best(values, index, |v| v.before[index]) {
+                    others.push((encoder.groups[group], assignment));
+                } else {
+                    reachable = false;
+                    break;
+                }
             }
         }
+        if !reachable {
+            continue;
+        }
         let mut point: Option<(u64, Picks)> = None;
-        for (combo, _) in local_products(&alternatives, encoder, &local) {
-            let value = if combo.is_empty() {
-                base.points[index].1 + base.points[index].2
-            } else {
-                let world = facts(inputs, encoder, &combo)?;
-                world.points[index].1 + world.points[index].2
-            };
+        for (combo, _) in local_products(&alternatives, encoder, &local, index) {
+            let world = facts(inputs, encoder, &combo)?;
+            let value = world.points[index].1 + world.points[index].2;
             if point.as_ref().is_none_or(|(best, _)| value > *best) {
                 point = Some((value, combo.iter().chain(&others).copied().collect()));
             }
@@ -329,32 +374,39 @@ fn encoder_witnesses(
             packs.push(picks);
         }
     }
+    let with_fixed =
+        |picks: Picks| -> Picks { encoder.fixed.iter().copied().chain(picks).collect() };
     Ok(EncoderWitnesses {
-        kernels,
-        packs,
-        outcomes: outcomes.into_iter().map(|outcome| outcome.3).collect(),
-        retained_max,
-        bytes_max,
+        kernels: kernels.into_iter().map(with_fixed).collect(),
+        packs: packs.into_iter().map(with_fixed).collect(),
+        outcomes: outcomes.into_iter().map(|o| with_fixed(o.3)).collect(),
+        retained_max: retained_max.into_iter().map(with_fixed).collect(),
+        successful_max: successful_max.into_iter().map(with_fixed).collect(),
+        bytes_max: vec![with_fixed(bytes_max)],
     })
 }
 
-/// Every witness world whose whole-candidate envelope is the exact maximum over all realizable
-/// text-alias worlds. A single empty world when the source has no aliases.
-pub(super) fn witness_worlds(inputs: &Inputs, regime: &Regime) -> Result<Vec<Picks>> {
-    let Some(fused) = inputs
-        .fused
-        .as_ref()
-        .filter(|fused| !fused.source.aliases.is_empty())
-    else {
-        return Ok(vec![Vec::new()]);
-    };
-    let mut encoders = Vec::new();
+/// Text witness picks for text-phase windows, and the text worlds every downstream window reads
+/// (encoder outcome pairs at their best retained bytes, plus the retained maximum warm heavy
+/// loads read). Both are `[[]]` without text aliases.
+fn text_witnesses(inputs: &Inputs, regime: &Regime) -> Result<(Vec<Picks>, Vec<Picks>)> {
+    let fused = inputs.fused.as_ref().expect("aliases are fused");
+    if !fused
+        .source
+        .aliases
+        .iter()
+        .any(|alias| matches!(alias.component, C::ClipL | C::ClipBigG))
+    {
+        return Ok((vec![Vec::new()], vec![Vec::new()]));
+    }
+    let mut witnesses = Vec::new();
     for (component, cfg) in [
         (C::ClipL, &inputs.arch.te1),
         (C::ClipBigG, &inputs.arch.te2),
     ] {
         let mut groups = Vec::new();
         let mut layer = Vec::new();
+        let mut global = Vec::new();
         for (index, alias) in fused.source.aliases.iter().enumerate() {
             if alias.component != component {
                 continue;
@@ -364,53 +416,90 @@ pub(super) fn witness_worlds(inputs: &Inputs, regime: &Regime) -> Result<Vec<Pic
                 .iter()
                 .map(|target| layer_of(target))
                 .collect::<Option<Vec<_>>>();
-            let Some(&first) = layers.as_ref().and_then(|layers| layers.first()) else {
-                return Err(Error::Unsupported(
-                    "sdxl fused text alias outside an encoder layer remains unpriced".into(),
-                ));
-            };
-            if layers.iter().flatten().any(|&other| other != first) {
-                return Err(Error::Unsupported(
-                    "sdxl fused text alias spanning encoder layers remains unpriced".into(),
-                ));
+            match layers.as_deref() {
+                Some([first, rest @ ..]) if rest.iter().all(|other| other == first) => {
+                    groups.push(index);
+                    layer.push(*first);
+                }
+                _ => global.push(
+                    (0..alias.assignments.len())
+                        .map(|assignment| (index, assignment))
+                        .collect::<Vec<_>>(),
+                ),
             }
-            groups.push(index);
-            layer.push(first);
         }
-        encoders.push(Encoder {
-            component,
-            cfg,
-            groups,
-            layer,
-        });
+        let mut merged = EncoderWitnesses::default();
+        for fixed in super::heavy_alias::product(&global) {
+            let encoder = Encoder {
+                component,
+                cfg,
+                groups: groups.clone(),
+                layer: layer.clone(),
+                fixed,
+            };
+            let found = encoder_witnesses(inputs, regime, &encoder)?;
+            merged.kernels.extend(found.kernels);
+            merged.packs.extend(found.packs);
+            merged.outcomes.extend(found.outcomes);
+            merged.retained_max.extend(found.retained_max);
+            merged.successful_max.extend(found.successful_max);
+            merged.bytes_max.extend(found.bytes_max);
+        }
+        witnesses.push(merged);
     }
-    let witnesses = encoders
-        .iter()
-        .map(|encoder| encoder_witnesses(inputs, regime, encoder))
-        .collect::<Result<Vec<_>>>()?;
     let [te1, te2] = [&witnesses[0], &witnesses[1]];
+    let pairs = |a: &[Picks], b: &[Picks]| {
+        a.iter()
+            .flat_map(|first| {
+                b.iter()
+                    .map(move |second| first.iter().chain(second).copied().collect::<Picks>())
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut text = Vec::new();
+    text.extend(pairs(&te1.kernels, &te2.retained_max));
+    text.extend(pairs(&te1.successful_max, &te2.kernels));
+    text.extend(pairs(&te1.packs, &te2.bytes_max));
+    text.extend(pairs(&te1.retained_max, &te2.packs));
+    // Also witnesses the pre-pack source read/cast window when every path fails before a pack.
+    text.extend(pairs(&te1.bytes_max, &te2.bytes_max));
+    let mut context = pairs(&te1.outcomes, &te2.outcomes);
+    context.extend(pairs(&te1.retained_max, &te2.retained_max));
+    Ok((text, context))
+}
+
+/// Every witness world whose whole-candidate envelope is the exact maximum over all realizable
+/// text and UNet/VAE alias worlds. Text windows read heavy aliases only through additive loaded
+/// bytes; heavy windows read text aliases only through retained bytes and encoder outcomes.
+pub(super) fn witness_worlds(
+    inputs: &mut Inputs,
+    regime: &Regime,
+    configured: Option<&mlx_gen::gen_core::LoadSpec>,
+) -> Result<Vec<Picks>> {
+    if inputs
+        .fused
+        .as_ref()
+        .is_none_or(|fused| fused.source.aliases.is_empty())
+    {
+        return Ok(vec![Vec::new()]);
+    }
+    let (text, context) = text_witnesses(inputs, regime)?;
     let join = |a: &Picks, b: &Picks| a.iter().chain(b).copied().collect::<Picks>();
-    let mut worlds: Vec<Picks> = Vec::new();
-    // Text kernels: the other encoder at its retained maximum (text() is their sum).
-    worlds.extend(
-        te1.kernels
-            .iter()
-            .map(|picks| join(picks, &te2.retained_max)),
-    );
-    worlds.extend(
-        te2.kernels
-            .iter()
-            .map(|picks| join(&te1.retained_max, picks)),
-    );
-    // Encoder-1 pack points also hold encoder 2's pre-pack footprint; encoder-2 points hold
-    // encoder 1's post-pack retained bytes.
-    worlds.extend(te1.packs.iter().map(|picks| join(picks, &te2.bytes_max)));
-    worlds.extend(te2.packs.iter().map(|picks| join(&te1.retained_max, picks)));
-    // Downstream windows: every pair of encoder outcomes, each at its best retained path.
-    for first in &te1.outcomes {
-        for second in &te2.outcomes {
-            worlds.push(join(first, second));
-        }
+    let mut worlds = Vec::new();
+    let mut resident = Vec::new();
+    for picks in &context {
+        let heavy = super::heavy_alias::heavy_witnesses(inputs, regime, configured, picks)?;
+        worlds.extend(heavy.all.iter().map(|other| join(picks, other)));
+        resident.extend(heavy.resident);
+    }
+    if context.is_empty() {
+        let heavy = super::heavy_alias::heavy_witnesses(inputs, regime, configured, &Vec::new())?;
+        resident.extend(heavy.resident);
+    }
+    resident.sort();
+    resident.dedup();
+    for picks in &text {
+        worlds.extend(resident.iter().map(|other| join(picks, other)));
     }
     for world in &mut worlds {
         world.sort_unstable();
