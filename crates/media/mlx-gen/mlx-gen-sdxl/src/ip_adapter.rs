@@ -98,17 +98,6 @@ impl IpImageEncoder {
         self.resampler.forward(&penultimate)
     }
 
-    /// Header-only pricing of [`Self::tokens`]: every quantum the image encode checks (the vision
-    /// tower, then the Resampler), in order, with the guards' own formulas. Returns the shape-only
-    /// `[1, num_queries, output_dim]` tokens.
-    #[cfg(test)]
-    pub(crate) fn price_tokens(&self, out: &mut crate::quantum::Quanta) -> Result<Array> {
-        let size = self.image_size as i32;
-        let pixels = crate::quantum::shaped(&[1, size, size, 3], self.resampler.dtype())?;
-        let penultimate = self.encoder.price_penultimate(&pixels, out)?;
-        self.resampler.price_forward(&penultimate, out)
-    }
-
     /// A zeros token tensor matching [`tokens`](Self::tokens)'s shape/dtype — the CFG uncond row.
     pub fn zeros_like_tokens(&self, dtype: Dtype) -> Result<Array> {
         let n = self.resampler.num_queries;
@@ -420,37 +409,6 @@ impl Resampler {
                 LN_EPS,
             )?)
         })
-    }
-
-    /// Header-only pricing of [`Self::forward`] over the shape-only `image_features`: every
-    /// quantum it checks, in order, with the guards' own formulas. Returns the shape-only tokens.
-    #[cfg(test)]
-    pub(crate) fn price_forward(
-        &self,
-        image_features: &Array,
-        out: &mut crate::quantum::Quanta,
-    ) -> Result<Array> {
-        let b = image_features.shape()[0];
-        let nx = image_features.shape()[1];
-        let act = crate::quantum::element_bytes(&self.latents);
-        let rows = |n: i32, width: u64| {
-            mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, width])
-        };
-        out.push((
-            crate::quantum::RESAMPLER_PROJ_IN,
-            2 * rows(nx, crate::quantum::linear_out(&self.proj_in)),
-        ));
-        for (attn, ff) in &self.layers {
-            out.push((
-                crate::quantum::RESAMPLER_LAYER,
-                self.layer_scratch(attn, ff, b, nx),
-            ));
-        }
-        out.push((
-            crate::quantum::RESAMPLER_PROJ_OUT,
-            self.proj_out_scratch(b, self.latents.dtype()),
-        ));
-        crate::quantum::shaped(&[b, self.num_queries, self.output_dim()], self.dtype())
     }
 
     fn proj_out_scratch(&self, b: i32, input: Dtype) -> u64 {

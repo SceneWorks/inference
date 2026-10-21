@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "963007df055aa6ae61d1818eca8021be170855486d70d02ac4ed1c89bb37a620",
+  "rust_proof_closure_sha256": "8c35ccc87128586a980506a39510f95febbf6370ca4b7243464a93dad9bec908",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -376,7 +376,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
-      "sha256": "04426a4aecb8a3934db7fcd2e52c1833ea971e392221554ff67c263492ad707d"
+      "sha256": "ed5ccc8a142733eced0f022b65b556aded25d15e9e19e623fac416cb0e654a53"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
@@ -480,7 +480,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
-      "sha256": "90efda518311d7f251216c579ab90125519b2a971c0e48bd704c3931fd21f21b"
+      "sha256": "2dfb42f7a051b1afff5f1c2b3b61b3971d13a3ee693d47ce3ba61da4d0023d40"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/Cargo.toml",
@@ -1430,8 +1430,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "50fef35b43bf96312cd3dc38f23864a33cadfa73c37334c173231bd750d6c2b9",
-    "classification_sha256": "a2f2a3c15c5f4dd0913abb380816c04971f9877c863240b0fde53e3566117c63",
+    "inventory_sha256": "81595b2dae3dac671bd59873fccab7aee3db1852eb819e7a5547a7210cb803b5",
+    "classification_sha256": "afd0c4fd5151402ae9a95795ec006cbeab299342e70150681f94cb9ad2ac6893",
     "selected_Rust_FQNs": 92,
     "HOST_logical": 79,
     "HOST_expected_PASS_rows": 80,
