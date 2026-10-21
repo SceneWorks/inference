@@ -1430,8 +1430,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "c52c084738c6f8e7acd881f08ddb4c39d7b7c3bd426bb2abec39f18a57f2873f",
-    "classification_sha256": "afd0c4fd5151402ae9a95795ec006cbeab299342e70150681f94cb9ad2ac6893",
+    "inventory_sha256": "778708de51b1b7285364b7cc78afc642de45b2a62fd9de7d1a41b2aa44f9036e",
+    "classification_sha256": "239bb7055e5ec6780bf1a8f215ea2019a32b697a7db7c91d6b5f4bf546bd2450",
     "selected_Rust_FQNs": 92,
     "HOST_logical": 79,
     "HOST_expected_PASS_rows": 80,
