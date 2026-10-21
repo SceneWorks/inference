@@ -92,7 +92,7 @@ fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow 
         ]
     };
     AnchorRow {
-        key: evidence_key(registry, c, DEVICE).unwrap(),
+        key: crate::source_work::fixture_key(registry, c, DEVICE),
         anchor_kind: AnchorKind::Optimized,
         selection: AnchorSelection::from_parts(
             c.context.selection.strategy,
@@ -510,7 +510,7 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
     );
     let resident_row = |demand_mib: u64| {
         evidence::fixture::completed(
-            evidence_key(&registry, &res, DEVICE).unwrap(),
+            crate::source_work::fixture_key(&registry, &res, DEVICE),
             AnchorKind::Resident,
             AnchorSelection::from_parts(
                 res.context.selection.strategy,

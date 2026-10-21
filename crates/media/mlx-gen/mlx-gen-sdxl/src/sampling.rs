@@ -41,6 +41,12 @@ impl SamplingRoute {
     }
 }
 
+mod source_context;
+pub use source_context::{
+    ControlSources, IndexedImageSourceFacts, SamplingSourceFacts, SamplingSourceFactsSeed,
+    SamplingSourceView, SamplingTextSourceFacts, SourceRequestBudget,
+};
+
 /// Validated, versioned replay of the controls SDXL actually consumes. Private fields prevent
 /// accepting caller-claimed factory/class identities. JSON is exposed through `to_value` /
 /// `from_value` so consumers can embed this in serde evidence without a generic-crate SDXL edge.
@@ -62,12 +68,83 @@ pub struct SamplingRecipe {
 }
 
 /// Payload-free conditioning roles supplied by a capture case or an actual request projection.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct SamplingWorkFacts {
     /// TRUE Conditioning::Reference roles, NOT MemoryGeometry's aggregate image-carrier count.
     pub reference_count: usize,
     pub mask_count: usize,
     pub control_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_image: Option<ReferenceImageFacts>,
+}
+
+/// Exact unvalidated source facts from the ACTUAL single Reference. A digest binds content but
+/// cannot recover these fields; never substitute output/CLIP/crop dimensions or width*height*3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceImageFacts {
+    pub width: u32,
+    pub height: u32,
+    pub buffer_bytes: u64,
+}
+impl ReferenceImageFacts {
+    pub fn from_image(image: &mlx_gen::media::Image) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            buffer_bytes: image.pixels.len() as u64,
+        }
+    }
+}
+
+impl SamplingWorkFacts {
+    /// Bounded scalar projection only. Keep all existing native validation chronology: copying
+    /// malformed dimensions/span here does not validate, resize, allocate media or discard errors.
+    pub fn from_request(request: &GenerationRequest) -> Self {
+        Self {
+            reference_count: request
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, Conditioning::Reference { .. }))
+                .count(),
+            mask_count: request
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, Conditioning::Mask { .. }))
+                .count(),
+            control_count: request
+                .conditioning
+                .iter()
+                .filter(|c| matches!(c, Conditioning::Control { .. }))
+                .count(),
+            reference_image: request.conditioning.iter().find_map(|c| match c {
+                Conditioning::Reference { image, .. } => {
+                    Some(ReferenceImageFacts::from_image(image))
+                }
+                _ => None,
+            }),
+        }
+    }
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("scalar work facts serialize")
+    }
+    /// Separate capture work sidecar, not a change to the sampling recipe/version or generic DTO.
+    pub fn from_value(value: Value) -> Result<Self> {
+        serde_json::from_value(value)
+            .map_err(|error| invalid(format!("invalid conditioning work facts: {error}")))
+    }
+    /// Used by replay at its existing source-binding boundary; never replace the full content SHA.
+    pub fn validate_actual(&self, request: &GenerationRequest) -> Result<()> {
+        if *self != Self::from_request(request) {
+            return Err(invalid(
+                "captured conditioning work facts differ from actual request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -90,23 +167,7 @@ impl ResolvedSampling {
             _ => None,
         });
         let reference_strength = references.next().flatten();
-        let work = SamplingWorkFacts {
-            reference_count: req
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, Conditioning::Reference { .. }))
-                .count(),
-            mask_count: req
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, Conditioning::Mask { .. }))
-                .count(),
-            control_count: req
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, Conditioning::Control { .. }))
-                .count(),
-        };
+        let work = SamplingWorkFacts::from_request(req);
         Self::resolve_controls(
             req.sampler.as_deref(),
             req.scheduler.as_deref(),

@@ -33,6 +33,7 @@
 //! Not priced (a typed refusal, never a silent under-price): adapter (LoRA/LoKr/LoHa) installs, the
 //! PiD decoder, a fused single-file (LDM) source, and a sealed geometry decode policy.
 
+use mlx_gen::adapters::facts::TensorFacts as PriceTensor;
 use mlx_gen::gen_core::{CfgBatching, GenerationMemory, LoadSpec, MemoryMode, WeightsSource};
 use mlx_gen::ios_pricing::{
     IosAnchorCandidate, IosAnchorWitness, IosMemoryCoordinate, IosMemoryDomain, IosPhase,
@@ -40,7 +41,6 @@ use mlx_gen::ios_pricing::{
 };
 use mlx_gen::{Error, Result};
 use mlx_rs::Dtype;
-use mlx_gen::adapters::facts::TensorFacts as PriceTensor;
 use std::path::{Path, PathBuf};
 
 use crate::config::{ClipTextConfig, UNetConfig, VaeConfig};
@@ -48,7 +48,9 @@ use crate::ip_adapter::{IpImageEncoder, ResamplerConfig};
 use crate::quantum::{self as q, Backend, Quanta};
 use crate::sampling::{ResolvedSampling, SamplingRecipe, SamplingRoute, SamplingWorkFacts};
 use crate::text_encoder::ClipPrice;
-use crate::unet::pricing::{UNetFacts, ControlFacts, FactView, tensor as price_tensor, tensor_bytes as price_bytes};
+use crate::unet::pricing::{
+    tensor as price_tensor, tensor_bytes as price_bytes, ControlFacts, FactView, UNetFacts,
+};
 use crate::vae::pricing::AutoencoderFacts;
 use crate::vision_encoder::VisionConfig;
 
@@ -335,6 +337,21 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
 /// `work` records original conditioning roles, before the provider's init/IP interpretation.
 /// A live generation/transform/depth context is rejected rather than silently overridden.
 /// Like [`ios_pricing`], this is a raw counted ledger, not physical/domain certification.
+/// Full source-context replay seam. Transport coherence is checked here; this does NOT certify
+/// tokenizer/fixed-vocab host allocations or source-request layouts as physical process growth.
+/// Native preprocessing/constructor validation remains at its existing runtime chronology.
+pub fn ios_pricing_with_source(
+    req: &IosPricingRequest<'_>,
+    recipe: &SamplingRecipe,
+    source: &crate::sampling::SamplingSourceFacts,
+) -> Result<IosPricing> {
+    let regime = Regime::from_recipe(req, recipe, source.work())?;
+    source.validate_roles()?;
+    // Return the existing RAW COUNTED NATIVE ledger only. Complete source facts are transported
+    // here, not converted to an invented tokenizer/image-host or physical-process certificate.
+    price_regime(req, &regime, Backend::Metal)
+}
+
 pub fn ios_pricing_with_recipe(
     req: &IosPricingRequest<'_>,
     recipe: &SamplingRecipe,
@@ -856,23 +873,7 @@ impl Regime {
                 "sdxl pricing has an unclassified conditioning carrier".into(),
             ));
         }
-        let work = SamplingWorkFacts {
-            reference_count: generation
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, mlx_gen::Conditioning::Reference { .. }))
-                .count(),
-            mask_count: generation
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, mlx_gen::Conditioning::Mask { .. }))
-                .count(),
-            control_count: generation
-                .conditioning
-                .iter()
-                .filter(|c| matches!(c, mlx_gen::Conditioning::Control { .. }))
-                .count(),
-        };
+        let work = SamplingWorkFacts::from_request(generation);
         if work
             .reference_count
             .checked_add(work.mask_count)
@@ -1195,15 +1196,25 @@ fn collect_pack_effect(
     let mut work = linear.clone();
     if work.bits.is_none() {
         let scratch = work.pack(bits)?;
-        points.push(LoadPackPoint { before_resident: *retained, scratch });
+        points.push(LoadPackPoint {
+            before_resident: *retained,
+            scratch,
+        });
         // Only the base changes. Residual factors/deltas stay in their original owner set.
-        let base_outputs = work.weights.iter().chain(work.bias.iter()).fold(0u64, |n, a|
-            n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(a.bytes())));
+        let base_outputs = work
+            .weights
+            .iter()
+            .chain(work.bias.iter())
+            .fold(0u64, |n, a| {
+                n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(a.bytes()))
+            });
         *retained = retained.saturating_add(base_outputs);
         *outputs = outputs.saturating_add(base_outputs);
     }
     if effects.0.insert(path.to_owned(), work).is_some() {
-        return Err(Error::Msg(format!("sdxl duplicate actual pack-walk target: {path}")));
+        return Err(Error::Msg(format!(
+            "sdxl duplicate actual pack-walk target: {path}"
+        )));
     }
     Ok(())
 }
@@ -1260,9 +1271,14 @@ fn control_tables(cfg: &crate::config::UNetConfig) -> u64 {
 /// Only the premature heavy metadata pack is deferred. Text finalization, IP construction,
 /// native constructors and all final post-install pack validation keep their actual order.
 pub(crate) fn initial_heavy_pack(
-    configured: Option<&LoadSpec>, pack: impl FnOnce() -> Result<()>,
+    configured: Option<&LoadSpec>,
+    pack: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    if configured.is_some_and(|spec| !spec.adapters.is_empty()) { Ok(()) } else { pack() }
+    if configured.is_some_and(|spec| !spec.adapters.is_empty()) {
+        Ok(())
+    } else {
+        pack()
+    }
 }
 
 impl Priced {
@@ -1291,16 +1307,8 @@ impl Priced {
             footprint(&one(&inputs.te2), dtype, |_| true)?,
         ];
         let te_pack = [
-            crate::text_encoder::text_pack_facts(
-                &te1_headers,
-                &arch.te1,
-                inputs.text_quant_bits,
-            )?,
-            crate::text_encoder::text_pack_facts(
-                &te2_headers,
-                &arch.te2,
-                inputs.text_quant_bits,
-            )?,
+            crate::text_encoder::text_pack_facts(&te1_headers, &arch.te1, inputs.text_quant_bits)?,
+            crate::text_encoder::text_pack_facts(&te2_headers, &arch.te2, inputs.text_quant_bits)?,
         ];
         if let Some(bits) = inputs.text_quant_bits {
             // Both header constructors precede the actual pair's ordered base-only metadata pack.
@@ -1349,7 +1357,9 @@ impl Priced {
             let ip_w = crate::loader::lazy_weights(&one(ip_file), dtype, false)?;
             let resampler =
                 crate::ip_adapter::Resampler::from_weights(&ip_w, "image_proj", &arch.resampler)?;
-            unet.install_ip_adapter(crate::unet::pricing::ip_pairs_from_headers(&headers(ip_file)?)?)?;
+            unet.install_ip_adapter(crate::unet::pricing::ip_pairs_from_headers(&headers(
+                ip_file,
+            )?)?)?;
             ip = Some(IpImageEncoder::with_image_size(
                 encoder,
                 resampler,
@@ -1360,33 +1370,58 @@ impl Priced {
             ip_resampler_bytes =
                 footprint(&one(ip_file), dtype, |name| name.starts_with("image_proj."))?.resident;
             // Raw IP source owners remain beside later packed base outputs; no release credit.
-            ip_kv_bytes = footprint(&one(ip_file), dtype,
-                |name| name.starts_with("ip_adapter."))?.resident;
+            ip_kv_bytes =
+                footprint(&one(ip_file), dtype, |name| name.starts_with("ip_adapter."))?.resident;
         }
         let mut unet_effects = None;
         let mut control_effects = Vec::new();
         let mut unet_retained = unet_bytes.resident;
         if let Some(bits) = inputs.quant_bits {
             initial_heavy_pack(configured, || {
-                let mut retained = unet_bytes.resident.saturating_add(vae_bytes.resident)
-                    .saturating_add(control_bytes.iter().map(|(load, _)| load.resident).sum::<u64>())
-                    .saturating_add(ip_encoder_bytes.resident).saturating_add(ip_adapter_bytes.resident);
+                let mut retained = unet_bytes
+                    .resident
+                    .saturating_add(vae_bytes.resident)
+                    .saturating_add(
+                        control_bytes
+                            .iter()
+                            .map(|(load, _)| load.resident)
+                            .sum::<u64>(),
+                    )
+                    .saturating_add(ip_encoder_bytes.resident)
+                    .saturating_add(ip_adapter_bytes.resident);
                 let mut effects = q::LinearEffects::default();
                 let mut outputs = 0;
                 // This is the ACTUAL ordered module walk, with a pure metadata visitor. The borrowed
                 // constructor facts stay untouched: no quantize_linear, Array creation, eval or read.
-                unet.quantize_using(bits, &mut |path, linear, bits|
-                    collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
-                        &mut load_quantize, &mut effects))?;
+                unet.quantize_using(bits, &mut |path, linear, bits| {
+                    collect_pack_effect(
+                        path,
+                        linear,
+                        bits,
+                        &mut retained,
+                        &mut outputs,
+                        &mut load_quantize,
+                        &mut effects,
+                    )
+                })?;
                 unet_retained = unet_retained.saturating_add(outputs);
                 unet_effects = Some(effects);
                 for (index, control) in controls.iter_mut().enumerate() {
                     let mut effects = q::LinearEffects::default();
                     let mut outputs = 0;
-                    control.quantize_using(bits, &mut |path, linear, bits|
-                        collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
-                            &mut load_quantize, &mut effects))?;
-                    control_bytes[index].1 = control_bytes[index].0.resident.saturating_add(outputs);
+                    control.quantize_using(bits, &mut |path, linear, bits| {
+                        collect_pack_effect(
+                            path,
+                            linear,
+                            bits,
+                            &mut retained,
+                            &mut outputs,
+                            &mut load_quantize,
+                            &mut effects,
+                        )
+                    })?;
+                    control_bytes[index].1 =
+                        control_bytes[index].0.resident.saturating_add(outputs);
                     control_effects.push(Some(effects));
                 }
                 Ok(())
@@ -1427,7 +1462,11 @@ impl Priced {
     /// pack walk, then through the whole forward before any envelope is taken. The native pricing
     /// model facts are never adapted/packed to discover values. Remaining IP graphs stay separate.
     pub(crate) fn price_configured(
-        &mut self, spec: &LoadSpec, unet_file: &Path, bits: Option<i32>, regime: &Regime,
+        &mut self,
+        spec: &LoadSpec,
+        unet_file: &Path,
+        bits: Option<i32>,
+        regime: &Regime,
     ) -> Result<IosPricing> {
         self.price_configured_observing(spec, unet_file, bits, regime, |_, _, _, _| Ok(()))
     }
@@ -1436,37 +1475,75 @@ impl Priced {
     /// whole forward price, before state restoration/enveloping, and cannot change target facts or
     /// retain native owners. Production supplies a no-op; CPU fixtures query native owners apart.
     pub(crate) fn price_configured_observing(
-        &mut self, spec: &LoadSpec, unet_file: &Path, bits: Option<i32>, regime: &Regime,
-        mut observe: impl FnMut(&crate::adapters::AdapterOutcome<'_>, &Self, &AdapterLoadLedger, &IosPricing) -> Result<()>,
+        &mut self,
+        spec: &LoadSpec,
+        unet_file: &Path,
+        bits: Option<i32>,
+        regime: &Regime,
+        mut observe: impl FnMut(
+            &crate::adapters::AdapterOutcome<'_>,
+            &Self,
+            &AdapterLoadLedger,
+            &IosPricing,
+        ) -> Result<()>,
     ) -> Result<IosPricing> {
-        if spec.adapters.is_empty() { return Ok(self.price(regime)?.0); }
+        if spec.adapters.is_empty() {
+            return Ok(self.price(regime)?.0);
+        }
         let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(unet_file)
             .map_err(|e| Error::Msg(e.to_string()))?;
         let config = self.arch.unet.clone();
-        let mut envelope: std::collections::BTreeMap<(IosPhase, Option<String>, String, String, usize), IosWindowPrice> =
-            std::collections::BTreeMap::new();
+        let mut envelope: std::collections::BTreeMap<
+            (IosPhase, Option<String>, String, String, usize),
+            IosWindowPrice,
+        > = std::collections::BTreeMap::new();
         let mut accepted = false;
         let mut first_refusal = None;
         let mut absent = None;
         crate::adapters::visit_configured_adapter_outcomes(spec, &headers, &config, |outcome| {
-            let ledger = AdapterLoadLedger::from_work_checked(outcome.work, self.unet_bytes.resident)?;
+            let ledger =
+                AdapterLoadLedger::from_work_checked(outcome.work, self.unet_bytes.resident)?;
             let pricing = if let Some(error) = &outcome.refusal {
                 first_refusal.get_or_insert_with(|| error.clone());
                 // Dir installs precede the VAE/control/IP loads. A source refusal never fabricates
                 // those loads, a successful target result, a post-install pack or a forward branch.
                 let warm = if regime.staged { 0 } else { self.text() };
                 let mut prefix = IosPricing::default();
-                prefix.take(IosPhase::Load, 0, self.te_bytes[0].floor, q::TEXT_ENCODER_1_LOAD);
-                prefix.take(IosPhase::Load, self.te_bytes[0].resident, self.te_bytes[1].floor, q::TEXT_ENCODER_2_LOAD);
+                prefix.take(
+                    IosPhase::Load,
+                    0,
+                    self.te_bytes[0].floor,
+                    q::TEXT_ENCODER_1_LOAD,
+                );
+                prefix.take(
+                    IosPhase::Load,
+                    self.te_bytes[0].resident,
+                    self.te_bytes[1].floor,
+                    q::TEXT_ENCODER_2_LOAD,
+                );
                 for (encoder, facts) in self.te_pack.iter().enumerate() {
-                    let other = if encoder == 0 { self.te_bytes[1].resident } else { self.te_pack[0].retained };
+                    let other = if encoder == 0 {
+                        self.te_bytes[1].resident
+                    } else {
+                        self.te_pack[0].retained
+                    };
                     for point in &facts.points {
-                        prefix.take(IosPhase::Load, other.saturating_add(point.before_resident), point.scratch, q::LOAD_QUANTIZE);
+                        prefix.take(
+                            IosPhase::Load,
+                            other.saturating_add(point.before_resident),
+                            point.scratch,
+                            q::LOAD_QUANTIZE,
+                        );
                     }
                 }
                 prefix.take(IosPhase::Load, warm, self.unet_bytes.floor, q::UNET_LOAD);
                 for point in ledger.quanta {
-                    prefix.take(point.phase, warm.saturating_add(point.resident), point.scratch, point.label);
+                    prefix.take(
+                        point.phase,
+                        warm.saturating_add(point.resident),
+                        point.scratch,
+                        point.label,
+                    );
                 }
                 prefix
             } else {
@@ -1475,47 +1552,83 @@ impl Priced {
                 let saved_packs = std::mem::take(&mut self.load_quantize);
                 let saved_adapter = std::mem::replace(&mut self.adapter_load, ledger);
                 let saved_retained = self.unet_retained;
-                let saved_control_resident: Vec<_> = self.control_bytes.iter().map(|(_, r)| *r).collect();
+                let saved_control_resident: Vec<_> =
+                    self.control_bytes.iter().map(|(_, r)| *r).collect();
                 let selected = (|| -> Result<IosPricing> {
                     use crate::adapters::{AdapterInstallStorage as S, AdapterWork};
                     let mut effects = q::LinearEffects::default();
-                    self.unet.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
-                        if effects.0.insert(path.to_owned(), linear.clone()).is_some() {
-                            return Err(Error::Msg(format!("sdxl duplicate adapter base target: {path}")));
-                        }
-                        Ok(())
-                    })?;
+                    self.unet
+                        .quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                            if effects.0.insert(path.to_owned(), linear.clone()).is_some() {
+                                return Err(Error::Msg(format!(
+                                    "sdxl duplicate adapter base target: {path}"
+                                )));
+                            }
+                            Ok(())
+                        })?;
                     for item in outcome.work {
-                        let AdapterWork::Install(install) = item else { continue; };
+                        let AdapterWork::Install(install) = item else {
+                            continue;
+                        };
                         let path: Vec<_> = install.target.split('.').collect();
                         if install.storage == S::DenseConv {
-                            self.unet.adaptable_conv_mut(&path).ok_or_else(|| Error::Msg(
-                                format!("sdxl missing actual selected convolution: {}", install.target)))?;
-                            let weight = install.installed.first().ok_or_else(|| Error::Msg(
-                                "sdxl selected convolution lacks its declared OHWI result".into()))?;
+                            self.unet.adaptable_conv_mut(&path).ok_or_else(|| {
+                                Error::Msg(format!(
+                                    "sdxl missing actual selected convolution: {}",
+                                    install.target
+                                ))
+                            })?;
+                            let weight = install.installed.first().ok_or_else(|| {
+                                Error::Msg(
+                                    "sdxl selected convolution lacks its declared OHWI result"
+                                        .into(),
+                                )
+                            })?;
                             effects.1.insert(install.target.clone(), weight.clone());
                         } else {
                             if !effects.0.contains_key(&install.target) {
                                 // Dense shortcut is deliberately absent from the base pack walk.
-                                let native = self.unet.adaptable_mut(&path).ok_or_else(|| Error::Msg(
-                                    format!("sdxl missing actual selected projection: {}", install.target)))?;
+                                let native = self.unet.adaptable_mut(&path).ok_or_else(|| {
+                                    Error::Msg(format!(
+                                        "sdxl missing actual selected projection: {}",
+                                        install.target
+                                    ))
+                                })?;
                                 effects.0.insert(install.target.clone(), native.clone());
                             }
-                            effects.0.get_mut(&install.target).expect("inserted selected target").install(install)?;
+                            effects
+                                .0
+                                .get_mut(&install.target)
+                                .expect("inserted selected target")
+                                .install(install)?;
                         }
                     }
                     let adapter_retained = self.adapter_load.retained_upper();
                     self.unet_retained = self.unet_bytes.resident.saturating_add(adapter_retained);
-                    let mut retained = self.unet_retained.saturating_add(self.vae_bytes.resident)
-                        .saturating_add(self.control_bytes.iter().map(|(load, _)| load.resident).sum::<u64>())
-                        .saturating_add(self.ip_encoder_bytes.resident).saturating_add(self.ip_adapter_bytes.resident);
+                    let mut retained = self
+                        .unet_retained
+                        .saturating_add(self.vae_bytes.resident)
+                        .saturating_add(
+                            self.control_bytes
+                                .iter()
+                                .map(|(load, _)| load.resident)
+                                .sum::<u64>(),
+                        )
+                        .saturating_add(self.ip_encoder_bytes.resident)
+                        .saturating_add(self.ip_adapter_bytes.resident);
                     if let Some(bits) = bits {
                         self.unet.quantize_using(bits, &mut |path, _, bits| {
-                            let projection = effects.0.get_mut(path).ok_or_else(|| Error::Msg(
-                                format!("sdxl selected world missing ordered pack target: {path}")))?;
+                            let projection = effects.0.get_mut(path).ok_or_else(|| {
+                                Error::Msg(format!(
+                                    "sdxl selected world missing ordered pack target: {path}"
+                                ))
+                            })?;
                             if projection.bits.is_none() {
                                 let scratch = projection.pack(bits)?;
-                                self.load_quantize.push(LoadPackPoint { before_resident: retained, scratch });
+                                self.load_quantize.push(LoadPackPoint {
+                                    before_resident: retained,
+                                    scratch,
+                                });
                                 // Whole declared projection, including unchanged residual owners,
                                 // remains an upper. No upper subtraction or backing release credit.
                                 let outputs = projection.declared_bytes();
@@ -1527,13 +1640,25 @@ impl Priced {
                         for (index, control) in self.controls.iter_mut().enumerate() {
                             let mut control_effects = q::LinearEffects::default();
                             let mut outputs = 0;
-                            control.quantize_using(bits, &mut |path, linear, bits|
-                                collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
-                                    &mut self.load_quantize, &mut control_effects))?;
-                            self.control_bytes[index].1 = self.control_bytes[index].0.resident.saturating_add(outputs);
+                            control.quantize_using(bits, &mut |path, linear, bits| {
+                                collect_pack_effect(
+                                    path,
+                                    linear,
+                                    bits,
+                                    &mut retained,
+                                    &mut outputs,
+                                    &mut self.load_quantize,
+                                    &mut control_effects,
+                                )
+                            })?;
+                            self.control_bytes[index].1 =
+                                self.control_bytes[index].0.resident.saturating_add(outputs);
                             self.control_effects.push(Some(control_effects));
                         }
-                    } else { self.control_effects.resize_with(self.controls.len(), || None); }
+                    } else {
+                        self.control_effects
+                            .resize_with(self.controls.len(), || None);
+                    }
                     self.unet_effects = Some(effects);
                     let candidate = self.price(regime)?.0;
                     observe(&outcome, self, &self.adapter_load, &candidate)?;
@@ -1544,7 +1669,11 @@ impl Priced {
                 self.load_quantize = saved_packs;
                 self.adapter_load = saved_adapter;
                 self.unet_retained = saved_retained;
-                for ((_, resident), saved) in self.control_bytes.iter_mut().zip(saved_control_resident) { *resident = saved; }
+                for ((_, resident), saved) in
+                    self.control_bytes.iter_mut().zip(saved_control_resident)
+                {
+                    *resident = saved;
+                }
                 let selected = selected?;
                 accepted = true;
                 absent.get_or_insert_with(|| selected.absent_phases.clone());
@@ -1554,22 +1683,37 @@ impl Priced {
             // worlds. Ordinals distinguish repeated same-label epochs without retaining world lists.
             let mut ordinals = std::collections::BTreeMap::new();
             for window in pricing.windows {
-                let identity = (window.phase, window.class.clone(), window.label.clone(), window.owner_domain.clone());
+                let identity = (
+                    window.phase,
+                    window.class.clone(),
+                    window.label.clone(),
+                    window.owner_domain.clone(),
+                );
                 let ordinal = ordinals.entry(identity.clone()).or_insert(0usize);
                 let key = (identity.0, identity.1, identity.2, identity.3, *ordinal);
                 *ordinal += 1;
                 match envelope.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(window); }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(window);
+                    }
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        if window.logical_peak_bytes() > entry.get().logical_peak_bytes() { entry.insert(window); }
+                        if window.logical_peak_bytes() > entry.get().logical_peak_bytes() {
+                            entry.insert(window);
+                        }
                     }
                 }
             }
             Ok(())
         })?;
-        if !accepted { return Err(Error::Msg(first_refusal.unwrap_or_else(|| "sdxl no complete adapter world".into()))); }
+        if !accepted {
+            return Err(Error::Msg(
+                first_refusal.unwrap_or_else(|| "sdxl no complete adapter world".into()),
+            ));
+        }
         let mut pricing = IosPricing::default();
-        for (_, window) in envelope { pricing.take_window(window); }
+        for (_, window) in envelope {
+            pricing.take_window(window);
+        }
         pricing.absent_phases = absent.unwrap_or_default();
         Ok(pricing)
     }
@@ -1657,8 +1801,11 @@ impl Priced {
         );
         loaded += self.unet_bytes.resident;
         for point in &self.adapter_load.quanta {
-            take(IosPhase::Load, warm_text.saturating_add(point.resident),
-                vec![(point.label, point.scratch)]);
+            take(
+                IosPhase::Load,
+                warm_text.saturating_add(point.resident),
+                vec![(point.label, point.scratch)],
+            );
         }
         loaded = loaded.saturating_add(self.adapter_load.retained_upper());
         let vae_label = if self.vae.dtype() == Dtype::Float32 {
@@ -1695,8 +1842,11 @@ impl Priced {
         }
 
         for point in &self.load_quantize {
-            take(IosPhase::Load, warm_text.saturating_add(point.before_resident),
-                vec![(q::LOAD_QUANTIZE, point.scratch)]);
+            take(
+                IosPhase::Load,
+                warm_text.saturating_add(point.before_resident),
+                vec![(q::LOAD_QUANTIZE, point.scratch)],
+            );
         }
         let heavy = self.heavy(false);
         let (h, w) = (regime.height, regime.width);
@@ -1980,7 +2130,9 @@ impl Priced {
                         + cond_embeds.iter().map(price_bytes).sum::<u64>()
                         + ip_tokens.as_ref().map_or(0, price_bytes),
                     scratch_bytes: q::sampler_step_bytes_metadata(
-                        (lh as u64) * (lw as u64) * 4, regime.route == Route::Mask),
+                        (lh as u64) * (lw as u64) * 4,
+                        regime.route == Route::Mask,
+                    ),
                     basis: Some(IosWorkBasis {
                         forward_rows: 1,
                         token_count: regime.context_tokens as u64,
@@ -2190,7 +2342,10 @@ impl Priced {
         let decoded = self
             .vae
             .price_decode(&latents, regime.tiling.as_ref(), &mut quanta)?;
-        quanta.push((q::DECODED_TO_IMAGE, q::decoded_to_image_bytes_from_metadata(decoded.elements())));
+        quanta.push((
+            q::DECODED_TO_IMAGE,
+            q::decoded_to_image_bytes_from_metadata(decoded.elements()),
+        ));
         let decode_resident = if staged {
             self.vae_bytes.resident
         } else {
@@ -2266,7 +2421,8 @@ impl Priced {
         let mut owners = Vec::new();
         let (mut raw_down, mut raw_mid, mut selected_rows) = (0u64, 0u64, 0u64);
         if regime.route == Route::Control {
-            for (branch_index, (branch, embed)) in self.controls.iter().zip(cond_embeds).enumerate() {
+            for (branch_index, (branch, embed)) in self.controls.iter().zip(cond_embeds).enumerate()
+            {
                 let s = embed.shape();
                 let row = price_tensor(&[batch, s[1], s[2], s[3]], embed.dtype())?;
                 let selected = if plan.cfg_row.is_some() && s[0] == 2 {
@@ -2275,7 +2431,8 @@ impl Priced {
                     0
                 };
                 let first_owner = owners.len();
-                let effects = self.control_effects[branch_index].as_ref()
+                let effects = self.control_effects[branch_index]
+                    .as_ref()
                     .map_or_else(q::EffectScope::native, q::EffectScope::root);
                 let (down, mid) = branch.price_forward_with_effects(
                     &x,
@@ -2333,10 +2490,20 @@ impl Priced {
             (down.iter().map(price_bytes).sum::<u64>(), price_bytes(mid))
         });
         let unet_first = quanta.len();
-        let effects = self.unet_effects.as_ref().map_or_else(q::EffectScope::native, q::EffectScope::root);
+        let effects = self
+            .unet_effects
+            .as_ref()
+            .map_or_else(q::EffectScope::native, q::EffectScope::root);
         let eps = self.unet.price_forward_with_effects(
-            &x, encoder_x, text_emb, control.as_ref(), ip_tokens.map(|t| (t, 1.0)),
-            plan, pending_control, quanta, &effects,
+            &x,
+            encoder_x,
+            text_emb,
+            control.as_ref(),
+            ip_tokens.map(|t| (t, 1.0)),
+            plan,
+            pending_control,
+            quanta,
+            &effects,
         )?;
         let (mut down_complete, mut mid_complete) = (false, false);
         for (label, _) in &quanta[unet_first..] {
@@ -2393,15 +2560,21 @@ pub(crate) struct AdapterLoadLedger {
 impl AdapterLoadLedger {
     #[cfg(test)]
     pub(crate) fn from_work(work: &[crate::adapters::AdapterWork], resident: u64) -> Self {
-        Self::from_work_checked(work, resident).expect("actual adapter producer dispatch is coherent")
+        Self::from_work_checked(work, resident)
+            .expect("actual adapter producer dispatch is coherent")
     }
 
     pub(crate) fn retained_upper(&self) -> u64 {
-        self.raw_parent_upper.saturating_add(self.preparation_upper).saturating_add(self.installed_upper)
+        self.raw_parent_upper
+            .saturating_add(self.preparation_upper)
+            .saturating_add(self.installed_upper)
     }
 
-    pub(crate) fn from_work_checked(work: &[crate::adapters::AdapterWork], resident: u64) -> Result<Self> {
-        use crate::adapters::{AdapterWork, AdapterInstallStorage as S, InstallKind as K};
+    pub(crate) fn from_work_checked(
+        work: &[crate::adapters::AdapterWork],
+        resident: u64,
+    ) -> Result<Self> {
+        use crate::adapters::{AdapterInstallStorage as S, AdapterWork, InstallKind as K};
         let mut result = Self::default();
         let mut selected = None;
         let mut pending: Option<&crate::adapters::AdapterInstallWork> = None;
@@ -2418,42 +2591,76 @@ impl AdapterLoadLedger {
                     });
                     result.raw_parent_upper = result.raw_parent_upper.saturating_add(raw);
                 }
-                AdapterWork::Selected(kind) => { selected = Some(*kind); }
+                AdapterWork::Selected(kind) => {
+                    selected = Some(*kind);
+                }
                 AdapterWork::AlphaRead { key, scratch } => {
                     if selected.is_none() || key.is_empty() {
-                        return Err(Error::Msg("sdxl alpha work lacks actual selected parser/key".into()));
+                        return Err(Error::Msg(
+                            "sdxl alpha work lacks actual selected parser/key".into(),
+                        ));
                     }
-                    result.quanta.push(PricedQuantum { phase: IosPhase::Load, resident: current,
-                        label: q::ADAPTER_LOAD, scratch: *scratch });
+                    result.quanta.push(PricedQuantum {
+                        phase: IosPhase::Load,
+                        resident: current,
+                        label: q::ADAPTER_LOAD,
+                        scratch: *scratch,
+                    });
                 }
                 AdapterWork::Preparation(parents) => {
-                    result.preparation_upper = parents.iter().fold(result.preparation_upper,
-                        |n, p| n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(p.bytes())));
-                    result.quanta.push(PricedQuantum { phase: IosPhase::Load,
+                    result.preparation_upper =
+                        parents.iter().fold(result.preparation_upper, |n, p| {
+                            n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(p.bytes()))
+                        });
+                    result.quanta.push(PricedQuantum {
+                        phase: IosPhase::Load,
                         resident: resident.saturating_add(result.retained_upper()),
-                        label: q::ADAPTER_MERGE, scratch: 0 });
+                        label: q::ADAPTER_MERGE,
+                        scratch: 0,
+                    });
                 }
                 AdapterWork::GuardAttempt(install) | AdapterWork::Install(install) => {
                     let allowed = match selected {
-                        Some(K::Lora) => matches!(install.storage, S::DenseLinear | S::DenseConv | S::PackedLora | S::PackedDelta),
-                        Some(K::Lokr) => matches!(install.storage, S::DenseLinear | S::StructuredLokr),
-                        Some(K::ThirdPartyLokr | K::ThirdPartyLoha) => matches!(install.storage, S::DenseLinear | S::PackedDelta),
-                        None => return Err(Error::Msg("sdxl install has no selected file dispatch".into())),
+                        Some(K::Lora) => matches!(
+                            install.storage,
+                            S::DenseLinear | S::DenseConv | S::PackedLora | S::PackedDelta
+                        ),
+                        Some(K::Lokr) => {
+                            matches!(install.storage, S::DenseLinear | S::StructuredLokr)
+                        }
+                        Some(K::ThirdPartyLokr | K::ThirdPartyLoha) => {
+                            matches!(install.storage, S::DenseLinear | S::PackedDelta)
+                        }
+                        None => {
+                            return Err(Error::Msg(
+                                "sdxl install has no selected file dispatch".into(),
+                            ))
+                        }
                     };
-                    if !allowed { return Err(Error::Msg("sdxl install storage disagrees with selected file dispatch".into())); }
+                    if !allowed {
+                        return Err(Error::Msg(
+                            "sdxl install storage disagrees with selected file dispatch".into(),
+                        ));
+                    }
                     if matches!(item, AdapterWork::GuardAttempt(_)) {
-                        result.quanta.push(adapter_install_quantum(install, current));
+                        result
+                            .quanta
+                            .push(adapter_install_quantum(install, current));
                         pending = Some(install);
                         continue;
                     }
                     if let Some(attempt) = pending.take() {
                         if attempt.target != install.target || attempt.storage != install.storage {
-                            return Err(Error::Msg("sdxl successful declaration disagrees with guard attempt".into()));
+                            return Err(Error::Msg(
+                                "sdxl successful declaration disagrees with guard attempt".into(),
+                            ));
                         }
                     } else {
                         // Actual producer witnesses record success only; their original event shape
                         // remains protected. Header outcomes carry a distinct preceding attempt.
-                        result.quanta.push(adapter_install_quantum(install, current));
+                        result
+                            .quanta
+                            .push(adapter_install_quantum(install, current));
                     }
                     // An upper may overlap earlier base/raw/view payload. Never subtract one
                     // logical upper from another to manufacture a physical lower/credit.
@@ -2465,7 +2672,10 @@ impl AdapterLoadLedger {
                         result.residuals.push(residual);
                     }
                 }
-                AdapterWork::FileScopeEnd => { selected = None; pending = None; }
+                AdapterWork::FileScopeEnd => {
+                    selected = None;
+                    pending = None;
+                }
             }
         }
         Ok(result)

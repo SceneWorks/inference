@@ -316,7 +316,7 @@ mod tests {
                 "valid scalar Z token roles must reach the same metadata reader"
             );
             assert!(
-                matches!(crate::sampling::price_metadata(&replay, sampling.token(), 0, 1), Err(mlx_gen::Error::Msg(reason)) if reason == reader_error),
+                matches!(crate::sampling::price_metadata(&replay, sampling.token(), 0, 1, None), Err(mlx_gen::Error::Msg(reason)) if reason == reader_error),
                 "catalog replay must pass true References, not aggregate image count"
             );
             let bad_live = IosPricingRequest {
@@ -402,7 +402,7 @@ mod tests {
             ..duplicate_req
         };
         assert!(
-            matches!(crate::sampling::price_metadata(&replay, token.token(), 0, 2), Err(mlx_gen::Error::Unsupported(reason)) if reason == role_error)
+            matches!(crate::sampling::price_metadata(&replay, token.token(), 0, 2, None), Err(mlx_gen::Error::Unsupported(reason)) if reason == role_error)
         );
         let base = crate::zimage::Z_IMAGE_TURBO_ID;
         for (p, aggregate, refs, masks, controls) in [
@@ -486,7 +486,7 @@ mod tests {
         };
         assert!(
             matches!(mlx_gen_sdxl::ios_pricing::ios_pricing_with_recipe(&sdxl_replay, &recipe,
-            mlx_gen_sdxl::sampling::SamplingWorkFacts { reference_count: 0, mask_count: 0, control_count: 1 }),
+            mlx_gen_sdxl::sampling::SamplingWorkFacts { reference_count: 0, mask_count: 0, control_count: 1 , reference_image: None}),
             Err(mlx_gen::Error::Unsupported(reason)) if reason == "sdxl captured recipe and geometry aggregate image counts differ")
         );
         let sdxl_valid_roles = IosPricingRequest {
@@ -496,7 +496,15 @@ mod tests {
             },
             ..sdxl_replay
         };
-        assert!(matches!(crate::sampling::price_metadata(&sdxl_valid_roles, &recipe.canonical_token(), 0, 1),
+        let mut source_budget = mlx_gen_sdxl::sampling::SourceRequestBudget::bounded(
+            crate::source_work::capture_requested_bytes(
+                mlx_gen_sdxl::sampling::SamplingSourceView::from_request(&sdxl_carrier),
+            )
+            .unwrap(),
+        );
+        let actual_source =
+            crate::SdxlWorkBinding::capture(&sdxl_carrier, &mut source_budget).unwrap();
+        assert!(matches!(crate::sampling::price_metadata(&sdxl_valid_roles, &recipe.canonical_token(), 0, 1, actual_source.facts()),
             Err(mlx_gen::Error::Unsupported(reason)) if reason == "sdxl pricing Control conditioning count differs from loaded branches"),
             "valid scalar roles must reach the actual SDXL load-count guard; this is not a successful numeric price");
     }

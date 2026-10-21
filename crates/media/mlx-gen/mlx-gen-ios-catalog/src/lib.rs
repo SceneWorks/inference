@@ -52,6 +52,11 @@ mod admission;
 pub mod anchor;
 pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
 mod binding;
+mod source_work;
+pub use mlx_gen_sdxl::sampling::SourceRequestBudget;
+pub use source_work::{
+    record_source_context, serialize_capture_failure, serialize_capture_row, SdxlWorkBinding,
+};
 mod bound;
 mod capture_config;
 pub use capture_config::capture_adapters;

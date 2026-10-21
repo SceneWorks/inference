@@ -146,13 +146,18 @@ fn z_pid_work_wire(flow_token: &str, prompt_utf8_bytes: u64) -> Result<String> {
         .map_err(|error| Error::Msg(error.to_string()))?;
     Ok(format!("{Z_PID_WORK_PREFIX}{}", crate::hex(&wire)))
 }
-fn z_pid_pricing_token(provider: &str, request: &GenerationRequest, flow_token: &str) -> Result<String> {
+fn z_pid_pricing_token(
+    provider: &str,
+    request: &GenerationRequest,
+    flow_token: &str,
+) -> Result<String> {
     if !z_pid_provider(provider) || !request.use_pid {
         return Ok(flow_token.to_owned());
     }
     // The ACTUAL request's original UTF-8 bytes; never chars/tokens, a synthetic caption,
     // the configured tokenizer limit, a native/OS budget, or a reconstructed metadata DTO.
-    let bytes = u64::try_from(request.prompt.len()).map_err(|error| Error::Msg(error.to_string()))?;
+    let bytes =
+        u64::try_from(request.prompt.len()).map_err(|error| Error::Msg(error.to_string()))?;
     z_pid_work_wire(flow_token, bytes)
 }
 fn z_flow_recipe(provider: &str, token: &str) -> Result<(FlowSamplingRecipe, Option<u64>)> {
@@ -160,28 +165,46 @@ fn z_flow_recipe(provider: &str, token: &str) -> Result<(FlowSamplingRecipe, Opt
         return Ok((FlowSamplingRecipe::from_token(token)?, None));
     };
     if !z_pid_provider(provider) {
-        return Err(Error::Unsupported("PiD work envelope is not a Control/foreign-provider route".into()));
+        return Err(Error::Unsupported(
+            "PiD work envelope is not a Control/foreign-provider route".into(),
+        ));
     }
-    if hex.len() > Z_PID_WORK_MAX_HEX || hex.len() % 2 != 0
-        || !hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
-        return Err(Error::Unsupported("invalid bounded provider-private PiD work token".into()));
+    if hex.len() > Z_PID_WORK_MAX_HEX
+        || hex.len() % 2 != 0
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Unsupported(
+            "invalid bounded provider-private PiD work token".into(),
+        ));
     }
-    let bytes = (0..hex.len()).step_by(2)
-        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16)
-            .map_err(|error| Error::Msg(error.to_string())))
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|error| Error::Msg(error.to_string()))
+        })
         .collect::<Result<Vec<_>>>()?;
-    let (version, flow_token, prompt_utf8_bytes): (u8, String, u64) = serde_json::from_slice(&bytes)
-        .map_err(|error| Error::Msg(format!("invalid private PiD work tuple: {error}")))?;
+    let (version, flow_token, prompt_utf8_bytes): (u8, String, u64) =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| Error::Msg(format!("invalid private PiD work tuple: {error}")))?;
     if version != 1 {
-        return Err(Error::Unsupported("unsupported provider-private PiD work version".into()));
+        return Err(Error::Unsupported(
+            "unsupported provider-private PiD work version".into(),
+        ));
     }
     let recipe = FlowSamplingRecipe::from_token(&flow_token)?;
     let value = value(&recipe)?;
     if value.get("use_pid").and_then(Value::as_bool) != Some(true) {
-        return Err(Error::Unsupported("PiD work envelope contains an inactive flow recipe".into()));
+        return Err(Error::Unsupported(
+            "PiD work envelope contains an inactive flow recipe".into(),
+        ));
     }
     if z_pid_work_wire(&recipe.canonical_token(), prompt_utf8_bytes)? != token {
-        return Err(Error::Unsupported("noncanonical provider-private PiD work token".into()));
+        return Err(Error::Unsupported(
+            "noncanonical provider-private PiD work token".into(),
+        ));
     }
     Ok((recipe, Some(prompt_utf8_bytes)))
 }
@@ -339,9 +362,13 @@ fn write_controls(provider: &str, token: &str, request: &mut GenerationRequest) 
 pub fn apply(provider: &str, token: &str, request: &mut GenerationRequest) -> Result<()> {
     if crate::zimage::is_z_image(provider) {
         if let Some(expected) = z_flow_recipe(provider, token)?.1 {
-            let actual = u64::try_from(request.prompt.len()).map_err(|error| Error::Msg(error.to_string()))?;
+            let actual = u64::try_from(request.prompt.len())
+                .map_err(|error| Error::Msg(error.to_string()))?;
             if actual != expected {
-                return Err(Error::Unsupported("PiD strict replay work basis differs from the actual request prompt bytes".into()));
+                return Err(Error::Unsupported(
+                    "PiD strict replay work basis differs from the actual request prompt bytes"
+                        .into(),
+                ));
             }
         }
     }
@@ -511,6 +538,7 @@ pub(crate) fn price_metadata(
     token: &str,
     mask_count: u32,
     control_count: u32,
+    source: Option<&mlx_gen_sdxl::sampling::SamplingSourceFacts>,
 ) -> Result<mlx_gen::ios_pricing::IosPricing> {
     if req.generation.is_some() || req.transform.is_some() || req.depth.is_some() {
         return Err(Error::Unsupported(
@@ -522,19 +550,37 @@ pub(crate) fn price_metadata(
             "anchor metadata replay requires positive output cardinality".into(),
         ));
     }
+    if req.provider != crate::sdxl::SDXL_ID && source.is_some() {
+        return Err(Error::Unsupported(
+            "SDXL source context belongs to another provider".into(),
+        ));
+    }
     match req.provider {
         crate::sdxl::SDXL_ID => {
-            use mlx_gen_sdxl::sampling::{ResolvedSampling, SamplingRecipe, SamplingWorkFacts};
+            use mlx_gen_sdxl::sampling::{ResolvedSampling, SamplingRecipe};
             let recipe = SamplingRecipe::from_token(token)?;
-            let work = SamplingWorkFacts {
-                reference_count: crate::pricing::reference_role_count(
-                    req.geometry.reference_count,
-                    mask_count,
-                    control_count,
-                )? as usize,
-                mask_count: mask_count as usize,
-                control_count: control_count as usize,
-            };
+            let source = source.ok_or_else(|| {
+                Error::Unsupported(
+                    "SDXL metadata replay lacks actual image/text source context".into(),
+                )
+            })?;
+            source.validate_roles()?;
+            let work = source.work();
+            if (work.reference_count, work.mask_count, work.control_count)
+                != (
+                    crate::pricing::reference_role_count(
+                        req.geometry.reference_count,
+                        mask_count,
+                        control_count,
+                    )? as usize,
+                    mask_count as usize,
+                    control_count as usize,
+                )
+            {
+                return Err(Error::Unsupported(
+                    "SDXL source context and replay roles differ".into(),
+                ));
+            }
             let resolved = ResolvedSampling::resolve_recipe(&recipe, work)?;
             let mut execution = *req.execution;
             execution.cfg_batching = Some(resolved.cfg_batching());
@@ -542,7 +588,7 @@ pub(crate) fn price_metadata(
                 execution: &execution,
                 ..*req
             };
-            mlx_gen_sdxl::ios_pricing::ios_pricing_with_recipe(&replay, &recipe, work)
+            mlx_gen_sdxl::ios_pricing::ios_pricing_with_source(&replay, &recipe, source)
         }
         crate::anima::ANIMA_TURBO_ID => {
             mlx_gen_anima::ios_pricing::ios_pricing_with_token(req, token, req.geometry.batch)
@@ -699,29 +745,54 @@ mod z_pid_work_token_tests {
     use crate::ios_admission::IosWork;
 
     fn request(prompt: &str, use_pid: bool) -> GenerationRequest {
-        GenerationRequest { prompt: prompt.into(), use_pid, steps: Some(4), ..Default::default() }
+        GenerationRequest {
+            prompt: prompt.into(),
+            use_pid,
+            steps: Some(4),
+            ..Default::default()
+        }
     }
     fn independent_wire(flow: &str, bytes: u64) -> String {
         let tuple = serde_json::to_vec(&(1u8, flow, bytes)).unwrap();
-        let lower = tuple.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let lower = tuple
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         format!("zpidwork1-{lower}")
     }
     #[test]
     fn actual_utf8_basis_roundtrips_without_treating_recipe_projection_as_real_prompt() {
         let req = request("é界", true);
-        let flow = mlx_gen_z_image::sampling::resolve(&req).unwrap().recipe().canonical_token();
+        let flow = mlx_gen_z_image::sampling::resolve(&req)
+            .unwrap()
+            .recipe()
+            .canonical_token();
         let identity = resolve(crate::zimage::Z_IMAGE_TURBO_ID, &req).unwrap();
-        assert_eq!(identity.token(), independent_wire(&flow, 5), "ACTUAL_UTF8_NOT_CHAR_OR_PADDED_TOKEN_COUNT");
-        let (recipe, basis) = z_flow_recipe(crate::zimage::Z_IMAGE_TURBO_ID, identity.token()).unwrap();
+        assert_eq!(
+            identity.token(),
+            independent_wire(&flow, 5),
+            "ACTUAL_UTF8_NOT_CHAR_OR_PADDED_TOKEN_COUNT"
+        );
+        let (recipe, basis) =
+            z_flow_recipe(crate::zimage::Z_IMAGE_TURBO_ID, identity.token()).unwrap();
         assert_eq!(recipe.canonical_token(), flow);
         assert_eq!(basis, Some(5));
         let replay = from_token(crate::zimage::Z_IMAGE_TURBO_ID, identity.token()).unwrap();
-        assert_eq!(replay.token(), identity.token(), "OUTER_BASIS_NOT_REENCODED_FROM_EMPTY_SCALAR_DTO");
+        assert_eq!(
+            replay.token(),
+            identity.token(),
+            "OUTER_BASIS_NOT_REENCODED_FROM_EMPTY_SCALAR_DTO"
+        );
         assert_eq!(replay.allocation_class(), identity.allocation_class());
         assert_eq!(replay.provenance(), identity.provenance());
         let maximum = independent_wire(&flow, u64::MAX);
-        assert_eq!(from_token(crate::zimage::Z_IMAGE_TURBO_ID, &maximum).unwrap().token(), maximum,
-            "METADATA_BASIS_PRESERVED_NOT_INVENTED_OR_CLIPPED");
+        assert_eq!(
+            from_token(crate::zimage::Z_IMAGE_TURBO_ID, &maximum)
+                .unwrap()
+                .token(),
+            maximum,
+            "METADATA_BASIS_PRESERVED_NOT_INVENTED_OR_CLIPPED"
+        );
     }
     #[test]
     fn strict_apply_checks_real_bytes_and_full_work_binding_still_checks_content() {
@@ -729,15 +800,23 @@ mod z_pid_work_token_tests {
         let mut actual = request("é界", true);
         let token = resolve(provider, &actual).unwrap().token().to_owned();
         apply(provider, &token, &mut actual).unwrap();
-        let mut wrong = actual.clone(); wrong.prompt = "four".into();
+        let mut wrong = actual.clone();
+        wrong.prompt = "four".into();
         let before_steps = wrong.steps;
-        assert!(apply(provider, &token, &mut wrong).is_err(), "STRICT_REPLAY_CANNOT_INVENT_PROMPT_FROM_LENGTH");
-        assert_eq!(wrong.prompt, "four"); assert_eq!(wrong.steps, before_steps);
-        let mut same_bytes = actual.clone(); same_bytes.prompt = "abcde".into();
+        assert!(
+            apply(provider, &token, &mut wrong).is_err(),
+            "STRICT_REPLAY_CANNOT_INVENT_PROMPT_FROM_LENGTH"
+        );
+        assert_eq!(wrong.prompt, "four");
+        assert_eq!(wrong.steps, before_steps);
+        let mut same_bytes = actual.clone();
+        same_bytes.prompt = "abcde".into();
         apply(provider, &token, &mut same_bytes).unwrap();
-        assert_ne!(crate::binding::work_binding(&IosWork::Generate(actual)),
+        assert_ne!(
+            crate::binding::work_binding(&IosWork::Generate(actual)),
             crate::binding::work_binding(&IosWork::Generate(same_bytes)),
-            "BYTE_BASIS_IS_NOT_PROMPT_CONTENT_OR_LIFETIME_IDENTITY");
+            "BYTE_BASIS_IS_NOT_PROMPT_CONTENT_OR_LIFETIME_IDENTITY"
+        );
     }
     #[test]
     fn representative_mints_its_actual_work_basis_but_legacy_replay_does_not_invent_one() {
@@ -746,36 +825,66 @@ mod z_pid_work_token_tests {
         let old = resolve(provider, &source).unwrap().token().to_owned();
         let mut target = request("é界", false);
         let constructed = apply_representative(provider, &old, &mut target).unwrap();
-        assert_eq!(z_flow_recipe(provider, constructed.token()).unwrap().1, Some(5));
+        assert_eq!(
+            z_flow_recipe(provider, constructed.token()).unwrap().1,
+            Some(5)
+        );
         assert_eq!(target.prompt, "é界");
-        let legacy = mlx_gen_z_image::sampling::resolve(&source).unwrap().recipe().canonical_token();
-        assert_eq!(z_flow_recipe(provider, &legacy).unwrap().1, None, "LEGACY_MISSING_IS_NOT_SOME_ZERO");
+        let legacy = mlx_gen_z_image::sampling::resolve(&source)
+            .unwrap()
+            .recipe()
+            .canonical_token();
+        assert_eq!(
+            z_flow_recipe(provider, &legacy).unwrap().1,
+            None,
+            "LEGACY_MISSING_IS_NOT_SOME_ZERO"
+        );
         assert_eq!(from_token(provider, &legacy).unwrap().token(), legacy);
-        assert!(apply(provider, &legacy, &mut target).is_err(), "STRICT_ACTIVE_PID_REPLAY_NEEDS_REAL_BASIS");
+        assert!(
+            apply(provider, &legacy, &mut target).is_err(),
+            "STRICT_ACTIVE_PID_REPLAY_NEEDS_REAL_BASIS"
+        );
         let empty = resolve(provider, &request("", true)).unwrap();
-        assert_eq!(z_flow_recipe(provider, empty.token()).unwrap().1, Some(0), "ZERO_ONLY_FROM_ACTUAL_EMPTY_REQUEST");
+        assert_eq!(
+            z_flow_recipe(provider, empty.token()).unwrap().1,
+            Some(0),
+            "ZERO_ONLY_FROM_ACTUAL_EMPTY_REQUEST"
+        );
     }
     #[test]
     fn non_pid_control_and_existing_flow_semantics_keep_exact_old_tokens() {
-        for provider in [crate::zimage::Z_IMAGE_TURBO_ID, crate::zimage::Z_IMAGE_TURBO_CONTROL_ID] {
+        for provider in [
+            crate::zimage::Z_IMAGE_TURBO_ID,
+            crate::zimage::Z_IMAGE_TURBO_CONTROL_ID,
+        ] {
             for active in [false, true] {
                 let req = request("actual prompt", active);
-                let flow = mlx_gen_z_image::sampling::resolve(&req).unwrap().recipe().canonical_token();
-                if provider == crate::zimage::Z_IMAGE_TURBO_ID && active { continue; }
+                let flow = mlx_gen_z_image::sampling::resolve(&req)
+                    .unwrap()
+                    .recipe()
+                    .canonical_token();
+                if provider == crate::zimage::Z_IMAGE_TURBO_ID && active {
+                    continue;
+                }
                 assert_eq!(resolve(provider, &req).unwrap().token(), flow);
                 assert_eq!(from_token(provider, &flow).unwrap().token(), flow);
             }
         }
         let req = request("é界", true);
         let wrapped = resolve(crate::zimage::Z_IMAGE_TURBO_ID, &req).unwrap();
-        assert!(from_token(crate::zimage::Z_IMAGE_TURBO_CONTROL_ID, wrapped.token()).is_err(),
-            "OPAQUE_WORK_NAMESPACE_CANNOT_CREATE_CONTROL_PID_ROUTE");
+        assert!(
+            from_token(crate::zimage::Z_IMAGE_TURBO_CONTROL_ID, wrapped.token()).is_err(),
+            "OPAQUE_WORK_NAMESPACE_CANNOT_CREATE_CONTROL_PID_ROUTE"
+        );
     }
     #[test]
     fn private_wire_is_canonical_bounded_and_does_not_cap_the_prompt_dimension() {
         let provider = crate::zimage::Z_IMAGE_TURBO_ID;
         let req = request("é界", true);
-        let flow = mlx_gen_z_image::sampling::resolve(&req).unwrap().recipe().canonical_token();
+        let flow = mlx_gen_z_image::sampling::resolve(&req)
+            .unwrap()
+            .recipe()
+            .canonical_token();
         let valid = independent_wire(&flow, u64::MAX);
         assert_eq!(z_flow_recipe(provider, &valid).unwrap().1, Some(u64::MAX));
         let version2 = serde_json::to_vec(&(2u8, &flow, 5u64)).unwrap();
@@ -785,8 +894,14 @@ mod z_pid_work_token_tests {
         assert!(z_flow_recipe(provider, "zpidwork1-a").is_err());
         assert!(z_flow_recipe(provider, "zpidwork1-AA").is_err());
         let huge = format!("zpidwork1-{}", "0".repeat(Z_PID_WORK_MAX_HEX + 2));
-        assert!(z_flow_recipe(provider, &huge).is_err(), "OUTER_BOUND_PRECEDES_VEC_AND_SERDE");
-        let inactive = mlx_gen_z_image::sampling::resolve(&request("actual", false)).unwrap().recipe().canonical_token();
+        assert!(
+            z_flow_recipe(provider, &huge).is_err(),
+            "OUTER_BOUND_PRECEDES_VEC_AND_SERDE"
+        );
+        let inactive = mlx_gen_z_image::sampling::resolve(&request("actual", false))
+            .unwrap()
+            .recipe()
+            .canonical_token();
         assert!(z_flow_recipe(provider, &independent_wire(&inactive, 6)).is_err());
     }
 }

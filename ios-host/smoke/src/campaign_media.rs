@@ -1225,12 +1225,21 @@ impl DeviceProvider<'_> {
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         // The memory-relevant key (path-free layout digest, mode, geometry, execution, token
         // window). A malformed artifact is a failure here, before any evidence question.
-        let key = runtime_ios::media::evidence_key(
+        let mut key = runtime_ios::media::evidence_key(
             self.registry,
             &candidate,
             &runtime_ios::device_machine(),
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        if c.provider == "sdxl" {
+            let allowance = runtime_ios::media::source_metadata_allowance()
+                .map_err(|e| AdmissionError::Failed(e))?;
+            let mut next = runtime_ios::media::source_metadata_capacity;
+            let mut budget =
+                runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
+            runtime_ios::media::record_source_context(&mut key, &candidate, &mut budget)
+                .map_err(AdmissionError::Failed)?;
+        }
         self.artifact = json!({"layout_sha256": key.layout_sha256});
         self.evidence_key = Some(key);
         self.candidate = Some(candidate);
@@ -1565,220 +1574,223 @@ fn phys_footprint() -> Option<(u64, support::PeakReading)> {
 
 pub fn report(value: &str, diagnostic: bool) -> String {
     let started = Instant::now();
-    let model_case = || -> Result<Value, String> {
-        let case = Case::parse(value)?;
-        let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
-        // The catalog's DOMAIN (provider, route, mode): an anchor or any configuration the anchor
-        // law derives. The selection is validated against the provider's declared space in
-        // `prepare` (a token outside it is a typed strategy refusal).
-        if !surfaces(catalog.media())?.iter().any(|s| {
-            s.provider == case.provider
-                && s.routes.contains(&case.route)
-                && s.modes.contains(&case.mode)
-        }) {
-            return Err("case not in the actual supported catalog".into());
-        }
-        if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
-            return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
-        }
-        let root = super::dirs_documents()
-            .ok_or("no Documents directory")?
-            .join("campaign");
-        let mut adapter = DeviceProvider {
-            registry: catalog.media(),
-            device_allowed: cfg!(all(target_os = "ios", not(target_abi = "sim"))),
-            artifact: Value::Null,
-            refusal_kind: None,
-            cancel: CancelFlag::new(),
-            deadline: started + Duration::from_secs(case_timeout()?),
-            root,
-            candidate: None,
-            evidence_key: None,
-            permit: None,
-            refused_quantum: None,
-            refusal_only: std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"),
-            admitted: None,
-            telemetry: None,
-        };
-        // Bind before any source inspection/load. This does not create footprint evidence.
-        runtime_ios::bound_mlx_to_platform_limits()
-            .ok_or("platform allocator limits could not be bound; refused before load")?;
-        if let Some(docs) = super::dirs_documents() {
-            std::fs::write(docs.join(super::RENDERS_MANIFEST), "").map_err(|e| e.to_string())?;
-        }
-        mlx_rs::memory::reset_peak_memory();
-        // The capture's starting footprint, before any of this case's loads: an evidence row's
-        // demand is its peak minus this baseline (admission never credits a product's residents).
-        let before_request_snapshot = footprint_snapshot();
-        let baseline_footprint = before_request_snapshot.current();
-        let start_peak = before_request_snapshot
-            .complete_pair()
-            .ok()
-            .map(|(_, peak)| peak);
-        // Every quantum boundary reads the kernel lifetime peak, attributed to the phase the
-        // provider says that quantum runs in: the anchor's per-phase split.
-        let marks = Arc::new(Mutex::new(support::CaptureMarks::default()));
-        let sink = Arc::clone(&marks);
-        let listener_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let failed = Arc::clone(&listener_failed);
-        let provider = case.provider.clone();
-        runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
-            let (label, opens, scratch) = match mark {
-                runtime_ios::media::ios_quantum::QuantumMark::Metadata {
-                    provider,
-                    kind,
-                    fields,
-                } => {
-                    match sink.lock() {
-                        Ok(mut captured) => captured.metadata(provider, kind, fields),
-                        Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
-                    }
-                    return;
-                }
-                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, scratch } => {
-                    (label, true, scratch)
-                }
-                runtime_ios::media::ios_quantum::QuantumMark::Synchronized { label } => {
-                    (label, false, 0)
-                }
-            };
-            let reading = phys_footprint();
-            match sink.lock() {
-                Ok(mut captured) => {
-                    let phase = runtime_ios::media::pricing::quantum_phase(&provider, label);
-                    // Check/context occurrence is real even when its footprint query failed.
-                    if opens {
-                        captured.checked(phase, label);
-                    }
-                    match reading {
-                        Some((current, support::PeakReading::Read(lifetime_peak))) => {
-                            let preceding_sampling_mark =
-                                if phase == Some(mlx_gen::ios_pricing::IosPhase::Denoise) {
-                                    captured.preceding_sampling_mark
-                                } else {
-                                    None
-                                };
-                            captured.marks.push(support::Mark {
-                                phase,
-                                opens,
-                                lifetime_peak,
-                                label: label.to_string(),
-                                scratch,
-                                current,
-                                preceding_sampling_mark,
-                            });
-                        }
-                        _ => captured.quantum_query_gaps += 1,
-                    }
-                }
-                Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
+    let model_case =
+        || -> Result<(Value, Option<runtime_ios::media::evidence::EvidenceKey>), String> {
+            let case = Case::parse(value)?;
+            let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
+            // The catalog's DOMAIN (provider, route, mode): an anchor or any configuration the anchor
+            // law derives. The selection is validated against the provider's declared space in
+            // `prepare` (a token outside it is a typed strategy refusal).
+            if !surfaces(catalog.media())?.iter().any(|s| {
+                s.provider == case.provider
+                    && s.routes.contains(&case.route)
+                    && s.modes.contains(&case.mode)
+            }) {
+                return Err("case not in the actual supported catalog".into());
             }
-        })));
-        let sampler = Sampler::start();
-        adapter.telemetry = Some(Arc::clone(&sampler.extrema));
-        let deadline = Deadline::start(
-            adapter.cancel.clone(),
-            adapter.deadline.saturating_duration_since(Instant::now()),
-        );
-        let (mut status, mut reason) = campaign::run(&mut adapter, &case, diagnostic);
-        if adapter.cancel.is_cancelled() {
-            status = Status::DiagnosticFailure;
-            reason = "device cooperative deadline cancelled the case".into();
-        }
-        drop(deadline);
-        runtime_ios::media::ios_quantum::set_quantum_listener(None);
-        let e = sampler.finish()?;
-        let ending_snapshot = footprint_snapshot();
-        if listener_failed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("capture observation listener failed".into());
-        }
-        let captured = marks
-            .lock()
-            .map_err(|_| "capture observation collector was poisoned")?;
-        captured.sampling.validate()?;
-        captured.quantum.validate(&captured.sampling)?;
-        let observed_current_peak = before_request_snapshot
-            .current()
-            .into_iter()
-            .chain(e.footprint)
-            .chain(ending_snapshot.current())
-            .chain(captured.marks.iter().map(|mark| mark.current))
-            .max();
-        let model_marks = captured
-            .model_mark_start
-            .and_then(|start| captured.marks.get(start..));
-        let observed_model_current_peak = e
-            .before_model_load
-            .and_then(|snapshot| snapshot.current())
-            .into_iter()
-            .chain(e.model_footprint)
-            .chain(ending_snapshot.current())
-            .chain(model_marks.into_iter().flatten().map(|mark| mark.current))
-            .max();
-        let valid_kernel_queries = e.valid_queries
-            + captured.marks.len() as u64
-            + u64::from(before_request_snapshot.complete_pair().is_ok())
-            + u64::from(ending_snapshot.complete_pair().is_ok());
-        let valid_model_kernel_queries = e.valid_model_queries
-            + model_marks.map_or(0, |marks| marks.len() as u64)
-            + u64::from(ending_snapshot.complete_pair().is_ok());
-        let growth = |start: Option<runtime_ios::media::evidence::KernelFootprintSnapshot>,
-                      current_peak: Option<u64>,
-                      queries|
-         -> Result<mlx_gen::ios_anchor_law::KernelGrowth, String> {
-            let (current, old_peak) = start
-                .ok_or("starting kernel snapshot missing")?
-                .complete_pair()?;
-            let (_, end_peak) = ending_snapshot.complete_pair()?;
-            mlx_gen::ios_anchor_law::KernelGrowth::from_queries(
-                current,
-                old_peak,
-                end_peak,
-                current_peak.ok_or("observed current footprint missing")?,
-                queries,
-            )
-            .map_err(|e| e.to_string())
-        };
-        let original_growth = growth(
-            Some(before_request_snapshot),
-            observed_current_peak,
-            valid_kernel_queries,
-        );
-        let sdk_growth = growth(
-            e.before_model_load,
-            observed_model_current_peak,
-            valid_model_kernel_queries,
-        );
-        let sampling_required = adapter.candidate.as_ref().is_some_and(|candidate| {
-            matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
-        });
-        let sampling_missing = sampling_required && !captured.sampling.has_execution_observation();
-        let quantum_missing = sampling_required && captured.quantum.checks.is_empty();
-        if matches!(status, Status::Successful | Status::DiagnosticSuccess)
-            && (sampling_missing
-                || quantum_missing
-                || captured.sampling.truncated
-                || captured.quantum.truncated)
-        {
-            status = Status::DiagnosticFailure;
-            reason = format!("actual observations missing_sampling={sampling_missing}, missing_quantum={quantum_missing}, sampling_truncated={}, quantum_truncated={}, dropped_metadata={}, dropped_checks={}, malformed={}; not class-coverage evidence",
+            if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
+                return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
+            }
+            let root = super::dirs_documents()
+                .ok_or("no Documents directory")?
+                .join("campaign");
+            let mut adapter = DeviceProvider {
+                registry: catalog.media(),
+                device_allowed: cfg!(all(target_os = "ios", not(target_abi = "sim"))),
+                artifact: Value::Null,
+                refusal_kind: None,
+                cancel: CancelFlag::new(),
+                deadline: started + Duration::from_secs(case_timeout()?),
+                root,
+                candidate: None,
+                evidence_key: None,
+                permit: None,
+                refused_quantum: None,
+                refusal_only: std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"),
+                admitted: None,
+                telemetry: None,
+            };
+            // Bind before any source inspection/load. This does not create footprint evidence.
+            runtime_ios::bound_mlx_to_platform_limits()
+                .ok_or("platform allocator limits could not be bound; refused before load")?;
+            if let Some(docs) = super::dirs_documents() {
+                std::fs::write(docs.join(super::RENDERS_MANIFEST), "")
+                    .map_err(|e| e.to_string())?;
+            }
+            mlx_rs::memory::reset_peak_memory();
+            // The capture's starting footprint, before any of this case's loads: an evidence row's
+            // demand is its peak minus this baseline (admission never credits a product's residents).
+            let before_request_snapshot = footprint_snapshot();
+            let baseline_footprint = before_request_snapshot.current();
+            let start_peak = before_request_snapshot
+                .complete_pair()
+                .ok()
+                .map(|(_, peak)| peak);
+            // Every quantum boundary reads the kernel lifetime peak, attributed to the phase the
+            // provider says that quantum runs in: the anchor's per-phase split.
+            let marks = Arc::new(Mutex::new(support::CaptureMarks::default()));
+            let sink = Arc::clone(&marks);
+            let listener_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let failed = Arc::clone(&listener_failed);
+            let provider = case.provider.clone();
+            runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
+                let (label, opens, scratch) = match mark {
+                    runtime_ios::media::ios_quantum::QuantumMark::Metadata {
+                        provider,
+                        kind,
+                        fields,
+                    } => {
+                        match sink.lock() {
+                            Ok(mut captured) => captured.metadata(provider, kind, fields),
+                            Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
+                        }
+                        return;
+                    }
+                    runtime_ios::media::ios_quantum::QuantumMark::Checked { label, scratch } => {
+                        (label, true, scratch)
+                    }
+                    runtime_ios::media::ios_quantum::QuantumMark::Synchronized { label } => {
+                        (label, false, 0)
+                    }
+                };
+                let reading = phys_footprint();
+                match sink.lock() {
+                    Ok(mut captured) => {
+                        let phase = runtime_ios::media::pricing::quantum_phase(&provider, label);
+                        // Check/context occurrence is real even when its footprint query failed.
+                        if opens {
+                            captured.checked(phase, label);
+                        }
+                        match reading {
+                            Some((current, support::PeakReading::Read(lifetime_peak))) => {
+                                let preceding_sampling_mark =
+                                    if phase == Some(mlx_gen::ios_pricing::IosPhase::Denoise) {
+                                        captured.preceding_sampling_mark
+                                    } else {
+                                        None
+                                    };
+                                captured.marks.push(support::Mark {
+                                    phase,
+                                    opens,
+                                    lifetime_peak,
+                                    label: label.to_string(),
+                                    scratch,
+                                    current,
+                                    preceding_sampling_mark,
+                                });
+                            }
+                            _ => captured.quantum_query_gaps += 1,
+                        }
+                    }
+                    Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
+                }
+            })));
+            let sampler = Sampler::start();
+            adapter.telemetry = Some(Arc::clone(&sampler.extrema));
+            let deadline = Deadline::start(
+                adapter.cancel.clone(),
+                adapter.deadline.saturating_duration_since(Instant::now()),
+            );
+            let (mut status, mut reason) = campaign::run(&mut adapter, &case, diagnostic);
+            if adapter.cancel.is_cancelled() {
+                status = Status::DiagnosticFailure;
+                reason = "device cooperative deadline cancelled the case".into();
+            }
+            drop(deadline);
+            runtime_ios::media::ios_quantum::set_quantum_listener(None);
+            let e = sampler.finish()?;
+            let ending_snapshot = footprint_snapshot();
+            if listener_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("capture observation listener failed".into());
+            }
+            let captured = marks
+                .lock()
+                .map_err(|_| "capture observation collector was poisoned")?;
+            captured.sampling.validate()?;
+            captured.quantum.validate(&captured.sampling)?;
+            let observed_current_peak = before_request_snapshot
+                .current()
+                .into_iter()
+                .chain(e.footprint)
+                .chain(ending_snapshot.current())
+                .chain(captured.marks.iter().map(|mark| mark.current))
+                .max();
+            let model_marks = captured
+                .model_mark_start
+                .and_then(|start| captured.marks.get(start..));
+            let observed_model_current_peak = e
+                .before_model_load
+                .and_then(|snapshot| snapshot.current())
+                .into_iter()
+                .chain(e.model_footprint)
+                .chain(ending_snapshot.current())
+                .chain(model_marks.into_iter().flatten().map(|mark| mark.current))
+                .max();
+            let valid_kernel_queries = e.valid_queries
+                + captured.marks.len() as u64
+                + u64::from(before_request_snapshot.complete_pair().is_ok())
+                + u64::from(ending_snapshot.complete_pair().is_ok());
+            let valid_model_kernel_queries = e.valid_model_queries
+                + model_marks.map_or(0, |marks| marks.len() as u64)
+                + u64::from(ending_snapshot.complete_pair().is_ok());
+            let growth = |start: Option<runtime_ios::media::evidence::KernelFootprintSnapshot>,
+                          current_peak: Option<u64>,
+                          queries|
+             -> Result<mlx_gen::ios_anchor_law::KernelGrowth, String> {
+                let (current, old_peak) = start
+                    .ok_or("starting kernel snapshot missing")?
+                    .complete_pair()?;
+                let (_, end_peak) = ending_snapshot.complete_pair()?;
+                mlx_gen::ios_anchor_law::KernelGrowth::from_queries(
+                    current,
+                    old_peak,
+                    end_peak,
+                    current_peak.ok_or("observed current footprint missing")?,
+                    queries,
+                )
+                .map_err(|e| e.to_string())
+            };
+            let original_growth = growth(
+                Some(before_request_snapshot),
+                observed_current_peak,
+                valid_kernel_queries,
+            );
+            let sdk_growth = growth(
+                e.before_model_load,
+                observed_model_current_peak,
+                valid_model_kernel_queries,
+            );
+            let sampling_required = adapter.candidate.as_ref().is_some_and(|candidate| {
+                matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
+            });
+            let sampling_missing =
+                sampling_required && !captured.sampling.has_execution_observation();
+            let quantum_missing = sampling_required && captured.quantum.checks.is_empty();
+            if matches!(status, Status::Successful | Status::DiagnosticSuccess)
+                && (sampling_missing
+                    || quantum_missing
+                    || captured.sampling.truncated
+                    || captured.quantum.truncated)
+            {
+                status = Status::DiagnosticFailure;
+                reason = format!("actual observations missing_sampling={sampling_missing}, missing_quantum={quantum_missing}, sampling_truncated={}, quantum_truncated={}, dropped_metadata={}, dropped_checks={}, malformed={}; not class-coverage evidence",
                 captured.sampling.truncated, captured.quantum.truncated, captured.sampling.dropped_marks,
                 captured.quantum.dropped_checks, captured.sampling.malformed_marks);
-        }
-        let phase_peaks = match (start_peak, e.lifetime_peak) {
-            (Some(start), Some(end)) => support::phase_peaks(start, &captured.marks, end)
-                .into_iter()
-                .map(|(phase, (peak, exact))| {
-                    (
-                        phase.as_key().to_string(),
-                        json!({"peak_bytes": peak, "exact": exact}),
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>(),
-            _ => serde_json::Map::new(),
-        };
-        // The per-formula DEVICE calibration: each quantum's priced scratch vs its observed growth.
-        let quanta = match e.lifetime_peak {
+            }
+            let phase_peaks = match (start_peak, e.lifetime_peak) {
+                (Some(start), Some(end)) => support::phase_peaks(start, &captured.marks, end)
+                    .into_iter()
+                    .map(|(phase, (peak, exact))| {
+                        (
+                            phase.as_key().to_string(),
+                            json!({"peak_bytes": peak, "exact": exact}),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
+                _ => serde_json::Map::new(),
+            };
+            // The per-formula DEVICE calibration: each quantum's priced scratch vs its observed growth.
+            let quanta = match e.lifetime_peak {
             Some(end) => support::quantum_observations(&captured.marks, end)
                 .into_iter()
                 .map(|(label, o)| {
@@ -1787,8 +1799,10 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                 .collect::<serde_json::Map<_, _>>(),
             _ => serde_json::Map::new(),
         };
-        let (status, reason) = if matches!(status, Status::Successful | Status::DiagnosticSuccess)
-            && (e.footprint.is_none()
+            let (status, reason) = if matches!(
+                status,
+                Status::Successful | Status::DiagnosticSuccess
+            ) && (e.footprint.is_none()
                 || e.min_headroom_mib.is_none()
                 || e.lifetime_peak.is_none()
                 || before_request_snapshot.complete_pair().is_err()
@@ -1798,43 +1812,43 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                 || captured.model_mark_start.is_none()
                 || original_growth.is_err()
                 || sdk_growth.is_err())
-        {
-            (Status::DiagnosticFailure, "completed but process footprint/headroom telemetry unavailable; not production evidence".into())
-        } else {
-            (status, reason)
-        };
-        let sampling_identity = adapter
-            .evidence_key
-            .as_ref()
-            .and_then(|key| key.sampling_recipe.as_deref())
-            .map(|token| {
-                runtime_ios::media::sampling::from_token(&case.provider, token)
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?;
-        if sampling_identity.is_none()
-            && adapter.candidate.as_ref().is_some_and(|candidate| {
-                matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
-            })
-        {
-            return Err(
-                "prepared generation capture is missing its resolved sampling identity".into(),
-            );
-        }
-        let resolved_steps = sampling_identity
-            .as_ref()
-            .map_or(case.steps, |identity| identity.steps());
-        let expected_render_count = adapter
-            .candidate
-            .as_ref()
-            .map(|candidate| match &candidate.work {
-                runtime_ios::media::IosWork::Generate(request) => {
-                    support::expected_generation_outputs(request)
-                }
-                _ => Ok(1),
-            })
-            .transpose()?;
-        let mut row = json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
+            {
+                (Status::DiagnosticFailure, "completed but process footprint/headroom telemetry unavailable; not production evidence".into())
+            } else {
+                (status, reason)
+            };
+            let sampling_identity = adapter
+                .evidence_key
+                .as_ref()
+                .and_then(|key| key.sampling_recipe.as_deref())
+                .map(|token| {
+                    runtime_ios::media::sampling::from_token(&case.provider, token)
+                        .map_err(|e| e.to_string())
+                })
+                .transpose()?;
+            if sampling_identity.is_none()
+                && adapter.candidate.as_ref().is_some_and(|candidate| {
+                    matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
+                })
+            {
+                return Err(
+                    "prepared generation capture is missing its resolved sampling identity".into(),
+                );
+            }
+            let resolved_steps = sampling_identity
+                .as_ref()
+                .map_or(case.steps, |identity| identity.steps());
+            let expected_render_count = adapter
+                .candidate
+                .as_ref()
+                .map(|candidate| match &candidate.work {
+                    runtime_ios::media::IosWork::Generate(request) => {
+                        support::expected_generation_outputs(request)
+                    }
+                    _ => Ok(1),
+                })
+                .transpose()?;
+            let mut row = json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
@@ -1854,7 +1868,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "sampling_coverage":if captured.sampling.total_marks > 0 { Some(&captured.sampling) } else { None },
             "quantum_coverage":Some(&captured.quantum), "quantum_query_gaps":captured.quantum_query_gaps,
             "admitted":adapter.admitted,
-            "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,
+            "evidence_class": if diagnostic { "capture" } else { "admitted" }, "refused_quantum":adapter.refused_quantum,
             "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),
             "refusal_kind":adapter.refusal_kind, "refusal_only":adapter.refusal_only,
@@ -1862,18 +1876,18 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "build_sha":option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
             "entitlement":std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok(),
             "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() });
-        e.write(&mut row);
-        // The final same-task kernel query, not a sampled lower/current value, is the run upper.
-        row["kernel_lifetime_phys_footprint_peak_bytes"] =
-            json!(ending_snapshot.lifetime_peak_bytes);
-        Ok(row)
-    };
+            e.write(&mut row);
+            // The final same-task kernel query, not a sampled lower/current value, is the run upper.
+            row["kernel_lifetime_phys_footprint_peak_bytes"] =
+                json!(ending_snapshot.lifetime_peak_bytes);
+            Ok((row, adapter.evidence_key))
+        };
     let result = if value == primitive::PROBE_KEY {
-        primitive::report(diagnostic)
+        primitive::report(diagnostic).map(|row| (row, None))
     } else {
         model_case()
     };
-    let mut row = result.unwrap_or_else(|e| json!({"schema":1,"case":value,"status":Status::DiagnosticFailure.label(),"production_success":false,"reason":e,"elapsed_seconds":started.elapsed().as_secs_f64(),"mlx_active_peak_bytes":null,"mlx_cache_peak_bytes":null,"mlx_active_cache_peak_bytes":null,"mlx_peak_bytes":null,"phys_footprint_peak_bytes":null,"min_headroom_mib":null,"diagnostic":diagnostic}));
+    let (mut row, source_key) = result.unwrap_or_else(|e| (json!({"schema":1,"case":value,"status":Status::DiagnosticFailure.label(),"production_success":false,"reason":e,"elapsed_seconds":started.elapsed().as_secs_f64(),"mlx_active_peak_bytes":null,"mlx_cache_peak_bytes":null,"mlx_active_cache_peak_bytes":null,"mlx_peak_bytes":null,"phys_footprint_peak_bytes":null,"min_headroom_mib":null,"diagnostic":diagnostic}), None));
     row["run_id"] = json!(std::env::var("IOS_CAMPAIGN_RUN_ID").ok());
     row["build_sha"] = json!(option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"));
     row["entitlement"] = json!(std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok());
@@ -1894,15 +1908,66 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             row
         );
     }
-    format!(
-        "SMOKE: {}\nCAMPAIGN_JSON {}\n",
-        if row["production_success"] == true {
-            "PASS"
-        } else {
-            "FAIL"
-        },
-        row
-    )
+    let prefix = if row["production_success"] == true {
+        "SMOKE: PASS\nCAMPAIGN_JSON "
+    } else {
+        "SMOKE: FAIL\nCAMPAIGN_JSON "
+    };
+    let serialized = (|| -> Result<String, String> {
+        let retained = source_key
+            .as_ref()
+            .and_then(|key| key.sdxl_work.as_ref())
+            .map(|binding| binding.retained_requested_bytes())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        let fresh = runtime_ios::media::source_metadata_allowance().map_err(|e| e.to_string())?;
+        let allowance = retained
+            .checked_add(fresh)
+            .ok_or("source serialization allowance overflow")?;
+        let mut next = runtime_ios::media::source_metadata_capacity;
+        let mut budget =
+            runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
+        budget
+            .account_retained(retained)
+            .map_err(|e| e.to_string())?;
+        runtime_ios::media::serialize_capture_row(prefix, &row, source_key.as_ref(), &mut budget)
+            .map_err(|e| e.to_string())
+    })();
+    match serialized {
+        Ok(output) => output,
+        // A failed output reservation is not a completed capture. This fixed-size diagnostic has
+        // no source key/payload and is never importable as completed evidence.
+        Err(_) => {
+            let fallback = (|| -> Result<String, String> {
+                let retained = source_key
+                    .as_ref()
+                    .and_then(|key| key.sdxl_work.as_ref())
+                    .map(|binding| binding.retained_requested_bytes())
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(0);
+                let fresh =
+                    runtime_ios::media::source_metadata_allowance().map_err(|e| e.to_string())?;
+                let allowance = retained
+                    .checked_add(fresh)
+                    .ok_or("source diagnostic allowance overflow")?;
+                let mut next = runtime_ios::media::source_metadata_capacity;
+                let mut budget =
+                    runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
+                budget
+                    .account_retained(retained)
+                    .map_err(|e| e.to_string())?;
+                runtime_ios::media::serialize_capture_failure(
+                    row.get("case").unwrap_or(&Value::Null),
+                    &mut budget,
+                )
+                .map_err(|e| e.to_string())
+            })();
+            // No output allocation, and no successful evidence line, if even the diagnostic fails.
+            fallback.unwrap_or_else(|_| String::new())
+        }
+    }
 }
 
 /// Extremes sampled every 20 ms across one case (model case or primitive probe). Unavailable

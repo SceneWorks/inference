@@ -230,7 +230,7 @@ pub(crate) mod tests {
             AnchorKind::Optimized
         };
         crate::evidence::fixture::completed(
-            evidence_key(registry, candidate, DEVICE).unwrap(),
+            crate::source_work::fixture_key(registry, candidate, DEVICE),
             kind,
             AnchorSelection::from_parts(
                 candidate.context.selection.strategy,
@@ -281,7 +281,7 @@ pub(crate) mod tests {
             "text_to_image",
         );
         let key = evidence_key(&registry, &base, DEVICE).unwrap();
-        // Same artifact installed elsewhere, other prompt words of the same window, other seed.
+        // Same artifact elsewhere, different words with the same actual UTF8 byte basis/window, other seed.
         let mut moved = candidate(
             &registry,
             b.path(),
@@ -290,9 +290,22 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "text_to_image",
         );
-        generate(&mut moved).prompt = "another short prompt".into();
+        generate(&mut moved).prompt = "different fixture".into();
+        let crate::IosWork::Generate(base_request) = &base.work else {
+            unreachable!()
+        };
+        assert_eq!(generate(&mut moved).prompt.len(), base_request.prompt.len());
         generate(&mut moved).seed = Some(99);
         assert_eq!(evidence_key(&registry, &moved, DEVICE).unwrap(), key);
+        let mut longer = moved.clone();
+        generate(&mut longer).prompt.push(' ');
+        let longer_key = evidence_key(&registry, &longer, DEVICE).unwrap();
+        assert_eq!(longer_key.token_window, key.token_window);
+        assert_ne!(
+            longer_key, key,
+            "same window does not reconstruct actual input bytes"
+        );
+        assert_eq!(longer_key.family(), key.family());
         // Each memory-relevant change is a different key.
         let differs = |c: &IosCandidate| evidence_key(&registry, c, DEVICE).unwrap() != key;
         assert!(differs(&candidate(

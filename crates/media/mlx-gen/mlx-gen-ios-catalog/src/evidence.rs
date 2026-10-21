@@ -139,6 +139,9 @@ pub struct EvidenceKey {
     /// resolver; a capture cannot claim a compatible class with an arbitrary string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_recipe: Option<String>,
+    /// Exact source context only; excluded from structural family/class identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdxl_work: Option<crate::SdxlWorkBinding>,
     /// Encoded text window: CLIP windows x 77 for SDXL, 0 where the provider pads to a fixed,
     /// artifact-determined window (covered by the layout digest).
     pub token_window: u32,
@@ -147,6 +150,9 @@ pub struct EvidenceKey {
 impl EvidenceKey {
     /// The anchor family this key belongs to: everything a derivation must hold EQUAL.
     pub fn family(&self) -> Result<AnchorFamily, String> {
+        if self.provider != crate::sdxl::SDXL_ID && self.sdxl_work.is_some() {
+            return Err("SDXL source binding belongs to another provider".into());
+        }
         let sampling = self
             .sampling_recipe
             .as_ref()
@@ -172,6 +178,7 @@ impl EvidenceKey {
                             as usize,
                         mask_count: self.mask_count as usize,
                         control_count: self.control_count as usize,
+                        reference_image: None,
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -936,6 +943,18 @@ pub(crate) fn validate_rows(rows: &[AnchorRow]) -> Result<(), String> {
             ));
         }
         validate_key(k)?;
+        if matches!(&row.outcome, AnchorOutcome::Completed { .. })
+            && k.provider == crate::sdxl::SDXL_ID
+            && k.sdxl_work.is_some()
+        {
+            let facts = k
+                .sdxl_work
+                .as_ref()
+                .ok_or("completed SDXL row lacks actual source context")?
+                .require_facts()
+                .map_err(|e| e.to_string())?;
+            crate::source_work::validate_key_roles(k, facts).map_err(|e| e.to_string())?;
+        }
         if row.selection.strategy().is_none() || row.selection.parameters().is_none() {
             return Err(format!("row {k:?}: malformed anchor selection"));
         }
@@ -1094,7 +1113,21 @@ pub(crate) fn validate_rows(rows: &[AnchorRow]) -> Result<(), String> {
 }
 
 pub(crate) fn parse(json: &str) -> Result<Vec<AnchorRow>, String> {
-    let table: Table = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut budget = mlx_gen_sdxl::sampling::SourceRequestBudget::bounded(json.len() as u64);
+    parse_with_source_budget(json, &mut budget)
+}
+
+/// Explicit finite requested-layout allowance. This does not certify tokenizer or process memory.
+pub fn parse_with_source_budget(
+    json: &str,
+    budget: &mut mlx_gen_sdxl::sampling::SourceRequestBudget<'_>,
+) -> Result<Vec<AnchorRow>, String> {
+    let (schema, anchors) = crate::source_work::parse_table(json, budget)?;
+    let table = Table {
+        schema,
+        about: String::new(),
+        anchors,
+    };
     // Schema 3 replaced the exact-match grid with anchors; an older table is refused (fail
     // closed), never migrated by guess.
     if table.schema != EVIDENCE_SCHEMA {
@@ -1105,9 +1138,31 @@ pub(crate) fn parse(json: &str) -> Result<Vec<AnchorRow>, String> {
 }
 
 /// The compiled-in, reviewed table. A malformed table admits nothing (every lookup refuses).
+static ROWS: OnceLock<Result<Vec<AnchorRow>, String>> = OnceLock::new();
 pub fn rows() -> Result<&'static [AnchorRow], String> {
-    static ROWS: OnceLock<Result<Vec<AnchorRow>, String>> = OnceLock::new();
     ROWS.get_or_init(|| parse(EVIDENCE_JSON))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(|e| format!("{EVIDENCE_TABLE_PATH}: {e}"))
+}
+
+/// Runtime initialization with an explicit byte-sensitive NEXT-allocation hook. A transient
+/// capacity refusal is not cached as a permanent artifact parse failure. An already initialized
+/// table allocates no new source payload; its retained bytes are already in the process snapshot.
+pub fn rows_with_source_capacity(
+    next: &mut dyn FnMut(u64) -> mlx_gen::Result<()>,
+) -> Result<&'static [AnchorRow], String> {
+    if ROWS.get().is_none() {
+        let mut budget = mlx_gen_sdxl::sampling::SourceRequestBudget::with_capacity(
+            EVIDENCE_JSON.len() as u64,
+            next,
+        );
+        let rows = parse_with_source_budget(EVIDENCE_JSON, &mut budget)?;
+        // Another initializer may win. Dropping this source copy is not physical retirement proof.
+        let _ = ROWS.set(Ok(rows));
+    }
+    ROWS.get()
+        .expect("reviewed rows initialized")
         .as_ref()
         .map(Vec::as_slice)
         .map_err(|e| format!("{EVIDENCE_TABLE_PATH}: {e}"))
@@ -1323,6 +1378,7 @@ mod tests {
             load_form: AnchorLoadForm::SequentialDeferred,
             execution: "Sequential|DeferredMaterialization|x".into(),
             sampling_recipe: None,
+            sdxl_work: None,
             token_window: 0,
         }
     }

@@ -742,5 +742,24 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(campaign.validate_primitive(row, session.run_id)["status"], "diagnostic_success")
 
 
+class SourceContextWireTests(unittest.TestCase):
+    def test_source_context_payload_survives_sorted_key_roundtrip(self):
+        key = {"provider": "sdxl", "reference_count": 1, "mask_count": 0, "control_count": 1,
+            "sdxl_work": {"sha256": "ab" * 32, "facts": {
+                "work": {"reference_count": 0, "mask_count": 0, "control_count": 1},
+                "text": {"prompt_utf8_bytes": 19, "negative_prompt_utf8_bytes": 7},
+                "reference_index": None, "mask": None,
+                "controls": [{"source_index": 0, "image": {"width": 7, "height": 3, "buffer_bytes": 62}}]}}}
+        # Refused-fixture wire only, not fabricated completed native evidence or a valid digest.
+        row = {"purpose": "resident", "case": "source-wire-fixture", "evidence_key": key,
+            "anchor_selection": {"rung": 0}, "status": "capture_refused",
+            "refused_quantum": {"label": "fixture", "scratch_bytes": 1, "reserve_bytes": 0, "available_bytes": 0},
+            "run_id": "fixture", "build_sha": "a" * 40}
+        anchors, problems = campaign.anchor_rows([row])
+        self.assertEqual(problems, [])
+        self.assertEqual(anchors[0]["key"], key)
+
+
 if __name__ == "__main__":
     unittest.main()
+

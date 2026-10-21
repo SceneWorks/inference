@@ -354,6 +354,7 @@ fn metadata_recipe_resolution_shares_actual_control_factory_and_typed_role_refus
         reference_count: 1,
         mask_count: 1,
         control_count: 0,
+        reference_image: None,
     };
     assert!(ResolvedSampling::resolve_recipe(&ancestral, inpaint).is_ok());
     assert!(ResolvedSampling::resolve_recipe(

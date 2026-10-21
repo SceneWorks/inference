@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "dcdb12571ca4400992a8e2a9a6cb5d4229b5c4e25e5a07ad973a21f853825036",
+  "rust_proof_closure_sha256": "c9d9995f14fd155bc4badf90c1e14d5d5800adb2fa8c9d5581976acc89c4817b",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -32,7 +32,7 @@
     },
     {
       "path": "crates/bundles/runtime-ios/src/lib.rs",
-      "sha256": "5f7a6be0f21a3ab44efe3df0241d11e66a10300dea697fdb80e0d35811b4f923"
+      "sha256": "dba216e0ad581b4b4be2d99da3042273c125b126a7340a9023a01e93f7d38539"
     },
     {
       "path": "crates/contracts/gen-core/Cargo.toml",
@@ -140,7 +140,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
-      "sha256": "8f858e121b8df22c02add168667a02bb11bf7a1d633bf94bd6250817cddde6b9"
+      "sha256": "ed52e73dffa832e1e382075f6628200c02af675704cfdd8a57f8b051b911ad33"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
@@ -152,15 +152,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/evidence.rs",
-      "sha256": "bd4db826c5bd299d6af80562def55abfd5e3abd60889df8d735a2bb44f047b08"
+      "sha256": "cdea16644dbbee959ec31c480ed3b6ac1f1ca7975c48aa3eb4164e6585bc4aac"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "03cfd4ce6fcfc8e3a45acd4e2d988e28726efe9ec8fa9e7578bc62337553cce9"
+      "sha256": "72a43cf7db947979c58926b54bc48d77e5200df15d785ece079668d728765fec"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
-      "sha256": "0276733e3019b6b3f7bd97a4fc018430140623c053211f5853cc07302f961962"
+      "sha256": "fd869456d45a6fb5862f6922769dd019f3e028ef824e4508a0a40e369038a059"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/layout.rs",
@@ -168,19 +168,19 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/lib.rs",
-      "sha256": "39587eeb83acf9ed41e810a2c400a5fce263ed049b7dfb065636dd6c9675359a"
+      "sha256": "321395b65e65e469cdb26dfee7eeb24c2a4b24e8a839aa6c1082a96683575c1a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
-      "sha256": "fd7a7bb5cfd2e47960e6fbbf8bb32de053c9b17be80c7029fae8a34151de0a90"
+      "sha256": "f03208bd3b68d86f129b068bac3579baca93a63dff25c139b5c89b09e626c0b8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
-      "sha256": "89db54dfb9b3f9ca6ad08edfe73857f8752ec5a074e394e3286b94712e609b18"
+      "sha256": "fb49dc46b495467054b90719773b7ab7751730618f0752ca293dfb5d308168f1"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
-      "sha256": "7b9807e970ba9c273e6fac62d8e5d544ac95d7c6324c8f6ef48d2346e758e3b2"
+      "sha256": "d58df94df482e116092d0d155b213b576a57c7d1e39ba2253545482d0bdafe45"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/zimage.rs",
@@ -372,7 +372,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "26d1fc8c243ca3098beafa64f12121f8759feb4b28308aa734090c309d5882d2"
+      "sha256": "22054621862495e0d7ccbdc976a7639de0004b003bd070612c1047337d668ef3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -428,11 +428,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling.rs",
-      "sha256": "08d505850ec0bae7c7afb462ba0a713eaa89cb39be264160bf19609b85502d88"
+      "sha256": "5f35bdf164169b9c8c252d31d0c979ebef48ce79dcbc27e1ec494be1f4dfbcf7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling_tests.rs",
-      "sha256": "4b5716eb537cc2c04ce9cc801aa9bc7c96e45cea5fcc3b02b9c3c00963768c11"
+      "sha256": "7f6f3ac7605ee5b720bf2381f34fe72bfbe6334182e38eaee825537a0320b8c5"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/test_support.rs",
@@ -804,7 +804,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "806e04337926f2c3df6406db176cd4fb51da6ea9a0410346a516e77f4e9a4cbd"
+      "sha256": "8a3d8ed49450c113eaffc24a8b661aa2751a83ab595784b34616eadfddf97f81"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -832,11 +832,31 @@
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
-      "sha256": "ab86d7bed9c261fd8424264500f8d8fbd6f064789df3c0e83dffede5f0c8efb1"
+      "sha256": "7f1261394d83437d5bfb11243e2f2197cd043a8d078944a6fc30aa1b5ed06f75"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/bound.rs",
       "sha256": "9271697acc4e806e3540272074e4ed17a72522b79c921317ef92606f2f3cba4f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/source_work.rs",
+      "sha256": "c00b88ecddb2e4defee5fcd9812d2ab41347e36c0597da22bfbedde41e810b52"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling/source_context.rs",
+      "sha256": "7af19a30b692b5fcddc33af5bc8b6808485b2454ce63bcb74caacc7338488734"
+    },
+    {
+      "path": "crates/bundles/runtime-ios/Cargo.toml",
+      "sha256": "6ed72c8cea6755afddf8d67dc1bfd02f0e8aec88745468734938f9bb8a2de3d7"
+    },
+    {
+      "path": "ios-host/smoke/Cargo.toml",
+      "sha256": "7eb70f9fe9634e327143f5deb14a7135096717508fcaa112182f69bf5319f634"
+    },
+    {
+      "path": "ios-host/smoke/examples/campaign_catalog.rs",
+      "sha256": "585c51bda6f34d18226d8aec1b2be4c718bf1704f35e7cf38504b332188e91b0"
     }
   ],
   "HOSTs": [
@@ -1390,8 +1410,8 @@
     "NativeToProcess/Darwinphysical/runtimeNoAD"
   ],
   "source_guard_provenance": {
-    "role44_newmap_sha256": "b9328731bddca530790850494ab163c5358fc9a08b1d3ced4c6db18bc3e5d2cb",
-    "role44_exact_preservation_proof_sha256": "52dd1439fa89a988d534a5f0998e3293cc6d4ac9e223adc761092934d3f7bf50",
+    "role44_newmap_sha256": "cc7a066e874cd1d62fc4e3e89818e0eeb4619acee35071ce7b1f4476b1987167",
+    "role44_exact_preservation_proof_sha256": "d579308d285cd34502841225911b258386f11a3243243c9651e6ee9753d039ba",
     "original379dapproveddelta_preservation_sha256": "eb2b28a5930fec70627e26df81f1cafc6e5970be47135a0badf12df29750484a"
   },
   "prior_proofs_not_current_runtime_acceptance": true,

@@ -72,11 +72,12 @@ pub mod media {
         anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
         build_candidate, capacity_budget, capture_adapters, capture_artifact_stem,
         configured_load_form, configured_variant_digest, evidence, evidence_key, hex,
-        ios_memory_budget, ios_quantum, pricing, sampling, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
-        work_mode, zimage, Admission, AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth,
+        ios_memory_budget, ios_quantum, pricing, record_source_context, sampling, sana_decode_plan,
+        sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory, sana_load_spec,
+        sana_snapshot_profile, sdxl, serialize_capture_failure, serialize_capture_row, work_mode,
+        zimage, Admission, AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth,
         BoundGenerator, BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal,
-        RefusalKind, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID,
+        RefusalKind, SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
         CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
         IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
         SANA_DEVICE_FOOTPRINTS,
@@ -212,6 +213,28 @@ pub mod media {
         );
         // No blanket reserve: the predicted peak is the anchor's demand plus its MEASURED margin.
         budget.reserved_headroom_bytes = 0;
+        // Initialize NEW source-context payloads under the real next-allocation hook, at the
+        // existing reviewed-table phase, before catalog admission reaches key tokenization.
+        // General parser/key strings and the tokenizer upper remain separate unfinished terms.
+        let mut source_capacity_refused = false;
+        let mut source_next = |bytes| {
+            let checked = source_metadata_capacity(bytes);
+            if checked.is_err() {
+                source_capacity_refused = true;
+            }
+            checked
+        };
+        let reviewed = evidence::rows_with_source_capacity(&mut source_next);
+        reviewed.map_err(|e| {
+            AdmissionError::refused(
+                if source_capacity_refused {
+                    RefusalKind::Capacity
+                } else {
+                    RefusalKind::NoEvidence
+                },
+                e,
+            )
+        })?;
         let admission = admit_with_baseline(
             &registry,
             candidates,
@@ -310,6 +333,24 @@ pub mod media {
         let registry = mlx_gen_ios_catalog::provider_registry()?;
         let permit = catalog_capture_permit(&registry, candidate, &super::device_machine())?;
         Ok((registry, permit))
+    }
+
+    /// Requested-layout metadata preflight. This is byte-sensitive, unlike capture_capacity.
+    /// It uses a fresh boundary (no old admission growth credit); requested bytes are NOT a
+    /// certificate of malloc/RSS/process growth. Tokenizer preflight is still a separate gap.
+    pub fn source_metadata_capacity(next_request_bytes: u64) -> Result<()> {
+        let now = super::process_memory();
+        incremental_capacity(next_request_bytes, now, now)
+    }
+
+    /// Explicit current allowance for newly retained source metadata; unavailable stays unknown.
+    pub fn source_metadata_allowance() -> Result<u64> {
+        super::process_memory().available.ok_or_else(|| {
+            Error::Unsupported(
+                "source metadata needs an explicit live or fixture requested-layout allowance"
+                    .into(),
+            )
+        })
     }
 
     /// The bounded-execution check a capture load and every capture call run: the quanta are only
@@ -1086,6 +1127,50 @@ mod tests {
         assert!(incremental_capacity(required, read(3000, 9000), read(1600, 9000)).is_err());
         // Off-device (no live reading): only the cap applies.
         incremental_capacity(required, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+    }
+
+    /// The source-metadata callback delegates to this existing injectable decision with the
+    /// SAME supplied snapshot on both sides: no OS query and no prior-growth credit. The
+    /// requested-layout ledger's retained total is not an additional process allocation.
+    #[cfg(feature = "media")]
+    #[test]
+    fn source_metadata_next_request_boundary_and_overflow() {
+        use super::media::incremental_capacity;
+        use super::ProcessMemory;
+
+        let cap = u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20;
+        let retained = 128_u64;
+        let next = 64_u64;
+        let at_cap_boundary = ProcessMemory {
+            // This current footprint ALREADY contains the retained source ledger bytes.
+            footprint: Some(cap - next),
+            available: Some(next),
+        };
+        incremental_capacity(next, at_cap_boundary, at_cap_boundary).unwrap();
+        assert!(incremental_capacity(next + 1, at_cap_boundary, at_cap_boundary).is_err());
+        assert!(
+            incremental_capacity(retained + next, at_cap_boundary, at_cap_boundary).is_err(),
+            "passing retained ledger + next would double-charge bytes already in the snapshot"
+        );
+
+        // Independently exercise live-headroom refusal well below the absolute process cap.
+        let at_headroom_boundary = ProcessMemory {
+            footprint: Some(retained),
+            available: Some(next),
+        };
+        incremental_capacity(next, at_headroom_boundary, at_headroom_boundary).unwrap();
+        assert!(
+            incremental_capacity(next + 1, at_headroom_boundary, at_headroom_boundary).is_err()
+        );
+
+        // Overflow/range errors must refuse rather than wrap into a small admitted estimate.
+        let overflow = ProcessMemory {
+            footprint: Some(retained),
+            available: Some(u64::MAX),
+        };
+        assert!(incremental_capacity(u64::MAX, overflow, overflow).is_err());
+        // The helper's existing refusal recorder is not read or cleared here: the decision
+        // assertions do not depend on shared flag state and cannot consume another test's flag.
     }
 
     /// The capture permit is not an admission and is unavailable off-device: without bounded

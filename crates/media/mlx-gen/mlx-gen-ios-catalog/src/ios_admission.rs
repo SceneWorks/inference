@@ -720,6 +720,12 @@ fn key_unchecked(
                     .into(),
             ),
         },
+        sdxl_work: match &candidate.work {
+            IosWork::Generate(request) if candidate.provider == crate::sdxl::SDXL_ID => {
+                Some(crate::SdxlWorkBinding::query(request))
+            }
+            _ => None,
+        },
         token_window: token_window(candidate)?,
     })
 }
@@ -839,6 +845,18 @@ fn price_anchor(
     let Some(_) = crate::pricing::provider_pricing(provider) else {
         return Err(no_evidence(format!("{provider}: no counted iOS pricing")));
     };
+    let recorded_source = if provider == crate::sdxl::SDXL_ID {
+        let binding = row.key.sdxl_work.as_ref().ok_or_else(|| {
+            pricing_error(Error::Unsupported(
+                "SDXL anchor lacks actual image/text source context".into(),
+            ))
+        })?;
+        let facts = binding.require_facts().map_err(pricing_error)?;
+        crate::source_work::validate_key_roles(&row.key, facts).map_err(pricing_error)?;
+        Some(facts)
+    } else {
+        None
+    };
     let mut spec = candidate.spec.clone();
     // Re-price the anchor's actual load, not the requesting endpoint's load form.
     row.key.load_form.apply(&mut spec);
@@ -888,6 +906,7 @@ fn price_anchor(
         token,
         row.key.mask_count,
         row.key.control_count,
+        recorded_source,
     )
     .map_err(pricing_error)
     .and_then(|mut pricing| {
@@ -1086,6 +1105,9 @@ fn admit_one(
     let guard = SourceInventory::capture(&candidate.spec)?;
     guard.read_unchanged(|| -> AdmissionResult<Admission> {
         let key = key_unchecked(candidate, machine, route.clone())?;
+        if let (Some(binding), IosWork::Generate(request)) = (&key.sdxl_work, &candidate.work) {
+            binding.validate_actual(request).map_err(pricing_error)?;
+        }
         let contract = registry
             .memory_strategy_contract(&candidate.provider, &candidate.spec)?
             .ok_or_else(|| {
@@ -1468,11 +1490,20 @@ mod original_z_execution_sidecar_tests {
     use mlx_gen::gen_core::{ControlKind, Image, MemoryStrategy, Quant, WeightsSource};
     use sha2::{Digest, Sha256};
     mod shared {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../mlx-gen-z-image/tests/common/original_z_execution_sidecar.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mlx-gen-z-image/tests/common/original_z_execution_sidecar.rs"
+        ));
     }
     use shared::{Inputs, ManualMode, Position};
 
-    fn image() -> Image { Image { width: 32, height: 32, pixels: vec![19; 32 * 32 * 3] } }
+    fn image() -> Image {
+        Image {
+            width: 32,
+            height: 32,
+            pixels: vec![19; 32 * 32 * 3],
+        }
+    }
 
     fn private_execution_binding(core: [u8; 32], program: &serde_json::Value) -> [u8; 32] {
         let mut hash = Sha256::new();
@@ -1482,16 +1513,22 @@ mod original_z_execution_sidecar_tests {
         hash.finalize().into()
     }
 
-
     /// Full canonical constructor inventory for this PUBLIC metadata-only fixture. No Array,
     /// coefficient payload, model load or native query is created. FF=2*dim and the VAE channel
     /// ladder deliberately follow the existing original fixture's valid topology; this is not a
     /// claim that sparse zero payload can execute or that it is the historical private program.
     struct PublicHeaders(std::collections::BTreeMap<String, (&'static str, Vec<usize>)>);
     impl PublicHeaders {
-        fn new() -> Self { Self(std::collections::BTreeMap::new()) }
+        fn new() -> Self {
+            Self(std::collections::BTreeMap::new())
+        }
         fn put(&mut self, name: impl Into<String>, dtype: &'static str, shape: &[usize]) {
-            assert!(self.0.insert(name.into(), (dtype, shape.to_vec())).is_none(), "PUBLIC_HEADER_UNIQUE_NAME");
+            assert!(
+                self.0
+                    .insert(name.into(), (dtype, shape.to_vec()))
+                    .is_none(),
+                "PUBLIC_HEADER_UNIQUE_NAME"
+            );
         }
         fn linear(&mut self, path: &str, output: usize, input: usize, packed: bool, bias: bool) {
             if packed {
@@ -1499,28 +1536,73 @@ mod original_z_execution_sidecar_tests {
                 self.put(format!("{path}.weight"), "U32", &[output, input / 4]);
                 self.put(format!("{path}.scales"), "BF16", &[output, input / 64]);
                 self.put(format!("{path}.biases"), "BF16", &[output, input / 64]);
-            } else { self.put(format!("{path}.weight"), "BF16", &[output, input]); }
-            if bias { self.put(format!("{path}.bias"), "BF16", &[output]); }
+            } else {
+                self.put(format!("{path}.weight"), "BF16", &[output, input]);
+            }
+            if bias {
+                self.put(format!("{path}.bias"), "BF16", &[output]);
+            }
         }
         fn block(&mut self, path: &str, dim: usize, heads: usize, modulation: bool, packed: bool) {
             for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
                 self.linear(&format!("{path}.attention.{leaf}"), dim, dim, packed, false);
             }
-            for leaf in ["norm_q", "norm_k"] { self.put(format!("{path}.attention.{leaf}.weight"), "BF16", &[dim / heads]); }
-            for leaf in ["attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2"] {
+            for leaf in ["norm_q", "norm_k"] {
+                self.put(
+                    format!("{path}.attention.{leaf}.weight"),
+                    "BF16",
+                    &[dim / heads],
+                );
+            }
+            for leaf in [
+                "attention_norm1",
+                "attention_norm2",
+                "ffn_norm1",
+                "ffn_norm2",
+            ] {
                 self.put(format!("{path}.{leaf}.weight"), "BF16", &[dim]);
             }
-            self.linear(&format!("{path}.feed_forward.w1"), 2 * dim, dim, packed, false);
-            self.linear(&format!("{path}.feed_forward.w2"), dim, 2 * dim, packed, false);
-            self.linear(&format!("{path}.feed_forward.w3"), 2 * dim, dim, packed, false);
-            if modulation { self.linear(&format!("{path}.adaLN_modulation.0"), 4 * dim, dim, packed, true); }
+            self.linear(
+                &format!("{path}.feed_forward.w1"),
+                2 * dim,
+                dim,
+                packed,
+                false,
+            );
+            self.linear(
+                &format!("{path}.feed_forward.w2"),
+                dim,
+                2 * dim,
+                packed,
+                false,
+            );
+            self.linear(
+                &format!("{path}.feed_forward.w3"),
+                2 * dim,
+                dim,
+                packed,
+                false,
+            );
+            if modulation {
+                self.linear(
+                    &format!("{path}.adaLN_modulation.0"),
+                    4 * dim,
+                    dim,
+                    packed,
+                    true,
+                );
+            }
         }
         fn norm(&mut self, path: &str, channels: usize) {
             self.put(format!("{path}.weight"), "BF16", &[channels]);
             self.put(format!("{path}.bias"), "BF16", &[channels]);
         }
         fn conv(&mut self, path: &str, output: usize, input: usize, kernel: usize) {
-            self.put(format!("{path}.weight"), "BF16", &[output, input, kernel, kernel]);
+            self.put(
+                format!("{path}.weight"),
+                "BF16",
+                &[output, input, kernel, kernel],
+            );
             self.put(format!("{path}.bias"), "BF16", &[output]);
         }
         fn resnet(&mut self, path: &str, input: usize, output: usize) {
@@ -1528,13 +1610,21 @@ mod original_z_execution_sidecar_tests {
             self.conv(&format!("{path}.conv1"), output, input, 3);
             self.norm(&format!("{path}.norm2"), output);
             self.conv(&format!("{path}.conv2"), output, output, 3);
-            if input != output { self.conv(&format!("{path}.conv_shortcut"), output, input, 1); }
+            if input != output {
+                self.conv(&format!("{path}.conv_shortcut"), output, input, 1);
+            }
         }
         fn mid(&mut self, path: &str, channels: usize) {
             self.resnet(&format!("{path}.resnets.0"), channels, channels);
             self.norm(&format!("{path}.attentions.0.group_norm"), channels);
             for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
-                self.linear(&format!("{path}.attentions.0.{leaf}"), channels, channels, true, true);
+                self.linear(
+                    &format!("{path}.attentions.0.{leaf}"),
+                    channels,
+                    channels,
+                    true,
+                    true,
+                );
             }
             self.resnet(&format!("{path}.resnets.1"), channels, channels);
         }
@@ -1544,28 +1634,45 @@ mod original_z_execution_sidecar_tests {
             let mut offset = 0u64;
             let mut header = serde_json::Map::new();
             for (name, (dtype, shape)) in &self.0 {
-                let width = match *dtype { "U32" => 4u64, "BF16" => 2, _ => unreachable!() };
-                let bytes = shape.iter().try_fold(width, |n, &d| n.checked_mul(u64::try_from(d).unwrap())).unwrap();
+                let width = match *dtype {
+                    "U32" => 4u64,
+                    "BF16" => 2,
+                    _ => unreachable!(),
+                };
+                let bytes = shape
+                    .iter()
+                    .try_fold(width, |n, &d| n.checked_mul(u64::try_from(d).unwrap()))
+                    .unwrap();
                 let end = offset.checked_add(bytes).unwrap();
-                header.insert(name.clone(), serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,end]}));
+                header.insert(
+                    name.clone(),
+                    serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,end]}),
+                );
                 offset = end;
             }
             let encoded = serde_json::to_vec(&header).unwrap();
             let mut file = std::fs::File::create(path).unwrap();
             gen_core_testkit::mark_sparse(path);
-            file.write_all(&(encoded.len() as u64).to_le_bytes()).unwrap();
+            file.write_all(&(encoded.len() as u64).to_le_bytes())
+                .unwrap();
             file.write_all(&encoded).unwrap();
             let header_bytes = u64::try_from(encoded.len()).unwrap();
-            assert!(header_bytes <= 100_000_000, "PUBLIC_FIXTURE_TESTKIT_HEADER_LIMIT");
-            let logical = 8u64.checked_add(header_bytes).and_then(|n| n.checked_add(offset)).unwrap();
+            assert!(
+                header_bytes <= 100_000_000,
+                "PUBLIC_FIXTURE_TESTKIT_HEADER_LIMIT"
+            );
+            let logical = 8u64
+                .checked_add(header_bytes)
+                .and_then(|n| n.checked_add(offset))
+                .unwrap();
             file.set_len(logical).unwrap();
         }
     }
 
-    fn public_te_epoch(root: &std::path::Path) -> (u64,u64,std::time::SystemTime) {
+    fn public_te_epoch(root: &std::path::Path) -> (u64, u64, std::time::SystemTime) {
         use std::os::unix::fs::MetadataExt;
-        let metadata=std::fs::metadata(root.join("text_encoder/model.safetensors")).unwrap();
-        (metadata.ino(),metadata.len(),metadata.modified().unwrap())
+        let metadata = std::fs::metadata(root.join("text_encoder/model.safetensors")).unwrap();
+        (metadata.ino(), metadata.len(), metadata.modified().unwrap())
     }
 
     fn complete_public_metadata_fixture(root: &std::path::Path, control: &std::path::Path) {
@@ -1578,15 +1685,39 @@ mod original_z_execution_sidecar_tests {
         let patch = usize::try_from(cfg.patch_size * cfg.patch_size * cfg.in_channels).unwrap();
         let mut base = PublicHeaders::new();
         base.linear("all_x_embedder.2-1", dim, patch, true, true);
-        base.linear("t_embedder.mlp.0", 1024, usize::try_from(cfg.frequency_embedding_size).unwrap(), true, true);
+        base.linear(
+            "t_embedder.mlp.0",
+            1024,
+            usize::try_from(cfg.frequency_embedding_size).unwrap(),
+            true,
+            true,
+        );
         base.linear("t_embedder.mlp.2", dim, 1024, true, true);
-        base.put("cap_embedder.0.weight", "BF16", &[usize::try_from(cfg.cap_feat_dim).unwrap()]);
-        base.linear("cap_embedder.1", dim, usize::try_from(cfg.cap_feat_dim).unwrap(), true, true);
+        base.put(
+            "cap_embedder.0.weight",
+            "BF16",
+            &[usize::try_from(cfg.cap_feat_dim).unwrap()],
+        );
+        base.linear(
+            "cap_embedder.1",
+            dim,
+            usize::try_from(cfg.cap_feat_dim).unwrap(),
+            true,
+            true,
+        );
         base.put("x_pad_token", "BF16", &[1, dim]);
         base.put("cap_pad_token", "BF16", &[1, dim]);
         base.linear("all_final_layer.2-1.linear", patch, dim, true, true);
-        base.linear("all_final_layer.2-1.adaLN_modulation.1", dim, dim, true, true);
-        for i in 0..cfg.n_layers { base.block(&format!("layers.{i}"), dim, heads, true, true); }
+        base.linear(
+            "all_final_layer.2-1.adaLN_modulation.1",
+            dim,
+            dim,
+            true,
+            true,
+        );
+        for i in 0..cfg.n_layers {
+            base.block(&format!("layers.{i}"), dim, heads, true, true);
+        }
         for i in 0..cfg.n_refiner_layers {
             base.block(&format!("noise_refiner.{i}"), dim, heads, true, true);
             base.block(&format!("context_refiner.{i}"), dim, heads, false, true);
@@ -1598,25 +1729,50 @@ mod original_z_execution_sidecar_tests {
             "cap_feat_dim":cfg.cap_feat_dim,"fixture_ff_hidden":2*cfg.dim,
             "quantization":{"bits":8,"group_size":64}}).to_string()).unwrap();
         let mut c = PublicHeaders::new();
-        c.linear("control_all_x_embedder.2-1", dim,
-            usize::try_from(cfg.patch_size * cfg.patch_size * mlx_gen_z_image::control_transformer::CONTROL_IN_DIM).unwrap(), false, true);
+        c.linear(
+            "control_all_x_embedder.2-1",
+            dim,
+            usize::try_from(
+                cfg.patch_size
+                    * cfg.patch_size
+                    * mlx_gen_z_image::control_transformer::CONTROL_IN_DIM,
+            )
+            .unwrap(),
+            false,
+            true,
+        );
         // The production Control topology in control_transformer.rs: places0,2,...,28 and0,1.
         for (stack, count) in [("control_layers", 15), ("control_noise_refiner", 2)] {
             for i in 0..count {
                 let p = format!("{stack}.{i}");
                 c.block(&p, dim, heads, true, false);
                 c.linear(&format!("{p}.after_proj"), dim, dim, false, true);
-                if i == 0 { c.linear(&format!("{p}.before_proj"), dim, dim, false, true); }
+                if i == 0 {
+                    c.linear(&format!("{p}.before_proj"), dim, dim, false, true);
+                }
             }
         }
         c.save(control);
-        let channels = [32usize,32,64,64];
+        let channels = [32usize, 32, 64, 64];
         let mut vae = PublicHeaders::new();
         vae.conv("encoder.conv_in", channels[0], 3, 3);
         let mut previous = channels[0];
         for (i, &out) in channels.iter().enumerate() {
-            for r in 0..2 { vae.resnet(&format!("encoder.down_blocks.{i}.resnets.{r}"), if r == 0 { previous } else { out }, out); }
-            if i < 3 { vae.conv(&format!("encoder.down_blocks.{i}.downsamplers.0.conv"), out, out, 3); }
+            for r in 0..2 {
+                vae.resnet(
+                    &format!("encoder.down_blocks.{i}.resnets.{r}"),
+                    if r == 0 { previous } else { out },
+                    out,
+                );
+            }
+            if i < 3 {
+                vae.conv(
+                    &format!("encoder.down_blocks.{i}.downsamplers.0.conv"),
+                    out,
+                    out,
+                    3,
+                );
+            }
             previous = out;
         }
         vae.mid("encoder.mid_block", previous);
@@ -1625,50 +1781,95 @@ mod original_z_execution_sidecar_tests {
         vae.conv("decoder.conv_in", previous, 16, 3);
         vae.mid("decoder.mid_block", previous);
         for (i, &out) in channels.iter().rev().enumerate() {
-            for r in 0..3 { vae.resnet(&format!("decoder.up_blocks.{i}.resnets.{r}"), if r == 0 { previous } else { out }, out); }
-            if i < 3 { vae.conv(&format!("decoder.up_blocks.{i}.upsamplers.0.conv"), out, out, 3); }
+            for r in 0..3 {
+                vae.resnet(
+                    &format!("decoder.up_blocks.{i}.resnets.{r}"),
+                    if r == 0 { previous } else { out },
+                    out,
+                );
+            }
+            if i < 3 {
+                vae.conv(
+                    &format!("decoder.up_blocks.{i}.upsamplers.0.conv"),
+                    out,
+                    out,
+                    3,
+                );
+            }
             previous = out;
         }
         vae.norm("decoder.conv_norm_out", previous);
         vae.conv("decoder.conv_out", 3, previous, 3);
         vae.save(&root.join("vae/model.safetensors"));
-        std::fs::write(root.join("vae/config.json"), serde_json::json!({"_class_name":"AutoencoderKL",
+        std::fs::write(
+            root.join("vae/config.json"),
+            serde_json::json!({"_class_name":"AutoencoderKL",
             "block_out_channels":channels,"layers_per_block":2,"latent_channels":16,
-            "quantization":{"bits":8,"group_size":64}}).to_string()).unwrap();
+            "quantization":{"bits":8,"group_size":64}})
+            .to_string(),
+        )
+        .unwrap();
 
         // Real source_for_load acquires an ArtifactSeal: it may sequentially SHA256 the whole
         // sparse TE once per acquisition without its identity memo. This is CPU/IO test-integrity
         // work, NOT semantic coefficient/scalar pricing and not a model load. Never bypass it.
         use std::os::unix::fs::MetadataExt;
-        fn storage(dir: &std::path::Path, logical: &mut u64, allocated: &mut u64,
-            small: &mut u64, count: &mut u64) {
+        fn storage(
+            dir: &std::path::Path,
+            logical: &mut u64,
+            allocated: &mut u64,
+            small: &mut u64,
+            count: &mut u64,
+        ) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
-                if path.is_dir() { storage(&path,logical,allocated,small,count); continue; }
+                if path.is_dir() {
+                    storage(&path, logical, allocated, small, count);
+                    continue;
+                }
                 let metadata = std::fs::metadata(&path).unwrap();
                 *logical = logical.checked_add(metadata.len()).unwrap();
-                *allocated = allocated.checked_add(metadata.blocks().checked_mul(512).unwrap()).unwrap();
-                if path.extension().and_then(|x| x.to_str()) == Some("safetensors") { *count += 1; }
-                else { *small = small.checked_add(metadata.len()).unwrap(); }
+                *allocated = allocated
+                    .checked_add(metadata.blocks().checked_mul(512).unwrap())
+                    .unwrap();
+                if path.extension().and_then(|x| x.to_str()) == Some("safetensors") {
+                    *count += 1;
+                } else {
+                    *small = small.checked_add(metadata.len()).unwrap();
+                }
             }
         }
-        let (mut logical,mut allocated,mut small,mut count)=(0,0,0,0);
-        storage(root,&mut logical,&mut allocated,&mut small,&mut count);
-        let te_bytes=std::fs::metadata(root.join("text_encoder/model.safetensors")).unwrap().len();
+        let (mut logical, mut allocated, mut small, mut count) = (0, 0, 0, 0);
+        storage(root, &mut logical, &mut allocated, &mut small, &mut count);
+        let te_bytes = std::fs::metadata(root.join("text_encoder/model.safetensors"))
+            .unwrap()
+            .len();
         // Three endpoint calls plus four mode calls. Every classified call acquires its contract
         // directly AND via build_candidate. Resident's configured form adds1; optimized explores
         // at most four forms for every actual optimized strategy. Do not assume the memo hits.
-        let contract_acquisitions=2*(3u64+4)+1+4*u64::try_from(
-            MemoryStrategy::ALL.into_iter().filter(|strategy| strategy.is_optimized()).count()).unwrap();
-        let max_te_scan=te_bytes.checked_mul(contract_acquisitions).unwrap();
+        let contract_acquisitions = 2 * (3u64 + 4)
+            + 1
+            + 4 * u64::try_from(
+                MemoryStrategy::ALL
+                    .into_iter()
+                    .filter(|strategy| strategy.is_optimized())
+                    .count(),
+            )
+            .unwrap();
+        let max_te_scan = te_bytes.checked_mul(contract_acquisitions).unwrap();
         eprintln!("PUBLIC_FIXTURE_STORAGE_V1 sparse_files={count} total_logical_bytes={logical} actual_allocated_bytes={allocated} metadata_file_bytes={small} TE_file_bytes={te_bytes} unique_TE_epochs=1 contract_acquisition_max={contract_acquisitions} TE_stream_scan_bytes_if_no_memo={max_te_scan} hash_buffer_bytes=65536");
 
         // The aggregate raw-source/real-constructor oracle runs after truthful TE discovery
         // in the HOST below. Retain the independent complete VAE endpoint check here.
         use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
         let vae_headers = safetensors_path_tensor_headers(root.join("vae")).unwrap();
-        assert!(vae_headers.iter().any(|h| h.name == "decoder.up_blocks.3.resnets.2.conv2.weight" && h.shape == [32,32,3,3]),
-            "PUBLIC_COMPLETE_VAE_DECODER_TOPOLOGY");
+        assert!(
+            vae_headers
+                .iter()
+                .any(|h| h.name == "decoder.up_blocks.3.resnets.2.conv2.weight"
+                    && h.shape == [32, 32, 3, 3]),
+            "PUBLIC_COMPLETE_VAE_DECODER_TOPOLOGY"
+        );
     }
 
     /// Independent raw-source oracle, not the PublicHeaders writer's inventory. Constructor
@@ -1676,35 +1877,89 @@ mod original_z_execution_sidecar_tests {
     /// timestep_embedder.rs, final_layer.rs, transformer_block.rs/context_block.rs and
     /// control_transformer.rs::{CONTROL_LAYERS_PLACES,CONTROL_REFINER_PLACES}. Those metadata
     /// helpers are crate-private; no production API is widened to make this fixture pass.
-    fn public_raw_schema(control: bool) -> std::collections::BTreeMap<String, (&'static str, Vec<usize>)> {
+    fn public_raw_schema(
+        control: bool,
+    ) -> std::collections::BTreeMap<String, (&'static str, Vec<usize>)> {
         type Schema = std::collections::BTreeMap<String, (&'static str, Vec<usize>)>;
         fn put(out: &mut Schema, name: String, dtype: &'static str, shape: Vec<usize>) {
-            assert!(out.insert(name, (dtype, shape)).is_none(), "PUBLIC_ORACLE_UNIQUE_RAW_KEY");
+            assert!(
+                out.insert(name, (dtype, shape)).is_none(),
+                "PUBLIC_ORACLE_UNIQUE_RAW_KEY"
+            );
         }
-        fn linear(out: &mut Schema, path: &str, output: usize, input: usize, packed: bool, bias: bool) {
+        fn linear(
+            out: &mut Schema,
+            path: &str,
+            output: usize,
+            input: usize,
+            packed: bool,
+            bias: bool,
+        ) {
             if packed {
                 assert_eq!(input % 64, 0, "PUBLIC_ORACLE_GROUP64");
-                for (suffix, dtype, columns) in [("weight", "U32", input / 4),
-                    ("scales", "BF16", input / 64), ("biases", "BF16", input / 64)] {
-                    put(out, format!("{path}.{suffix}"), dtype, vec![output, columns]);
+                for (suffix, dtype, columns) in [
+                    ("weight", "U32", input / 4),
+                    ("scales", "BF16", input / 64),
+                    ("biases", "BF16", input / 64),
+                ] {
+                    put(
+                        out,
+                        format!("{path}.{suffix}"),
+                        dtype,
+                        vec![output, columns],
+                    );
                 }
-            } else { put(out, format!("{path}.weight"), "BF16", vec![output, input]); }
-            if bias { put(out, format!("{path}.bias"), "BF16", vec![output]); }
+            } else {
+                put(out, format!("{path}.weight"), "BF16", vec![output, input]);
+            }
+            if bias {
+                put(out, format!("{path}.bias"), "BF16", vec![output]);
+            }
         }
-        fn block(out: &mut Schema, path: &str, dim: usize, heads: usize, context: bool, packed: bool) {
+        fn block(
+            out: &mut Schema,
+            path: &str,
+            dim: usize,
+            heads: usize,
+            context: bool,
+            packed: bool,
+        ) {
             // Each shape is the constructor's [out,in], not a count of whatever the writer emits.
             for (leaf, output, input, bias) in [
-                ("attention.to_q", dim, dim, false), ("attention.to_k", dim, dim, false),
-                ("attention.to_v", dim, dim, false), ("attention.to_out.0", dim, dim, false),
+                ("attention.to_q", dim, dim, false),
+                ("attention.to_k", dim, dim, false),
+                ("attention.to_v", dim, dim, false),
+                ("attention.to_out.0", dim, dim, false),
                 ("feed_forward.w1", 2 * dim, dim, false),
                 ("feed_forward.w2", dim, 2 * dim, false),
                 ("feed_forward.w3", 2 * dim, dim, false),
-            ] { linear(out, &format!("{path}.{leaf}"), output, input, packed, bias); }
-            if !context { linear(out, &format!("{path}.adaLN_modulation.0"), 4 * dim, dim, packed, true); }
-            for leaf in ["attention.norm_q", "attention.norm_k"] {
-                put(out, format!("{path}.{leaf}.weight"), "BF16", vec![dim / heads]);
+            ] {
+                linear(out, &format!("{path}.{leaf}"), output, input, packed, bias);
             }
-            for leaf in ["attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2"] {
+            if !context {
+                linear(
+                    out,
+                    &format!("{path}.adaLN_modulation.0"),
+                    4 * dim,
+                    dim,
+                    packed,
+                    true,
+                );
+            }
+            for leaf in ["attention.norm_q", "attention.norm_k"] {
+                put(
+                    out,
+                    format!("{path}.{leaf}.weight"),
+                    "BF16",
+                    vec![dim / heads],
+                );
+            }
+            for leaf in [
+                "attention_norm1",
+                "attention_norm2",
+                "ffn_norm1",
+                "ffn_norm2",
+            ] {
                 put(out, format!("{path}.{leaf}.weight"), "BF16", vec![dim]);
             }
         }
@@ -1714,33 +1969,90 @@ mod original_z_execution_sidecar_tests {
         let patch = usize::try_from(cfg.patch_size * cfg.patch_size * cfg.in_channels).unwrap();
         let mut out = Schema::new();
         if control {
-            linear(&mut out, "control_all_x_embedder.2-1", dim,
-                usize::try_from(cfg.patch_size * cfg.patch_size * mlx_gen_z_image::CONTROL_IN_DIM).unwrap(), false, true);
+            linear(
+                &mut out,
+                "control_all_x_embedder.2-1",
+                dim,
+                usize::try_from(cfg.patch_size * cfg.patch_size * mlx_gen_z_image::CONTROL_IN_DIM)
+                    .unwrap(),
+                false,
+                true,
+            );
             // Private placement constants are [0,2,..,28] and [0,1]; use their explicit source
             // positions, not a claim that a stack count alone establishes constructor placement.
-            for (stack, places) in [("control_layers", &[0usize,2,4,6,8,10,12,14,16,18,20,22,24,26,28][..]),
-                ("control_noise_refiner", &[0usize,1][..])] {
+            for (stack, places) in [
+                (
+                    "control_layers",
+                    &[0usize, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28][..],
+                ),
+                ("control_noise_refiner", &[0usize, 1][..]),
+            ] {
                 for (index, _) in places.iter().enumerate() {
                     let path = format!("{stack}.{index}");
                     block(&mut out, &path, dim, heads, false, false);
-                    linear(&mut out, &format!("{path}.after_proj"), dim, dim, false, true);
-                    if index == 0 { linear(&mut out, &format!("{path}.before_proj"), dim, dim, false, true); }
+                    linear(
+                        &mut out,
+                        &format!("{path}.after_proj"),
+                        dim,
+                        dim,
+                        false,
+                        true,
+                    );
+                    if index == 0 {
+                        linear(
+                            &mut out,
+                            &format!("{path}.before_proj"),
+                            dim,
+                            dim,
+                            false,
+                            true,
+                        );
+                    }
                 }
             }
         } else {
             for (path, output, input) in [
                 ("all_x_embedder.2-1", dim, patch),
-                ("t_embedder.mlp.0", 1024, usize::try_from(cfg.frequency_embedding_size).unwrap()),
+                (
+                    "t_embedder.mlp.0",
+                    1024,
+                    usize::try_from(cfg.frequency_embedding_size).unwrap(),
+                ),
                 ("t_embedder.mlp.2", dim, 1024),
-                ("cap_embedder.1", dim, usize::try_from(cfg.cap_feat_dim).unwrap()),
+                (
+                    "cap_embedder.1",
+                    dim,
+                    usize::try_from(cfg.cap_feat_dim).unwrap(),
+                ),
                 ("all_final_layer.2-1.linear", patch, dim),
                 ("all_final_layer.2-1.adaLN_modulation.1", dim, dim),
-            ] { linear(&mut out, path, output, input, true, true); }
-            put(&mut out, "cap_embedder.0.weight".into(), "BF16", vec![usize::try_from(cfg.cap_feat_dim).unwrap()]);
-            for name in ["x_pad_token", "cap_pad_token"] { put(&mut out, name.into(), "BF16", vec![1,dim]); }
-            for (stack, count, context) in [("layers",cfg.n_layers,false),
-                ("noise_refiner",cfg.n_refiner_layers,false),("context_refiner",cfg.n_refiner_layers,true)] {
-                for index in 0..count { block(&mut out, &format!("{stack}.{index}"), dim, heads, context, true); }
+            ] {
+                linear(&mut out, path, output, input, true, true);
+            }
+            put(
+                &mut out,
+                "cap_embedder.0.weight".into(),
+                "BF16",
+                vec![usize::try_from(cfg.cap_feat_dim).unwrap()],
+            );
+            for name in ["x_pad_token", "cap_pad_token"] {
+                put(&mut out, name.into(), "BF16", vec![1, dim]);
+            }
+            for (stack, count, context) in [
+                ("layers", cfg.n_layers, false),
+                ("noise_refiner", cfg.n_refiner_layers, false),
+                ("context_refiner", cfg.n_refiner_layers, true),
+            ] {
+                for index in 0..count {
+                    block(
+                        &mut out,
+                        &format!("{stack}.{index}"),
+                        dim,
+                        heads,
+                        context,
+                        true,
+                    );
+                }
             }
         }
         out
@@ -1748,20 +2060,41 @@ mod original_z_execution_sidecar_tests {
 
     fn public_raw_header_failures(
         component: &str,
-        actual: &std::collections::BTreeMap<String, mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+        actual: &std::collections::BTreeMap<
+            String,
+            mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+        >,
         expected: &std::collections::BTreeMap<String, (&'static str, Vec<usize>)>,
     ) -> Vec<String> {
         use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
         let mut failures = Vec::new();
         for (name, (dtype, shape)) in expected {
-            let category = if name.ends_with(".scales") || name.ends_with(".biases") { "companion/group64" }
-                else if name.ends_with(".bias") { "bias" } else { "tensor" };
+            let category = if name.ends_with(".scales") || name.ends_with(".biases") {
+                "companion/group64"
+            } else if name.ends_with(".bias") {
+                "bias"
+            } else {
+                "tensor"
+            };
             match actual.get(name) {
                 None => failures.push(format!("{component}: missing {category} {name}")),
                 Some(header) => {
-                    let dtype_matches = matches!((*dtype, header.dtype), ("U32", Stored::U32) | ("BF16", Stored::BF16));
-                    if !dtype_matches { failures.push(format!("{component}: dtype {name}: {:?}, expected {dtype}",header.dtype)); }
-                    if header.shape != *shape { failures.push(format!("{component}: {category} shape {name}: {:?}, expected {shape:?}",header.shape)); }
+                    let dtype_matches = matches!(
+                        (*dtype, header.dtype),
+                        ("U32", Stored::U32) | ("BF16", Stored::BF16)
+                    );
+                    if !dtype_matches {
+                        failures.push(format!(
+                            "{component}: dtype {name}: {:?}, expected {dtype}",
+                            header.dtype
+                        ));
+                    }
+                    if header.shape != *shape {
+                        failures.push(format!(
+                            "{component}: {category} shape {name}: {:?}, expected {shape:?}",
+                            header.shape
+                        ));
+                    }
                 }
             }
         }
@@ -1772,77 +2105,132 @@ mod original_z_execution_sidecar_tests {
         // suffixes and reject duplicates too: adding correct raw keys beside bad internal ones
         // must not make a supposedly complete fixture pass.
         if component == "base" {
-            for alias in ["t_embedder.linear1", "t_embedder.linear2", "all_final_layer.2-1.adaLN_modulation.0"] {
+            for alias in [
+                "t_embedder.linear1",
+                "t_embedder.linear2",
+                "all_final_layer.2-1.adaLN_modulation.0",
+            ] {
                 for suffix in ["weight", "scales", "biases", "bias"] {
                     let name = format!("{alias}.{suffix}");
-                    if actual.contains_key(&name) { failures.push(format!("base: internal raw-alias forbidden {name}")); }
+                    if actual.contains_key(&name) {
+                        failures.push(format!("base: internal raw-alias forbidden {name}"));
+                    }
                 }
             }
         }
         failures
     }
 
-    fn validate_public_raw_and_constructor_schemas(root: &std::path::Path, control: &std::path::Path) {
+    fn validate_public_raw_and_constructor_schemas(
+        root: &std::path::Path,
+        control: &std::path::Path,
+    ) {
         use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
-        let read = |source: &std::path::Path| safetensors_path_tensor_headers(source).unwrap()
-            .into_iter().map(|h| (h.name.clone(),h)).collect::<std::collections::BTreeMap<_,_>>();
+        let read = |source: &std::path::Path| {
+            safetensors_path_tensor_headers(source)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.name.clone(), h))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
         let raw_base = read(&root.join("transformer"));
         let raw_control = read(control);
         let base_schema = public_raw_schema(false);
         let control_schema = public_raw_schema(true);
         let mut failures = public_raw_header_failures("base", &raw_base, &base_schema);
-        failures.extend(public_raw_header_failures("control", &raw_control, &control_schema));
+        failures.extend(public_raw_header_failures(
+            "control",
+            &raw_control,
+            &control_schema,
+        ));
         // The exported graph entry is the existing native-free route to the REAL crate-private
         // remap: ios_pricing.rs::configured_overlay_semantic_facts_for constructs a separate
         // owned header map from the same serialized source, calls remap_transformer_header_keys,
         // then adapter_header_targets/linear_header_facts and the actual Control target resolver.
         // The immutable raw_base/raw_control maps above remain the authored-source inventory;
         // aliases in the constructor view are never serialized or charged as extra raw roots.
-        for provider in [crate::zimage::Z_IMAGE_TURBO_ID,crate::zimage::Z_IMAGE_TURBO_CONTROL_ID] {
-            let mut spec = crate::zimage::z_image_turbo_load_spec(WeightsSource::Dir(root.to_owned()),
-                (provider == crate::zimage::Z_IMAGE_TURBO_CONTROL_ID).then(|| WeightsSource::File(control.to_owned())));
+        for provider in [
+            crate::zimage::Z_IMAGE_TURBO_ID,
+            crate::zimage::Z_IMAGE_TURBO_CONTROL_ID,
+        ] {
+            let mut spec = crate::zimage::z_image_turbo_load_spec(
+                WeightsSource::Dir(root.to_owned()),
+                (provider == crate::zimage::Z_IMAGE_TURBO_CONTROL_ID)
+                    .then(|| WeightsSource::File(control.to_owned())),
+            );
             spec.quantize = Some(Quant::Q8);
-            match mlx_gen_z_image::ios_pricing::configured_overlay_semantic_facts_for(provider,&spec) {
+            match mlx_gen_z_image::ios_pricing::configured_overlay_semantic_facts_for(
+                provider, &spec,
+            ) {
                 Err(error) => failures.push(format!("constructor-view {provider}: {error}")),
                 Ok(graph) if provider == crate::zimage::Z_IMAGE_TURBO_CONTROL_ID => {
-                    if graph["control"]["main_places"] != serde_json::json!([0,2,4,6,8,10,12,14,16,18,20,22,24,26,28]) {
-                        failures.push("constructor-view control main placement differs from raw schema".into());
+                    if graph["control"]["main_places"]
+                        != serde_json::json!([
+                            0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28
+                        ])
+                    {
+                        failures.push(
+                            "constructor-view control main placement differs from raw schema"
+                                .into(),
+                        );
                     }
-                    if graph["control"]["refiner_places"] != serde_json::json!([0,1]) {
-                        failures.push("constructor-view control refiner placement differs from raw schema".into());
+                    if graph["control"]["refiner_places"] != serde_json::json!([0, 1]) {
+                        failures.push(
+                            "constructor-view control refiner placement differs from raw schema"
+                                .into(),
+                        );
                     }
                 }
                 Ok(_) => {}
             }
         }
-        assert!(failures.is_empty(), "PUBLIC_AGGREGATE_RAW_AND_ACTUAL_CONSTRUCTOR_SCHEMA:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "PUBLIC_AGGREGATE_RAW_AND_ACTUAL_CONSTRUCTOR_SCHEMA:\n{}",
+            failures.join("\n")
+        );
         // Check diagnostic aggregation independently on a cloned header map. This never writes
         // a source file, changes a source-policy selector, seals payload, or enters native code.
         let mut malformed = raw_base.clone();
         malformed.remove("t_embedder.mlp.0.scales");
         malformed.remove("t_embedder.mlp.2.bias");
-        malformed.get_mut("t_embedder.mlp.0.weight").unwrap().dtype = mlx_gen::gen_core::weightsmeta::Dtype::BF16;
+        malformed.get_mut("t_embedder.mlp.0.weight").unwrap().dtype =
+            mlx_gen::gen_core::weightsmeta::Dtype::BF16;
         malformed.get_mut("t_embedder.mlp.0.weight").unwrap().shape[0] += 1;
         malformed.get_mut("t_embedder.mlp.0.biases").unwrap().shape[1] += 1;
         let mut alias = raw_base["t_embedder.mlp.0.weight"].clone();
         alias.name = "t_embedder.linear1.weight".into();
-        malformed.insert(alias.name.clone(),alias);
+        malformed.insert(alias.name.clone(), alias);
         let diagnostics = public_raw_header_failures("base", &malformed, &base_schema);
-        for fragment in ["missing companion/group64 t_embedder.mlp.0.scales", "missing bias t_embedder.mlp.2.bias",
-            "dtype t_embedder.mlp.0.weight", "tensor shape t_embedder.mlp.0.weight",
+        for fragment in [
+            "missing companion/group64 t_embedder.mlp.0.scales",
+            "missing bias t_embedder.mlp.2.bias",
+            "dtype t_embedder.mlp.0.weight",
+            "tensor shape t_embedder.mlp.0.weight",
             "companion/group64 shape t_embedder.mlp.0.biases",
-            "unexpected raw key t_embedder.linear1.weight", "internal raw-alias forbidden t_embedder.linear1.weight"] {
-            assert!(diagnostics.iter().any(|line| line.contains(fragment)), "PUBLIC_AGGREGATE_DIAGNOSTIC_MISSING {fragment}");
+            "unexpected raw key t_embedder.linear1.weight",
+            "internal raw-alias forbidden t_embedder.linear1.weight",
+        ] {
+            assert!(
+                diagnostics.iter().any(|line| line.contains(fragment)),
+                "PUBLIC_AGGREGATE_DIAGNOSTIC_MISSING {fragment}"
+            );
         }
         let mut malformed_control = raw_control.clone();
         malformed_control.remove("control_layers.14.after_proj.bias");
         let mut misplaced = raw_control["control_layers.0.before_proj.weight"].clone();
         misplaced.name = "control_layers.1.before_proj.weight".into();
-        malformed_control.insert(misplaced.name.clone(),misplaced);
-        let diagnostics = public_raw_header_failures("control", &malformed_control, &control_schema);
-        for fragment in ["missing bias control_layers.14.after_proj.bias",
-            "unexpected raw key control_layers.1.before_proj.weight"] {
-            assert!(diagnostics.iter().any(|line| line.contains(fragment)), "PUBLIC_CONTROL_AGGREGATE_DIAGNOSTIC_MISSING {fragment}");
+        malformed_control.insert(misplaced.name.clone(), misplaced);
+        let diagnostics =
+            public_raw_header_failures("control", &malformed_control, &control_schema);
+        for fragment in [
+            "missing bias control_layers.14.after_proj.bias",
+            "unexpected raw key control_layers.1.before_proj.weight",
+        ] {
+            assert!(
+                diagnostics.iter().any(|line| line.contains(fragment)),
+                "PUBLIC_CONTROL_AGGREGATE_DIAGNOSTIC_MISSING {fragment}"
+            );
         }
         eprintln!("PUBLIC_AGGREGATE_RAW_SCHEMA_V1 base_headers={} control_headers={} base_packed_linears={} production_constructor_views=2",
             raw_base.len(),raw_control.len(),base_schema.iter().filter(|(name,(dtype,_))| name.ends_with(".weight") && *dtype == "U32").count());
@@ -1867,86 +2255,183 @@ mod original_z_execution_sidecar_tests {
     ) -> FixturePurposes {
         let has_control = matches!(mode, ManualMode::Control | ManualMode::ControlReference);
         let has_reference = matches!(mode, ManualMode::Reference | ManualMode::ControlReference);
-        let provider = if has_control { crate::zimage::Z_IMAGE_TURBO_CONTROL_ID } else { crate::zimage::Z_IMAGE_TURBO_ID };
-        let mut base = crate::zimage::z_image_turbo_load_spec(WeightsSource::Dir(root.to_owned()),
-            has_control.then(|| WeightsSource::File(control.to_owned())));
+        let provider = if has_control {
+            crate::zimage::Z_IMAGE_TURBO_CONTROL_ID
+        } else {
+            crate::zimage::Z_IMAGE_TURBO_ID
+        };
+        let mut base = crate::zimage::z_image_turbo_load_spec(
+            WeightsSource::Dir(root.to_owned()),
+            has_control.then(|| WeightsSource::File(control.to_owned())),
+        );
         base.quantize = Some(Quant::Q8);
         let (mut spec, strategy, position) = match endpoint {
             Some(kind) => {
-                let (spec, strategy) = configured_endpoint(registry, provider, &base, kind).unwrap();
-                (spec, strategy, if kind == AnchorKind::Resident { Position::ResidentEndpoint } else { Position::OptimizedEndpoint })
+                let (spec, strategy) =
+                    configured_endpoint(registry, provider, &base, kind).unwrap();
+                (
+                    spec,
+                    strategy,
+                    if kind == AnchorKind::Resident {
+                        Position::ResidentEndpoint
+                    } else {
+                        Position::OptimizedEndpoint
+                    },
+                )
             }
             None => (base, MemoryStrategy::Resident, Position::Intermediate),
         };
-        let contract = registry.memory_strategy_contract(provider, &spec).unwrap().unwrap();
-        let selection = *contract.selection_space(strategy, numeric_tier(&spec), false).unwrap().last().unwrap();
+        let contract = registry
+            .memory_strategy_contract(provider, &spec)
+            .unwrap()
+            .unwrap();
+        let selection = *contract
+            .selection_space(strategy, numeric_tier(&spec), false)
+            .unwrap()
+            .last()
+            .unwrap();
         let execution = execution_for(provider, &contract, &selection);
         // Match the legacy CALLER fact: the original DTO omits control, and the actual manual
         // argument supplies it. project() describes that argument without altering execution.
         spec.control = None;
         let projection = shared::project(Inputs {
-            provider, mode, position, original_spec: &spec,
-            actual_text_source: &root.join("text_encoder"), actual_control_source: control,
-            width: 32, height: 32, count: 1, execution,
-            hint: image(), init: has_reference.then(image), control_kind: ControlKind::Pose,
+            provider,
+            mode,
+            position,
+            original_spec: &spec,
+            actual_text_source: &root.join("text_encoder"),
+            actual_control_source: control,
+            width: 32,
+            height: 32,
+            count: 1,
+            execution,
+            hint: image(),
+            init: has_reference.then(image),
+            control_kind: ControlKind::Pose,
             // These are explicitly HEADER-TRANSPORT fixtures, not native Snapshot configuration
             // or a claim that sparse headers can execute. Z's separate metadata-only unit binds
             // the actual private Snapshot fields and SAME native-free window selectors.
-            configurations: std::array::from_fn(|_| "catalog sparse-header metadata transport only".into()),
-            original_factory_source: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../mlx-gen-z-image/src/ios_pricing_tests.rs")),
+            configurations: std::array::from_fn(|_| {
+                "catalog sparse-header metadata transport only".into()
+            }),
+            original_factory_source: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../mlx-gen-z-image/src/ios_pricing_tests.rs"
+            )),
             actual_vocab_size: i32::try_from(mlx_gen_z_image::ENCODER_CONTRACT.vocab_size).unwrap(),
-            te_explicit_window: execution.transformer_window_size.map(|window| usize::try_from(window).expect("u32 window fits usize on macOS")),
-            te_full_cover_fallback: None, dit_selector_window: execution.transformer_window_size.map(|window| usize::try_from(window).expect("u32 window fits usize on macOS")),
+            te_explicit_window: execution
+                .transformer_window_size
+                .map(|window| usize::try_from(window).expect("u32 window fits usize on macOS")),
+            te_full_cover_fallback: None,
+            dit_selector_window: execution
+                .transformer_window_size
+                .map(|window| usize::try_from(window).expect("u32 window fits usize on macOS")),
             actual_te_layers: mlx_gen_z_image::ENCODER_CONTRACT.num_hidden_layers,
             actual_base_blocks: mlx_gen_z_image::ZImageTransformerConfig::turbo().n_layers,
             actual_control_blocks: None,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(projection.provider, provider);
-        assert_eq!((projection.request.width, projection.request.height), (32, 32),
-            "PRIVATE_ORIGINAL_GEOMETRY_NOT_RESCALED");
-        assert_eq!(projection.program["geometry"], serde_json::json!({"width":32,"height":32,"count":1}),
-            "PRIVATE_PROGRAM_GEOMETRY_NOT_PUBLIC_FIXTURE");
+        assert_eq!(
+            (projection.request.width, projection.request.height),
+            (32, 32),
+            "PRIVATE_ORIGINAL_GEOMETRY_NOT_RESCALED"
+        );
+        assert_eq!(
+            projection.program["geometry"],
+            serde_json::json!({"width":32,"height":32,"count":1}),
+            "PRIVATE_PROGRAM_GEOMETRY_NOT_PUBLIC_FIXTURE"
+        );
 
         // A separate valid PUBLIC metadata transport request, at this actual descriptor's minimum.
         // It shares the declared roles/sampling, but is NOT the historical manual execution. Never
         // attach the private program/digest to it or bypass validate_actual/evidence_key.
-        let descriptor = registry.generators().map(|entry| (entry.descriptor)())
-            .find(|descriptor| descriptor.id == provider).unwrap();
+        let descriptor = registry
+            .generators()
+            .map(|entry| (entry.descriptor)())
+            .find(|descriptor| descriptor.id == provider)
+            .unwrap();
         let public_edge = u32::try_from(descriptor.capabilities.min_size).unwrap();
         let public_request = mlx_gen::gen_core::GenerationRequest {
-            width: public_edge, height: public_edge, ..projection.request.clone()
+            width: public_edge,
+            height: public_edge,
+            ..projection.request.clone()
         };
         let private_work = IosWork::Generate(projection.request);
         let core_binding = work_binding(&private_work);
         let sidecar_binding = private_execution_binding(core_binding, &projection.program);
         let public_work = IosWork::Generate(public_request);
         let public_binding = work_binding(&public_work);
-        assert_ne!(public_binding, core_binding, "PUBLIC_AND_PRIVATE_WORK_ARE_DISTINCT");
+        assert_ne!(
+            public_binding, core_binding,
+            "PUBLIC_AND_PRIVATE_WORK_ARE_DISTINCT"
+        );
         let wrong_public_default = IosWork::Generate(mlx_gen::gen_core::GenerationRequest {
-            width: public_edge, height: public_edge, count: 1,
-            memory: Some(mlx_gen::gen_core::GenerationMemory::default()), ..Default::default()
+            width: public_edge,
+            height: public_edge,
+            count: 1,
+            memory: Some(mlx_gen::gen_core::GenerationMemory::default()),
+            ..Default::default()
         });
-        assert_ne!(public_binding, work_binding(&wrong_public_default),
-            "VALID_PUBLIC_ROLES_SAMPLING_AND_EXECUTION_ARE_BOUND");
-        let candidate = build_candidate(registry, provider, projection.described_spec,
-            Some(selection), strategy, public_work).unwrap();
+        assert_ne!(
+            public_binding,
+            work_binding(&wrong_public_default),
+            "VALID_PUBLIC_ROLES_SAMPLING_AND_EXECUTION_ARE_BOUND"
+        );
+        let candidate = build_candidate(
+            registry,
+            provider,
+            projection.described_spec,
+            Some(selection),
+            strategy,
+            public_work,
+        )
+        .unwrap();
         assert_eq!(candidate.execution, execution);
-        assert_eq!(work_binding(&candidate.work), public_binding, "VALID_PUBLIC_TYPED_WORK_BINDING");
+        assert_eq!(
+            work_binding(&candidate.work),
+            public_binding,
+            "VALID_PUBLIC_TYPED_WORK_BINDING"
+        );
         // Resolve EVERY actual production target/schema before the positive EvidenceKey. This
         // is metadata validation only; it loads no model and is not catalog execution coverage.
-        let _configured_graph = mlx_gen_z_image::ios_pricing::configured_overlay_semantic_facts_for(
-            provider, &candidate.spec).expect("PUBLIC_COMPLETE_ACTUAL_CONFIGURED_PROJECTION_SCHEMA");
-        let key = evidence_key(registry, &candidate,
-            "valid-public-metadata-transport-NOT-original-execution").unwrap();
-        assert_eq!((key.width, key.height), (public_edge, public_edge),
-            "VALID_PUBLIC_DESCRIPTOR_MINIMUM_GEOMETRY");
+        let _configured_graph =
+            mlx_gen_z_image::ios_pricing::configured_overlay_semantic_facts_for(
+                provider,
+                &candidate.spec,
+            )
+            .expect("PUBLIC_COMPLETE_ACTUAL_CONFIGURED_PROJECTION_SCHEMA");
+        let key = evidence_key(
+            registry,
+            &candidate,
+            "valid-public-metadata-transport-NOT-original-execution",
+        )
+        .unwrap();
+        assert_eq!(
+            (key.width, key.height),
+            (public_edge, public_edge),
+            "VALID_PUBLIC_DESCRIPTOR_MINIMUM_GEOMETRY"
+        );
         // Exercise the actual classifier separately too, not a test-local copy of its policy.
-        let class = crate::sampling::from_token(provider, key.sampling_recipe.as_deref().unwrap()).unwrap();
-        let variant = crate::pricing::anchor_variant_for_roles(provider, &key.mode, &key.tier,
-            Some(class.allocation_class()), key.reference_count, key.mask_count, key.control_count).unwrap();
+        let class =
+            crate::sampling::from_token(provider, key.sampling_recipe.as_deref().unwrap()).unwrap();
+        let variant = crate::pricing::anchor_variant_for_roles(
+            provider,
+            &key.mode,
+            &key.tier,
+            Some(class.allocation_class()),
+            key.reference_count,
+            key.mask_count,
+            key.control_count,
+        )
+        .unwrap();
         assert!(key.family().unwrap().variant.starts_with(variant.as_str()));
-        FixturePurposes { public_key: key, private_core_binding: core_binding,
-            private_binding: sidecar_binding, private_program: projection.program }
+        FixturePurposes {
+            public_key: key,
+            private_core_binding: core_binding,
+            private_binding: sidecar_binding,
+            private_program: projection.program,
+        }
     }
 
     #[test]
@@ -1965,20 +2450,44 @@ mod original_z_execution_sidecar_tests {
         // exactly this OWN fixture location; it does not rewrite any literal configured path,
         // private original-program binding, or the later real source seal.
         let discovery_roots = mlx_gen::gen_core::hf_cache_discovery_roots(dir.path()).unwrap();
-        let _discovery = mlx_gen_z_image::ENCODER_CONTRACT.validate_source_for_discovery(
-            &WeightsSource::Dir(dir.path().join("text_encoder")), &discovery_roots)
+        let _discovery = mlx_gen_z_image::ENCODER_CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(dir.path().join("text_encoder")),
+                &discovery_roots,
+            )
             .expect("PUBLIC_COMPLETE_TE_HEADER_CONFIG_DISCOVERY");
         validate_public_raw_and_constructor_schemas(dir.path(), &control);
-        let te_epoch=public_te_epoch(dir.path());
+        let te_epoch = public_te_epoch(dir.path());
         let registry = crate::provider_registry().unwrap();
-        let FixturePurposes { public_key: resident, private_core_binding: resident_binding,
-            private_program: resident_program, .. } = classified(&registry, dir.path(), &control,
-            ManualMode::Control, Some(AnchorKind::Resident));
-        let FixturePurposes { public_key: optimized, private_core_binding: optimized_binding,
-            private_program: optimized_program, .. } = classified(&registry, dir.path(), &control,
-            ManualMode::Control, Some(AnchorKind::Optimized));
-        let FixturePurposes { public_key: intermediate, private_program: intermediate_program, .. } =
-            classified(&registry, dir.path(), &control, ManualMode::Control, None);
+        let FixturePurposes {
+            public_key: resident,
+            private_core_binding: resident_binding,
+            private_program: resident_program,
+            ..
+        } = classified(
+            &registry,
+            dir.path(),
+            &control,
+            ManualMode::Control,
+            Some(AnchorKind::Resident),
+        );
+        let FixturePurposes {
+            public_key: optimized,
+            private_core_binding: optimized_binding,
+            private_program: optimized_program,
+            ..
+        } = classified(
+            &registry,
+            dir.path(),
+            &control,
+            ManualMode::Control,
+            Some(AnchorKind::Optimized),
+        );
+        let FixturePurposes {
+            public_key: intermediate,
+            private_program: intermediate_program,
+            ..
+        } = classified(&registry, dir.path(), &control, ManualMode::Control, None);
         assert_eq!(resident.family().unwrap(), optimized.family().unwrap());
         assert_eq!(optimized.family().unwrap(), intermediate.family().unwrap());
         assert_ne!(resident.load_form, intermediate.load_form);
@@ -1986,56 +2495,101 @@ mod original_z_execution_sidecar_tests {
         assert_ne!(resident_binding, optimized_binding);
         assert_eq!(resident_program["position"], "resident_endpoint");
         assert_eq!(optimized_program["position"], "optimized_endpoint");
-        assert_eq!(intermediate_program["position"], "intermediate_deferred_full_cover_unstaged");
+        assert_eq!(
+            intermediate_program["position"],
+            "intermediate_deferred_full_cover_unstaged"
+        );
         let mut families = Vec::new();
-        for mode in [ManualMode::Text, ManualMode::Reference, ManualMode::Control, ManualMode::ControlReference] {
-            let FixturePurposes { public_key: key, private_core_binding: binding,
-                private_binding: sidecar_binding, private_program: program } =
-                classified(&registry, dir.path(), &control, mode, None);
+        for mode in [
+            ManualMode::Text,
+            ManualMode::Reference,
+            ManualMode::Control,
+            ManualMode::ControlReference,
+        ] {
+            let FixturePurposes {
+                public_key: key,
+                private_core_binding: binding,
+                private_binding: sidecar_binding,
+                private_program: program,
+            } = classified(&registry, dir.path(), &control, mode, None);
             families.push(key.family().unwrap());
             let wrong_default = IosWork::Generate(mlx_gen::gen_core::GenerationRequest {
-                width: 32, height: 32, count: 1,
-                memory: Some(mlx_gen::gen_core::GenerationMemory::default()), ..Default::default()
+                width: 32,
+                height: 32,
+                count: 1,
+                memory: Some(mlx_gen::gen_core::GenerationMemory::default()),
+                ..Default::default()
             });
-            assert_ne!(binding, work_binding(&wrong_default), "default DTO is not actual manual execution");
+            assert_ne!(
+                binding,
+                work_binding(&wrong_default),
+                "default DTO is not actual manual execution"
+            );
             // Manual start is NOT silently manufactured as an authored strength or lost from the
             // private full binding. It remains additional program context, not catalog approval.
             let mut changed = program.clone();
             changed["manual_flow"]["start"] = serde_json::json!(99);
-            assert_ne!(sidecar_binding, private_execution_binding(binding, &changed));
+            assert_ne!(
+                sidecar_binding,
+                private_execution_binding(binding, &changed)
+            );
             // HOST source-description variants only: no original constant/factory, Array or
             // runtime request is changed. A native capture or source-eligible alternate execution
             // is NOT claimed by these private digest-discrimination assertions.
-            let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../mlx-gen-z-image/src/ios_pricing_tests.rs"));
+            let source = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../mlx-gen-z-image/src/ios_pricing_tests.rs"
+            ));
             let window = i32::try_from(program["tokens"]["window"].as_i64().unwrap()).unwrap();
             let valid = i32::try_from(program["tokens"]["valid_tokens"].as_i64().unwrap()).unwrap();
-            let vocab = i32::try_from(program["tokens"]["vocabulary"]["size"].as_i64().unwrap()).unwrap();
+            let vocab =
+                i32::try_from(program["tokens"]["vocabulary"]["size"].as_i64().unwrap()).unwrap();
             for (name, old, new) in [("VALID", valid, valid - 1), ("WINDOW", window, window + 1)] {
                 let old = format!("const {name}: i32 = {old};");
                 let new = format!("const {name}: i32 = {new};");
                 assert_eq!(source.matches(old.as_str()).count(), 1);
                 let hypothetical_source = source.replacen(old.as_str(), new.as_str(), 1);
                 let mut changed = program.clone();
-                changed["tokens"] = shared::original_token_program(&hypothetical_source, vocab).unwrap();
-                assert_ne!(sidecar_binding, private_execution_binding(binding, &changed),
-                    "valid-token/window description must be privately bound");
+                changed["tokens"] =
+                    shared::original_token_program(&hypothetical_source, vocab).unwrap();
+                assert_ne!(
+                    sidecar_binding,
+                    private_execution_binding(binding, &changed),
+                    "valid-token/window description must be privately bound"
+                );
             }
             let mut changed = program.clone();
-            let mut mask: Vec<i32> = serde_json::from_value(changed["tokens"]["attention_mask"]["values"].clone()).unwrap();
+            let mut mask: Vec<i32> =
+                serde_json::from_value(changed["tokens"]["attention_mask"]["values"].clone())
+                    .unwrap();
             mask.swap(0, usize::try_from(valid).unwrap()); // same valid count, different mask positions
-            changed["tokens"]["attention_mask"]["values_sha256"] = serde_json::json!(shared::source_i32_values_hash(&mask));
+            changed["tokens"]["attention_mask"]["values_sha256"] =
+                serde_json::json!(shared::source_i32_values_hash(&mask));
             changed["tokens"]["attention_mask"]["values"] = serde_json::json!(mask);
-            assert_ne!(sidecar_binding, private_execution_binding(binding, &changed),
-                "attention mask values/positions must be privately bound");
+            assert_ne!(
+                sidecar_binding,
+                private_execution_binding(binding, &changed),
+                "attention mask values/positions must be privately bound"
+            );
             let mut changed = program.clone();
-            changed["tokens"] = shared::original_token_program(source, vocab.checked_add(1).unwrap()).unwrap();
-            assert_ne!(sidecar_binding, private_execution_binding(binding, &changed),
-                "actual embedding vocabulary dependency must be privately bound");
+            changed["tokens"] =
+                shared::original_token_program(source, vocab.checked_add(1).unwrap()).unwrap();
+            assert_ne!(
+                sidecar_binding,
+                private_execution_binding(binding, &changed),
+                "actual embedding vocabulary dependency must be privately bound"
+            );
         }
         for (i, family) in families.iter().enumerate() {
-            assert!(families[..i].iter().all(|other| other != family),
-                "actual role families must not borrow text evidence");
+            assert!(
+                families[..i].iter().all(|other| other != family),
+                "actual role families must not borrow text evidence"
+            );
         }
-        assert_eq!(public_te_epoch(dir.path()),te_epoch,"PUBLIC_ONE_IMMUTABLE_TE_EPOCH_ACROSS_CASES");
+        assert_eq!(
+            public_te_epoch(dir.path()),
+            te_epoch,
+            "PUBLIC_ONE_IMMUTABLE_TE_EPOCH_ACROSS_CASES"
+        );
     }
 }

@@ -106,7 +106,7 @@ fn row(registry: &ProviderRegistry, c: &IosCandidate, bytes: u64) -> AnchorRow {
         AnchorKind::Optimized
     };
     evidence::fixture::completed(
-        evidence_key(registry, c, DEVICE).unwrap(),
+        crate::source_work::fixture_key(registry, c, DEVICE),
         kind,
         evidence::AnchorSelection::from_parts(
             c.context.selection.strategy,
