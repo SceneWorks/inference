@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "ce06c260be82e271e48ff7dd22ba761930684752bac4021fd3d1661a4ec24b37",
+  "rust_proof_closure_sha256": "9169439c7c236fb5425cdb76e86bac0a04ecba3a0afffdd18b7f7677452bc3b4",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -216,7 +216,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
-      "sha256": "0abf11db694b46a16e9d8558fb5fd48fdae30bce8f52a35cbbe8a212fd08ea56"
+      "sha256": "4734353a31a00f24f8436f80d151e7670939eb62c9cbe9901249833d96f00660"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
@@ -236,7 +236,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/native_ledger.rs",
-      "sha256": "75568917394e40ab9f5b3cf8e3711e9ef827431f9f9f33e6b80d16512e458d6f"
+      "sha256": "dcd14d2df75d43fe0cb705cd6cc783a3996e98253860d25115f7c6bcbe14a77c"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
@@ -1458,11 +1458,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "78b71f7f40a41a0b3cd18bec7149abe4e2a84f9852d253bde971dbfa3c065d31",
-    "classification_sha256": "d1fb57e95c9a5f6f117ae3e8d9551ace9310679451bbc8fb18af90dfadc54e79",
-    "selected_Rust_FQNs": 108,
-    "HOST_logical": 92,
-    "HOST_expected_PASS_rows": 93,
+    "inventory_sha256": "ab2e3d20615d00f2072d8d489ddbd8fb231b4a723c870a439f14f37cc801bcd5",
+    "classification_sha256": "4261eacc94d122d83bcb5d1bc52abb9ce1214606eb9174e0796123eecf9bf08c",
+    "selected_Rust_FQNs": 115,
+    "HOST_logical": 98,
+    "HOST_expected_PASS_rows": 99,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

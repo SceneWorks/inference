@@ -47,7 +47,7 @@ fn ceil(n: u64, d: u64) -> Result<u64> {
         return Err(overflow());
     }
     (n / d)
-        .checked_add(u64::from(n % d != 0))
+        .checked_add(u64::from(!n.is_multiple_of(d)))
         .ok_or_else(overflow)
 }
 macro_rules! p {
@@ -71,6 +71,73 @@ fn backing_upper(n: u64, page: u64) -> Result<u64> {
     let slack = product(&[2, page])?;
     let extra = r.min(slack);
     plus(r, extra)
+}
+
+/// A quantized projection's packed codes, scale count and affine group width.
+#[derive(Clone, Copy)]
+struct QmmStorage {
+    codes: u64,
+    scales: u64,
+    group: u64,
+}
+
+/// One scaled-dot-product attention call's batch, head counts, query/key rows and head width.
+#[derive(Clone, Copy)]
+struct SdpaShape {
+    b: u64,
+    heads: u64,
+    kv_heads: u64,
+    q: u64,
+    k: u64,
+    dim: u64,
+}
+
+/// An attention block's query and key/value head counts and per-head width.
+#[derive(Clone, Copy)]
+struct AttentionHeads {
+    heads: u64,
+    kv_heads: u64,
+    dim: u64,
+}
+
+/// An attention block's element widths: residual stream, query, key and value.
+#[derive(Clone, Copy)]
+struct AttentionWidths {
+    width: u64,
+    qwidth: u64,
+    kwidth: u64,
+    vwidth: u64,
+}
+
+/// A self-attention block's model width, head count and input element width.
+#[derive(Clone, Copy)]
+struct SelfAttentionShape {
+    dim: u64,
+    heads: u64,
+    input_width: u64,
+}
+
+/// A self-attention block's QK-norm, rotary and mask options.
+#[derive(Clone, Copy)]
+struct SelfAttentionOptions {
+    qk: bool,
+    rope: bool,
+    mask: bool,
+}
+
+/// A text block's head count and residual-stream element width.
+#[derive(Clone, Copy)]
+struct TextBlockWidth {
+    heads: u64,
+    stream_width: u64,
+}
+
+/// A backbone forward's row-major order, first-call and streamed-residency flags.
+#[derive(Clone, Copy)]
+struct ForwardMode {
+    by_row: bool,
+    first: bool,
+    streamed: bool,
 }
 
 struct NativeLedger {
@@ -176,10 +243,13 @@ impl NativeLedger {
         rows: u64,
         input: u64,
         out: u64,
-        codes: u64,
-        scales: u64,
-        group: u64,
+        storage: QmmStorage,
     ) -> Result<()> {
+        let QmmStorage {
+            codes,
+            scales,
+            group,
+        } = storage;
         self.array(width, p!(rows, out))?;
         // CPU ensure_row_contiguous / Metal copy_unless_contiguous: at most one per operand.
         self.array(width, p!(rows, input))?;
@@ -190,7 +260,7 @@ impl NativeLedger {
             // path is conditional on architecture; charging its actual split law is conservative.
             let denom = p!(ceil(out, 32)?, ceil(rows, 32)?);
             let mut parts = (512 / denom).max(1).min(input / group);
-            while parts > 1 && input % p!(parts, group) != 0 {
+            while parts > 1 && !input.is_multiple_of(p!(parts, group)) {
                 parts -= 1;
             }
             if parts > 1 {
@@ -310,19 +380,16 @@ impl NativeLedger {
         self.repeated(4, p!(positions, dim / 2), 2)
     }
     /// Concrete fast::SDPA call, before the consumer's BHSD->BSHD reshape.
-    fn sdpa(
-        &mut self,
-        width: u64,
-        b: u64,
-        heads: u64,
-        kv_heads: u64,
-        q: u64,
-        k: u64,
-        dim: u64,
-        mask: bool,
-        causal: bool,
-    ) -> Result<()> {
-        if heads == 0 || kv_heads == 0 || heads % kv_heads != 0 || dim == 0 {
+    fn sdpa(&mut self, width: u64, shape: SdpaShape, mask: bool, causal: bool) -> Result<()> {
+        let SdpaShape {
+            b,
+            heads,
+            kv_heads,
+            q,
+            k,
+            dim,
+        } = shape;
+        if heads == 0 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) || dim == 0 {
             return Err(Error::Unsupported(
                 "Iris native SDPA has an invalid head geometry".into(),
             ));
@@ -405,16 +472,22 @@ impl NativeLedger {
         &mut self,
         b: u64,
         n: u64,
-        heads: u64,
-        kv_heads: u64,
-        dim: u64,
-        width: u64,
-        qwidth: u64,
-        kwidth: u64,
-        vwidth: u64,
+        heads: AttentionHeads,
+        widths: AttentionWidths,
         mask: bool,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<()> {
+        let AttentionHeads {
+            heads,
+            kv_heads,
+            dim,
+        } = heads;
+        let AttentionWidths {
+            width,
+            qwidth,
+            kwidth,
+            vwidth,
+        } = widths;
         self.cast(p!(b, n, heads, dim), qwidth, width)?;
         self.cast(p!(b, n, kv_heads, dim), kwidth, width)?;
         self.cast(p!(b, n, kv_heads, dim), vwidth, width)?;
@@ -433,7 +506,19 @@ impl NativeLedger {
         let mut calls = 0;
         while start < n {
             let count = block.min(n - start);
-            self.sdpa(width, b, heads, kv_heads, count, n, dim, mask, false)?;
+            self.sdpa(
+                width,
+                SdpaShape {
+                    b,
+                    heads,
+                    kv_heads,
+                    q: count,
+                    k: n,
+                    dim,
+                },
+                mask,
+                false,
+            )?;
             start = plus(start, count)?;
             calls = plus(calls, 1)?;
         }
@@ -471,9 +556,11 @@ impl Graph<'_> {
                 rows,
                 padded,
                 out,
-                codes,
-                header_elements(scales)?,
-                QUANT_GROUP_SIZE as u64,
+                QmmStorage {
+                    codes,
+                    scales: header_elements(scales)?,
+                    group: QUANT_GROUP_SIZE as u64,
+                },
             )?;
             if self.bb.headers.contains_key(&format!("{path}.bias")) {
                 // Portable separate epilogue is an upper for Metal's fused output-bias variant.
@@ -487,6 +574,14 @@ impl Graph<'_> {
                 )));
             }
             self.l.matmul(cw, 1, rows, out, input)?;
+        }
+        if let Some(adapters) = self.bb.adapter_facts.get(path) {
+            let compute = if cw == 4 {
+                mlx_rs::Dtype::Float32
+            } else {
+                mlx_rs::Dtype::Bfloat16
+            };
+            installed_adapters::forward(self.l, adapters, rows, input, out, compute)?;
         }
         Ok(out)
     }
@@ -526,14 +621,16 @@ impl Graph<'_> {
         path: &str,
         b: u64,
         n: u64,
-        dim: u64,
-        heads: u64,
-        input_width: u64,
-        qk: bool,
-        rope: bool,
-        mask: bool,
+        shape: SelfAttentionShape,
+        options: SelfAttentionOptions,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<()> {
+        let SelfAttentionShape {
+            dim,
+            heads,
+            input_width,
+        } = shape;
+        let SelfAttentionOptions { qk, rope, mask } = options;
         let rows = p!(b, n);
         self.linear(&format!("{path}.qkv"), rows, dim, input_width)?;
         if qk {
@@ -548,13 +645,17 @@ impl Graph<'_> {
         self.l.attention(
             b,
             n,
-            heads,
-            heads,
-            dim / heads,
-            self.bb.cw,
-            qw,
-            qw,
-            self.bb.cw,
+            AttentionHeads {
+                heads,
+                kv_heads: heads,
+                dim: dim / heads,
+            },
+            AttentionWidths {
+                width: self.bb.cw,
+                qwidth: qw,
+                kwidth: qw,
+                vwidth: self.bb.cw,
+            },
             mask,
             plan,
         )?;
@@ -566,23 +667,30 @@ impl Graph<'_> {
         path: &str,
         b: u64,
         n: u64,
-        heads: u64,
-        stream_width: u64,
+        width: TextBlockWidth,
         refiner: bool,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<()> {
+        let TextBlockWidth {
+            heads,
+            stream_width,
+        } = width;
         let rows = p!(b, n);
         let dim = self.norm(&format!("{path}.norm1"), rows, stream_width)?;
         self.self_attention(
             &format!("{path}.attn"),
             b,
             n,
-            dim,
-            heads,
-            4,
-            refiner && self.bb.cfg.qk_norm,
-            false,
-            refiner,
+            SelfAttentionShape {
+                dim,
+                heads,
+                input_width: 4,
+            },
+            SelfAttentionOptions {
+                qk: refiner && self.bb.cfg.qk_norm,
+                rope: false,
+                mask: refiner,
+            },
             plan,
         )?;
         // Residual promotion (layer stack f32; refiner compute-width).
@@ -654,13 +762,17 @@ impl Graph<'_> {
             self.l.attention(
                 b,
                 nt,
-                heads,
-                kvheads,
-                d / heads,
-                self.bb.cw,
-                4,
-                4,
-                self.bb.cw,
+                AttentionHeads {
+                    heads,
+                    kv_heads: kvheads,
+                    dim: d / heads,
+                },
+                AttentionWidths {
+                    width: self.bb.cw,
+                    qwidth: 4,
+                    kwidth: 4,
+                    vwidth: self.bb.cw,
+                },
                 false,
                 plan,
             )?;
@@ -705,13 +817,17 @@ impl Graph<'_> {
             self.l.attention(
                 b,
                 nt,
-                heads,
-                kvheads,
-                d / heads,
-                self.bb.cw,
-                4,
-                4,
-                self.bb.cw,
+                AttentionHeads {
+                    heads,
+                    kv_heads: kvheads,
+                    dim: d / heads,
+                },
+                AttentionWidths {
+                    width: self.bb.cw,
+                    qwidth: 4,
+                    kwidth: 4,
+                    vwidth: self.bb.cw,
+                },
                 false,
                 plan,
             )?;
@@ -758,12 +874,16 @@ impl Graph<'_> {
             &format!("{path}.attn"),
             b,
             n,
-            compact,
-            self.bb.cfg.pixel.num_heads as u64,
-            self.bb.cw,
-            self.bb.cfg.qk_norm,
-            true,
-            false,
+            SelfAttentionShape {
+                dim: compact,
+                heads: self.bb.cfg.pixel.num_heads as u64,
+                input_width: self.bb.cw,
+            },
+            SelfAttentionOptions {
+                qk: self.bb.cfg.qk_norm,
+                rope: true,
+                mask: false,
+            },
             plan,
         )?;
         self.linear(&format!("{path}.expand"), rows, compact, self.bb.cw)?;
@@ -788,16 +908,19 @@ impl Graph<'_> {
         b: u64,
         h: u64,
         w: u64,
-        by_row: bool,
-        first: bool,
-        streamed: bool,
+        mode: ForwardMode,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<()> {
+        let ForwardMode {
+            by_row,
+            first,
+            streamed,
+        } = mode;
         let m = self.bb.cfg.clone();
         let patch = m.patch_size as u64;
         if patch == 0
-            || h % patch != 0
-            || w % patch != 0
+            || !h.is_multiple_of(patch)
+            || !w.is_multiple_of(patch)
             || m.num_heads == 0
             || m.pixel.num_heads == 0
         {
@@ -836,8 +959,10 @@ impl Graph<'_> {
                 &format!("y_embedder.layer_blocks.{i}"),
                 p!(b, t),
                 self.bb.layers,
-                m.text_lap_num_heads as u64,
-                4,
+                TextBlockWidth {
+                    heads: m.text_lap_num_heads as u64,
+                    stream_width: 4,
+                },
                 false,
                 plan,
             )?;
@@ -851,8 +976,10 @@ impl Graph<'_> {
                 &format!("y_embedder.refiner.blocks.{i}"),
                 b,
                 t,
-                m.num_heads as u64,
-                cw,
+                TextBlockWidth {
+                    heads: m.num_heads as u64,
+                    stream_width: cw,
+                },
                 true,
                 plan,
             )?;
@@ -1060,7 +1187,7 @@ fn quantize_stored_grid(
     group: u64,
     bits: u64,
 ) -> Result<()> {
-    if input % group != 0 || !matches!(bits, 4 | 8) {
+    if !input.is_multiple_of(group) || !matches!(bits, 4 | 8) {
         return Err(overflow());
     }
     let n = p!(rows, input);
@@ -1184,10 +1311,7 @@ impl TowerFacts {
         output: u64,
     ) -> Result<()> {
         let key = format!("{path}.weight");
-        let weight = self
-            .built
-            .get(&key)
-            .ok_or_else(|| Error::MissingTensor(key))?;
+        let weight = self.built.get(&key).ok_or(Error::MissingTensor(key))?;
         if let Some(scales) = self.built.get(&format!("{path}.scales")) {
             let group = input
                 .checked_div(scales.shape[1] as u64)
@@ -1198,9 +1322,11 @@ impl TowerFacts {
                 rows,
                 input,
                 output,
-                header_elements(weight)?,
-                header_elements(scales)?,
-                group,
+                QmmStorage {
+                    codes: header_elements(weight)?,
+                    scales: header_elements(scales)?,
+                    group,
+                },
             )?;
         } else {
             l.matmul(2, 1, rows, output, input)?;
@@ -1444,7 +1570,9 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
     let path = resources
         .backbone_dir
         .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
-    let bb = priced_backbone(
+    crate::memory_strategy::refuse_streamed_adapters(crate::model::MODEL_ID, req.spec)
+        .map_err(Error::from)?;
+    let mut bb = priced_backbone(
         &config,
         &path,
         "",
@@ -1465,6 +1593,22 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
         None
     };
     let tower = TowerFacts::read(&resources.text_encoder_dir, req.spec.quantize, streamed)?;
+    let (adapter_inventory, packed_hosts) = if req.spec.adapters.is_empty() {
+        (crate::adapters::AdapterHeaderInventory::default(), 0)
+    } else {
+        let (projections, packed) = crate::adapters::projection_shapes_from_headers(&path)?;
+        (
+            crate::adapters::header_inventory(
+                &req.spec.adapters,
+                &projections,
+                compute_dtype(req.spec.precision),
+                IrisTask::Generation,
+                crate::model::MODEL_ID,
+            )?,
+            packed,
+        )
+    };
+    bb.facts.adapter_facts = adapter_inventory.projections.clone();
     // Residency::from_policy(Resident) loads both initially; run_request_scoped(staged) evicts
     // that pair and loads both again. Sequential starts cold and loads once inside the request.
     // Counting both pairs never credits their drops (gen-core/residency.rs:192-210,423-485).
@@ -1479,6 +1623,7 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
             |name| !streamed || Stack::of(name).is_none(),
             quantize,
         )?;
+        installed_adapters::load(l, &adapter_inventory, packed_hosts)?;
     }
     let tokenizer = mlx_gen::gen_core::tokenizer::TextTokenizer::from_file(
         resources.text_encoder_dir.join("tokenizer.json"),
@@ -1554,9 +1699,11 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
                 rows,
                 h,
                 w,
-                rungs.pixel_rows,
-                first_forward,
-                streamed,
+                ForwardMode {
+                    by_row: rungs.pixel_rows,
+                    first: first_forward,
+                    streamed,
+                },
                 attention,
             )?;
             first_forward = false;
@@ -1577,6 +1724,13 @@ fn generation_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result
 }
 
 fn depth_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> {
+    // depth.rs:126-143 refuses installed adapters on the task itself.
+    if !req.spec.adapters.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "{}: LoadSpec::adapters is not supported by the Iris-3B depth task",
+            crate::depth::DEPTH_MODEL_ID
+        )));
+    }
     let actual = req.depth.ok_or_else(|| {
         Error::Unsupported("Iris native depth recipe requires actual source/resolution".into())
     })?;
@@ -1649,9 +1803,11 @@ fn depth_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> 
         1,
         h,
         w,
-        false,
-        true,
-        streamed,
+        ForwardMode {
+            by_row: false,
+            first: true,
+            streamed,
+        },
         mlx_gen::AttentionPlan::UNBOUNDED,
     )?;
     // depth_reducer_body is addmm, NOT a convolution lowering despite its checkpoint key.
@@ -1674,11 +1830,6 @@ pub(super) fn cumulative_native_upper(
         // metal/scaled_dot_product_attention.cpp:477 is the sole internal override. No inference
         // doc/runbook/supported product path exposes it; no execution witness binds its value.
         return Err(Error::Unsupported("Iris native certificate: MLX_SDPA_BLOCKS override is not bound by any execution witness".into()));
-    }
-    if !req.spec.adapters.is_empty() {
-        // nn::Linear::forward applies installed adapter reconstruction/residual graphs beyond the
-        // bare backbone. Those source-specific graphs are not the source closure of this recipe.
-        return Err(Error::Unsupported("Iris native certificate: installed adapter reconstruction/residual source graph is not bound by this recipe".into()));
     }
     let mut ledger = NativeLedger::new(page, backend)?;
     match req.provider {
@@ -1715,7 +1866,7 @@ fn decoder_attention(
     kvheads: u64,
     dim: u64,
 ) -> Result<()> {
-    if kvheads == 0 || heads == 0 || heads % kvheads != 0 {
+    if kvheads == 0 || heads == 0 || !heads.is_multiple_of(kvheads) {
         return Err(overflow());
     }
     let gqa = heads / kvheads;
@@ -1734,7 +1885,19 @@ fn decoder_attention(
         (rows < n).then_some((rows, rows))
     };
     let Some((rows, eval_rows)) = route else {
-        return l.sdpa(2, 1, heads, kvheads, n, n, dim, false, true);
+        return l.sdpa(
+            2,
+            SdpaShape {
+                b: 1,
+                heads,
+                kv_heads: kvheads,
+                q: n,
+                k: n,
+                dim,
+            },
+            false,
+            true,
+        );
     };
     let checkpoint = n > eval_rows;
     let (mut start, mut group_rows, mut group_calls, mut groups, mut calls) = (0, 0, 0, 0, 0);
@@ -1742,7 +1905,19 @@ fn decoder_attention(
         let count = rows.min(n - start);
         let end = plus(start, count)?;
         // sdpa_tile's q/K/V slicing is view-only. Its concrete primitive normalizers are in sdpa.
-        l.sdpa(2, 1, heads, kvheads, count, end, dim, false, true)?;
+        l.sdpa(
+            2,
+            SdpaShape {
+                b: 1,
+                heads,
+                kv_heads: kvheads,
+                q: count,
+                k: end,
+                dim,
+            },
+            false,
+            true,
+        )?;
         group_rows = plus(group_rows, count)?;
         group_calls = plus(group_calls, 1)?;
         calls = plus(calls, 1)?;
@@ -1832,5 +2007,1010 @@ mod tests {
         let mut ledger = NativeLedger::new(16_384, NativeBackend::Metal).unwrap();
         assert!(ledger.array(4, u64::MAX).is_err());
         assert!(ledger.repeated(4, 1, u64::MAX).is_err());
+    }
+}
+
+// Source-derived adapter reconstruction: the strict loader's scalar/cast/matmul/Kronecker/
+// Hadamard/Tucker graph. Greedy contraction selection mirrors the immutable adapter_load.rs;
+// native requests below are independently charged through this ledger's per-backend laws.
+mod installed_adapters {
+    use super::*;
+    use crate::adapters::{AdapterHeaderInventory, AdapterReconstructionFacts};
+    use mlx_gen::adapters::facts::{dtype_width, AdapterFacts, TensorFacts};
+    use mlx_rs::Dtype;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct AdapterGraph<'a> {
+        l: &'a mut NativeLedger,
+    }
+
+    impl AdapterGraph<'_> {
+        fn output(
+            &mut self,
+            operation: &'static str,
+            shape: Vec<i32>,
+            dtype: Dtype,
+        ) -> Result<TensorFacts> {
+            let _ = operation; // Source-site name, not a reserve or opcode budget.
+            self.l
+                .array(dtype_width(dtype), checked_elements(&shape)?)?;
+            contiguous(shape, dtype)
+        }
+
+        fn cast(&mut self, input: &TensorFacts, dtype: Dtype) -> Result<TensorFacts> {
+            checked_tensor_bytes(input)?;
+            if input.dtype == dtype {
+                Ok(input.clone())
+            } else {
+                self.output("astype", input.shape.clone(), dtype)
+            }
+        }
+
+        fn scalar(&mut self) -> Result<()> {
+            // crate::array::scalar / Array::from_slice(&[alpha/rank], &[1]): allocated when the
+            // reconstruction expression is constructed, not when its lazy outputs are evaluated.
+            self.l.scalar(4)?;
+            Ok(())
+        }
+
+        fn matmul(&mut self, a: &TensorFacts, b: &TensorFacts) -> Result<TensorFacts> {
+            if a.shape.is_empty() || b.shape.is_empty() {
+                return Err(Error::Msg(
+                    "iris: adapter matmul factors cannot be scalars".into(),
+                ));
+            }
+            let avector = a.shape.len() == 1;
+            let bvector = b.shape.len() == 1;
+            let ashape = if avector {
+                vec![1, a.shape[0]]
+            } else {
+                a.shape.clone()
+            };
+            let bshape = if bvector {
+                vec![b.shape[0], 1]
+            } else {
+                b.shape.clone()
+            };
+            let (m, k) = (ashape[ashape.len() - 2], ashape[ashape.len() - 1]);
+            let (kb, n) = (bshape[bshape.len() - 2], bshape[bshape.len() - 1]);
+            if k != kb {
+                return Err(Error::Msg(
+                    "iris: adapter factor matmul contraction widths disagree".into(),
+                ));
+            }
+            let mut shape = broadcast(&ashape[..ashape.len() - 2], &bshape[..bshape.len() - 2])?;
+            if !avector {
+                shape.push(m);
+            }
+            if !bvector {
+                shape.push(n);
+            }
+            let dtype = matmul_dtype(a.dtype, b.dtype)?;
+            self.cast(a, dtype)?;
+            self.cast(b, dtype)?;
+            // Native matmul's promoted operands and each backend's layout/workspace branches.
+            // ops.cpp flattens A's leading rows when the original B is at most rank two.
+            let batch = checked_elements(&broadcast(
+                &ashape[..ashape.len() - 2],
+                &bshape[..bshape.len() - 2],
+            )?)?;
+            let width = dtype_width(dtype);
+            if a.shape.len() > 2 && b.shape.len() <= 2 {
+                self.l
+                    .matmul(width, 1, product(&[batch, m as u64])?, n as u64, k as u64)?;
+            } else {
+                self.l.matmul(width, batch, m as u64, n as u64, k as u64)?;
+            }
+            contiguous(shape, dtype)
+        }
+
+        fn multiply(
+            &mut self,
+            a: &TensorFacts,
+            b: &TensorFacts,
+            operation: &'static str,
+        ) -> Result<TensorFacts> {
+            let dtype = Dtype::from_promoting_types(a.dtype, b.dtype);
+            self.cast(a, dtype)?;
+            self.cast(b, dtype)?;
+            self.output(operation, broadcast(&a.shape, &b.shape)?, dtype)
+        }
+
+        fn scale(&mut self, input: &TensorFacts) -> Result<TensorFacts> {
+            self.scalar()?;
+            let dtype = Dtype::from_promoting_types(input.dtype, Dtype::Float32);
+            self.cast(input, dtype)?;
+            if dtype != Dtype::Float32 {
+                self.output("reconstruction scale scalar cast", vec![1], dtype)?;
+            }
+            self.output("reconstruction scale multiply", input.shape.clone(), dtype)
+        }
+
+        fn kron(&mut self, a: &TensorFacts, b: &TensorFacts) -> Result<TensorFacts> {
+            // reconstruct_lokr_delta_scaled appends singleton dimensions to w1 until its rank reaches
+            // w2's; native kron PREPENDS any remaining singleton dimensions to the shorter operand.
+            if checked_elements(&a.shape)? == 0 || checked_elements(&b.shape)? == 0 {
+                return Err(Error::Msg(
+                    "iris: native Kronecker factors cannot be empty".into(),
+                ));
+            }
+            let mut a = a.clone();
+            a.shape.resize(a.shape.len().max(b.shape.len()), 1);
+            let rank = a.shape.len().max(b.shape.len());
+            let mut sa = vec![1; rank - a.shape.len()];
+            sa.extend(&a.shape);
+            let mut sb = vec![1; rank - b.shape.len()];
+            sb.extend(&b.shape);
+            let shape: Vec<i32> = sa
+                .iter()
+                .zip(&sb)
+                .map(|(&x, &y)| {
+                    x.checked_mul(y).ok_or_else(|| {
+                        Error::Msg("iris: adapter Kronecker dimension overflows MLX shape".into())
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let dtype = Dtype::from_promoting_types(a.dtype, b.dtype);
+            self.cast(&a, dtype)?;
+            self.cast(b, dtype)?;
+            // Native kron inserts singleton axes (views) and broadcasts the multiply; no expanded
+            // operand copy. Its final reshape may require a copy if a scalar-factor fast path kept a
+            // Tucker factor's column-major orientation. Count that explicit native reshape branch as
+            // an upper, without pretending that an ordinary row-major reshape actually allocates.
+            self.output("Kronecker broadcast multiply", shape.clone(), dtype)?;
+            self.output("Kronecker reshape copy upper", shape, dtype)
+        }
+
+        fn tucker(
+            &mut self,
+            t: &TensorFacts,
+            a: &TensorFacts,
+            b: &TensorFacts,
+            loha_order: bool,
+        ) -> Result<TensorFacts> {
+            if t.shape.len() != 4 || a.shape.len() != 2 || b.shape.len() != 2 {
+                return Err(Error::Msg(
+                    "iris: Tucker reconstruction requires t[i,j,h,w], a[i,p], b[j,r]".into(),
+                ));
+            }
+            // MLX permits broadcasting a contracted dimension of size one. The dimensions in the
+            // native einsum map are the maximum across occurrences; incompatible non-singletons error.
+            broadcast_dim(t.shape[0], a.shape[0])?;
+            broadcast_dim(t.shape[1], b.shape[0])?;
+            let i = t.shape[0].max(a.shape[0]);
+            let j = t.shape[1].max(b.shape[0]);
+            let dims = BTreeMap::from([
+                ('i', i),
+                ('j', j),
+                ('h', t.shape[2]),
+                ('w', t.shape[3]),
+                ('p', a.shape[1]),
+                ('r', b.shape[1]),
+            ]);
+            let output = vec!['p', 'r', 'h', 'w'];
+            let mut terms = vec![
+                Term {
+                    axes: vec!['i', 'j', 'h', 'w'],
+                    tensor: t.clone(),
+                },
+                Term {
+                    axes: vec!['i', 'p'],
+                    tensor: a.clone(),
+                },
+                Term {
+                    axes: vec!['j', 'r'],
+                    tensor: b.clone(),
+                },
+            ];
+            // LoKr calls ijhw,ip,jr; LoHa calls ijhw,jr,ip. Operand order breaks greedy cost ties.
+            if loha_order {
+                terms.swap(1, 2);
+            }
+            let naive_cost = checked_mul(
+                axis_elements(&dims.keys().copied().collect::<Vec<_>>(), &dims)?,
+                3,
+                "Tucker naive cost",
+            )?;
+            let mut max_size = axis_elements(&output, &dims)?;
+            for term in &terms {
+                max_size = max_size.max(axis_elements(&term.axes, &dims)?);
+            }
+            let mut path_cost = 0_u64;
+            while terms.len() > 1 {
+                let mut candidates = Vec::new();
+                for outer in [false, true] {
+                    for x in 0..terms.len() {
+                        for y in x + 1..terms.len() {
+                            let union: BTreeSet<char> = terms[x]
+                                .axes
+                                .iter()
+                                .chain(&terms[y].axes)
+                                .copied()
+                                .collect();
+                            let shared = terms[x].axes.iter().any(|c| terms[y].axes.contains(c));
+                            if !outer && !shared {
+                                continue;
+                            }
+                            let mut kept: BTreeSet<char> = output
+                                .iter()
+                                .copied()
+                                .filter(|c| union.contains(c))
+                                .collect();
+                            for (index, term) in terms.iter().enumerate() {
+                                if index != x && index != y {
+                                    kept.extend(
+                                        term.axes.iter().copied().filter(|c| union.contains(c)),
+                                    );
+                                }
+                            }
+                            let mut axes: Vec<char> = kept.into_iter().collect();
+                            // Native output-axis ties come from an unordered_set. Copy upper bounds below
+                            // do not depend on a tie's incidental order.
+                            axes.sort_by_key(|c| dims[c]);
+                            let size = axis_elements(&axes, &dims)?;
+                            let cost = checked_mul(
+                                axis_elements(&union.iter().copied().collect::<Vec<_>>(), &dims)?,
+                                if union.len() > axes.len() { 2 } else { 1 },
+                                "Tucker contraction cost",
+                            )?;
+                            if size > max_size
+                                || checked_add(path_cost, cost, "Tucker candidate path cost")?
+                                    > naive_cost
+                            {
+                                continue;
+                            }
+                            let removed = axis_elements(&terms[x].axes, &dims)? as i128
+                                + axis_elements(&terms[y].axes, &dims)? as i128
+                                - size as i128;
+                            candidates.push((removed, cost, x, y, axes));
+                        }
+                    }
+                    if !candidates.is_empty() {
+                        break;
+                    }
+                }
+                if candidates.is_empty() {
+                    let term = self.naive_einsum(&terms, &output, &dims)?;
+                    terms = vec![term];
+                    break;
+                }
+                candidates.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then(a.1.cmp(&b.1))
+                        .then(a.2.cmp(&b.2))
+                        .then(a.3.cmp(&b.3))
+                });
+                let (_, cost, x, y, axes) = candidates.remove(0);
+                let union: BTreeSet<_> = terms[x]
+                    .axes
+                    .iter()
+                    .chain(&terms[y].axes)
+                    .copied()
+                    .collect();
+                let contracts = union.len() > axes.len();
+                let tensor = if contracts {
+                    let dtype = matmul_dtype(terms[x].tensor.dtype, terms[y].tensor.dtype)?;
+                    for term in [&terms[x], &terms[y]] {
+                        // Native batch_tensordot broadcasts contracted dimensions before its
+                        // transpose_reshape. Count the broadcast size for a possible normalization copy.
+                        let shape: Vec<i32> = term.axes.iter().map(|c| dims[c]).collect();
+                        // Broadcast views preserve source data_size. The native cast can keep that
+                        // smaller backing, while a required pre-cast transpose_reshape copies the
+                        // expanded operand in its ORIGINAL dtype. A post-cast matmul normalization
+                        // instead copies the promoted dtype. The one copy upper uses the wider
+                        // actual branch; it must not assume promotion always widens (I64+F16->F16).
+                        self.cast(&term.tensor, dtype)?;
+                        let copy_dtype = if dtype_width(term.tensor.dtype) > dtype_width(dtype) {
+                            term.tensor.dtype
+                        } else {
+                            dtype
+                        };
+                        self.output(
+                            "Tucker transpose_reshape/matmul operand copy upper",
+                            shape,
+                            copy_dtype,
+                        )?;
+                    }
+                    self.contraction(&terms[x], &terms[y], &axes, &dims, dtype)?
+                } else {
+                    self.naive_einsum(&[terms[x].clone(), terms[y].clone()], &axes, &dims)?
+                        .tensor
+                };
+                terms.remove(y);
+                terms.remove(x);
+                terms.push(Term { axes, tensor });
+                path_cost = checked_add(path_cost, cost, "Tucker selected path cost")?;
+            }
+            let term = terms
+                .pop()
+                .ok_or_else(|| Error::Msg("iris: empty Tucker graph".into()))?;
+            // The final transpose is a view. Describe its requested shape, retaining the same payload.
+            contiguous(output.iter().map(|c| dims[c]).collect(), term.tensor.dtype)
+        }
+
+        /// Native einsum batch_tensordot: common kept labels form the batch, remaining kept
+        /// A/B labels form M/N, and removed labels form K. Transpose/reshape views are zero;
+        /// conditional pre-normalization copies were charged at the source sites above.
+        fn contraction(
+            &mut self,
+            a: &Term,
+            b: &Term,
+            output: &[char],
+            dims: &BTreeMap<char, i32>,
+            dtype: Dtype,
+        ) -> Result<TensorFacts> {
+            let batch_axes: Vec<char> = output
+                .iter()
+                .copied()
+                .filter(|c| a.axes.contains(c) && b.axes.contains(c))
+                .collect();
+            let left: Vec<char> = output
+                .iter()
+                .copied()
+                .filter(|c| a.axes.contains(c) && !batch_axes.contains(c))
+                .collect();
+            let right: Vec<char> = output
+                .iter()
+                .copied()
+                .filter(|c| b.axes.contains(c) && !batch_axes.contains(c))
+                .collect();
+            let contracted: BTreeSet<char> = a
+                .axes
+                .iter()
+                .chain(&b.axes)
+                .copied()
+                .filter(|c| !output.contains(c))
+                .collect();
+            self.l.matmul(
+                dtype_width(dtype),
+                axis_elements(&batch_axes, dims)?,
+                axis_elements(&left, dims)?,
+                axis_elements(&right, dims)?,
+                axis_elements(&contracted.into_iter().collect::<Vec<_>>(), dims)?,
+            )?;
+            contiguous(output.iter().map(|c| dims[c]).collect(), dtype)
+        }
+
+        fn naive_einsum(
+            &mut self,
+            terms: &[Term],
+            output: &[char],
+            dims: &BTreeMap<char, i32>,
+        ) -> Result<Term> {
+            let first = terms
+                .first()
+                .ok_or_else(|| Error::Msg("iris: empty Tucker fallback".into()))?;
+            let mut axes = first.axes.clone();
+            let mut tensor = first.tensor.clone();
+            for term in &terms[1..] {
+                for c in &term.axes {
+                    if !axes.contains(c) {
+                        axes.push(*c);
+                    }
+                }
+                let dtype = Dtype::from_promoting_types(tensor.dtype, term.tensor.dtype);
+                self.cast(&tensor, dtype)?;
+                self.cast(&term.tensor, dtype)?;
+                tensor = self.output(
+                    "Tucker naive broadcast multiply",
+                    axes.iter().map(|c| dims[c]).collect(),
+                    dtype,
+                )?;
+            }
+            if axes.iter().any(|c| !output.contains(c)) {
+                let dtype = match tensor.dtype {
+                    Dtype::Bool | Dtype::Int8 | Dtype::Int16 => Dtype::Int32,
+                    Dtype::Uint8 | Dtype::Uint16 => Dtype::Uint32,
+                    dtype => dtype,
+                };
+                let out_shape: Vec<i32> = output.iter().map(|c| dims[c]).collect();
+                let input = checked_elements(&tensor.shape)?;
+                let out = checked_elements(&out_shape)?;
+                let extent = input.checked_div(out).unwrap_or(0);
+                adapter_reduce(
+                    self.l,
+                    dtype_width(tensor.dtype),
+                    dtype_width(dtype),
+                    input,
+                    out,
+                    extent,
+                )?;
+                tensor = contiguous(out_shape, dtype)?;
+            }
+            Ok(Term {
+                axes: output.to_vec(),
+                tensor,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Term {
+        axes: Vec<char>,
+        tensor: TensorFacts,
+    }
+
+    fn checked_add(a: u64, b: u64, what: &str) -> Result<u64> {
+        a.checked_add(b)
+            .ok_or_else(|| Error::Unsupported(format!("iris: {what} overflow")))
+    }
+    fn checked_mul(a: u64, b: u64, what: &str) -> Result<u64> {
+        a.checked_mul(b)
+            .ok_or_else(|| Error::Unsupported(format!("iris: {what} overflow")))
+    }
+    fn checked_elements(shape: &[i32]) -> Result<u64> {
+        if shape.iter().any(|&d| d < 0) {
+            return Err(Error::Unsupported(
+                "iris: negative adapter shape dimension".into(),
+            ));
+        }
+        if shape.contains(&0) {
+            return Ok(0);
+        }
+        shape.iter().try_fold(1, |total, &d| {
+            checked_mul(total, d as u64, "adapter shape product")
+        })
+    }
+    fn checked_tensor_bytes(t: &TensorFacts) -> Result<u64> {
+        checked_mul(
+            checked_elements(&t.shape)?,
+            dtype_width(t.dtype),
+            "adapter tensor byte product",
+        )
+    }
+    fn axis_elements(axes: &[char], dims: &BTreeMap<char, i32>) -> Result<u64> {
+        let shape = axes
+            .iter()
+            .map(|c| {
+                dims.get(c)
+                    .copied()
+                    .ok_or_else(|| Error::Msg("iris: unknown Tucker axis".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        checked_elements(&shape)
+    }
+    fn matmul_dtype(a: Dtype, b: Dtype) -> Result<Dtype> {
+        let dtype = Dtype::from_promoting_types(a, b);
+        if matches!(
+            dtype,
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64 | Dtype::Complex64
+        ) {
+            Ok(dtype)
+        } else {
+            Err(Error::Msg(format!(
+                "iris: native adapter matmul requires inexact types, got {a:?}/{b:?}"
+            )))
+        }
+    }
+    fn contiguous(shape: Vec<i32>, dtype: Dtype) -> Result<TensorFacts> {
+        checked_elements(&shape)?;
+        let mut stride = 1_usize;
+        let mut strides = vec![0; shape.len()];
+        for (i, &d) in shape.iter().enumerate().rev() {
+            strides[i] = stride;
+            stride = stride.checked_mul(d as usize).ok_or_else(|| {
+                Error::Unsupported("iris: adapter stride product overflow".into())
+            })?;
+        }
+        Ok(TensorFacts {
+            shape,
+            dtype,
+            strides,
+        })
+    }
+    fn broadcast_dim(a: i32, b: i32) -> Result<i32> {
+        if a == b {
+            Ok(a)
+        } else if a == 1 {
+            Ok(b)
+        } else if b == 1 {
+            Ok(a)
+        } else {
+            Err(Error::Msg(format!(
+                "iris: adapter dimensions {a} and {b} do not broadcast"
+            )))
+        }
+    }
+    fn broadcast(a: &[i32], b: &[i32]) -> Result<Vec<i32>> {
+        checked_elements(a)?;
+        checked_elements(b)?;
+        let n = a.len().max(b.len());
+        (0..n)
+            .map(|i| {
+                // Missing leading axes are the native broadcast's literal singleton dimensions.
+                let da = if i >= n - a.len() {
+                    a[i - (n - a.len())]
+                } else {
+                    1
+                };
+                let db = if i >= n - b.len() {
+                    b[i - (n - b.len())]
+                } else {
+                    1
+                };
+                broadcast_dim(da, db)
+            })
+            .collect()
+    }
+
+    pub(super) fn load(
+        l: &mut NativeLedger,
+        inventory: &AdapterHeaderInventory,
+        packed_hosts: u64,
+    ) -> Result<()> {
+        // ProjectionHost's scalar-backed logical placeholders never materialize a dense base.
+        l.repeated(4, 1, packed_hosts)?;
+        for file in &inventory.files {
+            for source in file.sources.values() {
+                l.array(dtype_width(source.dtype), checked_elements(&source.shape)?)?;
+            }
+            for key in &file.scalar_reads {
+                let alpha = file
+                    .sources
+                    .get(key)
+                    .ok_or_else(|| Error::MissingTensor(key.clone()))?;
+                if alpha.dtype != Dtype::Float32 {
+                    l.array(4, checked_elements(&alpha.shape)?)?;
+                }
+            }
+        }
+        for file in &inventory.files {
+            for plan in &file.reconstructions {
+                let mut graph = AdapterGraph { l: &mut *l };
+                let (path, delta) = match plan {
+                    AdapterReconstructionFacts::Lora {
+                        projection,
+                        up,
+                        alpha_fold,
+                        ..
+                    } => {
+                        if *alpha_fold {
+                            let source = &file.sources[up];
+                            let transposed = TensorFacts {
+                                shape: source.shape.iter().copied().rev().collect(),
+                                dtype: source.dtype,
+                                strides: source.strides.iter().copied().rev().collect(),
+                            };
+                            graph.scale(&transposed)?;
+                        }
+                        (projection, None)
+                    }
+                    AdapterReconstructionFacts::Lokr {
+                        projection,
+                        factors,
+                    } => {
+                        let mut factor = |full: &str,
+                                          a: &str,
+                                          b: &str,
+                                          t: Option<&str>|
+                         -> Result<TensorFacts> {
+                            if let Some(key) = factors.get(full) {
+                                return Ok(file.sources[key].clone());
+                            }
+                            let wa = factors
+                                .get(a)
+                                .and_then(|k| file.sources.get(k))
+                                .ok_or_else(|| {
+                                    Error::Msg(format!("iris: {projection} missing {a}"))
+                                })?;
+                            let wb = factors
+                                .get(b)
+                                .and_then(|k| file.sources.get(k))
+                                .ok_or_else(|| {
+                                    Error::Msg(format!("iris: {projection} missing {b}"))
+                                })?;
+                            if let Some(t) = t
+                                .filter(|_| {
+                                    (!factors.contains_key("lokr_w2")
+                                        && factors.contains_key("lokr_t2"))
+                                })
+                                .and_then(|t| factors.get(t))
+                                .and_then(|k| file.sources.get(k))
+                            {
+                                graph.tucker(t, wa, wb, false)
+                            } else {
+                                graph.matmul(wa, wb)
+                            }
+                        };
+                        let w1 = factor("lokr_w1", "lokr_w1_a", "lokr_w1_b", None)?;
+                        let w2 = factor("lokr_w2", "lokr_w2_a", "lokr_w2_b", Some("lokr_t2"))?;
+                        let product = graph.kron(&w1, &w2)?;
+                        let delta = graph.scale(&product)?;
+                        (projection, Some(delta))
+                    }
+                    AdapterReconstructionFacts::Loha {
+                        projection,
+                        factors,
+                    } => {
+                        // Shared reconstruct_loha_delta uses Tucker ONLY when both t1 and t2 exist;
+                        // a lone t tensor is parsed/read but both sides still use their matmuls.
+                        let tucker =
+                            (factors.contains_key("hada_t1") && factors.contains_key("hada_t2"));
+                        let mut factor = |a: &str, b: &str, t: &str| -> Result<TensorFacts> {
+                            let wa = factors
+                                .get(a)
+                                .and_then(|k| file.sources.get(k))
+                                .ok_or_else(|| {
+                                    Error::Msg(format!("iris: {projection} missing {a}"))
+                                })?;
+                            let wb = factors
+                                .get(b)
+                                .and_then(|k| file.sources.get(k))
+                                .ok_or_else(|| {
+                                    Error::Msg(format!("iris: {projection} missing {b}"))
+                                })?;
+                            if let Some(t) = factors
+                                .get(t)
+                                .filter(|_| tucker)
+                                .and_then(|k| file.sources.get(k))
+                            {
+                                graph.tucker(t, wa, wb, true)
+                            } else {
+                                graph.matmul(wa, wb)
+                            }
+                        };
+                        let w1 = factor("hada_w1_a", "hada_w1_b", "hada_t1")?;
+                        let w2 = factor("hada_w2_a", "hada_w2_b", "hada_t2")?;
+                        let product = graph.multiply(&w1, &w2, "LoHa Hadamard multiply")?;
+                        let delta = graph.scale(&product)?;
+                        (projection, Some(delta))
+                    }
+                };
+                if let Some(delta) = delta {
+                    let expected=inventory.projections.get(path).ok_or_else(|| Error::Msg(format!("missing adapter projection {path}")))?.iter().find_map(|a|match a {AdapterFacts::Materialized {delta,..}=>Some(delta),_=>None})
+                    .ok_or_else(||Error::Msg(format!("iris: materialized reconstruction has no delta inventory at {path}")))?;
+                    let actual_elements = checked_elements(&delta.shape)?;
+                    let expected_elements = checked_elements(&expected.shape)?;
+                    if actual_elements != expected_elements {
+                        return Err(Error::Msg(format!("iris: {path} reconstructed delta has {actual_elements} elements, target has {expected_elements}")));
+                    }
+                    // reconstruct_* ends with reshape(base_shape).as_dtype(compute). The reshape is
+                    // a view when the factor path already produced a compatible contiguous order;
+                    // Tucker/alias ordering can require one copy at this exact source site.
+                    let reshaped = graph.output(
+                        "delta reshape copy upper",
+                        expected.shape.clone(),
+                        delta.dtype,
+                    )?;
+                    graph.cast(&reshaped, expected.dtype)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Native reduction may promote an integer input without allocating a cast of that input.
+    /// Keep input-copy width separate from output/partial-array width (metal/reduce.cpp).
+    fn adapter_reduce(
+        l: &mut NativeLedger,
+        input_width: u64,
+        output_width: u64,
+        input: u64,
+        output: u64,
+        extent: u64,
+    ) -> Result<()> {
+        if l.backend == NativeBackend::Cpu {
+            return l.array(output_width, output);
+        }
+        l.bytes(product(&[output_width, output])?.max(4))?;
+        l.array(input_width, input)?; // conditional GeneralReduce normalization copy
+        if output == 1 && input > 4096 {
+            let rows = if product(&[input_width, input])? <= (1 << 26) {
+                128
+            } else {
+                4096
+            };
+            l.array(output_width, rows)?;
+        }
+        if extent >= 1024 {
+            let outer = if extent >= 32768 { 128 } else { 32 };
+            l.array(output_width, product(&[outer, output])?)?;
+        }
+        if extent > 256 && output / 32 < 1024 {
+            l.array(output_width, product(&[32, output])?)?;
+        }
+        Ok(())
+    }
+
+    fn cast_dtype(l: &mut NativeLedger, n: u64, from: Dtype, to: Dtype) -> Result<()> {
+        if from != to {
+            l.array(dtype_width(to), n)?;
+        }
+        Ok(())
+    }
+
+    /// AdaptableLinear::forward/forward_split -> apply_adapters -> Adapter::residual.
+    /// Input is the compute-dtype UNPADDED logical x even when the packed base uses padding.
+    /// Disabled adapters are skipped before any forward cast, scalar, product or sum is built.
+    pub(super) fn forward(
+        l: &mut NativeLedger,
+        adapters: &[AdapterFacts],
+        rows: u64,
+        input: u64,
+        output: u64,
+        compute: Dtype,
+    ) -> Result<()> {
+        for adapter in adapters.iter().filter(|a| !a.disabled()) {
+            let dtype = match adapter {
+                AdapterFacts::Lora { a, b, .. } => {
+                    if a.shape.len() != 2 || b.shape.len() != 2 {
+                        return Err(overflow());
+                    }
+                    checked_elements(&a.shape)?;
+                    checked_elements(&b.shape)?;
+                    let rank = u64::try_from(a.shape[1]).map_err(|_| overflow())?;
+                    if a.shape[0] as u64 != input
+                        || b.shape[0] as u64 != rank
+                        || b.shape[1] as u64 != output
+                    {
+                        return Err(Error::Unsupported(
+                            "Iris LoRA residual width mismatch".into(),
+                        ));
+                    }
+                    let first = Dtype::from_promoting_types(compute, a.dtype);
+                    cast_dtype(l, product(&[rows, input])?, compute, first)?;
+                    cast_dtype(l, checked_elements(&a.shape)?, a.dtype, first)?;
+                    l.matmul(dtype_width(first), 1, rows, rank, input)?;
+                    let second = Dtype::from_promoting_types(first, b.dtype);
+                    cast_dtype(l, product(&[rows, rank])?, first, second)?;
+                    cast_dtype(l, checked_elements(&b.shape)?, b.dtype, second)?;
+                    l.matmul(dtype_width(second), 1, rows, output, rank)?;
+                    second
+                }
+                AdapterFacts::Materialized { delta, .. } => {
+                    if delta.shape.len() != 2
+                        || delta.shape[0] as u64 != output
+                        || delta.shape[1] as u64 != input
+                    {
+                        return Err(Error::Unsupported(
+                            "Iris materialized adapter width mismatch".into(),
+                        ));
+                    }
+                    cast_dtype(l, checked_elements(&delta.shape)?, delta.dtype, compute)?;
+                    l.matmul(dtype_width(compute), 1, rows, output, input)?;
+                    compute
+                }
+                AdapterFacts::Structured { w1, w2, .. } => {
+                    if w1.shape.len() != 2 || w2.shape.len() != 2 {
+                        return Err(overflow());
+                    }
+                    let (a, c, b, d) = (
+                        w1.shape[0] as u64,
+                        w1.shape[1] as u64,
+                        w2.shape[0] as u64,
+                        w2.shape[1] as u64,
+                    );
+                    if product(&[c, d])? != input || product(&[a, b])? != output {
+                        return Err(Error::Unsupported(
+                            "Iris structured adapter width mismatch".into(),
+                        ));
+                    }
+                    cast_dtype(l, checked_elements(&w1.shape)?, w1.dtype, compute)?;
+                    cast_dtype(l, checked_elements(&w2.shape)?, w2.dtype, compute)?;
+                    l.reshape_copy(dtype_width(compute), product(&[rows, input])?)?;
+                    l.matmul(dtype_width(compute), rows, a, d, c)?;
+                    l.matmul(dtype_width(compute), rows, a, b, d)?;
+                    l.reshape_copy(dtype_width(compute), product(&[rows, output])?)?;
+                    // LokrFactors::residual returns directly: scale is baked into w2 at install.
+                    l.op(dtype_width(compute), product(&[rows, output])?)?;
+                    continue;
+                }
+            };
+            // scalar(scale) is first an f32 Array, then cast to the residual's exact dtype.
+            l.scalar(4)?;
+            cast_dtype(l, 1, Dtype::Float32, dtype)?;
+            l.op(dtype_width(dtype), product(&[rows, output])?)?;
+            cast_dtype(l, product(&[rows, output])?, dtype, compute)?;
+            l.op(dtype_width(compute), product(&[rows, output])?)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn matrix(rows: i32, cols: i32, dtype: Dtype) -> TensorFacts {
+            TensorFacts::matrix(rows, cols, dtype, false)
+        }
+        /// HOST: exact LoRA operand/scalar graph, including separate A/B matrix requests.
+        #[test]
+        fn lora_forward_prices_each_operand_and_disabled_is_zero_work() {
+            let live = AdapterFacts::Lora {
+                a: matrix(4, 2, Dtype::Float32),
+                b: matrix(2, 3, Dtype::Float32),
+                disabled: false,
+            };
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            forward(&mut l, &[live.clone()], 2, 4, 3, Dtype::Float32).unwrap();
+            let expected = [16, 32, 32, 24, 16, 24, 4, 24, 24]
+                .into_iter()
+                .map(|n| backing_upper(n, 16_384).unwrap())
+                .sum::<u64>();
+            assert_eq!(l.total, expected);
+            let disabled = AdapterFacts::Lora {
+                a: matrix(4, 2, Dtype::Float32),
+                b: matrix(2, 3, Dtype::Float32),
+                disabled: true,
+            };
+            let mut off = NativeLedger::new(16_384, NativeBackend::Metal).unwrap();
+            forward(&mut off, &[disabled], 2, 4, 3, Dtype::Float32).unwrap();
+            assert_eq!(off.total, 0);
+            let before = l.total;
+            forward(&mut l, &[live], 2, 4, 3, Dtype::Float32).unwrap();
+            assert_eq!(l.total, before.checked_mul(2).unwrap());
+        }
+        /// HOST: BF16+F16 promotes to f32 despite equal element widths, then narrows before add.
+        #[test]
+        fn mixed_lora_promotions_and_materialized_and_structured_are_counted() {
+            let mixed = AdapterFacts::Lora {
+                a: matrix(4, 2, Dtype::Float16),
+                b: matrix(2, 3, Dtype::Float32),
+                disabled: false,
+            };
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            forward(&mut l, &[mixed], 2, 4, 3, Dtype::Bfloat16).unwrap();
+            let expected = [32, 32, 16, 32, 32, 24, 16, 24, 4, 24, 12, 12]
+                .into_iter()
+                .map(|n| backing_upper(n, 16_384).unwrap())
+                .sum::<u64>();
+            assert_eq!(l.total, expected);
+            for (adapter, requests) in [
+                (
+                    AdapterFacts::Materialized {
+                        delta: matrix(3, 4, Dtype::Bfloat16),
+                        disabled: false,
+                    },
+                    vec![48, 24, 32, 48, 4, 24, 24],
+                ),
+                (
+                    AdapterFacts::Structured {
+                        w1: matrix(1, 2, Dtype::Float32),
+                        w2: matrix(3, 2, Dtype::Float32),
+                        disabled: false,
+                    },
+                    vec![32, 16, 16, 32, 24, 16, 48, 24, 24],
+                ),
+            ] {
+                let mut one = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+                forward(&mut one, &[adapter], 2, 4, 3, Dtype::Float32).unwrap();
+                let exact = requests
+                    .into_iter()
+                    .map(|n| backing_upper(n, 16_384).unwrap())
+                    .sum::<u64>();
+                assert_eq!(one.total, exact);
+            }
+        }
+        /// HOST: load-time Kronecker outputs/scaling remain charged; no release at materialize.
+        #[test]
+        fn reconstruction_graph_is_cumulative_and_backend_workspace_is_distinct() {
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            {
+                let mut g = AdapterGraph { l: &mut l };
+                let k = g
+                    .kron(&matrix(2, 2, Dtype::Float32), &matrix(3, 2, Dtype::Float32))
+                    .unwrap();
+                assert_eq!(k.shape, [6, 4]);
+                g.scale(&k).unwrap();
+            }
+            let expected = [96, 96, 4, 96]
+                .into_iter()
+                .map(|n| backing_upper(n, 16_384).unwrap())
+                .sum::<u64>();
+            assert_eq!(l.total, expected);
+            let mut cpu = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            let mut metal = NativeLedger::new(16_384, NativeBackend::Metal).unwrap();
+            for ledger in [&mut cpu, &mut metal] {
+                AdapterGraph { l: ledger }
+                    .matmul(
+                        &matrix(2, 4096, Dtype::Float32),
+                        &matrix(4096, 2, Dtype::Float32),
+                    )
+                    .unwrap();
+            }
+            assert!(metal.total > cpu.total);
+        }
+        /// HOST: real inventory traversal charges each file operand, alpha cast, host scalar and
+        /// alpha-fold output even for an adapter disabled only on the forward path.
+        #[test]
+        fn installed_file_load_prices_raw_alpha_fold_and_retained_outputs() {
+            use crate::adapters::AdapterFileFacts;
+            use mlx_gen::adapters::loader::UnfusedAdapterFormat;
+            let inventory = AdapterHeaderInventory {
+                projections: BTreeMap::from([(
+                    "p".into(),
+                    vec![AdapterFacts::Lora {
+                        a: matrix(4, 2, Dtype::Bfloat16),
+                        b: matrix(2, 3, Dtype::Float32),
+                        disabled: true,
+                    }],
+                )]),
+                files: vec![AdapterFileFacts {
+                    path: std::path::PathBuf::new(), // metadata-only: load never opens this path
+                    format: UnfusedAdapterFormat::PeftLora,
+                    sources: BTreeMap::from([
+                        ("a".into(), matrix(2, 4, Dtype::Bfloat16)),
+                        ("b".into(), matrix(3, 2, Dtype::Bfloat16)),
+                        (
+                            "alpha".into(),
+                            contiguous(vec![1], Dtype::Bfloat16).unwrap(),
+                        ),
+                    ]),
+                    scalar_reads: BTreeSet::from(["alpha".into()]),
+                    reconstructions: vec![AdapterReconstructionFacts::Lora {
+                        projection: "p".into(),
+                        down: "a".into(),
+                        up: "b".into(),
+                        alpha_fold: true,
+                    }],
+                }],
+            };
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            load(&mut l, &inventory, 2).unwrap();
+            let expected = [4, 4, 16, 12, 2, 4, 4, 24, 24]
+                .into_iter()
+                .map(|n| backing_upper(n, 16_384).unwrap())
+                .sum::<u64>();
+            assert_eq!(l.total, expected);
+        }
+        /// HOST: actual greedy Tucker contraction arithmetic and its naive reduction fallback
+        /// use per-operand native requests, not the old adapter scratch maxima.
+        #[test]
+        fn tucker_contraction_and_naive_reduction_price_actual_requests() {
+            let mut totals = Vec::new();
+            for loha_order in [false, true] {
+                let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+                let out = AdapterGraph { l: &mut l }
+                    .tucker(
+                        &contiguous(vec![1, 1, 1, 1], Dtype::Float32).unwrap(),
+                        &matrix(1, 2, Dtype::Float32),
+                        &matrix(1, 3, Dtype::Float32),
+                        loha_order,
+                    )
+                    .unwrap();
+                assert_eq!(out.shape, [2, 3, 1, 1]);
+                let exact = [4, 8, 8, 4, 8, 12, 8, 24, 12, 8]
+                    .into_iter()
+                    .map(|n| backing_upper(n, 16_384).unwrap())
+                    .sum::<u64>();
+                assert_eq!(l.total, exact);
+                totals.push(l.total);
+            }
+            assert_eq!(totals[0], totals[1]);
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            let terms = [
+                Term {
+                    axes: vec!['i'],
+                    tensor: contiguous(vec![2], Dtype::Float32).unwrap(),
+                },
+                Term {
+                    axes: vec!['p'],
+                    tensor: contiguous(vec![3], Dtype::Float32).unwrap(),
+                },
+            ];
+            let out = AdapterGraph { l: &mut l }
+                .naive_einsum(&terms, &['p'], &BTreeMap::from([('i', 2), ('p', 3)]))
+                .unwrap();
+            assert_eq!(out.tensor.shape, [3]);
+            assert_eq!(
+                l.total,
+                backing_upper(24, 16_384)
+                    .unwrap()
+                    .checked_add(backing_upper(12, 16_384).unwrap())
+                    .unwrap()
+            );
+        }
+        /// HOST: reconstruction dimensions fail closed, without tensor construction/evaluation.
+        #[test]
+        fn adapter_shape_arithmetic_fails_closed() {
+            assert!(checked_elements(&[-1, 2]).is_err());
+            assert!(checked_elements(&[i32::MAX, i32::MAX, i32::MAX]).is_err());
+            let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
+            let bad = AdapterFacts::Materialized {
+                delta: matrix(3, 5, Dtype::Float32),
+                disabled: false,
+            };
+            assert!(forward(&mut l, &[bad], 2, 4, 3, Dtype::Float32).is_err());
+        }
     }
 }

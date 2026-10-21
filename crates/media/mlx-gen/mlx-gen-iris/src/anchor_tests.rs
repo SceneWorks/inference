@@ -920,9 +920,9 @@ fn prompt_batch_body() {
     assert!(under.is_empty(), "2x area above its derivation: {under:#?}");
 }
 
-/// Certify the prompt batch and serial count at their actual rows/count (never scaled from batch
-/// 1) and the single prompt at twice the area, each from the measured text anchor, whole run and
-/// per phase.
+/// Certify the prompt batch and serial count at their actual rows/count (never scaled from
+/// batch 1) and the single prompt at twice the area, each from the measured text anchor, whole
+/// run and per phase.
 ///
 /// Mutation: price the batch/count as batch 1, or certify it from the batch-1 request; the
 /// pricing context or the single-prompt comparison goes red.
@@ -1743,5 +1743,135 @@ fn the_priced_resident_accounts_for_the_live_set_at_every_check() {
     in_cpu_child(
         "anchor_tests::the_priced_resident_accounts_for_the_live_set_at_every_check",
         resident_body,
+    );
+}
+
+// ---- installed generation adapter: native CPU anchor → twice the area -----------------------
+
+/// Real PEFT file for the tiny backbone's patch projection, following adapter_facts_tests' native
+/// parent-embed fixture. Constructed only AFTER in_cpu_child selects CPU and traps Metal; no fixture
+/// Arrays survive into the before-model-load measurement coordinate.
+fn generation_anchor_adapter(root: &std::path::Path) -> mlx_gen::AdapterSpec {
+    use mlx_gen::gen_core::iris::adapter_provenance;
+    use mlx_rs::{transforms::eval, Array};
+
+    let path = root.join("anchor-patch-lora.safetensors");
+    // Nonzero, modest factors keep the solver finite while exercising a large real rank term.
+    let a = Array::from_slice(&vec![0.001f32; 1536 * 48], &[1536, 48]);
+    let b = Array::from_slice(&vec![0.001f32; 64 * 1536], &[64, 1536]);
+    eval([&a, &b]).unwrap();
+    let metadata: std::collections::HashMap<_, _> =
+        adapter_provenance(IrisTask::Generation, "iris_3b")
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
+    Array::save_safetensors(
+        [
+            ("s_embedder.proj.lora_A.weight", &a),
+            ("s_embedder.proj.lora_B.weight", &b),
+        ],
+        Some(&metadata),
+        &path,
+    )
+    .unwrap();
+    mlx_gen::AdapterSpec::new(path, 0.25, mlx_gen::AdapterKind::Lora)
+}
+
+fn installed_adapter_anchor_body() {
+    let root = tempfile::tempdir().unwrap();
+    let adapter = generation_anchor_adapter(root.path());
+    let mut checked = Vec::new();
+    for (tier, mut source) in generation_tiers(root.path()) {
+        // Adapters attach to materialized projections; the streamed-load refusal is intentional.
+        // Ask the contract for the deepest LEGAL eager endpoint, never force rung 4 with adapters.
+        source.load_shape = LoadShape::EagerMaterialization;
+        source.adapters = vec![adapter.clone()];
+        for (rung, resident, expected_stream, spec, selection, memory) in
+            proved_selections(crate::model::MODEL_ID, &source)
+        {
+            assert!(!expected_stream, "installed adapters cannot use streaming");
+            let name = format!("iris_3b installed adapter→2x area {tier} {rung}");
+            let anchor_request = generation_request(&["a lighthouse at dusk"], memory);
+            let mut wide = anchor_request.clone();
+            wide.width = 2 * W;
+            let anchor = measure_generation(&spec, &anchor_request, resident, expected_stream);
+            let measured = measure_generation(&spec, &wide, resident, expected_stream);
+            // A header-only/mock overlay cannot satisfy these real install/materialize witnesses.
+            // Require every repeat on BOTH sides, not just one mark from a previous capture.
+            for captured in [&anchor, &measured] {
+                for observation in &captured.observations {
+                    for label in [
+                        crate::adapters::ADAPTER_HOST_QUANTUM,
+                        crate::adapters::ADAPTER_LOAD_QUANTUM,
+                        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+                    ] {
+                        assert!(
+                            observation.checks.iter().any(|check| check.label == label),
+                            "{name}: actual installed-adapter boundary missing: {label}"
+                        );
+                    }
+                }
+            }
+            let anchor_ctx = generation_ctx(&spec, &selection, &memory, W, 1, &anchor_request);
+            let wide_ctx = generation_ctx(&spec, &selection, &memory, 2 * W, 1, &wide);
+            let at_anchor = ios_pricing(&anchor_ctx).unwrap();
+            let priced = ios_pricing(&wide_ctx).unwrap();
+            let result = check(
+                name.clone(),
+                (&anchor, &anchor_ctx, &at_anchor),
+                (&measured, &wide_ctx, &priced),
+            );
+            let adapted = *result
+                .derived
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{name}: installed adapter is not certified: {e}"));
+
+            // Same request, tier and execution endpoint, with ONLY the installed stack removed.
+            // Its own actual bare anchor witnesses the counterfactual certificate; do not feed
+            // adapted marks to a bare bounder or compare a certificate against an unrelated price.
+            let mut bare_spec = spec.clone();
+            bare_spec.adapters.clear();
+            let bare_anchor =
+                measure_generation(&bare_spec, &anchor_request, resident, expected_stream);
+            let bare_anchor_ctx =
+                generation_ctx(&bare_spec, &selection, &memory, W, 1, &anchor_request);
+            let bare_wide_ctx = generation_ctx(&bare_spec, &selection, &memory, 2 * W, 1, &wide);
+            let bare_at_anchor = ios_pricing(&bare_anchor_ctx).unwrap();
+            let bare_priced = ios_pricing(&bare_wide_ctx).unwrap();
+            let bare = certify(
+                &format!("{name} no-adapter control"),
+                (&bare_anchor, &bare_anchor_ctx, &bare_at_anchor),
+                (&bare_wide_ctx, &bare_priced),
+            )
+            .unwrap()
+            .demand;
+            assert!(
+                adapted > bare,
+                "{name}: adapter certificate {adapted} must exceed the same no-adapter request certificate {bare}"
+            );
+            checked.push(result);
+        }
+    }
+    assert!(
+        !checked.is_empty(),
+        "no installed-adapter endpoint was exercised"
+    );
+    let under = failures(&checked);
+    assert!(
+        under.is_empty(),
+        "installed adapter 2x area above certified derivation, whole run or per phase: {under:#?}"
+    );
+}
+
+/// NATIVE macOS CPU-child proof (not host-only): real installed LoRA generation, dense/q4/q8,
+/// resident and deepest legal eager optimized endpoints. Both sizes load/run afresh; the source
+/// bounder and derive_certified must cover the run and every measured phase, with no tolerance.
+/// Mutation: omit installed adapter load/retention/forward terms from the native upper ledger;
+/// the native lower-bound checks or the no-adapter certificate discriminator must fail.
+#[test]
+fn installed_adapter_derivability_is_measured_at_both_endpoints_per_phase() {
+    in_cpu_child(
+        "anchor_tests::installed_adapter_derivability_is_measured_at_both_endpoints_per_phase",
+        installed_adapter_anchor_body,
     );
 }
