@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T18:10:13.951235+00:00",
-  "rust_proof_closure_sha256": "21c692ffec05ea087dc16218d8a49b2d836a1b07412d7aee00c313178859405e",
+  "UTC": "2026-10-21T18:38:21.756705+00:00",
+  "rust_proof_closure_sha256": "75b6ce1d56cea935f3a69ca80147dd32e2c462bbe1a14d926f17218b01fb15f4",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -184,7 +184,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "155dbc578c9615005530cc6072544bc362f0a4592e5688913c5de8f7593350ef"
+      "sha256": "039e3018e978f43faa421b18fccfe62d21cdf6901d548daf5d3332b104183a56"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -968,7 +968,7 @@
     },
     {
       "path": "vendor/clip-regex/SOURCE-AUTHORITY.json",
-      "sha256": "aacf4243523ec5c57b9dce86b3bf94b9c9f93d73828dee117cae42bdb288008f"
+      "sha256": "f4c722469eed911850778b221efae74a0a70e850babe02ed02cb5824d1fc35b4"
     },
     {
       "path": "vendor/clip-regex/build-verify.rs",
@@ -1624,7 +1624,7 @@
     },
     {
       "path": "vendor/clip-regex/regex/source-bindings.sha256",
-      "sha256": "35bd68ef085b968ef8a673d00f78d26675fa8be3a3643bbfc681e3d1c5fb8f65"
+      "sha256": "85b265a89472376a2bc5061c06fb4757586ac7a2d452ed8d42dc8e550eb40217"
     },
     {
       "path": "vendor/clip-regex/regex/src/builders.rs",
@@ -1636,7 +1636,7 @@
     },
     {
       "path": "vendor/clip-regex/regex/src/clip_source_certificate.rs",
-      "sha256": "6ee4c9aede23d5810cfc98dcf03f3c1b162c098af3ecf88d138076bf74746d8a"
+      "sha256": "42fe202d5347ec83000b3d4e37a26f4988695023c839d5f4447b67240fbe2146"
     },
     {
       "path": "vendor/clip-regex/regex/src/error.rs",
@@ -2370,8 +2370,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "7a31b1737e4ecc09b76bb8c749c0401e2153b28fe8239279f8083e38411b81df",
-    "classification_sha256": "6176e3173f0a1bcc0ecdf905c3f4de0c54c958ee9430471a1a1719bff7efffd4",
+    "inventory_sha256": "8fceed11e53d750c769ab64938caa213706be9f4b4a662a9ffa7da1e502d37ac",
+    "classification_sha256": "b0c0e73e7af29b01bca7263c84f870b34105c05d0a5e9a0af5596e08d1cb0951",
     "selected_Rust_FQNs": 216,
     "HOST_logical": 194,
     "HOST_expected_PASS_rows": 195,

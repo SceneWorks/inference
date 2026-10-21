@@ -73,10 +73,11 @@
   "no_native_J_or_totals_or_Iris_full_host_claim": true,
   "test_only_positive_instantiation": {
     "source_pre_sha256": "69e2cf6d0a1a0dd03008644f269f4b3984303267144c406acbfb95f2ad3d9090",
-    "source_post_sha256": "6ee4c9aede23d5810cfc98dcf03f3c1b162c098af3ecf88d138076bf74746d8a",
+    "source_post_sha256": "42fe202d5347ec83000b3d4e37a26f4988695023c839d5f4447b67240fbe2146",
     "original_runtime_formula_prefix_byte_unchanged": true,
     "mandatory_unconditional_positive_fqn": "clip_source_certificate::tests::admitted_target_public_api_returns_checked_finite_envelopes",
     "bounded_output": "C,S,J,J_limit,M0,M0_native,status=checked from actual checked Ok result only",
-    "no_local_numeric_evaluation": true
+    "no_local_numeric_evaluation": true,
+    "diagnostic_macro": "std::println! explicitly qualified for preserved upstream no_std crate; predicates unchanged"
   }
 }

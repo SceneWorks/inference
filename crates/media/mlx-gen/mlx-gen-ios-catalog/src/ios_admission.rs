@@ -1682,9 +1682,9 @@ fn admit_one(
     )
 }
 
-struct AdmissionAttempt<'a> {
-    evidence: AdmissionEvidence<'a>,
-    next: Option<KeyCapacity<'a>>,
+struct AdmissionAttempt<'facts, 'capacity> {
+    evidence: AdmissionEvidence<'facts>,
+    next: Option<KeyCapacity<'capacity>>,
 }
 
 fn admit_one_using_key_capacity(
@@ -1694,7 +1694,7 @@ fn admit_one_using_key_capacity(
     machine: &str,
     budget: MemoryBudget,
     rows: Option<&[AnchorRow]>,
-    attempt: AdmissionAttempt<'_>,
+    attempt: AdmissionAttempt<'_, '_>,
 ) -> AdmissionResult<Admission> {
     let AdmissionAttempt { evidence, mut next } = attempt;
     validate_actual(registry, candidate)?;
@@ -2169,6 +2169,7 @@ fn capture_permit_using_key_capacity(
                 .into(),
         )));
     }
+    let premise_policy = PremisePolicy::default();
     admit_one_using_key_capacity(
         registry,
         0,
@@ -2185,7 +2186,7 @@ fn capture_permit_using_key_capacity(
             evidence: AdmissionEvidence {
                 request_baseline: None,
                 execution_facts: None,
-                premise_policy: &PremisePolicy::default(),
+                premise_policy: &premise_policy,
             },
             next,
         },

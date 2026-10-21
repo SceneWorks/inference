@@ -444,6 +444,6 @@ mod tests {
         assert!(cold > 1_754_183);
         assert!(search > 20_018_036);
         assert_ne!(cold, search);
-        println!("CLIP_SOURCE_FACTS C={cold} S={search} J={j} J_limit={K} M0={m0} M0_native={m0_native} status=checked");
+        std::println!("CLIP_SOURCE_FACTS C={cold} S={search} J={j} J_limit={K} M0={m0} M0_native={m0_native} status=checked");
     }
 }
