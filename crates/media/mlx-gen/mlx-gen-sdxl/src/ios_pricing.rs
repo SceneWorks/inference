@@ -98,6 +98,9 @@ const PHASES: &[(&str, IosPhase)] = &[
 /// guard checks it.
 pub(crate) const REQUEST_INPUTS: &str = "SDXL request inputs";
 
+/// Pricing-only Rust host preprocessing work; not a native quantum or physical bound.
+const IP_PREPROCESS_HOST: &str = "SDXL IP preprocess host logical";
+
 /// Modes requiring their own iOS anchor at `tier` (`bf16`, `q8`, `q4`).
 /// The CPU additivity proof executes every advertised mode at both endpoints for all three
 /// tiers. This compatibility list is not a physical-transfer certificate: correlated admission

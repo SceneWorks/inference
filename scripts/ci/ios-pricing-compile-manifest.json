@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "e324e64574429a0fdb828b386e5918666fae7700994d744a868610661616494a",
+  "rust_proof_closure_sha256": "963007df055aa6ae61d1818eca8021be170855486d70d02ac4ed1c89bb37a620",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -372,7 +372,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "90748c361d5c35e1c0e1fcab105813190542f9480f0e3a9c8543baf50d208a07"
+      "sha256": "7cee2571fc5e3e9e0b239bc79d5fc2419fdf6cd8e55a924c7d49d0080aa2ec38"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -1422,8 +1422,8 @@
     "NativeToProcess/Darwinphysical/runtimeNoAD"
   ],
   "source_guard_provenance": {
-    "role44_newmap_sha256": "53e33670db4a1bfc8c0e040a3ff95bdb813d9a3e0a06bbca6e00685bf4b33c80",
-    "role44_exact_preservation_proof_sha256": "61d9862e25e002848f5ca4b2ccd850254a632aecdf5285e382e03af5e2692eed",
+    "role44_newmap_sha256": "8b4210225db1f17457d11c93f533aa83c09f9968508b8eaa09d036a77242813f",
+    "role44_exact_preservation_proof_sha256": "88975f14b10c0294d9313fdd6ab046d4f27f9890b6a0d05310fb427087d0fab9",
     "original379dapproveddelta_preservation_sha256": "eb2b28a5930fec70627e26df81f1cafc6e5970be47135a0badf12df29750484a"
   },
   "prior_proofs_not_current_runtime_acceptance": true,
