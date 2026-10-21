@@ -47,6 +47,7 @@ pub mod providers {
     pub use candle_gen_sdxl as sdxl;
     pub use candle_gen_seedvr2 as seedvr2;
     pub use candle_gen_sensenova as sensenova;
+    pub use candle_gen_supra2 as supra2;
     pub use candle_gen_svd as svd;
     pub use candle_gen_wan as wan;
     pub use candle_gen_z_image as z_image;
@@ -126,6 +127,8 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_sdxl::register_providers(registry);
     let registry = candle_gen_seedvr2::register_providers(registry);
     let registry = candle_gen_sensenova::register_providers(registry);
+    // sc-24214: Supra2-IMG under the same engine id as its MLX twin (`supra2_img`).
+    let registry = candle_gen_supra2::register_providers(registry);
     let registry = candle_gen_svd::register_providers(registry);
     let registry = candle_gen_wan::register_providers(registry);
     candle_gen_z_image::register_providers(registry)
@@ -702,13 +705,17 @@ mod preview_advertising {
         /// The frozen MOSS pipeline exposes final images/latents only. Its small decoder has no
         /// authenticated preview projection; another FLUX.2 decoder's coefficients do not transfer.
         MossImage,
+        /// Supra2-IMG (sc-24214): the frozen upstream `generate()` publishes no preview and its MLX
+        /// twin advertises `supports_preview: false`. Its SD ft-MSE four-channel space is not the
+        /// SDXL VAE's, so SDXL's measured fit does not transfer, and no fit is measured or claimed.
+        Supra2,
     }
 
     impl NoGo {
         /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
         /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
         /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-        const ALL: [NoGo; 9] = [
+        const ALL: [NoGo; 10] = [
             NoGo::Ltx,
             NoGo::Mage,
             NoGo::Mochi,
@@ -718,6 +725,7 @@ mod preview_advertising {
             NoGo::Seedvr2SuperResolution,
             NoGo::MinimaxH3Joint,
             NoGo::MossImage,
+            NoGo::Supra2,
         ];
 
         /// Exactly the variants epic 16624 put a number on. Kept beside [`NoGo::measured`] so the
@@ -745,7 +753,7 @@ mod preview_advertising {
                      candle-side adjudication sc-16954",
                 ),
                 NoGo::Seedvr2SuperResolution => None,
-                NoGo::MinimaxH3Joint | NoGo::MossImage => None,
+                NoGo::MinimaxH3Joint | NoGo::MossImage | NoGo::Supra2 => None,
             }
         }
 
@@ -766,7 +774,8 @@ mod preview_advertising {
                 | NoGo::SvdTemporal
                 | NoGo::Seedvr2SuperResolution
                 | NoGo::MinimaxH3Joint
-                | NoGo::MossImage => None,
+                | NoGo::MossImage
+                | NoGo::Supra2 => None,
             }
         }
 
@@ -797,6 +806,11 @@ mod preview_advertising {
                         "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
                          temporal decoder) — NEVER measured, same program gate; not SDXL's \
                          four-channel space"
+                    }
+                    NoGo::Supra2 => {
+                        "the frozen Supra2-IMG interface publishes no preview (its MLX twin advertises \
+                         supports_preview: false); its SD ft-MSE four-channel space is not SDXL's, so \
+                         no measured fit transfers; NEVER measured and no fit is claimed (sc-24214)"
                     }
                     NoGo::MossImage => {
                         "the frozen MOSS author interface returns final images/latents; NEVER measured; no preview projection is published for its exact small decoder, and no fit measurement is claimed (sc-26324)"
@@ -836,7 +850,7 @@ mod preview_advertising {
     /// method makes one viable it reopens as a **new** story with a **new** measurement; nothing here
     /// is "to be decided".
     ///
-    /// Twenty-two ids across nine crates. The crate set is *derived* from these ids by
+    /// Twenty-five ids across eleven crates. The crate set is *derived* from these ids by
     /// `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` rather than restated, so a new
     /// registration in one of those crates joins the scan automatically.
     const PREVIEW_INERT_ROUTE_IDS: &[(&str, NoGo)] = &[
@@ -858,6 +872,7 @@ mod preview_advertising {
         ("mochi_1", NoGo::Mochi),
         ("moss_image_base", NoGo::MossImage),
         ("moss_image_sft", NoGo::MossImage),
+        ("supra2_img", NoGo::Supra2),
         ("mage_flow", NoGo::Mage),
         ("mage_flow_base", NoGo::Mage),
         ("mage_flow_turbo", NoGo::Mage),
@@ -1460,6 +1475,14 @@ mod preview_advertising {
                 direct: 2,
                 dark: &[],
             }],
+        },
+        ProviderCrate {
+            dir: "candle-gen-supra2",
+            // Upstream's plain Euler/CFG loop (`sampling::denoise`) is bespoke; it emits no preview
+            // (`NoGo::Supra2`).
+            register: candle_gen_supra2::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
         },
         ProviderCrate {
             dir: "candle-gen-svd",
@@ -3648,6 +3671,12 @@ mod preview_advertising {
             resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
+            dir: "candle-gen-supra2",
+            register_providers: candle_gen_supra2::register_providers,
+            register_surfaces: None,
+            resident_only_on_cpu: true,
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-svd",
             register_providers: candle_gen_svd::register_providers,
             register_surfaces: Some(candle_gen_svd::register_memory_contract_surfaces),
@@ -4290,10 +4319,11 @@ mod preview_advertising {
                 "candle-gen-moss-image",
                 "candle-gen-scail2",
                 "candle-gen-seedvr2",
+                "candle-gen-supra2",
                 "candle-gen-svd",
                 "candle-gen-wan",
             ],
-            "the 22 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
+            "the 25 no-go ids must resolve to exactly these eleven crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
         );
 
@@ -5236,7 +5266,9 @@ mod tests {
                 "moss_image" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 "sana" => Some(&SANA_LATENT_SPACE),
                 "seedvr2" => Some(&SEEDVR2_VIDEO_LATENT_SPACE),
-                "svd" => Some(&SVD_LATENT_SPACE),
+                // Supra2-IMG decodes with stabilityai/sd-vae-ft-mse: SD's 4-channel f8 latent at
+                // scale 0.18215, the same space SVD's VAE consumes (sc-24214, as on MLX).
+                "svd" | "supra2" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
                 // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
@@ -5972,6 +6004,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_ti2v_5b",
                 "wan2_2_t2v_14b",
@@ -6027,7 +6060,8 @@ mod tests {
         // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55; sc-26235 adds
         // `flux3_klein`, a generator with its own complete row: 66 / 56; sc-26239 adds
         // `flux3_klein_base`, a generator with its own complete row: 67 / 57; the sc-26240
-        // `flux3_klein_base` trainer reuses that generator's id and row and adds no id).
+        // `flux3_klein_base` trainer reuses that generator's id and row and adds no id; sc-24214
+        // adds `supra2_img`, a generator with its own complete row: 70 / 60 with the MOSS pair).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -6041,8 +6075,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 69);
-        assert_eq!(super::provider_components().len(), 59);
+        assert_eq!(distinct.len(), 70);
+        assert_eq!(super::provider_components().len(), 60);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

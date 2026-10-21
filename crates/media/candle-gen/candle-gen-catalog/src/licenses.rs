@@ -451,6 +451,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
     },
+    // --- supra2 (sc-24214) --------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE — the
+    // MLX twin's row, unchanged.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
+    },
     // --- svd --------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and the ViT-H image encoder all ship in one ungated snapshot.
     ProviderComponents {
@@ -621,7 +628,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 59);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 60);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -653,9 +660,10 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            69,
-            "69 distinct Candle provider ids: 62 generators (qwen_image_2_1_turbo joined in \
-             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323) + 20 trainers (16 of them also \
+            70,
+            "70 distinct Candle provider ids: 63 generators (qwen_image_2_1_turbo joined in \
+             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323, \
+             supra2_img in sc-24214) + 20 trainers (16 of them also \
              generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -829,6 +837,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_i2v_14b",
                 "wan2_2_t2v_14b",
