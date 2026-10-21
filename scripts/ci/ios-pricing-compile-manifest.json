@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "eff6b6e0f7345259aa67f2b4bcfe93422dd7357840397cc37142971872f138a8",
+  "rust_proof_closure_sha256": "37215bcb34837df4241bb1589867bab2b5e6f8cf143549ac02da3a1042046793",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -796,7 +796,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign.rs",
-      "sha256": "883feedaf4ffe1f596c231b37ed0941964f4ffff98b60ea2b1b4bbd673cc1a0c"
+      "sha256": "12ae3a8c541698a683c582998c3fb271ad73e684f2be869ff1e5457adbd0d94c"
     },
     {
       "path": "ios-host/smoke/src/campaign_admission_tests.rs",
@@ -804,7 +804,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "d019a15124151ef5c4a5c0bbbebb53473eed362fe442a478acd76478e9aaacd5"
+      "sha256": "66ff417de096f22d8faa93b6e866e4578cf7f8b0f4d73fb27ad1e2dbef833cd6"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",

@@ -7,7 +7,9 @@
 //! steps. Two validation cases ride along for ONE model: the optimized anchor at full steps (does a
 //! short-step capture see the full-step peak?) and at the [`VALIDATION_EDGE`] (an ADMITTED run the
 //! anchor law predicts before it is measured).
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// The selection token of a strategy with no declared parameters (and of a rung the provider does
 /// not implement: admission refuses it, typed).

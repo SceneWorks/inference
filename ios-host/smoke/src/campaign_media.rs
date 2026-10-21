@@ -442,7 +442,8 @@ fn variant_for_case(
 }
 
 /// Unresolved carriers remain visible as unresolved families, never borrowed text evidence.
-pub fn variant(provider: &str, mode: &str, tier: &str, class: Option<&str>) -> String {
+#[cfg(test)]
+fn variant(provider: &str, mode: &str, tier: &str, class: Option<&str>) -> String {
     runtime_ios::catalog()
         .map_err(|error| error.to_string())
         .and_then(|catalog| variant_for_registry(catalog.media(), provider, mode, tier, class))
