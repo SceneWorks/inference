@@ -8,7 +8,7 @@ use mlx_gen::gen_core::iris::depth::{DepthOutput, DepthRequest, IrisDepthEstimat
 use mlx_gen::gen_core::*;
 
 fn generation_binding(req: &GenerationRequest) -> [u8; 32] {
-    work_binding(&IosWork::Generate(req.clone()))
+    crate::binding::generation_binding(req)
 }
 
 pub struct BoundGenerator {
@@ -382,5 +382,164 @@ impl IrisDepthEstimator for BoundDepth {
         (self.capacity)(self.footprint)?;
         self.spec
             .read_prepared_files_unchanged(|| self.inner.estimate(req, on_progress))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::tests::allocations_during;
+    use mlx_gen::gen_core::{Conditioning, Image};
+
+    #[test]
+    fn borrowed_generation_binding_matches_owned_role_scalar_matrix_without_request_clone() {
+        use mlx_gen::gen_core::{ControlKind, GenerationMemory};
+
+        fn image(tag: u8) -> Image {
+            Image {
+                width: 3,
+                height: 2,
+                pixels: (0..18).map(|i| tag.wrapping_add(i)).collect(),
+            }
+        }
+        fn buffers(request: &GenerationRequest) -> Vec<(u32, u32, *const u8, usize, usize)> {
+            request
+                .conditioning
+                .iter()
+                .map(|role| {
+                    let image = match role {
+                        Conditioning::Reference { image, .. }
+                        | Conditioning::Mask { image }
+                        | Conditioning::Control { image, .. } => image,
+                        _ => unreachable!("the matrix only constructs SDXL image roles"),
+                    };
+                    (
+                        image.width,
+                        image.height,
+                        image.pixels.as_ptr(),
+                        image.pixels.len(),
+                        image.pixels.capacity(),
+                    )
+                })
+                .collect()
+        }
+
+        // Initialize fixed neutral-cancellation state before the allocation observation.
+        work_binding(&IosWork::Generate(GenerationRequest::default()));
+        for scalar in [None, Some(0.0), Some(-0.0), Some(0.625)] {
+            for sampler in [None, Some("euler_ancestral"), Some("heun")] {
+                for memory_case in 0..3 {
+                    for role_case in 0..5 {
+                        let reference = || Conditioning::Reference {
+                            image: image(11),
+                            strength: scalar,
+                        };
+                        let control = |tag| Conditioning::Control {
+                            image: image(tag),
+                            kind: ControlKind::Canny,
+                            scale: scalar,
+                        };
+                        let conditioning = match role_case {
+                            0 => vec![],
+                            1 => vec![reference()],
+                            2 => vec![reference(), Conditioning::Mask { image: image(29) }],
+                            3 => vec![control(47), control(83)],
+                            4 => vec![reference(), control(47), control(83)],
+                            _ => unreachable!(),
+                        };
+                        let memory = match memory_case {
+                            0 => None,
+                            1 => Some(GenerationMemory::default()),
+                            2 => Some(GenerationMemory {
+                                stage_residency: true,
+                                chunk_attention: true,
+                                attention_chunk_size: Some(128),
+                                stream_transformer_blocks: true,
+                                transformer_window_size: Some(2),
+                                ..Default::default()
+                            }),
+                            _ => unreachable!(),
+                        };
+                        let mut request = GenerationRequest {
+                            prompt: "borrowed λ\n\"quoted\"\\path\t雪".into(),
+                            negative_prompt: Some("negative Ω\n\"quoted\"\\tail".into()),
+                            sampler: sampler.map(str::to_owned),
+                            memory,
+                            strength: scalar,
+                            conditioning,
+                            ..Default::default()
+                        };
+                        // The legacy clone is TEST-ONLY and outside the counted region.
+                        let expected = work_binding(&IosWork::Generate(request.clone()));
+                        let before_buffers = buffers(&request);
+                        let before_prompt = (request.prompt.as_ptr(), request.prompt.capacity());
+                        let before_negative = request
+                            .negative_prompt
+                            .as_ref()
+                            .map(|text| (text.as_ptr(), text.capacity()));
+                        let (actual, allocated) =
+                            allocations_during(|| generation_binding(&request));
+                        assert_eq!(actual, expected, "role/scalar/sampler/memory projection");
+                        assert_eq!(
+                            allocated, 0,
+                            "the warmed borrowed Generate hash must not allocate Rust heap storage"
+                        );
+                        assert_eq!(buffers(&request), before_buffers);
+                        assert_eq!(
+                            (request.prompt.as_ptr(), request.prompt.capacity()),
+                            before_prompt
+                        );
+                        assert_eq!(
+                            request
+                                .negative_prompt
+                                .as_ref()
+                                .map(|text| (text.as_ptr(), text.capacity())),
+                            before_negative
+                        );
+
+                        if role_case >= 3 {
+                            let end = request.conditioning.len();
+                            request.conditioning.swap(end - 2, end - 1);
+                            let reordered = generation_binding(&request);
+                            assert_ne!(reordered, expected, "Control occurrence order is bound");
+                            assert_eq!(
+                                reordered,
+                                work_binding(&IosWork::Generate(request.clone()))
+                            );
+                            request.conditioning.swap(end - 2, end - 1);
+                        }
+                        if let Some(role) = request.conditioning.first_mut() {
+                            let image = match role {
+                                Conditioning::Reference { image, .. }
+                                | Conditioning::Mask { image }
+                                | Conditioning::Control { image, .. } => image,
+                                _ => unreachable!(),
+                            };
+                            image.pixels[0] ^= 1;
+                            assert_ne!(
+                                generation_binding(&request),
+                                expected,
+                                "the helper retains full pixel-content binding"
+                            );
+                            match request.conditioning.first_mut().unwrap() {
+                                Conditioning::Reference { image, .. }
+                                | Conditioning::Mask { image }
+                                | Conditioning::Control { image, .. } => image.pixels[0] ^= 1,
+                                _ => unreachable!(),
+                            }
+                        }
+                        request.seed = Some(19);
+                        request.cancel.cancel();
+                        assert_eq!(generation_binding(&request), expected);
+                        assert_eq!(
+                            generation_binding(&request),
+                            work_binding(&IosWork::Generate(request.clone()))
+                        );
+                        request.prompt.push('!');
+                        assert_ne!(generation_binding(&request), expected);
+                    }
+                }
+            }
+        }
     }
 }

@@ -117,6 +117,17 @@ impl fmt::Debug for DepthView<'_> {
     }
 }
 
+/// Bind a borrowed generation request with the existing exact-work byte projection.
+/// The owned-work entry below remains the independent compatibility oracle.
+pub(crate) fn generation_binding(request: &GenerationRequest) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(DOMAIN);
+    let mut sink = DigestWriter(&mut hash);
+    write!(&mut sink, "generate:{:?}", GenerationView(request))
+        .expect("Debug writes into an infallible SHA sink");
+    hash.finalize().into()
+}
+
 pub(crate) fn work_binding(work: &IosWork) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(DOMAIN);
@@ -131,7 +142,7 @@ pub(crate) fn work_binding(work: &IosWork) -> [u8; 32] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mlx_gen::gen_core::{Conditioning, Image};
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -168,7 +179,7 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-    fn allocations_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    pub(crate) fn allocations_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {

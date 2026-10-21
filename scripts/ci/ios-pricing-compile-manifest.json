@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "c229bb2d170f6cef18e4390850f47ae16e2a1ce2711f435aebdd2229b7535322",
+  "rust_proof_closure_sha256": "dcdb12571ca4400992a8e2a9a6cb5d4229b5c4e25e5a07ad973a21f853825036",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -144,7 +144,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
-      "sha256": "940a672556caad36d2019634c15c3afbdf2ba90f761c5b7de85ed15bc8a9e573"
+      "sha256": "1d8d621f4986bd14a9cb5c7e46c7f4985e5499bc2061b2edf2678f60782790b2"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/capture_config.rs",
@@ -833,6 +833,10 @@
     {
       "path": "scripts/tests/test_ios_campaign.py",
       "sha256": "ab86d7bed9c261fd8424264500f8d8fbd6f064789df3c0e83dffede5f0c8efb1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/bound.rs",
+      "sha256": "9271697acc4e806e3540272074e4ed17a72522b79c921317ef92606f2f3cba4f"
     }
   ],
   "HOSTs": [
