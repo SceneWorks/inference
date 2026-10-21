@@ -73,11 +73,18 @@ pub(crate) fn component_headers(
             source_indices,
             transform_failures,
         } => {
+            if let Some((_, error)) = transform_failures.first() {
+                return Err(Error::Msg(format!(
+                    "sdxl LDM fused source transform fails in every source order: {error}"
+                )));
+            }
             // Existing semantic projection cannot certify these source-order-dependent files.
             // This is an explicit unfinished source-seam dependency, not a new native restriction
             // or numeric/full-Fused completion. Do not enumerate worlds or select a fake winner.
-            Err(Error::Unsupported(format!("sdxl LDM metadata needs actual correlated source order ({} non-equivalent writes, {} possible transform failures)",
-                source_indices.len(),transform_failures.len())))
+            Err(Error::Unsupported(format!(
+                "sdxl LDM metadata needs actual correlated source order ({} order-dependent writes)",
+                source_indices.len()
+            )))
         }
     }
 }

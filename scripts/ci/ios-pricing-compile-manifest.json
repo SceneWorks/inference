@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "b294c39921013c974fede832cb611c4e8a3e8ef40cad6d6d44a37335f26a151e",
+  "rust_proof_closure_sha256": "88026bcfc6b8cef7d19506c22b54d090c4a5eb33231e3ced4a0cc3e53c4811a4",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -372,7 +372,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "7cee2571fc5e3e9e0b239bc79d5fc2419fdf6cd8e55a924c7d49d0080aa2ec38"
+      "sha256": "10c6c3486892de0c8a00b03c9ac5e493f47e4845c2eeff435210a812b2f02f57"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -380,7 +380,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
-      "sha256": "57d1fb48c3e85e93835eacf71be931eda246a042f2dec334d1676d51759d0c57"
+      "sha256": "19a2bdab391b1f1b31059444547eaa275ec57c71e64c3d3c3595a5b355643848"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
@@ -400,7 +400,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quant.rs",
-      "sha256": "18ed6def4aee6fae1a0c962028364a2a37fc8fbabfbd7e4aa830a7d876a6aecd"
+      "sha256": "85daac9971096cf42e69e452da3d969c1076d7293264f329e5c8380b2da6b391"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum.rs",
@@ -864,7 +864,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm/pricing.rs",
-      "sha256": "f6d60212a91ab158e4dd4acc61e69366d9ff6e17e53000821a7153eca9b65d1a"
+      "sha256": "75d7895f7f597380d9b70e3c27331ea0800909bfa032149a666e2276a6372c71"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources/native_allocations.rs",
@@ -1430,11 +1430,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "778708de51b1b7285364b7cc78afc642de45b2a62fd9de7d1a41b2aa44f9036e",
-    "classification_sha256": "239bb7055e5ec6780bf1a8f215ea2019a32b697a7db7c91d6b5f4bf546bd2450",
-    "selected_Rust_FQNs": 92,
-    "HOST_logical": 79,
-    "HOST_expected_PASS_rows": 80,
+    "inventory_sha256": "c32b87d09c235e03e6c1c25b1db291332c6a3692569b9f9e7cbf9f74999d5a47",
+    "classification_sha256": "672e1e7c1454be9d65a04d04fcf12f777975ca0e9a35de65611c072843401a2a",
+    "selected_Rust_FQNs": 97,
+    "HOST_logical": 84,
+    "HOST_expected_PASS_rows": 85,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

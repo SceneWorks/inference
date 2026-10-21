@@ -375,9 +375,16 @@ pub fn ios_bounder(
     let requested = Regime::from_request(request)?;
     let anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
     let request_inputs = Inputs::from_spec(request.spec, &requested)?;
-    if anchor_inputs.fused.is_some() || request_inputs.fused.is_some() {
-        return Err(Error::Unsupported("sdxl fused source/view native backing transfer remains unbound; logical parents are not physical certificates".into()));
+    if anchor_inputs.fused.is_some() != request_inputs.fused.is_some() {
+        return Err(Error::Unsupported(
+            "sdxl common-forward transfer needs the same source component graph".into(),
+        ));
     }
+    // Fused native backing follows the MLX ACTIVE-ALLOCATOR counter law only (audit
+    // sc26270-fused-native-backing-source-authority-v2): anchor and request split the same file,
+    // so equal-order backing cancels and the counter delta adds the full source-order variance.
+    // NativeAllocatorGrowth only; task footprint/physical mapping stays the activity-26569 premise.
+    let order_variance = request_inputs.fused_counter_order_variance()?;
     if anchor_request.execution != request.execution
         || anchor_request.spec.load_shape != request.spec.load_shape
         || anchor_request.spec.offload_policy != request.spec.offload_policy
@@ -412,13 +419,26 @@ pub fn ios_bounder(
                 "sdxl transfer pricing is not the source-generated profile".into(),
             ));
         }
-        bound_ancestral_forward_windows(
+        let mut bounds = bound_ancestral_forward_windows(
             &anchor,
             anchor_pricing,
             &requested,
             request_pricing,
             anchor_inputs.arch.latent_scale,
-        )
+        )?;
+        for bound in &mut bounds {
+            if let IosWindowBound::Transfer {
+                anchor_candidates, ..
+            } = bound
+            {
+                for candidate in anchor_candidates {
+                    candidate.delta_growth_upper = candidate
+                        .delta_growth_upper
+                        .saturating_add(i128::from(order_variance));
+                }
+            }
+        }
+        Ok(bounds)
     })
 }
 
@@ -1072,6 +1092,40 @@ pub(crate) struct FusedInputs {
     ip_source: Option<WeightsSource>,
 }
 
+impl Inputs {
+    /// MLX active-counter variance (upper minus lower) of the fused load over every realizable
+    /// native source order, summed over the text and heavy splits; zero for Directory inputs.
+    /// Counter-scoped: not task footprint, retirement or source-parent subtraction.
+    fn fused_counter_order_variance(&self) -> Result<u64> {
+        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        let Some(fused) = &self.fused else {
+            return Ok(0);
+        };
+        let vae_dtype = self.vae.1;
+        let loaded =
+            |component: C, header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| {
+                match component {
+                    C::Vae => Ok(vae_dtype),
+                    _ => crate::quant::loaded_dtype_in_component(
+                        fused.source.component_packed(component),
+                        header,
+                    ),
+                }
+            };
+        let heavy: &[C] = if fused.vae_fix.is_some() {
+            &[C::Unet]
+        } else {
+            &[C::Unet, C::Vae]
+        };
+        let mut variance = 0u64;
+        for components in [&[C::ClipL, C::ClipBigG][..], heavy] {
+            let backing = fused.source.active_counter_backing(components, &loaded)?;
+            variance = variance.saturating_add(backing.upper.saturating_sub(backing.lower));
+        }
+        Ok(variance)
+    }
+}
+
 /// The files and load facts one request's components come from.
 pub(crate) struct Inputs {
     pub fused: Option<FusedInputs>,
@@ -1304,19 +1358,14 @@ fn footprint(files: &[PathBuf], dtype: Dtype, keep: impl Fn(&str) -> bool) -> Re
     Ok(Footprint { resident, floor })
 }
 
-/// Source-parent terms stay logical and unclassified by the Directory physical bounder.
-/// No source/view logical product establishes a native backing size or retirement time.
+/// Source-parent terms stay logical. Native backing is the separate counter-scoped
+/// [`Inputs::fused_counter_order_variance`] law; no logical product is a retirement time.
 struct FusedLoadFacts {
     text_floor: u64,
     heavy_floor: u64,
     text_parents: u64,
     heavy_parents: u64,
     external_vae: bool,
-    native_backing: FusedNativeBacking,
-}
-#[derive(Clone, Copy)]
-enum FusedNativeBacking {
-    Unbound,
 }
 fn fused_header_footprint(
     headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
@@ -1598,7 +1647,6 @@ impl Priced {
                     // During U-Net construction even a later-replaced VAE map still exists.
                     heavy_parents: fused.source.raw_parent_bytes(&[C::Unet, C::Vae]),
                     external_vae: fused.vae_fix.is_some(),
-                    native_backing: FusedNativeBacking::Unbound,
                 })
             })
             .transpose()?;
@@ -1921,7 +1969,6 @@ impl Priced {
     /// on from-weights constructors. Source parents are logical, never a backing-size credit.
     fn fused_load_points(&self, regime: &Regime) -> Option<Vec<PricedQuantum>> {
         let fused = self.fused.as_ref()?;
-        let FusedNativeBacking::Unbound = fused.native_backing;
         let mut points = Vec::new();
         let mut push = |resident, label, scratch| {
             points.push(PricedQuantum {

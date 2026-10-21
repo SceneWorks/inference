@@ -131,7 +131,11 @@ pub(crate) fn guarded_load_quantize<T>(body: impl FnOnce() -> T) -> T {
 pub(crate) type QuantizeLinear<'a> = dyn FnMut(&str, &mut AdaptableLinear, i32) -> Result<()> + 'a;
 
 pub(crate) fn child_path(prefix: &str, child: &str) -> String {
-    if prefix.is_empty() { child.to_owned() } else { format!("{prefix}.{child}") }
+    if prefix.is_empty() {
+        child.to_owned()
+    } else {
+        format!("{prefix}.{child}")
+    }
 }
 
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
@@ -231,8 +235,16 @@ pub(crate) fn loaded_header_dtype(
     headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
     header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
 ) -> Result<Dtype> {
+    loaded_dtype_in_component(headers.iter().any(|h| h.name.ends_with(".scales")), header)
+}
+
+/// [`loaded_header_dtype`] given the component-wide packed flag (any `.scales` name), which is a
+/// property of the component's target NAMES and therefore identical in every fused source order.
+pub(crate) fn loaded_dtype_in_component(
+    packed: bool,
+    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> Result<Dtype> {
     let stored = header_dtype(header.dtype)?;
-    let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
     if !packed
         || (header.is_float()
             && !header.name.ends_with(".scales")

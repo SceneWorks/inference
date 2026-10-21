@@ -237,6 +237,13 @@ impl FusedSourceIr {
     }
 
     pub(crate) fn project_equivalent(&self) -> Result<OrderInvariantProjection> {
+        // Per-component packed flag from target NAMES only: identical in every source order.
+        let mut packed = [false; 4];
+        for (component, name) in self.target_writers.keys() {
+            if name.ends_with(".scales") {
+                packed[usize::from(*component)] = true;
+            }
+        }
         let mut result = FusedHeaders::default();
         let mut ambiguous = vec![false; self.operations.len()];
         let mut transform_failures = Vec::new();
@@ -250,12 +257,21 @@ impl FusedSourceIr {
                 continue;
             };
             let value = self.output(first);
-            // Compare complete transformed facts, not independent shape cells. Equal targets
-            // may come from different raw parents: ALL raw operations remain in this IR/floor.
-            if writers
-                .iter()
-                .any(|&writer| self.output(writer).header != value.header)
-            {
+            // Compare every fact a header pricing consumer reads, never independent maxima.
+            // Equal targets may come from different raw parents: ALL raw operations remain in
+            // this IR and in the raw load floor/parent terms, which never use a winner.
+            let component_packed = packed[usize::from(component_key(value.component))];
+            let mut ambiguous_target = false;
+            for &writer in writers {
+                if !pricing_equivalent(
+                    component_packed,
+                    &self.output(writer).header,
+                    &value.header,
+                )? {
+                    ambiguous_target = true;
+                }
+            }
+            if ambiguous_target {
                 for writer in writers {
                     ambiguous[writer.source] = true;
                 }
@@ -278,6 +294,27 @@ impl FusedSourceIr {
         result.require_components()?;
         Ok(OrderInvariantProjection::Resolved(result))
     }
+}
+
+/// Whether two writers of the SAME target are indistinguishable to every SDXL header pricing
+/// consumer. Those consumers read a component header only as: its name; its shape; its loaded
+/// dtype (`quant::loaded_header_dtype`, via `clip_header_tensor`, `linear_from_headers`,
+/// `HeaderWeights`, adapter `header_targets` and the fused footprint); raw dtypes only where the
+/// loaded dtype IS the stored dtype (packed codes/scales/biases); raw dtype validation, which
+/// `FusedSourceIr::from_headers` already applies to every source; and `text_pack_facts`, which
+/// takes `data_bytes` only when the stored dtype equals the loaded one and otherwise the loaded
+/// materialized size. Transformed `data_bytes` is elements x stored width by construction, so equal
+/// shapes and equal loaded dtypes give equal bytes on both branches. Fused sources never arm the
+/// rung-4 block stream (`memory_strategy::streamable` requires a Directory). Hence equal shape and
+/// equal loaded dtype make every pricing input identical in every actual source order.
+fn pricing_equivalent(
+    packed: bool,
+    a: &SafetensorsTensorHeader,
+    b: &SafetensorsTensorHeader,
+) -> Result<bool> {
+    Ok(a.shape == b.shape
+        && crate::quant::loaded_dtype_in_component(packed, a)?
+            == crate::quant::loaded_dtype_in_component(packed, b)?)
 }
 
 /// O(H+E) proof result, not an arbitrary winner or capability refusal. If an alternative changes
@@ -335,10 +372,19 @@ impl FusedHeaderSource {
                 source_indices,
                 transform_failures,
             } => {
-                // Mandatory all-orders walker is being developed separately. This unfinished
-                // seam is not a permanent alias policy or a claim of full Fused support.
-                Err(Error::Unsupported(format!("sdxl fused all-orders pricing remains incomplete ({} source alternatives, {} transform failure alternatives)",
-                    source_indices.len(),transform_failures.len())))
+                // Native split transforms EVERY mapped source before any component check, so a
+                // failing transform fails in every source order: a certain native failure.
+                if let Some((_, error)) = transform_failures.first() {
+                    return Err(Error::Msg(format!(
+                        "sdxl LDM fused source transform fails in every source order: {error}"
+                    )));
+                }
+                // Remaining: writers whose shape or loaded dtype differ, so the priced program
+                // depends on native source order. Not a native restriction or Fused completion.
+                Err(Error::Unsupported(format!(
+                    "sdxl fused pricing for order-dependent source aliases remains incomplete ({} source alternatives)",
+                    source_indices.len()
+                )))
             }
         }
     }
@@ -367,6 +413,194 @@ impl FusedHeaderSource {
                 sum.saturating_add(mlx_gen::ios_quantum::allocated_bytes(op.raw_data_bytes))
             })
     }
+}
+
+/// MLX ACTIVE-ALLOCATOR counter charge for one materialized request of `n` bytes (audit
+/// sc26270-fused-native-backing-source-authority-v2, sha 3c577d52…): a new MTLBuffer has the
+/// page-rounded length r(n); a cache-reused one is below min(2*r(n), r(n)+2*page). This is a
+/// native counter law, NOT task RSS/process footprint (activity-26569 premise stays separate).
+pub(crate) fn active_counter_charge(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let rounded = mlx_gen::ios_quantum::allocated_bytes(n);
+    rounded
+        .saturating_mul(2)
+        .min(rounded.saturating_add(2 * mlx_gen::ios_quantum::PAGE_BYTES))
+}
+
+/// Lower/upper MLX active-counter backing of one actual fused split over every realizable native
+/// source order. Counter-scoped only: no physical mapping, retirement or parent subtraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FusedCounterBacking {
+    pub lower: u64,
+    pub upper: u64,
+}
+
+impl FusedHeaderSource {
+    /// The component-wide packed flag (`quant::loaded_header_dtype`) from target NAMES only.
+    pub(crate) fn component_packed(&self, component: SdxlComponent) -> bool {
+        let key = component_key(component);
+        self.ir
+            .target_writers
+            .keys()
+            .any(|(c, name)| *c == key && name.ends_with(".scales"))
+    }
+
+    /// Native split moves each mapped source's lazy Load into its component map; an overwritten
+    /// writer and every ignored or unconstructed-component source is dropped unevaluated. A
+    /// winning source is evaluated once (Load allocates its nbytes); split/transpose/reshape views
+    /// share that buffer, so a source is charged ONCE however many targets it wins. Each winning
+    /// target whose loaded dtype differs from its stored dtype adds its AsType output. Alias groups
+    /// are connected components of (source, ambiguous target); their realizable winner assignments
+    /// are exactly those whose "winner after every other writer" constraints are acyclic, and
+    /// distinct groups share no source, so their extremes add.
+    pub(crate) fn active_counter_backing(
+        &self,
+        components: &[SdxlComponent],
+        loaded: &dyn Fn(SdxlComponent, &SafetensorsTensorHeader) -> Result<mlx_rs::Dtype>,
+    ) -> Result<FusedCounterBacking> {
+        let cast = |writer: WriterId| -> Result<u64> {
+            let output = self.ir.output(writer);
+            let target = loaded(output.component, &output.header)?;
+            if crate::quant::header_dtype(output.header.dtype)? == target {
+                return Ok(0);
+            }
+            let bytes = output
+                .header
+                .materialized_bytes(crate::quantum::dtype_bytes(target))
+                .map_err(|error| Error::Msg(error.to_string()))?;
+            Ok(active_counter_charge(bytes))
+        };
+        let raw = |source: usize| active_counter_charge(self.ir.operations[source].raw_data_bytes);
+        let selected = self
+            .ir
+            .target_writers
+            .iter()
+            .filter(|((component, _), writers)| {
+                !writers.is_empty() && components.iter().any(|c| component_key(*c) == *component)
+            })
+            .map(|(_, writers)| writers.as_slice())
+            .collect::<Vec<_>>();
+        let mut fixed_sources = std::collections::BTreeSet::new();
+        let mut base = 0u64;
+        for writers in selected.iter().filter(|writers| writers.len() == 1) {
+            fixed_sources.insert(writers[0].source);
+            base = base.saturating_add(cast(writers[0])?);
+        }
+        for &source in &fixed_sources {
+            base = base.saturating_add(raw(source));
+        }
+        // Union sources through ambiguous targets.
+        let ambiguous = selected
+            .iter()
+            .filter(|writers| writers.len() > 1)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut parent = (0..self.ir.operations.len()).collect::<Vec<_>>();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for writers in &ambiguous {
+            let first = find(&mut parent, writers[0].source);
+            for writer in &writers[1..] {
+                let other = find(&mut parent, writer.source);
+                parent[other] = first;
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<&[WriterId]>> = BTreeMap::new();
+        for writers in ambiguous {
+            let root = find(&mut parent, writers[0].source);
+            groups.entry(root).or_default().push(writers);
+        }
+        let (mut lower, mut upper) = (base, base);
+        for targets in groups.values() {
+            let mut extreme: Option<(u64, u64)> = None;
+            let mut choice = vec![0usize; targets.len()];
+            loop {
+                if realizable(targets, &choice) {
+                    let mut charged = std::collections::BTreeSet::new();
+                    let mut cost = 0u64;
+                    for (writers, &pick) in targets.iter().zip(&choice) {
+                        let winner = writers[pick];
+                        cost = cost.saturating_add(cast(winner)?);
+                        if !fixed_sources.contains(&winner.source) && charged.insert(winner.source)
+                        {
+                            cost = cost.saturating_add(raw(winner.source));
+                        }
+                    }
+                    extreme =
+                        Some(extreme.map_or((cost, cost), |(lo, hi)| (lo.min(cost), hi.max(cost))));
+                }
+                // Odometer over this group's per-target writer lists only.
+                let mut index = 0;
+                loop {
+                    if index == choice.len() {
+                        break;
+                    }
+                    choice[index] += 1;
+                    if choice[index] < targets[index].len() {
+                        break;
+                    }
+                    choice[index] = 0;
+                    index += 1;
+                }
+                if index == choice.len() {
+                    break;
+                }
+            }
+            // Some order always exists, so every group has a realizable assignment.
+            let (lo, hi) = extreme.ok_or_else(|| {
+                Error::Msg("sdxl fused alias group has no realizable source order".into())
+            })?;
+            lower = lower.saturating_add(lo);
+            upper = upper.saturating_add(hi);
+        }
+        Ok(FusedCounterBacking { lower, upper })
+    }
+}
+
+/// A winner assignment is realizable iff "winner follows every other writer of its target" is an
+/// acyclic relation over the group's sources (then some native visit order produces it).
+fn realizable(targets: &[&[WriterId]], choice: &[usize]) -> bool {
+    let mut edges: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut nodes = std::collections::BTreeSet::new();
+    for (writers, &pick) in targets.iter().zip(choice) {
+        let winner = writers[pick].source;
+        for writer in writers.iter() {
+            nodes.insert(writer.source);
+            if writer.source != winner {
+                edges.entry(writer.source).or_default().push(winner);
+            }
+        }
+    }
+    let mut indegree: BTreeMap<usize, usize> = nodes.iter().map(|&n| (n, 0)).collect();
+    for targets in edges.values() {
+        for target in targets {
+            *indegree.get_mut(target).expect("edge endpoint is a node") += 1;
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&n, _)| n)
+        .collect::<Vec<_>>();
+    let mut visited = 0usize;
+    while let Some(node) = ready.pop() {
+        visited += 1;
+        for target in edges.get(&node).into_iter().flatten() {
+            let degree = indegree.get_mut(target).expect("edge endpoint is a node");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(*target);
+            }
+        }
+    }
+    visited == nodes.len()
 }
 
 #[cfg(test)]
@@ -473,6 +707,139 @@ mod source_ir_tests {
             large.target_writers.values().map(Vec::len).sum::<usize>(),
             8
         );
+    }
+
+    #[test]
+    fn dtype_only_aliases_price_identically_in_every_actual_order_host() {
+        let mut headers = source();
+        // Same post-split shape as the Q part, different stored dtype (F16 vs split F32).
+        headers.push(header(
+            "conditioner.embedders.1.model.transformer.resblocks.0.attn.q_proj.weight",
+            &[2, 4],
+            Stored::F16,
+        ));
+        let OrderInvariantProjection::Resolved(_) = FusedSourceIr::from_headers(&headers)
+            .unwrap()
+            .project_equivalent()
+            .unwrap()
+        else {
+            panic!("equal shape and loaded dtype are pricing-equivalent");
+        };
+        // Both actual native orders: the split writer last, then the alias writer last.
+        let split_last = split_in_exact_source_order(&headers, &[6, 0, 1, 2, 3, 4, 5]).unwrap();
+        let alias_last = split_in_exact_source_order(&headers, &[0, 1, 2, 3, 4, 5, 6]).unwrap();
+        let q = "text_model.encoder.layers.0.self_attn.q_proj.weight";
+        assert_eq!(split_last.clip_bigg[q].dtype, Stored::F32);
+        assert_eq!(alias_last.clip_bigg[q].dtype, Stored::F16);
+        let a: Vec<_> = split_last.clip_bigg.values().cloned().collect();
+        let b: Vec<_> = alias_last.clip_bigg.values().cloned().collect();
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(
+                crate::text_encoder::clip_header_tensor(&a, &x.name).unwrap(),
+                crate::text_encoder::clip_header_tensor(&b, &y.name).unwrap()
+            );
+        }
+        let cfg = crate::config::ClipTextConfig::sdxl_te2();
+        assert_eq!(
+            crate::text_encoder::text_pack_facts(&a, &cfg, None)
+                .unwrap()
+                .retained,
+            crate::text_encoder::text_pack_facts(&b, &cfg, None)
+                .unwrap()
+                .retained
+        );
+        // Every raw parent, including the losing alias, stays in the source-parent term.
+        let source = FusedHeaderSource::from_headers(headers).unwrap();
+        assert_eq!(
+            source.raw_parent_bytes(&[SdxlComponent::ClipBigG]),
+            96 + 32 + 16
+        );
+    }
+
+    #[test]
+    fn packed_companion_dtype_alias_stays_order_dependent_host() {
+        let mut headers = source();
+        let base = "model.diffusion_model.output_blocks.2";
+        // Both upsampler slots remap to up_blocks.0.upsamplers.0.conv.scales; packed
+        // companions load at their STORED dtype, so F16 vs BF16 changes priced facts.
+        headers.push(header(
+            &format!("{base}.1.conv.scales"),
+            &[4, 1],
+            Stored::F16,
+        ));
+        headers.push(header(
+            &format!("{base}.2.conv.scales"),
+            &[4, 1],
+            Stored::BF16,
+        ));
+        let OrderInvariantProjection::NeedsActualOrder {
+            source_indices,
+            transform_failures,
+        } = FusedSourceIr::from_headers(&headers)
+            .unwrap()
+            .project_equivalent()
+            .unwrap()
+        else {
+            panic!("loaded-dtype difference must not be collapsed");
+        };
+        assert_eq!(source_indices, [6, 7]);
+        assert!(transform_failures.is_empty());
+        let error = FusedHeaderSource::from_headers(headers).err().unwrap();
+        assert!(matches!(&error, Error::Unsupported(text) if text.contains("order-dependent")));
+    }
+
+    #[test]
+    fn fused_transform_failure_is_a_certain_native_failure_host() {
+        let mut headers = source();
+        headers.push(header(
+            "conditioner.embedders.1.model.transformer.resblocks.1.attn.in_proj_weight",
+            &[7, 4],
+            Stored::F32,
+        ));
+        let error = FusedHeaderSource::from_headers(headers).err().unwrap();
+        assert!(
+            matches!(&error, Error::Msg(text) if text.contains("every source order") && text.contains("split evenly"))
+        );
+    }
+
+    #[test]
+    fn fused_active_counter_backing_charges_unique_winning_sources_and_casts_host() {
+        let mut headers = source();
+        // Pricing-equivalent alias (same shape, loaded F16) but different raw bytes/cast.
+        headers.push(header(
+            "conditioner.embedders.1.model.transformer.resblocks.0.attn.q_proj.weight",
+            &[2, 4],
+            Stored::BF16,
+        ));
+        let source = FusedHeaderSource::from_headers(headers).unwrap();
+        let loaded = |_: SdxlComponent, _: &SafetensorsTensorHeader| Ok(crate::model::DTYPE);
+        let backing = source
+            .active_counter_backing(&[SdxlComponent::ClipBigG], &loaded)
+            .unwrap();
+        // Fixed: split source U(96)=192 once for its three views + text_projection U(32)=64,
+        // casts of K, V and the projection U(16)=32 each. Q: split wins (cast 32, raw already
+        // charged) or the BF16 alias wins (raw U(16)=32 + cast 32). U(n)=2n below one page.
+        assert_eq!(
+            backing,
+            FusedCounterBacking {
+                lower: 352 + 32,
+                upper: 352 + 64
+            }
+        );
+        assert_eq!(active_counter_charge(0), 0);
+        let page = mlx_gen::ios_quantum::PAGE_BYTES;
+        assert_eq!(active_counter_charge(10 * page + 1), 11 * page + 2 * page);
+    }
+
+    #[test]
+    fn alias_winner_assignments_need_an_acyclic_source_order_host() {
+        let w = |source| WriterId { source, output: 0 };
+        let q = [w(1), w(2)];
+        let k = [w(1), w(2)];
+        // Two split sources writing Q and K: Q from 1 and K from 2 needs 1 after 2 and 2 after 1.
+        assert!(realizable(&[&q, &k], &[0, 0]));
+        assert!(realizable(&[&q, &k], &[1, 1]));
+        assert!(!realizable(&[&q, &k], &[0, 1]));
     }
 
     #[test]
