@@ -2843,7 +2843,7 @@ mod installed_adapters {
                 disabled: false,
             };
             let mut l = NativeLedger::new(16_384, NativeBackend::Cpu).unwrap();
-            forward(&mut l, &[live.clone()], 2, 4, 3, Dtype::Float32).unwrap();
+            forward(&mut l, std::slice::from_ref(&live), 2, 4, 3, Dtype::Float32).unwrap();
             let expected = [16, 32, 32, 24, 16, 24, 4, 24, 24]
                 .into_iter()
                 .map(|n| backing_upper(n, 16_384).unwrap())
