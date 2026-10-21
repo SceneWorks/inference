@@ -341,7 +341,7 @@ pub struct PhasePeak {
 /// Engineering bounds on observation storage, NOT a memory estimate, step cap or fit gate.
 pub const MAX_SAMPLING_MARKS: usize = 1024;
 pub const MAX_SAMPLING_FIELDS: usize = 64;
-const MAX_SAMPLING_NAME_BYTES: usize = 128;
+pub const MAX_SAMPLING_NAME_BYTES: usize = 128;
 
 /// Scalar metadata emitted at an ACTUAL production observation site. A request/serial mark is
 /// not a model evaluation; kind/fields retain that distinction. No tensors/values are serialized.

@@ -1663,26 +1663,34 @@ fn generation_upper(
                 )?;
             }
         }
-        // A payload-free token replay records rows/CFG but no caption tokens. Each encode is
-        // bounded by assemble_window's largest window: the prefix, a caption cut to
-        // `max_length - suffix`, and the suffix (`prefix + max_length` real ids, `max_length`
-        // window tokens). Every charged extent in `encode` is nondecreasing in both counts.
+        // A payload-free token replay records rows/CFG but no caption tokens. `encode` is NOT
+        // monotone in the window (a short window adds a zero pad and a full-width concat, and
+        // the decoder attention route changes with the token count), so no single "largest"
+        // window is assumed. Every caption length assemble_window can produce (0 through the
+        // budget `max_length - suffix`) is priced exactly on a fresh ledger, and the MAXIMUM is
+        // charged for each encode: the actual unrecorded caption is one of these windows.
         None => {
             let max_length = config.text_encoder.max_length;
-            if max_length <= suffix.len() {
-                return Err(Error::Unsupported(
-                    "Iris text window leaves no room for a caption".into(),
-                ));
-            }
-            for _ in 0..encodes {
+            let budget = max_length
+                .checked_sub(suffix.len())
+                .filter(|&b| b > 0)
+                .ok_or_else(|| {
+                    Error::Unsupported("Iris text window leaves no room for a caption".into())
+                })?;
+            let mut window_upper = 0u64;
+            for caption in 0..=budget {
+                let real = plus(caption as u64, suffix.len() as u64)?;
+                let mut window = NativeLedger::new(l.page, l.backend)?;
                 tower.encode(
-                    l,
-                    plus(prefix.len() as u64, max_length as u64)?,
-                    max_length as u64,
+                    &mut window,
+                    plus(prefix.len() as u64, real)?,
+                    real,
                     config,
                     streamed,
                 )?;
+                window_upper = window_upper.max(window.total);
             }
+            l.total = plus(l.total, p!(window_upper, encodes))?;
         }
     }
     let cond = p!(
@@ -1840,7 +1848,7 @@ fn depth_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> 
 }
 
 /// Complete source-derived cumulative native Active upper. Parent owns profile validation,
-/// source identity/witness validation and certificate issuance. Restoration has no recipe.
+/// source identity/witness validation and certificate issuance. Host payload is a separate domain.
 pub(super) fn cumulative_native_upper(
     req: &IosPricingRequest<'_>,
     page: u64,
@@ -1856,6 +1864,7 @@ pub(super) fn cumulative_native_upper(
     match req.provider {
         crate::model::MODEL_ID => generation_upper(req, None, &mut ledger)?,
         crate::depth::DEPTH_MODEL_ID => depth_upper(req, &mut ledger)?,
+        crate::restoration::MODEL_ID => restoration_upper(req, &mut ledger)?,
         _ => {
             return Err(Error::Unsupported(
                 "Iris native certificate has no recipe for this route".into(),
@@ -3033,5 +3042,2409 @@ mod installed_adapters {
             };
             assert!(forward(&mut l, &[bad], 2, 4, 3, Dtype::Float32).is_err());
         }
+    }
+}
+
+/// Repeat one source-identical call graph, applying U to each operand BEFORE repetition. The
+/// first call can create a position cache; every subsequent call is the same steady graph. This
+/// is exact call multiplicity, not a global allocation multiplier or an assumed scratch budget.
+fn repeated_native_calls(
+    l: &mut NativeLedger,
+    calls: u64,
+    mut call: impl FnMut(&mut NativeLedger, bool) -> Result<()>,
+) -> Result<()> {
+    if calls == 0 {
+        return Err(Error::Unsupported(
+            "Iris restoration has no tile forwards".into(),
+        ));
+    }
+    call(l, true)?;
+    if calls > 1 {
+        let mut steady = NativeLedger::new(l.page, l.backend)?;
+        call(&mut steady, false)?;
+        l.total = plus(l.total, product(&[steady.total, calls - 1])?)?;
+    }
+    Ok(())
+}
+
+fn restoration_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> {
+    restoration_upper_replay(req, None, l)
+}
+
+/// restoration.rs:150-196,242-264: export/prompt load, then one upload+time+DiT per actual tile.
+/// All image/canvas/fusion/wavelet/RGB assembly is the neutral HOST driver, not an MLX graph.
+fn restoration_upper_replay(
+    req: &IosPricingRequest<'_>,
+    token: Option<&RestorationToken>,
+    l: &mut NativeLedger,
+) -> Result<()> {
+    req.validate_work_context()?;
+    if req.provider != crate::restoration::MODEL_ID {
+        return Err(Error::Unsupported(
+            "not an Iris restoration native replay".into(),
+        ));
+    }
+    crate::memory_strategy::refuse_unloadable_quant(crate::restoration::MODEL_ID, req.spec)
+        .map_err(Error::from)?;
+    for (field, set) in [
+        ("adapters", !req.spec.adapters.is_empty()),
+        ("text_encoder", req.spec.text_encoder.is_some()),
+        ("control", req.spec.control.is_some()),
+        ("extra_controls", !req.spec.extra_controls.is_empty()),
+        ("ip_adapter", req.spec.ip_adapter.is_some()),
+        ("pid", req.spec.pid.is_some()),
+        ("identity", req.spec.identity.is_some()),
+    ] {
+        if set {
+            return Err(Error::Unsupported(format!(
+                "{}: LoadSpec::{field} is not supported by the Iris-3B restoration route",
+                crate::restoration::MODEL_ID
+            )));
+        }
+    }
+    let resources = RestorationResources::from_spec(req.spec, crate::restoration::MODEL_ID)
+        .map_err(Error::from)?;
+    let config = &resources.export.config;
+    let plan = restoration_priced_plan(req, &resources, token)?;
+    crate::packed::refuse_dense_requested_as_packed(
+        crate::restoration::MODEL_ID,
+        &resources.export.weights_path(),
+        req.spec.quantize,
+    )?;
+    let artifact = crate::packed::artifact_tier(&resources.export.weights_path())?;
+    if artifact.is_some() && req.spec.precision != Precision::Bf16 {
+        return Err(Error::Unsupported(format!(
+            "iris: {} is a packed {artifact:?} artifact, which runs under the bf16 compute policy",
+            resources.export.weights_path().display()
+        )));
+    }
+    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+    let bb = priced_backbone(
+        config,
+        &resources.export.weights_path(),
+        "",
+        req.spec.precision,
+        req.spec.quantize,
+        streamed,
+        config.model.in_channels as u64,
+        Pricing::default(),
+    )?;
+    let raw: HashMap<String, Header> = crate::stream::headers(&resources.export.weights_path())?
+        .into_iter()
+        .map(|h| (h.name.clone(), h))
+        .collect();
+    load_backbone_set(
+        l,
+        &raw,
+        bb.facts.cw,
+        "",
+        |name| !streamed || Stack::of(name).is_none(),
+        None,
+    )?;
+    let prompt = crate::stream::headers(&resources.export.empty_prompt_path())?;
+    let embeddings = prompt
+        .iter()
+        .find(|h| h.name == "embeddings")
+        .ok_or_else(|| Error::MissingTensor("empty-prompt embeddings".into()))?;
+    // EmptyPrompt::read uses host safetensors decoding; only this f32 from_slice is native.
+    l.array(4, header_elements(embeddings)?)?;
+    let (h, w) = if plan.single_pass() {
+        (u64::from(plan.padded.height), u64::from(plan.padded.width))
+    } else {
+        (u64::from(plan.tile), u64::from(plan.tile))
+    };
+    repeated_native_calls(
+        l,
+        plan.forward_count().map_err(Error::from)?,
+        |ledger, first| {
+            ledger.array(4, p!(3, h, w))?; // velocity_body tile upload
+            ledger.array(4, 1)?; // model time from_slice
+            Graph {
+                l: &mut *ledger,
+                bb: &bb.facts,
+            }
+            .forward(
+                1,
+                h,
+                w,
+                ForwardMode {
+                    by_row: false,
+                    first,
+                    streamed,
+                },
+                mlx_gen::AttentionPlan::UNBOUNDED,
+            )
+            // velocity's f32 as_dtype is identity; its flatten/readback creates no new native backing.
+        },
+    )
+}
+
+/// Native recipe replay only. This does NOT itself grant a restoration certificate or combine
+/// native Active with host payload/process heap; the parent bounder owns that separate law.
+pub(super) fn cumulative_native_upper_with_restoration_token(
+    req: &IosPricingRequest<'_>,
+    token: &RestorationToken,
+    page: u64,
+    backend: NativeBackend,
+) -> Result<u64> {
+    if backend == NativeBackend::Metal && std::env::var_os("MLX_SDPA_BLOCKS").is_some() {
+        return Err(Error::Unsupported("Iris native certificate: MLX_SDPA_BLOCKS override is not bound by any execution witness".into()));
+    }
+    let mut l = NativeLedger::new(page, backend)?;
+    restoration_upper_replay(req, Some(token), &mut l)?;
+    Ok(l.total)
+}
+
+/// Opaque reserved proof input. No constructor is exposed while aa011's COMPLETE cold
+/// tokenizer/regex construction and first-search/cache allocation upper remains unproved.
+/// A future source-owned proof, not a caller-provided allowance, must construct this term.
+pub(super) struct TokenizerHostBound {
+    cumulative_requested_bytes: u64,
+}
+
+/// Opaque reserved proof input for complete parser/key/container requested layouts, including
+/// EACH repeated streamed header/Weights parse, config validator formatting, and scoped-thread
+/// requested bookkeeping layouts. No constructor is exposed without source proof. RawVec growth
+/// alone is NOT a bound for serde scratch, HashMap/BTree nodes or std thread-spawn packets.
+pub(super) struct MetadataHostBound {
+    cumulative_requested_bytes: u64,
+}
+
+const TOKENIZER_HOST_GAP: &str =
+    "tokenizer/regex cold-construction and first-search host allocation upper unproved (aa011)";
+const METADATA_HOST_GAP: &str =
+    "Iris metadata host allocation upper unproved: exact libc0.2.183 Apple cfg-chain / pthread_mutex_t requested layout missing";
+
+fn required_tokenizer_host_bytes(
+    provider: &str,
+    bound: Option<&TokenizerHostBound>,
+) -> Result<u64> {
+    if provider == crate::model::MODEL_ID {
+        bound
+            .map(|b| b.cumulative_requested_bytes)
+            .ok_or_else(|| Error::Unsupported(TOKENIZER_HOST_GAP.into()))
+    } else {
+        Ok(0)
+    } // depth/restoration load a shipped EmptyPrompt and NEVER tokenize
+}
+
+/// Finite complete requested HOST-layout bound only when every input term is proved. No
+/// request-scaled parser/tokenizer/plan/container allocation may hide in a fixed empirical reserve.
+/// Today generation fails at aa011, and depth/restoration retain the named exact-version
+/// Apple Mutex ABI gap. Recovered parser/table components are independently source-priced below.
+/// The plane/tap/axis payload recipes below remain available separately, but are NOT certificates.
+pub(super) fn host_growth_upper(
+    req: &IosPricingRequest<'_>,
+    callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+) -> Result<u64> {
+    host_growth_upper_with_bounds(req, None, None, callback)
+}
+
+pub(super) fn host_growth_upper_with_bounds(
+    req: &IosPricingRequest<'_>,
+    metadata: Option<&MetadataHostBound>,
+    tokenizer: Option<&TokenizerHostBound>,
+    callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+) -> Result<u64> {
+    host_growth_upper_checked(req, metadata, tokenizer, callback, |_| Ok(()))
+}
+
+/// Capacity seam for the SDK caller: supply runtime_ios::media::source_metadata_capacity here
+/// BEFORE this helper parses configs/tokenizer files or constructs new source-context payloads.
+/// runtime-ios/src/lib.rs:217-227,338-344 checks requested bytes at a fresh boundary; it does NOT
+/// itself prove a parser/tokenizer malloc or process bound. The provider cannot depend upward on
+/// the runtime bundle. Passing the checked byte count never grants a physical-charge assumption.
+pub(super) fn host_growth_upper_checked(
+    req: &IosPricingRequest<'_>,
+    metadata: Option<&MetadataHostBound>,
+    tokenizer: Option<&TokenizerHostBound>,
+    callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+    mut source_metadata_capacity: impl FnMut(u64) -> Result<()>,
+) -> Result<u64> {
+    req.validate_work_context()?;
+    let callback = callback.ok_or_else(|| Error::Unsupported(CALLBACK_HOST_GAP.into()))?;
+    let tokenizer = required_tokenizer_host_bytes(req.provider, tokenizer)?;
+    let metadata = metadata
+        .ok_or_else(|| Error::Unsupported(METADATA_HOST_GAP.into()))?
+        .cumulative_requested_bytes;
+    let source_context = plus(metadata, tokenizer)?;
+    source_metadata_capacity(source_context)?;
+    let payload = match req.provider {
+        crate::restoration::MODEL_ID => restoration_host_upper(req)?,
+        crate::depth::DEPTH_MODEL_ID => host_payload::depth(req)?,
+        crate::model::MODEL_ID => host_payload::generation(req)?,
+        _ => {
+            return Err(Error::Unsupported(
+                "Iris has no host layout recipe for this provider".into(),
+            ))
+        }
+    };
+    let callbacks = match callback {
+        mlx_gen::ios_pricing::IosCallbackHost::NonAllocating => 0,
+        mlx_gen::ios_pricing::IosCallbackHost::Bounded {
+            fixed_bytes,
+            per_progress_event_bytes,
+            per_preview_event_bytes,
+            per_quantum_mark_bytes,
+            per_quantum_label_byte_bytes,
+        } => callback_event_upper(req)?.priced(
+            fixed_bytes,
+            per_progress_event_bytes,
+            per_preview_event_bytes,
+            per_quantum_mark_bytes,
+            per_quantum_label_byte_bytes,
+        )?,
+    };
+    plus(plus(source_context, payload)?, callbacks)
+}
+
+/// Known requested image/table/axis/plan payload upper ONLY. It excludes unproved parser/key and
+/// tokenizer terms and MUST NOT be substituted for host_growth_upper in a live certificate.
+pub(super) fn host_payload_growth_upper(req: &IosPricingRequest<'_>) -> Result<u64> {
+    req.validate_work_context()?;
+    required_tokenizer_host_bytes(req.provider, None)?; // refuse BEFORE invoking an unproved tokenizer
+    match req.provider {
+        crate::restoration::MODEL_ID => restoration_host_upper(req),
+        crate::depth::DEPTH_MODEL_ID => host_payload::depth(req),
+        _ => Err(Error::Unsupported(
+            "Iris has no supplied host payload context".into(),
+        )),
+    }
+}
+
+/// Known restoration producer PAYLOAD only, not complete requested metadata or process heap.
+/// Live certificates must use host_growth_upper and its required complete MetadataHostBound.
+pub(super) fn restoration_host_upper(req: &IosPricingRequest<'_>) -> Result<u64> {
+    host_payload::restoration(req, None)
+}
+
+/// Payload-only replay counterpart; the same missing-metadata qualification applies.
+pub(super) fn restoration_host_upper_with_token(
+    req: &IosPricingRequest<'_>,
+    token: &RestorationToken,
+) -> Result<u64> {
+    host_payload::restoration(req, Some(token))
+}
+
+mod host_payload {
+    use super::*;
+    use mlx_gen::gen_core::iris::restoration::{Dims, RestorationPlanMetadata};
+
+    /// TOOLCHAIN-POLICY ASSUMPTION, NOT MLX/Iris source authority: RawVec's amortized growth
+    /// requests new capacity <= max(2*old, required, min_non_zero_cap), min_non_zero_cap <= 8.
+    /// Retaining all old allocations yields a cumulative capacity upper (4*len+8) elements.
+    /// Used ONLY at source growth-policy sites: fs::read bytes, Result<Vec<_>> collections and
+    /// scoped-worker/result containers. Allocator overhead is NOT included or claimed bounded.
+    const ASSUMED_GROWTH_FACTOR: u64 = 4;
+    const ASSUMED_MIN_CAPACITY_SLACK: u64 = 8;
+
+    #[derive(Default)]
+    struct Payload {
+        bytes: u64,
+    }
+    impl Payload {
+        fn bytes(&mut self, n: u64) -> Result<()> {
+            self.bytes = plus(self.bytes, n)?;
+            Ok(())
+        }
+        fn vec<T>(&mut self, n: u64) -> Result<()> {
+            self.bytes(product(&[std::mem::size_of::<T>() as u64, n])?)
+        }
+        fn growth<T>(&mut self, n: u64) -> Result<()> {
+            if n == 0 {
+                return Ok(());
+            }
+            let capacity = plus(
+                product(&[ASSUMED_GROWTH_FACTOR, n])?,
+                ASSUMED_MIN_CAPACITY_SLACK,
+            )?;
+            self.vec::<T>(capacity)
+        }
+        fn repeat(&mut self, n: u64, one: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+            if n == 0 {
+                return Ok(());
+            }
+            let mut call = Self::default();
+            one(&mut call)?;
+            self.bytes(product(&[n, call.bytes])?)
+        }
+    }
+    fn pixels(d: Dims) -> Result<u64> {
+        product(&[u64::from(d.width), u64::from(d.height)])
+    }
+    fn rgb(p: &mut Payload, d: Dims) -> Result<()> {
+        p.vec::<f32>(product(&[3, pixels(d)?])?)
+    }
+
+    /// imageops.rs:74-145: each axis creates both f64 and quantized i64 coefficient tables.
+    /// Each inner Vec has explicit/ExactSize capacity; the source's clipped support-window bound
+    /// applies separately to each coefficient row (same rule as resize_lanczos_u8_host_bytes).
+    fn lanczos_axis(p: &mut Payload, input: u32, output: u32) -> Result<()> {
+        if input == 0 || output == 0 {
+            return Err(overflow());
+        }
+        let support = 3.0 * (f64::from(input) / f64::from(output)).max(1.0);
+        let taps = plus((2.0 * support).ceil() as u64, 2)?.min(u64::from(input));
+        p.vec::<(usize, Vec<f64>)>(u64::from(output))?;
+        p.vec::<(usize, Vec<i64>)>(u64::from(output))?;
+        p.vec::<f64>(product(&[taps, u64::from(output)])?)?;
+        p.vec::<i64>(product(&[taps, u64::from(output)])?)
+    }
+    /// imageops.rs:162-231: two axis table sets, one horizontal plane, one output plane.
+    /// Sum ALL producers; do not reuse the source helper's coincident peak as a cumulative price.
+    fn lanczos(p: &mut Payload, source: Dims, output: Dims) -> Result<()> {
+        lanczos_axis(p, source.width, output.width)?;
+        lanczos_axis(p, source.height, output.height)?;
+        p.vec::<f32>(product(&[
+            3,
+            u64::from(source.height),
+            u64::from(output.width),
+        ])?)?;
+        rgb(p, output)
+    }
+    /// restoration.rs:849-882: one outer tuple Vec and clipped-support f32 weights per axis row.
+    fn aa_axis(p: &mut Payload, input: u32, output: u32) -> Result<()> {
+        if input == 0 || output == 0 {
+            return Err(overflow());
+        }
+        let scale = input as f32 / output as f32;
+        let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };
+        let taps = plus(product(&[support.ceil() as u64, 2])?, 1)?.min(u64::from(input));
+        p.vec::<(usize, Vec<f32>)>(u64::from(output))?;
+        p.vec::<f32>(product(&[taps, u64::from(output)])?)
+    }
+    /// restoration.rs:941-982: unconditional clone, then every changed horizontal/vertical pass.
+    fn aa_resize(p: &mut Payload, source: Dims, output: Dims) -> Result<()> {
+        rgb(p, source)?;
+        if source.width != output.width {
+            aa_axis(p, source.width, output.width)?;
+            p.vec::<f32>(product(&[
+                3,
+                u64::from(source.height),
+                u64::from(output.width),
+            ])?)?;
+        }
+        if source.height != output.height {
+            aa_axis(p, source.height, output.height)?;
+            rgb(p, output)?;
+        }
+        Ok(())
+    }
+    /// tables.rs:44-90 + nn.rs:511-519: frequencies/coordinates/angles and BOTH host cos/sin Vecs.
+    fn grid_rope(p: &mut Payload, h: u64, w: u64, head: u64) -> Result<()> {
+        let pairs = product(&[2, head / 4])?;
+        p.vec::<f32>(head / 4)?;
+        p.vec::<f32>(h)?;
+        p.vec::<f32>(w)?;
+        p.repeat(3, |one| one.vec::<f32>(product(&[h, w, pairs])?))
+    }
+    /// Actual request-scaled host table/mask producers inside ONE DiT forward. Scalar tensor
+    /// constructors use native allocator backing and are already charged in NativeLedger.
+    fn backbone(p: &mut Payload, m: &IrisModel, b: u64, h: u64, w: u64, first: bool) -> Result<()> {
+        let patch = m.patch_size as u64;
+        if patch == 0 || m.num_heads == 0 || m.pixel.num_heads == 0 {
+            return Err(overflow());
+        }
+        let (hp, wp) = (h / patch, w / patch);
+        let t = m.text_len as u64;
+        p.vec::<f32>(mlx_gen::gen_core::iris::TIMESTEP_FREQUENCY_DIM as u64 / 2)?;
+        p.vec::<f32>(product(&[b, t, t])?)?; // key_padding_additive vec![0;B*T*T]
+        let head = (m.hidden_size / m.num_heads) as u64;
+        grid_rope(p, hp, wp, head)?;
+        p.vec::<f32>(head / 2)?; // text rope inverse frequencies
+        p.repeat(3, |one| one.vec::<f32>(product(&[t, head / 2])?))?; // angles/cos/sin
+        if first {
+            p.vec::<f64>(m.pixel.hidden_size as u64 / 4)?; // pixel_sincos omega
+            p.vec::<f32>(product(&[h, w, m.pixel.hidden_size as u64])?)?;
+        }
+        grid_rope(
+            p,
+            hp,
+            wp,
+            (m.pixel.attn_hidden_size / m.pixel.num_heads) as u64,
+        )
+    }
+    /// downstream.rs:280-326: file bytes, decoded f32 embeddings and i32 mask. Parser/map/name
+    /// bookkeeping is a SEPARATE UNPROVED MetadataHostBound, never a fixed-overhead credit.
+    fn empty_prompt(p: &mut Payload, export: &TaskExport, outer_mask: bool) -> Result<()> {
+        let path = export.empty_prompt_path();
+        let len = std::fs::metadata(&path)
+            .map_err(|e| Error::Msg(e.to_string()))?
+            .len();
+        p.growth::<u8>(len)?; // TOOLCHAIN assumption for fs::read/Read::read_to_end
+        let headers = crate::stream::headers(&path)?;
+        let emb = headers
+            .iter()
+            .find(|h| h.name == "embeddings")
+            .ok_or_else(|| Error::MissingTensor("embeddings".into()))?;
+        p.vec::<f32>(header_elements(emb)?)?;
+        p.vec::<i32>(export.config.model.text_len as u64)?;
+        p.vec::<i32>(4)?; // load's shape.iter().map(...).collect
+        if outer_mask {
+            p.vec::<Vec<i32>>(1)?;
+        }
+        Ok(())
+    }
+    /// Full neutral restoration driver payload graph, restoration.rs:1193-1344. This also covers
+    /// every owner in restoration_decode_host_bytes/host_plane_bytes_metadata, but NEVER adds a
+    /// live-set/peak value again as if it were a newly allocated plane.
+    fn restoration_driver(
+        p: &mut Payload,
+        plan: &RestorationPlanMetadata,
+        caller: u64,
+    ) -> Result<()> {
+        p.bytes(caller)?;
+        p.bytes(plan.axis_bytes().map_err(Error::from)?)?; // collect's explicit axis capacities
+        if plan.budget_applied {
+            lanczos(p, plan.source, plan.input)?;
+            p.vec::<u8>(product(&[3, pixels(plan.input)?])?)?; // fit_budget_image f32->u8 collect
+        } else {
+            p.vec::<u8>(product(&[3, pixels(plan.source)?])?)?;
+        } // image.clone
+        rgb(p, plan.input)?; // Planes::from_rgb8
+        p.vec::<([usize; 4], [f32; 4])>(plus(
+            u64::from(plan.output.width),
+            u64::from(plan.output.height),
+        )?)?;
+        rgb(p, plan.output)?; // bicubic_scale_factor reference
+        if plan.enlarged {
+            aa_resize(p, plan.output, plan.processing)?;
+        } else {
+            rgb(p, plan.output)?;
+        } // reference.clone
+        rgb(p, plan.padded)?; // normalized padded input
+        let tiles = plan.forward_count().map_err(Error::from)?;
+        if plan.single_pass() {
+            rgb(p, plan.padded)?; // velocity readback to_vec
+            rgb(p, plan.padded)?; // restore_tile's x-sigma*v collect
+        } else {
+            p.repeat(2, |one| one.vec::<f32>(u64::from(plan.tile)))?; // Gaussian axes
+            p.vec::<f32>(product(&[u64::from(plan.tile), u64::from(plan.tile)])?)?;
+            rgb(p, plan.padded)?; // fused canvas
+            p.vec::<f32>(pixels(plan.padded)?)?; // fusion weights
+            p.repeat(tiles, |one| {
+                one.repeat(3, |buffer| {
+                    buffer.vec::<f32>(product(&[3, u64::from(plan.tile), u64::from(plan.tile)])?)
+                })
+                // source crop, velocity readback, restored crop are DISTINCT Vecs per tile
+            })?;
+        }
+        rgb(p, plan.processing)?; // fused.crop
+        if plan.enlarged {
+            aa_resize(p, plan.processing, plan.output)?;
+        }
+        if plan.color_fix {
+            let o = pixels(plan.output)?;
+            let dilations = mlx_gen::gen_core::iris::restoration::COLOR_FIX_DILATIONS.len() as u64;
+            p.repeat(3, |worker| {
+                // EACH split has high+low and one blur output PER dilation, no release credit.
+                worker.repeat(2, |split| {
+                    split.repeat(plus(2, dilations)?, |plane| plane.vec::<f32>(o))
+                })?;
+                worker.vec::<f32>(o) // high+low output for this channel
+            })?;
+            // TOOLCHAIN containers: scoped handles, then fallible worker-result Vec collection.
+            p.growth::<std::thread::ScopedJoinHandle<'static, mlx_gen::gen_core::Result<Vec<f32>>>>(3)?;
+            p.growth::<Vec<f32>>(3)?;
+            p.bytes(provider_scoped_thread_heap_upper(3)?)?;
+            rgb(p, plan.output)?; // planes.concat
+        }
+        p.vec::<u8>(product(&[3, pixels(plan.output)?])?) // Planes::to_rgb8, host only
+    }
+
+    pub(super) fn restoration(
+        req: &IosPricingRequest<'_>,
+        token: Option<&RestorationToken>,
+    ) -> Result<u64> {
+        if req.provider != crate::restoration::MODEL_ID {
+            return Err(Error::Unsupported(
+                "not an Iris restoration host replay".into(),
+            ));
+        }
+        req.validate_work_context()?;
+        let resources =
+            RestorationResources::from_spec(req.spec, req.provider).map_err(Error::from)?;
+        let plan = restoration_priced_plan(req, &resources, token)?;
+        let caller = match token {
+            Some(token) => token.wire()?.source_capacity_bytes,
+            None => req
+                .transform
+                .ok_or_else(|| Error::Unsupported("missing restoration host source".into()))?
+                .image
+                .pixels
+                .capacity() as u64,
+        };
+        let mut p = Payload::default();
+        empty_prompt(&mut p, &resources.export, true)?;
+        restoration_driver(&mut p, &plan, caller)?;
+        let (h, w) = if plan.single_pass() {
+            (u64::from(plan.padded.height), u64::from(plan.padded.width))
+        } else {
+            (u64::from(plan.tile), u64::from(plan.tile))
+        };
+        let tiles = plan.forward_count().map_err(Error::from)?;
+        // velocity_body's &[f32;1] model time is a stack literal, NOT a host Vec.
+        backbone(&mut p, &resources.export.config.model, 1, h, w, true)?;
+        if tiles > 1 {
+            p.repeat(tiles - 1, |one| {
+                backbone(one, &resources.export.config.model, 1, h, w, false)
+            })?;
+        }
+        Ok(p.bytes)
+    }
+
+    fn depth_input_planes(p: &mut Payload, source: Dims, model: Dims, resized: bool) -> Result<()> {
+        if resized {
+            lanczos(p, source, model)?;
+        } else {
+            rgb(p, model)?;
+        } // HWC u8->f32 exact-size collect
+        rgb(p, model) // CHW vec![0;3HW]
+    }
+    /// model.rs:483-489,523-539 + pipeline.rs:310-331 + image.rs:108-119.
+    fn generation_outputs(p: &mut Payload, b: u64, count: u64, h: u64, w: u64) -> Result<()> {
+        p.vec::<mlx_rs::Array>(product(&[b, count])?)?;
+        p.vec::<mlx_gen::Image>(product(&[b, count])?)?;
+        p.repeat(count, |batch| {
+            if b == 1 {
+                batch.vec::<mlx_gen::Image>(1)?;
+            } else {
+                batch.growth::<mlx_gen::Image>(b)?;
+            }
+            batch.repeat(b, |row| row.vec::<u8>(product(&[3, h, w])?))
+        })
+    }
+
+    pub(super) fn depth(req: &IosPricingRequest<'_>) -> Result<u64> {
+        let actual = req.depth.ok_or_else(|| {
+            Error::Unsupported("depth host payload needs actual source/resolution".into())
+        })?;
+        let export = TaskExport::from_spec(req.spec, IrisTask::Depth, crate::depth::DEPTH_MODEL_ID)
+            .map_err(Error::from)?;
+        let plan = depth_input_plan(req.spec, actual)?;
+        let source = Dims::new(plan.source_width, plan.source_height);
+        let model = Dims::new(plan.model_width, plan.model_height);
+        let mut p = Payload::default();
+        p.bytes(actual.image.pixels.capacity() as u64)?;
+        empty_prompt(&mut p, &export, false)?;
+        depth_input_planes(&mut p, source, model, plan.resized())?;
+        p.vec::<f32>(1)?; // depth_input_body vec![t_model;b], b=1
+        p.vec::<i32>(export.config.model.text_len as u64)?;
+        p.vec::<Vec<i32>>(1)?; // depth_forward_with mask clone + outer mask
+        backbone(
+            &mut p,
+            &export.config.model,
+            1,
+            u64::from(plan.model_height),
+            u64::from(plan.model_width),
+            true,
+        )?;
+        p.vec::<f32>(pixels(model)?)?; // native map readback to_vec
+        if plan.resized() {
+            p.vec::<(usize, usize, f32, f32)>(plus(
+                u64::from(plan.source_height),
+                u64::from(plan.source_width),
+            )?)?;
+            p.vec::<f32>(pixels(source)?)?; // interpolate_bilinear with_capacity
+        }
+        Ok(p.bytes)
+    }
+
+    pub(super) fn generation(req: &IosPricingRequest<'_>) -> Result<u64> {
+        // A sampling-only replay records no raw caption lengths. Source wrapper encode_ids
+        // copies ALL ids before truncating. It cannot be bounded from token_window alone.
+        let actual = req.generation.ok_or_else(|| Error::Unsupported(
+            "Iris host payload needs actual generation captions: sampling replay omits pre-truncation tokenizer-id payload lengths".into()))?;
+        let resources = GenerationResources::from_spec(req.spec, crate::model::MODEL_ID)
+            .map_err(Error::from)?;
+        let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
+        let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
+        let plan = params.plan_metadata().map_err(Error::from)?;
+        let b = params.prompts.len() as u64;
+        let count = u64::from(actual.count);
+        let (h, w) = (u64::from(params.height), u64::from(params.width));
+        let max = config.text_encoder.max_length as u64;
+        let mut p = Payload::default();
+        // Actual caller capacities once, plus GenerationParams::resolve's cloned prompt payloads.
+        p.bytes(actual.prompt.capacity() as u64)?;
+        p.vec::<String>(actual.prompt_batch.capacity() as u64)?;
+        for prompt in &actual.prompt_batch {
+            p.bytes(prompt.capacity() as u64)?;
+        }
+        if let Some(negative) = &actual.negative_prompt {
+            p.bytes(negative.capacity() as u64)?;
+        }
+        // model::generate_impl first validate_impl -> validate_generation_request resolves
+        // controls once, then resolves them again for execution (model.rs:436-450,553-560;
+        // gen-core/iris.rs:1411-1413). Both cloned payloads remain charged cumulatively.
+        p.repeat(2, |resolved| {
+            resolved.vec::<String>(b)?;
+            for prompt in &params.prompts {
+                resolved.vec::<u8>(prompt.len() as u64)?;
+            }
+            resolved.vec::<u8>(params.negative_prompt.len() as u64)
+        })?;
+        let tokenizer = mlx_gen::gen_core::tokenizer::TextTokenizer::from_file(
+            resources.text_encoder_dir.join("tokenizer.json"),
+            mlx_gen::gen_core::tokenizer::TokenizerConfig {
+                max_length: usize::MAX,
+                pad_token_id: 0,
+                chat_template: mlx_gen::gen_core::tokenizer::ChatTemplate::None,
+                pad_to_max_length: false,
+            },
+        )
+        .map_err(Error::from)?;
+        let prefix = tokenizer
+            .encode_ids(PROMPT_PREFIX, false)
+            .map_err(Error::from)?;
+        let suffix = tokenizer
+            .encode_ids(mlx_gen::gen_core::iris::PROMPT_SUFFIX, false)
+            .map_err(Error::from)?;
+        let staged =
+            req.execution.stage_residency || req.spec.offload_policy == OffloadPolicy::Sequential;
+        let loads = plus(
+            1,
+            u64::from(staged && req.spec.offload_policy == OffloadPolicy::Resident),
+        )?;
+        let cfg = mlx_llm::ModelConfig::from_dir(&resources.text_encoder_dir)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        let head = u64::try_from(cfg.head_dim).map_err(|_| overflow())?;
+        p.repeat(loads, |load| {
+            load.vec::<i32>(prefix.len() as u64)?;
+            load.vec::<i32>(suffix.len() as u64)?;
+            load.vec::<f32>(head / 2)?; // Rope::standard inverse frequencies retained on host
+            load.vec::<f32>(head) // Rope::new expanded frequency row before native upload
+        })?;
+        let mut warnings = 0u64;
+        for prompt in params
+            .prompts
+            .iter()
+            .map(String::as_str)
+            .chain(params.uses_cfg().then_some(params.negative_prompt.as_str()))
+        {
+            let caption = tokenizer.encode_ids(prompt, false).map_err(Error::from)?;
+            let window = mlx_gen::gen_core::iris::assemble_window(
+                &prefix,
+                &caption,
+                &suffix,
+                config.text_encoder.max_length,
+            )
+            .map_err(Error::from)?;
+            p.vec::<i32>(caption.len() as u64)?; // wrapper encode_ids map/collect, BEFORE truncation
+            p.vec::<i32>(window.input_ids.len() as u64)?; // explicit assemble_window capacity
+            p.vec::<i32>(max)?; // window.mask vec![0;max]
+            p.vec::<i32>(max)?; // TextConditioning.mask clone
+            if req.spec.load_shape != LoadShape::DeferredMaterialization {
+                p.vec::<u64>(plus(cfg.num_layers as u64, 1)?)?; // resident iOS layer-gate scratch Vec
+            }
+            if matches!(
+                params.caption_overflow,
+                mlx_gen::gen_core::CaptionOverflowPolicy::Warn
+            ) {
+                if let Some(warning) = mlx_gen::gen_core::iris::caption_overflow_warning(
+                    &window,
+                    config.text_encoder.max_length,
+                    suffix.len(),
+                ) {
+                    p.growth::<u8>(warning.len() as u64)?; // TOOLCHAIN formatter String growth
+                    warnings = plus(warnings, 1)?;
+                }
+            }
+        }
+        p.growth::<String>(warnings)?; // pipeline::encode_in warnings.extend
+        p.growth::<mlx_gen::gen_core::GenerationWarning>(warnings)?; // final warning report collect
+        p.repeat(warnings, |warning| {
+            warning.vec::<u8>("caption_truncated".len() as u64)
+        })?;
+        generation_outputs(&mut p, b, count, h, w)?;
+        let mut first = true;
+        for _ in 0..count {
+            p.bytes(plan.host_bytes().map_err(Error::from)?)?; // DpmStep plan + sigma Vec, not a peak
+            p.vec::<u64>(b)?; // independent row seeds
+            p.growth::<mlx_rs::Array>(b)?; // noise_batch fallible row collection
+            p.vec::<&mlx_rs::Array>(b)?; // noise_batch refs
+            p.vec::<Vec<i32>>(b)?; // cond_mask outer Vec
+            p.vec::<i32>(product(&[b, max])?)?; // one cloned mask per prompt
+            if params.uses_cfg() {
+                p.vec::<Vec<i32>>(product(&[2, b])?)?;
+                p.vec::<i32>(product(&[2, b, max])?)?; // repeat_n + cond-mask clones
+            }
+            for index in 0..plan.len() {
+                let step = plan.step(index).ok_or_else(overflow)?;
+                let rows = product(&[b, if params.cfg_at(&step) { 2 } else { 1 }])?;
+                p.vec::<f32>(rows)?; // pipeline's vec![model_time;rows]
+                backbone(&mut p, &config.model, rows, h, w, first)?;
+                first = false;
+                if actual.preview.is_active() {
+                    p.vec::<f32>(9)?; // preview::project_latents factor_values
+                    p.vec::<u8>(product(&[
+                        3,
+                        h / config.model.patch_size as u64,
+                        w / config.model.patch_size as u64,
+                    ])?)?;
+                }
+            }
+        }
+        // Adapter tensors/alpha-fold scalars are MLX Arrays, not host plane Vecs. Their native
+        // constructors are charged in installed_adapters::load. Projection/factor-name maps and
+        // safetensors parsing require the separate MetadataHostBound, never a fixed-overhead credit.
+        Ok(p.bytes)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use mlx_gen::gen_core::iris::restoration::{
+            plan_metadata, RestorationOptions, TileGeometry,
+        };
+        fn plan(w: u32, h: u32, scale: f64, color_fix: bool) -> RestorationPlanMetadata {
+            plan_metadata(
+                Dims::new(w, h),
+                &RestorationOptions {
+                    scale,
+                    input_sizing: mlx_gen::InputSizing::Original,
+                    color_fix,
+                },
+                TileGeometry {
+                    tile: 16,
+                    patch: 16,
+                },
+                crate::restoration::MODEL_ID,
+            )
+            .unwrap()
+        }
+        /// HOST: direct Vec capacities and the separately labelled toolchain policy are distinct.
+        #[test]
+        fn payload_capacity_arithmetic_and_growth_assumption_are_explicit() {
+            let mut p = Payload::default();
+            p.vec::<f32>(3).unwrap();
+            assert_eq!(p.bytes, 12);
+            p.growth::<f32>(3).unwrap();
+            assert_eq!(p.bytes, 12 + (4 * 3 + 8) * 4);
+            assert!(p.vec::<f32>(u64::MAX).is_err());
+            assert!(p.growth::<f32>(u64::MAX).is_err());
+        }
+        /// HOST: exact legal single-pass path. short<=tile sets enlarged=true even at ratio 1,
+        /// so the two identity aa-resize calls each clone once and MUST still be charged.
+        #[test]
+        fn restoration_single_pass_is_cumulative_and_rgb_is_host_only() {
+            let plan = plan(16, 16, 1.0, false);
+            assert!(plan.single_pass());
+            assert!(plan.enlarged);
+            let caller = 3 * 16 * 16;
+            let mut p = Payload::default();
+            restoration_driver(&mut p, &plan, caller).unwrap();
+            let taps = (plan.output.height as u64 + plan.output.width as u64)
+                * std::mem::size_of::<([usize; 4], [f32; 4])>() as u64;
+            // caller + RGB clone + eight f32 RGB planes + RGB8 output + bicubic taps.
+            let exact = 3 * caller + 8 * (3 * 16 * 16 * 4) + taps;
+            assert_eq!(p.bytes, exact);
+            assert!(
+                p.bytes
+                    >= crate::restoration::host_plane_bytes_metadata(&plan)
+                        .unwrap()
+                        .peak()
+            );
+        }
+        /// HOST: tiled work retains ALL crop/readback/restored-crop requests, not one tile peak.
+        #[test]
+        fn restoration_tiles_and_wavelet_dilations_all_accumulate() {
+            let plain = plan(32, 16, 1.0, false);
+            assert!(!plain.single_pass());
+            let mut colored = plain.clone();
+            colored.color_fix = true;
+            let mut bare = Payload::default();
+            restoration_driver(&mut bare, &plain, 3 * 32 * 16).unwrap();
+            let mut fixed = Payload::default();
+            restoration_driver(&mut fixed, &colored, 3 * 32 * 16).unwrap();
+            let o = pixels(colored.output).unwrap();
+            let planes = (2
+                * (2 + mlx_gen::gen_core::iris::restoration::COLOR_FIX_DILATIONS.len() as u64)
+                + 1)
+                * 3
+                + 3;
+            let mut workers = Payload::default();
+            workers.growth::<std::thread::ScopedJoinHandle<'static, mlx_gen::gen_core::Result<Vec<f32>>>>(3).unwrap();
+            workers.growth::<Vec<f32>>(3).unwrap();
+            assert_eq!(
+                fixed.bytes - bare.bytes,
+                planes * o * 4 + workers.bytes + provider_scoped_thread_heap_upper(3).unwrap()
+            );
+        }
+        /// HOST: native Active requests and host Vec capacities have independent arithmetic.
+        #[test]
+        fn repeated_native_tile_calls_apply_operand_u_before_call_count() {
+            for backend in [NativeBackend::Cpu, NativeBackend::Metal] {
+                let mut l = NativeLedger::new(16_384, backend).unwrap();
+                repeated_native_calls(&mut l, 3, |one, first| {
+                    one.array(4, 5)?;
+                    one.array(4, 1)?;
+                    if first {
+                        one.array(4, 7)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(
+                    l.total,
+                    3 * (backing_upper(20, 16_384).unwrap() + backing_upper(4, 16_384).unwrap())
+                        + backing_upper(28, 16_384).unwrap()
+                );
+            }
+        }
+        /// HOST: equal-size resize clones once; no unchanged-axis tap/plane producer is invented.
+        #[test]
+        fn aa_resize_counts_only_actual_axis_producers() {
+            let mut identity = Payload::default();
+            aa_resize(&mut identity, Dims::new(16, 16), Dims::new(16, 16)).unwrap();
+            assert_eq!(identity.bytes, 3 * 16 * 16 * 4);
+            let mut resized = Payload::default();
+            aa_resize(&mut resized, Dims::new(16, 16), Dims::new(32, 16)).unwrap();
+            let mut taps = Payload::default();
+            aa_axis(&mut taps, 16, 32).unwrap();
+            assert_eq!(resized.bytes, identity.bytes + taps.bytes + 3 * 16 * 32 * 4);
+        }
+        /// HOST: depth native-size input allocates HWC and CHW independently, not one peak plane.
+        #[test]
+        fn depth_payload_counts_both_input_layouts_and_resize_tables() {
+            let mut native = Payload::default();
+            depth_input_planes(&mut native, Dims::new(16, 16), Dims::new(16, 16), false).unwrap();
+            assert_eq!(native.bytes, 2 * 3 * 16 * 16 * 4);
+            let mut resized = Payload::default();
+            depth_input_planes(&mut resized, Dims::new(32, 32), Dims::new(16, 16), true).unwrap();
+            let mut exact = Payload::default();
+            lanczos(&mut exact, Dims::new(32, 32), Dims::new(16, 16)).unwrap();
+            exact.vec::<f32>(3 * 16 * 16).unwrap();
+            assert_eq!(resized.bytes, exact.bytes);
+            assert!(resized.bytes > native.bytes);
+        }
+        /// HOST: generation's RGB and per-batch collections retain all serial and prompt rows.
+        #[test]
+        fn generation_output_payload_counts_all_rows_and_serials() {
+            let (b, count, h, w) = (2, 3, 16, 16);
+            let mut p = Payload::default();
+            generation_outputs(&mut p, b, count, h, w).unwrap();
+            let exact = b
+                * count
+                * (std::mem::size_of::<mlx_rs::Array>() as u64
+                    + std::mem::size_of::<mlx_gen::Image>() as u64)
+                + count * (4 * b + 8) * std::mem::size_of::<mlx_gen::Image>() as u64
+                + b * count * 3 * h * w;
+            assert_eq!(p.bytes, exact);
+        }
+        /// HOST: live host-layout API refuses missing proof terms BEFORE config/tokenizer parsing.
+        /// Supplied test-only metadata values exercise payload-plus-bound arithmetic, not a
+        /// production proof constructor or an approved physical-charge premise.
+        #[test]
+        fn complete_host_bound_refuses_named_gaps_and_adds_test_only_terms() {
+            use mlx_gen::gen_core::{
+                MemoryGeometry, MemoryNumericTier, MemorySelection, MemoryStrategy,
+                MemoryStrategyParameters,
+            };
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+            let restore_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+                fixtures.join("tiny-snapshot/upscaler"),
+            ));
+            let depth_spec =
+                mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(fixtures.join("tiny-depth")));
+            let selection = MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: MemoryStrategyParameters::default(),
+                tier: MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+            };
+            let memory = GenerationMemory::default();
+            let mode = crate::memory_strategy::memory_mode(IrisTask::Restoration);
+            let transform = mlx_gen::TransformRequest {
+                image: mlx_gen::Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![128; 3 * 16 * 16],
+                },
+                target: mlx_gen::TargetSize::Scale(1.0),
+                color_fix: Some(false),
+                input_sizing: mlx_gen::InputSizing::Original,
+                ..Default::default()
+            };
+            let req = IosPricingRequest {
+                provider: crate::restoration::MODEL_ID,
+                spec: &restore_spec,
+                mode: &mode,
+                selection: &selection,
+                execution: &memory,
+                geometry: MemoryGeometry {
+                    width: 16,
+                    height: 16,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                generation: None,
+                transform: Some(&transform),
+                depth: None,
+                token_window: 0,
+            };
+            match host_growth_upper(&req, None) {
+                Err(Error::Unsupported(reason)) => assert_eq!(reason, CALLBACK_HOST_GAP),
+                other => panic!("missing callback host term accepted: {other:?}"),
+            }
+            match host_growth_upper(
+                &req,
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+            ) {
+                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                other => panic!("missing metadata proof accepted: {other:?}"),
+            }
+            let supplied = MetadataHostBound {
+                cumulative_requested_bytes: 777,
+            };
+            let known = restoration_host_upper(&req).unwrap();
+            let mut checks = 0;
+            let complete = host_growth_upper_checked(
+                &req,
+                Some(&supplied),
+                None,
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+                |bytes| {
+                    assert_eq!(bytes, 777);
+                    checks += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(checks, 1);
+            assert_eq!(complete, known.checked_add(777).unwrap());
+            let depth_work = mlx_gen::gen_core::iris::depth::DepthRequest {
+                image: transform.image.clone(),
+                ..Default::default()
+            };
+            let depth_mode = crate::memory_strategy::memory_mode(IrisTask::Depth);
+            let depth_req = IosPricingRequest {
+                provider: crate::depth::DEPTH_MODEL_ID,
+                spec: &depth_spec,
+                mode: &depth_mode,
+                transform: None,
+                depth: Some(&depth_work),
+                ..req
+            };
+            match host_growth_upper(
+                &depth_req,
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+            ) {
+                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                other => panic!("depth metadata proof accepted: {other:?}"),
+            }
+            assert_eq!(
+                host_growth_upper_with_bounds(
+                    &depth_req,
+                    Some(&supplied),
+                    None,
+                    Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating)
+                )
+                .unwrap(),
+                depth(&depth_req).unwrap().checked_add(777).unwrap()
+            );
+            let generation = GenerationRequest::default();
+            let generation_req = IosPricingRequest {
+                provider: crate::model::MODEL_ID,
+                mode: &MemoryMode::TextToImage,
+                generation: Some(&generation),
+                transform: None,
+                depth: None,
+                ..req
+            };
+            match host_growth_upper(
+                &generation_req,
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+            ) {
+                Err(Error::Unsupported(reason)) => assert_eq!(reason, TOKENIZER_HOST_GAP),
+                other => panic!("unproved tokenizer accepted: {other:?}"),
+            }
+            let tokenizer = TokenizerHostBound {
+                cumulative_requested_bytes: 123,
+            };
+            assert_eq!(
+                required_tokenizer_host_bytes(crate::model::MODEL_ID, Some(&tokenizer)).unwrap(),
+                123
+            );
+            // Even a supplied tokenizer term cannot bypass the missing metadata-layout term.
+            match host_growth_upper_with_bounds(
+                &generation_req,
+                None,
+                Some(&tokenizer),
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+            ) {
+                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                other => panic!("tokenizer-only bound accepted: {other:?}"),
+            }
+            // Full generation payload arithmetic with TEST-ONLY proof terms. This creates no
+            // MLX Array or tensor evaluation; the fixture tokenizer is pure Rust host work.
+            let mut generation_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+                fixtures.join("tiny-snapshot/iris"),
+            ));
+            generation_spec.components.insert(
+                "text_encoder".into(),
+                mlx_gen::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+            let generation_work = GenerationRequest {
+                prompt: "a lighthouse".into(),
+                width: 16,
+                height: 16,
+                steps: Some(1),
+                guidance: Some(1.0),
+                ..Default::default()
+            };
+            let generation_req = IosPricingRequest {
+                spec: &generation_spec,
+                generation: Some(&generation_work),
+                ..generation_req
+            };
+            let generation_payload = super::generation(&generation_req).unwrap();
+            let complete = host_growth_upper_with_bounds(
+                &generation_req,
+                Some(&supplied),
+                Some(&tokenizer),
+                Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+            )
+            .unwrap();
+            assert_eq!(
+                complete,
+                generation_payload
+                    .checked_add(777)
+                    .unwrap()
+                    .checked_add(123)
+                    .unwrap()
+            );
+        }
+    }
+}
+
+/// Actual byte-size facts captured under the existing retained SourceInventory. These are NOT
+/// parser/HashMap/BTree allocation bounds and cannot construct MetadataHostBound on their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CapturedMetadataBytes {
+    pub(super) file_bytes: u64,
+    pub(super) header_bytes: Option<u64>,
+}
+
+/// Reuse SourceInventory's before/after identity checks instead of treating a fresh path stat as
+/// immutable proof. Reads a stack-sized safetensors prefix only, never a tensor or serde object.
+/// Existing callers can capture these sizes before invoking source_metadata_capacity; that hook
+/// guards the requested input buffers, not the still-unproved parser/scratch allocation graph.
+pub(super) fn captured_metadata_bytes(
+    req: &IosPricingRequest<'_>,
+    path: &Path,
+    safetensors: bool,
+) -> Result<CapturedMetadataBytes> {
+    use std::io::Read;
+    let inventory = req.spec.source_inventory().ok_or_else(|| {
+        Error::Unsupported(
+            "Iris metadata size capture requires the retained SourceInventory".into(),
+        )
+    })?;
+    inventory.verify_for(req.spec).map_err(Error::from)?;
+    // SourceInventory verifies configured roots, not an arbitrary caller-supplied path. Require
+    // exact configured File membership or a nonhidden, traversal-free descendant of a captured
+    // directory. Its before/after directory-membership checks then cover this file as well.
+    // No canonicalization: the existing pin identity is keyed on the literal loader path.
+    let absolute = std::path::absolute(path).map_err(|e| Error::Msg(e.to_string()))?;
+    let exact_file = req
+        .spec
+        .file_source_paths()
+        .into_iter()
+        .any(|file| std::path::absolute(file).is_ok_and(|file| file == absolute));
+    let in_directory = req.spec.directory_source_paths().into_iter().any(|dir| {
+        std::path::absolute(dir)
+            .ok()
+            .and_then(|dir| absolute.strip_prefix(dir).ok().map(Path::to_path_buf))
+            .is_some_and(|tail| {
+                !tail.as_os_str().is_empty()
+                    && tail.components().all(|part| match part {
+                        std::path::Component::Normal(name) => {
+                            !name.to_string_lossy().starts_with('.')
+                        }
+                        _ => false,
+                    })
+            })
+    });
+    if !exact_file && !in_directory {
+        return Err(Error::Unsupported(
+            "Iris metadata size path is outside the retained SourceInventory".into(),
+        ));
+    }
+    inventory.read_unchanged(|| -> Result<_> {
+        let mut file = std::fs::File::open(path).map_err(|e| Error::Msg(e.to_string()))?;
+        let file_bytes = file
+            .metadata()
+            .map_err(|e| Error::Msg(e.to_string()))?
+            .len();
+        let header_bytes = if safetensors {
+            let mut prefix = [0u8; 8];
+            file.read_exact(&mut prefix)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let header = u64::from_le_bytes(prefix);
+            if plus(8, header)? > file_bytes {
+                return Err(Error::Unsupported(
+                    "Iris captured safetensors header extends past file".into(),
+                ));
+            }
+            Some(header)
+        } else {
+            None
+        };
+        Ok(CapturedMetadataBytes {
+            file_bytes,
+            header_bytes,
+        })
+    })
+}
+
+/// Finite, independently composable metadata-layout FRAGMENTS whose producers ARE in the
+/// snapshots. Each read/view multiplicity is an actual source call count, not an empirical factor.
+///
+/// This excludes serde_json/safetensors deserializer scratch and HashMap/BTree bucket/node
+/// requests. Their authority is outside the supplied snapshots, so this cannot close the full
+/// MetadataHostBound and must NOT be substituted for it in host_growth_upper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct KnownMetadataLayouts {
+    pub(super) direct_input_buffers: u64,
+    pub(super) normalized_header_vectors: u64,
+    pub(super) config_parser_vecs_and_strings: u64,
+    pub(super) streamed_key_string_payloads: u64,
+}
+impl KnownMetadataLayouts {
+    pub(super) fn total(self) -> Result<u64> {
+        plus(
+            plus(self.direct_input_buffers, self.normalized_header_vectors)?,
+            plus(
+                self.config_parser_vecs_and_strings,
+                self.streamed_key_string_payloads,
+            )?,
+        )
+    }
+}
+
+/// Finite custom-YAML TREE allocation bound from actual input bytes (iris.rs:706-863).
+/// There are at most B nonempty lines, entries, scalar/list items and nonempty containers in
+/// B bytes. For each family sum the DECLARED RawVec policy, 4*total_items+8*containers;
+/// no constant parser multiplier or arbitrary input cap is used. Source unquote never expands
+/// input bytes; empty map values produce literal "null" (four bytes per entry). Flow-list cur
+/// strings are a separate growth family, and unquote creates its own final scalar String.
+/// This tree bound does not assert a serde_json/safetensors allocation policy.
+fn known_yaml_tree_layout(input_bytes: u64) -> Result<u64> {
+    fn bytes(width: u64, elements: u64) -> Result<u64> {
+        product(&[width, elements])
+    }
+    // The ACTUAL parser element sizes, measured on gen-core's private types (no mirror).
+    let layout = mlx_gen::gen_core::iris::yaml_parser_layouts();
+    let slots = plus(product(&[4, input_bytes])?, product(&[8, input_bytes])?)?;
+    let lines = if input_bytes == 0 {
+        0
+    } else {
+        bytes(layout.line as u64, plus(product(&[4, input_bytes])?, 8)?)?
+    };
+    let maps = bytes(layout.map_entry as u64, slots)?;
+    let lists = bytes(layout.value as u64, slots)?;
+    let flow_items = bytes(std::mem::size_of::<String>() as u64, slots)?;
+    let flow_cur_strings = slots; // one-byte String growth, same total bytes/nonempty count bound
+    let unquoted = input_bytes;
+    let null_literals = product(&["null".len() as u64, input_bytes])?;
+    [
+        lines,
+        maps,
+        lists,
+        flow_items,
+        flow_cur_strings,
+        unquoted,
+        null_literals,
+    ]
+    .into_iter()
+    .try_fold(0, plus)
+}
+
+/// TaskExport::from_dir (downstream.rs:135-144) reads a file Vec and clones it into the UTF-8
+/// String. The fs::read growth term uses only the explicitly labelled RawVec policy assumption.
+/// Safetensors header-only readers (weightsmeta.rs:621-625) allocate exactly header_len bytes.
+/// Locations/shapes use Result<Vec<_>> growth; the header-only final projection is ExactSize.
+/// Streamed StackInventory key pairs (dit.rs:500-548) clone a file key and its stripped built key;
+/// each key's byte length is bounded by the ACTUAL captured header name, not a fixed reserve.
+/// The same two-key upper covers a full-view Rust key copy (mlx-rs/utils/io.rs:49-76) and a
+/// selected built-key clone (stream.rs:234-265); initial inventory-pair construction is another
+/// separately counted source call. HashMap buckets themselves remain in MetadataHostBound.
+pub(super) fn known_metadata_layouts(
+    config_bytes: u64,
+    config_reads: u64,
+    header_bytes: u64,
+    header_reads: u64,
+    headers: &[Header],
+    window_key_builds: u64,
+) -> Result<KnownMetadataLayouts> {
+    fn assumed_vec_capacity_bytes(width: u64, len: u64) -> Result<u64> {
+        // Same declared RawVec policy as host_payload; no allocator metadata/usable-size claim.
+        if len == 0 {
+            return Ok(0);
+        }
+        product(&[width, plus(product(&[4, len])?, 8)?])
+    }
+    let config_buffer = plus(assumed_vec_capacity_bytes(1, config_bytes)?, config_bytes)?;
+    let direct_input_buffers = plus(
+        product(&[config_buffer, config_reads])?,
+        product(&[header_bytes, header_reads])?,
+    )?;
+    let count = headers.len() as u64;
+    let mut vectors = assumed_vec_capacity_bytes(
+        std::mem::size_of::<mlx_gen::gen_core::weightsmeta::SafetensorsTensorLocation>() as u64,
+        count,
+    )?;
+    vectors = plus(
+        vectors,
+        product(&[std::mem::size_of::<Header>() as u64, count])?,
+    )?;
+    let mut names = 0;
+    for h in headers {
+        vectors = plus(
+            vectors,
+            assumed_vec_capacity_bytes(std::mem::size_of::<usize>() as u64, h.shape.len() as u64)?,
+        )?;
+        names = plus(names, h.name.len() as u64)?;
+    }
+    Ok(KnownMetadataLayouts {
+        direct_input_buffers,
+        normalized_header_vectors: product(&[vectors, header_reads])?,
+        // TaskExport::from_dir calls yaml::parse twice: task settings, then IrisConfig::parse.
+        config_parser_vecs_and_strings: product(&[
+            known_yaml_tree_layout(config_bytes)?,
+            2,
+            config_reads,
+        ])?,
+        streamed_key_string_payloads: product(&[2, names, window_key_builds])?,
+    })
+}
+
+#[cfg(test)]
+mod metadata_payload_tests {
+    use super::*;
+    /// HOST: actual source bytes/cardinalities scale the known fragments; no arbitrary header cap
+    /// or fixed metadata reserve is used. Missing map/parser authority remains a separate gap.
+    #[test]
+    fn captured_sizes_and_tensor_counts_price_only_source_known_layouts() {
+        let h = Header {
+            name: "blocks.0.q.weight".into(),
+            dtype: Stored::F32,
+            shape: vec![2, 3],
+            data_bytes: 24,
+        };
+        let one = known_metadata_layouts(100, 1, 200, 1, std::slice::from_ref(&h), 1).unwrap();
+        assert_eq!(one.direct_input_buffers, (4 * 100 + 8) + 100 + 200);
+        assert_eq!(one.streamed_key_string_payloads, 2 * h.name.len() as u64);
+        let repeated = known_metadata_layouts(100, 3, 200, 3, &[h], 3).unwrap();
+        assert_eq!(
+            repeated.total().unwrap(),
+            one.total().unwrap().checked_mul(3).unwrap()
+        );
+        assert!(known_metadata_layouts(u64::MAX, 1, 0, 0, &[], 0).is_err());
+    }
+}
+
+const CALLBACK_HOST_GAP: &str =
+    "caller callback host allocation bound not supplied (on_progress / quantum listener)";
+
+/// Source-derived event-count UPPER. Conditional load/check/synchronization branches are charged
+/// even if disabled/off-device; one supplied callback term must cover all of its callback kinds.
+/// Progress enum values and borrowed QuantumMark fields are stack values; there is no provider
+/// boxing at those call sites. The execution owner supplies callback-body allocation requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CallbackEventUpper {
+    progress: u64,
+    preview: u64,
+    metadata: u64,
+    checked: u64,
+    synchronized: u64,
+}
+impl CallbackEventUpper {
+    fn add(&mut self, rhs: Self) -> Result<()> {
+        self.progress = plus(self.progress, rhs.progress)?;
+        self.preview = plus(self.preview, rhs.preview)?;
+        self.metadata = plus(self.metadata, rhs.metadata)?;
+        self.checked = plus(self.checked, rhs.checked)?;
+        self.synchronized = plus(self.synchronized, rhs.synchronized)?;
+        Ok(())
+    }
+    fn times(self, n: u64) -> Result<Self> {
+        Ok(Self {
+            progress: product(&[self.progress, n])?,
+            preview: product(&[self.preview, n])?,
+            metadata: product(&[self.metadata, n])?,
+            checked: product(&[self.checked, n])?,
+            synchronized: product(&[self.synchronized, n])?,
+        })
+    }
+    fn priced(
+        self,
+        fixed: u64,
+        progress: u64,
+        preview: u64,
+        quantum: u64,
+        label_byte: u64,
+    ) -> Result<u64> {
+        let marks = plus(plus(self.metadata, self.checked)?, self.synchronized)?;
+        // Checked/Synchronized marks carry one of this crate's source labels
+        // (`quantum_labels`, the complete coverage set of `ios_quantum_phase`): each is at most
+        // the longest of them.
+        let labelled = plus(self.checked, self.synchronized)?;
+        let longest = super::quantum_labels()
+            .iter()
+            .map(|label| label.len() as u64)
+            .max()
+            .unwrap_or(0);
+        [
+            fixed,
+            product(&[self.progress, progress])?,
+            product(&[self.preview, preview])?,
+            product(&[marks, quantum])?,
+            product(&[labelled, longest, label_byte])?,
+        ]
+        .into_iter()
+        .try_fold(0, plus)
+    }
+}
+
+fn stack_windows(depth: u64, window: Option<usize>) -> Result<u64> {
+    if depth == 0 {
+        return Ok(0);
+    }
+    ceil(
+        depth,
+        window.map(|w| w as u64).unwrap_or(depth).clamp(1, depth),
+    )
+}
+
+/// dit.rs:501-582,589-665,2890-3150: every block, allocation-region mark, output row, stream
+/// window read, and BOTH scopes (forward_impl and text_adapter_exec). Each scope emits its own
+/// entry and restoration Metadata mark (ios_quantum.rs:295-325,342-382), including nested scopes.
+fn backbone_callback_events(
+    m: &IrisModel,
+    rows: u64,
+    by_row: bool,
+    stream: Option<usize>,
+) -> Result<CallbackEventUpper> {
+    let layer = Stack::Layer.depth(m) as u64;
+    let refiner = Stack::Refiner.depth(m) as u64;
+    let trunk = m.depth as u64;
+    let pixel = m.pixel.depth as u64;
+    let row_bound = by_row && rows > 1;
+    let iterations = if row_bound { rows } else { 1 };
+    let mut windows = 0;
+    if let Some(window) = stream {
+        for depth in [layer, refiner, trunk, pixel] {
+            windows = plus(windows, stack_windows(depth, Some(window))?)?;
+        }
+    }
+    let quanta = [
+        7,
+        layer,
+        refiner,
+        trunk,
+        product(&[plus(pixel, 1)?, iterations])?,
+        u64::from(row_bound),
+        windows,
+    ]
+    .into_iter()
+    .try_fold(0, plus)?;
+    let metadata = [
+        3,
+        layer,
+        refiner,
+        trunk,
+        product(&[plus(pixel, 1)?, iterations])?,
+        windows,
+        4,
+    ]
+    .into_iter()
+    .try_fold(0, plus)?;
+    Ok(CallbackEventUpper {
+        metadata,
+        checked: quanta,
+        synchronized: quanta,
+        ..Default::default()
+    })
+}
+
+fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUpper> {
+    match req.provider {
+        crate::restoration::MODEL_ID => {
+            let resources =
+                RestorationResources::from_spec(req.spec, req.provider).map_err(Error::from)?;
+            let plan = restoration_priced_plan(req, &resources, None)?;
+            let tiles = plan.forward_count().map_err(Error::from)?;
+            let stream = (req.spec.load_shape == LoadShape::DeferredMaterialization)
+                .then_some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize);
+            let mut count =
+                backbone_callback_events(&resources.export.config.model, 1, false, stream)?
+                    .times(tiles)?;
+            // Load checks: restoration LOAD plus model BACKBONE_LOAD. Plan axes (when nonempty)
+            // have before/finish; HOST_PLANES and POST_TILE only have before, not finish.
+            count.add(CallbackEventUpper {
+                progress: plus(tiles, 1)?,
+                checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
+                synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
+                metadata: plus(plus(4, 2)?, tiles)?,
+                ..Default::default()
+            })?;
+            // Every velocity has a separate TILE before/finish outside the DiT's own quanta.
+            count.add(CallbackEventUpper {
+                checked: tiles,
+                synchronized: tiles,
+                ..Default::default()
+            })?;
+            Ok(count)
+        }
+        crate::depth::DEPTH_MODEL_ID => {
+            let actual = req.depth.ok_or_else(|| {
+                Error::Unsupported("depth callback counts need source/resolution".into())
+            })?;
+            let export = TaskExport::from_spec(req.spec, IrisTask::Depth, req.provider)
+                .map_err(Error::from)?;
+            let plan = depth_input_plan(req.spec, actual)?;
+            let stream = (req.spec.load_shape == LoadShape::DeferredMaterialization)
+                .then_some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize);
+            let mut count = backbone_callback_events(&export.config.model, 1, false, stream)?;
+            // One LOAD check; PREP,RGB,INPUT,REDUCER,HOST_MAP pairs; optional HOST_POST pair.
+            count.add(CallbackEventUpper {
+                progress: 1,
+                metadata: 3,
+                checked: plus(6, u64::from(plan.resized()))?,
+                synchronized: plus(5, u64::from(plan.resized()))?,
+                ..Default::default()
+            })?;
+            Ok(count)
+        }
+        crate::model::MODEL_ID => {
+            let actual = req.generation.ok_or_else(|| {
+                Error::Unsupported(
+                    "generation callback counts need actual sampling/preview context".into(),
+                )
+            })?;
+            let resources =
+                GenerationResources::from_spec(req.spec, req.provider).map_err(Error::from)?;
+            let config = IrisConfig::from_dir(&resources.backbone_dir).map_err(Error::from)?;
+            let params = resolved_generation_controls(&config, actual, actual.seed.unwrap_or(0))?;
+            let plan = params.plan_metadata().map_err(Error::from)?;
+            let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+            let rungs = crate::model::request_rungs(actual, streamed)?;
+            let staged = req.execution.stage_residency
+                || req.spec.offload_policy == OffloadPolicy::Sequential;
+            let loads = plus(
+                1,
+                u64::from(staged && req.spec.offload_policy == OffloadPolicy::Resident),
+            )?;
+            let rows = params.prompts.len() as u64;
+            let serials = u64::from(actual.count);
+            let mut count = CallbackEventUpper {
+                progress: plus(product(&[serials, plan.len() as u64])?, 3)?,
+                preview: if actual.preview.is_active() {
+                    product(&[serials, plan.len() as u64])?
+                } else {
+                    0
+                },
+                metadata: 3,
+                checked: product(&[2, loads])?,
+                ..Default::default()
+            };
+            // The progress +3 is Decoding plus at most TWO conditional Loading events. A warm
+            // retained pair emits neither Loading event; source residency.rs:449-465,662-682.
+            let cfg = mlx_llm::ModelConfig::from_dir(&resources.text_encoder_dir)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let deepest = *config.text_encoder.hidden_layers.last().unwrap_or(&0) as u64;
+            let encodes = plus(rows, u64::from(params.uses_cfg()))?;
+            let text = if streamed {
+                let layers = deepest.min(cfg.num_layers as u64);
+                let windows = stack_windows(layers, rungs.text_window)?;
+                CallbackEventUpper {
+                    metadata: 2,
+                    checked: plus(plus(2, layers)?, windows)?,
+                    synchronized: plus(plus(2, layers)?, windows)?,
+                    ..Default::default()
+                }
+            } else {
+                CallbackEventUpper {
+                    metadata: 2,
+                    checked: plus(plus(3, deepest)?, cfg.num_layers as u64)?,
+                    synchronized: plus(3, deepest)?,
+                    ..Default::default()
+                }
+            };
+            count.add(text.times(encodes)?)?;
+            for _ in 0..serials {
+                // serial, solve_complete; PLAN, FINALIZE, IMAGE pairs.
+                count.add(CallbackEventUpper {
+                    metadata: 2,
+                    checked: 3,
+                    synchronized: 3,
+                    ..Default::default()
+                })?;
+                for index in 0..plan.len() {
+                    let step = plan.step(index).ok_or_else(overflow)?;
+                    let b = product(&[rows, if params.cfg_at(&step) { 2 } else { 1 }])?;
+                    let stream = streamed.then_some(rungs.dit_window.unwrap_or(usize::MAX));
+                    let mut epoch =
+                        backbone_callback_events(&config.model, b, rungs.pixel_rows, stream)?;
+                    // solver epoch metadata, pipeline forward metadata; STEP before/finish.
+                    epoch.add(CallbackEventUpper {
+                        metadata: 2,
+                        checked: 1,
+                        synchronized: 1,
+                        ..Default::default()
+                    })?;
+                    count.add(epoch)?;
+                }
+            }
+            if !req.spec.adapters.is_empty() {
+                let path = resources
+                    .backbone_dir
+                    .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+                let (projections, _) = crate::adapters::projection_shapes_from_headers(&path)?;
+                let inventory = crate::adapters::header_inventory(
+                    &req.spec.adapters,
+                    &projections,
+                    compute_dtype(req.spec.precision),
+                    IrisTask::Generation,
+                    req.provider,
+                )?;
+                let targets = inventory.projections.len() as u64;
+                // HOST before once; Iris file before AND strict shared-loader before per file;
+                // materialization before+finish for every adapted projection, disabled included.
+                count.add(CallbackEventUpper {
+                    checked: product(&[
+                        loads,
+                        plus(
+                            plus(1, product(&[2, req.spec.adapters.len() as u64])?)?,
+                            targets,
+                        )?,
+                    ])?,
+                    synchronized: product(&[loads, targets])?,
+                    ..Default::default()
+                })?;
+            }
+            Ok(count)
+        }
+        _ => Err(Error::Unsupported(
+            "Iris callback counts have no provider source".into(),
+        )),
+    }
+}
+
+/// Allocation-law components re-audited from Cargo.lock-checksum-authenticated dependency bytes
+/// and exact ac68 std bytes. These are requested-layout bounds, never malloc/RSS charges. Their
+/// source file manifest is supplied with the delta; no alternate package version is authority.
+mod authenticated_metadata {
+    use super::*;
+    fn align_up(n: u64, a: u64) -> Result<u64> {
+        if !a.is_power_of_two() {
+            return Err(overflow());
+        }
+        product(&[ceil(n, a)?, a])
+    }
+    fn growth(width: u64, len: u64, containers: u64) -> Result<u64> {
+        product(&[
+            width,
+            plus(product(&[4, len])?, product(&[8, containers])?)?,
+        ])
+    }
+    fn group_width() -> Result<u64> {
+        if cfg!(target_arch = "aarch64") {
+            Ok(8)
+        } else if cfg!(target_arch = "x86_64") {
+            Ok(16)
+        } else {
+            Err(Error::Unsupported(
+                "authenticated std/hashbrown group layout requires aarch64 or x86_64".into(),
+            ))
+        }
+    }
+    /// hashbrown 0.16.1 raw/mod.rs:105-162,218-239; 0.17.1 raw.rs:104-160,216-237.
+    /// All maps here have non-ZST elements of >=one pointer, so the small-table minimum is 3.
+    fn buckets(cap: u64) -> Result<u64> {
+        if cap == 0 {
+            return Ok(0);
+        }
+        if cap < 15 {
+            return Ok(if cap < 4 {
+                4
+            } else if cap < 8 {
+                8
+            } else {
+                16
+            });
+        }
+        (product(&[cap, 8])? / 7)
+            .checked_next_power_of_two()
+            .ok_or_else(overflow)
+    }
+    fn table_request(width: u64, align: u64, count: u64) -> Result<u64> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let group = group_width()?;
+        plus(
+            align_up(product(&[width, count])?, align.max(group))?,
+            plus(count, group)?,
+        )
+    }
+    /// Include EVERY geometrically grown backing. reserve_rehash_inner grows only while the
+    /// current capacity is <2*new_items; once sparse enough it rehashes in place without a backing.
+    /// Therefore buckets(2*max_items) bounds the last table even under remove/reinsert churn.
+    fn hashmap<K, V>(items: u64) -> Result<u64> {
+        if items == 0 {
+            return Ok(0);
+        }
+        let last = buckets(product(&[2, items])?)?;
+        let (width, align) = (
+            std::mem::size_of::<(K, V)>() as u64,
+            std::mem::align_of::<(K, V)>() as u64,
+        );
+        if width < std::mem::size_of::<usize>() as u64 {
+            return Err(overflow());
+        }
+        let (mut current, mut total) = (4, 0);
+        while current <= last {
+            total = plus(total, table_request(width, align, current)?)?;
+            current = current.checked_mul(2).ok_or_else(overflow)?;
+        }
+        Ok(total)
+    }
+    /// Exact source fields of ac68 btree/node.rs:42-69,102-114: parent pointer, two u16s,
+    /// 11 key/value slots; internal node adds 12 pointers. Rounding EACH field to max alignment
+    /// is an upper independent of private Rust field reordering, not a fitted per-node reserve.
+    fn btree_node<K, V>() -> Result<u64> {
+        let a = (std::mem::align_of::<K>() as u64)
+            .max(std::mem::align_of::<V>() as u64)
+            .max(std::mem::align_of::<usize>() as u64);
+        [
+            std::mem::size_of::<usize>() as u64,
+            2,
+            2,
+            product(&[11, std::mem::size_of::<K>() as u64])?,
+            product(&[11, std::mem::size_of::<V>() as u64])?,
+            product(&[12, std::mem::size_of::<usize>() as u64])?,
+        ]
+        .into_iter()
+        .try_fold(0, |sum, field| plus(sum, align_up(field, a)?))
+    }
+    /// Insert-only deserialization never frees/replaces tree nodes. Every allocated stable node
+    /// contains a key; count + one root-insertion transient per nonempty map is a source upper.
+    fn btrees<K, V>(entries: u64, maps: u64) -> Result<u64> {
+        product(&[plus(entries, maps)?, btree_node::<K, V>()?])
+    }
+    /// indexmap2.14 inner.rs:228-265,480-498: entries reserve_exact to index-table capacity.
+    /// Sum table AND entry buffers at every possible table size, no release/resize credit.
+    fn indexmaps<K, V>(entries: u64) -> Result<u64> {
+        if entries == 0 {
+            return Ok(0);
+        }
+        let last = buckets(product(&[2, entries])?)?;
+        let mut current = 4;
+        let mut total = 0;
+        while current <= last {
+            total = plus(
+                total,
+                table_request(
+                    std::mem::size_of::<usize>() as u64,
+                    std::mem::align_of::<usize>() as u64,
+                    current,
+                )?,
+            )?;
+            total = plus(
+                total,
+                product(&[current, std::mem::size_of::<(usize, K, V)>() as u64])?,
+            )?;
+            current = current.checked_mul(2).ok_or_else(overflow)?;
+        }
+        Ok(total)
+    }
+
+    /// Insert-only map families: capacity_to_buckets(n) <=4*n; a geometric backing sequence
+    /// sums to <2*last_buckets, hence <=8*n bucket slots across ALL independent maps too.
+    /// There are <=n growths. Charge each table's real control group/alignment padding separately.
+    /// This avoids assuming nonlinear table envelopes distribute over nested object cardinalities.
+    fn indexmap_family<K, V>(entries: u64) -> Result<u64> {
+        if entries == 0 {
+            return Ok(0);
+        }
+        let group = group_width()?;
+        let slots = product(&[8, entries])?;
+        let indices = product(&[slots, std::mem::size_of::<usize>() as u64])?;
+        let controls = slots;
+        let tail_padding = product(&[entries, plus(group - 1, group)?])?;
+        let values = product(&[slots, std::mem::size_of::<(usize, K, V)>() as u64])?;
+        [indices, controls, tail_padding, values]
+            .into_iter()
+            .try_fold(0, plus)
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct JsonCounts {
+        pub(super) bytes: u64,
+        pub(super) objects: u64,
+        pub(super) object_entries: u64,
+        pub(super) arrays: u64,
+        pub(super) array_elements: u64,
+        pub(super) strings: u64,
+        pub(super) string_source_bytes: u64,
+        pub(super) numbers: u64,
+        pub(super) number_source_bytes: u64,
+        pub(super) floats: u64,
+        pub(super) raw_value_key: bool,
+    }
+    struct Scan<'a> {
+        data: &'a [u8],
+        at: usize,
+        counts: JsonCounts,
+    }
+    impl Scan<'_> {
+        fn ws(&mut self) {
+            while self.data.get(self.at).is_some_and(u8::is_ascii_whitespace) {
+                self.at += 1;
+            }
+        }
+        fn bad<T>() -> Result<T> {
+            Err(Error::Unsupported(
+                "invalid JSON for metadata layout scan".into(),
+            ))
+        }
+        fn byte(&mut self) -> Result<u8> {
+            let b = *self
+                .data
+                .get(self.at)
+                .ok_or_else(|| Error::Unsupported("truncated metadata JSON".into()))?;
+            self.at += 1;
+            Ok(b)
+        }
+        fn string(&mut self, key: bool) -> Result<()> {
+            if self.byte()? != b'"' {
+                return Self::bad();
+            }
+            let start = self.at;
+            let magic: [&[u8]; 2] = [
+                b"$serde_json::private::RawValue",
+                b"$serde_json::private::Number",
+            ];
+            let (mut matched, mut exact) = ([0usize; 2], [true; 2]);
+            loop {
+                let b = self.byte()?;
+                if b == b'"' {
+                    break;
+                }
+                let decoded = if b == b'\\' {
+                    match self.byte()? {
+                        b'u' => {
+                            let mut c = 0u16;
+                            for _ in 0..4 {
+                                let b = self.byte()?;
+                                let digit = match b {
+                                    b'0'..=b'9' => b - b'0',
+                                    b'a'..=b'f' => b - b'a' + 10,
+                                    b'A'..=b'F' => b - b'A' + 10,
+                                    _ => return Self::bad(),
+                                };
+                                c = (c << 4) | u16::from(digit);
+                            }
+                            u8::try_from(c).ok().filter(u8::is_ascii)
+                        }
+                        b'"' => Some(b'"'),
+                        b'\\' => Some(b'\\'),
+                        b'/' => Some(b'/'),
+                        b'b' => Some(8),
+                        b'f' => Some(12),
+                        b'n' => Some(10),
+                        b'r' => Some(13),
+                        b't' => Some(9),
+                        _ => return Self::bad(),
+                    }
+                } else {
+                    if b < 0x20 {
+                        return Self::bad();
+                    }
+                    Some(b)
+                };
+                for which in 0..magic.len() {
+                    if exact[which] && magic[which].get(matched[which]).copied() == decoded {
+                        matched[which] += 1;
+                    } else {
+                        exact[which] = false;
+                    }
+                }
+            }
+            self.counts.strings = plus(self.counts.strings, 1)?;
+            self.counts.string_source_bytes = plus(
+                self.counts.string_source_bytes,
+                (self.at - start - 1) as u64,
+            )?;
+            self.counts.raw_value_key |= key
+                && (0..magic.len())
+                    .any(|which| exact[which] && matched[which] == magic[which].len());
+            Ok(())
+        }
+        fn value(&mut self, depth: u16) -> Result<()> {
+            if depth > 128 {
+                return Err(Error::Unsupported(
+                    "metadata JSON exceeds serde default recursion depth".into(),
+                ));
+            }
+            self.ws();
+            match self.data.get(self.at).copied() {
+                Some(b'{') => {
+                    self.at += 1;
+                    self.counts.objects = plus(self.counts.objects, 1)?;
+                    self.ws();
+                    if self.data.get(self.at) == Some(&b'}') {
+                        self.at += 1;
+                        return Ok(());
+                    }
+                    loop {
+                        self.ws();
+                        self.string(true)?;
+                        self.ws();
+                        if self.byte()? != b':' {
+                            return Self::bad();
+                        }
+                        self.counts.object_entries = plus(self.counts.object_entries, 1)?;
+                        self.value(depth + 1)?;
+                        self.ws();
+                        match self.byte()? {
+                            b'}' => break,
+                            b',' => {}
+                            _ => return Self::bad(),
+                        }
+                    }
+                }
+                Some(b'[') => {
+                    self.at += 1;
+                    self.counts.arrays = plus(self.counts.arrays, 1)?;
+                    self.ws();
+                    if self.data.get(self.at) == Some(&b']') {
+                        self.at += 1;
+                        return Ok(());
+                    }
+                    loop {
+                        self.counts.array_elements = plus(self.counts.array_elements, 1)?;
+                        self.value(depth + 1)?;
+                        self.ws();
+                        match self.byte()? {
+                            b']' => break,
+                            b',' => {}
+                            _ => return Self::bad(),
+                        }
+                    }
+                }
+                Some(b'"') => self.string(false)?,
+                Some(b't' | b'f' | b'n') => {
+                    let literal: &[u8] = match self.data[self.at] {
+                        b't' => b"true",
+                        b'f' => b"false",
+                        _ => b"null",
+                    };
+                    if self.data.get(self.at..self.at + literal.len()) != Some(literal) {
+                        return Self::bad();
+                    }
+                    self.at += literal.len();
+                }
+                Some(b'-' | b'0'..=b'9') => {
+                    let start = self.at;
+                    let mut float = false;
+                    while self.data.get(self.at).is_some_and(|b| {
+                        matches!(b, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                    }) {
+                        float |= matches!(self.data[self.at], b'.' | b'e' | b'E');
+                        self.at += 1;
+                    }
+                    self.counts.numbers = plus(self.counts.numbers, 1)?;
+                    self.counts.number_source_bytes =
+                        plus(self.counts.number_source_bytes, (self.at - start) as u64)?;
+                    self.counts.floats = plus(self.counts.floats, u64::from(float))?;
+                }
+                _ => return Self::bad(),
+            }
+            Ok(())
+        }
+    }
+    /// Allocation-free lexical cardinality scan. It does not replace serde validation, expand
+    /// strings, allocate an AST, or trust an attacker-supplied cardinality field.
+    pub(super) fn scan_json(data: &[u8]) -> Result<JsonCounts> {
+        let mut s = Scan {
+            data,
+            at: 0,
+            counts: JsonCounts {
+                bytes: data.len() as u64,
+                ..Default::default()
+            },
+        };
+        s.value(0)?;
+        s.ws();
+        if s.at != data.len() {
+            return Scan::bad();
+        }
+        Ok(s.counts)
+    }
+
+    /// serde_core/private/content.rs and serde/private/de.rs:10-39,313-510: the private
+    /// `Content` enum's widest variant payload is a three-word String/Vec (no i128/u128 variant
+    /// in this source). Its size is an UPPER from that payload plus a full-word discriminant,
+    /// rounded to the word, under the labelled TOOLCHAIN-LAYOUT assumption that a repr(Rust)
+    /// enum is no larger than one word of tag plus its widest payload (no type is mirrored and no
+    /// equality with the private layout is claimed). Never below the public JSON Value cell.
+    fn content_cell() -> u64 {
+        let word = std::mem::size_of::<usize>() as u64;
+        let widest_payload = 3 * word;
+        (widest_payload + word).max(std::mem::size_of::<serde_json::Value>() as u64)
+    }
+    /// Complete generic JSON Value/Content TREE layouts and shared scanner scratch, excluding
+    /// numeric bigint fallback (separate below). Cfg-exclusive BTree and IndexMap implementations
+    /// are both charged so global serde_json feature unification is not silently guessed.
+    pub(super) fn json_tree_layout(c: JsonCounts) -> Result<u64> {
+        let value = std::mem::size_of::<serde_json::Value>() as u64;
+        let mut total = growth(1, plus(c.bytes, 3)?, 1)?; // shared unescape scratch + reserve(4)
+        total = plus(total, c.string_source_bytes)?; // owned strings in Value visitor
+        total = plus(total, growth(value, c.array_elements, c.arrays)?)?;
+        total = plus(
+            total,
+            btrees::<String, serde_json::Value>(c.object_entries, c.objects)?,
+        )?;
+        total = plus(
+            total,
+            indexmap_family::<String, serde_json::Value>(c.object_entries)?,
+        )?;
+        // Serde #[flatten] Content buffer, then typed leaves: real separate source allocations.
+        total = plus(total, growth(content_cell(), c.array_elements, c.arrays)?)?;
+        total = plus(
+            total,
+            growth(product(&[2, content_cell()])?, c.object_entries, c.objects)?,
+        )?;
+        total = plus(total, c.string_source_bytes)?; // Content owned-string branch
+                                                     // arbitrary_precision starts a 16-byte String for EACH number; normalized f64 uses
+                                                     // stack zmij Buffer[24] then one owned Number string. Both source cfg branches count.
+        total = plus(total, product(&[16, c.numbers])?)?;
+        total = plus(total, growth(1, c.number_source_bytes, c.numbers)?)?;
+        total = plus(total, product(&[24, c.numbers])?)?;
+        // Typed String/String metadata and String/usize index maps (both SafeTensors versions).
+        total = plus(total, hashmap::<String, String>(c.object_entries)?)?;
+        total = plus(total, hashmap::<String, usize>(c.object_entries)?)?;
+        total = plus(total, product(&[2, c.string_source_bytes])?)?;
+        Ok(total)
+    }
+
+    /// serde_json lexical/math.rs:661-775 recurrence over EVERY source Vec producer.
+    /// Each long product creates y.len() small-product Vecs and grows its accumulating result.
+    /// Balanced Karatsuba creates two sum Vecs, three recursive products and a result reserve;
+    /// uneven Karatsuba creates one result and ceil(y/x) recursive products. Max is over actual
+    /// mutually exclusive algorithm paths, NOT a guard scratch maximum or an operation budget.
+    fn lexical_multiply_layout(max_words: usize, limb: u64) -> Result<u64> {
+        const MAX: usize = ((4 * 769 + 3 * ((1usize << 14) - 1) + 64 + 31) / 32) + 2;
+        if max_words > MAX {
+            return Err(overflow());
+        }
+        let mut cumulative = [0u64; MAX + 1]; // fixed STACK memo, no host allocation
+        for n in 1..=max_words {
+            let out = plus(product(&[2, n as u64])?, 2)?;
+            cumulative[n] = if n <= 32 {
+                plus(
+                    product(&[n as u64, growth(limb, plus(n as u64, 1)?, 1)?])?,
+                    growth(limb, out, 1)?,
+                )?
+            } else {
+                let half = n.div_ceil(2) + 1;
+                let balanced = [
+                    growth(limb, half as u64, 1)?,
+                    growth(limb, half as u64, 1)?,
+                    cumulative[n / 2],
+                    cumulative[half],
+                    cumulative[n.div_ceil(2)],
+                    product(&[limb, out])?,
+                ]
+                .into_iter()
+                .try_fold(0, plus)?;
+                let mut uneven = 0;
+                for x in 1..n.div_ceil(2) {
+                    let path = plus(
+                        growth(limb, out, 1)?,
+                        product(&[ceil(n as u64, x as u64)?, cumulative[x]])?,
+                    )?;
+                    uneven = uneven.max(path);
+                }
+                balanced.max(uneven)
+            };
+        }
+        Ok(cumulative[max_words])
+    }
+    /// Recovered lexical sources: Bigint defaults to 20 limbs; f64 MAX_DIGITS=769;
+    /// POW5 has 14 static tables; each pow5 loop selects at most 14 products. Before any
+    /// potentially enormous binary shift, bits <=4*769+3*(2^14-1)+64. Shift count is bounded
+    /// by the source i32 exponent domain, <=2^31. Both Bigint owners and both source paths
+    /// remain charged; no cap is invented from a test size. Both 32/64-limb cfgs are covered.
+    fn lexical_float_layout() -> Result<u64> {
+        let before_bits = plus(
+            plus(product(&[4, 769])?, product(&[3, (1u64 << 14) - 1])?)?,
+            64,
+        )?;
+        let mut total = 0;
+        for limb in [4u64, 8] {
+            let words = plus(ceil(before_bits, product(&[8, limb])?)?, 2)?;
+            let shifted = plus(
+                ceil(plus(before_bits, 1u64 << 31)?, product(&[8, limb])?)?,
+                2,
+            )?;
+            let defaults = product(&[2, 20, limb])?;
+            let owner_growth = product(&[2, growth(limb, shifted, 1)?])?;
+            let products = product(&[2, 14, lexical_multiply_layout(words as usize, limb)?])?;
+            total = plus(total, plus(plus(defaults, owner_growth)?, products)?)?;
+        }
+        Ok(total)
+    }
+
+    /// Finite complete parser-layout component, including optional raw-value/number reparsing
+    /// and float_roundtrip Bigints. Each recursive private-marker reparse consumes a nested
+    /// encoded string and never duplicates source bytes; there are <=B parser passes and <=B
+    /// bytes per pass in B initial bytes. Normal headers without private keys use ONE pass.
+    /// This function does not price the provider's execution schedule or std thread/IO wrappers.
+    pub(super) fn json_parse_layout(data: &[u8]) -> Result<u64> {
+        let c = scan_json(data)?;
+        let (one, passes) = if c.raw_value_key {
+            let b = c.bytes;
+            (
+                JsonCounts {
+                    bytes: b,
+                    objects: b,
+                    object_entries: b,
+                    arrays: b,
+                    array_elements: b,
+                    strings: b,
+                    string_source_bytes: b,
+                    numbers: b,
+                    number_source_bytes: b,
+                    floats: b,
+                    raw_value_key: true,
+                },
+                plus(b, 1)?,
+            )
+        } else {
+            (c, 1)
+        };
+        let mut parsed = json_tree_layout(one)?;
+        if one.floats != 0 {
+            parsed = plus(parsed, product(&[one.floats, lexical_float_layout()?])?)?;
+        }
+        product(&[passes, parsed])
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn json_scan_tracks_real_cardinalities_without_parsing_allocations() {
+            let c = scan_json(br#"{"a":[1,2],"b":{"x":"hello"}}"#).unwrap();
+            assert_eq!(
+                (
+                    c.objects,
+                    c.object_entries,
+                    c.arrays,
+                    c.array_elements,
+                    c.numbers,
+                    c.strings
+                ),
+                (2, 3, 1, 2, 2, 4)
+            );
+            assert!(!c.raw_value_key);
+            assert!(
+                scan_json(br#"{"$serde_json::private::RawValue":"{}"}"#)
+                    .unwrap()
+                    .raw_value_key
+            );
+            assert!(scan_json(b"{").is_err());
+        }
+        #[test]
+        fn recovered_json_layouts_and_small_bigint_recurrence_are_finite() {
+            let raw = br#"{"shape":[1,2],"dtype":"F32","data_offsets":[0,8]}"#;
+            assert!(json_parse_layout(raw).unwrap() > raw.len() as u64);
+            let exact = 2 * growth(8, 3, 1).unwrap() + growth(8, 6, 1).unwrap();
+            assert_eq!(lexical_multiply_layout(2, 8).unwrap(), exact);
+        }
+        #[test]
+        fn authenticated_table_layouts_include_every_grown_backing() {
+            let group = group_width().unwrap();
+            assert_eq!(
+                table_request(32, 8, 4).unwrap(),
+                align_up(128, group).unwrap() + 4 + group
+            );
+            assert!(hashmap::<String, usize>(8).unwrap() > table_request(32, 8, 4).unwrap());
+            assert!(
+                btree_node::<String, serde_json::Value>().unwrap()
+                    > std::mem::size_of::<serde_json::Value>() as u64
+            );
+            assert!(hashmap::<String, usize>(u64::MAX).is_err());
+        }
+    }
+}
+
+/// Finite source-known Vec/PathBuf part of SourceInventory::verify_for + verify_unchanged.
+/// Uses actual retained cardinalities, not directory guesses. Overlapping roots may visit a
+/// member once per root; old buffers remain charged. This does NOT include std ReadDir's private
+/// OS-wrapper layouts or the remaining complete MetadataHostBound, and cannot replace that term.
+pub(super) fn known_inventory_verify_vectors(req: &IosPricingRequest<'_>) -> Result<u64> {
+    let inventory = req.spec.source_inventory().ok_or_else(|| {
+        Error::Unsupported(
+            "Iris host metadata needs retained SourceInventory allocation facts".into(),
+        )
+    })?;
+    let f = inventory.allocation_facts().map_err(Error::from)?;
+    fn grown(width: u64, elements: u64) -> Result<u64> {
+        if elements == 0 {
+            return Ok(0);
+        }
+        product(&[width, plus(product(&[4, elements])?, 8)?])
+    }
+    let paths = std::mem::size_of::<std::path::PathBuf>() as u64;
+    let refs = std::mem::size_of::<&std::path::Path>() as u64;
+    let entries = product(&[f.roots_len, f.entries_len])?;
+    let files = product(&[f.roots_len, f.pins_len])?;
+    let member_bytes = product(&[f.roots_len, f.entries_path_bytes])?;
+    let member_growth = plus(product(&[4, member_bytes])?, product(&[8, entries])?)?;
+    [
+        grown(refs, f.roots_len)?,
+        grown(refs, f.roots_len)?, // configured File/Dir path lists
+        grown(paths, f.roots_len)?,
+        f.roots_path_bytes, // absolute roots and their path clones
+        grown(paths, entries)?,
+        grown(paths, files)?,
+        member_growth,
+        product(&[2, member_bytes])?,
+    ] // DirEntry.path + retained entry/file clones
+    .into_iter()
+    .try_fold(0, plus)
+}
+
+#[cfg(test)]
+mod callback_host_tests {
+    use super::*;
+    #[test]
+    fn callback_cost_keeps_progress_preview_and_all_mark_kinds_separate() {
+        let events = CallbackEventUpper {
+            progress: 2,
+            preview: 3,
+            metadata: 5,
+            checked: 7,
+            synchronized: 11,
+        };
+        let longest = super::super::quantum_labels()
+            .iter()
+            .map(|label| label.len() as u64)
+            .max()
+            .unwrap();
+        assert!(longest > 0);
+        assert_eq!(
+            events.priced(13, 17, 19, 23, 29).unwrap(),
+            13 + 2 * 17 + 3 * 19 + (5 + 7 + 11) * 23 + (7 + 11) * longest * 29
+        );
+        assert!(events.priced(u64::MAX, 1, 1, 1, 0).is_err());
+        assert!(events.times(u64::MAX).is_err());
+    }
+    #[test]
+    fn source_forward_event_formulas_cover_scope_and_window_marks() {
+        let config = IrisConfig::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/iris"),
+        )
+        .unwrap();
+        let m = &config.model;
+        let dense = backbone_callback_events(m, 1, false, None).unwrap();
+        let blocks = m.depth as u64 + m.pixel.depth as u64;
+        assert_eq!(dense.checked, 12 + blocks);
+        assert_eq!(dense.synchronized, 12 + blocks);
+        assert_eq!(dense.metadata, 12 + blocks); // allocation-region/block/output metadata +4 scope marks
+        let streamed = backbone_callback_events(m, 1, false, Some(1)).unwrap();
+        let windows = 4 + blocks;
+        assert_eq!(streamed.checked - dense.checked, windows);
+        assert_eq!(streamed.synchronized - dense.synchronized, windows);
+        assert_eq!(streamed.metadata - dense.metadata, windows);
+        let rows = backbone_callback_events(m, 2, true, None).unwrap();
+        assert_eq!(rows.checked - dense.checked, m.pixel.depth as u64 + 2);
+    }
+}
+
+/// Source-private aggregate-layout UPPER (never an equality claim about a private type): each
+/// real source field rounded up to the maximum field alignment. Labelled TOOLCHAIN-LAYOUT
+/// assumption: a repr(Rust) struct is no larger than that sum (rustc inserts no padding beyond
+/// alignment and may only reorder or niche-pack fields, which can only shrink it).
+fn aggregate_requested_layout(fields: &[(u64, u64)], minimum_alignment: u64) -> Result<(u64, u64)> {
+    let align = fields
+        .iter()
+        .map(|&(_, align)| align)
+        .fold(minimum_alignment, u64::max);
+    if !align.is_power_of_two() {
+        return Err(overflow());
+    }
+    let bytes = fields.iter().try_fold(0, |sum, &(size, _)| {
+        plus(sum, product(&[ceil(size, align)?, align])?)
+    })?;
+    Ok((bytes, align))
+}
+fn arc_requested_layout(payload: (u64, u64)) -> Result<u64> {
+    // Exact ac68 alloc/sync.rs ArcInner repr(C,align(2)), two AtomicUsize header words.
+    let word = std::mem::size_of::<usize>() as u64;
+    let align = payload.1.max(std::mem::align_of::<usize>() as u64).max(2);
+    let offset = product(&[ceil(product(&[2, word])?, payload.1)?, payload.1])?;
+    product(&[ceil(plus(offset, payload.0)?, align)?, align])
+}
+
+/// Provider-owned Rust heap around RGB wavelet worker bodies (already separately priced).
+/// Source: exact ac68 thread/{scoped:148,lifecycle:56-57,113,121,148-151,180-184,
+/// thread:49-107,current:241-250,284-300}, Darwin Parker:39-43. ScopeData/Packet/closure/ThreadInit
+/// use real source fields; Arc clones allocate nothing. The cold parent Thread handle is included.
+///
+/// Spawn hooks are source-proven empty: stable1.96.0 cannot call the gated unstable API, and the
+/// immutable workspace + every recovered dependency have no caller/feature. See scan manifest.
+/// NATIVE libdispatch semaphore objects, OS thread stacks/guards/TLS backing and allocator charge
+/// are NOT Rust requested layouts and remain explicitly unapproved physical quantities.
+/// The paired producer change uses Builder.stack_size(COLOR_FIX_WORKER_STACK_BYTES), which
+/// bypasses lifecycle.rs:29-44's ENTIRE cache/env closure. Request-time RUST_MIN_STACK bytes are
+/// therefore source-proven zero for that producer, not a cache-warm assumption or env change.
+fn provider_scoped_thread_heap_upper(workers: u64) -> Result<u64> {
+    if workers == 0 {
+        return Ok(0);
+    }
+    if !cfg!(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    )) {
+        return Err(Error::Unsupported(
+            "scoped-thread requested layouts require authenticated 64-bit Apple/Linux target"
+                .into(),
+        ));
+    }
+    let word = std::mem::size_of::<usize>() as u64;
+    let word_align = std::mem::align_of::<usize>() as u64;
+    let thread = (
+        std::mem::size_of::<std::thread::Thread>() as u64,
+        std::mem::align_of::<std::thread::Thread>() as u64,
+    );
+    let id = (
+        std::mem::size_of::<std::thread::ThreadId>() as u64,
+        std::mem::align_of::<std::thread::ThreadId>() as u64,
+    );
+    let parker = if cfg!(target_vendor = "apple") {
+        aggregate_requested_layout(&[(word, word_align), (1, 1)], word_align)? // dispatch ptr +AtomicI8
+    } else {
+        (
+            std::mem::size_of::<std::sync::atomic::AtomicU32>() as u64,
+            std::mem::align_of::<std::sync::atomic::AtomicU32>() as u64,
+        )
+    }; // Linux futex Parker
+    let inner = aggregate_requested_layout(
+        &[
+            (
+                std::mem::size_of::<Option<std::ffi::CString>>() as u64,
+                std::mem::align_of::<Option<std::ffi::CString>>() as u64,
+            ),
+            id,
+            parker,
+        ],
+        8,
+    )?;
+    let scope = aggregate_requested_layout(&[(word, word_align), (1, 1), thread], word_align)?;
+    type WorkerReturn = mlx_gen::gen_core::Result<Vec<f32>>;
+    type PacketResult = Option<std::thread::Result<WorkerReturn>>;
+    let packet = aggregate_requested_layout(
+        &[
+            (word, word_align),
+            (
+                std::mem::size_of::<PacketResult>() as u64,
+                std::mem::align_of::<PacketResult>() as u64,
+            ),
+        ],
+        word_align,
+    )?;
+    // Iris worker F captures cp,rp:&[f32],h,w:usize,cancel:&CancelFlag; all are source-visible.
+    let f = aggregate_requested_layout(
+        &[
+            (std::mem::size_of::<&[f32]>() as u64, word_align),
+            (std::mem::size_of::<&[f32]>() as u64, word_align),
+            (word, word_align),
+            (word, word_align),
+            (word, word_align),
+        ],
+        word_align,
+    )?;
+    let hooks = aggregate_requested_layout(
+        &[
+            (word, word_align),
+            (
+                std::mem::size_of::<Vec<Box<dyn FnOnce() + Send>>>() as u64,
+                word_align,
+            ),
+        ],
+        word_align,
+    )?;
+    let start = aggregate_requested_layout(&[f, hooks, (word, word_align)], word_align)?;
+    let init = aggregate_requested_layout(
+        &[
+            thread,
+            (
+                std::mem::size_of::<Box<dyn FnOnce() + Send>>() as u64,
+                word_align,
+            ),
+        ],
+        word_align,
+    )?;
+    let each = [
+        arc_requested_layout(inner)?,
+        arc_requested_layout(packet)?,
+        start.0,
+        init.0,
+    ]
+    .into_iter()
+    .try_fold(0, plus)?;
+    plus(
+        plus(arc_requested_layout(scope)?, arc_requested_layout(inner)?)?,
+        product(&[workers, each])?,
+    )
+}
+
+/// Separate, UNAPPROVED PHYSICAL-domain quantity: sum of BUILDER-REQUESTED worker stack bytes.
+/// Uses the actual explicit source constant used by Builder::stack_size, never an inferred RSS
+/// cap. pthread minimum/page rules, stack guards, TLS and libdispatch are additional
+/// physical questions. This is deliberately not added to native Active OR Rust heap totals.
+pub(super) fn restoration_worker_os_stack_request_bytes(
+    req: &IosPricingRequest<'_>,
+) -> Result<u64> {
+    let resources = RestorationResources::from_spec(req.spec, crate::restoration::MODEL_ID)
+        .map_err(Error::from)?;
+    let plan = restoration_priced_plan(req, &resources, None)?;
+    if plan.color_fix {
+        product(&[
+            3,
+            mlx_gen::gen_core::iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
+        ])
+    } else {
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod scoped_thread_layout_tests {
+    use super::*;
+    #[test]
+    fn explicit_worker_heap_excludes_os_stack_and_environment_bytes() {
+        assert_eq!(provider_scoped_thread_heap_upper(0).unwrap(), 0);
+        let one = provider_scoped_thread_heap_upper(1).unwrap();
+        let three = provider_scoped_thread_heap_upper(3).unwrap();
+        assert!(three > one);
+        assert_eq!(
+            three - one,
+            2 * (provider_scoped_thread_heap_upper(2).unwrap() - one)
+        );
+        let payload = aggregate_requested_layout(&[(8, 8), (1, 1), (8, 8)], 8).unwrap();
+        assert_eq!(payload, (24, 8));
+        assert_eq!(arc_requested_layout(payload).unwrap(), 40);
     }
 }

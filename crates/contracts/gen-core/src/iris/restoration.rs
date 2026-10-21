@@ -25,6 +25,15 @@ use crate::runtime::{CancelFlag, LoadSpec, Progress};
 use crate::transform::{InputBudget, InputSizing, TargetSize, TransformRequest};
 use crate::{Error, Result};
 
+/// The REQUESTED stack of each colour-fix worker thread (one per RGB channel). Equal to std's
+/// default for these targets (Rust ac68 `library/std/src/sys/thread/unix.rs:20-26`,
+/// `DEFAULT_MIN_STACK_SIZE = 2 MiB`), stated explicitly so these INTERNAL workers never read the
+/// process-wide `RUST_MIN_STACK` override: std reads (and allocates) that variable only when no
+/// stack size is given (`thread/lifecycle.rs:29`). Implementation choice, not a user control:
+/// these workers no longer inherit that global std environment override. Requested virtual
+/// stack bytes, not a resident/committed-memory bound.
+pub const COLOR_FIX_WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+
 /// Registry id of the Iris-3B restoration transform.
 pub const MODEL_ID: &str = "iris_3b_restore";
 /// `Restorer.__call__(scale=4.0)` — the release default.
@@ -1085,16 +1094,19 @@ fn wavelet_color_fix_cancellable(
     }
     let (h, w) = (content.height, content.width);
     let planes: Vec<Vec<f32>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..content.channels)
+        let handles = (0..content.channels)
             .map(|c| {
                 let (cp, rp) = (content.plane(c), reference.plane(c));
-                scope.spawn(move || -> Result<Vec<f32>> {
-                    let (high, _) = split_plane(cp, h, w, cancel)?;
-                    let (_, low) = split_plane(rp, h, w, cancel)?;
-                    Ok(high.iter().zip(&low).map(|(a, b)| a + b).collect())
-                })
+                std::thread::Builder::new()
+                    .stack_size(COLOR_FIX_WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || -> Result<Vec<f32>> {
+                        let (high, _) = split_plane(cp, h, w, cancel)?;
+                        let (_, low) = split_plane(rp, h, w, cancel)?;
+                        Ok(high.iter().zip(&low).map(|(a, b)| a + b).collect())
+                    })
+                    .map_err(|e| Error::Msg(format!("iris: colour-fix worker did not start: {e}")))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         handles
             .into_iter()
             .map(|h| h.join().expect("colour-fix worker panicked"))

@@ -642,8 +642,32 @@ impl Section<'_> {
 /// indentation, `key: scalar`, `- scalar` sequences and one-line flow sequences of scalars
 /// (`[a, b]`, `[]` — the upstream stage configs use them). Anything else (flow mappings, nested flow
 /// collections, anchors, multi-line scalars) is an error rather than a guess.
+/// Element sizes of the custom-YAML parser's allocation-bearing containers, measured on the
+/// ACTUAL private types by `size_of` (no field mirror): one `Line` per parsed line, one
+/// `(String, Value)` per map entry, one `Value` per list item. Requested element layouts for
+/// source-derived host bounds; not malloc/process charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YamlParserLayouts {
+    pub line: usize,
+    pub map_entry: usize,
+    pub value: usize,
+}
+
+/// The [`YamlParserLayouts`] of this build's parser types.
+pub fn yaml_parser_layouts() -> YamlParserLayouts {
+    yaml::layouts()
+}
+
 mod yaml {
     use crate::{Error, Result};
+
+    pub(super) fn layouts() -> super::YamlParserLayouts {
+        super::YamlParserLayouts {
+            line: std::mem::size_of::<Line<'static>>(),
+            map_entry: std::mem::size_of::<(String, Value)>(),
+            value: std::mem::size_of::<Value>(),
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum Value {
@@ -2020,5 +2044,15 @@ flow:
         );
         let err = GenerationResources::from_spec(&spec, "iris_3b").unwrap_err();
         assert!(err.to_string().contains("config.yaml"), "{err}");
+    }
+
+    /// HOST: the parser layout accessor reports the ACTUAL private element sizes (each map entry
+    /// holds its String key, each Line its text slice), so callers never mirror private types.
+    #[test]
+    fn yaml_parser_layouts_report_the_actual_private_element_sizes() {
+        let layouts = super::yaml_parser_layouts();
+        assert!(layouts.value > 0);
+        assert!(layouts.map_entry >= std::mem::size_of::<String>() + layouts.value);
+        assert!(layouts.line >= std::mem::size_of::<&str>() + 2 * std::mem::size_of::<usize>());
     }
 }

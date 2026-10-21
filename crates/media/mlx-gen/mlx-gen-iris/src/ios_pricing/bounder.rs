@@ -64,9 +64,10 @@ pub fn ios_bounder_with_replay(
         ));
     }
     match request.provider {
-        crate::model::MODEL_ID | crate::depth::DEPTH_MODEL_ID => {}
-        // Host planes invisible to MLX's active counter: no native certificate exists.
-        crate::restoration::MODEL_ID => return Ok(Vec::new()),
+        // Restoration's Rust host planes are outside MLX's active counter: its NATIVE certificate
+        // covers only its MLX allocations; its host payload upper is a separate domain
+        // (`host_payload_growth_upper`), carried beside these bounds, never folded into them.
+        crate::model::MODEL_ID | crate::depth::DEPTH_MODEL_ID | crate::restoration::MODEL_ID => {}
         other => {
             return Err(Error::Unsupported(format!(
                 "{other}: not an Iris native-certified family"
@@ -217,6 +218,13 @@ enum AnchorIdentity {
         model_width: u64,
         model_height: u64,
     },
+    Restoration {
+        source_width: u64,
+        source_height: u64,
+        output_width: u64,
+        output_height: u64,
+        tile: u64,
+    },
 }
 
 impl AnchorIdentity {
@@ -247,6 +255,38 @@ impl AnchorIdentity {
                 serial_count: u64::from(work.envelope.count),
                 prompt_rows: work.envelope.rows,
                 steps: work.envelope.plan.len() as u64,
+            })
+        } else if req.provider == crate::restoration::MODEL_ID {
+            let token = match (req.transform, replay) {
+                (Some(_), None) => None,
+                (None, Some(IrisReplay::Restoration(token))) => Some(token),
+                (Some(_), Some(_)) => {
+                    return Err(Error::Unsupported(
+                        "Iris restoration anchor carries both an actual request and a replay"
+                            .into(),
+                    ))
+                }
+                _ => {
+                    return Err(Error::Unsupported(
+                        "Iris restoration anchor needs its actual transform request or \
+                         restoration replay token"
+                            .into(),
+                    ))
+                }
+            };
+            let resources = mlx_gen::gen_core::iris::restoration::RestorationResources::from_spec(
+                req.spec,
+                req.provider,
+            )
+            .map_err(Error::from)?;
+            // The SAME plan the anchor's pricing priced (actual request or token alone).
+            let plan = super::restoration_priced_plan(req, &resources, token)?;
+            Ok(Self::Restoration {
+                source_width: u64::from(plan.source.width),
+                source_height: u64::from(plan.source.height),
+                output_width: u64::from(plan.output.width),
+                output_height: u64::from(plan.output.height),
+                tile: u64::from(plan.tile),
             })
         } else {
             let plan =
@@ -297,6 +337,20 @@ impl AnchorIdentity {
                     && is("model_width", model_width)
                     && is("model_height", model_height)
             }
+            Self::Restoration {
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+                tile,
+            } => {
+                kind == "restoration_request"
+                    && is("source_width", source_width)
+                    && is("source_height", source_height)
+                    && is("output_width", output_width)
+                    && is("output_height", output_height)
+                    && is("tile", tile)
+            }
         }
     }
 }
@@ -312,6 +366,7 @@ fn witnessed_page(
     let provider = match identity {
         AnchorIdentity::Generation { .. } => crate::model::MODEL_ID,
         AnchorIdentity::Depth { .. } => crate::depth::DEPTH_MODEL_ID,
+        AnchorIdentity::Restoration { .. } => crate::restoration::MODEL_ID,
     };
     let marks = || {
         check

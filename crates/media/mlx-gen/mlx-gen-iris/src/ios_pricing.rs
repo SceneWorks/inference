@@ -52,6 +52,27 @@ mod bounder;
 mod native_ledger;
 pub use bounder::{ios_bounder, ios_bounder_with_replay, IrisReplay};
 
+/// The request's finite source/request-derived HOST (Rust heap) growth upper outside the MLX
+/// counter, including the caller-stated callback term. Refuses with the exact named gap while
+/// any term is unproved (today: generation's tokenizer/regex upper; depth/restoration's
+/// exact-version metadata/Apple Mutex layout); never a partial sum.
+pub fn host_growth_upper(
+    req: &IosPricingRequest<'_>,
+    callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+) -> Result<u64> {
+    native_ledger::host_growth_upper(req, callback)
+}
+
+/// The OS thread-stack bytes the request's code explicitly requests (restoration's colour-fix
+/// workers), a separate physical quantity never included in heap or native totals.
+pub fn os_stack_request_bytes(req: &IosPricingRequest<'_>) -> Result<u64> {
+    if req.provider == crate::restoration::MODEL_ID {
+        native_ledger::restoration_worker_os_stack_request_bytes(req)
+    } else {
+        Ok(0)
+    }
+}
+
 /// Canonical Iris sampling recipe. Normalization is exclusively the production
 /// `GenerationParams::resolve` + `plan`; this is not the generic diffusion solver factory.
 #[derive(Clone, Debug)]

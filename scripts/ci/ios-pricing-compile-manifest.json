@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T13:39:59.638575+00:00",
-  "rust_proof_closure_sha256": "1d97bdb31fc9ef8f35d00d30289bf2efbda918a64110ada196dc603153676ab2",
+  "UTC": "2026-10-21T14:15:45.884748+00:00",
+  "rust_proof_closure_sha256": "11e7cc92f05b378555f9d423f69b66e423717a176bcc89ed3b806cb17fbc4fc0",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -36,7 +36,7 @@
     },
     {
       "path": "crates/bundles/runtime-ios/src/lib.rs",
-      "sha256": "95b0dd691c8eacfd5cd9ee9e514938d6fef4f7438a2ddb099de570280c20f583"
+      "sha256": "3142d4c7f6e7c43b5aa95981983f1941c6a0f9a277837d47c6b245b1aeaeec92"
     },
     {
       "path": "crates/contracts/gen-core/Cargo.toml",
@@ -52,7 +52,7 @@
     },
     {
       "path": "crates/contracts/gen-core/src/iris.rs",
-      "sha256": "eb33ebb2dcdbbfc27f03a3a2fa94ebda1363e02d7c348dc559d1f30c1e1ffb0f"
+      "sha256": "2582417b8a9a23eadce31ac1169c148cc7a6130b208fba2ded6674ef11ca8bae"
     },
     {
       "path": "crates/contracts/gen-core/src/iris/depth.rs",
@@ -60,7 +60,7 @@
     },
     {
       "path": "crates/contracts/gen-core/src/iris/restoration.rs",
-      "sha256": "47a9f65407e492ad4251fb7813840ecdcf2dd59319deb1dad62596e8ca0fea06"
+      "sha256": "9da6823459c991f8c103e476a24d175bf69c1dcbf7dd65e629c2d992c36572bb"
     },
     {
       "path": "crates/contracts/gen-core/src/lib.rs",
@@ -89,6 +89,10 @@
     {
       "path": "crates/contracts/gen-core/src/sampling/unified.rs",
       "sha256": "8e3f6d2b85f313d0081954b6d7b0d5c747072ad059127df3afa3eb39bb643acb"
+    },
+    {
+      "path": "crates/contracts/gen-core/src/source_inventory.rs",
+      "sha256": "d00dc62347fa73d640d95c368a4991818f72a66e5eb751763ddac61707881401"
     },
     {
       "path": "crates/contracts/gen-core/src/weightsmeta.rs",
@@ -148,7 +152,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
-      "sha256": "ee16560c8f4bf19384f8fc3651aae0bc7167afabc6be302131eb604a9c7e27d7"
+      "sha256": "ee44fc48fa162165e3f12399a8d2fa5cd53d9fc6ecd0ec30be6ad65b07ec44ef"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
@@ -164,11 +168,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/evidence.rs",
-      "sha256": "cdea16644dbbee959ec31c480ed3b6ac1f1ca7975c48aa3eb4164e6585bc4aac"
+      "sha256": "b2bc901337b2975755e5131ab5cfeaa9311f8bc4ce007e2d8018a7d040ed3cbe"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "c4cc178eb161e35b64e754e3d5b8eba90d8c80d50073df2995b170dfde5eabdd"
+      "sha256": "59a64bbd278f7e2a79a7611d9951130ccc2ac840c428ffdcf01b760dac2c48f3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -180,11 +184,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/lib.rs",
-      "sha256": "250441a8f407f5a7f77184d48be6383536f04f2c1ef011201e9517a76fc6428d"
+      "sha256": "5bc64879e59b23ecdfdecac1aeef253ae0deeeb1b7cc2880a745a3b82617e728"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
-      "sha256": "6262657feb6f5aefded5ca5f72af30a8648293b93c393a00a12e537fc01c81ed"
+      "sha256": "5379c3b76803fc0710918014b6213ce3340b3ac609788859225e951f8349b572"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
@@ -220,7 +224,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
-      "sha256": "6d90828c918773d02a49460f5fb8bf8477aa90bec63151692a0b0caebc1bcb38"
+      "sha256": "935b6c65c618a9b85fd4660db940e61c3f3b9ea0048b3c6c32a0c44eb9edba09"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
@@ -232,15 +236,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "384f36605ab08445b7c6e0b3943d74e940ea8533c7244226114807497896de5b"
+      "sha256": "24450bc92c8fe2a2c3e8bab2f0ad00a3decc7fe6c586fd014a5779867e53d1c9"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
-      "sha256": "f714ec2325caa5041944bb4dd00af7af804693fbb06d9bde1caa12f766e7b6c8"
+      "sha256": "f477f184805e9f5022229469604893a176032f11b0de6fd337acef5ad5097af3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/native_ledger.rs",
-      "sha256": "6bdf966550bef74189b3abdba8db8c262f3c192322b50b0eaa5fbd47031bcee2"
+      "sha256": "0c95f6e1873fc311adacf35415a9e32b5161d4b44bad7507167c858cc0725345"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
@@ -816,7 +820,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
-      "sha256": "d14017ee2bf487b2049d27c992af264f165e8903d8e4c53121fdaaab95875f40"
+      "sha256": "61776f8f1bcce19c49b8de1ab984555549d44be560e832577e8ee68ec1397be0"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
@@ -880,11 +884,11 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_admission_tests.rs",
-      "sha256": "85116249bcd8936d94c658304612dafb219d7da16495841f740e15c0b7aede9e"
+      "sha256": "2226c45775b3a50021d76d98b977203710ed7bdf4d7583abe9d2e972545c0cb7"
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "bfbee6b954928bc127217420437cc9af9b62a95b8978e05bd72b36c9843658f7"
+      "sha256": "6d183f834c740c2c3c5e6cfbd861e6efea28c16db9086c22d67230b6e46feb6f"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -892,11 +896,11 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_support.rs",
-      "sha256": "4681623d5521e3e18fc3f74aa7f0a8e0c6e16713cb1a10e4415ee6636258efa1"
+      "sha256": "853a97831581cf4bce143883f26c1536614b95b0d33accf8d80859794a00dbb5"
     },
     {
       "path": "ios-host/smoke/src/lib.rs",
-      "sha256": "498874bbebe0482600b7b16f097d046f34be223569956a0a7c3304a23e0585b8"
+      "sha256": "345b5521bae1f4dd52ca2af13c710aee986555e49afbb57acec1ad19cb3ff72f"
     },
     {
       "path": "rust-toolchain.toml",
@@ -1474,11 +1478,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "ee2a036f1104159aee1b6d3616598679c2265cfed59fa5e6040392913ec5a80d",
-    "classification_sha256": "40ce798bedab72ad0b713b3e022b61c56a1524a6484471e14c05b24264e7ce68",
-    "selected_Rust_FQNs": 150,
-    "HOST_logical": 128,
-    "HOST_expected_PASS_rows": 129,
+    "inventory_sha256": "0bdd1a1a50a63490c53e0ef592e94c53216b7138a352e89c2c9cb8ad0999e5d1",
+    "classification_sha256": "9160a76806ac06650ea64a37c384ff94deeedba11047063094261b38a9bdc7f4",
+    "selected_Rust_FQNs": 174,
+    "HOST_logical": 152,
+    "HOST_expected_PASS_rows": 153,
     "native_logical": 22,
     "native_expected_PASS_rows": 44,
     "Python_exact_tests": 1,

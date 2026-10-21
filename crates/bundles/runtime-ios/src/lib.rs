@@ -66,7 +66,7 @@ pub mod media {
     #[cfg(feature = "device-capture")]
     use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::control_required;
-    pub use mlx_gen_ios_catalog::{admit, admit_with_baseline};
+    pub use mlx_gen_ios_catalog::{admit, admit_with_baseline, admit_with_boundary, PremisePolicy};
     pub use mlx_gen_ios_catalog::{
         anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
@@ -82,6 +82,7 @@ pub mod media {
         IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
         SANA_DEVICE_FOOTPRINTS,
     };
+    pub use mlx_gen_ios_catalog::{IosCallbackHost, IosExecutionFacts, IosExecutionStream};
     pub use mlx_gen_ios_catalog::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
@@ -168,11 +169,40 @@ pub mod media {
         move |bytes| incremental_capacity(bytes, super::process_memory(), at_admission)
     }
 
+    /// The facade's authoritative statement of the execution it will run, made at the admission
+    /// boundary by the execution owner (never defaulted inside a pure pricing function): the MLX
+    /// default device's stream family, whether the iOS quantum scope is active, the live host
+    /// allowance as the exact-analysis budget (0 when no live reading exists, so a
+    /// schedule-dependent derivation refuses rather than guesses), and the CALLER's statement of
+    /// its own callbacks' host allocations (`None`: unstated; a provider whose host certificate
+    /// needs it then refuses, naming the term).
+    pub fn execution_facts(
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<IosExecutionFacts> {
+        let device = mlx_rs::Device::try_default().map_err(|e| {
+            AdmissionError::Failed(Error::Unsupported(format!(
+                "iOS admission cannot state the execution stream (no MLX default device): {e}"
+            )))
+        })?;
+        Ok(IosExecutionFacts {
+            stream: if device == mlx_rs::Device::cpu() {
+                IosExecutionStream::Cpu
+            } else {
+                IosExecutionStream::Metal
+            },
+            ios_quantum_scope: ios_quantum::enabled(),
+            analysis_budget_bytes: super::process_memory().available.unwrap_or(0),
+            callback_host: callbacks,
+        })
+    }
+
     /// Admit the caller's highest-preference candidate for one of `providers` (the facade's own
-    /// surface; a candidate for another provider is a typed `mode` refusal).
+    /// surface; a candidate for another provider is a typed `mode` refusal). `callbacks` is the
+    /// caller's statement of the host allocations its own progress callbacks make.
     fn admitted(
         providers: &[&str],
         candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
     ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
         require_limits_bound()?;
         if let Some(c) = candidates
@@ -235,12 +265,17 @@ pub mod media {
                 e,
             )
         })?;
-        let admission = admit_with_baseline(
+        // The full SDK boundary: baseline AND stated execution facts. The default policy approves
+        // no premise, so native certificates still refuse process-domain derivation by default.
+        let facts = execution_facts(callbacks)?;
+        let admission = admit_with_boundary(
             &registry,
             candidates,
             &super::device_machine(),
             budget,
             &baseline,
+            &facts,
+            &PremisePolicy::default(),
         )?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
         incremental_capacity(admission.required_bytes(), now, now)
@@ -251,8 +286,9 @@ pub mod media {
     fn generator(
         providers: &[&str],
         candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
     ) -> AdmissionResult<(usize, BoundGenerator)> {
-        let (registry, admission, at) = admitted(providers, candidates)?;
+        let (registry, admission, at) = admitted(providers, candidates, callbacks)?;
         let index = admission.index();
         Ok((
             index,
@@ -264,13 +300,33 @@ pub mod media {
     /// admitted candidate's index and a wrapper bound to its exact request (geometry, decode tile,
     /// mode, prompt, execution), which rechecks live capacity before every call.
     pub fn load_sana(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&["sana_1600m", "sana_sprint_1600m"], candidates)
+        generator(&["sana_1600m", "sana_sprint_1600m"], candidates, None)
+    }
+
+    /// [`load_sana`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_sana_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(
+            &["sana_1600m", "sana_sprint_1600m"],
+            candidates,
+            Some(callbacks),
+        )
     }
 
     /// The SDXL family (every checkpoint route): text, image-to-image, edit/inpaint, control and
     /// IP-adapter.
     pub fn load_sdxl(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&[sdxl::SDXL_ID], candidates)
+        generator(&[sdxl::SDXL_ID], candidates, None)
+    }
+
+    /// [`load_sdxl`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_sdxl_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[sdxl::SDXL_ID], candidates, Some(callbacks))
     }
 
     /// Anima Turbo. The host-planned selection ([`anima_turbo_ios_selection`]) is what to offer;
@@ -278,7 +334,15 @@ pub mod media {
     pub fn load_anima_turbo(
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&[ANIMA_TURBO_ID], candidates)
+        generator(&[ANIMA_TURBO_ID], candidates, None)
+    }
+
+    /// [`load_anima_turbo`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_anima_turbo_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[ANIMA_TURBO_ID], candidates, Some(callbacks))
     }
 
     /// Z-Image Turbo: `z_image_turbo` (text, image-to-image, LoRA/LoKr) and its Fun-Controlnet-Union
@@ -290,19 +354,55 @@ pub mod media {
         generator(
             &[zimage::Z_IMAGE_TURBO_ID, zimage::Z_IMAGE_TURBO_CONTROL_ID],
             candidates,
+            None,
+        )
+    }
+
+    /// [`load_z_image_turbo`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_z_image_turbo_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(
+            &[zimage::Z_IMAGE_TURBO_ID, zimage::Z_IMAGE_TURBO_CONTROL_ID],
+            candidates,
+            Some(callbacks),
         )
     }
 
     /// Iris 3B generation, including prompt batches.
     pub fn load_iris(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
-        generator(&["iris_3b"], candidates)
+        generator(&["iris_3b"], candidates, None)
+    }
+
+    /// [`load_iris`] with the caller's statement of its progress callbacks' host allocations.
+    pub fn load_iris_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&["iris_3b"], candidates, Some(callbacks))
     }
 
     /// The Iris 3B restoration transform.
     pub fn load_iris_restore(
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundTransform)> {
-        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates)?;
+        restorer(candidates, None)
+    }
+
+    /// [`load_iris_restore`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_iris_restore_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundTransform)> {
+        restorer(candidates, Some(callbacks))
+    }
+
+    fn restorer(
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(usize, BoundTransform)> {
+        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates, callbacks)?;
         let index = admission.index();
         Ok((
             index,
@@ -312,7 +412,22 @@ pub mod media {
 
     /// The Iris 3B depth task.
     pub fn load_iris_depth(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundDepth)> {
-        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates)?;
+        depth(candidates, None)
+    }
+
+    /// [`load_iris_depth`] with the caller's statement of its callbacks' host allocations.
+    pub fn load_iris_depth_with(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+    ) -> AdmissionResult<(usize, BoundDepth)> {
+        depth(candidates, Some(callbacks))
+    }
+
+    fn depth(
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(usize, BoundDepth)> {
+        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates, callbacks)?;
         let index = admission.index();
         Ok((index, admission.load_depth(capacity_from(at))?))
     }
@@ -1175,6 +1290,35 @@ mod tests {
 
     /// The capture permit is not an admission and is unavailable off-device: without bounded
     /// quanta it is a typed failure before any load.
+    /// HOST: the facade states its execution facts at the admission boundary: the caller's
+    /// callback statement is carried exactly (unstated stays `None`, never defaulted), the
+    /// quantum scope is the live `ios_quantum` state, and the stream is the MLX default device's.
+    #[cfg(feature = "media")]
+    #[test]
+    fn the_facade_states_execution_facts_with_the_callers_callback_term() {
+        use super::media::{execution_facts, ios_quantum, IosCallbackHost, IosExecutionStream};
+        let stated = IosCallbackHost::Bounded {
+            fixed_bytes: 1,
+            per_progress_event_bytes: 2,
+            per_preview_event_bytes: 3,
+            per_quantum_mark_bytes: 4,
+            per_quantum_label_byte_bytes: 5,
+        };
+        let facts = execution_facts(Some(stated)).unwrap();
+        assert_eq!(facts.callback_host, Some(stated));
+        assert_eq!(facts.ios_quantum_scope, ios_quantum::enabled());
+        let cpu = mlx_rs::Device::try_default().unwrap() == mlx_rs::Device::cpu();
+        assert_eq!(
+            facts.stream,
+            if cpu {
+                IosExecutionStream::Cpu
+            } else {
+                IosExecutionStream::Metal
+            }
+        );
+        assert_eq!(execution_facts(None).unwrap().callback_host, None);
+    }
+
     #[cfg(all(feature = "device-capture", not(target_os = "ios")))]
     #[test]
     fn capture_permit_requires_bounded_quanta() {

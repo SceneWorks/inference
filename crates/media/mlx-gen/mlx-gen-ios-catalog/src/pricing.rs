@@ -6,8 +6,7 @@
 //! scaling), but nothing of it would be derivable: every other configuration refuses `no_evidence`.
 
 use mlx_gen::ios_pricing::{
-    IosCertifiedBounder, IosExecutionFacts, IosExecutionStream, IosPhase, IosPricer,
-    IosQuantumPhase,
+    IosCertifiedBounder, IosExecutionFacts, IosPhase, IosPricer, IosQuantumPhase,
 };
 
 type Pricing = (IosPricer, IosQuantumPhase);
@@ -33,10 +32,12 @@ pub(crate) fn with_test_pricing<T>(pricing: Option<Pricing>, body: impl FnOnce()
     body()
 }
 
-/// SDXL's public source bounder takes no execution facts. Its native-backing authority
-/// (sc26270 fused-native-backing v2 and the ancestral lifetime proof) was audited for the iOS
-/// CPU-stream build inside the quantum scope only, so every other stated execution is refused
-/// here exactly; a Metal-stream law, when audited, must be added as its own authority.
+/// SDXL's default (proven-only) source bounder: the full-window native ledger. Each request
+/// window's delta is the request's own cumulative native upper over the LARGER of its CPU- and
+/// Metal-stream source graphs, so both stream families are covered, but only the
+/// iOS-quantum-scope graph it prices. A payload-free catalog anchor resolves from its recorded
+/// recipe token, typed roles and RECORDED `SamplingSourceFacts` (the same facts its token-replay
+/// pricing consumed). No premise: certificates are fully source-proved in the native domain.
 fn sdxl_certified_bounder(
     anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
     anchor_pricing: &mlx_gen::ios_pricing::IosPricing,
@@ -44,16 +45,82 @@ fn sdxl_certified_bounder(
     request_pricing: &mlx_gen::ios_pricing::IosPricing,
     execution: &IosExecutionFacts,
 ) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
-    certified_cpu_scope(crate::sdxl::SDXL_ID, execution)?;
-    // The canonical SDXL bounder (212a6d6) is proven-only: no premise. Its future premise mode
-    // MUST be mapped through `sdxl_premised` below, never returned as bare bounds.
-    mlx_gen_sdxl::ios_pricing::ios_bounder(
+    certified_scope(crate::sdxl::SDXL_ID, execution)?;
+    let replay = match anchor_request.replay {
+        None => None,
+        Some(replay) => Some(mlx_gen_sdxl::ios_pricing::SdxlReplay {
+            token: replay.token,
+            true_reference_count: replay.true_reference_count as usize,
+            mask_count: replay.mask_count as usize,
+            control_count: replay.control_count as usize,
+            source: match replay.source {
+                None => None,
+                Some(source) => Some(
+                    source
+                        .0
+                        .downcast_ref::<mlx_gen_sdxl::sampling::SamplingSourceFacts>()
+                        .ok_or_else(|| {
+                            mlx_gen::Error::Unsupported(
+                                "SDXL anchor replay source facts are not SamplingSourceFacts"
+                                    .into(),
+                            )
+                        })?,
+                ),
+            },
+        }),
+    };
+    mlx_gen_sdxl::ios_pricing::ios_bounder_with_replay(
         anchor_request.pricing,
+        replay,
         anchor_pricing,
         request.pricing,
         request_pricing,
     )
     .map(mlx_gen::ios_pricing::IosCertifiedBounds::proven)
+}
+
+/// The SDXL Metal-capture-retirement premise id (named platform premise, unapproved by default).
+pub(crate) fn sdxl_retirement_premise_id() -> &'static str {
+    mlx_gen_sdxl::ios_pricing::SdxlRetirementPremise::MetalSynchronizeRetirement.id()
+}
+
+/// SDXL's PREMISE-MODE bounder, registered and selected ONLY when admission policy approves the
+/// exact [`sdxl_retirement_premise_id`]. Its source result maps into premise-carrying certified
+/// bounds without reinterpretation, so the premise is also re-checked by the policy and recorded
+/// with the admission. It needs an actual-request anchor (the premise arm resolves no replay).
+fn sdxl_premise_bounder(
+    anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &mlx_gen::ios_pricing::IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &mlx_gen::ios_pricing::IosPricing,
+    execution: &IosExecutionFacts,
+) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
+    certified_scope(crate::sdxl::SDXL_ID, execution)?;
+    mlx_gen_sdxl::ios_pricing::ios_bounder_with_premise(
+        mlx_gen_sdxl::ios_pricing::SdxlRetirementPremise::MetalSynchronizeRetirement,
+        anchor_request.pricing,
+        anchor_pricing,
+        request.pricing,
+        request_pricing,
+    )
+    .map(sdxl_premised)
+}
+
+/// Map a premise-dependent SDXL result into certified bounds carrying exactly its premise.
+fn sdxl_premised(
+    premised: mlx_gen_sdxl::ios_pricing::SdxlPremisedBounds,
+) -> mlx_gen::ios_pricing::IosCertifiedBounds {
+    mlx_gen::ios_pricing::IosCertifiedBounds {
+        bounds: premised.bounds,
+        premises: vec![mlx_gen::ios_pricing::IosCertificatePremise {
+            id: premised.premise.into(),
+            statement: "SDXL Metal command-buffer captures (completed-handler-held input, sibling \
+                        and encoder-temporary Data) are retired once mlx_synchronize \
+                        (waitUntilCompleted) returns; a named platform premise, NOT source-proved"
+                .into(),
+        }],
+        host: mlx_gen::ios_pricing::IosHostGrowth::Undeclared,
+    }
 }
 
 /// Iris's canonical source bounder (212a6d6) takes no execution facts. Its certificates are each
@@ -85,13 +152,19 @@ fn iris_certified_bounder(
                     anchor_request.pricing.provider
                 )));
             }
+            if replay.source.is_some() {
+                return Err(mlx_gen::Error::Unsupported(format!(
+                    "{}: Iris anchor replay carries foreign provider source facts",
+                    anchor_request.pricing.provider
+                )));
+            }
             Some(crate::sampling::IrisAnchorReplay::parse(
                 anchor_request.pricing.provider,
                 replay.token,
             )?)
         }
     };
-    mlx_gen_iris::ios_pricing::ios_bounder_with_replay(
+    let bounds = mlx_gen_iris::ios_pricing::ios_bounder_with_replay(
         anchor_request.pricing,
         replay
             .as_ref()
@@ -99,24 +172,41 @@ fn iris_certified_bounder(
         anchor_pricing,
         request.pricing,
         request_pricing,
-    )
-    .map(mlx_gen::ios_pricing::IosCertifiedBounds::proven)
+    )?;
+    let host =
+        mlx_gen_iris::ios_pricing::host_growth_upper(request.pricing, execution.callback_host)
+            .and_then(|host_bytes| {
+                Ok((
+                    host_bytes,
+                    mlx_gen_iris::ios_pricing::os_stack_request_bytes(request.pricing)?,
+                ))
+            });
+    Ok(iris_host_claim(bounds, host))
 }
 
-/// The exact refusal shared by providers whose only audited lowering is the scoped CPU stream.
-fn certified_cpu_scope(provider: &str, execution: &IosExecutionFacts) -> mlx_gen::Result<()> {
-    if execution.stream != IosExecutionStream::Cpu {
-        return Err(mlx_gen::Error::Unsupported(format!(
-            "{provider}: no audited native-allocation law for the {:?} stream; device certificates stay unclosed",
-            execution.stream
-        )));
+/// Every Iris task has request-scoped host allocations outside the MLX counter, so its claim is
+/// never Undeclared. A finite upper (host bytes, requested worker-stack bytes) is Declared AND
+/// carries the unapproved Rust toolchain requested-layout premise it rests on, so admission
+/// refuses it unless that exact premise is approved; an unproved term is the exact named gap.
+fn iris_host_claim(
+    bounds: Vec<mlx_gen::ios_pricing::IosWindowBound>,
+    host: mlx_gen::Result<(u64, u64)>,
+) -> mlx_gen::ios_pricing::IosCertifiedBounds {
+    match host {
+        Ok((host_bytes, stacks)) => {
+            let mut certified = mlx_gen::ios_pricing::IosCertifiedBounds::proven_with_host(
+                bounds, host_bytes, stacks,
+            );
+            certified
+                .premises
+                .push(mlx_gen::ios_pricing::rust_toolchain_layout_premise());
+            certified
+        }
+        Err(gap) => mlx_gen::ios_pricing::IosCertifiedBounds {
+            host: mlx_gen::ios_pricing::IosHostGrowth::Unproved(gap.to_string()),
+            ..mlx_gen::ios_pricing::IosCertifiedBounds::proven(bounds)
+        },
     }
-    if !execution.ios_quantum_scope {
-        return Err(mlx_gen::Error::Unsupported(format!(
-            "{provider}: certificates price the iOS-quantum-scope graph; an unscoped execution is not certified"
-        )));
-    }
-    Ok(())
 }
 
 /// Z-Image certifies BOTH MLX stream families (its CPU lowering and its source-derived Metal
@@ -136,14 +226,35 @@ pub type ExecutionGate = fn(&str, &IosExecutionFacts) -> mlx_gen::Result<()>;
 
 /// The registered source-owned transfer bounder of a provider, if it exposes one, with the gate of
 /// the executions its source authority covers. Providers without one (Sana, Anima) are admitted
-/// only at their anchors' own keys.
+/// only at their anchors' own keys. Never selects a premise-mode bounder.
 pub fn provider_bounder(provider: &str) -> Option<(IosCertifiedBounder, ExecutionGate)> {
+    provider_bounder_under(provider, |_| false).map(|selected| (selected.0, selected.1))
+}
+
+/// [`provider_bounder`] under an admission policy: a provider's premise-mode bounder is selected
+/// ONLY when `approves` holds for its exact premise id (returned as the third element);
+/// otherwise its proven bounder is returned and the third element is `None`.
+pub fn provider_bounder_under(
+    provider: &str,
+    approves: impl Fn(&str) -> bool,
+) -> Option<(IosCertifiedBounder, ExecutionGate, Option<&'static str>)> {
     #[cfg(test)]
     if let Some(bounder) = TEST_BOUNDER.with(std::cell::Cell::get) {
-        return bounder;
+        return bounder.map(|(bounder, gate)| (bounder, gate, None));
     }
+    if provider == crate::sdxl::SDXL_ID && approves(sdxl_retirement_premise_id()) {
+        return Some((
+            sdxl_premise_bounder,
+            certified_scope,
+            Some(sdxl_retirement_premise_id()),
+        ));
+    }
+    provider_proven_bounder(provider).map(|(bounder, gate)| (bounder, gate, None))
+}
+
+fn provider_proven_bounder(provider: &str) -> Option<(IosCertifiedBounder, ExecutionGate)> {
     match provider {
-        crate::sdxl::SDXL_ID => Some((sdxl_certified_bounder, certified_cpu_scope)),
+        crate::sdxl::SDXL_ID => Some((sdxl_certified_bounder, certified_scope)),
         "iris_3b" | crate::ios_admission::IRIS_RESTORE_ID | crate::ios_admission::IRIS_DEPTH_ID => {
             Some((iris_certified_bounder, certified_scope))
         }
@@ -1083,6 +1194,7 @@ mod host_integration {
             stream: IosExecutionStream::Metal,
             ios_quantum_scope: true,
             analysis_budget_bytes: 1 << 20,
+            callback_host: Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
         };
         let request = IosBoundRequest {
             pricing: &req,
@@ -1096,6 +1208,7 @@ mod host_integration {
                     true_reference_count: roles.0,
                     mask_count: roles.1,
                     control_count: roles.2,
+                    source: None,
                 }),
             };
             match super::iris_certified_bounder(
@@ -1112,5 +1225,175 @@ mod host_integration {
                 other => panic!("{roles:?}: {other:?}"),
             }
         }
+    }
+
+    /// HOST: recorded anchor source facts reach a provider bounder only under their own type:
+    /// SDXL refuses foreign-typed facts and Iris (which records none) refuses any, each exactly
+    /// and before any source is opened (no files exist under this spec).
+    #[test]
+    fn anchor_replay_source_facts_reach_only_their_own_provider_type() {
+        use mlx_gen::gen_core::{
+            GenerationMemory, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
+            MemoryStrategy,
+        };
+        use mlx_gen::ios_pricing::{
+            IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
+            IosReplay, IosReplaySource,
+        };
+        use mlx_gen::LoadSpec;
+        let scratch = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(scratch.path().join("absent")));
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+        };
+        let execution = GenerationMemory::default();
+        let mode = MemoryMode::TextToImage;
+        let foreign: u32 = 7;
+        let facts = IosExecutionFacts {
+            stream: IosExecutionStream::Cpu,
+            ios_quantum_scope: true,
+            analysis_budget_bytes: 1 << 20,
+            callback_host: Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+        };
+        let cases: [(&str, mlx_gen::ios_pricing::IosCertifiedBounder, &str); 2] = [
+            (
+                crate::sdxl::SDXL_ID,
+                super::sdxl_certified_bounder,
+                "SDXL anchor replay source facts are not SamplingSourceFacts",
+            ),
+            (
+                "iris_3b",
+                super::iris_certified_bounder,
+                "iris_3b: Iris anchor replay carries foreign provider source facts",
+            ),
+        ];
+        for (provider, bounder, refusal) in cases {
+            let req = IosPricingRequest {
+                provider,
+                spec: &spec,
+                mode: &mode,
+                geometry: MemoryGeometry {
+                    width: 32,
+                    height: 16,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                selection: &selection,
+                execution: &execution,
+                generation: None,
+                transform: None,
+                depth: None,
+                token_window: 0,
+            };
+            let anchor = IosBoundRequest {
+                pricing: &req,
+                replay: Some(IosReplay {
+                    token: "unparsed",
+                    true_reference_count: 0,
+                    mask_count: 0,
+                    control_count: 0,
+                    source: Some(IosReplaySource(&foreign)),
+                }),
+            };
+            let request = IosBoundRequest {
+                pricing: &req,
+                replay: None,
+            };
+            match bounder(
+                &anchor,
+                &IosPricing::default(),
+                &request,
+                &IosPricing::default(),
+                &facts,
+            ) {
+                Err(mlx_gen::Error::Unsupported(reason)) => assert_eq!(reason, refusal),
+                other => panic!("{provider}: {other:?}"),
+            }
+        }
+    }
+
+    /// HOST: SDXL's premise-mode bounder is selected ONLY for the exact approved premise id
+    /// (never by default, never for a near-miss id, never for another provider), and its source
+    /// result maps into certified bounds carrying exactly that premise with no host claim.
+    #[test]
+    fn sdxl_premise_mode_is_selected_only_by_its_exact_approved_id() {
+        let id = super::sdxl_retirement_premise_id();
+        assert_eq!(
+            id,
+            mlx_gen_sdxl::ios_pricing::SdxlRetirementPremise::MetalSynchronizeRetirement.id()
+        );
+        let selected = |provider: &str, approves: &dyn Fn(&str) -> bool| {
+            super::provider_bounder_under(provider, approves).map(|(_, _, premise)| premise)
+        };
+        assert_eq!(selected(crate::sdxl::SDXL_ID, &|_| false), Some(None));
+        assert_eq!(
+            selected(crate::sdxl::SDXL_ID, &|candidate| candidate == id),
+            Some(Some(id))
+        );
+        let near_miss = format!("{id}-v2");
+        assert_eq!(
+            selected(crate::sdxl::SDXL_ID, &|candidate| candidate == near_miss),
+            Some(None)
+        );
+        let proven_only = mlx_gen_sdxl::ios_pricing::SdxlRetirementPremise::ProvenOnly.id();
+        assert_eq!(
+            selected(crate::sdxl::SDXL_ID, &|candidate| candidate == proven_only),
+            Some(None)
+        );
+        assert_eq!(selected("iris_3b", &|_| true), Some(None));
+        assert!(super::provider_bounder(crate::sdxl::SDXL_ID).is_some());
+        let mapped = super::sdxl_premised(mlx_gen_sdxl::ios_pricing::SdxlPremisedBounds {
+            premise: id,
+            bounds: Vec::new(),
+        });
+        assert_eq!(mapped.premises.len(), 1);
+        assert_eq!(mapped.premises[0].id, id);
+        assert_eq!(mapped.host, mlx_gen::ios_pricing::IosHostGrowth::Undeclared);
+    }
+
+    /// HOST: an Iris host claim is never treated as source-proven: a finite upper is Declared
+    /// WITH the unapproved Rust toolchain requested-layout premise (so the default policy refuses
+    /// it), and an unproved term stays the exact named gap with no premise added.
+    #[test]
+    fn iris_host_claims_carry_the_toolchain_premise_or_stay_unproved() {
+        use mlx_gen::ios_pricing::{
+            IosAnchorCandidate, IosHostGrowth, IosHostGrowthBound, IosMemoryCoordinate,
+            IosMemoryDomain, IosWindowBound, RUST_TOOLCHAIN_LAYOUT_PREMISE_ID,
+        };
+        let bounds = vec![IosWindowBound::Transfer {
+            domain: IosMemoryDomain::NativeAllocatorGrowth,
+            coordinate: IosMemoryCoordinate::BeforeModelLoad,
+            request_class: "r".into(),
+            anchor_candidates: vec![IosAnchorCandidate {
+                anchor_class: "a".into(),
+                delta_growth_upper: 1,
+                physical_anchor_lower_bound: None,
+                witnesses: Vec::new(),
+            }],
+        }];
+        let declared = super::iris_host_claim(bounds.clone(), Ok((10, 20)));
+        assert_eq!(
+            declared.host,
+            IosHostGrowth::Declared(vec![IosHostGrowthBound {
+                request_class: "r".into(),
+                growth_upper: 10,
+                os_stack_request_bytes: 20,
+            }])
+        );
+        assert_eq!(declared.premises.len(), 1);
+        assert_eq!(declared.premises[0].id, RUST_TOOLCHAIN_LAYOUT_PREMISE_ID);
+        let unproved =
+            super::iris_host_claim(bounds, Err(mlx_gen::Error::Unsupported("named gap".into())));
+        assert!(unproved.premises.is_empty());
+        assert!(
+            matches!(unproved.host, IosHostGrowth::Unproved(ref reason) if reason.contains("named gap"))
+        );
     }
 }

@@ -290,6 +290,39 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
 /// It samples rather than reads at the end because the failure it exists to explain kills the
 /// process mid-phase; anything computed after the work is exactly the part that never runs.
 #[cfg(any(feature = "media", feature = "zimage"))]
+/// The source-derived host upper of THIS lane's progress callback (`on_progress` below): one
+/// formatted stage String per event, at most the longest `Progress` rendering (`Step` with two
+/// `u32::MAX` values; `Decoding`; `Loading(TextEncoder|Renderer)`), replacing the previous stage
+/// (no drop credit taken). Under the labelled toolchain assumption that a `format!` String grown
+/// to `n` bytes allocates at most `4·n + 8` cumulative bytes. No listener; no preview sink.
+#[cfg(feature = "media")]
+fn sampler_progress_callback_host() -> runtime_ios::media::IosCallbackHost {
+    let longest = [
+        format!("Step {}/{}", u32::MAX, u32::MAX).len(),
+        format!("{:?}", runtime_ios::gen_core::Progress::Decoding).len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::TextEncoder)
+        )
+        .len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::Renderer)
+        )
+        .len(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0) as u64;
+    runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes: 0,
+        per_progress_event_bytes: longest * 4 + 8,
+        per_preview_event_bytes: 0,
+        per_quantum_mark_bytes: 0,
+        per_quantum_label_byte_bytes: 0,
+    }
+}
+
 struct MemorySampler {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     min_available_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1408,9 +1441,12 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 )
             } else {
                 Box::new(
-                    runtime_ios::media::load_sana(std::slice::from_ref(&candidate))
-                        .map_err(|e| format!("{label}: load failed: {e}"))?
-                        .1,
+                    runtime_ios::media::load_sana_with(
+                        std::slice::from_ref(&candidate),
+                        sampler_progress_callback_host(),
+                    )
+                    .map_err(|e| format!("{label}: load failed: {e}"))?
+                    .1,
                 )
             };
             // Tiling asked for through the CONTRACT (the candidate wrote the provider's ladder

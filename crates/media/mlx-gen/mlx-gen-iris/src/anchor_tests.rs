@@ -160,6 +160,12 @@ fn observe_marks<T>(body: impl FnOnce() -> T) -> (T, IosAnchorObservation) {
             BTreeMap::new(),
         )));
     let sink = std::sync::Arc::clone(&recorded);
+    // Every Checked/Synchronized label must be one of this crate's source labels: the provider's
+    // caller-callback host term prices each delivered label by the longest of them.
+    let labels: std::collections::BTreeSet<&'static str> =
+        crate::ios_pricing::quantum_labels().into_iter().collect();
+    let foreign: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let foreign_sink = std::sync::Arc::clone(&foreign);
     struct RemoveListener;
     impl Drop for RemoveListener {
         fn drop(&mut self) {
@@ -188,12 +194,27 @@ fn observe_marks<T>(body: impl FnOnce() -> T) -> (T, IosAnchorObservation) {
                     });
                     latest.insert((provider.into(), kind.into()), index);
                 }
-                QuantumMark::Checked { label, .. } => observation.checks.push(IosObservedCheck {
-                    phase: ios_quantum_phase(label),
-                    label: label.into(),
-                    context: latest.values().copied().collect(),
-                }),
-                QuantumMark::Synchronized { .. } => {}
+                QuantumMark::Checked { label, .. } => {
+                    if !labels.contains(label) {
+                        foreign_sink
+                            .lock()
+                            .expect("foreign label lock")
+                            .push(label.into());
+                    }
+                    observation.checks.push(IosObservedCheck {
+                        phase: ios_quantum_phase(label),
+                        label: label.into(),
+                        context: latest.values().copied().collect(),
+                    })
+                }
+                QuantumMark::Synchronized { label } => {
+                    if !labels.contains(label) {
+                        foreign_sink
+                            .lock()
+                            .expect("foreign label lock")
+                            .push(label.into());
+                    }
+                }
             }
         }))),
         "an isolated anchor child must not replace another capture listener"
@@ -201,6 +222,11 @@ fn observe_marks<T>(body: impl FnOnce() -> T) -> (T, IosAnchorObservation) {
     let guard = RemoveListener;
     let value = body();
     drop(guard);
+    let foreign = foreign.lock().expect("foreign label lock").clone();
+    assert!(
+        foreign.is_empty(),
+        "quantum labels outside crate::ios_pricing::quantum_labels(): {foreign:?}"
+    );
     let observation = recorded
         .lock()
         .expect("actual mark collector lock")
@@ -1466,12 +1492,6 @@ fn measure_depth(
     (run, geometry)
 }
 
-/// The first restoration class `derive_certified` reaches uncovered: Load runs first and its
-/// classes are visited in order. Restoration has no native certificate, so this is its exact
-/// current refusal.
-const RESTORATION_REFUSAL_CLASS: &str =
-    "iris.restoration.backbone_load/Iris backbone load/operator0";
-
 fn downstream_body() {
     let root = tempfile::tempdir().unwrap();
     let mut checks = Vec::new();
@@ -1505,13 +1525,45 @@ fn downstream_body() {
             let (anchor_ctx, request_ctx) = (ctx(at, &first_request), ctx(second, &second_request));
             restore_host
                 .push(crate::ios_pricing::restoration_decode_host_bytes(&anchor_ctx).unwrap());
+            let (at_anchor, priced) = (
+                ios_pricing(&anchor_ctx).unwrap(),
+                ios_pricing(&request_ctx).unwrap(),
+            );
+            // Without the anchor run's actual marks there is no witness and no certificate.
+            assert!(
+                crate::ios_pricing::ios_bounder(&anchor_ctx, &at_anchor, &request_ctx, &priced)
+                    .is_err(),
+                "{tier} {rung}: an unwitnessed restoration anchor was certified"
+            );
+            // The catalog's payload-free restoration anchor: no TransformRequest, only its token.
+            let token =
+                crate::ios_pricing::canonical_restoration_token(&spec, &first_request).unwrap();
+            let free_ctx = IosPricingRequest {
+                transform: None,
+                ..anchor_ctx
+            };
+            assert_replay_anchor_certifies(
+                &format!("iris_3b_restore replay anchor {tier} {rung}"),
+                &anchor,
+                (&anchor_ctx, &at_anchor),
+                (
+                    &free_ctx,
+                    crate::ios_pricing::IrisReplay::Restoration(&token),
+                    &crate::ios_pricing::pricing_facts_with_restoration_token(&free_ctx, &token)
+                        .unwrap()
+                        .pricing,
+                ),
+                (&request_ctx, &priced),
+                "Iris restoration pricing requires the actual TransformRequest \
+                 source/scale/sizing/color-fix context",
+            );
             checks.push(check(
                 format!(
                     "iris_3b_restore {}x{}→{}x{} {tier} {rung}",
                     at.width, at.height, second.width, second.height
                 ),
-                (&anchor, &anchor_ctx, &ios_pricing(&anchor_ctx).unwrap()),
-                (&measured, &request_ctx, &ios_pricing(&request_ctx).unwrap()),
+                (&anchor, &anchor_ctx, &at_anchor),
+                (&measured, &request_ctx, &priced),
             ));
         }
     }
@@ -1583,21 +1635,31 @@ fn downstream_body() {
     }
     assert_eq!(checks.len(), 12, "2 routes × 3 tiers × 2 selections");
     let (restore, depth) = checks.split_at(6);
-    // Restoration's intended NEGATIVE: invisible Rust host planes have no native certificate, so
-    // the certified law refuses at its first uncovered class rather than pricing host payload.
+    // Restoration: its NATIVE certificate covers only its MLX allocations (this CPU stand-in's
+    // active counter, like the device's, excludes its Rust host planes, which are certified
+    // separately as host payload). Certified at the second size, above its own anchor, and
+    // measured ≤ derived whole run and per phase.
     for (c, host) in restore.iter().zip(&restore_host) {
         assert!(
             *host > 0,
             "{}: fixture must actually exercise Rust host planes",
             c.name
         );
-        assert_eq!(
-            c.derived,
-            Err(NotDerivable::Coverage(RESTORATION_REFUSAL_CLASS.into())),
-            "{}: host payload upper {host} gained transfer authority",
-            c.name
+        let derived = *c.derived.as_ref().unwrap_or_else(|e| {
+            panic!("{}: restoration second size is not certified: {e}", c.name)
+        });
+        assert!(
+            derived > c.anchor,
+            "{}: derived {derived} ≤ anchor {}",
+            c.name,
+            c.anchor
         );
     }
+    let under = failures(restore);
+    assert!(
+        under.is_empty(),
+        "restoration above its native derivation: {under:#?}"
+    );
     // Depth: certified at the second size, above its own anchor, and measured ≤ derived whole
     // run and per phase.
     for c in depth {
@@ -1616,14 +1678,13 @@ fn downstream_body() {
     assert!(under.is_empty(), "depth above its derivation: {under:#?}");
 }
 
-/// Restoration and depth, each its own family with one mode. Depth is certified from its own
-/// measured run at a second input size and stays within it, whole run and per phase. Restoration's
-/// host planes are invisible to MLX's active memory, so it has no native certificate: its exact
-/// `derive_certified` refusal is asserted.
+/// Restoration and depth, each its own family with one mode. Each is certified from its own
+/// measured run at a second input size and stays within it, whole run and per phase, in the
+/// native-allocator domain (restoration's host planes are a separately certified domain).
 #[test]
-fn depth_derives_a_second_size_and_restoration_is_host_unmeasurable() {
+fn depth_and_restoration_derive_a_second_size_from_native_certificates() {
     in_cpu_child(
-        "anchor_tests::depth_derives_a_second_size_and_restoration_is_host_unmeasurable",
+        "anchor_tests::depth_and_restoration_derive_a_second_size_from_native_certificates",
         downstream_body,
     );
 }

@@ -245,6 +245,32 @@ pub struct IosExecutionFacts {
     /// `ResolvedFlowControls::check_capture_schedule_bytes` before any schedule is built). A
     /// request whose schedule exceeds it is refused, never clamped.
     pub analysis_budget_bytes: u64,
+    /// The execution owner's statement of host allocations made by the callbacks IT installs
+    /// (`on_progress` closures, an `ios_quantum` listener). `None` is unstated: a provider whose
+    /// host certificate depends on it refuses, naming the missing term (never zero).
+    pub callback_host: Option<IosCallbackHost>,
+}
+
+/// Host allocations made by caller-owned callbacks, stated by the caller that installs them and
+/// derived from THAT caller's source. The provider multiplies the per-event terms by its own
+/// source-derived event counts; provider-side `Progress`/formatting work stays provider-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IosCallbackHost {
+    /// Every installed callback is source-demonstrably non-allocating (e.g. `|_| {}`), and no
+    /// quantum listener is installed.
+    NonAllocating,
+    /// Source-derived cumulative upper (no drop credit): bytes allocated once at installation,
+    /// plus per progress event, plus per preview-sink event, plus per quantum mark delivered to
+    /// a listener, plus per BYTE of each delivered Checked/Synchronized label (a listener that
+    /// copies the full label). The provider supplies each event count and its own source label
+    /// lengths; no label is capped or truncated to make this finite.
+    Bounded {
+        fixed_bytes: u64,
+        per_progress_event_bytes: u64,
+        per_preview_event_bytes: u64,
+        per_quantum_mark_bytes: u64,
+        per_quantum_label_byte_bytes: u64,
+    },
 }
 
 /// A NOT-source-proved premise a provider's bounds depend on (e.g. a retirement ordering asserted
@@ -262,20 +288,111 @@ pub struct IosCertificatePremise {
 pub struct IosCertifiedBounds {
     pub bounds: Vec<IosWindowBound>,
     pub premises: Vec<IosCertificatePremise>,
+    /// The provider's request-scoped HOST growth outside the MLX native counter, a SEPARATE
+    /// domain from `bounds` (never folded into a native delta here).
+    pub host: IosHostGrowth,
 }
 
 impl IosCertifiedBounds {
-    /// Fully source-proved bounds (no premise).
+    /// Fully source-proved bounds (no premise), with no host-growth claim.
     pub fn proven(bounds: Vec<IosWindowBound>) -> Self {
         Self {
             bounds,
             premises: Vec::new(),
+            host: IosHostGrowth::Undeclared,
+        }
+    }
+
+    /// Fully source-proved native bounds plus a source-derived request host-growth upper and the
+    /// request's explicitly REQUESTED OS thread-stack bytes (a separate physical quantity) for
+    /// EVERY distinct native request class (the same cumulative request uppers per class).
+    pub fn proven_with_host(
+        bounds: Vec<IosWindowBound>,
+        host_growth_upper: u64,
+        os_stack_request_bytes: u64,
+    ) -> Self {
+        let mut classes = std::collections::BTreeSet::new();
+        let host = bounds
+            .iter()
+            .filter_map(|bound| match bound {
+                IosWindowBound::Transfer {
+                    domain: IosMemoryDomain::NativeAllocatorGrowth,
+                    request_class,
+                    ..
+                } => Some(request_class.clone()),
+                _ => None,
+            })
+            .filter(|class| classes.insert(class.clone()))
+            .map(|request_class| IosHostGrowthBound {
+                request_class,
+                growth_upper: host_growth_upper,
+                os_stack_request_bytes,
+            })
+            .collect();
+        Self {
+            bounds,
+            premises: Vec::new(),
+            host: IosHostGrowth::Declared(host),
         }
     }
 }
 
+/// A provider's claim about request-scoped HOST (Rust heap) growth outside the MLX native
+/// allocator counter. Separate domain: it never alters native certificates or measured evidence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IosHostGrowth {
+    /// No host-growth claim. The native-to-process model's stated fixed overhead is the only
+    /// allowance for non-native growth (the original activity-26569 premise, unchanged).
+    #[default]
+    Undeclared,
+    /// A finite source/request-derived cumulative upper (bytes, no drop credit) on ALL the
+    /// request's host allocations outside the MLX counter, per native request class. Mapping requires exactly one entry for every
+    /// native transfer class and refuses missing, duplicate or foreign entries; it is consumed
+    /// only under the separately approved host-extended premise.
+    Declared(Vec<IosHostGrowthBound>),
+    /// The provider HAS request-scoped host allocations outside the MLX counter but no finite
+    /// bound for at least one of them yet (the named reason). Native-domain use is unaffected;
+    /// any mapping into the process domain refuses with this reason, never treating it as zero.
+    Unproved(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosHostGrowthBound {
+    pub request_class: String,
+    /// Rust heap: finite source/request-derived cumulative host allocation upper.
+    pub growth_upper: u64,
+    /// Separate PHYSICAL quantity: OS thread-stack bytes the request's code explicitly requests
+    /// (e.g. `Builder::stack_size`), never part of `growth_upper` or any native total.
+    pub os_stack_request_bytes: u64,
+}
+
 /// The stable id of the activity-26569 native-to-process premise.
 pub const NATIVE_TO_PROCESS_PREMISE_ID: &str = "activity-26569/target-device-native-to-process";
+
+/// The stable id of the HOST-EXTENDED native-to-process premise (PROPOSED, unapproved). It is a
+/// distinct premise: approving [`NATIVE_TO_PROCESS_PREMISE_ID`] never approves this one.
+pub const NATIVE_TO_PROCESS_HOST_PREMISE_ID: &str =
+    "activity-26569/target-device-native-to-process-with-host-v1";
+
+/// The stable id of the Rust TOOLCHAIN requested-layout premise (unapproved by default): host
+/// growth uppers that rest on toolchain container-growth or repr(Rust) layout rules rather than
+/// on source guarantees carry it, so a consumer can never use them silently.
+pub const RUST_TOOLCHAIN_LAYOUT_PREMISE_ID: &str = "rust-toolchain/requested-host-layout-v1";
+
+/// The toolchain requested-layout premise a host-growth upper rests on, for policy approval.
+pub fn rust_toolchain_layout_premise() -> IosCertificatePremise {
+    IosCertificatePremise {
+        id: RUST_TOOLCHAIN_LAYOUT_PREMISE_ID.into(),
+        statement: "on the authority-pinned Rust toolchain (1.96.0 / std ac68): (a) String::from \
+                    / to_string of a str allocate exactly its length; (b) a Vec grown by push or \
+                    collect to n elements requests at most (4n + 8) elements cumulatively; (c) an \
+                    insert-only BTreeMap allocates at most entries + 1 nodes, each no larger than \
+                    an internal node; (d) a repr(Rust) struct is no larger than its fields each \
+                    rounded to the maximum field alignment, and a repr(Rust) enum no larger than \
+                    one tag word plus its widest payload. NOT source-proved"
+            .into(),
+    }
+}
 
 /// Activity 26569's TARGET-DEVICE ENGINEERING MODEL, as an explicit premise and transform, stated
 /// in exactly the ANCHOR-RELATIVE form the transform applies: for the anchor and request of one
@@ -309,10 +426,99 @@ impl IosNativeToProcessModel {
         }
     }
 
+    /// The host-extended premise, for policy approval and recording beside [`Self::premise`].
+    pub fn host_premise(&self) -> IosCertificatePremise {
+        IosCertificatePremise {
+            id: NATIVE_TO_PROCESS_HOST_PREMISE_ID.into(),
+            statement: format!(
+                "for each transfer of one family: process_growth(request) - process_growth(anchor) \
+                 <= native_growth(request) - native_growth(anchor) + host_growth_upper(request) + \
+                 os_stack_request(request) + {} B per window, where os_stack_request is the \
+                 provider's explicitly requested worker thread-stack bytes (assumed to bound their \
+                 physical charge) and host_growth_upper is the provider's FINITE \
+                 source/request-derived cumulative upper on ALL request-scoped host allocations \
+                 outside the MLX counter (requested layouts, parse/tokenizer/schedule bookkeeping \
+                 and container growth, the latter under stated toolchain assumptions); the \
+                 anchor's own host growth is not subtracted, and only unmodelled physical, driver \
+                 and allocator residual remains inside the stated overhead (anchor-relative \
+                 engineering model: {})",
+                self.overhead_bytes, self.provenance
+            ),
+        }
+    }
+
     /// Map native-allocator TRANSFER certificates into the process domain. Process-domain bounds
     /// pass unchanged; any other domain, a raw native bound, or overflow refuses: a native raw
     /// total has no anchor-relative form this model is stated for.
     pub fn to_process(&self, bounds: &[IosWindowBound]) -> crate::Result<Vec<IosWindowBound>> {
+        self.map_native(bounds, |_| Ok(0))
+    }
+
+    /// [`Self::to_process`] with a DECLARED source-derived host term: each native transfer's
+    /// delta gains the stated overhead PLUS its class's host upper (added, never subtracted, and
+    /// the native delta is retained). Every native transfer class needs exactly one host entry;
+    /// a missing, duplicate or foreign entry refuses (host evidence is never silently zero).
+    /// An undeclared host claim is the original premise exactly.
+    pub fn to_process_with_host(
+        &self,
+        bounds: &[IosWindowBound],
+        host: &IosHostGrowth,
+    ) -> crate::Result<Vec<IosWindowBound>> {
+        let entries = match host {
+            IosHostGrowth::Undeclared => return self.to_process(bounds),
+            IosHostGrowth::Unproved(reason) => {
+                return Err(crate::Error::Unsupported(format!(
+                    "host growth unproved: {reason}"
+                )))
+            }
+            IosHostGrowth::Declared(entries) => entries,
+        };
+        let refuse = |why: String| crate::Error::Unsupported(format!("host growth: {why}"));
+        let mut by_class = std::collections::BTreeMap::new();
+        for entry in entries {
+            let bytes = entry
+                .growth_upper
+                .checked_add(entry.os_stack_request_bytes)
+                .ok_or_else(|| refuse("host term overflows".into()))?;
+            if by_class
+                .insert(entry.request_class.as_str(), bytes)
+                .is_some()
+            {
+                return Err(refuse(format!(
+                    "duplicate entry for {}",
+                    entry.request_class
+                )));
+            }
+        }
+        let native: std::collections::BTreeSet<&str> = bounds
+            .iter()
+            .filter_map(|bound| match bound {
+                IosWindowBound::Transfer {
+                    domain: IosMemoryDomain::NativeAllocatorGrowth,
+                    request_class,
+                    ..
+                } => Some(request_class.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some(foreign) = by_class.keys().find(|class| !native.contains(*class)) {
+            return Err(refuse(format!(
+                "{foreign} is not a native transfer class (a process bound already includes host)"
+            )));
+        }
+        self.map_native(bounds, |class| {
+            by_class
+                .get(class)
+                .map(|&bytes| i128::from(bytes))
+                .ok_or_else(|| refuse(format!("no source-derived host upper for {class}")))
+        })
+    }
+
+    fn map_native(
+        &self,
+        bounds: &[IosWindowBound],
+        host: impl Fn(&str) -> crate::Result<i128>,
+    ) -> crate::Result<Vec<IosWindowBound>> {
         let overhead = i128::from(self.overhead_bytes);
         bounds
             .iter()
@@ -322,29 +528,34 @@ impl IosNativeToProcessModel {
                     coordinate,
                     request_class,
                     anchor_candidates,
-                } => Ok(IosWindowBound::Transfer {
-                    domain: IosMemoryDomain::ProcessGrowth,
-                    coordinate: *coordinate,
-                    request_class: request_class.clone(),
-                    anchor_candidates: anchor_candidates
-                        .iter()
-                        .map(|candidate| {
-                            Ok(IosAnchorCandidate {
-                                delta_growth_upper: candidate
-                                    .delta_growth_upper
-                                    .checked_add(overhead)
-                                    .ok_or_else(|| {
-                                        crate::Error::Unsupported(
-                                            "native-to-process delta overflows".into(),
-                                        )
-                                    })?,
-                                // A native lower bound is not a process lower bound.
-                                physical_anchor_lower_bound: None,
-                                ..candidate.clone()
+                } => {
+                    let extra = overhead.checked_add(host(request_class)?).ok_or_else(|| {
+                        crate::Error::Unsupported("native-to-process delta overflows".into())
+                    })?;
+                    Ok(IosWindowBound::Transfer {
+                        domain: IosMemoryDomain::ProcessGrowth,
+                        coordinate: *coordinate,
+                        request_class: request_class.clone(),
+                        anchor_candidates: anchor_candidates
+                            .iter()
+                            .map(|candidate| {
+                                Ok(IosAnchorCandidate {
+                                    delta_growth_upper: candidate
+                                        .delta_growth_upper
+                                        .checked_add(extra)
+                                        .ok_or_else(|| {
+                                            crate::Error::Unsupported(
+                                                "native-to-process delta overflows".into(),
+                                            )
+                                        })?,
+                                    // A native lower bound is not a process lower bound.
+                                    physical_anchor_lower_bound: None,
+                                    ..candidate.clone()
+                                })
                             })
-                        })
-                        .collect::<crate::Result<Vec<_>>>()?,
-                }),
+                            .collect::<crate::Result<Vec<_>>>()?,
+                    })
+                }
                 bound if bound_is_process(bound) => Ok(bound.clone()),
                 _ => Err(crate::Error::Unsupported(
                     "native-to-process model maps only native TRANSFER certificates".into(),
@@ -375,6 +586,20 @@ pub struct IosReplay<'a> {
     pub true_reference_count: u32,
     pub mask_count: u32,
     pub control_count: u32,
+    /// The anchor's recorded provider-typed source facts, when its provider records them.
+    pub source: Option<IosReplaySource<'a>>,
+}
+
+/// Opaque provider-typed source facts recorded with a payload-free anchor (for SDXL, its
+/// `SamplingSourceFacts`): only that provider's bounder downcasts them, and a mismatched type
+/// refuses there. Recorded capture metadata only; never constructed from a request or payload.
+#[derive(Clone, Copy)]
+pub struct IosReplaySource<'a>(pub &'a (dyn std::any::Any + Send + Sync));
+
+impl std::fmt::Debug for IosReplaySource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IosReplaySource(..)")
+    }
 }
 
 /// One side of a transfer: its pricing request plus, for a payload-free anchor, its replay facts.
@@ -634,5 +859,93 @@ mod native_to_process_tests {
             growth_upper: 1,
         };
         assert!(model.to_process(&[raw]).is_err());
+    }
+
+    /// HOST: a DECLARED source-derived host term is ADDED to each native transfer (native delta
+    /// and fixed overhead retained); missing, duplicate and foreign entries refuse rather than
+    /// zero; an undeclared claim is exactly the original premise; process bounds never gain host;
+    /// and the host-extended premise is a distinct id with its own statement.
+    #[test]
+    fn the_host_extended_model_adds_only_declared_source_host_growth() {
+        let model = IosNativeToProcessModel {
+            overhead_bytes: 8,
+            provenance: "test".into(),
+        };
+        let host = model.host_premise();
+        assert_eq!(host.id, NATIVE_TO_PROCESS_HOST_PREMISE_ID);
+        assert_ne!(host.id, NATIVE_TO_PROCESS_PREMISE_ID);
+        assert!(host.statement.contains("os_stack_request(request) + 8 B"));
+        let native = transfer(IosMemoryDomain::NativeAllocatorGrowth, -3);
+        let delta = |bounds: &[IosWindowBound]| match &bounds[0] {
+            IosWindowBound::Transfer {
+                domain: IosMemoryDomain::ProcessGrowth,
+                anchor_candidates,
+                ..
+            } => anchor_candidates[0].delta_growth_upper,
+            other => panic!("{other:?}"),
+        };
+        let entry = |class: &str, bytes| IosHostGrowthBound {
+            request_class: class.into(),
+            growth_upper: bytes,
+            os_stack_request_bytes: 0,
+        };
+        let declared = IosHostGrowth::Declared(vec![entry("r", 100)]);
+        let slice = std::slice::from_ref(&native);
+        assert_eq!(
+            delta(&model.to_process_with_host(slice, &declared).unwrap()),
+            105
+        );
+        assert_eq!(
+            model
+                .to_process_with_host(slice, &IosHostGrowth::Undeclared)
+                .unwrap(),
+            model.to_process(slice).unwrap()
+        );
+        assert!(model
+            .to_process_with_host(slice, &IosHostGrowth::Declared(vec![]))
+            .is_err());
+        assert!(model
+            .to_process_with_host(
+                slice,
+                &IosHostGrowth::Declared(vec![entry("r", 1), entry("r", 2)])
+            )
+            .is_err());
+        assert!(model
+            .to_process_with_host(
+                slice,
+                &IosHostGrowth::Declared(vec![entry("r", 1), entry("other", 2)])
+            )
+            .is_err());
+        let process = transfer(IosMemoryDomain::ProcessGrowth, 4);
+        assert!(model
+            .to_process_with_host(
+                std::slice::from_ref(&process),
+                &IosHostGrowth::Declared(vec![entry("r", 1)])
+            )
+            .is_err());
+        let huge = IosHostGrowth::Declared(vec![entry("r", u64::MAX)]);
+        let top = transfer(IosMemoryDomain::NativeAllocatorGrowth, i128::MAX - 1);
+        assert!(model
+            .to_process_with_host(std::slice::from_ref(&top), &huge)
+            .is_err());
+        let unproved = IosHostGrowth::Unproved("tokenizer upper unproved".into());
+        let refusal = model.to_process_with_host(slice, &unproved).unwrap_err();
+        assert!(refusal.to_string().contains("tokenizer upper unproved"));
+        let certified = IosCertifiedBounds::proven_with_host(vec![native.clone(), native], 9, 0);
+        assert_eq!(
+            certified.host,
+            IosHostGrowth::Declared(vec![entry("r", 9)]),
+            "one entry per distinct native class"
+        );
+        // The requested OS stack is a separate field that the mapping adds beside the heap term.
+        let with_stack = IosHostGrowth::Declared(vec![IosHostGrowthBound {
+            request_class: "r".into(),
+            growth_upper: 100,
+            os_stack_request_bytes: 1000,
+        }]);
+        assert_eq!(
+            delta(&model.to_process_with_host(slice, &with_stack).unwrap()),
+            1105
+        );
     }
 }

@@ -205,6 +205,7 @@ fn cpu_scoped() -> IosExecutionFacts {
         stream: mlx_gen::ios_pricing::IosExecutionStream::Cpu,
         ios_quantum_scope: true,
         analysis_budget_bytes: 1 << 20,
+        callback_host: Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
     }
 }
 
@@ -927,29 +928,33 @@ fn certified_derivation_refuses_exactly_without_facts_audited_stream_or_certific
             stream,
             ios_quantum_scope,
             analysis_budget_bytes: 1 << 20,
+            callback_host: Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
         };
         assert!(
             no_evidence_reason(admit_with_facts(&registry, &small, &rows, None))
                 .contains("certified execution facts")
         );
-        let metal = facts(IosExecutionStream::Metal, true);
-        assert!(
-            no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&metal)))
-                .contains("no audited native-allocation law for the Metal stream")
-        );
-        let unscoped = facts(IosExecutionStream::Cpu, false);
-        assert!(
-            no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&unscoped)))
-                .contains("unscoped execution is not certified")
-        );
-        // A synthetic counted price is not SDXL's source-generated profile: no certificate.
-        let cpu = facts(IosExecutionStream::Cpu, true);
-        // (or the anchor's real SDXL replay over this header-only fixture refuses first).
-        let reason = no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&cpu)));
-        assert!(
-            reason.contains("no transfer certificate") || reason.contains("not derivable"),
-            "{reason}"
-        );
+        for stream in [IosExecutionStream::Cpu, IosExecutionStream::Metal] {
+            let unscoped = facts(stream, false);
+            assert!(
+                no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&unscoped)))
+                    .contains("unscoped execution is not certified"),
+                "{stream:?}"
+            );
+            // SDXL's ledger covers BOTH stream families, so neither is refused for its stream.
+            // A synthetic counted price is still not SDXL's source-generated profile: no
+            // certificate (or the anchor's real SDXL replay over this header-only fixture
+            // refuses first).
+            let scoped = facts(stream, true);
+            let reason =
+                no_evidence_reason(admit_with_facts(&registry, &small, &rows, Some(&scoped)));
+            assert!(
+                !reason.contains("no audited native-allocation law")
+                    && (reason.contains("no transfer certificate")
+                        || reason.contains("not derivable")),
+                "{stream:?}: {reason}"
+            );
+        }
         let exact = admit_with_facts(&registry, &opt, &rows, None).unwrap();
         assert_eq!(
             exact.basis(),
@@ -1007,4 +1012,123 @@ fn only_providers_exposing_source_bounders_are_registered() {
             "{provider}"
         );
     }
+}
+
+/// The synthetic native bounder plus a DECLARED source-derived host-growth upper per class.
+const HOST_GROWTH_MIB: u64 = 64;
+
+fn host_declaring_bounder(
+    anchor: &IosBoundRequest<'_>,
+    at_anchor: &IosPricing,
+    request: &IosBoundRequest<'_>,
+    at_request: &IosPricing,
+    execution: &IosExecutionFacts,
+) -> mlx_gen::Result<IosCertifiedBounds> {
+    let native = synthetic_bounder(anchor, at_anchor, request, at_request, execution)?;
+    Ok(IosCertifiedBounds::proven_with_host(
+        native.bounds,
+        HOST_GROWTH_MIB * MIB,
+        0,
+    ))
+}
+
+/// The synthetic native bounder with host growth that has no finite bound yet.
+fn host_unproved_bounder(
+    anchor: &IosBoundRequest<'_>,
+    at_anchor: &IosPricing,
+    request: &IosBoundRequest<'_>,
+    at_request: &IosPricing,
+    execution: &IosExecutionFacts,
+) -> mlx_gen::Result<IosCertifiedBounds> {
+    let mut native = synthetic_bounder(anchor, at_anchor, request, at_request, execution)?;
+    native.host = mlx_gen::ios_pricing::IosHostGrowth::Unproved("synthetic tokenizer gap".into());
+    Ok(native)
+}
+
+/// HOST: a declared host-growth term is consumed ONLY under the separately approved
+/// host-extended premise: approving the original native-to-process premise alone refuses,
+/// naming the host premise; approving both ADDS the host upper to the derived delta (native
+/// delta and stated overhead retained) and records both premises. The default approves nothing.
+#[test]
+fn declared_host_growth_needs_its_own_premise_and_is_added_not_subtracted() {
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let opt = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let res = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::Resident,
+        "text_to_image",
+    );
+    let rows = [
+        optimized_anchor(&registry, &opt),
+        resident_anchor(&registry, &res, 3100),
+    ];
+    priced(|| {
+        crate::pricing::with_test_bounder(Some((host_declaring_bounder, any_execution)), || {
+            let small = at(
+                &registry,
+                root.path(),
+                512,
+                MemoryStrategy::BoundedDecode,
+                "text_to_image",
+            );
+            let refused = |policy: &PremisePolicy| match admit_under(
+                &registry, &small, 4096, &rows, policy,
+            ) {
+                Err(AdmissionError::Refused(refusal)) => refusal.reason,
+                Err(AdmissionError::Failed(error)) => panic!("failed: {error}"),
+                Ok(admitted) => panic!("admitted: basis {:?}", admitted.basis()),
+            };
+            assert!(refused(&PremisePolicy::default()).contains(NATIVE_TO_PROCESS_PREMISE_ID));
+            assert!(refused(&approved()).contains(NATIVE_TO_PROCESS_HOST_PREMISE_ID));
+            let both = PremisePolicy::approving([
+                NATIVE_TO_PROCESS_PREMISE_ID.to_owned(),
+                NATIVE_TO_PROCESS_HOST_PREMISE_ID.to_owned(),
+            ])
+            .with_native_to_process(model());
+            let admitted = admit_under(&registry, &small, 4096, &rows, &both).unwrap();
+            assert_eq!(
+                admitted.demand_bytes(),
+                (2500 + MODEL_OVERHEAD_MIB + HOST_GROWTH_MIB) * MIB
+            );
+            assert_eq!(
+                admitted.certificate_premises(),
+                &[model().premise(), model().host_premise()]
+            );
+        });
+        // Unproved host growth is never zero: even fully approved, the mapping refuses naming it.
+        crate::pricing::with_test_bounder(Some((host_unproved_bounder, any_execution)), || {
+            let small = at(
+                &registry,
+                root.path(),
+                512,
+                MemoryStrategy::BoundedDecode,
+                "text_to_image",
+            );
+            let both = PremisePolicy::approving([
+                NATIVE_TO_PROCESS_PREMISE_ID.to_owned(),
+                NATIVE_TO_PROCESS_HOST_PREMISE_ID.to_owned(),
+            ])
+            .with_native_to_process(model());
+            match admit_under(&registry, &small, 4096, &rows, &both) {
+                Err(AdmissionError::Refused(refusal)) => {
+                    assert!(
+                        refusal.reason.contains("synthetic tokenizer gap"),
+                        "{}",
+                        refusal.reason
+                    )
+                }
+                Err(AdmissionError::Failed(error)) => panic!("failed: {error}"),
+                Ok(admitted) => panic!("unproved host growth admitted: {:?}", admitted.basis()),
+            }
+        });
+    });
 }

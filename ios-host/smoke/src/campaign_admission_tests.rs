@@ -740,3 +740,43 @@ fn campaign_cells_execute_their_own_declared_selection() {
     assert_eq!(p.refusal_kind, Some("strategy"));
     assert!(p.candidate.is_none());
 }
+
+/// HOST: the campaign states a finite, source-derived host bound for ITS OWN callbacks: no
+/// allocation per progress or preview event (its progress closures are `|_| {}`), and per quantum
+/// mark at least the phase key, the context Vec and the `Mark` slot, and one byte per label byte
+/// (labels are stored in full, never capped).
+#[test]
+fn the_campaign_states_its_listener_callback_host_bound() {
+    use runtime_ios::media::evidence::{MAX_SAMPLING_MARKS, MAX_SAMPLING_NAME_BYTES};
+    let runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes,
+        per_progress_event_bytes,
+        per_preview_event_bytes,
+        per_quantum_mark_bytes,
+        per_quantum_label_byte_bytes,
+    } = support::capture_listener_callback_host("iris_3b").unwrap()
+    else {
+        panic!("the campaign's listener allocates, so its term is Bounded");
+    };
+    assert_eq!((per_progress_event_bytes, per_preview_event_bytes), (0, 0));
+    // Labels are kept in full: their copy is a per-byte term, never a cap.
+    assert_eq!(per_quantum_label_byte_bytes, 1);
+    let floor = "conditioning".len() as u64
+        + 4 * MAX_SAMPLING_MARKS as u64
+        + std::mem::size_of::<support::Mark>() as u64;
+    assert!(
+        per_quantum_mark_bytes >= floor,
+        "{per_quantum_mark_bytes} < {floor}"
+    );
+    assert!(fixed_bytes >= MAX_SAMPLING_MARKS as u64 * 2 * MAX_SAMPLING_NAME_BYTES as u64);
+    // The provider String the listener clones is part of the installation term.
+    let longer = support::capture_listener_callback_host("iris_3b_restore").unwrap();
+    let runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes: longer_fixed,
+        ..
+    } = longer
+    else {
+        panic!("Bounded");
+    };
+    assert_eq!(longer_fixed - fixed_bytes, "_restore".len() as u64);
+}

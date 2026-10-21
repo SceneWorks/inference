@@ -1498,12 +1498,20 @@ impl Provider for DeviceProvider<'_> {
             baseline.bytes,
             now.available,
         );
-        let admitted = runtime_ios::media::admit_with_baseline(
+        // The full SDK boundary: this campaign is the execution owner, so it states the facts of
+        // the run it is about to execute, including its OWN callbacks: the no-op progress closures
+        // and the capture listener installed for this case (source-derived upper, not zero).
+        let callbacks = support::capture_listener_callback_host(&candidate.provider)?;
+        let facts = runtime_ios::media::execution_facts(Some(callbacks))
+            .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        let admitted = runtime_ios::media::admit_with_boundary(
             self.registry,
             std::slice::from_ref(candidate),
             &runtime_ios::device_machine(),
             budget,
             &baseline,
+            &facts,
+            &runtime_ios::media::PremisePolicy::default(),
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if admitted.index() != 0 {

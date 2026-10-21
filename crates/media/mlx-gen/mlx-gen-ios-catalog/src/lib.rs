@@ -80,7 +80,10 @@ pub use layout::{
     architecture_digest, artifact_layout_digest, capture_artifact_stem, configured_variant_digest,
     hex,
 };
-pub use mlx_gen::ios_pricing::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
+pub use mlx_gen::ios_pricing::{
+    IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosMemoryBaseline, IosMemoryCoordinate,
+    IosMemoryDomain,
+};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads
 /// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
 pub use mlx_gen::ios_quantum;

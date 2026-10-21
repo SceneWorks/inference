@@ -36,9 +36,10 @@ use mlx_gen::gen_core::{
     Quant, Result, SourceInventory, TransformRequest,
 };
 use mlx_gen::ios_pricing::{
-    IosBoundRequest, IosCertificatePremise, IosCertifiedBounds, IosExecutionFacts,
+    IosBoundRequest, IosCertificatePremise, IosCertifiedBounds, IosExecutionFacts, IosHostGrowth,
     IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain, IosNativeToProcessModel, IosPricing,
-    IosPricingRequest, IosReplay, IosWindowBound, NATIVE_TO_PROCESS_PREMISE_ID,
+    IosPricingRequest, IosReplay, IosWindowBound, NATIVE_TO_PROCESS_HOST_PREMISE_ID,
+    NATIVE_TO_PROCESS_PREMISE_ID,
 };
 
 use crate::anchor;
@@ -788,11 +789,20 @@ fn in_anchor_domain(
 ) -> std::result::Result<(Vec<IosWindowBound>, Vec<IosCertificatePremise>), String> {
     policy.accept(&certified.premises)?;
     let mut premises = certified.premises;
+    let declared_host = !matches!(certified.host, IosHostGrowth::Undeclared);
     if certified
         .bounds
         .iter()
         .all(|bound| bound_domain(bound) == measured.domain)
     {
+        // A process-domain certificate already includes host growth: a declared (or unproved)
+        // host term beside it is unsupported evidence, never silently dropped. A native anchor's
+        // counter excludes host allocations by construction, so there it is not consumed.
+        if declared_host && measured.domain == IosMemoryDomain::ProcessGrowth {
+            return Err(
+                "a declared host-growth term accompanies process-domain certificates".into(),
+            );
+        }
         return Ok((certified.bounds, premises));
     }
     if measured.domain != IosMemoryDomain::ProcessGrowth {
@@ -807,10 +817,20 @@ fn in_anchor_domain(
              explicitly approved premise {NATIVE_TO_PROCESS_PREMISE_ID} and its model"
         )
     })?;
+    if declared_host && !policy.approved.contains(NATIVE_TO_PROCESS_HOST_PREMISE_ID) {
+        return Err(format!(
+            "certificates declaring source-derived host growth need the separately approved \
+             host-extended premise {NATIVE_TO_PROCESS_HOST_PREMISE_ID} ({})",
+            model.host_premise().statement
+        ));
+    }
     let bounds = model
-        .to_process(&certified.bounds)
+        .to_process_with_host(&certified.bounds, &certified.host)
         .map_err(|e| e.to_string())?;
     premises.push(model.premise());
+    if declared_host {
+        premises.push(model.host_premise());
+    }
     Ok((bounds, premises))
 }
 
@@ -963,6 +983,9 @@ impl AnchorContext<'_> {
                 .map_err(pricing_error)?,
                 mask_count: self.mask_count,
                 control_count: self.control_count,
+                source: self
+                    .recorded_source
+                    .map(|source| mlx_gen::ios_pricing::IosReplaySource(source)),
             }),
         })
     }
@@ -1221,7 +1244,13 @@ fn anchored_demand(
              facts (stream, iOS quantum scope) at the admission boundary"
         ))
     })?;
-    let Some((bounder, gate)) = crate::pricing::provider_bounder(&candidate.provider) else {
+    // A provider's premise-mode bounder is selected ONLY when the policy approves its exact
+    // premise id; its certificates then carry that premise, which the policy re-checks.
+    let Some((bounder, gate, _premise_mode)) =
+        crate::pricing::provider_bounder_under(&candidate.provider, |id| {
+            premise_policy.approved.contains(id)
+        })
+    else {
         return Err(no_evidence(format!(
             "{}: no source-owned transfer bounder, so only its anchors' own keys are admitted",
             candidate.provider

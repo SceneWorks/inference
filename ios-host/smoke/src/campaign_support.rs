@@ -252,6 +252,130 @@ pub(super) fn growth_report(
     }
 }
 
+/// Labelled TOOLCHAIN-LAYOUT assumptions (the authority-pinned Rust 1.96 std, ac68), NOT campaign
+/// source: (a) `str::to_string` / `String::from` / `&str -> String` allocate exactly `len` bytes;
+/// (b) RawVec amortized growth: a Vec grown by `push`/`collect` to `n` elements allocates at most
+/// `(4·n + 8)·size_of::<T>()` cumulative bytes with no drop credit; (c) an insert-only BTreeMap
+/// (B = 6: 11 slots, 12 edges) allocates at most `entries + 1` nodes, each no larger than an
+/// internal node (parent pointer, parent index, length, 11 keys, 11 values, 12 edges).
+fn btree_node_bytes(key: usize, value: usize) -> Option<u64> {
+    let leaf = 8usize
+        .checked_add(4)?
+        .checked_add(key.checked_mul(11)?)?
+        .checked_add(value.checked_mul(11)?)?;
+    let aligned = leaf.checked_add(7)? / 8 * 8;
+    u64::try_from(aligned.checked_add(12 * 8)?).ok()
+}
+
+fn vec_growth_bytes(n: u64, elem: usize) -> Option<u64> {
+    n.checked_mul(4)?
+        .checked_add(8)?
+        .checked_mul(u64::try_from(elem).ok()?)
+}
+
+fn btree_bytes(entries: u64, key: usize, value: usize) -> Option<u64> {
+    entries
+        .checked_add(1)?
+        .checked_mul(btree_node_bytes(key, value)?)
+}
+
+/// The longest phase key `QuantumCoverage::record` allocates for a check (`IosPhase::as_key`).
+fn max_phase_key_bytes() -> u64 {
+    mlx_gen::ios_pricing::IosPhase::ALL
+        .iter()
+        .map(|phase| phase.as_key().len() as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Source-derived host-allocation upper of THIS campaign's own quantum listener
+/// (`campaign_media::run_case`) and its no-op progress callbacks (`|_| {}`, non-allocating),
+/// stated to admission as the caller-owned callback term. Bounded by the recorders' own caps:
+/// `SamplingCoverage` retains at most `MAX_SAMPLING_MARKS` accepted marks (names ≤
+/// `MAX_SAMPLING_NAME_BYTES`, ≤ `MAX_SAMPLING_FIELDS` fields) and allocates nothing for dropped
+/// ones; `QuantumCoverage` retains at most `MAX_QUANTUM_CHECKS` checks. Every label is stored in
+/// FULL (never capped or truncated): its copy is stated per label byte and the provider
+/// multiplies by its own source label lengths. Per quantum mark it allocates one context Vec
+/// (≤ one entry per accepted metadata mark), one phase-key String, one `Mark` slot and one
+/// exact-length label copy. Uses the labelled toolchain-layout assumptions above.
+pub(super) fn capture_listener_callback_host(
+    provider: &str,
+) -> Result<runtime_ios::media::IosCallbackHost, String> {
+    use runtime_ios::media::evidence::{
+        QuantumCheck, SamplingMark, MAX_QUANTUM_CHECKS, MAX_SAMPLING_FIELDS, MAX_SAMPLING_MARKS,
+        MAX_SAMPLING_NAME_BYTES,
+    };
+    use std::collections::BTreeMap;
+    use std::mem::size_of;
+    let overflow = || "capture listener host bound overflows".to_string();
+    let name = MAX_SAMPLING_NAME_BYTES as u64;
+    let marks = MAX_SAMPLING_MARKS as u64;
+    let fields = MAX_SAMPLING_FIELDS as u64;
+    let checks = MAX_QUANTUM_CHECKS as u64;
+    let sum = |terms: &[Option<u64>]| -> Result<u64, String> {
+        terms.iter().try_fold(0u64, |total, term| {
+            total
+                .checked_add(term.ok_or_else(overflow)?)
+                .ok_or_else(overflow)
+        })
+    };
+    // One accepted metadata mark: SamplingMark provider/kind Strings and its fields map (keys and
+    // nodes); `counts` and `latest` allocate a provider and kind String per accepted call.
+    let per_accepted = sum(&[
+        name.checked_mul(2),
+        fields.checked_mul(name),
+        btree_bytes(fields, size_of::<String>(), size_of::<u64>()),
+        name.checked_mul(2),
+        name.checked_mul(2),
+    ])?;
+    let fixed = sum(&[
+        // Installation: the provider String clone, both Arcs and the boxed closure (two Arcs
+        // and one String captured).
+        Some(provider.len() as u64),
+        Some((size_of::<std::sync::Mutex<CaptureMarks>>() + 16) as u64),
+        Some((size_of::<std::sync::atomic::AtomicBool>() + 16) as u64),
+        Some((2 * size_of::<usize>() + size_of::<String>()) as u64),
+        marks.checked_mul(per_accepted),
+        vec_growth_bytes(marks, size_of::<SamplingMark>()),
+        // `counts` / `latest`: outer maps (≤ one entry per accepted mark) and inner maps
+        // (≤ one node per accepted entry plus one root per inner map).
+        btree_bytes(
+            marks,
+            size_of::<String>(),
+            size_of::<BTreeMap<String, u64>>(),
+        ),
+        marks
+            .checked_mul(2)
+            .and_then(|nodes| nodes.checked_mul(btree_node_bytes(size_of::<String>(), 8)?)),
+        btree_bytes(
+            marks,
+            size_of::<String>(),
+            size_of::<BTreeMap<String, u32>>(),
+        ),
+        marks
+            .checked_mul(2)
+            .and_then(|nodes| nodes.checked_mul(btree_node_bytes(size_of::<String>(), 4)?)),
+        // Retained checks: each new check's label String plus the checks Vec growth.
+        checks.checked_mul(name),
+        vec_growth_bytes(checks, size_of::<QuantumCheck>()),
+        // The constant part of the `marks` Vec growth.
+        vec_growth_bytes(0, size_of::<Mark>()),
+    ])?;
+    let per_quantum_mark = sum(&[
+        vec_growth_bytes(marks, size_of::<u32>()),
+        Some(max_phase_key_bytes()),
+        (size_of::<Mark>() as u64).checked_mul(4),
+    ])?;
+    Ok(runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes: fixed,
+        per_progress_event_bytes: 0,
+        per_preview_event_bytes: 0,
+        per_quantum_mark_bytes: per_quantum_mark,
+        // `label.to_string()`: exactly the label's bytes (toolchain assumption (a)).
+        per_quantum_label_byte_bytes: 1,
+    })
+}
+
 #[derive(Default)]
 pub(super) struct CaptureMarks {
     pub marks: Vec<Mark>,
