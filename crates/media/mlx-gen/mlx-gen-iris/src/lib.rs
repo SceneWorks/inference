@@ -56,6 +56,8 @@ pub mod text_encoder;
 pub mod train;
 
 #[cfg(all(test, target_os = "macos"))]
+mod anchor_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod packed_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_proofs;

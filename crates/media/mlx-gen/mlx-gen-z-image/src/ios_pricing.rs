@@ -3836,7 +3836,7 @@ mod load_quantization_header_tests {
         let inventory = VaeSourceInventory::new(&source).unwrap();
         let mut generated_worlds = 0;
         inventory.visit_selected(&std::collections::BTreeSet::from(["encoder.conv_in.conv.weight".into()]), &mut |world| {
-            assert_eq!(world.current.contains_key("encoder.conv_in.conv.weight"), true,
+            assert!(world.current.contains_key("encoder.conv_in.conv.weight"),
                 "VAE-HOST-DYNAMIC-ENCODER-EXISTS");
             let value = &world.current["encoder.conv_in.conv.weight"];
             assert_eq!((&value.raw, &value.header.shape, value.path.len(), world.reads.iter().map(|r| r.encoder).collect::<Vec<_>>()),
@@ -4292,7 +4292,7 @@ mod load_quantization_header_tests {
                     accepted += 1;
                     Ok(())
                 });
-                assert_eq!(consumer_result.is_ok(), true,
+                assert!(consumer_result.is_ok(),
                     "VAE-NATIVE-DISCOVERY-FAILED-PACKED-READS: {:?}", consumer_result.as_ref().err());
                 consumer_result?;
                 assert_eq!(accepted, if packed { 1 } else { 2 },
@@ -4657,7 +4657,8 @@ mod load_quantization_header_tests {
         // These are native constructor targets, not a rank-2 packing heuristic. The extra F32 bias
         // is deliberately still in the raw/effective dictionary: ignoring it as a module input is
         // NOT a claim that the file Array/cache/native backing has been released.
-        let cases: [(&str, fn(&str) -> bool, bool); 7] = [
+        type BiasCase = (&'static str, fn(&str) -> bool, bool);
+        let cases: [BiasCase; 7] = [
             (
                 "model.layers.0.self_attn.q_proj",
                 |_| crate::quant::TEXT_LINEAR_HAS_BIAS,

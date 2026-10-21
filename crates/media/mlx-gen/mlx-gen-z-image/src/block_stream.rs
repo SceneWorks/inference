@@ -379,8 +379,8 @@ mod capacity_proofs {
     }
 
     enum Block {
-        Base(ZImageTransformerBlock),
-        Control(crate::control_transformer_block::ZImageControlBlock),
+        Base(Box<ZImageTransformerBlock>),
+        Control(Box<crate::control_transformer_block::ZImageControlBlock>),
     }
     impl Block {
         fn counted(
@@ -391,23 +391,22 @@ mod capacity_proofs {
         ) -> Result<(Self, u64)> {
             match role {
                 Role::Base => base_block_counted(view, role.prefix(), cfg, bits)
-                    .map(|(block, read)| (Self::Base(block), read)),
+                    .map(|(block, read)| (Self::Base(Box::new(block)), read)),
                 _ => control_block_counted(view, role.prefix(), cfg, role.before(), bits)
-                    .map(|(block, read)| (Self::Control(block), read)),
+                    .map(|(block, read)| (Self::Control(Box::new(block)), read)),
             }
         }
         fn from_headers(view: &Weights, role: Role, cfg: ZImageBlockConfig) -> Result<Self> {
             match role {
-                Role::Base => {
-                    ZImageTransformerBlock::from_weights(view, role.prefix(), cfg).map(Self::Base)
-                }
+                Role::Base => ZImageTransformerBlock::from_weights(view, role.prefix(), cfg)
+                    .map(|block| Self::Base(Box::new(block))),
                 _ => crate::control_transformer_block::ZImageControlBlock::from_weights(
                     view,
                     role.prefix(),
                     cfg,
                     role.before(),
                 )
-                .map(Self::Control),
+                .map(|block| Self::Control(Box::new(block))),
             }
         }
         fn scratch(&self, x: &Array, freqs: &Array) -> u64 {
@@ -594,7 +593,7 @@ mod capacity_proofs {
             offset += bytes;
         }
         let mut bytes = serde_json::to_vec(&json).unwrap();
-        while bytes.len() % 8 != 0 {
+        while !bytes.len().is_multiple_of(8) {
             bytes.push(b' ');
         }
         let path = root.join(format!("{name}.safetensors"));

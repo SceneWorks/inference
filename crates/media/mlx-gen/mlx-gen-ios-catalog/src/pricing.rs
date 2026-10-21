@@ -120,6 +120,7 @@ pub(crate) fn reference_role_count(
 ///   mlx_gen::img2img::resolve_reference single-init producer.
 /// - Anima/Iris generation descriptors leave conditioning empty; restoration/depth are separate
 ///   typed tasks, not fabricated generation references.
+///
 /// Future/unknown multi-reference mechanisms remain unclassified/open, not declared unsupported.
 /// MultiControlNet's actual branch topology is separately sealed by the configured overlay digest
 /// (SDXL model::resolve_control + generate's loaded-count validation), so cardinality must not be

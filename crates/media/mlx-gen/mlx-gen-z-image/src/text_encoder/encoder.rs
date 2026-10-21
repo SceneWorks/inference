@@ -368,6 +368,26 @@ fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
     Ok(Array::from_slice(&data, &[b as i32, 1, s as i32, s as i32]))
 }
 
+/// The exact projections constructed by the native encoder and covered by its quantize walk.
+pub(crate) fn quantization_header_targets(
+    prefix: &str,
+    cfg: &ZTextEncoderConfig,
+) -> Vec<(String, bool)> {
+    let mut targets = vec![(join(prefix, EMBEDDING_PATH), true)];
+    for layer in 0..cfg.n_layers {
+        for leaf in super::attention::QUANTIZATION_LINEAR_PATHS {
+            targets.push((
+                join(prefix, &format!("layers.{layer}.self_attn.{leaf}")),
+                false,
+            ));
+        }
+        for leaf in super::mlp::QUANTIZATION_LINEAR_PATHS {
+            targets.push((join(prefix, &format!("layers.{layer}.mlp.{leaf}")), false));
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,24 +432,4 @@ mod tests {
         assert_eq!(v[7], 0.0);
         assert_eq!(v[8], neg);
     }
-}
-
-/// The exact projections constructed by the native encoder and covered by its quantize walk.
-pub(crate) fn quantization_header_targets(
-    prefix: &str,
-    cfg: &ZTextEncoderConfig,
-) -> Vec<(String, bool)> {
-    let mut targets = vec![(join(prefix, EMBEDDING_PATH), true)];
-    for layer in 0..cfg.n_layers {
-        for leaf in super::attention::QUANTIZATION_LINEAR_PATHS {
-            targets.push((
-                join(prefix, &format!("layers.{layer}.self_attn.{leaf}")),
-                false,
-            ));
-        }
-        for leaf in super::mlp::QUANTIZATION_LINEAR_PATHS {
-            targets.push((join(prefix, &format!("layers.{layer}.mlp.{leaf}")), false));
-        }
-    }
-    targets
 }

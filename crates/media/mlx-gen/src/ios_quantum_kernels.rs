@@ -813,16 +813,25 @@ mod metadata_constructor_tests {
             kernel.saturating_add(frontend)
         }
     }
-    fn old_resnet(
-        x: &[i32],
+    struct OldResnetWidths {
         act_in: u64,
         act_out: u64,
-        conv1: &[i32],
         width1: u64,
-        conv2: &[i32],
         width2: u64,
+    }
+    fn old_resnet(
+        x: &[i32],
+        widths: OldResnetWidths,
+        conv1: &[i32],
+        conv2: &[i32],
         backend: Backend,
     ) -> u64 {
+        let OldResnetWidths {
+            act_in,
+            act_out,
+            width1,
+            width2,
+        } = widths;
         let (cin, cout) = old_conv_channels(conv1);
         let act_out = act_out.max(act_in);
         let input = [x[0], x[1], x[2], cin];
@@ -895,8 +904,18 @@ mod metadata_constructor_tests {
                 for (ai, ao) in [(2, 2), (2, 4), (4, 2), (4, 4)] {
                     for backend in [Backend::Cpu, Backend::Metal] {
                         // Defect map: lost concat/shortcut/widen/norm/transient/page formula term.
-                        let expected =
-                            old_resnet(&case.x, ai, ao, &case.c1, wi, &case.c2, wo, backend);
+                        let expected = old_resnet(
+                            &case.x,
+                            OldResnetWidths {
+                                act_in: ai,
+                                act_out: ao,
+                                width1: wi,
+                                width2: wo,
+                            },
+                            &case.c1,
+                            &case.c2,
+                            backend,
+                        );
                         assert_eq!(resnet_bytes_from_metadata(&case.x, ai, ao, ConvOperandMetadata { shape: &case.c1, element_bytes: wi }, ConvOperandMetadata { shape: &case.c2, element_bytes: wo }, backend), expected,
                             "ROOT_OLD_LITERAL_RESNET x={:?} weights={wi}/{wo} activation={ai}/{ao} backend={backend:?}", case.x);
                     }
@@ -946,7 +965,18 @@ mod metadata_constructor_tests {
             "ROOT_CONVCALL_AXIS3"
         );
         for backend in [Backend::Cpu, Backend::Metal] {
-            let expected = old_resnet(&x, 2, 4, &c1, 2, &c2, 4, backend);
+            let expected = old_resnet(
+                &x,
+                OldResnetWidths {
+                    act_in: 2,
+                    act_out: 4,
+                    width1: 2,
+                    width2: 4,
+                },
+                &c1,
+                &c2,
+                backend,
+            );
             assert_eq!(
                 resnet_bytes_from_metadata(
                     &x,
@@ -969,12 +999,34 @@ mod metadata_constructor_tests {
             let wrong2 = [64, 3, 3, 64, 64];
             assert_ne!(
                 expected,
-                old_resnet(&x, 2, 4, &wrong1, 2, &wrong2, 4, backend),
+                old_resnet(
+                    &x,
+                    OldResnetWidths {
+                        act_in: 2,
+                        act_out: 4,
+                        width1: 2,
+                        width2: 4
+                    },
+                    &wrong1,
+                    &wrong2,
+                    backend
+                ),
                 "ROOT_ODD_CASE_MUST_DISCRIMINATE_AXIS3"
             );
         }
         let c = CASES[0];
-        let correct = old_resnet(&c.x, 4, 4, &c.c1, 2, &c.c2, 2, Backend::Cpu);
+        let correct = old_resnet(
+            &c.x,
+            OldResnetWidths {
+                act_in: 4,
+                act_out: 4,
+                width1: 2,
+                width2: 2,
+            },
+            &c.c1,
+            &c.c2,
+            Backend::Cpu,
+        );
         assert_ne!(
             correct,
             resnet_bytes_from_metadata(
@@ -1178,12 +1230,14 @@ mod metadata_constructor_tests {
                         for backend in [Backend::Cpu, Backend::Metal] {
                             let expected = old_resnet(
                                 input.shape(),
-                                ain,
-                                aout,
+                                OldResnetWidths {
+                                    act_in: ain,
+                                    act_out: aout,
+                                    width1: expected_width(d1),
+                                    width2: expected_width(d2),
+                                },
                                 &case.c1,
-                                expected_width(d1),
                                 &case.c2,
-                                expected_width(d2),
                                 backend,
                             );
                             assert_eq!(

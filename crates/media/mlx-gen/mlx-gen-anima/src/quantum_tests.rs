@@ -2194,10 +2194,82 @@ fn reachable_sizes_prediction() {
                     t5_tokens: tokens,
                     backend: crate::transformer::Backend::Metal,
                 };
-                let pricing = fold(&price_quanta(&facts, work, &execution).unwrap());
+                let quanta = price_quanta(&facts, work, &execution).unwrap();
+                let pricing = fold(&quanta);
                 if quant.is_none() {
                     // The device entry point reads the same facts off the snapshot, header-only:
                     // nothing it builds is evaluated, so MLX allocates nothing.
+                    // An actual valid Turbo text-to-image request at this edge: one serial output,
+                    // the provider's default FLOW sampler/scheduler/steps.
+                    let generation = mlx_gen::GenerationRequest {
+                        width: edge,
+                        height: edge,
+                        count: 1,
+                        ..Default::default()
+                    };
+                    // Independent expected envelope from the sampler's source semantics, not the
+                    // entry's output: each DiT/sampler-body quantum is owned once per possible solver
+                    // callback family over the f32 (w/8)x(h/8)xC latent, holding the callback's outer
+                    // owners, the caller's f32 latent handle (except inside the step itself, which
+                    // owns that state), and the host sigma schedule; the sampler step additionally
+                    // owns a solve-complete window holding only the schedule. Other quanta are their
+                    // own windows, and Encode never runs.
+                    let sampling = crate::sampling::resolve(&generation).unwrap();
+                    let latent = u64::from(edge / crate::config::VAE_COMPRESSION).pow(2)
+                        * crate::config::VAE_CHANNELS as u64;
+                    let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
+                        sampling.solver(),
+                        sampling.convention(),
+                        latent,
+                        4,
+                        4,
+                    )
+                    .unwrap();
+                    let schedule = sampling.host_schedule_bytes().unwrap();
+                    let class = |window: &mlx_gen::ios_pricing::IosWindowPrice, family: &str| {
+                        format!(
+                            "{}/{}/{family}",
+                            window.class.as_deref().unwrap(),
+                            sampling.allocation_class()
+                        )
+                    };
+                    let mut expected = mlx_gen::ios_pricing::IosPricing::default();
+                    for quantum in &quanta {
+                        let step = quantum.label == mlx_gen::sampler::SAMPLER_STEP_QUANTUM;
+                        let body = step
+                            || [
+                                crate::transformer::DIT_EMBED_QUANTUM,
+                                crate::transformer::DIT_BLOCK_QUANTUM,
+                                crate::transformer::DIT_OUTPUT_QUANTUM,
+                            ]
+                            .contains(&quantum.label);
+                        if !body {
+                            expected.take_window(quantum.window.clone());
+                            continue;
+                        }
+                        for callback in &callbacks {
+                            let mut window = quantum.window.clone();
+                            window.class = Some(class(&window, &callback.family()));
+                            window.held_bytes += callback.callback_outer_bytes
+                                + if step { 0 } else { callback.state_bytes }
+                                + schedule;
+                            expected.take_window(window);
+                        }
+                        if step {
+                            let mut window = quantum.window.clone();
+                            window.class = Some(class(&window, "solve-complete"));
+                            window.held_bytes += schedule;
+                            expected.take_window(window);
+                        }
+                    }
+                    expected.phase_not_run(
+                        mlx_gen::ios_pricing::IosPhase::Encode,
+                        "Anima serves text-to-image only",
+                    );
+                    assert!(
+                        !callbacks.is_empty(),
+                        "the Turbo FLOW sampler owns callbacks"
+                    );
                     let before = mlx_rs::memory::get_active_memory();
                     let entry = ios_pricing(&IosPricingRequest {
                         provider: "anima_turbo",
@@ -2212,11 +2284,18 @@ fn reachable_sizes_prediction() {
                         },
                         selection,
                         execution: &execution,
+                        generation: Some(&generation),
+                        transform: None,
+                        depth: None,
                         token_window: 0,
                     })
                     .unwrap();
                     assert_eq!(mlx_rs::memory::get_active_memory(), before, "header-only");
-                    assert_eq!(entry, pricing);
+                    assert_eq!(entry, expected);
+                    assert_ne!(
+                        entry, pricing,
+                        "sampler callbacks are not the bare quantum fold"
+                    );
                 }
                 for price in &pricing.phases {
                     let total = price.peak_bytes() + PROCESS_RESERVE_BYTES;

@@ -396,7 +396,7 @@ mod capacity_proofs {
             tensor(key.clone(), vec![1], "BF16", 2, false);
         }
         let mut bytes = serde_json::to_vec(&header).unwrap();
-        while bytes.len() % 8 != 0 {
+        while !bytes.len().is_multiple_of(8) {
             bytes.push(b' ');
         }
         let path = root.join(format!("packed-q{bits}.safetensors"));

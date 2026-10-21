@@ -43,9 +43,11 @@ mod tests {
 
     #[test]
     fn base_descriptor_and_true_cfg_use_the_shared_actual_factory() {
-        let mut req = GenerationRequest::default();
-        req.guidance = Some(1.0);
-        req.true_cfg = Some(7.0);
+        let mut req = GenerationRequest {
+            guidance: Some(1.0),
+            true_cfg: Some(7.0),
+            ..Default::default()
+        };
         assert_eq!(resolve_base(&req).unwrap().effective_guidance(), Some(7.0));
         for name in crate::model::descriptor().capabilities.samplers {
             req.sampler = Some(name.into());

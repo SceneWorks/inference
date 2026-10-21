@@ -1041,7 +1041,7 @@ mod adapter_namespace_proofs {
             offset += bytes;
         }
         let mut header = serde_json::to_vec(&header).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = root.join(format!("{name}.safetensors"));

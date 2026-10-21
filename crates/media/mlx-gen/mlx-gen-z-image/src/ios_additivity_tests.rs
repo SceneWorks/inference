@@ -452,7 +452,7 @@ fn capture_repeat(body: impl FnOnce() -> mlx_gen::Result<()>) -> mlx_gen::Result
         .expect("actual before-model-load boundary was not observed");
     // Absolute readings are retained above, including intervals below baseline. Nonnegative
     // growth normalization here is a COUNTER definition, not baseline-owner cancellation proof.
-    let growth = |absolute: u64| absolute.checked_sub(baseline.bytes).unwrap_or(0);
+    let growth = |absolute: u64| absolute.saturating_sub(baseline.bytes);
     let native = MeasuredRun {
         demand: growth(state.whole_peak),
         phases: state
@@ -1396,7 +1396,7 @@ mod original_pre_embed_capacity {
                 "actual Control patch constructor source absent: {key}"
             ))
         })?;
-        if embedding.shape.len() != 2 || embedding.shape.iter().any(|&dim| dim == 0) {
+        if embedding.shape.len() != 2 || embedding.shape.contains(&0) {
             return Err(invalid(
                 "actual Control patch constructor is not a positive matrix",
             ));

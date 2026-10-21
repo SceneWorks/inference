@@ -3104,7 +3104,7 @@ mod configured_header_tests {
             );
         }
         let mut header = serde_json::to_vec(&header).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -3196,7 +3196,7 @@ mod configured_header_tests {
             serde_json::json!({}),
         );
         let s = spec(path, AdapterKind::Lokr, 1.0);
-        let (_, packed) = facts(&[s.clone()], true).unwrap();
+        let (_, packed) = facts(std::slice::from_ref(&s), true).unwrap();
         assert!(matches!(
             &packed[0].1,
             AdapterFacts::Structured { disabled: true, .. }
@@ -3236,13 +3236,13 @@ mod configured_header_tests {
         );
         let s = spec(path, AdapterKind::Lokr, 1.0);
         assert!(matches!(
-            &facts(&[s.clone()], true).unwrap().1[0].1,
+            &facts(std::slice::from_ref(&s), true).unwrap().1[0].1,
             AdapterFacts::Structured {
                 disabled: false,
                 ..
             }
         ));
-        let negative_result = facts(&[s.clone()], false);
+        let negative_result = facts(std::slice::from_ref(&s), false);
         assert!(
             negative_result.is_ok(),
             "actual rank<=0 parser normalization must precede the dense gate"
@@ -3274,7 +3274,7 @@ mod configured_header_tests {
             serde_json::json!({"networkType":"lokr","rank":"inf","alpha":"1"}),
         );
         let infinite = spec(infinite_path, AdapterKind::Lokr, 1.0);
-        let infinite_packed = facts(&[infinite.clone()], true);
+        let infinite_packed = facts(std::slice::from_ref(&infinite), true);
         assert!(
             infinite_packed.is_ok(),
             "finite packed coefficient zero must remain accepted"
@@ -3312,7 +3312,7 @@ mod alpha_control_tests {
             serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[0,bytes.len()]}),
         );
         let mut header = serde_json::to_vec(&entries).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let mut file = (header.len() as u64).to_le_bytes().to_vec();

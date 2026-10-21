@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "0824ec7236902b4d5042e709c1cc11674163376320f290badcafbf7a91ea9063",
+  "rust_proof_closure_sha256": "e6d899fb55313c5a982cbe603b6cf9d98311724834d28c755f5c55d1096235ce",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -164,7 +164,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "72a43cf7db947979c58926b54bc48d77e5200df15d785ece079668d728765fec"
+      "sha256": "09b370fde62ce3f0af835ac8f69f8f853314f999af47066c885d43a0758219c2"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -180,7 +180,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/pricing.rs",
-      "sha256": "f03208bd3b68d86f129b068bac3579baca93a63dff25c139b5c89b09e626c0b8"
+      "sha256": "c98f446603b3e17c142512f91a35836623ece6bc781cddd4eddbf38653ca3e2c"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sampling.rs",
@@ -192,7 +192,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/source_work.rs",
-      "sha256": "c00b88ecddb2e4defee5fcd9812d2ab41347e36c0597da22bfbedde41e810b52"
+      "sha256": "7601edae55771c2a67145e9ecb75db4d90b8456b109238ff3e500fff763ed137"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/zimage.rs",
@@ -360,7 +360,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sana/src/sampling.rs",
-      "sha256": "18a9345f7e8c41b7a00442071b3e04f3c7132ca395ff6ab1202b9dfa1aa12eb1"
+      "sha256": "79572bff04059874f53ddef5a83cdb31911543b012df7cfbfb90e68d54316af9"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sana/src/transformer.rs",
@@ -524,7 +524,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/block_stream.rs",
-      "sha256": "d18ad88e7f4b3b7900a9649efc6492b5b0ae08297b376eaeadcffc257a4ebee0"
+      "sha256": "2844fd73aad9d2c84db852c112bebeece07adc14dce2e03e005e81d542852bed"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/comfyui.rs",
@@ -536,7 +536,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer.rs",
-      "sha256": "af9fb43ea97d88445d408ee5d8b607deb48f0d3def90fa0cce643469333b6bc8"
+      "sha256": "2bb08f3d271a67dbd108557235f02027842d7e16fb9d452467eba422880c63f6"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/control_transformer_block.rs",
@@ -556,15 +556,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs",
-      "sha256": "6e8141db818fa06e0a3096ad6c368a3c93558e4af25a8bdc2fec957f247642f4"
+      "sha256": "99b1ed13ef73454b5c7c316519670395784a63a0261e65e5134dd7864a43fe50"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
-      "sha256": "f43badc33fb41784020f9d042f25968e326398bc27f2142f8c464b654c00a19b"
+      "sha256": "c10aab7f1904276be9d7499f140e3abf21f2a19177026d3274f2ba4cbc84ab3b"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
-      "sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b"
+      "sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
@@ -644,7 +644,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/sampling.rs",
-      "sha256": "63498fa70555e8d410259b5b6f48105a3808f050a075b8b175c0fbe1b8cda62b"
+      "sha256": "1b9f00f5c56b2679f05b646bb7de5d6dbc64f42f0f4208dc0b7d42ab5fde01c3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/attention.rs",
@@ -652,7 +652,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/encoder.rs",
-      "sha256": "f24bad1630dd0f73473a463b8a8a7189b4d9c1da30944297251265d9cef1c3a4"
+      "sha256": "e759bc73de34d8e064c4e2b7f7ef9892ad6cdf092a8f5f9d268866c3115f48dd"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/layer.rs",
@@ -668,7 +668,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/text_encoder/stream.rs",
-      "sha256": "637c2a0b3f5764f2ce66928635b754a6d34643c1c34396d63bcc6c568942c69f"
+      "sha256": "c954b3b0eba229a38d77769f359fc84528e7c25346e94d975796f2ab8f10c4e1"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/timestep_embedder.rs",
@@ -748,11 +748,11 @@
     },
     {
       "path": "crates/media/mlx-gen/src/adapters/loader.rs",
-      "sha256": "6527abe32bc9ad04c55318c05f0ec7b0a0b0080bb28a537a0b3b9c85a7059ed3"
+      "sha256": "b03aba6241630e62273604ae1938bb1eff095acead2916bd6a924b7241c9a743"
     },
     {
       "path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs",
-      "sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e"
+      "sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e"
     },
     {
       "path": "crates/media/mlx-gen/src/array.rs",
@@ -788,7 +788,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum_kernels.rs",
-      "sha256": "358e9de0249af3431b670963a4a1a3bf1973c613c07db7a58ac5551da88c1505"
+      "sha256": "cca890772c31c6247b6169b20ae0890064e35d42e4bb20f4bcb63a2fd5e5f733"
     },
     {
       "path": "crates/media/mlx-gen/src/lib.rs",
@@ -879,7 +879,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::family_validates_actual_stop_order_and_action_multiplicity_not_only_sets",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -891,7 +891,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::callback_error_preserves_same_nonempty_prefix_once_without_replay",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -903,7 +903,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::future_file_io_cannot_preempt_an_earlier_known_parse_failure",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -915,7 +915,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::repeated_literal_paths_keep_file_epochs_and_global_same_target_slots",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -927,7 +927,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::full_alpha_vector_cast_and_orphan_raw_materialization_survive_in_source_work",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -939,7 +939,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::every_existing_unfused_family_produces_and_materializes_its_exact_source_keys",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -951,7 +951,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::packed_tucker_probe_and_full_factor_precedence_keep_shadow_raw_sources",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -963,7 +963,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::sequential_naive_products_preserve_integer_intermediate_and_local_shapes",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -975,7 +975,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::operator_refusals_preserve_only_reached_casts_and_no_successful_output",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -987,7 +987,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::failed_raw_materialization_is_consumed_once_before_any_future_file_observation",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -999,7 +999,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::aggregate_zero_relaxation_does_not_change_successful_semantic_v1_json_or_unknown_targets",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1011,7 +1011,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::enumerator_abort_keeps_actual_pending_prefix_before_any_callback_delivery",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1023,7 +1023,7 @@
     {
       "binary_binding": "mlx_gen",
       "fqn": "adapters::loader::source_facts::tests::same_width_f16_bf16_cast_is_conversion_work_not_source_clone",
-      "source_sha256": "983bfb67f6f04c74315bf7539664df77101c81965910ce69c4c21c21b3e2f18e",
+      "source_sha256": "54b30f5c472227516a334517b873edd5d5fcfecfd9e991b23b4a6ff2a92d4c8e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1155,7 +1155,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::raw_union_is_by_epoch_key_but_alpha_and_constructor_work_is_by_action",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1167,7 +1167,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::operation_identity_never_falls_back_to_first_same_label",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1179,7 +1179,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::retained_endpoint_requires_the_exact_epoch_constructor_and_global_slot",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1191,7 +1191,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::same_global_slot_consumes_cold_recurrent_zero_late_and_serial_history_owners",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1203,7 +1203,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_callback_abort_preserves_prefix_and_previous_whole_windows_once",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1215,7 +1215,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::global_abort_and_all_refused_keep_prior_prices_without_valid_envelope",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1227,7 +1227,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::adapter_sources::source_ledger_tests::actual_legacy_listener_enabled_and_disabled_preserves_typed_causes",
-      "source_sha256": "cbe1a57a3ffecbdfd10e3803a076b16c3086be5f990428a6eb45c500f1329f8b",
+      "source_sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 2,
       "expected_logical_targets": 1,
@@ -1434,8 +1434,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "35344109dd18019f809cb79e78c9d2136f8d3e78b0df16b13db26ff55473d455",
-    "classification_sha256": "3e49999772162a823e658fe5778abfb36ccacbd1c14bc027e833887750859dce",
+    "inventory_sha256": "a9e441e3ddd69030f32fd1a36ca9257b855aeb9c3e5fbb5b8adfb3253d576906",
+    "classification_sha256": "33169fd1572052872a6ce11d84d7f3ed57c48aa60c68d4a09c8e308feda81181",
     "selected_Rust_FQNs": 99,
     "HOST_logical": 86,
     "HOST_expected_PASS_rows": 87,

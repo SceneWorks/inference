@@ -2351,7 +2351,7 @@ mod original_z_execution_sidecar_tests {
             .map(|entry| (entry.descriptor)())
             .find(|descriptor| descriptor.id == provider)
             .unwrap();
-        let public_edge = u32::try_from(descriptor.capabilities.min_size).unwrap();
+        let public_edge = descriptor.capabilities.min_size;
         let public_request = mlx_gen::gen_core::GenerationRequest {
             width: public_edge,
             height: public_edge,

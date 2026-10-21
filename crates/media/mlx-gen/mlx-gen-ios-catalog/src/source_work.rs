@@ -912,6 +912,58 @@ pub(crate) fn capture_requested_bytes(view: SamplingSourceView<'_>) -> Result<u6
         .ok_or_else(|| invalid("capture source layout overflow"))
 }
 
+/// Allocation-refusal fallback preserves the existing schema/case/status wire, without cloning
+/// the Case string or retaining source facts in a Value. If even this bounded output is refused,
+/// the existing String-returning harness cannot emit a line without another allocation.
+pub fn serialize_capture_failure(
+    case: &serde_json::Value,
+    budget: &mut SourceRequestBudget<'_>,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct Failure<'a> {
+        schema: u8,
+        case: &'a serde_json::Value,
+        status: &'static str,
+        production_success: bool,
+        reason: &'static str,
+    }
+    serialize_framed_with_budget(
+        "SMOKE: FAIL\nCAMPAIGN_JSON ",
+        "\n",
+        &Failure {
+            schema: 1,
+            case,
+            status: "diagnostic_failure",
+            production_success: false,
+            reason: "source metadata output budget refused",
+        },
+        budget,
+    )
+}
+
+/// Existing anchor fixtures must carry their own REAL request context under a finite requested
+/// allowance. This does not turn synthetic telemetry into execution/physical evidence.
+#[cfg(test)]
+pub(crate) fn fixture_key(
+    registry: &mlx_gen::gen_core::ProviderRegistry,
+    candidate: &crate::IosCandidate,
+    machine: &str,
+) -> crate::evidence::EvidenceKey {
+    let mut key = crate::evidence_key(registry, candidate, machine).unwrap();
+    if let crate::IosWork::Generate(request) = &candidate.work {
+        if candidate.provider == crate::sdxl::SDXL_ID {
+            let bytes = capture_requested_bytes(SamplingSourceView::from_request(request)).unwrap();
+            record_source_context(
+                &mut key,
+                candidate,
+                &mut SourceRequestBudget::bounded(bytes),
+            )
+            .unwrap();
+        }
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,56 +1419,4 @@ mod tests {
         short.account_retained(retained).unwrap();
         assert!(serialize_capture_row(prefix, &row, Some(&k), &mut short).is_err());
     }
-}
-
-/// Allocation-refusal fallback preserves the existing schema/case/status wire, without cloning
-/// the Case string or retaining source facts in a Value. If even this bounded output is refused,
-/// the existing String-returning harness cannot emit a line without another allocation.
-pub fn serialize_capture_failure(
-    case: &serde_json::Value,
-    budget: &mut SourceRequestBudget<'_>,
-) -> Result<String> {
-    #[derive(Serialize)]
-    struct Failure<'a> {
-        schema: u8,
-        case: &'a serde_json::Value,
-        status: &'static str,
-        production_success: bool,
-        reason: &'static str,
-    }
-    serialize_framed_with_budget(
-        "SMOKE: FAIL\nCAMPAIGN_JSON ",
-        "\n",
-        &Failure {
-            schema: 1,
-            case,
-            status: "diagnostic_failure",
-            production_success: false,
-            reason: "source metadata output budget refused",
-        },
-        budget,
-    )
-}
-
-/// Existing anchor fixtures must carry their own REAL request context under a finite requested
-/// allowance. This does not turn synthetic telemetry into execution/physical evidence.
-#[cfg(test)]
-pub(crate) fn fixture_key(
-    registry: &mlx_gen::gen_core::ProviderRegistry,
-    candidate: &crate::IosCandidate,
-    machine: &str,
-) -> crate::evidence::EvidenceKey {
-    let mut key = crate::evidence_key(registry, candidate, machine).unwrap();
-    if let crate::IosWork::Generate(request) = &candidate.work {
-        if candidate.provider == crate::sdxl::SDXL_ID {
-            let bytes = capture_requested_bytes(SamplingSourceView::from_request(request)).unwrap();
-            record_source_context(
-                &mut key,
-                candidate,
-                &mut SourceRequestBudget::bounded(bytes),
-            )
-            .unwrap();
-        }
-    }
-    key
 }

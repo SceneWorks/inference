@@ -1232,7 +1232,7 @@ mod source_ledger_tests {
             );
         }
         let mut header = serde_json::to_vec(&header).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = root.join("metadata-only.safetensors");
@@ -1292,7 +1292,6 @@ mod source_ledger_tests {
             &mut projection,
             &mut consume,
         );
-        drop(consume);
         (
             failed(prices.finish("z_image", visited)),
             first.unwrap(),
@@ -1441,7 +1440,6 @@ mod source_ledger_tests {
             &mut projection,
             &mut consume,
         );
-        drop(consume);
         let failure = failed(prices.finish("z_image", visited));
         assert_eq!(
             failure.committed.len(),
@@ -1649,7 +1647,7 @@ mod native_source_proofs {
             offset += size;
         }
         let mut header = serde_json::to_vec(&header).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = root.join(format!("{name}.safetensors"));

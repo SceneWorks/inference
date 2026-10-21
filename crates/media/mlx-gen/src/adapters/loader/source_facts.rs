@@ -2777,7 +2777,7 @@ mod tests {
             offset += bytes;
         }
         let mut header = serde_json::to_vec(&header).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = root.join(format!("{name}.safetensors"));
@@ -2966,12 +2966,13 @@ mod tests {
     #[test]
     fn every_existing_unfused_family_produces_and_materializes_its_exact_source_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let cases: Vec<(
-            &str,
+        type FamilyFixture<'a> = (
+            &'a str,
             AdapterKind,
-            Vec<(&str, &[usize], &str)>,
+            Vec<(&'a str, &'a [usize], &'a str)>,
             serde_json::Value,
-        )> = vec![
+        );
+        let cases: Vec<FamilyFixture<'_>> = vec![
             (
                 "peft",
                 AdapterKind::Lora,
@@ -3349,7 +3350,6 @@ mod tests {
         assert_eq!(failure.attempted_case_id, None);
         assert!(matches!(failure.prefix.work.as_slice(),[AdapterSourceWork::FileMapAttempt(AdapterFileEpoch(1))]),
             "ENUMERATOR-PREFIX: actual pending epoch survives ordinal abort, not empty reconstruction");
-        drop(delivery);
         assert_eq!(
             calls, 0,
             "overflow abort is BEFORE callback; provenance is not a replay channel"
