@@ -16,7 +16,8 @@ use mlx_gen_flux3::{load_dit, SampleTokens};
 use mlx_rs::{Array, Dtype};
 
 use crate::common::{
-    assert_close, cpu_process, fixture, host_f32, on_cpu, tiny_config, tiny_package,
+    assert_close, cpu_process, fixture, host_f32, on_cpu, tiny_base_config, tiny_config,
+    tiny_package,
 };
 
 // AE computes in f32 before the source explicitly stores conditioning in BF16. CPU summation
@@ -156,8 +157,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
             Dtype::Float32,
         )
         .unwrap();
-        let mut cfg = tiny_config();
-        cfg.dit.flow_map = false;
+        let cfg = tiny_base_config();
         let base = mlx_gen_flux3::load_dit(
             &crate::common::fixtures().join("tiny-base-snapshot/model.safetensors"),
             &cfg,
@@ -602,8 +602,7 @@ fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
                 };
                 use mlx_gen_flux3::pipeline::denoise_cfg;
                 use mlx_gen_flux3::{Flux3Dit, TextConditioning};
-                let mut config = tiny_config();
-                config.dit.flow_map = false;
+                let config = tiny_base_config();
                 let mut weights =
                     Weights::from_file(tiny_package().join("model.safetensors")).unwrap();
                 let remove: Vec<_> = weights

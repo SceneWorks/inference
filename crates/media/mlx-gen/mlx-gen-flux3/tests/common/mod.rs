@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub mod metal_guard;
 
-use mlx_gen::gen_core::flux3::Flux3Config;
+use mlx_gen::gen_core::flux3::{resolve_checkpoint, Flux3Config};
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
 
@@ -32,8 +32,21 @@ pub fn tiny_autoencoder() -> PathBuf {
     tiny_package().join("ae.safetensors")
 }
 
+/// The miniature distilled package's config, resolved from its weights' headers exactly as the
+/// loaders resolve a real package (the `ref_time_in` pair decides `flow_map`).
 pub fn tiny_config() -> Flux3Config {
-    Flux3Config::from_dir(&tiny_package()).expect("tiny config.json parses")
+    resolve_checkpoint(&tiny_package()).expect("the tiny distilled package resolves")
+}
+
+/// The miniature base (CFG) package: `config.json` + `model.safetensors` without `ref_time_in`.
+pub fn tiny_base_package() -> PathBuf {
+    fixtures().join("tiny-base-snapshot")
+}
+
+/// The miniature base package's config, resolved from its headers — never a distilled config
+/// with `flow_map` hand-flipped.
+pub fn tiny_base_config() -> Flux3Config {
+    resolve_checkpoint(&tiny_base_package()).expect("the tiny base package resolves")
 }
 
 /// Run `f` with the MLX **CPU** stream as this thread's default. MLX's Metal GEMM accumulates f32

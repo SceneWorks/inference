@@ -8,7 +8,6 @@
     ],
     "depth": 2,
     "depth_single": 3,
-    "flow_map": false,
     "heads": 2,
     "hidden": 64,
     "image_rope_scale": 0.5,
@@ -25,7 +24,7 @@
     "vec_in_dim": null
   },
   "format_version": 1,
-  "model": "flux-3-image-klein-base-tiny-fixture",
+  "model": "flux-3-image-klein",
   "quantization": null,
   "sampler": {
     "alpha": 6.93,

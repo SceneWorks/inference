@@ -80,7 +80,7 @@ pub fn convert_ggml(
 pub(crate) mod tests {
     use super::*;
     use candle_gen::gen_core::flux3::conversion::ComponentRole;
-    use candle_gen::gen_core::flux3::{Flux3Config, DIT_WEIGHTS_FILE};
+    use candle_gen::gen_core::flux3::DIT_WEIGHTS_FILE;
     use candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
     use std::path::PathBuf;
 
@@ -144,7 +144,7 @@ pub(crate) mod tests {
             r1.verify_external(&source.root).unwrap();
             assert!(!one.join("ae.safetensors").exists());
             assert_eq!(NativeDitStorage::from_package(&one).unwrap(), storage);
-            let cfg = Flux3Config::from_dir(&one).unwrap();
+            let cfg = gen_core::flux3::resolve_checkpoint(&one).unwrap();
             storage
                 .validate_headers(
                     &cfg.dit,

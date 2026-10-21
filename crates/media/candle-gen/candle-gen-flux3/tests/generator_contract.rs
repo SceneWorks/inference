@@ -611,8 +611,9 @@ fn components_override_the_bundled_copies() {
     }
 }
 
-/// A CFG (base) package is a typed refusal at load, never sampled as a flow map; a quantized
-/// package likewise (sc-26241).
+/// A CFG (base) package is a typed refusal at load, never sampled as a flow map — decided by its
+/// DiT header (no `ref_time_in`), not its descriptive metadata; metadata that contradicts the
+/// header is refused too, and a quantized package likewise (sc-26241).
 #[test]
 fn base_and_quantized_packages_are_typed_refusals() {
     let registry = candle_gen_flux3::provider_registry().unwrap();
@@ -625,11 +626,37 @@ fn base_and_quantized_packages_are_typed_refusals() {
     assert!(
         matches!(registry.memory_strategy_contract(ID, &file), Err(CoreError::Unsupported(message)) if message.contains("package directory"))
     );
+    // The real tiny base package (header without `ref_time_in`) on the distilled route.
+    let mut base = LoadSpec::new(WeightsSource::Dir(
+        crate::common::fixtures().join("tiny-base-snapshot"),
+    ));
+    base.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(tiny_text_encoder()),
+    );
+    base.components.insert(
+        AUTOENCODER_COMPONENT.into(),
+        WeightsSource::File(tiny_autoencoder()),
+    );
+    for result in [
+        registry.load(ID, &base).map(|_| ()),
+        registry.memory_strategy_contract(ID, &base).map(|_| ()),
+    ] {
+        match result {
+            Err(CoreError::Unsupported(m)) => assert!(m.contains("flow_map"), "base route: {m}"),
+            other => panic!(
+                "base route: expected a typed refusal, got {:?}",
+                other.err()
+            ),
+        }
+    }
     let config = std::fs::read_to_string(tiny_package().join("config.json")).unwrap();
     for (what, needle, edit) in [
         (
-            "base checkpoint",
-            "CFG checkpoint",
+            // The distilled DiT header carries `ref_time_in`; metadata claiming a CFG base is a
+            // contradiction, never a route switch.
+            "metadata contradicting the checkpoint header",
+            "flow_map",
             config
                 .replace("\"flow_map\": true", "\"flow_map\": false")
                 .replace("\"guidance\": null", "\"guidance\": 3.5")

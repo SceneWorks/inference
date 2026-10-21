@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::Flux3Config;
+use candle_gen::gen_core::flux3::{resolve_checkpoint, Flux3Config};
 
 /// The MLX twin's `tests/fixtures/` — produced once by `crates/media/mlx-gen/tools/dump_flux3_*.py`
 /// from the frozen upstream and read by both backends.
@@ -32,8 +32,20 @@ pub fn tiny_autoencoder() -> PathBuf {
     tiny_package().join("ae.safetensors")
 }
 
+/// The miniature distilled package's config, resolved header-authoritatively (its DiT carries
+/// `ref_time_in`, so `flow_map` is the checkpoint's, not the metadata's).
 pub fn tiny_config() -> Flux3Config {
-    Flux3Config::from_dir(&tiny_package()).expect("tiny config.json parses")
+    resolve_checkpoint(&tiny_package()).expect("tiny package resolves")
+}
+
+/// The miniature CFG base package (`config.json` + `model.safetensors`, no `ref_time_in`).
+pub fn tiny_base_package() -> PathBuf {
+    fixtures().join("tiny-base-snapshot")
+}
+
+/// The miniature base package's config, resolved from its own DiT header.
+pub fn tiny_base_config() -> Flux3Config {
+    resolve_checkpoint(&tiny_base_package()).expect("tiny base package resolves")
 }
 
 /// The parity lane's device: Candle CPU (true f32, like the oracle's FP32 CPU path).

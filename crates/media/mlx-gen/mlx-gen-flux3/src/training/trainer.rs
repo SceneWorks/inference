@@ -8,6 +8,8 @@ use super::{
 };
 use crate::autoencoder::FrozenTrainingEncoder;
 use crate::{Flux3TextEncoder, SampleTokens};
+use gen_core::flux3::artifacts::NativeDitStorage;
+use gen_core::flux3::quantization::DitFormat;
 use gen_core::flux3::training::{
     caption_choice,
     checkpoint::{ResumePolicy, TrainingCursor},
@@ -23,9 +25,8 @@ use gen_core::flux3::training::{
     training_condition_ids, training_sigma, CaptionChoice, ResumeIdentity, Weighting,
 };
 use gen_core::flux3::{
-    assemble_window, latent_ids, scaled_image_ids, Flux3Config, GenerationResources,
-    AUTOENCODER_COMPONENT, BASE_MODEL_ID, CONFIG_FILE, DIT_WEIGHTS_FILE, FAMILY, IMAGE_ROPE_SCALE,
-    TEXT_ENCODER_COMPONENT,
+    assemble_window, latent_ids, scaled_image_ids, GenerationResources, AUTOENCODER_COMPONENT,
+    BASE_MODEL_ID, DIT_WEIGHTS_FILE, FAMILY, IMAGE_ROPE_SCALE, TEXT_ENCODER_COMPONENT,
 };
 use gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -515,11 +516,24 @@ fn execute(
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(invalid("base directory required"));
     };
-    let cfg = Flux3Config::parse(
-        &std::fs::read_to_string(root.join(CONFIG_FILE))
-            .map_err(|e| invalid(format!("read base config: {e}")))?,
-    )
-    .map_err(Error::from)?;
+    // Header authority before any encoder, autoencoder or dataset work: the strict resolver's
+    // `ref_time_in` pair decides the mode, the base (CFG) route must match it, and the FULL dense
+    // inventory of the package's own DiT file is checked before anything is decoded or loaded.
+    let cfg = gen_core::flux3::resolve_checkpoint(root).map_err(Error::from)?;
+    cfg.validate_route(BASE_MODEL_ID).map_err(Error::from)?;
+    let storage = NativeDitStorage::from_package(root).map_err(Error::from)?;
+    if storage != NativeDitStorage::Publisher(DitFormat::Dense) {
+        return Err(invalid(format!(
+            "requires the dense pinned base directory, not a {} package",
+            storage.key().map_err(Error::from)?
+        )));
+    }
+    storage
+        .validate_headers(
+            &cfg.dit,
+            &gen_core::flux3::checkpoint_tensor_headers(root).map_err(Error::from)?,
+        )
+        .map_err(Error::from)?;
     identity::validate_release_config(&cfg).map_err(Error::from)?;
     let resources =
         GenerationResources::from_spec(spec, &cfg, BASE_MODEL_ID).map_err(Error::from)?;
@@ -751,6 +765,7 @@ mod tests {
     //! pending-gradient resume / bit-identical continuation / reload contract as Candle.
     use super::*;
     use gen_core::flux3::training::policy::SourceLrKind;
+    use gen_core::flux3::Flux3Config;
     use gen_core::train::{TrainingConfig, TrainingItem};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -787,10 +802,8 @@ mod tests {
         session_for(Workflow::PairedEdit)
     }
     fn session_for(workflow: Workflow) -> (MlxSession, Flux3Config) {
-        let config = Flux3Config::parse(
-            &std::fs::read_to_string(fixtures().join("tiny-base-snapshot/config.json")).unwrap(),
-        )
-        .unwrap();
+        let config =
+            gen_core::flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
         let dit = crate::model::load_dit(
             &fixtures().join("tiny-base-snapshot/model.safetensors"),
             &config,

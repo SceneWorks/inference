@@ -25,8 +25,7 @@ use super::quantization::DitFormat;
 use super::safetensors_stream::{
     PlannedTensor, SafetensorsSource, SafetensorsStreamWriter, SourceTensor,
 };
-use super::{Flux3Config, CONFIG_FILE, DIT_WEIGHTS_FILE};
-use crate::weightsmeta::safetensors_path_tensor_headers;
+use super::{CONFIG_FILE, DIT_WEIGHTS_FILE};
 use crate::{CancelFlag, Error, Result};
 
 fn invalid(detail: impl std::fmt::Display) -> Error {
@@ -114,8 +113,13 @@ pub fn convert_native(
     let root_buf = std::fs::canonicalize(&source.root)
         .map_err(|e| invalid(format!("resolve {}: {e}", source.root.display())))?;
     let root = &root_buf;
-    let config = Flux3Config::from_dir(root)?;
+    let config = super::resolve_checkpoint(root)?;
     config.validate_supported()?;
+    super::conversion::validate_source_mode(
+        &source.repository,
+        &source.revision,
+        config.dit.flow_map,
+    )?;
     let dense = NativeDitStorage::from_package(root)?;
     if dense != NativeDitStorage::Publisher(DitFormat::Dense) {
         return Err(invalid(
@@ -124,7 +128,10 @@ pub fn convert_native(
         ));
     }
     let dit_source = root.join(DIT_WEIGHTS_FILE);
-    dense.validate_headers(&config.dit, &safetensors_path_tensor_headers(&dit_source)?)?;
+    dense.validate_headers(&config.dit, &super::checkpoint_tensor_headers(root)?)?;
+    if !dit_source.is_file() {
+        return Err(invalid("native conversion requires the frozen single-file dense source model.safetensors; sharded metadata is not a source-byte identity"));
+    }
     let reader = SafetensorsSource::open(&dit_source)?;
     let expected = storage.expected_tensors(&config.dit)?;
     let targets = storage.packed_targets(&config.dit)?;

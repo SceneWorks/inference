@@ -277,6 +277,55 @@ fn push_mode<'a>(
     Ok(())
 }
 
+/// The two `ref_time_in` projections (`MLPEmbedder` is bias-free) whose presence is the
+/// checkpoint's own flow-map evidence (`checkpoint.FLOW_MAP_KEY`).
+pub const REF_TIME_KEYS: [&str; 2] = [
+    "ref_time_in.in_layer.weight",
+    "ref_time_in.out_layer.weight",
+];
+
+/// The checkpoint's `ref_time_in` evidence against the resolved `cfg.flow_map`: both projections
+/// or neither (half a target-time embedder is no architecture), and that presence must equal the
+/// resolved bool. A typed refusal naming `flow_map`, checked before any other weight is read.
+pub fn check_ref_time_pair(cfg: &DitConfig, contains: impl Fn(&str) -> bool) -> Result<bool> {
+    let [has_in, has_out] = REF_TIME_KEYS.map(contains);
+    if has_in != has_out {
+        let [present, absent] = if has_in {
+            REF_TIME_KEYS
+        } else {
+            [REF_TIME_KEYS[1], REF_TIME_KEYS[0]]
+        };
+        return Err(Error::Unsupported(format!(
+            "flux3: the checkpoint carries only half of `ref_time_in` ({present} present, \
+             {absent} absent); flow_map cannot be resolved from a partial target-time embedder"
+        )));
+    }
+    if has_in != cfg.flow_map {
+        return Err(Error::Unsupported(format!(
+            "flux3: the resolved config says flow_map = {} but the checkpoint {} `ref_time_in` \
+             (the flow-map key `checkpoint.FLOW_MAP_KEY`)",
+            cfg.flow_map,
+            if has_in { "carries" } else { "lacks" }
+        )));
+    }
+    Ok(has_in)
+}
+
+/// Full physical-inventory preflight of one selected DiT checkpoint for EVERY storage (dense
+/// included): the `ref_time_in` pair against `cfg.flow_map` first, then the exact names / dtypes /
+/// shapes `storage` implies. Header-only — no tensor byte is read and no device is touched, so a
+/// caller runs it before any text-encoder, autoencoder, adapter or memory work.
+pub fn validate_checkpoint_headers(
+    cfg: &DitConfig,
+    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    headers: &[candle_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> Result<()> {
+    check_ref_time_pair(cfg, |key| headers.iter().any(|h| h.name == key))?;
+    storage
+        .validate_headers(cfg, headers)
+        .map_err(|e| Error::Unsupported(e.to_string()))
+}
+
 impl Flux3Dit {
     /// Install one preflight-validated projection; unknown paths remain typed refusals.
     pub fn install_lora(
@@ -366,10 +415,12 @@ impl Flux3Dit {
         )
     }
 
-    /// [`Self::load`] for an explicit native storage. The exact physical inventory is validated
-    /// from the headers BEFORE any tensor is read; GGML targets load as `QTensor`s and every
-    /// other tensor through the dense compute-dtype path. Publisher FP8R/NVFP4 and MLX affine
-    /// storage are typed refusals here (no Candle kernel / not a Candle format).
+    /// [`Self::load`] for an explicit native storage. The exact physical inventory of EVERY
+    /// storage (dense included) is validated from the headers BEFORE any tensor is read
+    /// ([`validate_checkpoint_headers`]); GGML targets load as `QTensor`s and every other tensor
+    /// through the dense compute-dtype path. Publisher FP8R/NVFP4 load onto their CUDA kernels
+    /// ([`PublisherSource::new`] refuses any other backend); MLX affine storage is a typed refusal
+    /// (not a Candle format).
     pub fn load_with_storage(
         path: &Path,
         cfg: &DitConfig,
@@ -384,18 +435,11 @@ impl Flux3Dit {
                 path.display()
             )));
         }
-        let dense = NativeDitStorage::Publisher(
-            candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
-        );
-        if storage != dense {
-            // The dense path keeps its historical per-key checks; a packed package must match its
-            // exact physical inventory before one code byte is read.
-            let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
-                .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
-            storage
-                .validate_headers(cfg, &headers)
-                .map_err(|e| Error::Unsupported(e.to_string()))?;
-        }
+        // Every storage, dense included, must match its exact physical inventory (and its
+        // `ref_time_in` pair the resolved flow_map) before one tensor byte is read.
+        let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+            .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
+        validate_checkpoint_headers(cfg, storage, &headers)?;
         use candle_gen::gen_core::flux3::quantization::DitFormat;
         let targets = || {
             storage
@@ -458,6 +502,10 @@ impl Flux3Dit {
             packed,
             publisher,
         };
+        // The flow-map evidence (the `ref_time_in` pair) against the resolved bool FIRST: an
+        // in-memory map that disagrees is refused before any other weight is read or cast onto
+        // the device.
+        let has_ref = check_ref_time_pair(cfg, |key| l.contains(key))?;
         let hidden = cfg.hidden;
         let emb_in_image = l.linear("emb_in.image")?;
         let emb_in_image_cond = l.linear("emb_in.image_cond")?;
@@ -483,15 +531,6 @@ impl Flux3Dit {
             }
         }
         let time_in = MlpEmbedder::load(&l, "time_in")?;
-        let has_ref = l.contains("ref_time_in.in_layer.weight");
-        if has_ref != cfg.flow_map {
-            return Err(Error::Unsupported(format!(
-                "flux3: config.json says flow_map = {} but the checkpoint {} `ref_time_in` (the \
-                 flow-map key `checkpoint.FLOW_MAP_KEY`)",
-                cfg.flow_map,
-                if has_ref { "carries" } else { "lacks" }
-            )));
-        }
         let ref_time_in = if has_ref {
             Some(MlpEmbedder::load(&l, "ref_time_in")?)
         } else {
@@ -799,5 +838,90 @@ impl Flux3Dit {
             cat(&refs, 0)
         };
         Ok([one(0)?, one(1)?, one(2)?])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tiny_dit_config() -> DitConfig {
+        candle_gen::gen_core::flux3::resolve_checkpoint(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
+        )
+        .unwrap()
+        .dit
+    }
+
+    /// The in-memory constructor checks the `ref_time_in` pair against the resolved bool BEFORE
+    /// any other weight: each map below holds nothing else, so reaching `emb_in.image` would be a
+    /// missing-tensor `Msg`, not this typed refusal. CPU only, no device context.
+    ///
+    /// *Mutations that red this:* checking only one half of the pair, or moving the check after
+    /// the input projections.
+    #[test]
+    fn in_memory_flow_map_evidence_is_checked_before_any_other_weight() {
+        let device = Device::Cpu;
+        let flow = tiny_dit_config();
+        assert!(flow.flow_map);
+        let mut cfg_map = flow.clone();
+        cfg_map.flow_map = false;
+        let weight = || Tensor::zeros((2, 2), DType::F32, &device).unwrap();
+        for (cfg, present, needle) in [
+            (&flow, vec![REF_TIME_KEYS[0]], "half"),
+            (&flow, vec![REF_TIME_KEYS[1]], "half"),
+            (&cfg_map, vec![REF_TIME_KEYS[0]], "half"),
+            (&flow, vec![], "lacks"),
+            (&cfg_map, REF_TIME_KEYS.to_vec(), "carries"),
+        ] {
+            let tensors: HashMap<String, Tensor> =
+                present.iter().map(|k| (k.to_string(), weight())).collect();
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            match Flux3Dit::from_var_builder(&vb, cfg, DType::F32, &device) {
+                Err(Error::Unsupported(m)) => {
+                    assert!(
+                        m.contains(needle) && m.contains("ref_time_in"),
+                        "{present:?}: {m}"
+                    )
+                }
+                Err(other) => panic!("{present:?}: expected a typed refusal, got {other:?}"),
+                Ok(_) => panic!("{present:?}: must be refused"),
+            }
+        }
+    }
+
+    /// The header preflight covers the dense storage too, with the same pair check first.
+    #[test]
+    fn dense_header_preflight_checks_the_pair_then_the_inventory() {
+        use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        let cfg = tiny_dit_config();
+        let dense = NativeDitStorage::Publisher(DitFormat::Dense);
+        let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot/model.safetensors"),
+        )
+        .unwrap();
+        validate_checkpoint_headers(&cfg, dense, &headers).unwrap();
+        let half: Vec<_> = headers
+            .iter()
+            .filter(|h| h.name != REF_TIME_KEYS[1])
+            .cloned()
+            .collect();
+        match validate_checkpoint_headers(&cfg, dense, &half) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("half"), "{m}"),
+            other => panic!("expected a typed pair refusal, got {other:?}"),
+        }
+        let missing: Vec<_> = headers
+            .iter()
+            .filter(|h| h.name != "txt_in.weight")
+            .cloned()
+            .collect();
+        match validate_checkpoint_headers(&cfg, dense, &missing) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("txt_in.weight"), "{m}"),
+            other => panic!("expected a typed inventory refusal, got {other:?}"),
+        }
     }
 }

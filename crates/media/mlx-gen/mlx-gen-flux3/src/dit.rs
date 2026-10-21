@@ -254,6 +254,38 @@ pub struct SampleTokens<'a> {
     pub target_timestep: Option<f32>,
 }
 
+/// Upstream `checkpoint.FLOW_MAP_KEY` (`ref_time_in`): the target-time embedder only the
+/// distilled flow-map checkpoint carries, as an `in_layer` / `out_layer` pair.
+const REF_TIME_PAIR: [&str; 2] = [
+    "ref_time_in.in_layer.weight",
+    "ref_time_in.out_layer.weight",
+];
+
+/// Whether the in-memory map carries the `ref_time_in` pair, checked against the resolved route
+/// before any other weight is read: both halves or neither, present exactly when `cfg.flow_map`.
+fn ref_time_pair(w: &Weights, cfg: &DitConfig) -> Result<bool> {
+    let [has_in, has_out] = REF_TIME_PAIR.map(|key| w.get(key).is_some());
+    if has_in != has_out {
+        return Err(Error::Unsupported(format!(
+            "flux3: the DiT weights carry half a `ref_time_in` pair ({} {}, {} {}); the flow-map \
+             target-time embedder is both tensors or neither",
+            REF_TIME_PAIR[0],
+            if has_in { "present" } else { "absent" },
+            REF_TIME_PAIR[1],
+            if has_out { "present" } else { "absent" },
+        )));
+    }
+    if has_in != cfg.flow_map {
+        return Err(Error::Unsupported(format!(
+            "flux3: the resolved checkpoint config has flow_map = {} but the DiT weights {} \
+             `ref_time_in` (the flow-map key `checkpoint.FLOW_MAP_KEY`)",
+            cfg.flow_map,
+            if has_in { "carry" } else { "lack" }
+        )));
+    }
+    Ok(has_in)
+}
+
 /// The loaded DiT.
 pub struct Flux3Dit {
     cfg: DitConfig,
@@ -381,6 +413,10 @@ impl Flux3Dit {
         compute: Dtype,
         affine: Option<&crate::nn::AffineTargets>,
     ) -> Result<Self> {
+        // The route authority comes first: the resolved `flow_map` and the in-memory map's
+        // `ref_time_in` pair must agree before any other weight is read, so a half pair or a
+        // mismatched route is a typed refusal, never a failure deep in the block stack.
+        let has_ref = ref_time_pair(w, cfg)?;
         let l = Loader {
             weights: w,
             compute,
@@ -411,15 +447,6 @@ impl Flux3Dit {
             }
         }
         let time_in = MlpEmbedder::load(&l, "time_in")?;
-        let has_ref = w.get("ref_time_in.in_layer.weight").is_some();
-        if has_ref != cfg.flow_map {
-            return Err(Error::Unsupported(format!(
-                "flux3: config.json says flow_map = {} but the checkpoint {} `ref_time_in` (the \
-                 flow-map key `checkpoint.FLOW_MAP_KEY`)",
-                cfg.flow_map,
-                if has_ref { "carries" } else { "lacks" }
-            )));
-        }
         let ref_time_in = if has_ref {
             Some(MlpEmbedder::load(&l, "ref_time_in")?)
         } else {
@@ -743,5 +770,61 @@ impl Flux3Dit {
             cat(&refs, 0)
         };
         Ok([one(0)?, one(1)?, one(2)?])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use super::*;
+
+    fn tiny_dit(flow_map: bool) -> DitConfig {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(if flow_map {
+            "tests/fixtures/tiny-snapshot"
+        } else {
+            "tests/fixtures/tiny-base-snapshot"
+        });
+        let config = gen_core::flux3::resolve_checkpoint(&dir).unwrap();
+        assert_eq!(config.dit.flow_map, flow_map, "{}", dir.display());
+        config.dit
+    }
+
+    /// A map holding ONLY `ref_time_in` tensors: any refusal that names another key would prove
+    /// the route check ran after the projections. No array is evaluated.
+    fn map(keys: &[&str]) -> Weights {
+        Weights::from_map(
+            keys.iter()
+                .map(|k| (k.to_string(), Array::zeros::<f32>(&[1, 1]).unwrap()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    fn refusal(w: &Weights, cfg: &DitConfig) -> String {
+        match Flux3Dit::from_weights(w, cfg, Dtype::Float32) {
+            Err(Error::Unsupported(message)) => message,
+            Err(other) => panic!("expected a typed refusal, got {other}"),
+            Ok(_) => panic!("expected a typed refusal, the DiT loaded"),
+        }
+    }
+
+    #[test]
+    fn ref_time_pair_and_route_are_checked_before_any_other_weight() {
+        let distilled = tiny_dit(true);
+        let base = tiny_dit(false);
+        for half in REF_TIME_PAIR {
+            for cfg in [&distilled, &base] {
+                let message = refusal(&map(&[half]), cfg);
+                assert!(message.contains("half a `ref_time_in` pair"), "{message}");
+                assert!(!message.contains("emb_in"), "{message}");
+            }
+        }
+        let message = refusal(&map(&REF_TIME_PAIR), &base);
+        assert!(message.contains("flow_map = false"), "{message}");
+        assert!(message.contains("carry"), "{message}");
+        let message = refusal(&map(&[]), &distilled);
+        assert!(message.contains("flow_map = true"), "{message}");
+        assert!(message.contains("lack"), "{message}");
     }
 }

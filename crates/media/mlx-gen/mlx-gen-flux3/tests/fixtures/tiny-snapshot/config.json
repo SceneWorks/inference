@@ -25,7 +25,7 @@
     "vec_in_dim": null
   },
   "format_version": 1,
-  "model": "flux-3-image-klein-tiny-fixture",
+  "model": "flux-3-image-klein",
   "quantization": null,
   "sampler": {
     "alpha": 6.93,
