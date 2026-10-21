@@ -175,8 +175,8 @@ fn price_request_controls(
     let quanta = price_quanta(&facts, work, req.execution)?;
     let mut pricing = IosPricing::default();
     if let Some(sampling) = sampling {
-        let elements = u64::from(work.width / crate::config::VAE_COMPRESSION as u32)
-            * u64::from(work.height / crate::config::VAE_COMPRESSION as u32)
+        let elements = u64::from(work.width / crate::config::VAE_COMPRESSION)
+            * u64::from(work.height / crate::config::VAE_COMPRESSION)
             * crate::config::VAE_CHANNELS as u64;
         let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
             sampling.solver(),

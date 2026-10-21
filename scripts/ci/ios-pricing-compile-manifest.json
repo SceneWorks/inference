@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "80c01a92cb55b542c0a1672f00a024b7cbf104ac0c023e3d629af0f0614ac716",
+  "rust_proof_closure_sha256": "0824ec7236902b4d5042e709c1cc11674163376320f290badcafbf7a91ea9063",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -108,7 +108,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-anima/src/ios_pricing.rs",
-      "sha256": "0a7589b8a5cb8a219ff5a116aaaa0df52d5a4ae14301508f4b2b0641337979d4"
+      "sha256": "cb806d914279cb86fec51333d51732364f7f0fc67204de9262b6515783b7e37d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-anima/src/lib.rs",
