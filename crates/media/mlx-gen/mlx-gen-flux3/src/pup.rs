@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn near_limit_native_layout_caption_reaches_final_parameters_once() {
-        let config = gen_core::flux3::Flux3Config::from_dir(
+        let config = gen_core::flux3::resolve_checkpoint(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot"),
         )
         .unwrap();

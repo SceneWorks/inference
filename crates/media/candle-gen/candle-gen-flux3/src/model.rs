@@ -10,7 +10,7 @@ use candle_gen::gen_core::flux3::artifacts::{ArtifactBackend, NativeDitStorage};
 use candle_gen::gen_core::flux3::conversion::ComponentRole;
 use candle_gen::gen_core::flux3::quantization::DitFormat;
 use candle_gen::gen_core::flux3::{
-    validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
+    validate_generation_request, Flux3Config, GenerationParams, GenerationResources, BASE_MODEL_ID,
     DISTILLED_MODEL_ID, FAMILY, SAMPLERS, TEXT_ENCODER_COMPONENT,
 };
 use candle_gen::gen_core::{
@@ -195,15 +195,13 @@ pub fn load_autoencoder(path: &Path, device: &Device) -> Result<Flux3AutoEncoder
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_backend(device: &Device) -> Result<ArtifactBackend> {
+fn cuda_backend(id: &str, device: &Device) -> Result<ArtifactBackend> {
     let Device::Cuda(cuda) = device else {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: expected a CUDA device"
-        )));
+        return Err(Error::Unsupported(format!("{id}: expected a CUDA device")));
     };
     let (major, minor) = candle_quant_kernels::nvrtc::device_compute_cap(cuda).map_err(|e| {
         Error::Unsupported(format!(
-            "{MODEL_ID}: cannot read the CUDA compute capability: {e}"
+            "{id}: cannot read the CUDA compute capability: {e}"
         ))
     })?;
     Ok(ArtifactBackend::CandleCuda {
@@ -214,9 +212,9 @@ fn cuda_backend(device: &Device) -> Result<ArtifactBackend> {
 
 /// A non-CUDA build never opens a CUDA device.
 #[cfg(not(feature = "cuda"))]
-fn cuda_backend(_device: &Device) -> Result<ArtifactBackend> {
+fn cuda_backend(id: &str, _device: &Device) -> Result<ArtifactBackend> {
     Err(Error::Unsupported(format!(
-        "{MODEL_ID}: this build has no CUDA backend"
+        "{id}: this build has no CUDA backend"
     )))
 }
 
@@ -225,6 +223,7 @@ fn cuda_backend(_device: &Device) -> Result<ArtifactBackend> {
 /// component full-hash verified where this load actually reads it (the resolved text-encoder
 /// directory and autoencoder file). A mismatch is refused before any weight is read.
 fn verify_native_package(
+    id: &str,
     package_dir: &Path,
     storage: NativeDitStorage,
     config: &Flux3Config,
@@ -234,7 +233,7 @@ fn verify_native_package(
     let (algorithm, bits, group_size) = storage.receipt_algorithm()?;
     if receipt.algorithm != algorithm || receipt.bits != bits || receipt.group_size != group_size {
         return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: {} receipt records {} (bits {:?}, group {:?}), not the declared {}",
+            "{id}: {} receipt records {} (bits {:?}, group {:?}), not the declared {}",
             package_dir.display(),
             receipt.algorithm,
             receipt.bits,
@@ -247,23 +246,21 @@ fn verify_native_package(
         ComponentRole::TextEncoder => path
             .strip_prefix(&te_prefix)
             .map(|rest| resources.text_encoder_dir.join(rest))
-            .ok_or_else(|| {
-                gen_core::Error::Unsupported(format!("{MODEL_ID}: text-encoder path {path}"))
-            }),
+            .ok_or_else(|| gen_core::Error::Unsupported(format!("{id}: text-encoder path {path}"))),
         ComponentRole::Autoencoder if path == config.vae.path => {
             Ok(resources.autoencoder_file.clone())
         }
         other => Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: external {} file {path} has no resolved load location",
+            "{id}: external {} file {path} has no resolved load location",
             other.name()
         ))),
     })?;
     Ok(())
 }
 
-pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
-    crate::memory_strategy::selected_storage(spec.quantize)?;
+pub(crate) fn refuse_unsupported_spec(id: &str, spec: &LoadSpec) -> Result<()> {
+    crate::memory_strategy::refuse_deferred_load_shape(id, spec)?;
+    crate::memory_strategy::selected_storage(id, spec.quantize)?;
     let refusals: [(&str, bool); 6] = [
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
@@ -275,8 +272,8 @@ pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     for (field, set) in refusals {
         if set {
             return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: LoadSpec::{field} is not supported by the distilled FLUX 3 route \
-                 (the text encoder is the '{TEXT_ENCODER_COMPONENT}' component)"
+                "{id}: LoadSpec::{field} is not supported by the Candle FLUX 3 route (the text \
+                 encoder is the '{TEXT_ENCODER_COMPONENT}' component)"
             )));
         }
     }
@@ -299,38 +296,17 @@ pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
-    refuse_unsupported_spec(spec)?;
-    let package_dir = match &spec.weights {
-        gen_core::WeightsSource::Dir(dir) => dir.clone(),
-        gen_core::WeightsSource::File(file) => {
-            return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: the weights resource must be the package directory, not {}",
-                file.display()
-            )))
-        }
-    };
-    let config = Flux3Config::from_dir(&package_dir)?;
-    let storage = crate::memory_strategy::selected_storage(spec.quantize)?;
-    let package_storage = NativeDitStorage::from_package(&package_dir)?;
-    if package_storage != storage {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: selected {} but the quantization marker of {} is {}; install or \
-             convert the exact requested native tier (no tier or model fallback)",
-            storage.key()?,
-            package_dir.display(),
-            package_storage.key()?
-        )));
-    }
-    storage.validate_selection(spec.quantize, spec.precision)?;
+    let id = if base { BASE_MODEL_ID } else { MODEL_ID };
+    refuse_unsupported_spec(id, spec)?;
+    let package_dir = crate::memory_strategy::package_dir(id, spec)?;
+    // Header-authoritative: the mode is the selected DiT checkpoint's (`ref_time_in`), never the
+    // descriptive `config.json` (both real packages carry the same metadata), and the package
+    // must BE the selected route. Then the full header preflight of the selected storage (dense
+    // included) — all before any adapter, text-encoder, autoencoder, memory or device work, and
+    // never deferred to a `Sequential` first render.
+    let config = crate::memory_strategy::resolve_route_checkpoint(id, &package_dir)?;
+    let storage = crate::memory_strategy::preflight_checkpoint(id, spec, &package_dir, &config)?;
     let dense = storage == NativeDitStorage::Publisher(DitFormat::Dense);
-    if dense {
-        config.validate_supported()?;
-    } else {
-        config.validate_native_storage_graph()?;
-    }
-    if config.dit.flow_map == base {
-        return Err(Error::Unsupported(format!("flux3: selected {} route but package {} has flow_map={}; select the matching CFG checkpoint or distilled flow-map route", if base { "base CFG" } else { "distilled flow-map" }, config.model, config.dit.flow_map)));
-    }
     crate::adapters::validate(&spec.adapters, &config.dit)?;
     let adapter_reports = spec
         .adapters
@@ -344,24 +320,25 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         })
         .collect::<gen_core::Result<Vec<_>>>()?;
 
-    let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
+    let resources = GenerationResources::from_spec(spec, &config, id)?;
     // Converted packages carry a receipt; a publisher FP8R/NVFP4 package is the pinned upstream
     // repository itself, whose identity is the install manifest's, not a conversion's.
     if !dense && !matches!(storage, NativeDitStorage::Publisher(_)) {
-        verify_native_package(&package_dir, storage, &config, &resources)?;
+        verify_native_package(id, &package_dir, storage, &config, &resources)?;
     }
     // Priced from the resources' tensor headers BEFORE any weight is read, so a spec the
     // registration refuses is the same refusal through `load` on every offload policy
     // (`Sequential` defers every component to the first render).
-    let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
+    let memory_strategy =
+        crate::memory_strategy::generation_contract(id, spec, &resources, &config)?;
     // Resolve only the optional source path. No VLM/model/prefix cache is loaded
     // until an enabled request enters the exclusive prepare phase.
     let prompt_upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
     let device = candle_gen::default_device().map_err(|e| {
         Error::Unsupported(format!(
-        "{MODEL_ID}: cannot initialize the selected native Candle device: {e}; use a supported \
+            "{id}: cannot initialize the selected native Candle device: {e}; use a supported \
          NVIDIA CUDA device and driver, or the native MLX backend on Apple Silicon"
-    ))
+        ))
     })?;
     if !dense {
         // The device's REAL compute capability: the publisher FP8R/NVFP4 floors depend on it
@@ -371,7 +348,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         } else if device.is_metal() {
             ArtifactBackend::CandleMetal
         } else {
-            cuda_backend(&device)?
+            cuda_backend(id, &device)?
         };
         storage.check_backend(backend)?;
     }
@@ -405,7 +382,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
                 let ae = load_autoencoder(&ae_path, &heavy_device)?;
                 if ae.latent_channels() != heavy_cfg.dit.image_in_channels {
                     return Err(Error::Msg(format!(
-                        "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
+                        "{id}: the autoencoder at {} packs {} channels per token, the DiT \
                      reads {}",
                         ae_path.display(),
                         ae.latent_channels(),
@@ -689,7 +666,7 @@ impl Flux3Klein {
             req,
         )?;
         validate_generation_request(self.descriptor.id, req, &self.config)?;
-        refuse_unhonored_memory(req)?;
+        refuse_unhonored_memory(self.descriptor.id, req)?;
         Ok(())
     }
 }
@@ -698,7 +675,7 @@ impl Flux3Klein {
 /// ignored: the autoencoder decode is not tiled (sc-26241), there is no bounded-attention path
 /// through the DiT and no block-streaming loader. Staged residency is the one control honoured
 /// ([`stage_residency_for`]), and it is the only one the route's request scope ever writes.
-fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
+fn refuse_unhonored_memory(id: &str, req: &GenerationRequest) -> Result<()> {
     let Some(memory) = req.memory else {
         return Ok(());
     };
@@ -713,8 +690,8 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
     for (control, set) in refusals {
         if set {
             return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: GenerationMemory::{control} is not a memory strategy of the Candle \
-                 distilled FLUX 3 route (it stages residency only)"
+                "{id}: GenerationMemory::{control} is not a memory strategy of the Candle \
+                 FLUX 3 route (it stages residency only)"
             )));
         }
     }
@@ -1221,30 +1198,170 @@ mod tests {
     }
 
     /// Every unsupported load axis is a typed `Unsupported`, never a stringified message and
-    /// never a torch fallback.
+    /// never a torch fallback. The publisher FP8R/NVFP4 tiers are the CUDA build's capability
+    /// (loaded as shipped onto their kernels), so only the other builds refuse them by spec.
     ///
-    /// *Mutation that reds this:* dropping any row of `refuse_unsupported_spec`'s table.
+    /// *Mutation that reds this:* dropping any row of `refuse_unsupported_spec`'s table, or
+    /// advertising/refusing the publisher tiers on the wrong build.
     #[test]
     fn unsupported_spec_fields_are_typed_refusals() {
         let sentinel = || LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()));
-        let mut quant = sentinel();
-        quant.quantize = Some(gen_core::Quant::Nvfp4);
         let mut pid = sentinel();
         pid.pid = Some(gen_core::PidWeights {
             checkpoint: WeightsSource::File("/pid-not-on-disk.safetensors".into()),
             gemma: WeightsSource::Dir("/gemma-not-on-disk".into()),
         });
-        for (field, spec) in [
-            ("quantize", quant),
+        let mut refusals = vec![
             ("pid", pid),
             (
                 "load_shape",
                 sentinel().with_load_shape(gen_core::LoadShape::DeferredMaterialization),
             ),
+        ];
+        for quant in [gen_core::Quant::Nvfp4, gen_core::Quant::Fp8Rowwise] {
+            let spec = sentinel().with_quant(quant);
+            if cfg!(feature = "cuda") {
+                // Admitted by spec on CUDA; the package/device checks run later, at load.
+                refuse_unsupported_spec(MODEL_ID, &spec).unwrap();
+                refuse_unsupported_spec(BASE_MODEL_ID, &spec).unwrap();
+            } else {
+                refusals.push(("quantize", spec));
+            }
+        }
+        for (field, spec) in refusals {
+            for (id, result) in [(MODEL_ID, load(&spec)), (BASE_MODEL_ID, load_base(&spec))] {
+                match result {
+                    Err(gen_core::Error::Unsupported(m)) => {
+                        assert!(m.contains(field), "{m}");
+                        assert!(m.starts_with(id), "{id}: the refusal names the route: {m}");
+                    }
+                    other => panic!(
+                        "{id} {field}: expected a typed refusal, got {:?}",
+                        other.err()
+                    ),
+                }
+            }
+        }
+    }
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mlx-gen/mlx-gen-flux3/tests/fixtures")
+    }
+
+    /// The route is the DiT HEADER's, checked before any component is resolved: neither spec
+    /// names a text encoder / autoencoder the base package lacks, so reaching resource resolution
+    /// would be a missing-resource `Msg`, not this typed refusal.
+    ///
+    /// *Mutations that red this:* dropping `validate_route`, or resolving it after
+    /// `GenerationResources::from_spec`.
+    #[test]
+    fn the_wrong_route_is_refused_from_the_header_before_component_work() {
+        for (base, dir) in [(false, "tiny-base-snapshot"), (true, "tiny-snapshot")] {
+            let spec = LoadSpec::new(WeightsSource::Dir(fixtures().join(dir)));
+            match load_inner(&spec, base) {
+                Err(Error::Unsupported(m)) => assert!(m.contains("flow_map"), "{dir}: {m}"),
+                Err(other) => panic!("{dir}: expected a typed route refusal, got {other:?}"),
+                Ok(_) => panic!("{dir}: the wrong route must not load"),
+            }
+        }
+    }
+
+    /// The native DiT is a frozen SINGLE file: an index-only package (`config.json` +
+    /// `model.safetensors.index.json`, no `model.safetensors`) is the resolver's typed
+    /// layout refusal on both routes, both offload policies and the memory contract — before any
+    /// text-encoder / autoencoder / device work (no component is named, so reaching resource
+    /// resolution would be a missing-resource `Msg`). No shard is ever read.
+    ///
+    /// *Mutations that red this:* scanning the index into a sharded tensor load, or resolving
+    /// components before the checkpoint.
+    #[test]
+    fn an_index_only_package_is_the_resolvers_typed_layout_refusal() {
+        const LAYOUT: &str = "unsupported checkpoint layout";
+        for (base, source) in [(false, "tiny-snapshot"), (true, "tiny-base-snapshot")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(
+                fixtures().join(source).join("config.json"),
+                dir.path().join("config.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("model.safetensors.index.json"),
+                r#"{"metadata":{},"weight_map":{"time_in.in_layer.weight":"model-00001-of-00002.safetensors"}}"#,
+            )
+            .unwrap();
+            let id = if base { BASE_MODEL_ID } else { MODEL_ID };
+            for policy in [
+                gen_core::OffloadPolicy::Resident,
+                gen_core::OffloadPolicy::Sequential,
+            ] {
+                let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()))
+                    .with_offload_policy(policy);
+                match load_inner(&spec, base) {
+                    Err(Error::Unsupported(m)) => {
+                        assert!(m.contains(LAYOUT), "{id} {policy:?}: {m}")
+                    }
+                    Err(other) => {
+                        panic!("{id} {policy:?}: expected the layout refusal, got {other:?}")
+                    }
+                    Ok(_) => panic!("{id} {policy:?}: an index-only package must not load"),
+                }
+                match crate::memory_strategy::memory_strategy_contract(id, &spec) {
+                    Err(gen_core::Error::Unsupported(m)) => {
+                        assert!(m.contains(LAYOUT), "{id} {policy:?} contract: {m}")
+                    }
+                    other => panic!(
+                        "{id} {policy:?} contract: expected the layout refusal, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The dense DiT's full physical inventory is preflighted at LOAD under both offload
+    /// policies — a `Sequential` load must not defer the refusal to its first render.
+    ///
+    /// *Mutation that reds this:* restricting the header preflight to packed storages, or
+    /// running it only inside the residency's heavy loader.
+    #[test]
+    fn dense_inventory_is_preflighted_at_load_under_both_policies() {
+        use gen_core::flux3::AUTOENCODER_COMPONENT;
+        let package = fixtures().join("tiny-snapshot");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(package.join("config.json"), dir.path().join("config.json")).unwrap();
+        let mut tensors = candle_gen::candle_core::safetensors::load(
+            package.join("model.safetensors"),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert!(tensors.remove("final_layer.image.linear.weight").is_some());
+        candle_gen::candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors"))
+            .unwrap();
+        for policy in [
+            gen_core::OffloadPolicy::Resident,
+            gen_core::OffloadPolicy::Sequential,
         ] {
-            match load(&spec) {
-                Err(gen_core::Error::Unsupported(m)) => assert!(m.contains(field), "{m}"),
-                other => panic!("{field}: expected a typed refusal, got {:?}", other.err()),
+            let mut spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()))
+                .with_offload_policy(policy);
+            spec.precision = Precision::Fp32;
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(package.join("text_encoder")),
+            );
+            spec.components.insert(
+                AUTOENCODER_COMPONENT.into(),
+                WeightsSource::File(package.join("ae.safetensors")),
+            );
+            match load_inner(&spec, false) {
+                Err(Error::Unsupported(m)) => {
+                    assert!(
+                        m.contains("final_layer.image.linear.weight"),
+                        "{policy:?}: {m}"
+                    )
+                }
+                Err(other) => {
+                    panic!("{policy:?}: expected a typed inventory refusal, got {other:?}")
+                }
+                Ok(_) => panic!("{policy:?}: an incomplete dense DiT must be refused at load"),
             }
         }
     }
@@ -1278,11 +1395,14 @@ mod tests {
             memory: Some(memory),
             ..Default::default()
         };
-        refuse_unhonored_memory(&GenerationRequest::default()).unwrap();
-        refuse_unhonored_memory(&with(GenerationMemory {
-            stage_residency: true,
-            ..Default::default()
-        }))
+        refuse_unhonored_memory(MODEL_ID, &GenerationRequest::default()).unwrap();
+        refuse_unhonored_memory(
+            MODEL_ID,
+            &with(GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+        )
         .unwrap();
         for (control, memory) in [
             (
@@ -1308,9 +1428,10 @@ mod tests {
                 },
             ),
         ] {
-            match refuse_unhonored_memory(&with(memory)) {
+            match refuse_unhonored_memory(BASE_MODEL_ID, &with(memory)) {
                 Err(Error::Unsupported(message)) => {
-                    assert!(message.contains(control), "{message}")
+                    assert!(message.contains(control), "{message}");
+                    assert!(message.starts_with(BASE_MODEL_ID), "{message}");
                 }
                 other => panic!("{control}: expected a typed refusal, got {other:?}"),
             }

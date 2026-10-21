@@ -1,5 +1,5 @@
 //! Actual saved-state continuation/reload on SYNTHETIC tiny weights, not downloaded BFL weights.
-use crate::common::{fixture, fixtures, host_f32, ids_of, tiny_config};
+use crate::common::{fixture, fixtures, host_f32, ids_of, tiny_base_config};
 use candle_gen::candle_core::{backprop::GradStore, DType, Device};
 use candle_gen::gen_core::flux3::{
     training::{
@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 fn graph() -> TrainingGraph {
-    let mut config = tiny_config();
-    config.dit.flow_map = false;
+    let config = tiny_base_config();
     let dit = Flux3Dit::load(
         &fixtures().join("tiny-base-snapshot/model.safetensors"),
         &config.dit,
@@ -230,8 +229,7 @@ fn real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_
         &cancel,
     )
     .unwrap();
-    let mut config = tiny_config();
-    config.dit.flow_map = false;
+    let config = tiny_base_config();
     let spec = AdapterSpec::new(adapter, 1.0, AdapterKind::Lora);
     assert_eq!(
         candle_gen::gen_core::flux3::adapters::inspect(&spec, &config.dit)
@@ -453,8 +451,7 @@ fn export_records_the_configured_alpha_verbatim() {
         alpha,
         "the case must be one where re-deriving alpha from the scale rounds"
     );
-    let mut config = tiny_config();
-    config.dit.flow_map = false;
+    let config = tiny_base_config();
     let dit = Flux3Dit::load(
         &fixtures().join("tiny-base-snapshot/model.safetensors"),
         &config.dit,

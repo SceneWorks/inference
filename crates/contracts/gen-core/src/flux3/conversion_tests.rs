@@ -4,6 +4,22 @@ use std::fs;
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+fn model_bytes() -> Vec<u8> {
+    super::super::checkpoint::tests::dense_stub_bytes(true)
+}
+fn config_bytes() -> Vec<u8> {
+    let mut value = super::super::checkpoint::tests::real_config_json(
+        true,
+        super::super::quantization::DitFormat::Dense,
+    );
+    value["quantization"] = super::super::artifacts::NativeDitStorage::MlxAffine {
+        bits: 4,
+        group_size: 64,
+    }
+    .marker()
+    .unwrap();
+    serde_json::to_vec(&value).unwrap()
+}
 fn receipt() -> ConversionReceipt {
     ConversionReceipt {
         source_repository: super::super::DISTILLED_WEIGHTS_REPO.into(),
@@ -24,8 +40,8 @@ fn receipt() -> ConversionReceipt {
                 files: BTreeMap::from([(
                     "model.safetensors".into(),
                     OutputFile {
-                        bytes: 6,
-                        sha256: digest(b"packed"),
+                        bytes: model_bytes().len() as u64,
+                        sha256: digest(&model_bytes()),
                     },
                 )]),
                 quantized_targets: vec!["single_blocks.0.q_proj".into()],
@@ -92,11 +108,16 @@ fn receipt() -> ConversionReceipt {
         package_files: ["config.json", "LICENSE.md", "NOTICE.md"]
             .into_iter()
             .map(|p| {
+                let bytes = if p == "config.json" {
+                    config_bytes()
+                } else {
+                    b"{}".to_vec()
+                };
                 (
                     p.into(),
                     OutputFile {
-                        bytes: 2,
-                        sha256: digest(b"{}"),
+                        bytes: bytes.len() as u64,
+                        sha256: digest(&bytes),
                     },
                 )
             })
@@ -106,15 +127,15 @@ fn receipt() -> ConversionReceipt {
 fn populate(dir: &Path) -> Result<()> {
     fs::create_dir(dir.join("text_encoder"))?;
     for (p, bytes) in [
-        ("model.safetensors", b"packed".as_slice()),
-        ("ae.safetensors", b"ae".as_slice()),
-        ("config.json", b"{}".as_slice()),
-        ("LICENSE.md", b"{}".as_slice()),
-        ("NOTICE.md", b"{}".as_slice()),
-        ("text_encoder/config.json", b"{}".as_slice()),
-        ("text_encoder/model.safetensors", b"te".as_slice()),
-        ("text_encoder/tokenizer.json", b"{}".as_slice()),
-        ("text_encoder/tokenizer_config.json", b"{}".as_slice()),
+        ("model.safetensors", model_bytes()),
+        ("ae.safetensors", b"ae".to_vec()),
+        ("config.json", config_bytes()),
+        ("LICENSE.md", b"{}".to_vec()),
+        ("NOTICE.md", b"{}".to_vec()),
+        ("text_encoder/config.json", b"{}".to_vec()),
+        ("text_encoder/model.safetensors", b"te".to_vec()),
+        ("text_encoder/tokenizer.json", b"{}".to_vec()),
+        ("text_encoder/tokenizer_config.json", b"{}".to_vec()),
     ] {
         fs::write(dir.join(p), bytes)?;
     }
@@ -310,10 +331,10 @@ fn external_components_are_verified_in_the_source_root_not_the_output() {
     let ext = r.clone();
     publish_conversion(&target, move |dir| {
         for (p, bytes) in [
-            ("model.safetensors", b"packed".as_slice()),
-            ("config.json", b"{}".as_slice()),
-            ("LICENSE.md", b"{}".as_slice()),
-            ("NOTICE.md", b"{}".as_slice()),
+            ("model.safetensors", model_bytes()),
+            ("config.json", config_bytes()),
+            ("LICENSE.md", b"{}".to_vec()),
+            ("NOTICE.md", b"{}".to_vec()),
         ] {
             fs::write(dir.join(p), bytes)?;
         }

@@ -21,7 +21,7 @@ use gen_core::flux3::training::{
 };
 use gen_core::flux3::{
     assemble_window, Flux3Config, GenerationResources, AUTOENCODER_COMPONENT, BASE_MODEL_ID,
-    CONFIG_FILE, DIT_WEIGHTS_FILE, FAMILY, TEXT_ENCODER_COMPONENT,
+    DIT_WEIGHTS_FILE, FAMILY, TEXT_ENCODER_COMPONENT,
 };
 use gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -164,6 +164,26 @@ fn load_training_dit(
         }
     }
 }
+/// The dense CFG base this trainer fine-tunes, resolved header-authoritatively (the mode is the
+/// DiT checkpoint's `ref_time_in` evidence, never the descriptive `config.json`), refused unless
+/// it IS the base route and the pinned release config, and its full dense physical inventory
+/// preflighted from the headers — all before any resource, text-encoder, autoencoder, LoRA-target,
+/// dataset or device work.
+fn resolve_training_base(root: &Path) -> Result<Flux3Config> {
+    let cfg = gen_core::flux3::resolve_checkpoint(root).map_err(Error::from)?;
+    cfg.validate_route(BASE_MODEL_ID).map_err(Error::from)?;
+    identity::validate_release_config(&cfg).map_err(Error::from)?;
+    let headers = gen_core::flux3::checkpoint_tensor_headers(root).map_err(Error::from)?;
+    crate::dit::validate_checkpoint_headers(
+        &cfg.dit,
+        gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+            gen_core::flux3::quantization::DitFormat::Dense,
+        ),
+        &headers,
+    )?;
+    Ok(cfg)
+}
+
 fn execute(
     spec: &LoadSpec,
     req: &TrainingRequest,
@@ -177,12 +197,7 @@ fn execute(
         WeightsSource::Dir(root) => root,
         _ => return Err(invalid("base directory required")),
     };
-    let cfg = Flux3Config::parse(
-        &std::fs::read_to_string(root.join(CONFIG_FILE))
-            .map_err(|e| invalid(format!("read base config: {e}")))?,
-    )
-    .map_err(Error::from)?;
-    identity::validate_release_config(&cfg).map_err(Error::from)?;
+    let cfg = resolve_training_base(root)?;
     let resources =
         GenerationResources::from_spec(spec, &cfg, BASE_MODEL_ID).map_err(Error::from)?;
     let artifacts =

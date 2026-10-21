@@ -209,17 +209,11 @@ pub fn load_dit_with_storage(
 ) -> Result<Flux3Dit> {
     let affine = match storage {
         NativeDitStorage::Publisher(DitFormat::Dense) => None,
-        NativeDitStorage::MlxAffine { bits, group_size } => {
-            storage.validate_headers(
-                &config.dit,
-                &gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?,
-            )?;
-            Some(crate::nn::AffineTargets {
-                targets: storage.packed_targets(&config.dit)?,
-                bits: bits as i32,
-                group_size: group_size as i32,
-            })
-        }
+        NativeDitStorage::MlxAffine { bits, group_size } => Some(crate::nn::AffineTargets {
+            targets: storage.packed_targets(&config.dit)?,
+            bits: bits as i32,
+            group_size: group_size as i32,
+        }),
         other => {
             return Err(Error::Unsupported(format!(
                 "flux3: {} DiT storage has no MLX loader; install the MLX affine tier or the \
@@ -228,6 +222,11 @@ pub fn load_dit_with_storage(
             )))
         }
     };
+    // Dense and packed alike: the exact inventory before any tensor is read.
+    storage.validate_headers(
+        &config.dit,
+        &gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?,
+    )?;
     let mut weights = Weights::from_file(weights)
         .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", weights.display())))?;
     // The release ships bf16. Cast every tensor to the compute dtype ONE TENSOR AT A TIME and
@@ -276,6 +275,7 @@ pub fn load_autoencoder(path: &Path) -> Result<Flux3AutoEncoder> {
 /// receipt's algorithm identical to the declared storage, and every EXTERNAL component full-hash
 /// verified where this load reads it. Twin of the Candle check.
 fn verify_native_package(
+    route_id: &str,
     package_dir: &Path,
     storage: NativeDitStorage,
     config: &Flux3Config,
@@ -285,7 +285,7 @@ fn verify_native_package(
     let (algorithm, bits, group_size) = storage.receipt_algorithm()?;
     if receipt.algorithm != algorithm || receipt.bits != bits || receipt.group_size != group_size {
         return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: {} receipt records {} (bits {:?}, group {:?}), not the declared {}",
+            "{route_id}: {} receipt records {} (bits {:?}, group {:?}), not the declared {}",
             package_dir.display(),
             receipt.algorithm,
             receipt.bits,
@@ -299,24 +299,24 @@ fn verify_native_package(
             .strip_prefix(&te_prefix)
             .map(|rest| resources.text_encoder_dir.join(rest))
             .ok_or_else(|| {
-                gen_core::Error::Unsupported(format!("{MODEL_ID}: text-encoder path {path}"))
+                gen_core::Error::Unsupported(format!("{route_id}: text-encoder path {path}"))
             }),
         ComponentRole::Autoencoder if path == config.vae.path => {
             Ok(resources.autoencoder_file.clone())
         }
         other => Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: external {} file {path} has no resolved load location",
+            "{route_id}: external {} file {path} has no resolved load location",
             other.name()
         ))),
     })?;
     Ok(())
 }
 
-fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
+fn refuse_unsupported_spec(route_id: &str, spec: &LoadSpec) -> Result<()> {
+    crate::memory_strategy::refuse_deferred_load_shape(route_id, spec)?;
     if let Some(q @ (gen_core::Quant::Nvfp4 | gen_core::Quant::Fp8Rowwise)) = spec.quantize {
         return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: LoadSpec::quantize {} has no MLX FLUX3 kernel; the native MLX tiers \
+            "{route_id}: LoadSpec::quantize {} has no MLX FLUX3 kernel; the native MLX tiers \
              are affine q4/q8",
             q.key()
         )));
@@ -332,7 +332,7 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     for (field, set) in refusals {
         if set {
             return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: LoadSpec::{field} is not supported by the distilled FLUX 3 route \
+                "{route_id}: LoadSpec::{field} is not supported by the FLUX 3 route \
                  (quantized variants are sc-26241, LoRA is sc-26239; the text encoder is the \
                  '{}' component)",
                 gen_core::flux3::TEXT_ENCODER_COMPONENT
@@ -360,30 +360,54 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
     Ok(Box::new(load_model(spec, base)?))
 }
 
-fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
-    refuse_unsupported_spec(spec)?;
-    let package_dir = match &spec.weights {
-        gen_core::WeightsSource::Dir(dir) => dir.clone(),
-        gen_core::WeightsSource::File(file) => {
-            return Err(Error::Msg(format!(
-                "{MODEL_ID}: the weights resource must be the package directory, not {}",
-                file.display()
-            )))
-        }
-    };
-    let config = Flux3Config::from_dir(&package_dir)?;
-    let storage = NativeDitStorage::from_package(&package_dir)?;
-    storage.validate_selection(spec.quantize, spec.precision)?;
+/// The checkpoint authority every actual MLX boundary (load, memory contract, training) runs
+/// BEFORE any text-encoder, autoencoder, adapter, memory or dataset work: the strict header
+/// resolver ([`gen_core::flux3::resolve_checkpoint`], whose `ref_time_in` pair decides
+/// `flow_map`), the selected route against that resolved mode, the declared storage against the
+/// selection and this backend, then the FULL native inventory (dense and packed alike) from the
+/// package's own DiT file/index headers — so a `Sequential` load, whose DiT materializes only on
+/// the first request, refuses a malformed package at load like a `Resident` one.
+pub(crate) fn resolve_package(
+    package_dir: &Path,
+    route_id: &str,
+    quantize: Option<gen_core::Quant>,
+    precision: Precision,
+) -> gen_core::Result<(Flux3Config, NativeDitStorage)> {
+    let config = gen_core::flux3::resolve_checkpoint(package_dir)?;
+    config.validate_route(route_id)?;
+    let storage = NativeDitStorage::from_package(package_dir)?;
+    storage.validate_selection(quantize, precision)?;
     storage.check_backend(ArtifactBackend::Mlx)?;
-    let dense = storage == NativeDitStorage::Publisher(DitFormat::Dense);
-    if dense {
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
         config.validate_supported()?;
     } else {
         config.validate_native_storage_graph()?;
     }
-    if config.dit.flow_map == base {
-        return Err(Error::Unsupported(format!("flux3: selected {} route but package {} has flow_map={}; select the matching CFG checkpoint or distilled flow-map route", if base { "base CFG" } else { "distilled flow-map" }, config.model, config.dit.flow_map)));
-    }
+    storage.validate_headers(
+        &config.dit,
+        &gen_core::flux3::checkpoint_tensor_headers(package_dir)?,
+    )?;
+    Ok((config, storage))
+}
+
+fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
+    let route_id = if base {
+        gen_core::flux3::BASE_MODEL_ID
+    } else {
+        MODEL_ID
+    };
+    refuse_unsupported_spec(route_id, spec)?;
+    let package_dir = match &spec.weights {
+        gen_core::WeightsSource::Dir(dir) => dir.clone(),
+        gen_core::WeightsSource::File(file) => {
+            return Err(Error::Msg(format!(
+                "{route_id}: the weights resource must be the package directory, not {}",
+                file.display()
+            )))
+        }
+    };
+    let (config, storage) = resolve_package(&package_dir, route_id, spec.quantize, spec.precision)?;
+    let dense = storage == NativeDitStorage::Publisher(DitFormat::Dense);
     crate::adapters::validate(&spec.adapters, &config.dit)?;
     let adapter_reports = spec
         .adapters
@@ -397,9 +421,9 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         })
         .collect::<gen_core::Result<Vec<_>>>()?;
 
-    let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
+    let resources = GenerationResources::from_spec(spec, &config, route_id)?;
     if !dense {
-        verify_native_package(&package_dir, storage, &config, &resources)?;
+        verify_native_package(route_id, &package_dir, storage, &config, &resources)?;
     }
     let compute = compute_dtype(spec);
     let te_dir = resources.text_encoder_dir.clone();
@@ -421,7 +445,7 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
                 let ae = load_autoencoder(&ae_path)?;
                 if ae.latent_channels() as usize != heavy_cfg.dit.image_in_channels {
                     return Err(Error::Msg(format!(
-                        "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
+                        "{route_id}: the autoencoder at {} packs {} channels per token, the DiT \
                      reads {}",
                         ae_path.display(),
                         ae.latent_channels(),
@@ -1122,5 +1146,81 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
         let err = load(&spec).err().expect("an empty package must fail");
         assert!(err.to_string().contains("config.json"), "{err}");
+    }
+
+    /// The native DiT is a frozen SINGLE file. An index-only snapshot (no root
+    /// `model.safetensors`, a root `model.safetensors.index.json` over an otherwise valid shard)
+    /// is refused by both routes under both policies with EXACTLY the resolver's typed reason —
+    /// before any text-encoder / autoencoder resolution (the package has neither, so reaching
+    /// them would be a different error) and before any device work. No shard is ever loaded.
+    #[test]
+    fn index_only_package_is_the_resolvers_typed_layout_refusal_on_both_routes() {
+        use gen_core::OffloadPolicy;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (fixture, route_load, route_id) in [
+            (
+                "tiny-snapshot",
+                load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+                MODEL_ID,
+            ),
+            (
+                "tiny-base-snapshot",
+                load_base,
+                gen_core::flux3::BASE_MODEL_ID,
+            ),
+        ] {
+            let source = fixtures.join(fixture);
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(source.join("config.json"), dir.path().join("config.json")).unwrap();
+            let shard = "model-00001-of-00001.safetensors";
+            std::fs::copy(source.join("model.safetensors"), dir.path().join(shard)).unwrap();
+            let weight_map: serde_json::Map<String, serde_json::Value> =
+                gen_core::weightsmeta::safetensors_path_tensor_headers(
+                    &source.join("model.safetensors"),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.name, serde_json::Value::from(shard)))
+                .collect();
+            std::fs::write(
+                dir.path().join("model.safetensors.index.json"),
+                serde_json::to_vec(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
+            )
+            .unwrap();
+            assert!(!dir.path().join("model.safetensors").exists());
+
+            let resolver = gen_core::flux3::resolve_checkpoint(dir.path())
+                .expect_err("an index-only native DiT is not a supported checkpoint layout");
+            assert!(
+                matches!(resolver, gen_core::Error::Unsupported(_)),
+                "{resolver:?}"
+            );
+            assert!(
+                resolver
+                    .to_string()
+                    .contains("unsupported checkpoint layout"),
+                "{resolver}"
+            );
+            let expected = Error::from(resolver).to_string();
+            for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+                let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()))
+                    .with_offload_policy(policy);
+                let err = route_load(&spec)
+                    .err()
+                    .expect("an index-only package must not load");
+                assert!(
+                    matches!(err, Error::Unsupported(_)),
+                    "{route_id} {policy:?}: {err:?}"
+                );
+                assert_eq!(err.to_string(), expected, "{route_id} {policy:?}");
+                let contract = crate::memory_strategy::memory_strategy_contract(route_id, &spec)
+                    .expect_err("no memory contract for an index-only package");
+                assert_eq!(
+                    Error::from(contract).to_string(),
+                    expected,
+                    "{route_id} {policy:?}"
+                );
+            }
+        }
     }
 }

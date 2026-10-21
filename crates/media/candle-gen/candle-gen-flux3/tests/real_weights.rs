@@ -21,7 +21,8 @@ use std::time::Instant;
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::flux3::{
-    text_ids, Flux3Config, GenerationParams, DISTILLED_AUTOENCODER_SHA256, DISTILLED_DIT_SHA256,
+    resolve_checkpoint, text_ids, GenerationParams, DISTILLED_AUTOENCODER_SHA256,
+    DISTILLED_DIT_SHA256,
 };
 use candle_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Precision, Progress, WeightsSource,
@@ -98,7 +99,7 @@ fn vram_probe() -> Option<VramProbe> {
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR)"]
 fn real_package_config_is_the_release() {
-    let config = Flux3Config::from_dir(&package()).unwrap();
+    let config = resolve_checkpoint(&package()).unwrap();
     config.validate_supported().unwrap();
     assert_eq!(config.model, "flux-3-image-klein");
     assert_eq!((config.dit.hidden, config.dit.heads), (3072, 24));
@@ -124,7 +125,7 @@ fn real_package_config_is_the_release() {
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR) + the real golden"]
 fn real_text_encoder_matches_upstream() {
-    let config = Flux3Config::from_dir(&package()).unwrap();
+    let config = resolve_checkpoint(&package()).unwrap();
     let g = golden();
     let te = Flux3TextEncoder::load(
         &package().join(&config.text_encoder.path),
@@ -153,7 +154,7 @@ fn real_text_encoder_matches_upstream() {
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR) + the real golden"]
 fn real_dit_forward_matches_upstream() {
-    let config = Flux3Config::from_dir(&package()).unwrap();
+    let config = resolve_checkpoint(&package()).unwrap();
     let g = golden();
     let compute = compute();
     let device = device();
@@ -240,7 +241,7 @@ fn real_autoencoder_decode_matches_upstream() {
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR) + the real golden"]
 fn real_e2e_64_matches_upstream() {
-    let config = Flux3Config::from_dir(&package()).unwrap();
+    let config = resolve_checkpoint(&package()).unwrap();
     let g = golden();
     let compute = compute();
     let device = device();
@@ -331,7 +332,7 @@ fn real_distilled_text_to_image_renders() {
     if compute() == DType::F32 {
         spec.precision = Precision::Fp32;
     }
-    let config = Flux3Config::from_dir(&package()).unwrap();
+    let config = resolve_checkpoint(&package()).unwrap();
     let request = GenerationRequest {
         prompt: prompt.clone(),
         width: size,
