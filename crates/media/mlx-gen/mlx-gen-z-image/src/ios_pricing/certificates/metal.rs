@@ -21,7 +21,7 @@ fn ceil(n: u64, d: u64) -> Result<u64> {
     if d == 0 {
         return Err(unsupported("zero divisor in source geometry"));
     }
-    add(n / d, u64::from(n % d != 0))
+    add(n / d, u64::from(!n.is_multiple_of(d)))
 }
 fn floating(x: &Tensor) -> Result<()> {
     if matches!(x.dtype, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32) {
@@ -320,9 +320,10 @@ impl Graph {
             Some(&a)
         } else if a.data_size == 1 && b.contiguous {
             Some(&b)
-        } else if b.data_size == 1 && a.contiguous {
-            Some(&a)
-        } else if (a.row_contiguous() && b.row_contiguous()) || (col(&a)? && col(&b)?) {
+        } else if (b.data_size == 1 && a.contiguous)
+            || (a.row_contiguous() && b.row_contiguous())
+            || (col(&a)? && col(&b)?)
+        {
             Some(&a)
         } else {
             None
@@ -954,7 +955,7 @@ impl Graph {
         }
         nonempty(x)?;
         let r = x.shape.len();
-        if r < 2 || groups == 0 || x.shape[r - 1] % groups != 0 {
+        if r < 2 || groups == 0 || !x.shape[r - 1].is_multiple_of(groups) {
             return Err(unsupported("GroupNorm channels/groups"));
         }
         let batch = x.shape[0];

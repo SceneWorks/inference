@@ -4471,7 +4471,7 @@ impl NativeLedger {
                         w as i32,
                     )
                 })
-                .and_then(|_| tile);
+                .and(tile);
             let image = self.vae_decode_graph(&p.vae, latent, decode_tile)?;
             let image = self.cg_cast(&image, Dtype::Float32)?;
             self.rgb_graph(image.elements()?)?;

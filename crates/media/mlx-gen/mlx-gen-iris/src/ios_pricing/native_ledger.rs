@@ -2622,8 +2622,8 @@ mod installed_adapters {
                                 })?;
                             if let Some(t) = t
                                 .filter(|_| {
-                                    (!factors.contains_key("lokr_w2")
-                                        && factors.contains_key("lokr_t2"))
+                                    !factors.contains_key("lokr_w2")
+                                        && factors.contains_key("lokr_t2")
                                 })
                                 .and_then(|t| factors.get(t))
                                 .and_then(|k| file.sources.get(k))
@@ -2646,7 +2646,7 @@ mod installed_adapters {
                         // Shared reconstruct_loha_delta uses Tucker ONLY when both t1 and t2 exist;
                         // a lone t tensor is parsed/read but both sides still use their matmuls.
                         let tucker =
-                            (factors.contains_key("hada_t1") && factors.contains_key("hada_t2"));
+                            factors.contains_key("hada_t1") && factors.contains_key("hada_t2");
                         let mut factor = |a: &str, b: &str, t: &str| -> Result<TensorFacts> {
                             let wa = factors
                                 .get(a)
