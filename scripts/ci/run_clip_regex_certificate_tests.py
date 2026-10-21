@@ -34,7 +34,10 @@ def require_one_passed(output: str, name: str) -> None:
 
 
 def require_positive_facts(output: str) -> dict[str, int]:
-    rows = re.findall(r"^CLIP_SOURCE_FACTS C=([0-9]{1,20}) S=([0-9]{1,20}) J=([0-9]{1,20}) J_limit=([0-9]{1,20}) M0=([0-9]{1,20}) M0_native=([0-9]{1,20}) status=checked$", output, re.MULTILINE)
+    # libtest --nocapture writes its exact progress prefix before the test's first println.
+    # Accept that one known framing or a standalone record, never an arbitrary substring/prefix.
+    prefix = re.escape("test clip_source_certificate::tests::admitted_target_public_api_returns_checked_finite_envelopes ... ")
+    rows = re.findall(r"^(?:" + prefix + r")?CLIP_SOURCE_FACTS C=([0-9]{1,20}) S=([0-9]{1,20}) J=([0-9]{1,20}) J_limit=([0-9]{1,20}) M0=([0-9]{1,20}) M0_native=([0-9]{1,20}) status=checked$", output, re.MULTILINE)
     if len(rows) != 1:
         raise RuntimeError("expected one actual checked positive source-fact record")
     cold, search, j, limit, m0, native_m0 = map(int, rows[0])

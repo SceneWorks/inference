@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T18:38:21.756705+00:00",
-  "rust_proof_closure_sha256": "75b6ce1d56cea935f3a69ca80147dd32e2c462bbe1a14d926f17218b01fb15f4",
+  "UTC": "2026-10-21T18:59:06.147110+00:00",
+  "rust_proof_closure_sha256": "f2f5ed08f55cf7d7a43581997c06b56300d6056c94771622a49bc40db740f88b",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -944,7 +944,7 @@
     },
     {
       "path": "scripts/ci/run_clip_regex_certificate_tests.py",
-      "sha256": "5575c925f760e90c0cc613fc5bc7fea2fe5e6c53892198330a7c3d2901adb21d"
+      "sha256": "a8331508e0399b4b8ca97d84a793d4ecb29fa06b853eaf4d5b8bb145625c6f25"
     },
     {
       "path": "scripts/clock_assertions_baseline.txt",
@@ -960,7 +960,7 @@
     },
     {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
-      "sha256": "f18282e35dc2ee7fa45a997bdb3239390a42afc5f19ddf9273856b2e578a058c"
+      "sha256": "735a3bc048cf1cad0b249509550d2202dda11c986ac88a131b7e324ccf930d2e"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
@@ -2370,8 +2370,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "8fceed11e53d750c769ab64938caa213706be9f4b4a662a9ffa7da1e502d37ac",
-    "classification_sha256": "b0c0e73e7af29b01bca7263c84f870b34105c05d0a5e9a0af5596e08d1cb0951",
+    "inventory_sha256": "bdec69bb4d819182e82afa79f952da7ba27162d18b07c997b5fe2f06dfeae375",
+    "classification_sha256": "82a423749a14b92ab160c7aea3f5a025553d080ddf75f2ec796468d03dea6ebe",
     "selected_Rust_FQNs": 216,
     "HOST_logical": 194,
     "HOST_expected_PASS_rows": 195,
