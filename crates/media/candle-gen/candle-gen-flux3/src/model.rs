@@ -1248,19 +1248,35 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mlx-gen/mlx-gen-flux3/tests/fixtures")
     }
 
-    /// The route is the DiT HEADER's, checked before any component is resolved: neither spec
-    /// names a text encoder / autoencoder the base package lacks, so reaching resource resolution
-    /// would be a missing-resource `Msg`, not this typed refusal.
+    /// The route is checked before adapter work, not merely by the later resource resolver.
+    /// The missing adapter would fail before `GenerationResources::from_spec`, so its duplicate
+    /// route check cannot make this ordering assertion pass after the early gate is removed.
     ///
-    /// *Mutations that red this:* dropping `validate_route`, or resolving it after
-    /// `GenerationResources::from_spec`.
+    /// *Mutations that red this:* dropping the early `validate_route`, or moving route
+    /// resolution after adapter admission.
     #[test]
     fn the_wrong_route_is_refused_from_the_header_before_component_work() {
+        let poison = tempfile::tempdir().unwrap();
         for (base, dir) in [(false, "tiny-base-snapshot"), (true, "tiny-snapshot")] {
-            let spec = LoadSpec::new(WeightsSource::Dir(fixtures().join(dir)));
+            let package = fixtures().join(dir);
+            let id = if base { BASE_MODEL_ID } else { MODEL_ID };
+            match crate::memory_strategy::resolve_route_checkpoint(id, &package) {
+                Err(gen_core::Error::Unsupported(message)) => {
+                    assert!(message.contains("flow_map"), "{dir}: {message}")
+                }
+                other => panic!("{dir}: the EARLY route resolver must refuse, got {other:?}"),
+            }
+            let mut spec = LoadSpec::new(WeightsSource::Dir(package));
+            spec.adapters.push(gen_core::AdapterSpec::new(
+                poison
+                    .path()
+                    .join("must-not-read-this-missing-adapter.safetensors"),
+                0.4,
+                gen_core::AdapterKind::Lora,
+            ));
             match load_inner(&spec, base) {
                 Err(Error::Unsupported(m)) => assert!(m.contains("flow_map"), "{dir}: {m}"),
-                Err(other) => panic!("{dir}: expected a typed route refusal, got {other:?}"),
+                Err(other) => panic!("{dir}: expected a typed route refusal before the missing adapter, got {other:?}"),
                 Ok(_) => panic!("{dir}: the wrong route must not load"),
             }
         }

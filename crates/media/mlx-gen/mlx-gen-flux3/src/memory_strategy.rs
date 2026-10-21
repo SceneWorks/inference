@@ -789,7 +789,26 @@ mod tests {
         let registered = memory_strategy_contract(gen_core::flux3::BASE_MODEL_ID, &spec).unwrap();
         assert_eq!(registered.provider_id, gen_core::flux3::BASE_MODEL_ID);
         assert_eq!(registered.asset_facts, plain.asset_facts);
-        assert!(memory_strategy_contract(MODEL_ID, &spec).is_err());
+        // Exercise the EARLY resolver directly: a later from_spec route check must not
+        // rescue this test if resolve_package stops validating the route before component work.
+        // Mutation: removing resolve_package's validate_route makes this return Ok.
+        match crate::model::resolve_package(
+            &fixture.join("tiny-base-snapshot"),
+            MODEL_ID,
+            spec.quantize,
+            spec.precision,
+        ) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("flow_map"), "{message}")
+            }
+            other => panic!("the early wrong-route resolver must refuse, got {other:?}"),
+        }
+        match memory_strategy_contract(MODEL_ID, &spec) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("flow_map"), "{message}")
+            }
+            other => panic!("wrong-route contract must retain the typed refusal, got {other:?}"),
+        }
         spec.adapters.push(gen_core::AdapterSpec::new(
             fixture.join("flux3_base_lora.safetensors"),
             0.4,
