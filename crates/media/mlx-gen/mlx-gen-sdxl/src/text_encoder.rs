@@ -54,6 +54,8 @@ pub(crate) fn quantizable_text_paths(cfg: &ClipTextConfig) -> Vec<(String, bool)
 /// One actual projection-pack point. These declared logical owners can overlap native storage;
 /// they are neither an allocation identity nor a subtractable physical lower bound.
 pub(crate) struct TextPackPoint {
+    /// The packed projection's module path, identifying the point across source worlds.
+    pub path: String,
     pub before_resident: u64,
     pub scratch: u64,
 }
@@ -148,6 +150,7 @@ pub(crate) fn text_pack_facts(
         };
         let elements = output.checked_mul(input).ok_or_else(overflow)?;
         points.push(TextPackPoint {
+            path: path.clone(),
             before_resident: retained,
             scratch: crate::quant::quantize_bytes_from_metadata(elements, bias_bytes, bits),
         });
@@ -432,31 +435,56 @@ impl ClipPrice {
         n: i32,
         out: &mut crate::quantum::Quanta,
     ) -> (Dtype, Dtype) {
-        let dim = self.token_embedding.shape[1];
-        out.push((
-            crate::quantum::CLIP_EMBEDDINGS,
-            clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype),
-        ));
-        let mut x =
-            Dtype::from_promoting_types(self.token_embedding.dtype, self.position_embedding.dtype);
+        let (embeddings, mut x) = self.embeddings_quantum(b, n);
+        out.push((crate::quantum::CLIP_EMBEDDINGS, embeddings));
         let mut hidden_states = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            out.push((crate::quantum::CLIP_LAYER, layer.quantum_scratch(b, n, x)));
-            x = layer.output_dtype(x);
+        for index in 0..self.layers.len() {
+            let (scratch, next) = self.layer_quantum(index, b, n, x);
+            out.push((crate::quantum::CLIP_LAYER, scratch));
+            x = next;
             hidden_states.push(x);
         }
-        out.push((
-            crate::quantum::CLIP_POOLED,
-            clip_final_scratch(
-                b,
-                n,
-                dim,
-                x,
-                &self.final_ln_w,
-                &self.final_ln_b,
-                self.text_projection.as_ref(),
-            ),
-        ));
+        let (pooled_scratch, pooled) = self.pooled_quantum(b, n, x);
+        out.push((crate::quantum::CLIP_POOLED, pooled_scratch));
+        let penultimate = hidden_states
+            .len()
+            .checked_sub(2)
+            .map_or(x, |i| hidden_states[i]);
+        (penultimate, pooled)
+    }
+
+    /// The embeddings quantum's scratch and the dtype it hands the first layer.
+    pub(crate) fn embeddings_quantum(&self, b: i32, n: i32) -> (u64, Dtype) {
+        let dim = self.token_embedding.shape[1];
+        (
+            clip_embeddings_scratch(b, n, dim, self.token_embedding.dtype),
+            Dtype::from_promoting_types(self.token_embedding.dtype, self.position_embedding.dtype),
+        )
+    }
+
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Layer `index`'s quantum scratch for an `x`-typed input, and its output dtype.
+    pub(crate) fn layer_quantum(&self, index: usize, b: i32, n: i32, x: Dtype) -> (u64, Dtype) {
+        let layer = &self.layers[index];
+        (layer.quantum_scratch(b, n, x), layer.output_dtype(x))
+    }
+
+    /// The final norm/pool/projection quantum for an `x`-typed last hidden state, and the pooled
+    /// output's dtype.
+    pub(crate) fn pooled_quantum(&self, b: i32, n: i32, x: Dtype) -> (u64, Dtype) {
+        let dim = self.token_embedding.shape[1];
+        let scratch = clip_final_scratch(
+            b,
+            n,
+            dim,
+            x,
+            &self.final_ln_w,
+            &self.final_ln_b,
+            self.text_projection.as_ref(),
+        );
         let normed = Dtype::from_promoting_types(
             Dtype::from_promoting_types(x, self.final_ln_w.dtype),
             self.final_ln_b.dtype,
@@ -465,11 +493,7 @@ impl ClipPrice {
             .text_projection
             .as_ref()
             .map_or(normed, |p| p.output_dtype(normed));
-        let penultimate = hidden_states
-            .len()
-            .checked_sub(2)
-            .map_or(x, |i| hidden_states[i]);
-        (penultimate, pooled)
+        (scratch, pooled)
     }
 
     #[cfg(test)]

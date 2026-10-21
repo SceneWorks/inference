@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "cde622fb52a40b0cfd51b12cc615edc6991a981ce817134a5d7061559c897c17",
+  "rust_proof_closure_sha256": "80c01a92cb55b542c0a1672f00a024b7cbf104ac0c023e3d629af0f0614ac716",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -29,6 +29,10 @@
     {
       "path": "Cargo.toml",
       "sha256": "44642075ee00bb72b9ad8f42fbf065c3c3042b553a72a1c086f5f13de0483680"
+    },
+    {
+      "path": "crates/bundles/runtime-ios/Cargo.toml",
+      "sha256": "6ed72c8cea6755afddf8d67dc1bfd02f0e8aec88745468734938f9bb8a2de3d7"
     },
     {
       "path": "crates/bundles/runtime-ios/src/lib.rs",
@@ -147,6 +151,10 @@
       "sha256": "1d8d621f4986bd14a9cb5c7e46c7f4985e5499bc2061b2edf2678f60782790b2"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/bound.rs",
+      "sha256": "9271697acc4e806e3540272074e4ed17a72522b79c921317ef92606f2f3cba4f"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/capture_config.rs",
       "sha256": "a7a791fe9ebe08c567356bf596af8aa12c13300672852bf80955980fecdfd14f"
     },
@@ -181,6 +189,10 @@
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
       "sha256": "d58df94df482e116092d0d155b213b576a57c7d1e39ba2253545482d0bdafe45"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/source_work.rs",
+      "sha256": "c00b88ecddb2e4defee5fcd9812d2ab41347e36c0597da22bfbedde41e810b52"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/zimage.rs",
@@ -320,7 +332,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing.rs",
-      "sha256": "66ee4a687caf2e50ac1410ebab50392a9208d5e40769dc1739abb7c2fa0a42d0"
+      "sha256": "1942511560b2453bc8533b2ddeb8b15dfcb899813f1ac2ac900bbe7a804935c8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/additivity.rs",
@@ -372,15 +384,27 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "8455684b411cc7cc3f203f552a7e064fe7205bc98ead16c36f4b68741e2dfcfa"
+      "sha256": "971fd01e57858252badc441433c91f44f32d48e09dee6088a5944582b8b072ea"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing/text_alias.rs",
+      "sha256": "e92240ba2f66621d99ef26f68ff54b3159290ea5140d1813de66cb2ba3917105"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
       "sha256": "ed5ccc8a142733eced0f022b65b556aded25d15e9e19e623fac416cb0e654a53"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter/pricing.rs",
+      "sha256": "3f68a0fdea244a0c3eb479ff76c24b3fcce19a5395bccd44790539c5f5ec79b4"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
-      "sha256": "9f407fba771e0ccacad42bc56808faceb8bface1573e5ed73347d2acba9c3cfb"
+      "sha256": "c4972e51ca2476f276fbc9cb65848fec86b2d7d1c714c3c671ade38f5d0f2f42"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm/pricing.rs",
+      "sha256": "5b66f904bd8baf582a357dd1ad67ddcb430fa7c62fa305e9980dc6b51f0b31bc"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
@@ -416,7 +440,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "4f5f4083d307633f01eeb92ecc42ca8524208423b4f7d4c80d2a205cd2102834"
+      "sha256": "259e0dbb8c2c65bcce502287b470e983b3053f3d73a3c547b62b392e60f3b1e0"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -431,6 +455,10 @@
       "sha256": "8da746e3e6ba86c27a72e9363afc84c9f6737ce45565b2e44ff7cebacfd66117"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling/source_context.rs",
+      "sha256": "decf783f916f9cfe6adace0ae11fc7ee95e5697a65e085842aeba787d3b7e47a"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling_tests.rs",
       "sha256": "19ea2e0df592ff5bf03fe20237be8349b269d1d2b5e4fbb70c47c7ce79813075"
     },
@@ -440,7 +468,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/text_encoder.rs",
-      "sha256": "09adc760b336afc5cdfa56ab0f67c528814d4f34a8039baa7787e425745046f1"
+      "sha256": "bbe87ca5f50105dbfd9fcf6907a5ea81d6fcda25bd9f514756551440f956c0b7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
@@ -541,6 +569,10 @@
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
       "sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources/native_allocations.rs",
+      "sha256": "24e59f04189d750258ae9cf49b83582e50619937b9d1705d4424faf35acb5665"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
@@ -795,6 +827,14 @@
       "sha256": "c8970823ef9faa774151e1d52a732d6aaf6e311a4a55f7a48de9273b7fb780fb"
     },
     {
+      "path": "ios-host/smoke/Cargo.toml",
+      "sha256": "7eb70f9fe9634e327143f5deb14a7135096717508fcaa112182f69bf5319f634"
+    },
+    {
+      "path": "ios-host/smoke/examples/campaign_catalog.rs",
+      "sha256": "585c51bda6f34d18226d8aec1b2be4c718bf1704f35e7cf38504b332188e91b0"
+    },
+    {
       "path": "ios-host/smoke/src/campaign.rs",
       "sha256": "12ae3a8c541698a683c582998c3fb271ad73e684f2be869ff1e5457adbd0d94c"
     },
@@ -833,42 +873,6 @@
     {
       "path": "scripts/tests/test_ios_campaign.py",
       "sha256": "7f1261394d83437d5bfb11243e2f2197cd043a8d078944a6fc30aa1b5ed06f75"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/bound.rs",
-      "sha256": "9271697acc4e806e3540272074e4ed17a72522b79c921317ef92606f2f3cba4f"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/source_work.rs",
-      "sha256": "c00b88ecddb2e4defee5fcd9812d2ab41347e36c0597da22bfbedde41e810b52"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling/source_context.rs",
-      "sha256": "decf783f916f9cfe6adace0ae11fc7ee95e5697a65e085842aeba787d3b7e47a"
-    },
-    {
-      "path": "crates/bundles/runtime-ios/Cargo.toml",
-      "sha256": "6ed72c8cea6755afddf8d67dc1bfd02f0e8aec88745468734938f9bb8a2de3d7"
-    },
-    {
-      "path": "ios-host/smoke/Cargo.toml",
-      "sha256": "7eb70f9fe9634e327143f5deb14a7135096717508fcaa112182f69bf5319f634"
-    },
-    {
-      "path": "ios-host/smoke/examples/campaign_catalog.rs",
-      "sha256": "585c51bda6f34d18226d8aec1b2be4c718bf1704f35e7cf38504b332188e91b0"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter/pricing.rs",
-      "sha256": "3f68a0fdea244a0c3eb479ff76c24b3fcce19a5395bccd44790539c5f5ec79b4"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm/pricing.rs",
-      "sha256": "a85fee0f2d5a0f5528ce94c36174787ca3380174655aa67996a6790d3d88e13d"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources/native_allocations.rs",
-      "sha256": "24e59f04189d750258ae9cf49b83582e50619937b9d1705d4424faf35acb5665"
     }
   ],
   "HOSTs": [
@@ -1430,11 +1434,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "4b92426f4150ebe7350f9e006be011405970390385e1d8cec6cfec7e686ec717",
-    "classification_sha256": "735b99c4e052e7e875cd742f698a7b0585a71b6036109a8ee4fc633bd7a3a397",
-    "selected_Rust_FQNs": 97,
-    "HOST_logical": 84,
-    "HOST_expected_PASS_rows": 85,
+    "inventory_sha256": "35344109dd18019f809cb79e78c9d2136f8d3e78b0df16b13db26ff55473d455",
+    "classification_sha256": "3e49999772162a823e658fe5778abfb36ccacbd1c14bc027e833887750859dce",
+    "selected_Rust_FQNs": 99,
+    "HOST_logical": 86,
+    "HOST_expected_PASS_rows": 87,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

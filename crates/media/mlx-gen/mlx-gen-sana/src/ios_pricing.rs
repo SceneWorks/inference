@@ -508,9 +508,12 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
     );
 }
 
+/// One quantum's scratch bytes, label, optional spatial extent, and extra held bytes.
+type PhaseQuantum = (u64, &'static str, Option<(u64, u64)>, u64);
+
 /// The counted quanta of one phase, `(scratch, label)` in run order.
 #[derive(Clone, Default)]
-struct Quanta(Vec<(u64, &'static str, Option<(u64, u64)>, u64)>);
+struct Quanta(Vec<PhaseQuantum>);
 impl Quanta {
     fn take(&mut self, scratch: u64, label: &'static str) {
         self.0.push((scratch, label, None, 0));

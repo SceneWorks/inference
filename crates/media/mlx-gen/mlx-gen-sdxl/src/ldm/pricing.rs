@@ -79,6 +79,17 @@ impl FusedHeaders {
             SdxlComponent::Vae => &mut self.vae,
         }
     }
+    pub(crate) fn component(
+        &self,
+        component: SdxlComponent,
+    ) -> &BTreeMap<String, SafetensorsTensorHeader> {
+        match component {
+            SdxlComponent::Unet => &self.unet,
+            SdxlComponent::ClipL => &self.clip_l,
+            SdxlComponent::ClipBigG => &self.clip_bigg,
+            SdxlComponent::Vae => &self.vae,
+        }
+    }
     fn require_components(&self) -> Result<()> {
         for (name, empty) in [
             ("UNet", self.unet.is_empty()),
@@ -236,14 +247,83 @@ impl FusedSourceIr {
         &self.operations[writer.source].outputs[writer.output]
     }
 
-    pub(crate) fn project_equivalent(&self) -> Result<OrderInvariantProjection> {
-        // Per-component packed flag from target NAMES only: identical in every source order.
+    /// The world with assignment 0 of every order-dependent alias group, plus those groups.
+    /// Pricing-equivalent multi-writer targets take their first writer, which every pricing
+    /// consumer reads identically ([`pricing_equivalent`]).
+    pub(crate) fn pricing_aliases(&self) -> Result<(FusedHeaders, Vec<PricingAlias>)> {
+        let packed = self.packed_components();
+        let mut base = FusedHeaders::default();
+        let mut ambiguous = Vec::new();
+        for writers in self.target_writers.values() {
+            let Some(&first) = writers.first() else {
+                continue;
+            };
+            let value = self.output(first);
+            let component_packed = packed[usize::from(component_key(value.component))];
+            let mut differs = false;
+            for &writer in writers {
+                if !pricing_equivalent(
+                    component_packed,
+                    &self.output(writer).header,
+                    &value.header,
+                )? {
+                    differs = true;
+                }
+            }
+            if differs {
+                ambiguous.push(writers.as_slice());
+            }
+            base.map(value.component)
+                .insert(value.header.name.clone(), value.header.clone());
+        }
+        let mut aliases = Vec::new();
+        for targets in alias_groups(self.operations.len(), ambiguous) {
+            let component = self.output(targets[0][0]).component;
+            let names = targets
+                .iter()
+                .map(|writers| self.output(writers[0]).header.name.clone())
+                .collect::<Vec<_>>();
+            let assignments = realizable_assignments(&targets)
+                .into_iter()
+                .map(|choice| {
+                    targets
+                        .iter()
+                        .zip(&choice)
+                        .map(|(writers, &pick)| self.output(writers[pick]).header.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let Some(first) = assignments.first() else {
+                return Err(Error::Msg(
+                    "sdxl fused alias group has no realizable source order".into(),
+                ));
+            };
+            for (name, header) in names.iter().zip(first) {
+                base.map(component).insert(name.clone(), header.clone());
+            }
+            aliases.push(PricingAlias {
+                component,
+                targets: names,
+                assignments,
+            });
+        }
+        base.require_components()?;
+        Ok((base, aliases))
+    }
+
+    fn packed_components(&self) -> [bool; 4] {
         let mut packed = [false; 4];
         for (component, name) in self.target_writers.keys() {
             if name.ends_with(".scales") {
                 packed[usize::from(*component)] = true;
             }
         }
+        packed
+    }
+
+    pub(crate) fn project_equivalent(&self) -> Result<OrderInvariantProjection> {
+        // Per-component packed flag from target NAMES only: identical in every source order.
+        let packed = self.packed_components();
         let mut result = FusedHeaders::default();
         let mut ambiguous = vec![false; self.operations.len()];
         let mut transform_failures = Vec::new();
@@ -326,6 +406,7 @@ pub(crate) enum OrderInvariantProjection {
         transform_failures: Vec<(usize, String)>,
     },
 }
+#[cfg(test)]
 pub(crate) fn order_invariant_projection(
     headers: &[SafetensorsTensorHeader],
 ) -> Result<OrderInvariantProjection> {
@@ -338,6 +419,17 @@ pub(crate) struct FusedHeaderSource {
     pub raw: Vec<SafetensorsTensorHeader>,
     pub components: FusedHeaders,
     ir: FusedSourceIr,
+    /// Order-dependent alias groups whose writers differ in shape or loaded dtype. `components`
+    /// holds the world with assignment 0 of every group; each assignment is realizable.
+    pub aliases: Vec<PricingAlias>,
+}
+
+/// One order-dependent alias group: its targets and, per realizable native winner assignment,
+/// the winning transformed header of each target (same order as `targets`).
+pub(crate) struct PricingAlias {
+    pub component: SdxlComponent,
+    pub targets: Vec<String>,
+    pub assignments: Vec<Vec<SafetensorsTensorHeader>>,
 }
 impl FusedHeaderSource {
     pub(crate) fn read(path: &std::path::Path) -> Result<Self> {
@@ -347,27 +439,26 @@ impl FusedHeaderSource {
     }
     pub(crate) fn from_headers(raw: Vec<SafetensorsTensorHeader>) -> Result<Self> {
         let ir = FusedSourceIr::from_headers(&raw)?;
+        // The same IR that established source-op/target provenance supplies the actual raw parent
+        // records consumed by the shared native load-floor expression. These are lossless original
+        // records, NOT joined/maximized checkpoint headers.
+        let raw = ir
+            .operations
+            .iter()
+            .map(|op| SafetensorsTensorHeader {
+                name: op.source_name.clone(),
+                shape: op.raw_shape.clone(),
+                dtype: op.raw_dtype,
+                data_bytes: op.raw_data_bytes,
+            })
+            .collect();
         match ir.project_equivalent()? {
-            OrderInvariantProjection::Resolved(components) => {
-                // The same IR that established source-op/target provenance supplies the actual
-                // raw parent records consumed by the shared native load-floor expression.
-                // These are lossless original records, NOT joined/maximized checkpoint headers.
-                let raw = ir
-                    .operations
-                    .iter()
-                    .map(|op| SafetensorsTensorHeader {
-                        name: op.source_name.clone(),
-                        shape: op.raw_shape.clone(),
-                        dtype: op.raw_dtype,
-                        data_bytes: op.raw_data_bytes,
-                    })
-                    .collect();
-                Ok(Self {
-                    raw,
-                    components,
-                    ir,
-                })
-            }
+            OrderInvariantProjection::Resolved(components) => Ok(Self {
+                raw,
+                components,
+                ir,
+                aliases: Vec::new(),
+            }),
             OrderInvariantProjection::NeedsActualOrder {
                 source_indices,
                 transform_failures,
@@ -379,23 +470,55 @@ impl FusedHeaderSource {
                         "sdxl LDM fused source transform failure in every source order: {error}"
                     )));
                 }
-                // Remaining: writers whose shape or loaded dtype differ, so the priced program
-                // depends on native source order. Not a native restriction or Fused completion.
-                Err(Error::Unsupported(format!(
-                    "sdxl fused pricing for order-dependent source aliases remains incomplete ({} source alternatives)",
-                    source_indices.len()
-                )))
+                let (components, aliases) = ir.pricing_aliases()?;
+                // Text-encoder aliases are priced exactly (ios_pricing witness worlds). UNet/VAE
+                // aliases are a later slice: not a native restriction or Fused completion.
+                let heavy = aliases
+                    .iter()
+                    .filter(|alias| {
+                        matches!(alias.component, SdxlComponent::Unet | SdxlComponent::Vae)
+                    })
+                    .count();
+                if heavy > 0 {
+                    return Err(Error::Unsupported(format!(
+                        "sdxl fused pricing for order-dependent UNet/VAE source aliases remains incomplete ({heavy} alias groups over {} sources)",
+                        source_indices.len()
+                    )));
+                }
+                Ok(Self {
+                    raw,
+                    components,
+                    ir,
+                    aliases,
+                })
             }
         }
     }
+    /// `component`'s headers in the world selecting assignment `pick.1` of alias group `pick.0`
+    /// for every listed pick, and assignment 0 of every other group.
+    pub(crate) fn headers_with(
+        &self,
+        component: SdxlComponent,
+        picks: &[(usize, usize)],
+    ) -> Vec<SafetensorsTensorHeader> {
+        let mut map = self.components.component(component).clone();
+        for &(group, assignment) in picks {
+            let alias = &self.aliases[group];
+            if alias.component != component {
+                continue;
+            }
+            for (target, header) in alias.targets.iter().zip(&alias.assignments[assignment]) {
+                map.insert(target.clone(), header.clone());
+            }
+        }
+        map.into_values().collect()
+    }
     pub(crate) fn headers(&self, component: SdxlComponent) -> Vec<SafetensorsTensorHeader> {
-        let map = match component {
-            SdxlComponent::Unet => &self.components.unet,
-            SdxlComponent::ClipL => &self.components.clip_l,
-            SdxlComponent::ClipBigG => &self.components.clip_bigg,
-            SdxlComponent::Vae => &self.components.vae,
-        };
-        map.values().cloned().collect()
+        self.components
+            .component(component)
+            .values()
+            .cloned()
+            .collect()
     }
     pub(crate) fn raw_parent_bytes(&self, components: &[SdxlComponent]) -> u64 {
         self.ir
@@ -497,32 +620,12 @@ impl FusedHeaderSource {
             .filter(|writers| writers.len() > 1)
             .copied()
             .collect::<Vec<_>>();
-        let mut parent = (0..self.ir.operations.len()).collect::<Vec<_>>();
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
-        for writers in &ambiguous {
-            let first = find(&mut parent, writers[0].source);
-            for writer in &writers[1..] {
-                let other = find(&mut parent, writer.source);
-                parent[other] = first;
-            }
-        }
-        let mut groups: BTreeMap<usize, Vec<&[WriterId]>> = BTreeMap::new();
-        for writers in ambiguous {
-            let root = find(&mut parent, writers[0].source);
-            groups.entry(root).or_default().push(writers);
-        }
+        let groups = alias_groups(self.ir.operations.len(), ambiguous);
         let (mut lower, mut upper) = (base, base);
-        for targets in groups.values() {
+        for targets in &groups {
             let mut extreme: Option<(u64, u64)> = None;
-            let mut choice = vec![0usize; targets.len()];
-            loop {
-                if realizable(targets, &choice) {
+            for choice in realizable_assignments(targets) {
+                {
                     let mut charged = std::collections::BTreeSet::new();
                     let mut cost = 0u64;
                     for (writers, &pick) in targets.iter().zip(&choice) {
@@ -536,22 +639,6 @@ impl FusedHeaderSource {
                     extreme =
                         Some(extreme.map_or((cost, cost), |(lo, hi)| (lo.min(cost), hi.max(cost))));
                 }
-                // Odometer over this group's per-target writer lists only.
-                let mut index = 0;
-                loop {
-                    if index == choice.len() {
-                        break;
-                    }
-                    choice[index] += 1;
-                    if choice[index] < targets[index].len() {
-                        break;
-                    }
-                    choice[index] = 0;
-                    index += 1;
-                }
-                if index == choice.len() {
-                    break;
-                }
             }
             // Some order always exists, so every group has a realizable assignment.
             let (lo, hi) = extreme.ok_or_else(|| {
@@ -561,6 +648,59 @@ impl FusedHeaderSource {
             upper = upper.saturating_add(hi);
         }
         Ok(FusedCounterBacking { lower, upper })
+    }
+}
+
+/// Connected components of (source, target) over the given multi-writer targets. Distinct
+/// components share no source, so their native winner choices are independent.
+fn alias_groups(sources: usize, targets: Vec<&[WriterId]>) -> Vec<Vec<&[WriterId]>> {
+    let mut parent = (0..sources).collect::<Vec<_>>();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for writers in &targets {
+        let first = find(&mut parent, writers[0].source);
+        for writer in &writers[1..] {
+            let other = find(&mut parent, writer.source);
+            parent[other] = first;
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<&[WriterId]>> = BTreeMap::new();
+    for writers in targets {
+        let root = find(&mut parent, writers[0].source);
+        groups.entry(root).or_default().push(writers);
+    }
+    groups.into_values().collect()
+}
+
+/// Every realizable winner assignment (one writer index per target) of one alias group. A group
+/// spans at most one layer's correlated Q/K/V targets, so this odometer stays tiny.
+fn realizable_assignments(targets: &[&[WriterId]]) -> Vec<Vec<usize>> {
+    let mut result = Vec::new();
+    let mut choice = vec![0usize; targets.len()];
+    loop {
+        if realizable(targets, &choice) {
+            result.push(choice.clone());
+        }
+        let mut index = 0;
+        loop {
+            if index == choice.len() {
+                break;
+            }
+            choice[index] += 1;
+            if choice[index] < targets[index].len() {
+                break;
+            }
+            choice[index] = 0;
+            index += 1;
+        }
+        if index == choice.len() {
+            return result;
+        }
     }
 }
 
@@ -840,6 +980,46 @@ mod source_ir_tests {
         assert!(realizable(&[&q, &k], &[0, 0]));
         assert!(realizable(&[&q, &k], &[1, 1]));
         assert!(!realizable(&[&q, &k], &[0, 1]));
+    }
+
+    #[test]
+    fn text_alias_groups_keep_every_realizable_world_host() {
+        let mut headers = source();
+        // A separate Q writer whose post-split shape differs from the split part.
+        headers.push(header(
+            "conditioner.embedders.1.model.transformer.resblocks.0.attn.q_proj.weight",
+            &[3, 4],
+            Stored::F32,
+        ));
+        let source = FusedHeaderSource::from_headers(headers).unwrap();
+        assert_eq!(source.aliases.len(), 1);
+        let alias = &source.aliases[0];
+        assert_eq!(alias.component, SdxlComponent::ClipBigG);
+        let q = "text_model.encoder.layers.0.self_attn.q_proj.weight";
+        assert_eq!(alias.targets, [q]);
+        let shapes = alias
+            .assignments
+            .iter()
+            .map(|world| world[0].shape.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            [vec![2, 4], vec![3, 4]],
+            "both native winners, split first"
+        );
+        let find = |headers: Vec<SafetensorsTensorHeader>| {
+            headers.into_iter().find(|h| h.name == q).unwrap().shape
+        };
+        assert_eq!(find(source.headers(SdxlComponent::ClipBigG)), [2, 4]);
+        assert_eq!(
+            find(source.headers_with(SdxlComponent::ClipBigG, &[(0, 1)])),
+            [3, 4]
+        );
+        // Text aliases never change another component's headers.
+        assert_eq!(
+            source.headers_with(SdxlComponent::Unet, &[(0, 1)]),
+            source.headers(SdxlComponent::Unet)
+        );
     }
 
     #[test]

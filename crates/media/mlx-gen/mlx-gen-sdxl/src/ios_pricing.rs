@@ -33,6 +33,8 @@ use mlx_gen::{Error, Result};
 use mlx_rs::Dtype;
 use std::path::{Path, PathBuf};
 
+mod text_alias;
+
 /// Every quantum label this crate checks (`ios_quantum::{run, before, before_load*}`) and the phase
 /// it runs in. A device capture attributes its kernel peak through [`ios_quantum_phase`].
 const PHASES: &[(&str, IosPhase)] = &[
@@ -354,11 +356,131 @@ fn price_regime(
     regime: &Regime,
     backend: Backend,
 ) -> Result<IosPricing> {
-    let inputs = Inputs::from_spec(req.spec, regime)?;
+    let mut inputs = Inputs::from_spec(req.spec, regime)?;
     q::with_backend(backend, || {
-        let mut priced = Priced::build_configured(&inputs, req.spec)?;
-        priced.price_configured(req.spec, &inputs.unet, inputs.quant_bits, regime)
+        price_inputs(&mut inputs, regime, Some(req.spec))
     })
+}
+
+/// The exact pricer over every witness world of the source's order-dependent text aliases
+/// ([`text_alias`]), kept as one whole-candidate window envelope. A source without aliases has
+/// the single base world and returns its ledger unchanged.
+fn price_inputs(
+    inputs: &mut Inputs,
+    regime: &Regime,
+    configured: Option<&LoadSpec>,
+) -> Result<IosPricing> {
+    let worlds = text_alias::witness_worlds(inputs, regime)?;
+    price_worlds(inputs, regime, configured, worlds)
+}
+
+fn price_worlds(
+    inputs: &mut Inputs,
+    regime: &Regime,
+    configured: Option<&LoadSpec>,
+    worlds: Vec<text_alias::Picks>,
+) -> Result<IosPricing> {
+    let price_world = |inputs: &Inputs| -> Result<IosPricing> {
+        match configured {
+            Some(spec) => {
+                let mut priced = Priced::build_configured(inputs, spec)?;
+                priced.price_configured(spec, &inputs.unet, inputs.quant_bits, regime)
+            }
+            None => Ok(Priced::build(inputs)?.price(regime)?.0),
+        }
+    };
+    if worlds.len() == 1 && worlds[0].is_empty() {
+        return price_world(inputs);
+    }
+    let mut envelope = WindowEnvelope::new();
+    let mut absent = None;
+    for world in worlds {
+        inputs
+            .fused
+            .as_mut()
+            .expect("text alias worlds are fused")
+            .world = world;
+        let pricing = price_world(inputs)?;
+        absent.get_or_insert_with(|| pricing.absent_phases.clone());
+        merge_envelope(&mut envelope, pricing);
+    }
+    inputs
+        .fused
+        .as_mut()
+        .expect("text alias worlds are fused")
+        .world = Vec::new();
+    let mut pricing = IosPricing::default();
+    for (_, window) in envelope {
+        pricing.take_window(window);
+    }
+    pricing.absent_phases = absent.unwrap_or_default();
+    Ok(pricing)
+}
+
+/// Test oracle: the same envelope over EVERY realizable text-alias world (the full product of
+/// each group's realizable assignments), or over the production witness worlds.
+#[cfg(test)]
+pub(crate) fn alias_envelope_for_test(
+    inputs: &mut Inputs,
+    regime: &Regime,
+    configured: Option<&LoadSpec>,
+    every_world: bool,
+) -> Result<IosPricing> {
+    let worlds = if every_world {
+        let aliases = &inputs
+            .fused
+            .as_ref()
+            .expect("fused alias fixture")
+            .source
+            .aliases;
+        let mut worlds: Vec<text_alias::Picks> = vec![Vec::new()];
+        for (group, alias) in aliases.iter().enumerate() {
+            worlds = worlds
+                .into_iter()
+                .flat_map(|world| {
+                    (0..alias.assignments.len()).map(move |assignment| {
+                        let mut world = world.clone();
+                        world.push((group, assignment));
+                        world
+                    })
+                })
+                .collect();
+        }
+        worlds
+    } else {
+        text_alias::witness_worlds(inputs, regime)?
+    };
+    price_worlds(inputs, regime, configured, worlds)
+}
+
+type WindowEnvelope =
+    std::collections::BTreeMap<(IosPhase, Option<String>, String, String, usize), IosWindowPrice>;
+
+/// Keep a whole coincident candidate per window identity, never max(resident) + max(scratch)
+/// from different worlds. Ordinals distinguish repeated same-label epochs.
+fn merge_envelope(envelope: &mut WindowEnvelope, pricing: IosPricing) {
+    let mut ordinals = std::collections::BTreeMap::new();
+    for window in pricing.windows {
+        let identity = (
+            window.phase,
+            window.class.clone(),
+            window.label.clone(),
+            window.owner_domain.clone(),
+        );
+        let ordinal = ordinals.entry(identity.clone()).or_insert(0usize);
+        let key = (identity.0, identity.1, identity.2, identity.3, *ordinal);
+        *ordinal += 1;
+        match envelope.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(window);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if window.logical_peak_bytes() > entry.get().logical_peak_bytes() {
+                    entry.insert(window);
+                }
+            }
+        }
+    }
 }
 
 /// Source-owned NATIVE-ALLOCATOR matched-window certificates for the correlated anchor law.
@@ -373,8 +495,8 @@ pub fn ios_bounder(
 ) -> Result<Vec<IosWindowBound>> {
     let anchor = Regime::from_request(anchor_request)?;
     let requested = Regime::from_request(request)?;
-    let anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
-    let request_inputs = Inputs::from_spec(request.spec, &requested)?;
+    let mut anchor_inputs = Inputs::from_spec(anchor_request.spec, &anchor)?;
+    let mut request_inputs = Inputs::from_spec(request.spec, &requested)?;
     if anchor_inputs.fused.is_some() != request_inputs.fused.is_some() {
         return Err(Error::Unsupported(
             "sdxl common-forward transfer needs the same source component graph".into(),
@@ -405,8 +527,8 @@ pub fn ios_bounder(
         ));
     }
     q::with_backend(Backend::Metal, || {
-        let expected_anchor = Priced::build(&anchor_inputs)?.price(&anchor)?.0;
-        let expected_request = Priced::build(&request_inputs)?.price(&requested)?.0;
+        let expected_anchor = price_inputs(&mut anchor_inputs, &anchor, None)?;
+        let expected_request = price_inputs(&mut request_inputs, &requested, None)?;
         let matches_source = |expected: &IosPricing, supplied: &IosPricing| {
             expected.phases == supplied.phases
                 && expected.windows == supplied.windows
@@ -1090,6 +1212,8 @@ pub(crate) struct FusedInputs {
     source: crate::ldm::pricing::FusedHeaderSource,
     vae_fix: Option<WeightsSource>,
     ip_source: Option<WeightsSource>,
+    /// The selected world of `source.aliases`; empty selects assignment 0 of every group.
+    world: text_alias::Picks,
 }
 
 impl Inputs {
@@ -1205,6 +1329,7 @@ impl Inputs {
                     .get(crate::loader::VAE_FP16_FIX_COMPONENT)
                     .cloned(),
                 ip_source: spec.ip_adapter.clone(),
+                world: Vec::new(),
             }),
         };
         let dtype = crate::model::DTYPE;
@@ -1428,7 +1553,7 @@ impl Priced {
         };
         use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
         let component_headers = |file: &Path, component: C| match &inputs.fused {
-            Some(fused) => Ok(fused.source.headers(component)),
+            Some(fused) => Ok(fused.source.headers_with(component, &fused.world)),
             None => headers(file),
         };
         let te1_headers = component_headers(&inputs.te1, C::ClipL)?;
@@ -1711,10 +1836,7 @@ impl Priced {
         let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(unet_file)
             .map_err(|e| Error::Msg(e.to_string()))?;
         let config = self.arch.unet.clone();
-        let mut envelope: std::collections::BTreeMap<
-            (IosPhase, Option<String>, String, String, usize),
-            IosWindowPrice,
-        > = std::collections::BTreeMap::new();
+        let mut envelope = WindowEnvelope::new();
         let mut accepted = false;
         let mut first_refusal = None;
         let mut absent = None;
@@ -1897,30 +2019,7 @@ impl Priced {
                 absent.get_or_insert_with(|| selected.absent_phases.clone());
                 selected
             };
-            // Keep a whole coincident candidate, never max(resident) + max(scratch) from different
-            // worlds. Ordinals distinguish repeated same-label epochs without retaining world lists.
-            let mut ordinals = std::collections::BTreeMap::new();
-            for window in pricing.windows {
-                let identity = (
-                    window.phase,
-                    window.class.clone(),
-                    window.label.clone(),
-                    window.owner_domain.clone(),
-                );
-                let ordinal = ordinals.entry(identity.clone()).or_insert(0usize);
-                let key = (identity.0, identity.1, identity.2, identity.3, *ordinal);
-                *ordinal += 1;
-                match envelope.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(window);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        if window.logical_peak_bytes() > entry.get().logical_peak_bytes() {
-                            entry.insert(window);
-                        }
-                    }
-                }
-            }
+            merge_envelope(&mut envelope, pricing);
             Ok(())
         })?;
         if !accepted {

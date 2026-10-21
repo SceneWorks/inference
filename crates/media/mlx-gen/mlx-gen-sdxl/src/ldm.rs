@@ -59,34 +59,20 @@ pub(crate) fn component_headers(
 ) -> Result<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
     let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
         .map_err(|error| Error::Msg(error.to_string()))?;
-    match pricing::order_invariant_projection(&headers)? {
-        pricing::OrderInvariantProjection::Resolved(components) => {
-            let selected = match component {
-                SdxlComponent::Unet => components.unet,
-                SdxlComponent::ClipL => components.clip_l,
-                SdxlComponent::ClipBigG => components.clip_bigg,
-                SdxlComponent::Vae => components.vae,
-            };
-            Ok(selected.into_values().collect())
-        }
-        pricing::OrderInvariantProjection::NeedsActualOrder {
-            source_indices,
-            transform_failures,
-        } => {
-            if let Some((_, error)) = transform_failures.first() {
-                return Err(Error::Msg(format!(
-                    "sdxl LDM fused source transform failure in every source order: {error}"
-                )));
-            }
-            // Existing semantic projection cannot certify these source-order-dependent files.
-            // This is an explicit unfinished source-seam dependency, not a new native restriction
-            // or numeric/full-Fused completion. Do not enumerate worlds or select a fake winner.
-            Err(Error::Unsupported(format!(
-                "sdxl LDM metadata needs actual correlated source order ({} order-dependent writes)",
-                source_indices.len()
-            )))
-        }
+    // Alias-free and text-only alias files expose one invariant component header set here; a
+    // requested component that itself carries order-dependent aliases is not certified.
+    let source = pricing::FusedHeaderSource::from_headers(headers)?;
+    let aliased = source
+        .aliases
+        .iter()
+        .filter(|alias| alias.component == component)
+        .count();
+    if aliased > 0 {
+        return Err(Error::Unsupported(format!(
+            "sdxl LDM metadata needs actual correlated source order ({aliased} order-dependent alias groups)"
+        )));
     }
+    Ok(source.headers(component))
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {

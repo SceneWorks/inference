@@ -7328,6 +7328,89 @@ fn write_header_only_sparse(
 }
 
 #[test]
+fn fused_text_alias_witness_envelope_equals_every_world_host() {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    use mlx_gen::gen_core::{LoadSpec, Quant, WeightsSource};
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("alias.safetensors");
+    let (mut raw, arch) = fused_skeleton_headers();
+    // Two order-dependent OpenCLIP aliases with different priced facts: a third Q writer (the
+    // fixture already carries an equal-facts `attn.q_proj` alias) beside the split in_proj
+    // (layer 0), and a direct fc1 writer beside c_fc (layer 1) whose wider output changes the
+    // layer quantum and the pack point.
+    raw.push(hierarchy_header(
+        "conditioner.embedders.1.model.transformer.resblocks.0.self_attn.q_proj.weight",
+        &[32, 64],
+        Stored::F32,
+    ));
+    raw.push(hierarchy_header(
+        "conditioner.embedders.1.model.transformer.resblocks.1.mlp.fc1.weight",
+        &[256, 64],
+        Stored::F32,
+    ));
+    write_header_only_sparse(&file, &raw);
+    for (staged, quantized) in [(false, false), (true, true), (false, true)] {
+        let mut spec = LoadSpec::new(WeightsSource::File(file.clone()));
+        spec.quantize = quantized.then_some(Quant::Q4);
+        let mut r = regime(Route::Text);
+        r.staged = staged;
+        r.tiling = None;
+        let mut input = Inputs::from_spec_for_test(&spec, &r).unwrap();
+        input.arch = arch.clone();
+        let (witness, every, base) = crate::quantum::with_backend(Backend::Cpu, || {
+            let witness =
+                crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), false)
+                    .unwrap();
+            let every =
+                crate::ios_pricing::alias_envelope_for_test(&mut input, &r, Some(&spec), true)
+                    .unwrap();
+            let base = Priced::build_configured(&input, &spec)
+                .unwrap()
+                .price(&r)
+                .unwrap()
+                .0;
+            (witness, every, base)
+        });
+        let peaks = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+            pricing
+                .windows
+                .iter()
+                .map(|w| {
+                    (
+                        (
+                            w.phase,
+                            w.class.clone(),
+                            w.label.clone(),
+                            w.owner_domain.clone(),
+                        ),
+                        w.logical_peak_bytes(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let phases = |pricing: &mlx_gen::ios_pricing::IosPricing| {
+            pricing
+                .phases
+                .iter()
+                .map(|phase| (phase.phase, phase.peak_bytes()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            peaks(&witness),
+            peaks(&every),
+            "witness worlds reach every window maximum over all realizable worlds staged={staged} quantized={quantized}"
+        );
+        assert_eq!(phases(&witness), phases(&every));
+        assert_eq!(witness.absent_phases, every.absent_phases);
+        assert_ne!(
+            peaks(&every),
+            peaks(&base),
+            "the aliases change priced windows; a single world is not the envelope"
+        );
+    }
+}
+
+#[test]
 fn fused_file_header_build_and_real_load_recipe_are_connected_host() {
     use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     use mlx_gen::gen_core::{LoadSpec, Quant, WeightsSource};
