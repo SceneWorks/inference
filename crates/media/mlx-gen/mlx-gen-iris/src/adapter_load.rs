@@ -495,11 +495,7 @@ impl Graph {
             let in_elements = checked_elements(&tensor.shape)?;
             // A genuinely empty output needs no partial reduction; this is an explicit native
             // empty-shape case, not an overflow/default fallback.
-            let reduction = if out_elements == 0 {
-                0
-            } else {
-                in_elements / out_elements
-            };
+            let reduction = in_elements.checked_div(out_elements).unwrap_or(0);
             let all_partials = if in_elements > 4 * 1024 {
                 if checked_tensor_bytes(&tensor)? <= 1 << 26 {
                     32 * 4

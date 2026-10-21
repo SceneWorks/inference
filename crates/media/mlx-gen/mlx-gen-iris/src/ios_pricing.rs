@@ -1258,7 +1258,7 @@ impl Backbone {
         let m = &self.cfg;
         let cw = self.cw;
         let p = m.patch_size as u64;
-        if p == 0 || h == 0 || w == 0 || h % p != 0 || w % p != 0 {
+        if p == 0 || h == 0 || w == 0 || !h.is_multiple_of(p) || !w.is_multiple_of(p) {
             return Err(Error::Unsupported(
                 "Iris invocation is not on its actual patch grid".into(),
             ));
@@ -2766,14 +2766,14 @@ fn generation(
             &mut pricing,
             IosPhase::Denoise,
             bb.resident + warm_te,
-            conditioning + u64::from(serial) * state + state + if serial == 0 { 0 } else { table },
+            conditioning + serial * state + state + if serial == 0 { 0 } else { table },
             &[(crate::solver::PLAN_QUANTUM, plan_host)],
             IosWorkBasis {
                 forward_rows: prompts,
                 model_width: w as u32,
                 model_height: h as u32,
                 source_plane_bytes: state,
-                output_plane_bytes: u64::from(serial) * state,
+                output_plane_bytes: serial * state,
                 ..Default::default()
             },
             &format!("iris.gen.plan/serial{}", serial != 0),
@@ -2786,7 +2786,7 @@ fn generation(
             &mut pricing,
             IosPhase::Denoise,
             bb.resident + warm_te,
-            solve_held + table + u64::from(serial) * state + 2 * state,
+            solve_held + table + serial * state + 2 * state,
             &[(
                 crate::solver::FINALIZE_QUANTUM,
                 crate::solver::final_clamp_scratch(state_elements),
@@ -2797,7 +2797,7 @@ fn generation(
                 model_height: h as u32,
                 source_plane_bytes: state,
                 processed_plane_bytes: state,
-                output_plane_bytes: u64::from(serial) * state,
+                output_plane_bytes: serial * state,
                 ..Default::default()
             },
             &format!("iris.gen.final_clamp/serial{}", serial != 0),
@@ -2806,7 +2806,7 @@ fn generation(
         );
         // Decode runs only after ALL serial solves. Their f32 outputs stay resident, while the
         // solve-local batches and original noises have dropped. Earlier RGB8 results are host bytes.
-        let prior_rgb = u64::from(serial) * prompts * 3 * h * w;
+        let prior_rgb = serial * prompts * 3 * h * w;
         take_source_at(
             &mut pricing,
             IosPhase::Decode,

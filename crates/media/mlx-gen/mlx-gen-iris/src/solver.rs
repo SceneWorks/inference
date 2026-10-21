@@ -36,7 +36,6 @@ pub fn sample(
 ) -> Result<Array> {
     let mut x = z.as_dtype(Dtype::Float32)?;
     let mut prev_x0: Option<Array> = None;
-    let mut completed_steps = 0u64;
     for (i, step) in plan.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -66,7 +65,7 @@ pub fn sample(
                 ("state_rows", x.shape()[0] as u64),
                 ("state_f32", u64::from(x.dtype() == Dtype::Float32)),
                 // This is completed-loop evidence, not a native availability assertion on lazy state.
-                ("prior_completed_steps", completed_steps),
+                ("prior_completed_steps", i as u64),
             ],
         );
         #[cfg(all(test, target_os = "macos"))]
@@ -77,7 +76,6 @@ pub fn sample(
         x = next;
         eval([&x, &x0])?;
         mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[&x, &x0])?;
-        completed_steps += 1;
         on_step(i + 1, &x0);
         prev_x0 = Some(x0);
     }

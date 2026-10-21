@@ -2547,18 +2547,29 @@ fn adjacent_rope(
     p.native_output(native, &out, NativeCall::Unbound)?;
     Ok(out)
 }
+struct HeadSpec<'a> {
+    heads: i32,
+    dim: i32,
+    qn: &'a str,
+    kn: &'a str,
+    cos: &'a Tensor,
+    sin: &'a Tensor,
+}
 fn prepare_heads(
     p: &mut Program,
     w: &mut Sources,
     site: &str,
     packed: &Tensor,
-    heads: i32,
-    dim: i32,
-    qn: &str,
-    kn: &str,
-    cos: &Tensor,
-    sin: &Tensor,
+    args: HeadSpec<'_>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    let HeadSpec {
+        heads,
+        dim,
+        qn,
+        kn,
+        cos,
+        sin,
+    } = args;
     let parts = p.split(&format!("{site}/packed-qkv-split"), packed, 3, 2)?;
     let mut tensors = Vec::new();
     for (i, part) in parts.iter().enumerate() {
@@ -2590,6 +2601,10 @@ fn feed_forward(p: &mut Program, w: &mut Sources, site: &str, x: &Tensor) -> Res
     let product = p.binary(&format!("{site}/swiglu-product"), &a, &b)?;
     p.linear(w, &format!("{site}.w2"), &product, true, false)
 }
+struct RopePair<'a> {
+    ri: &'a (Tensor, Tensor),
+    rt: &'a (Tensor, Tensor),
+}
 fn patch_block(
     p: &mut Program,
     e: &mut EngineSources,
@@ -2597,9 +2612,9 @@ fn patch_block(
     x: &Tensor,
     y: &Tensor,
     condition: &Tensor,
-    ri: &(Tensor, Tensor),
-    rt: &(Tensor, Tensor),
+    args: RopePair<'_>,
 ) -> Result<(Tensor, Tensor)> {
+    let RopePair { ri, rt } = args;
     let b = format!("patch_blocks.{index}");
     let c = e.cfg.clone();
     let mx = p.linear(
@@ -2631,24 +2646,28 @@ fn patch_block(
         &mut e.student,
         &format!("{b}/img-qkv"),
         &qx,
-        c.num_groups,
-        c.head_dim(),
-        &format!("{b}.attn.q_norm_x.weight"),
-        &format!("{b}.attn.k_norm_x.weight"),
-        &ri.0,
-        &ri.1,
+        HeadSpec {
+            heads: c.num_groups,
+            dim: c.head_dim(),
+            qn: &format!("{b}.attn.q_norm_x.weight"),
+            kn: &format!("{b}.attn.k_norm_x.weight"),
+            cos: &ri.0,
+            sin: &ri.1,
+        },
     )?;
     let txt = prepare_heads(
         p,
         &mut e.student,
         &format!("{b}/txt-qkv"),
         &qy,
-        c.num_groups,
-        c.head_dim(),
-        &format!("{b}.attn.q_norm_y.weight"),
-        &format!("{b}.attn.k_norm_y.weight"),
-        &rt.0,
-        &rt.1,
+        HeadSpec {
+            heads: c.num_groups,
+            dim: c.head_dim(),
+            qn: &format!("{b}.attn.q_norm_y.weight"),
+            kn: &format!("{b}.attn.k_norm_y.weight"),
+            cos: &rt.0,
+            sin: &rt.1,
+        },
     )?;
     let q = p.concat(&format!("{b}/text-first-q"), &[&txt.0, &img.0], 2)?;
     let k = p.concat(&format!("{b}/text-first-k"), &[&txt.1, &img.1], 2)?;
@@ -2701,6 +2720,10 @@ fn patch_block(
     Ok((x, y))
 }
 
+struct TokenGrid {
+    batch: i32,
+    tokens: i32,
+}
 fn pixel_block(
     p: &mut Program,
     e: &mut EngineSources,
@@ -2708,9 +2731,9 @@ fn pixel_block(
     x: &Tensor,
     s: &Tensor,
     rope: &(Tensor, Tensor),
-    batch: i32,
-    tokens: i32,
+    args: TokenGrid,
 ) -> Result<Tensor> {
+    let TokenGrid { batch, tokens } = args;
     let c = e.cfg.clone();
     let b = format!("pixel_blocks.{index}");
     let sh = x.shape.clone();
@@ -2762,12 +2785,14 @@ fn pixel_block(
         &mut e.student,
         &format!("{b}/qkv"),
         &qkv,
-        c.pixel_num_groups,
-        c.pixel_head_dim(),
-        &format!("{b}.attn.q_norm.weight"),
-        &format!("{b}.attn.k_norm.weight"),
-        &rope.0,
-        &rope.1,
+        HeadSpec {
+            heads: c.pixel_num_groups,
+            dim: c.pixel_head_dim(),
+            qn: &format!("{b}.attn.q_norm.weight"),
+            kn: &format!("{b}.attn.k_norm.weight"),
+            cos: &rope.0,
+            sin: &rope.1,
+        },
     )?;
     let attn = p.sdpa(&format!("{b}/pixel-flash-sdpa"), &h.0, &h.1, &h.2)?;
     let attn = merge_heads(p, &format!("{b}/attention-merge"), &attn)?;
@@ -2903,7 +2928,15 @@ fn net_forward(
                 sigma,
             )?;
         }
-        let out = patch_block(p, e, index, &main, &y, &condition, &ri, &rt)?;
+        let out = patch_block(
+            p,
+            e,
+            index,
+            &main,
+            &y,
+            &condition,
+            RopePair { ri: &ri, rt: &rt },
+        )?;
         main = out.0;
         y = out.1;
     }
@@ -2961,7 +2994,7 @@ fn net_forward(
     )?;
     let rp = rope_cache(p, e, true, hs, ws)?;
     for index in 0..c.pixel_depth {
-        xp = pixel_block(p, e, index, &xp, &s, &rp, batch, tokens)?;
+        xp = pixel_block(p, e, index, &xp, &s, &rp, TokenGrid { batch, tokens })?;
     }
     let norm = e.student.require(p, "final_layer.norm.weight")?;
     xp = p.rms("PiD final pixel RMS", &xp, &norm)?;
@@ -3010,16 +3043,25 @@ fn slice(
     p.complete(op, &out);
     Ok(out) // split_sections aliases the WHOLE x/LQ parent, never a tile payload copy
 }
+struct Placement {
+    axis: usize,
+    start: i32,
+    extent: i32,
+    total: i32,
+}
 fn accumulate(
     p: &mut Program,
     site: &str,
     previous: Option<Tensor>,
     x: &Tensor,
-    axis: usize,
-    start: i32,
-    extent: i32,
-    total: i32,
+    args: Placement,
 ) -> Result<Tensor> {
+    let Placement {
+        axis,
+        start,
+        extent,
+        total,
+    } = args;
     if x.shape[axis] != extent {
         return Err(Error::Msg("PiD actual accumulate extent gate".into()));
     }
@@ -3043,20 +3085,34 @@ fn accumulate(
         Ok(placed)
     }
 }
+struct TiledVelocityRequest<'a> {
+    time: &'a Tensor,
+    caption: &'a Tensor,
+    lq: &'a Tensor,
+    sigma: &'a Tensor,
+    edge: i32,
+    overlap: i32,
+    held: &'a BTreeSet<Slot>,
+    serial: u32,
+    step: usize,
+}
 fn tiled_velocity(
     p: &mut Program,
     e: &mut EngineSources,
     x: &Tensor,
-    time: &Tensor,
-    caption: &Tensor,
-    lq: &Tensor,
-    sigma: &Tensor,
-    edge: i32,
-    overlap: i32,
-    held: &BTreeSet<Slot>,
-    serial: u32,
-    step: usize,
+    args: TiledVelocityRequest<'_>,
 ) -> Result<Tensor> {
+    let TiledVelocityRequest {
+        time,
+        caption,
+        lq,
+        sigma,
+        edge,
+        overlap,
+        held,
+        serial,
+        step,
+    } = args;
     let (h, w) = (x.shape[2], x.shape[3]);
     let align = (h / lq.shape[2]).max(1);
     let tiles = mlx_gen_pid::tiling::plan_tiles(h, w, edge, overlap, align);
@@ -3113,10 +3169,12 @@ fn tiled_velocity(
             "PiD row strip",
             row.take(),
             &weighted,
-            3,
-            tile.x0,
-            tw,
-            w,
+            Placement {
+                axis: 3,
+                start: tile.x0,
+                extent: tw,
+                total: w,
+            },
         )?);
         let last_in_row = tiles.get(index + 1).is_none_or(|next| next.y0 != tile.y0);
         if last_in_row {
@@ -3128,10 +3186,12 @@ fn tiled_velocity(
                 "PiD full image accumulator",
                 acc.take(),
                 &strip,
-                2,
-                tile.y0,
-                th,
-                h,
+                Placement {
+                    axis: 2,
+                    start: tile.y0,
+                    extent: th,
+                    total: h,
+                },
             )?);
         }
         let mut resident = held.clone();
@@ -3354,7 +3414,20 @@ fn sample_decode(
         let velocity = match selection {
             TileSelection::Whole => net_forward(p, e, &x, &time, caption, &lq, &sigma)?,
             TileSelection::Tiled { edge, overlap } => tiled_velocity(
-                p, e, &x, &time, caption, &lq, &sigma, *edge, *overlap, &step_held, serial, step,
+                p,
+                e,
+                &x,
+                TiledVelocityRequest {
+                    time: &time,
+                    caption,
+                    lq: &lq,
+                    sigma: &sigma,
+                    edge: *edge,
+                    overlap: *overlap,
+                    held: &step_held,
+                    serial,
+                    step,
+                },
             )?,
         };
         if next > 0.0 && sampler.sample_type == SampleType::Ode {
@@ -3402,7 +3475,6 @@ fn sample_decode(
         false,
         false,
     )?;
-    let mut held = held;
     held.extend(e.caches.roots());
     p.window(
         IosPhase::Decode,
@@ -3571,9 +3643,11 @@ fn base_context(
             f,
             IosPhase::Load,
             mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM,
-            0,
-            structural,
-            staged,
+            crate::ios_pricing::WindowPoint {
+                point: 0,
+                structural,
+                staged,
+            },
             last_load.source_vae.as_deref(),
         )?
         .ok_or_else(|| Error::Msg("PiD base postVAE source operation".into()))?;
@@ -3596,9 +3670,11 @@ fn base_context(
             f,
             q.window.phase,
             q.label,
-            q.source_point,
-            q.source_structural,
-            staged,
+            crate::ios_pricing::WindowPoint {
+                point: q.source_point,
+                structural: q.source_structural,
+                staged,
+            },
             q.source_vae.as_deref(),
         )?;
     }
@@ -3609,9 +3685,11 @@ fn base_context(
             f,
             IosPhase::Decode,
             "PiD source decode",
-            0,
-            if staged { 0 } else { structural },
-            staged,
+            crate::ios_pricing::WindowPoint {
+                point: 0,
+                structural: if staged { 0 } else { structural },
+                staged,
+            },
             last_load.source_vae.as_deref(),
         )?
         .ok_or_else(|| Error::Msg("PiD base decode ownership operation".into()))?;
@@ -3741,21 +3819,27 @@ fn decoded_conversion(
     Ok(())
 }
 
+type ObserveFn<'a> = dyn FnMut(u64, &[Condition], &Prefix, &IosPricing, bool) -> Result<()> + 'a;
+
+struct RefusalContext<'a> {
+    base: &'a BaseContext,
+    route: &'a Route,
+    scale: i32,
+}
+
 struct Unified<'a> {
     next: u64,
     pricing: IosPricing,
     source_cases: Vec<SourceSummary>,
-    observe: &'a mut dyn FnMut(u64, &[Condition], &Prefix, &IosPricing, bool) -> Result<()>,
+    observe: &'a mut ObserveFn<'a>,
     complete: u64,
     refused: u64,
     last_failure: Option<(Error, AdapterSourcePrefix, Arc<Prefix>)>,
     pending: Arc<Prefix>,
     attempted_case_id: Option<u64>,
 }
-impl Unified<'_> {
-    fn new(
-        observe: &mut dyn FnMut(u64, &[Condition], &Prefix, &IosPricing, bool) -> Result<()>,
-    ) -> Unified<'_> {
+impl<'a> Unified<'a> {
+    fn new(observe: &'a mut ObserveFn<'a>) -> Self {
         Unified {
             next: 0,
             pricing: IosPricing::default(),
@@ -3838,11 +3922,10 @@ impl Unified<'_> {
         error: Error,
         adapter: &AdapterSourcePrefix,
         p: Program,
-        base: &BaseContext,
-        route: &Route,
-        scale: i32,
+        context: RefusalContext<'_>,
         conditions: Vec<Condition>,
     ) -> Result<()> {
+        let RefusalContext { base, route, scale } = context;
         let prefix = Arc::new(p.prefix);
         self.pending = Arc::clone(&prefix);
         let local = pid_source_prices(
@@ -3855,7 +3938,7 @@ impl Unified<'_> {
         self.last_failure = Some((error, adapter.clone(), prefix.clone()));
         self.commit(local, conditions, prefix, false)
     }
-    fn finish(self) -> std::result::Result<PidReport, PidFailure> {
+    fn finish(self) -> std::result::Result<PidReport, Box<PidFailure>> {
         if self.complete != 0 {
             return Ok(PidReport {
                 pricing: self.pricing,
@@ -3871,14 +3954,14 @@ impl Unified<'_> {
                 Arc::new(Prefix::default()),
             )
         });
-        Err(PidFailure {
+        Err(Box::new(PidFailure {
             error,
             adapter_prefix,
             source,
             committed: self.pricing.windows,
             attempted_case_id: None,
             adapter_attempted_case_id: None,
-        })
+        }))
     }
 }
 
@@ -3919,19 +4002,30 @@ fn emit_raw_io_refusals(
     Ok(())
 }
 
+struct CaseSources<'a> {
+    adapter: &'a AdapterSourceCase,
+    ledger: &'a super::adapter_sources::Ledger,
+    quanta: &'a [Priced],
+    base_pricing: &'a IosPricing,
+    controls: &'a Controls,
+    work_basis: Option<PidWorkBasis>,
+}
 fn source_case(
     unified: &mut Unified,
     model: &Model,
     route: &Route,
     sampling: &ResolvedFlowControls,
     spec: &LoadSpec,
-    adapter: &AdapterSourceCase,
-    ledger: &super::adapter_sources::Ledger,
-    quanta: &[Priced],
-    base_pricing: &IosPricing,
-    controls: &Controls,
-    work_basis: Option<PidWorkBasis>,
+    args: CaseSources<'_>,
 ) -> Result<()> {
+    let CaseSources {
+        adapter,
+        ledger,
+        quanta,
+        base_pricing,
+        controls,
+        work_basis,
+    } = args;
     let (positive, zero) = super::source_callback_presence(route, sampling)?;
     let forwards = [(true, positive), (false, zero)]
         .into_iter()
@@ -3962,9 +4056,11 @@ fn source_case(
                 ),
                 &adapter.prefix,
                 p,
-                &base,
-                route,
-                1,
+                RefusalContext {
+                    base: &base,
+                    route,
+                    scale: 1,
+                },
                 vec![Condition::EngineUsed(false)],
             );
         }
@@ -3995,9 +4091,11 @@ fn source_case(
                 error,
                 &adapter.prefix,
                 loaded,
-                &first_base,
-                route,
-                1,
+                RefusalContext {
+                    base: &first_base,
+                    route,
+                    scale: 1,
+                },
                 vec![Condition::EngineUsed(true)],
             );
         }
@@ -4046,9 +4144,11 @@ fn source_case(
         Error::Msg("conditional native PiD minimum-tile guard refusal".into()),
         &adapter.prefix,
         refused,
-        &first_base,
-        route,
-        engine.cfg.sr_scale,
+        RefusalContext {
+            base: &first_base,
+            route,
+            scale: engine.cfg.sr_scale,
+        },
         vec![Condition::NativeMinimumTileGuardPasses(false)],
     )?;
     unified.pending = Arc::new(loaded.prefix.clone());
@@ -4138,9 +4238,11 @@ fn source_case(
                             error,
                             &adapter.prefix,
                             p,
-                            &base,
-                            route,
-                            e.cfg.sr_scale,
+                            RefusalContext {
+                                base: &base,
+                                route,
+                                scale: e.cfg.sr_scale,
+                            },
                             conditions,
                         )?;
                         continue;
@@ -4199,9 +4301,11 @@ fn source_case(
                         error,
                         &adapter.prefix,
                         p,
-                        &base,
-                        route,
-                        e.cfg.sr_scale,
+                        RefusalContext {
+                            base: &base,
+                            route,
+                            scale: e.cfg.sr_scale,
+                        },
                         conditions,
                     )?;
                     continue;
@@ -4232,7 +4336,7 @@ pub(super) fn price_request(
     sampling: &ResolvedFlowControls,
     initial_width: u64,
     work_basis: Option<PidWorkBasis>,
-) -> std::result::Result<PidReport, PidFailure> {
+) -> std::result::Result<PidReport, Box<PidFailure>> {
     price_request_using(
         provider,
         spec,
@@ -4244,15 +4348,15 @@ pub(super) fn price_request(
     )
 }
 
-fn price_request_using(
+fn price_request_using<'a>(
     provider: &str,
     spec: &LoadSpec,
     route: &Route,
     sampling: &ResolvedFlowControls,
     initial_width: u64,
     work_basis: Option<PidWorkBasis>,
-    observe: &mut dyn FnMut(u64, &[Condition], &Prefix, &IosPricing, bool) -> Result<()>,
-) -> std::result::Result<PidReport, PidFailure> {
+    observe: &'a mut ObserveFn<'a>,
+) -> std::result::Result<PidReport, Box<PidFailure>> {
     let setup = (|| -> Result<_> {
         let controls = Controls::from_source(sampling, route)?;
         if controls.use_pid && !route.mode.control() {
@@ -4293,13 +4397,15 @@ fn price_request_using(
         }
         Ok((controls, model, cfg, kohya, projections))
     })();
-    let (controls, mut model, cfg, kohya, projections) = setup.map_err(|error| PidFailure {
-        error,
-        adapter_prefix: AdapterSourcePrefix::default(),
-        source: Arc::new(Prefix::default()),
-        committed: Vec::new(),
-        attempted_case_id: None,
-        adapter_attempted_case_id: None,
+    let (controls, mut model, cfg, kohya, projections) = setup.map_err(|error| {
+        Box::new(PidFailure {
+            error,
+            adapter_prefix: AdapterSourcePrefix::default(),
+            source: Arc::new(Prefix::default()),
+            committed: Vec::new(),
+            attempted_case_id: None,
+            adapter_attempted_case_id: None,
+        })
     })?;
     let mut projection = |path: &str| -> Result<_> {
         let Some(canonical) = crate::transformer::canonical_adapter_path(&cfg, path) else {
@@ -4354,12 +4460,14 @@ fn price_request_using(
                 route,
                 sampling,
                 spec,
-                adapter,
-                &ledger,
-                quanta,
-                &base,
-                &controls,
-                work_basis,
+                CaseSources {
+                    adapter,
+                    ledger: &ledger,
+                    quanta,
+                    base_pricing: &base,
+                    controls: &controls,
+                    work_basis,
+                },
             )
         })
     };
@@ -4370,17 +4478,16 @@ fn price_request_using(
         &mut projection,
         &mut consume,
     );
-    drop(consume);
     match visited {
         Ok(summary) if summary.enumeration_complete => unified.finish(),
-        Ok(_) => Err(PidFailure {
+        Ok(_) => Err(Box::new(PidFailure {
             error: Error::Msg("PiD source enumeration did not finish".into()),
             adapter_prefix: AdapterSourcePrefix::default(),
             source: unified.pending,
             committed: unified.pricing.windows,
             attempted_case_id: None,
             adapter_attempted_case_id: None,
-        }),
+        })),
         Err(failure) => {
             let AdapterSourceFailure {
                 error,
@@ -4388,14 +4495,14 @@ fn price_request_using(
                 attempted_case_id,
                 ..
             } = *failure;
-            Err(PidFailure {
+            Err(Box::new(PidFailure {
                 error,
                 adapter_prefix: prefix,
                 source: unified.pending,
                 committed: unified.pricing.windows,
                 attempted_case_id: unified.attempted_case_id,
                 adapter_attempted_case_id: attempted_case_id,
-            })
+            }))
         }
     }
 }
@@ -4428,7 +4535,7 @@ pub(super) fn price_before_existing_guard(
         initial_width,
         actual.or(work_basis),
     )
-    .map_err(PidFailure::into_legacy_error)?;
+    .map_err(|failure| failure.into_legacy_error())?;
     let source_windows = report.pricing.windows.len();
     let workspaces = report
         .source_cases
@@ -5143,8 +5250,32 @@ mod source_tests {
                 Dtype::Bfloat16,
             )
             .unwrap();
-        let row = accumulate(&mut p, "independent row", None, &tile, 3, 1, 3, 7).unwrap();
-        let full = accumulate(&mut p, "independent full", None, &row, 2, 1, 2, 5).unwrap();
+        let row = accumulate(
+            &mut p,
+            "independent row",
+            None,
+            &tile,
+            Placement {
+                axis: 3,
+                start: 1,
+                extent: 3,
+                total: 7,
+            },
+        )
+        .unwrap();
+        let full = accumulate(
+            &mut p,
+            "independent full",
+            None,
+            &row,
+            Placement {
+                axis: 2,
+                start: 1,
+                extent: 2,
+                total: 5,
+            },
+        )
+        .unwrap();
         assert_eq!(row.shape, vec![1, 3, 2, 7]);
         assert_eq!(full.shape, vec![1, 3, 5, 7]);
         let before = p.prefix.capacities.len();

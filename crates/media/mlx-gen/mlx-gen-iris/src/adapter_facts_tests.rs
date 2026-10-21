@@ -13,7 +13,7 @@ use mlx_rs::{transforms::eval, Array, Dtype};
 
 use super::header_inventory;
 use crate::nn::{BackboneQuant, Loader};
-use crate::retention::{allocated, Kind, Retention};
+use crate::retention::{allocated, Kind, LinearShape, Retention};
 
 fn cpu_child(test: &str, body: fn()) {
     const CHILD: &str = "IRIS_ADAPTER_FACTS_CHILD";
@@ -514,7 +514,17 @@ fn production_lora_forward_peak_requires_rank_and_dtype_terms() {
                     let x = tensor(&[128, 65], compute);
                     let facts = linear.adapter_facts();
                     let mut r = Retention::on(crate::nn::dtype_bytes(compute), true);
-                    r.adapted_linear(128, 65, 64, false, linear.input_pad(), Kind::Named, &facts);
+                    r.adapted_linear(
+                        LinearShape {
+                            rows: 128,
+                            input: 65,
+                            output: 64,
+                        },
+                        false,
+                        linear.input_pad(),
+                        Kind::Named,
+                        &facts,
+                    );
                     let formula = r.price();
                     let measured =
                         mlx_gen::ios_quantum::measured_peak_bytes(|| Ok(vec![linear.forward(&x)?]))
@@ -855,7 +865,17 @@ fn materialized_lokr_loha_native_peak_requires_adapter_budget() {
                     let x = tensor(&[512, 65], Dtype::Float32);
                     let facts = linear.adapter_facts();
                     let mut r = Retention::on(4, true);
-                    r.adapted_linear(512, 65, 64, false, linear.input_pad(), Kind::Named, &facts);
+                    r.adapted_linear(
+                        LinearShape {
+                            rows: 512,
+                            input: 65,
+                            output: 64,
+                        },
+                        false,
+                        linear.input_pad(),
+                        Kind::Named,
+                        &facts,
+                    );
                     let formula = r.price();
                     let measured =
                         mlx_gen::ios_quantum::measured_peak_bytes(|| Ok(vec![linear.forward(&x)?]))
@@ -975,7 +995,17 @@ fn scale_zero_keeps_payloads_but_executes_no_residual() {
             .unwrap();
             let facts = linear.adapter_facts();
             let mut actual = Retention::on(4, true);
-            actual.adapted_linear(17, 65, 64, false, 0, Kind::Named, &facts);
+            actual.adapted_linear(
+                LinearShape {
+                    rows: 17,
+                    input: 65,
+                    output: 64,
+                },
+                false,
+                0,
+                Kind::Named,
+                &facts,
+            );
             let mut unchanged = Retention::on(4, true);
             unchanged.linear(17, 65, 64, false, 0, Kind::Named);
             // Mutation: stop skipping disabled residual facts in adapted_linear.

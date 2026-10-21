@@ -18,7 +18,7 @@ use mlx_rs::nn::{gelu, sigmoid, silu};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-use crate::retention::{Attention, Kind, NormInput, Retention};
+use crate::retention::{Attention, Kind, LinearShape, NormInput, Retention};
 use crate::stream::{BlockRead, CastPolicy};
 
 use crate::nn::{
@@ -877,6 +877,18 @@ pub struct TextBatch<'a> {
     pub mask: &'a [Vec<i32>],
 }
 
+/// One SwiGLU MLP request: `rows` tokens of width `d` through hidden `ff` (down-projection input
+/// pad `pad`), with an optional post-norm; `bound` when the block binds the MLP output.
+struct SwigluMlp<'a> {
+    rows: u64,
+    d: u64,
+    ff: u64,
+    pad: u64,
+    post_norm: bool,
+    bound: bool,
+    path: &'a str,
+}
+
 impl IrisDiT {
     /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype.
     /// Every source key must be consumed; a leftover or missing key is a load error.
@@ -1339,11 +1351,51 @@ impl IrisDiT {
         let narrow = r.narrow();
         let path = |role| format!("{stem}{role}{side}");
         if g.split_qkv {
-            r.linear_at(&path("q_proj"), rows, d, d, narrow, 0, Kind::Named)
-                .linear_at(&path("k_proj"), rows, d, kvw, narrow, 0, Kind::Named)
-                .linear_at(&path("v_proj"), rows, d, kvw, narrow, 0, Kind::Named);
+            r.linear_at(
+                &path("q_proj"),
+                LinearShape {
+                    rows,
+                    input: d,
+                    output: d,
+                },
+                narrow,
+                0,
+                Kind::Named,
+            )
+            .linear_at(
+                &path("k_proj"),
+                LinearShape {
+                    rows,
+                    input: d,
+                    output: kvw,
+                },
+                narrow,
+                0,
+                Kind::Named,
+            )
+            .linear_at(
+                &path("v_proj"),
+                LinearShape {
+                    rows,
+                    input: d,
+                    output: kvw,
+                },
+                narrow,
+                0,
+                Kind::Named,
+            );
         } else {
-            r.linear_at(&path("qkv"), rows, d, d + 2 * kvw, narrow, 0, Kind::Named);
+            r.linear_at(
+                &path("qkv"),
+                LinearShape {
+                    rows,
+                    input: d,
+                    output: d + 2 * kvw,
+                },
+                narrow,
+                0,
+                Kind::Named,
+            );
         }
     }
 
@@ -1351,21 +1403,51 @@ impl IrisDiT {
     /// casts; SiLU and the gate product donate), and its output norm when `post_norm`. `bound`: the
     /// block binds the MLP output (held to the end; its norm reads a held input), else the output is
     /// a temporary the norm's result can reuse.
-    fn swiglu(
-        r: &mut Retention,
-        rows: u64,
-        d: u64,
-        ff: u64,
-        pad: u64,
-        post_norm: bool,
-        bound: bool,
-        path: &str,
-    ) {
+    fn swiglu(r: &mut Retention, mlp: SwigluMlp<'_>) {
+        let SwigluMlp {
+            rows,
+            d,
+            ff,
+            pad,
+            post_norm,
+            bound,
+            path,
+        } = mlp;
         let narrow = r.narrow();
         let out_kind = if bound { Kind::Named } else { Kind::Temp };
-        r.linear_at(&format!("{path}.w1"), rows, d, ff, narrow, 0, Kind::Temp)
-            .linear_at(&format!("{path}.w3"), rows, d, ff, narrow, 0, Kind::Temp)
-            .linear_at(&format!("{path}.w2"), rows, ff, d, false, pad, out_kind);
+        r.linear_at(
+            &format!("{path}.w1"),
+            LinearShape {
+                rows,
+                input: d,
+                output: ff,
+            },
+            narrow,
+            0,
+            Kind::Temp,
+        )
+        .linear_at(
+            &format!("{path}.w3"),
+            LinearShape {
+                rows,
+                input: d,
+                output: ff,
+            },
+            narrow,
+            0,
+            Kind::Temp,
+        )
+        .linear_at(
+            &format!("{path}.w2"),
+            LinearShape {
+                rows,
+                input: ff,
+                output: d,
+            },
+            false,
+            pad,
+            out_kind,
+        );
         if post_norm {
             let input = match (narrow, bound) {
                 (true, _) => NormInput::Cast,
@@ -1460,11 +1542,31 @@ impl IrisDiT {
         } else {
             NormInput::Donor
         };
-        r.linear_at("attn_gate", rows_o, d, d, narrow, 0, Kind::Named)
-            .linear_at("attn_proj", rows_o, d, d, false, 0, proj_kind)
-            .norm(h_o, rows_o, post_in, Kind::Named)
-            .named(4, h_o)
-            .barrier();
+        r.linear_at(
+            "attn_gate",
+            LinearShape {
+                rows: rows_o,
+                input: d,
+                output: d,
+            },
+            narrow,
+            0,
+            Kind::Named,
+        )
+        .linear_at(
+            "attn_proj",
+            LinearShape {
+                rows: rows_o,
+                input: d,
+                output: d,
+            },
+            false,
+            0,
+            proj_kind,
+        )
+        .norm(h_o, rows_o, post_in, Kind::Named)
+        .named(4, h_o)
+        .barrier();
         // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
         // modulation sum and the residual stream.
         r.last_phase()
@@ -1472,7 +1574,18 @@ impl IrisDiT {
             .hold(4, h_o)
             .norm(h_o, rows_o, NormInput::Held, Kind::Temp)
             .temp(4, b * d);
-        Self::swiglu(&mut r, rows_o, d, g.ff, g.down_pad, true, true, "mlp");
+        Self::swiglu(
+            &mut r,
+            SwigluMlp {
+                rows: rows_o,
+                d,
+                ff: g.ff,
+                pad: g.down_pad,
+                post_norm: true,
+                bound: true,
+                path: "mlp",
+            },
+        );
         r.price()
     }
 
@@ -1539,18 +1652,22 @@ impl IrisDiT {
             let side = if k == 0 { "x" } else { "y" };
             r.linear_at(
                 &format!("attn_gate_{side}"),
-                stream,
-                d,
-                d,
+                LinearShape {
+                    rows: stream,
+                    input: d,
+                    output: d,
+                },
                 narrow,
                 0,
                 Kind::Named,
             )
             .linear_at(
                 &format!("attn.proj_{side}"),
-                stream,
-                d,
-                d,
+                LinearShape {
+                    rows: stream,
+                    input: d,
+                    output: d,
+                },
                 false,
                 0,
                 Kind::Named,
@@ -1576,13 +1693,15 @@ impl IrisDiT {
                 .temp(4, b * d);
             Self::swiglu(
                 &mut r,
-                stream,
-                d,
-                g.ff,
-                g.down_pad,
-                true,
-                false,
-                &format!("mlp_{side}"),
+                SwigluMlp {
+                    rows: stream,
+                    d,
+                    ff: g.ff,
+                    pad: g.down_pad,
+                    post_norm: true,
+                    bound: false,
+                    path: &format!("mlp_{side}"),
+                },
             );
         }
         r.price()
@@ -1656,9 +1775,11 @@ impl IrisDiT {
         // Phase 1.
         r.linear_at(
             "adaln",
-            rows,
-            g.condition_width,
-            g.modulation_width,
+            LinearShape {
+                rows,
+                input: g.condition_width,
+                output: g.modulation_width,
+            },
             narrow,
             0,
             Kind::Named,
@@ -1666,18 +1787,22 @@ impl IrisDiT {
         .norm(plane, rows * g.patch_pixels, plane_in, Kind::Temp)
         .linear_at(
             "compress",
-            rows,
-            g.patch_pixels * g.pixel_width,
-            g.compact_width,
+            LinearShape {
+                rows,
+                input: g.patch_pixels * g.pixel_width,
+                output: g.compact_width,
+            },
             narrow,
             0,
             Kind::Named,
         )
         .linear_at(
             "attn.qkv",
-            rows,
-            g.compact_width,
-            3 * g.compact_width,
+            LinearShape {
+                rows,
+                input: g.compact_width,
+                output: 3 * g.compact_width,
+            },
             false,
             0,
             Kind::Named,
@@ -1705,18 +1830,22 @@ impl IrisDiT {
         })
         .linear_at(
             "attn.proj",
-            rows,
-            g.compact_width,
-            g.compact_width,
+            LinearShape {
+                rows,
+                input: g.compact_width,
+                output: g.compact_width,
+            },
             false,
             0,
             Kind::Named,
         )
         .linear_at(
             "expand",
-            rows,
-            g.compact_width,
-            g.patch_pixels * g.pixel_width,
+            LinearShape {
+                rows,
+                input: g.compact_width,
+                output: g.patch_pixels * g.pixel_width,
+            },
             false,
             0,
             Kind::Named,
@@ -1731,9 +1860,11 @@ impl IrisDiT {
             .norm(plane, mlp_rows, plane_in, Kind::Temp)
             .linear_at(
                 "mlp.fc1",
-                mlp_rows,
-                g.pixel_width,
-                g.fc1_width,
+                LinearShape {
+                    rows: mlp_rows,
+                    input: g.pixel_width,
+                    output: g.fc1_width,
+                },
                 narrow,
                 0,
                 Kind::Temp,
@@ -1744,9 +1875,11 @@ impl IrisDiT {
         }
         r.linear_at(
             "mlp.fc2",
-            mlp_rows,
-            g.fc1_width,
-            g.pixel_width,
+            LinearShape {
+                rows: mlp_rows,
+                input: g.fc1_width,
+                output: g.pixel_width,
+            },
             narrow,
             0,
             Kind::Named,
@@ -1874,9 +2007,11 @@ impl IrisDiT {
         };
         r.norm(h, rows, stream_in, input_kind).linear_at(
             "attn.qkv",
-            rows,
-            g.dim,
-            3 * g.dim,
+            LinearShape {
+                rows,
+                input: g.dim,
+                output: 3 * g.dim,
+            },
             narrow,
             0,
             Kind::Named,
@@ -1902,7 +2037,17 @@ impl IrisDiT {
             mask: g.refiner.then_some((g.batch * g.tokens * g.tokens, narrow)),
             out_kind: Kind::Temp,
         })
-        .linear_at("attn.proj", rows, g.dim, g.dim, false, 0, Kind::Named)
+        .linear_at(
+            "attn.proj",
+            LinearShape {
+                rows,
+                input: g.dim,
+                output: g.dim,
+            },
+            false,
+            0,
+            Kind::Named,
+        )
         .named(g.stream_bytes, h);
         // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
         // residual stream.
@@ -1911,13 +2056,44 @@ impl IrisDiT {
             .norm(h, rows, stream_in, Kind::Temp);
         if g.refiner {
             // The SwiGLU output is a temporary: the residual sum reuses it.
-            Self::swiglu(&mut r, rows, g.dim, g.ff, g.down_pad, false, false, "mlp");
+            Self::swiglu(
+                &mut r,
+                SwigluMlp {
+                    rows,
+                    d: g.dim,
+                    ff: g.ff,
+                    pad: g.down_pad,
+                    post_norm: false,
+                    bound: false,
+                    path: "mlp",
+                },
+            );
         } else {
             // `mlp.2`'s output is bound, so the residual sum is a new buffer (bf16: its operand's
             // f32 cast, which the sum reuses).
-            r.linear_at("mlp.0", rows, g.dim, g.ff, narrow, 0, Kind::Temp)
-                .linear_at("mlp.2", rows, g.ff, g.dim, false, g.down_pad, Kind::Named)
-                .temp(g.stream_bytes, h);
+            r.linear_at(
+                "mlp.0",
+                LinearShape {
+                    rows,
+                    input: g.dim,
+                    output: g.ff,
+                },
+                narrow,
+                0,
+                Kind::Temp,
+            )
+            .linear_at(
+                "mlp.2",
+                LinearShape {
+                    rows,
+                    input: g.ff,
+                    output: g.dim,
+                },
+                false,
+                g.down_pad,
+                Kind::Named,
+            )
+            .temp(g.stream_bytes, h);
         }
         r.price()
     }
@@ -1981,9 +2157,11 @@ impl IrisDiT {
         r.temp(4, b * g.patches * g.patch_in)
             .linear_at(
                 "s_embedder.proj",
-                b * g.patches,
-                g.patch_in,
-                g.hidden,
+                LinearShape {
+                    rows: b * g.patches,
+                    input: g.patch_in,
+                    output: g.hidden,
+                },
                 narrow,
                 0,
                 Kind::Named,
@@ -1993,18 +2171,22 @@ impl IrisDiT {
             .temp(4, b * g.sinusoid)
             .linear_at(
                 "t_embedder.mlp.0",
-                b,
-                g.sinusoid,
-                g.t_hidden,
+                LinearShape {
+                    rows: b,
+                    input: g.sinusoid,
+                    output: g.t_hidden,
+                },
                 narrow,
                 0,
                 Kind::Temp,
             )
             .linear_at(
                 "t_embedder.mlp.2",
-                b,
-                g.t_hidden,
-                g.t_out,
+                LinearShape {
+                    rows: b,
+                    input: g.t_hidden,
+                    output: g.t_out,
+                },
                 false,
                 0,
                 Kind::Named,
@@ -2169,9 +2351,11 @@ impl IrisDiT {
         r.norm(rows * input, rows, input_kind, Kind::Temp)
             .linear_at(
                 "final_layer.linear",
-                rows,
-                input,
-                out,
+                LinearShape {
+                    rows,
+                    input,
+                    output: out,
+                },
                 narrow,
                 0,
                 Kind::Temp,

@@ -526,7 +526,6 @@ fn price_source_quanta(
             }
         }
     }
-    drop(take);
     if !route.mode.img2img() && !route.mode.control() {
         pricing.phase_not_run(
             IosPhase::Encode,
@@ -732,16 +731,16 @@ fn configured_z_adapter_facts(
     Vec<(String, mlx_gen::adapters::facts::AdapterFacts)>,
 )> {
     use mlx_gen::adapters::facts::linear_header_facts;
-    let kohya = crate::transformer::adapter_header_targets(&cfg, false)
+    let kohya = crate::transformer::adapter_header_targets(cfg, false)
         .into_iter()
         .map(|(path, _)| path)
         .collect::<Vec<_>>();
     let mut projections = std::collections::BTreeMap::new();
-    for (path, header) in crate::transformer::adapter_header_targets(&cfg, true) {
+    for (path, header) in crate::transformer::adapter_header_targets(cfg, true) {
         projections.insert(
             path,
             linear_header_facts(
-                &headers,
+                headers,
                 &header,
                 mlx_gen::quant::DEFAULT_GROUP_SIZE,
                 load_quantize,
@@ -753,7 +752,7 @@ fn configured_z_adapter_facts(
         &kohya,
         mlx_gen::adapters::DEFAULT_LYCORIS_DTYPE,
         |path| {
-            let Some(canonical) = crate::transformer::canonical_adapter_path(&cfg, path) else {
+            let Some(canonical) = crate::transformer::canonical_adapter_path(cfg, path) else {
                 return Ok(None);
             };
             Ok(projections
@@ -1010,6 +1009,12 @@ pub(crate) fn control_quantization_targets() -> Vec<(String, bool)> {
     .collect()
 }
 
+/// `(projection, old owners, retained outputs, temporary casts)` records of one quantized load.
+type QuantConversions = Vec<(String, u64, u64, u64)>;
+
+/// `(label, live input, scratch, width, height)` rows of one VAE encode/decode schedule.
+type VaeQuanta = Vec<(&'static str, u64, u64, i32, i32)>;
+
 /// One component's safetensors files and their headers.
 #[derive(Clone, Debug)]
 pub(crate) struct Component {
@@ -1045,7 +1050,7 @@ impl Component {
         &self,
         targets: &[(String, bool)],
         bits: i32,
-    ) -> Result<(Self, Vec<(String, u64, u64, u64)>)> {
+    ) -> Result<(Self, QuantConversions)> {
         self.load_quantized_with_bias(targets, bits, |_| true)
     }
 
@@ -1058,7 +1063,7 @@ impl Component {
         targets: &[(String, bool)],
         bits: i32,
         has_bias: impl Fn(&str) -> bool,
-    ) -> Result<(Self, Vec<(String, u64, u64, u64)>)> {
+    ) -> Result<(Self, QuantConversions)> {
         use mlx_gen::adapters::facts::{linear_header_facts, native_header_dtype, TensorFacts};
         if !matches!(bits, 4 | 8) {
             return Err(Error::Unsupported(format!(
@@ -1396,6 +1401,15 @@ pub(crate) enum QuantizationHistory {
     NoModelForward,
 }
 
+/// The source point of one quantum window: its per-label operation index, the structural
+/// resident bytes at that point, and whether the request stages residency.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowPoint {
+    pub(crate) point: usize,
+    pub(crate) structural: u64,
+    pub(crate) staged: bool,
+}
+
 /// Mutable traversal state for a single bounded logical candidate. It never contains native
 /// arrays, payload, an observed witness or a physical release assertion.
 struct QuantizationCursor {
@@ -1429,7 +1443,17 @@ impl QuantizationCursor {
         structural: u64,
         staged: bool,
     ) -> Result<Option<(u64, u64, bool)>> {
-        self.window_with_vae(facts, phase, label, point, structural, staged, None)
+        self.window_with_vae(
+            facts,
+            phase,
+            label,
+            crate::ios_pricing::WindowPoint {
+                point,
+                structural,
+                staged,
+            },
+            None,
+        )
     }
 
     fn window_with_vae(
@@ -1437,11 +1461,14 @@ impl QuantizationCursor {
         facts: &Facts,
         phase: IosPhase,
         label: &str,
-        point: usize,
-        structural: u64,
-        staged: bool,
+        at: WindowPoint,
         vae: Option<&VaeOwnerHistory>,
     ) -> Result<Option<(u64, u64, bool)>> {
+        let WindowPoint {
+            point,
+            structural,
+            staged,
+        } = at;
         // Preparation/control embedding run before the sliced solve. A no-transition slice
         // executes neither model callbacks nor sampler updates. Sigma == 0 ALONE is not this
         // condition: actual solver terminal handling calls denoise/model BEFORE its alias branch.
@@ -1483,9 +1510,11 @@ impl QuantizationCursor {
             .quantization_owner_window_for_components(
                 phase,
                 label,
-                if label == q::DIT_EMBED { 0 } else { point },
-                structural,
-                staged,
+                crate::ios_pricing::WindowPoint {
+                    point: if label == q::DIT_EMBED { 0 } else { point },
+                    structural,
+                    staged,
+                },
                 &mut self.seen,
                 vae.is_none(),
             )?;
@@ -1558,9 +1587,11 @@ impl Facts {
                 self,
                 phase,
                 operation.label,
-                operation.source_point,
-                operation.source_structural,
-                route.execution.stage_residency,
+                crate::ios_pricing::WindowPoint {
+                    point: operation.source_point,
+                    structural: operation.source_structural,
+                    staged: route.execution.stage_residency,
+                },
                 operation.source_vae.as_deref(),
             )?
             else {
@@ -1712,7 +1743,15 @@ impl Facts {
         seen: &mut [std::collections::BTreeSet<String>; 3],
     ) -> Result<(u64, u64, bool)> {
         self.quantization_owner_window_for_components(
-            phase, label, point, structural, staged, seen, true,
+            phase,
+            label,
+            crate::ios_pricing::WindowPoint {
+                point,
+                structural,
+                staged,
+            },
+            seen,
+            true,
         )
     }
 
@@ -1720,12 +1759,15 @@ impl Facts {
         &self,
         phase: IosPhase,
         label: &str,
-        point: usize,
-        structural: u64,
-        staged: bool,
+        at: WindowPoint,
         seen: &mut [std::collections::BTreeSet<String>; 3],
         legacy_vae: bool,
     ) -> Result<(u64, u64, bool)> {
+        let WindowPoint {
+            point,
+            structural,
+            staged,
+        } = at;
         let present = match phase {
             IosPhase::Load => match label {
                 q::TE_LOAD => [false, false, false],
@@ -2891,9 +2933,11 @@ impl Model {
                 f,
                 phase,
                 label,
-                *point,
-                structural,
-                staged,
+                crate::ios_pricing::WindowPoint {
+                    point: *point,
+                    structural,
+                    staged,
+                },
                 Some(&vae_owners),
             )?
             else {
@@ -3293,13 +3337,7 @@ impl Model {
     /// The VAE encode of one `w x h` image as the device runs it ([`Vae::encode`]: the bounded,
     /// layer-wise tiled encode above [`crate::vae::decoder::IOS_ENCODE_TILE_PX`], else whole), as
     /// `(label, live input beside the image, scratch)`.
-    fn encode_quanta(
-        &self,
-        vae: &Vae,
-        w: i32,
-        h: i32,
-        b: Backend,
-    ) -> Result<Vec<(&'static str, u64, u64, i32, i32)>> {
+    fn encode_quanta(&self, vae: &Vae, w: i32, h: i32, b: Backend) -> Result<VaeQuanta> {
         let encoder = vae
             .encoder()
             .ok_or_else(|| Error::Msg("iOS pricing: the VAE has no encoder".into()))?;
@@ -3445,7 +3483,7 @@ impl Model {
         h: i32,
         tiling: Option<&mlx_gen::tiling::TilingConfig>,
         b: Backend,
-    ) -> Result<Vec<(&'static str, u64, u64, i32, i32)>> {
+    ) -> Result<VaeQuanta> {
         let decoder = vae.decoder();
         let (conv_in, mid, ups, conv_out) = decoder.parts();
         let labels = &q::DECODE_LABELS;
@@ -3911,9 +3949,11 @@ mod load_quantization_header_tests {
                         &facts,
                         IosPhase::Decode,
                         q::VAE_DECODE_IN,
-                        0,
-                        0,
-                        true,
+                        crate::ios_pricing::WindowPoint {
+                            point: 0,
+                            structural: 0,
+                            staged: true
+                        },
                         Some(&owners)
                     )?,
                     Some((old + 8, 0, true)),
@@ -3924,9 +3964,11 @@ mod load_quantization_header_tests {
                         &facts,
                         IosPhase::Decode,
                         q::VAE_DECODE_ATTENTION,
-                        0,
-                        0,
-                        true,
+                        crate::ios_pricing::WindowPoint {
+                            point: 0,
+                            structural: 0,
+                            staged: true
+                        },
                         Some(&owners)
                     )?,
                     Some((old + 8, 152 + 512, true)),
@@ -3937,9 +3979,11 @@ mod load_quantization_header_tests {
                         &facts,
                         IosPhase::Decode,
                         q::VAE_DECODE_OUT,
-                        0,
-                        0,
-                        true,
+                        crate::ios_pricing::WindowPoint {
+                            point: 0,
+                            structural: 0,
+                            staged: true
+                        },
                         Some(&owners)
                     )?,
                     Some((152 + 8, 0, false)),
@@ -3951,9 +3995,11 @@ mod load_quantization_header_tests {
                         &facts,
                         IosPhase::Decode,
                         q::VAE_DECODE_IN,
-                        0,
-                        0,
-                        false,
+                        crate::ios_pricing::WindowPoint {
+                            point: 0,
+                            structural: 0,
+                            staged: false
+                        },
                         Some(&owners)
                     )?,
                     Some((160, 0, false)),
@@ -4236,9 +4282,9 @@ mod load_quantization_header_tests {
                         "VAE-NATIVE-ACTUAL-CONSUMER-FORWARD");
                     let facts = empty_vae_facts();
                     let mut cold = QuantizationCursor::new(QuantizationHistory::RequestFirst, false);
-                    let before = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_IN, 0, 0, true, Some(&owners))?.unwrap();
-                    let at = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_ATTENTION, 0, 0, true, Some(&owners))?.unwrap();
-                    let after = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_OUT, 0, 0, true, Some(&owners))?.unwrap();
+                    let before = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_IN, crate::ios_pricing::WindowPoint { point: 0, structural: 0, staged: true }, Some(&owners))?.unwrap();
+                    let at = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_ATTENTION, crate::ios_pricing::WindowPoint { point: 0, structural: 0, staged: true }, Some(&owners))?.unwrap();
+                    let after = cold.window_with_vae(&facts, IosPhase::Decode, q::VAE_DECODE_OUT, crate::ios_pricing::WindowPoint { point: 0, structural: 0, staged: true }, Some(&owners))?.unwrap();
                     assert_eq!((before.0, before.1, at.0, at.1),
                         (at.0, 0, before.0, (if packed { 3 } else { 4 }) * 2304 + if packed { 0 } else { 8192 }),
                         "VAE-NATIVE-ACTUAL-CONSUMER-COLD-REPLAY");

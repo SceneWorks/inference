@@ -158,7 +158,7 @@ fn div_up(a: u64, b: u64) -> Result<u64> {
     if b == 0 {
         return Err(fail("zero divisor"));
     }
-    Ok(a / b + u64::from(a % b != 0))
+    Ok(a / b + u64::from(!a.is_multiple_of(b)))
 }
 fn count(shape: &[i32]) -> Result<u64> {
     shape.iter().try_fold(1, |n, &d| {
@@ -315,7 +315,7 @@ fn simd_split(m: u64, n: u64, k: u64) -> Result<u64> {
     let power = ratio
         .checked_next_power_of_two()
         .ok_or_else(|| fail("split power overflow"))?;
-    Ok(power.max(2).min(32))
+    Ok(power.clamp(2, 32))
 }
 fn nax_split(k: u64) -> Result<u64> {
     let partition = if k <= 1024 {
@@ -345,7 +345,7 @@ fn qmm_split(m: u64, n: u64, k: u64, group: u64) -> Result<u64> {
         return Err(fail("empty quantized tile/group"));
     }
     let mut p = (512 / tiles).max(1).min(k / group);
-    while p > 1 && k % times(p, group)? != 0 {
+    while p > 1 && !k.is_multiple_of(times(p, group)?) {
         p -= 1;
     }
     Ok(p)
@@ -499,9 +499,8 @@ fn conv_bias_static_possible(w: &NativeWorkspace, out: &Capacity, groups: i32) -
         times(count(&out.shape[..1])?, count(&out.shape[1..2])?)?,
         count(&out.shape[2..3])?,
     )? >= 256;
-    Ok(((c <= 4 || c % 16 == 0) && (o <= 16 || o % 16 == 0))
-        || (c % 16 == 0 && o % 16 == 0)
-        || out_large)
+    // {c, o} both divisible by 16 already satisfies the first clause, so that term is absorbed.
+    Ok((c <= 4 || c % 16 == 0) && (o <= 16 || o % 16 == 0) || out_large)
 }
 fn conv_extra(
     r: &mut WorkRequests,
@@ -586,11 +585,9 @@ fn conv_extra(
         let implicit = (c <= 4 || c % 16 == 0) && (o <= 16 || o % 16 == 0);
         let general = c % 16 == 0 && o % 16 == 0 || out_large;
         if groups != 1 || (!implicit && !general) {
-            let m = if o == 0 {
-                return Err(fail("zero conv output channels"));
-            } else {
-                count(&out.shape)? / o
-            };
+            let nonzero_o =
+                std::num::NonZeroU64::new(o).ok_or_else(|| fail("zero conv output channels"))?;
+            let m = count(&out.shape)? / nonzero_o;
             let k = count(f)? / o;
             r.common(
                 "conv-unfold",
@@ -771,7 +768,7 @@ pub(super) fn evaluate(prefix: &Prefix, window: &SourceWindow) -> Result<WindowR
                 let full=times(f32bytes,if x.1==Dtype::Float32 {2}else{4})?;
                 let small=times(groups,16)?; // mu,var,eps-add,rsqrt: four F32 group scalars
                 r.composed_branch("groupnorm-CPU-components","rmsnorm-softmax","IF LayerNorm CPU fallback: F32 cast/center/square/product and group moments; LN T output already covered above",add(full,small)?);
-                let axis=if groups==0 {return Err(fail("empty norm group"));}else{count(&x.0)?/groups};
+                let nonzero_groups=std::num::NonZeroU64::new(groups).ok_or_else(|| fail("empty norm group"))?;let axis=count(&x.0)?/nonzero_groups;
                 reduction(&mut r,times(groups,4)?,f32bytes,axis,true)?;
                 reduction(&mut r,times(groups,4)?,f32bytes,axis,true)?;
                 r.unknown("groupnorm-layernorm","actual exact-epilogue flag/fallback, reshape-copy selectors, fast data_size/donation and transformed graphs remain unbound; affine outputs are existing eager slots");
@@ -841,7 +838,7 @@ pub(super) fn evaluate(prefix: &Prefix, window: &SourceWindow) -> Result<WindowR
             .bytes;
         // SAME output exact request versus already-counted logical nbytes, NOT a physical
         // upper-minus-upper or anchor lower. Alternative rules for one output max once.
-        let extra = actual.checked_sub(nominal).unwrap_or(0);
+        let extra = actual.saturating_sub(nominal);
         excess_by_output
             .entry(product.output_slot)
             .and_modify(|n| *n = (*n).max(extra))
@@ -1537,7 +1534,7 @@ pub(super) fn join_owners(prefix: &Prefix, window: &SourceWindow) -> Result<Owne
     let mut leases = BTreeMap::new();
     for state in &report.descriptors {
         for key in &state.leases {
-            leases.entry(key.clone()).or_insert_with(|| {
+            leases.entry(*key).or_insert_with(|| {
                 let requested = match key {
                     LeaseKey::AllocatorRequest(id) => report
                         .descriptors
@@ -1559,7 +1556,7 @@ pub(super) fn join_owners(prefix: &Prefix, window: &SourceWindow) -> Result<Owne
                     }
                 };
                 LeaseState {
-                    key: key.clone(),
+                    key: *key,
                     length,
                     cached_reuse,
                     may_be_queued: true,

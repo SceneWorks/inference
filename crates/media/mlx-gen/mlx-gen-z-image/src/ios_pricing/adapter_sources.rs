@@ -178,7 +178,7 @@ impl AdapterCasePrices {
         self,
         provider: &str,
         visited: std::result::Result<AdapterSourceSummary, Box<AdapterSourceFailure>>,
-    ) -> std::result::Result<AdapterPricingReport, AdapterPricingFailure> {
+    ) -> std::result::Result<AdapterPricingReport, Box<AdapterPricingFailure>> {
         match visited {
             Ok(summary) if summary.enumeration_complete && summary.complete_cases != 0 => {
                 Ok(AdapterPricingReport {
@@ -187,14 +187,14 @@ impl AdapterCasePrices {
                     refusal_prefixes: self.refusal_prefixes,
                 })
             }
-            Ok(_) => Err(AdapterPricingFailure {
+            Ok(_) => Err(Box::new(AdapterPricingFailure {
                 error: Error::Unsupported(format!(
                     "{provider}: every native adapter source case refuses"
                 )),
                 source_prefix: self.last_refused_prefix.unwrap_or_default(),
                 attempted_case_id: None,
                 committed: self.committed.into_values().flatten().collect(),
-            }),
+            })),
             Err(failure) => {
                 let AdapterSourceFailure {
                     error,
@@ -202,12 +202,12 @@ impl AdapterCasePrices {
                     attempted_case_id,
                     ..
                 } = *failure;
-                Err(AdapterPricingFailure {
+                Err(Box::new(AdapterPricingFailure {
                     error,
                     source_prefix: prefix,
                     attempted_case_id,
                     committed: self.committed.into_values().flatten().collect(),
-                })
+                }))
             }
         }
     }
@@ -541,9 +541,11 @@ pub(super) fn load_windows(
             &model.facts,
             IosPhase::Load,
             mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM,
-            0,
-            structural,
-            staged,
+            crate::ios_pricing::WindowPoint {
+                point: 0,
+                structural,
+                staged,
+            },
             last_load.source_vae.as_deref(),
         )?
         .ok_or_else(|| Error::Msg("adapter base source prefix missing".into()))?;
@@ -761,7 +763,7 @@ pub(super) fn price_request(
     route: &Route,
     sampling: &mlx_gen::sampler::flow_sampling::ResolvedFlowControls,
     initial_width: u64,
-) -> std::result::Result<AdapterPricingReport, AdapterPricingFailure> {
+) -> std::result::Result<AdapterPricingReport, Box<AdapterPricingFailure>> {
     let setup = (|| -> Result<_> {
         let WeightsSource::Dir(root) = &spec.weights else {
             return Err(Error::Unsupported(
@@ -795,11 +797,13 @@ pub(super) fn price_request(
         }
         Ok((cfg, kohya, projections))
     })();
-    let (cfg, kohya, projections) = setup.map_err(|error| AdapterPricingFailure {
-        error,
-        source_prefix: AdapterSourcePrefix::default(),
-        attempted_case_id: None,
-        committed: Vec::new(),
+    let (cfg, kohya, projections) = setup.map_err(|error| {
+        Box::new(AdapterPricingFailure {
+            error,
+            source_prefix: AdapterSourcePrefix::default(),
+            attempted_case_id: None,
+            committed: Vec::new(),
+        })
     })?;
     let mut projection = |path: &str| -> Result<_> {
         let Some(canonical) = crate::transformer::canonical_adapter_path(&cfg, path) else {
@@ -850,7 +854,6 @@ pub(super) fn price_request(
         &mut projection,
         &mut consume,
     );
-    drop(consume);
     prices.finish(provider, visited)
 }
 
@@ -877,7 +880,7 @@ pub(super) fn price_before_existing_guard(
         sampling,
         initial_width,
     )
-    .map_err(AdapterPricingFailure::into_legacy_error)?; // Consume provenance, preserve SAME typed cause.
+    .map_err(|failure| failure.into_legacy_error())?; // Consume provenance, preserve SAME typed cause.
     if !report.source_summary.enumeration_complete || report.source_summary.complete_cases == 0 {
         return Err(Error::Msg(
             "adapter source pricing did not complete constructor histories".into(),
@@ -1208,10 +1211,10 @@ mod source_ledger_tests {
     }
 
     fn failed(
-        result: std::result::Result<AdapterPricingReport, AdapterPricingFailure>,
+        result: std::result::Result<AdapterPricingReport, Box<AdapterPricingFailure>>,
     ) -> AdapterPricingFailure {
         match result {
-            Err(failure) => failure,
+            Err(failure) => *failure,
             Ok(_) => panic!("aborted/all-refused cases cannot produce a successful envelope"),
         }
     }

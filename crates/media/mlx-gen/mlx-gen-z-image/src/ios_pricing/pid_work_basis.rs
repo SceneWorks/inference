@@ -58,7 +58,7 @@ fn hex_decode(text: &str) -> Result<Vec<u8>> {
             "PiD work token exceeds bounded wrapper encoding".into(),
         ));
     }
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(Error::Msg("PiD work token has odd hex length".into()));
     }
     if !text

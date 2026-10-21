@@ -66,6 +66,14 @@ pub enum NormInput {
     Held,
 }
 
+/// A projection's request rows and its input/output feature widths.
+#[derive(Clone, Copy, Debug)]
+pub struct LinearShape {
+    pub rows: u64,
+    pub input: u64,
+    pub output: u64,
+}
+
 /// One quantum's counted retention, phase by phase.
 #[derive(Clone, Copy, Debug)]
 pub struct Retention<'a> {
@@ -112,9 +120,7 @@ impl<'a> Retention<'a> {
     pub fn linear_at(
         &mut self,
         path: &str,
-        rows: u64,
-        input: u64,
-        output: u64,
+        shape: LinearShape,
         cast: bool,
         pad: u64,
         kind: Kind,
@@ -128,9 +134,7 @@ impl<'a> Retention<'a> {
             facts.get(&key)
         });
         self.adapted_linear(
-            rows,
-            input,
-            output,
+            shape,
             cast,
             pad,
             kind,
@@ -293,14 +297,17 @@ impl<'a> Retention<'a> {
     /// to succeed. It is NOT physical-footprint evidence or a subtractable anchor basis.
     pub fn adapted_linear(
         &mut self,
-        rows: u64,
-        in_features: u64,
-        out_features: u64,
+        shape: LinearShape,
         cast: bool,
         pad: u64,
         out_kind: Kind,
         adapters: &[mlx_gen::adapters::facts::AdapterFacts],
     ) -> &mut Self {
+        let LinearShape {
+            rows,
+            input: in_features,
+            output: out_features,
+        } = shape;
         let live = adapters.iter().filter(|a| !a.disabled()).count();
         self.linear(
             rows,
