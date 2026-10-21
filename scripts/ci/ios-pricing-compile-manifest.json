@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "19cca62e242b291d5fd7cf581ab66c28e11a89507b654fcc6c2406b03e79fb93",
+  "rust_proof_closure_sha256": "40dbcbe6bec3a3bca9a7a0094789c45ec14770c24daf48e069d8a330309f72fd",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -568,19 +568,19 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates.rs",
-      "sha256": "129d3d754c8c63a5f001083f66bb48e36b3921a003e13bba0da8837d8eb8ff4f"
+      "sha256": "abcb510028fd93a0f46b170fdffa6929617cc7af8ac215f4bfacce4a9ba5aec6"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/cpu.rs",
-      "sha256": "9916bb1bcc767710a830ad1f46805129f516464ded958cbc097aed07606d344b"
+      "sha256": "00d8d9bbdf3dfd05e3aba7660a2e98f82541ffa4364cf2da48186740d15e953d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/vae_graph.rs",
-      "sha256": "dae39bc91f822bddc9ad21af0e6d1b43d527c5693d8d62b99240fe1d087cb4e0"
+      "sha256": "047f3dab89576c05329b7af441f9e3c112733a21d5c5d1d48e93d3be347a4d0c"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/z_graph.rs",
-      "sha256": "25eb72b64620358691eee8ec93f8241e68e0c837c191a641aab9a4d764c92277"
+      "sha256": "3e5ed738bbe60663e73515299543f085a1ce235aec00d79f31d50710a6b06908"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
@@ -1450,8 +1450,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "0c35c6fce3c819e39a790c8cb9b039bbaa33423fcc731ac8629f49531490787d",
-    "classification_sha256": "cca9a0d4ffbd1e6489ac053728cf809bbfd000433d57d9ff496b5df9350c2882",
+    "inventory_sha256": "1eac7398a32ef80924a09fe538f177d657419c6c5f8e9cf04d1d58a2586f1e6a",
+    "classification_sha256": "dfa044b919f72e0bfa6bdcc4d100377aca5552b2fbc06e04143c101f54b5f313",
     "selected_Rust_FQNs": 103,
     "HOST_logical": 90,
     "HOST_expected_PASS_rows": 91,

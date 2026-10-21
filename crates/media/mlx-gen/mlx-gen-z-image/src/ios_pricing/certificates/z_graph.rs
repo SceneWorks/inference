@@ -283,16 +283,21 @@ fn te_rope(g: &mut Graph, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tens
     let b = g.binary(&rot, sin, "text_encoder/attention.rs rotate*sin")?;
     g.binary(&a, &b, "text_encoder/attention.rs RoPE add")
 }
+/// One text-encoder layer's rotary tables and attention mask.
+struct TeRope<'a> {
+    cos: &'a Tensor,
+    sin: &'a Tensor,
+    mask: &'a Tensor,
+}
 fn te_layer(
     g: &mut Graph,
     c: &mut Catalog,
     index: usize,
     x: &Tensor,
     cfg: crate::text_encoder::ZTextEncoderConfig,
-    cos: &Tensor,
-    sin: &Tensor,
-    mask: &Tensor,
+    rope: TeRope<'_>,
 ) -> Result<Tensor> {
+    let TeRope { cos, sin, mask } = rope;
     let p = format!("model.layers.{index}");
     let n = x.shape[1];
     let a = norm(g, c, &format!("{p}.input_layernorm.weight"), x)?;
@@ -434,6 +439,12 @@ pub(super) fn budgeted_sdpa(
     }
     g.concat(&chunks, 2, "attention.rs query chunk concatenate")
 }
+/// A transformer block's attention head count and query rows.
+#[derive(Clone, Copy)]
+struct BlockAttention {
+    heads: u64,
+    query_rows: u64,
+}
 fn block(
     g: &mut Graph,
     c: &mut Catalog,
@@ -441,9 +452,9 @@ fn block(
     x: &Tensor,
     freqs: &Tensor,
     t: Option<&Tensor>,
-    heads: u64,
-    query_rows: u64,
+    attention: BlockAttention,
 ) -> Result<Tensor> {
+    let BlockAttention { heads, query_rows } = attention;
     let dim = *x.shape.last().unwrap();
     let modulation = if let Some(t) = t {
         let m = c.linear(g, &format!("{p}.adaLN_modulation.0"), t, true)?;
@@ -682,19 +693,35 @@ fn hint(g: &mut Graph, x: &Tensor, h: &Tensor) -> Result<Tensor> {
     let scaled = g.binary(h, &scale, "control_transformer.rs add_hint multiply")?;
     g.binary(x, &scaled, "control_transformer.rs add_hint residual")
 }
-fn control_stack(
-    p: &mut Program,
-    catalog: &mut Catalog,
-    prefix: &str,
+/// One Control stack: its weight prefix and block count, the control input, the base stream it
+/// threads hints into, the rotary table, the timestep embedding, attention shape and streaming.
+struct ControlStackRequest<'a> {
+    prefix: &'a str,
     count: usize,
-    input: &Tensor,
-    base: &Tensor,
-    freqs: &Tensor,
-    t: &Tensor,
+    input: &'a Tensor,
+    base: &'a Tensor,
+    freqs: &'a Tensor,
+    t: &'a Tensor,
     heads: u64,
     query_rows: u64,
     streamed: bool,
+}
+fn control_stack(
+    p: &mut Program,
+    catalog: &mut Catalog,
+    request: ControlStackRequest<'_>,
 ) -> Result<(Tensor, Vec<Tensor>)> {
+    let ControlStackRequest {
+        prefix,
+        count,
+        input,
+        base,
+        freqs,
+        t,
+        heads,
+        query_rows,
+        streamed,
+    } = request;
     let mut x = input.clone();
     let mut hints = Vec::new();
     for i in 0..count {
@@ -713,7 +740,15 @@ fn control_stack(
                 .graph
                 .binary(&x, base, "control_transformer.rs before_proj + base")?;
         }
-        x = block(&mut p.graph, c, &key, &x, freqs, Some(t), heads, query_rows)?;
+        x = block(
+            &mut p.graph,
+            c,
+            &key,
+            &x,
+            freqs,
+            Some(t),
+            BlockAttention { heads, query_rows },
+        )?;
         hints.push(c.linear(&mut p.graph, &format!("{key}.after_proj"), &x, true)?);
         p.mark(q::CONTROL_BLOCK)?;
     }
@@ -775,15 +810,17 @@ fn forward(
         let (threaded, hints) = control_stack(
             p,
             ctrl,
-            "control_noise_refiner",
-            crate::control_transformer::CONTROL_REFINER_PLACES.len(),
-            control_input,
-            &x,
-            &prep.x_freqs,
-            &t,
-            heads,
-            query_rows(prep.n)?,
-            false,
+            ControlStackRequest {
+                prefix: "control_noise_refiner",
+                count: crate::control_transformer::CONTROL_REFINER_PLACES.len(),
+                input: control_input,
+                base: &x,
+                freqs: &prep.x_freqs,
+                t: &t,
+                heads,
+                query_rows: query_rows(prep.n)?,
+                streamed: false,
+            },
         )?;
         (Some(threaded), hints)
     } else {
@@ -797,8 +834,10 @@ fn forward(
             &x,
             &prep.x_freqs,
             Some(&t),
-            heads,
-            query_rows(prep.n)?,
+            BlockAttention {
+                heads,
+                query_rows: query_rows(prep.n)?,
+            },
         )?;
         if control.is_some() {
             if let Some(k) = crate::control_transformer::hint_index(
@@ -827,8 +866,10 @@ fn forward(
             &cap,
             &prep.cap_freqs,
             None,
-            heads,
-            query_rows(prep.c)?,
+            BlockAttention {
+                heads,
+                query_rows: query_rows(prep.c)?,
+            },
         )?;
         p.mark(q::DIT_CONTEXT_BLOCK)?;
     }
@@ -849,15 +890,17 @@ fn forward(
         control_stack(
             p,
             ctrl,
-            "control_layers",
-            crate::control_transformer::CONTROL_LAYERS_PLACES.len(),
-            &control_unified,
-            &unified,
-            &prep.unified_freqs,
-            &t,
-            heads,
-            query_rows(add(prep.n, prep.c)?)?,
-            model.facts.streamable,
+            ControlStackRequest {
+                prefix: "control_layers",
+                count: crate::control_transformer::CONTROL_LAYERS_PLACES.len(),
+                input: &control_unified,
+                base: &unified,
+                freqs: &prep.unified_freqs,
+                t: &t,
+                heads,
+                query_rows: query_rows(add(prep.n, prep.c)?)?,
+                streamed: model.facts.streamable,
+            },
         )?
         .1
     } else {
@@ -878,8 +921,10 @@ fn forward(
             &unified,
             &prep.unified_freqs,
             Some(&t),
-            heads,
-            query_rows(add(prep.n, prep.c)?)?,
+            BlockAttention {
+                heads,
+                query_rows: query_rows(add(prep.n, prep.c)?)?,
+            },
         )?;
         if control.is_some() {
             if let Some(k) = crate::control_transformer::hint_index(
@@ -1008,7 +1053,18 @@ fn te_condition(p: &mut Program, model: &Model, c: &mut Catalog, route: &Route) 
             &mut *c
         };
         previous = x.clone();
-        x = te_layer(&mut p.graph, source, index, &x, cfg, &cos, &sin, &mask)?;
+        x = te_layer(
+            &mut p.graph,
+            source,
+            index,
+            &x,
+            cfg,
+            TeRope {
+                cos: &cos,
+                sin: &sin,
+                mask: &mask,
+            },
+        )?;
         p.mark(q::TE_LAYER)?;
     }
     let valid = u64::from(f.caption_tokens.min(f.window_tokens));
@@ -1241,7 +1297,6 @@ impl mlx_gen::gen_core::sampling::LatentOps for SolverOps {
         self.apply(|g| g.binary(a, b, "sampler.rs MlxLatentOps sub"))
     }
     fn axpy(&self, a: f32, x: &Tensor, _b: f32, y: &Tensor) -> mlx_gen::gen_core::Result<Tensor> {
-        use mlx_gen::gen_core::sampling::LatentOps;
         let by = self.multiply(y)?;
         if a == 1.0 {
             self.add(x, &by)

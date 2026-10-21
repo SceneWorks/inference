@@ -125,7 +125,7 @@ fn group_norm(
 }
 
 fn check_affine(channels: u64, weight: &Tensor, bias: &Tensor) -> Result<()> {
-    if channels % GROUPS != 0 || weight.shape != [channels] || bias.shape != [channels] {
+    if !channels.is_multiple_of(GROUPS) || weight.shape != [channels] || bias.shape != [channels] {
         return Err(error("GroupNorm affine shape/groups"));
     }
     Ok(())

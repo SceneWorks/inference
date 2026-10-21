@@ -212,7 +212,7 @@ impl Graph {
         let mut strides = Vec::new();
         let mut copy = false;
         for &d in shape {
-            if d != 0 && j < chunks.len() && chunks[j].0 % d == 0 {
+            if d != 0 && j < chunks.len() && chunks[j].0.is_multiple_of(d) {
                 chunks[j].0 /= d;
                 strides.push(mul(chunks[j].0, chunks[j].1)?);
                 if chunks[j].0 == 1 {
@@ -279,11 +279,11 @@ impl Graph {
             Some(&a)
         } else if a.data_size == 1 && b.contiguous {
             Some(&b)
-        } else if b.data_size == 1 && a.contiguous {
-            Some(&a)
-        } else if (a.row_contiguous() && b.row_contiguous())
+        } else if (b.data_size == 1 && a.contiguous)
+            || (a.row_contiguous() && b.row_contiguous())
             || (a.col_contiguous() && b.col_contiguous())
         {
+            // VectorScalar and VectorVector: binary.h:60-79 both malloc a.data_size()*itemsize.
             Some(&a)
         } else {
             None

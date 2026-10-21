@@ -18,7 +18,7 @@ mod cpu;
 mod vae_graph;
 #[path = "certificates/z_graph.rs"]
 mod z_graph;
-use cpu::{add, count, mul, Graph, Tensor};
+use cpu::{add, mul, Graph, Tensor};
 
 #[derive(Debug, Default)]
 pub(crate) struct WindowCertificates {
