@@ -641,6 +641,8 @@ pub fn selection_token(p: &MemoryStrategyParameters) -> String {
     }
 }
 
+type CampaignSelections = std::collections::BTreeMap<(String, String, u8), Vec<String>>;
+
 /// The provider's declared selection space per `(tier, rung)` as quality-first tokens, from its
 /// weights-free contract surface at the load shape the campaign actually uses ([`load_spec`]).
 fn selections(
@@ -648,7 +650,7 @@ fn selections(
     provider: &str,
     routes: &[String],
     snapshots: Option<&Path>,
-) -> Result<std::collections::BTreeMap<(String, String, u8), Vec<String>>, String> {
+) -> Result<CampaignSelections, String> {
     let mut out = std::collections::BTreeMap::new();
     let contracts = registry
         .memory_contract_surfaces()

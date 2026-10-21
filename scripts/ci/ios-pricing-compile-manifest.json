@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T11:52:39.833217+00:00",
-  "rust_proof_closure_sha256": "fbaaa8a5fa25012ca3ca78a70b50cb96386d3b0f355ee882886dc3c42b647331",
+  "UTC": "2026-10-21T12:17:53.732645+00:00",
+  "rust_proof_closure_sha256": "fb871244c2a1be8d80e9f8d1cc14958a6ee192b1871445902f05586d242c8c79",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -456,7 +456,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "cb1e874738e0048763eaf7e548cc28d2a9021a647b11b821b92bfe3c14d3d0f6"
+      "sha256": "8575518eadaeb2602e6d70969d284251bddf833fa96436817a2b3320f5275a6f"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -576,7 +576,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
-      "sha256": "41d32842a55f4bdc6408f17afca202bfd32fc450f7fe8788847f390d585d65af"
+      "sha256": "c80b65b3513e5507c268c2a1f3abb10c54b2a5e722c7dc463a3445a570d15c43"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
@@ -880,7 +880,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "66ff417de096f22d8faa93b6e866e4578cf7f8b0f4d73fb27ad1e2dbef833cd6"
+      "sha256": "bfbee6b954928bc127217420437cc9af9b62a95b8978e05bd72b36c9843658f7"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -1470,8 +1470,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "912a4ccaaa7fd65c0b676a953f0d0dc7414c075a1dea5824d23a78debd72f2e3",
-    "classification_sha256": "e3ed18bf58fe89ce02a4de660fe556996d77eaaf6e3dd0f6ca8681138c60bcc8",
+    "inventory_sha256": "b0effd5d9e2946ec4d6988a29014a1824f01ca869df947df9bfea6bfddc9f0dd",
+    "classification_sha256": "d919b2c512fdf6b2f15c342f9a6b2ff1d98a183e1965cc3a7cf36e27511ede5f",
     "selected_Rust_FQNs": 150,
     "HOST_logical": 128,
     "HOST_expected_PASS_rows": 129,

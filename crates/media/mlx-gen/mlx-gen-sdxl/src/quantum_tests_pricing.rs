@@ -8379,11 +8379,8 @@ fn fused_adapter_selected_headers_are_normalized_host() {
     assert!(!selected
         .iter()
         .any(|h| h.name.starts_with("model.diffusion_model.")));
-    let expected = inputs
-        .fused
-        .as_ref()
+    let expected = crate::ldm::pricing::FusedHeaderSource::read(&file)
         .unwrap()
-        .source
         .headers_with(mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet, &[]);
     assert_eq!(selected, expected);
 }

@@ -373,14 +373,15 @@ mod production_bounder_tests {
     fn ios_bounder_is_the_shared_bounder_signature() {
         let bounder: mlx_gen::ios_pricing::IosBounder = ios_bounder;
         let _ = bounder;
-        let with_facts: fn(
+        type ExecutionBounder = fn(
             &IosPricingRequest<'_>,
             &IosPricing,
             &IosPricingRequest<'_>,
             &IosPricing,
             CertifiedExecution,
             u64,
-        ) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>> = ios_bounder_with_execution;
+        ) -> Result<Vec<mlx_gen::ios_pricing::IosWindowBound>>;
+        let with_facts: ExecutionBounder = ios_bounder_with_execution;
         let _ = with_facts;
     }
 
