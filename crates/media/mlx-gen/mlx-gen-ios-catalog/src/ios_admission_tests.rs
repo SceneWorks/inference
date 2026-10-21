@@ -939,12 +939,9 @@ fn exact_key_uses_before_model_load_growth_and_rejects_masked_repeats() {
             );
             crate::sdxl::tests::write_header_fixture(
                 &incomplete_source,
-                headers.into_iter().map(|header| {
-                    (
-                        header.name,
-                        header.shape.into_iter().map(|dim| dim as usize).collect(),
-                    )
-                }),
+                headers
+                    .into_iter()
+                    .map(|header| (header.name, header.shape)),
             );
             let quality_artifact = || mlx_gen::gen_core::MemoryDecodeArtifactIdentity {
                 repository: "synthetic-negative-control".into(),
