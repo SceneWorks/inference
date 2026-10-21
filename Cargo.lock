@@ -281,6 +281,7 @@ dependencies = [
  "candle-nn",
  "cmudict-fast",
  "core-llm",
+ "flate2",
  "misaki-rs",
  "rand",
  "rand_distr",
@@ -453,6 +454,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.8",
+ "flate2",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -599,6 +601,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-gen-seedvr2",
  "candle-gen-sensenova",
+ "candle-gen-supra2",
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
@@ -1100,6 +1103,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-sdxl",
+ "candle-transformers",
+ "image",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1748,7 +1763,6 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
- "zlib-rs",
 ]
 
 [[package]]
@@ -2395,7 +2409,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
- "zip",
 ]
 
 [[package]]
@@ -2492,6 +2505,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-seedvr2",
  "mlx-gen-sensenova",
+ "mlx-gen-supra2",
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
@@ -2948,6 +2962,19 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+ "serde_json",
  "tempfile",
 ]
 
@@ -3736,6 +3763,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]
@@ -4436,12 +4464,6 @@ dependencies = [
  "nix",
  "typed-path",
 ]
-
-[[package]]
-name = "zlib-rs"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

@@ -1,0 +1,26 @@
+[package]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+edition = "2021"
+description = "Native Supra2-IMG (SupraDiT + Flan-T5-Base + SD VAE ft-MSE) text-to-image for MLX."
+license = "Apache-2.0"
+autotests = false
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# The T5 v1.1 encoder (Flan-T5-Base is the same block structure at 12 layers / 12 heads).
+mlx-gen-flux = { path = "../mlx-gen-flux" }
+# The SD AutoencoderKL (sd-vae-ft-mse shares SDXL's VAE block structure; scaling 0.18215).
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+# Component config.json geometry checks.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+tempfile = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"
