@@ -829,6 +829,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "8221cb10667e0e72f2a125f9a466527643560383faa2c52a7b6de8b65f3b0207",
+  "rust_proof_closure_sha256": "eff6b6e0f7345259aa67f2b4bcfe93422dd7357840397cc37142971872f138a8",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -792,7 +792,7 @@
     },
     {
       "path": "ios-host/smoke/Cargo.lock",
-      "sha256": "03f163ed989bedff13676af5540c53db51166083171a551820bdd81d95cdc798"
+      "sha256": "c8970823ef9faa774151e1d52a732d6aaf6e311a4a55f7a48de9273b7fb780fb"
     },
     {
       "path": "ios-host/smoke/src/campaign.rs",
