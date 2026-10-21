@@ -100,7 +100,7 @@ def verify_output(output: str, expected_uuid: str | None = None) -> None:
             raise UnitFailure("missing, duplicate or mismatched actual CUDA context UUID")
     # --nocapture can print after the libtest prefix but before its final `ok`. Remove ONLY
     # the identity marker; retain exact FQN, one running test, and the strict result summary.
-    normalized = re.sub(r"MOSS_CUDA_CONTEXT_UUID=[^\s]+", "", output)
+    normalized = re.sub(r"MOSS_CUDA_CONTEXT_UUID=[^\s]+", "", output).replace("\r\n", "\n")
     names = re.findall(r"(?m)^test (\S+) \.\.\.", normalized)
     if names != [TEST_NAME] or not re.search(rf"(?m)^test {re.escape(TEST_NAME)} \.\.\.[ \t\r\n]*ok$", normalized):
         raise UnitFailure(f"{TEST_NAME} was not reported ok")
@@ -267,7 +267,7 @@ def positive_integer(value, label: str) -> int:
 def read_unit_resources() -> tuple[dict, dict, dict]:
     try:
         resource = json.loads(RESOURCE_FILE.read_text(encoding="utf-8"))
-        author = (REPO_ROOT / resource["author_fixture_root"]).resolve()
+        author = (RESOURCE_FILE.parents[2] / resource["author_fixture_root"]).resolve()
         if not author.is_relative_to(REPO_ROOT.resolve()):
             raise UnitFailure("unit author fixture must stay inside the repository")
         return (resource, json.loads((author / "fixture.json").read_text(encoding="utf-8")),

@@ -17,11 +17,11 @@ fn unit_fixture(name: &str) -> Value {
     let resources = unit_resources();
     let relative = std::path::Path::new(resources["author_fixture_root"].as_str().unwrap());
     assert!(!relative.is_absolute());
-    assert!(!relative
-        .components()
-        .any(|part| matches!(part, std::path::Component::ParentDir)));
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../");
-    serde_json::from_slice(&std::fs::read(root.join(relative).join(name)).unwrap()).unwrap()
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = manifest.ancestors().nth(4).unwrap().canonicalize().unwrap();
+    let author = manifest.join(relative).canonicalize().unwrap();
+    assert!(author.starts_with(repository));
+    serde_json::from_slice(&std::fs::read(author.join(name)).unwrap()).unwrap()
 }
 
 fn data(device: &Device, dtype: DType) -> (Transformer, Weights, Tensor, Tensor) {

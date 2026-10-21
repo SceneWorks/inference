@@ -76,7 +76,7 @@ class VerifyOutputTests(unittest.TestCase):
         marker = f"MOSS_CUDA_CONTEXT_UUID={uuid}"
         interleaved = OK_OUTPUT.replace(" ... ok", f" ... {marker}\nok")
         standalone = OK_OUTPUT.replace(" ... ok", f" ... \n{marker}\nok")
-        for valid in (interleaved, standalone):
+        for valid in (interleaved, standalone, interleaved.replace("\n", "\r\n"), standalone.replace("\n", "\r\n")):
             try:
                 unit.verify_output(valid, uuid)
             except unit.UnitFailure as error:
