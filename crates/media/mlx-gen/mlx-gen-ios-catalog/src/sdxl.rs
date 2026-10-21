@@ -140,6 +140,123 @@ pub(crate) mod tests {
         root
     }
 
+    /// Source-header mechanism fixture only: complete inspected U-Net target inventory, not
+    /// model weights or native/physical evidence. Paths mirror the served SDXL block selectors;
+    /// deliberately tiny valid dimensions keep source-identity tests payload-independent.
+    type FixtureHeaders = Vec<(String, Vec<usize>)>;
+
+    fn unet_fixture_headers() -> (FixtureHeaders, usize) {
+        let cfg = mlx_gen_sdxl::config::UNetConfig::sdxl_base();
+        let mut headers = Vec::new();
+        let mut cross = 0;
+        let mut transformer = |prefix: String, depth: i32| {
+            for leaf in ["proj_in", "proj_out"] {
+                headers.push((format!("{prefix}.{leaf}.weight"), vec![8, 8]));
+            }
+            for block in 0..depth {
+                let prefix = format!("{prefix}.transformer_blocks.{block}");
+                for attention in ["attn1", "attn2"] {
+                    for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                        headers.push((format!("{prefix}.{attention}.{leaf}.weight"), vec![8, 8]));
+                    }
+                }
+                cross += 1;
+                for leaf in ["ff.net.0.proj", "ff.net.2"] {
+                    headers.push((format!("{prefix}.{leaf}.weight"), vec![8, 8]));
+                }
+            }
+        };
+        for up in [false, true] {
+            for index in 0..cfg.num_blocks() {
+                let ci = if up {
+                    cfg.num_blocks() - 1 - index
+                } else {
+                    index
+                };
+                let attention = if up {
+                    &cfg.up_block_types[ci]
+                } else {
+                    &cfg.down_block_types[ci]
+                };
+                if attention.contains("CrossAttn") {
+                    for resnet in 0..cfg.layers_per_block[ci] + i32::from(up) {
+                        transformer(
+                            format!(
+                                "{}_blocks.{index}.attentions.{resnet}",
+                                if up { "up" } else { "down" }
+                            ),
+                            cfg.transformer_layers_per_block[ci],
+                        );
+                    }
+                }
+            }
+        }
+        transformer(
+            "mid_block.attentions.0".into(),
+            *cfg.transformer_layers_per_block.last().unwrap(),
+        );
+        for leaf in ["conv_in", "conv_out"] {
+            headers.push((format!("{leaf}.weight"), vec![8, 8, 1, 1]));
+        }
+        for up in [false, true] {
+            for index in 0..cfg.num_blocks() {
+                let ci = if up {
+                    cfg.num_blocks() - 1 - index
+                } else {
+                    index
+                };
+                let prefix = format!("{}_blocks.{index}", if up { "up" } else { "down" });
+                for resnet in 0..cfg.layers_per_block[ci] + i32::from(up) {
+                    for leaf in ["conv1", "conv2"] {
+                        headers.push((
+                            format!("{prefix}.resnets.{resnet}.{leaf}.weight"),
+                            vec![8, 8, 1, 1],
+                        ));
+                    }
+                }
+                if (!up && index + 1 < cfg.num_blocks()) || (up && ci > 0) {
+                    headers.push((
+                        format!(
+                            "{prefix}.{}samplers.0.conv.weight",
+                            if up { "up" } else { "down" }
+                        ),
+                        vec![8, 8, 1, 1],
+                    ));
+                }
+            }
+        }
+        for resnet in 0..2 {
+            for leaf in ["conv1", "conv2"] {
+                headers.push((
+                    format!("mid_block.resnets.{resnet}.{leaf}.weight"),
+                    vec![8, 8, 1, 1],
+                ));
+            }
+        }
+        (headers, cross)
+    }
+
+    pub(crate) fn write_header_fixture(
+        path: &Path,
+        headers: impl IntoIterator<Item = (String, Vec<usize>)>,
+    ) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut map = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, shape) in headers {
+            let bytes = shape.iter().product::<usize>() * 2;
+            assert!(map.insert(name, serde_json::json!({"dtype":"BF16", "shape":shape, "data_offsets":[offset,offset+bytes]})).is_none());
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&map).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len((8 + header.len() + offset) as u64).unwrap();
+    }
+
     pub(crate) fn populate(root: &Path) {
         for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
             let name = if component.starts_with("text") {
@@ -149,6 +266,10 @@ pub(crate) mod tests {
             };
             write_tensor(&root.join(component).join(name), "F16", 8);
         }
+        write_header_fixture(
+            &root.join("unet/diffusion_pytorch_model.safetensors"),
+            unet_fixture_headers().0,
+        );
         write_tokenizer(&root.join("tokenizer"));
         write_tokenizer(&root.join("tokenizer_2"));
     }
@@ -194,9 +315,21 @@ pub(crate) mod tests {
         let mut spec = sdxl_load_spec(route, WeightsSource::Dir(root.to_owned())).unwrap();
         spec.quantize = quant;
         if mode == "ip_adapter" {
-            let ip = root.join("ip/ip.safetensors");
-            write_tensor(&ip, "F16", 8);
-            spec.ip_adapter = Some(WeightsSource::File(ip));
+            let ip = root.join("ip");
+            write_tensor(&ip.join("models/image_encoder/model.safetensors"), "F16", 8);
+            let pairs = (0..unet_fixture_headers().1).flat_map(|index| {
+                ["k", "v"].map(move |role| {
+                    (
+                        format!("ip_adapter.{}.to_{role}_ip.weight", 2 * index + 1),
+                        vec![8, 8],
+                    )
+                })
+            });
+            write_header_fixture(
+                &ip.join("sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors"),
+                pairs,
+            );
+            spec.ip_adapter = Some(WeightsSource::Dir(ip));
         }
         let request = GenerationRequest {
             prompt: "synthetic fixture".into(),
@@ -349,7 +482,7 @@ pub(crate) mod tests {
             assert!(differs(&aspect), "{w}x{h} borrowed 512x512 evidence");
         }
         // Two modes with the same reference count, layout and execution differ only by mode.
-        let img2img = candidate(
+        let mut img2img = candidate(
             &registry,
             a.path(),
             "sdxl",
@@ -357,6 +490,13 @@ pub(crate) mod tests {
             Some(Quant::Q4),
             "image_to_image",
         );
+        // Isolate the mode/role distinction: do not additionally change a recipe's explicit
+        // reference-strength control while asserting the execution recipes are identical.
+        let Conditioning::Reference { strength, .. } = &mut generate(&mut img2img).conditioning[0]
+        else {
+            unreachable!()
+        };
+        *strength = None;
         let control = candidate(&registry, a.path(), "sdxl", 512, Some(Quant::Q4), "control");
         let (k1, k2) = (
             evidence_key(&registry, &img2img, DEVICE).unwrap(),
@@ -671,6 +811,7 @@ mod execution_tests {
     use super::tests::admit_fixture_rows as admit_with_rows;
     use super::tests::{budget, candidate, capture, fixture, write_tensor, DEVICE};
     use super::*;
+    use crate::evidence::ANCHOR_MARGIN_FLOOR_BYTES;
     use crate::ios_admission::{Admission, IosCandidate, IosWork};
     use mlx_gen::gen_core::*;
     use std::cell::{Cell, RefCell};
@@ -856,7 +997,11 @@ mod execution_tests {
             std::slice::from_ref(candidate),
             DEVICE,
             budget(),
-            &[capture(registry, candidate, 1 << 20)],
+            &[capture(
+                registry,
+                candidate,
+                ANCHOR_MARGIN_FLOOR_BYTES + (1 << 20),
+            )],
         )
         .unwrap()
     }

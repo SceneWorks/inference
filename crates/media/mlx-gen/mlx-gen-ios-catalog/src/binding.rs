@@ -60,6 +60,7 @@ impl fmt::Debug for GenerationView<'_> {
             .field("duration", &r.duration)
             .field("video_mode", &r.video_mode)
             .field("veda", &r.veda)
+            .field("h3_terminal_telemetry", &r.h3_terminal_telemetry)
             .field("trim_first_frames", &r.trim_first_frames)
             .field("num_generated_keyframes", &r.num_generated_keyframes)
             .field("reference_image_short_edge", &r.reference_image_short_edge)
@@ -275,6 +276,13 @@ pub(crate) mod tests {
             work_binding(&works[0]),
             tiny_reference(&IosWork::Generate(GenerationRequest::default()))
         );
+        assert_eq!(work_binding(&works[0]), tiny_reference(&works[0]));
+        let before_telemetry = work_binding(&works[0]);
+        let IosWork::Generate(r) = &mut works[0] else {
+            unreachable!()
+        };
+        r.h3_terminal_telemetry = true;
+        assert_ne!(work_binding(&works[0]), before_telemetry);
         assert_eq!(work_binding(&works[0]), tiny_reference(&works[0]));
     }
 

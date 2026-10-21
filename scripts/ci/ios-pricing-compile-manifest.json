@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T12:42:25.676479+00:00",
-  "rust_proof_closure_sha256": "aa35d011924f5bef9fb46807acc850514a633160b82ffa6785198cc850ab75bd",
+  "UTC": "2026-10-21T13:39:59.638575+00:00",
+  "rust_proof_closure_sha256": "1d97bdb31fc9ef8f35d00d30289bf2efbda918a64110ada196dc603153676ab2",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -139,16 +139,20 @@
       "sha256": "68b6accd9212aa99c6ee562ee5050d52d03369af0739568eafa1bffc46f918b5"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/admission.rs",
+      "sha256": "e9552e17bf4f33005ba406c9bb7671b9495c557b2fec8930835dfde28978a80a"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor.rs",
       "sha256": "30e7a7a35cd64cc25581170a8cfe367993a7136274ad42b15c0e264f31627266"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
-      "sha256": "9954504603894622aa9229150df4ec511f9843c739f46c1b26a86bca0cf4afbe"
+      "sha256": "ee16560c8f4bf19384f8fc3651aae0bc7167afabc6be302131eb604a9c7e27d7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
-      "sha256": "1d8d621f4986bd14a9cb5c7e46c7f4985e5499bc2061b2edf2678f60782790b2"
+      "sha256": "1c4aa129682ccb7188865b42fa29e4382a906a1ed02db61dc4f9ce2e88e2b9e0"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/bound.rs",
@@ -188,7 +192,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/sdxl.rs",
-      "sha256": "d58df94df482e116092d0d155b213b576a57c7d1e39ba2253545482d0bdafe45"
+      "sha256": "9a7224d57e3e5ccb1e0d72b4b58a51107d31504231f412bf2839eb5520258397"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/source_work.rs",
@@ -196,7 +200,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/zimage.rs",
-      "sha256": "948978f6e5530e03c51e633b691269844904bc63b6c45b2025be7a8f256081eb"
+      "sha256": "ca5842f40c127c1a7cd32a0efe1d03b226e95940bbd1578901f64a1653a153aa"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/Cargo.toml",
@@ -1470,8 +1474,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "99f40029819915d072a47434c146bd17ed24cb651716a9b13bac0841c798efdc",
-    "classification_sha256": "ceebb3fff2be7150e99a89950bb79f4db0a7adf60877784f2ff7e663d9be58af",
+    "inventory_sha256": "ee2a036f1104159aee1b6d3616598679c2265cfed59fa5e6040392913ec5a80d",
+    "classification_sha256": "40ce798bedab72ad0b713b3e022b61c56a1524a6484471e14c05b24264e7ce68",
     "selected_Rust_FQNs": 150,
     "HOST_logical": 128,
     "HOST_expected_PASS_rows": 129,

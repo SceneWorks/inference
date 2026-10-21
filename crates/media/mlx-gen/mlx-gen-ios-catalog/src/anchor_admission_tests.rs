@@ -97,8 +97,20 @@ const SYNTHETIC_CHECKS: [(IosPhase, &str); 5] = [
 ];
 
 fn witnessed(mut row: AnchorRow) -> AnchorRow {
+    let roles = [
+        ("reference_count", u64::from(row.key.reference_count)),
+        ("mask_count", u64::from(row.key.mask_count)),
+        ("control_count", u64::from(row.key.control_count)),
+    ];
     if let AnchorOutcome::Completed { captures } = &mut row.outcome {
         for capture in captures {
+            // Schema witness from this fixture's own actual request key, not native evidence.
+            capture
+                .sampling_coverage
+                .as_mut()
+                .unwrap()
+                .record("ios_capture", "conditioning-roles", &roles)
+                .unwrap();
             let coverage = capture.quantum_coverage.as_mut().unwrap();
             for (phase, label) in SYNTHETIC_CHECKS {
                 coverage.record(Some(phase), label, vec![0]);
