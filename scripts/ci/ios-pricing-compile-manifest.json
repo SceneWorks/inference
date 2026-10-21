@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "3bee6136a66fbb1aad513be5180c44e06c05629dab8a886d547875ad57d0a2ac",
+  "rust_proof_closure_sha256": "b294c39921013c974fede832cb611c4e8a3e8ef40cad6d6d44a37335f26a151e",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -56,7 +56,7 @@
     },
     {
       "path": "crates/contracts/gen-core/src/iris/restoration.rs",
-      "sha256": "7c7bb17019e63554f140970c051206138a59a188abe2453cc2ec01e04860bd90"
+      "sha256": "47a9f65407e492ad4251fb7813840ecdcf2dd59319deb1dad62596e8ca0fea06"
     },
     {
       "path": "crates/contracts/gen-core/src/lib.rs",

@@ -1187,10 +1187,7 @@ pub fn restore_detailed(
 /// (otherwise it is dropped as soon as it is cropped — 3×H×W f32 of the padded output).
 /// Narrow only the progress wire representation, never an inventory or execution count.
 fn display_step_count(count: u64) -> u32 {
-    match u32::try_from(count) {
-        Ok(value) => value,
-        Err(_) => u32::MAX,
-    }
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 fn run_restoration(
