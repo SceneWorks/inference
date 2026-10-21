@@ -78,3 +78,18 @@ class RustcTestArtifactPlanTests(unittest.TestCase):
         self.assertEqual(bridge.linkable_test_args(args), ["--crate-name=regex", "--crate-type=bin", "--emit", "link", "-Cmetadata=keep", "--test", "-o", "/test/exact"])
         without_output = args[:-2]
         self.assertEqual(bridge.linkable_test_args(without_output), without_output)
+
+
+class PositiveSourceFactRecordTests(unittest.TestCase):
+    # Tiny arithmetic/parser fixtures, NOT native certificate values or a J execution.
+    RECORD = "CLIP_SOURCE_FACTS C=11 S=22 J=7 J_limit=2097152 M0=37 M0_native=37 status=checked"
+
+    def test_requires_one_checked_positive_record(self):
+        actual = load_runner().require_positive_facts(self.RECORD)
+        self.assertEqual((actual["C"], actual["S"], actual["J"]), (11, 22, 7))
+
+    def test_rejects_missing_duplicate_failed_predicates_and_unchecked_records(self):
+        runner = load_runner()
+        for output in ["", self.RECORD + "\n" + self.RECORD, self.RECORD.replace("J=7", "J=2097152"), self.RECORD.replace("J_limit=2097152", "J_limit=4194304"), self.RECORD.replace("M0_native=37", "M0_native=36"), self.RECORD.replace("status=checked", "status=unproved"), self.RECORD.replace("C=11", "C=0")]:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                runner.require_positive_facts(output)

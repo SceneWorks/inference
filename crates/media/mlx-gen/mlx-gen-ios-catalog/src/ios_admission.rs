@@ -1483,7 +1483,8 @@ fn anchored_demand_using_source_capacity(
                    anchor_pricing: &IosPricing,
                    request: &IosBoundRequest<'_>,
                    request_pricing: &IosPricing,
-                   source_metadata_capacity: &mut Option<KeyCapacity<'_>>| {
+                   source_metadata_capacity: &mut Option<KeyCapacity<'_>>|
+     -> mlx_gen::Result<IosCertifiedBounds> {
         if let (true, Some(next)) = (
             matches!(
                 candidate.provider.as_str(),
@@ -1510,7 +1511,7 @@ fn anchored_demand_using_source_capacity(
             // The real boundary must still refuse Capacity, never reinterpret it
             // as successful native output or later turn it into NoEvidence.
             if source_capacity_refused.get() {
-                return Err(Error::Unsupported(
+                return Err(mlx_gen::Error::Unsupported(
                     "source metadata capacity check refused before guarded repricing".into(),
                 ));
             }
@@ -1857,9 +1858,9 @@ fn admit_one_using_key_capacity(
         // Source/spec/token cloning and binding need their own checked ownership law.
         // Do not clone first and then pretend a verification check covered that allocation.
         if let Some(next) = next.as_mut() {
-            return with_source_inventory_capacity(&mut **next, |core_next| {
-                SourceInventory::metadata_gap(core_next, SourceInventory::PIN_CAPTURE_METADATA_GAP)
-            });
+            with_source_inventory_capacity(&mut **next, |core_next| {
+                guard.preflight_admission_binding_with_capacity(&candidate.spec, core_next)
+            })?;
         }
         let mut spec = candidate.spec.clone();
         if spec.source_inventory().is_none() {

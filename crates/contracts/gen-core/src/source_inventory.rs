@@ -96,6 +96,19 @@ impl SourceInventory {
         Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
     }
 
+    /// Guard receipt source/spec/token ownership BEFORE cloning or binding it. A complete
+    /// checked allocation law is required before this operation can succeed. This narrow
+    /// public operation exposes only the fixed initial-seal/binding gap, not arbitrary reasons.
+    /// The borrowed inputs are available for the future source law; no native fallback or clone
+    /// is performed while its authority remains missing (sc-26270 activity 26647).
+    pub fn preflight_admission_binding_with_capacity(
+        &self,
+        _spec: &LoadSpec,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        Self::metadata_gap(next, Self::PIN_CAPTURE_METADATA_GAP)
+    }
+
     /// Initial guarded inventory acquisition. No current-directory Vec or seal acquisition runs
     /// before its real source law. The native `capture` API remains unchanged.
     pub fn capture_with_capacity(
@@ -757,5 +770,40 @@ mod source_prelude_boundary_tests {
             .unwrap_err()
             .to_string()
             .contains("real prelude check refused"));
+    }
+}
+
+#[cfg(test)]
+mod admission_binding_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_binding_checks_capacity_before_its_fixed_source_gap() {
+        let source = SourceInventory {
+            roots: Vec::new(),
+            entries: Vec::new(),
+            pins: Vec::new(),
+        };
+        let spec = LoadSpec::new(crate::WeightsSource::File(PathBuf::from(
+            "/binding-fixture-never-opened",
+        )));
+        let mut checked = Vec::new();
+        let mut next = |bytes| {
+            checked.push(bytes);
+            Ok(())
+        };
+        let result = source.preflight_admission_binding_with_capacity(&spec, &mut next);
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == SourceInventory::PIN_CAPTURE_METADATA_GAP)
+        );
+        assert_eq!(
+            checked,
+            [SourceInventory::PIN_CAPTURE_METADATA_GAP.len() as u64]
+        );
+        let mut refuse = |_| Err(Error::Canceled);
+        assert!(matches!(
+            source.preflight_admission_binding_with_capacity(&spec, &mut refuse),
+            Err(Error::Canceled)
+        ));
     }
 }

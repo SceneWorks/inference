@@ -4,7 +4,8 @@
 The root workspace test selection does not run a dependency's unit tests. Cargo rustc builds
 regex's OWN lib source as a test harness with its normal locked dependencies and actual build
 provenance. No upstream dev-dependency resolution, copied assertions, synthetic source markers,
-model/runtime work, or measurement gate. The six exact test rows and hash-vector row must run.
+model/runtime work, or measurement gate. The original six rows, mandatory positive row and
+hash-vector row must actually run.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ GENERATOR_TESTS = (
     "real_type_queries_produce_two_distinct_finite_terms_when_supported",
     "search_keeps_hybrid_and_both_fallback_stores",
     "arc_payload_is_not_the_arc_pointer_layout",
+    "admitted_target_public_api_returns_checked_finite_envelopes",
 )
 
 
@@ -29,6 +31,16 @@ def require_one_passed(output: str, name: str) -> None:
     rows = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;", output)
     if rows != [("ok", "1", "0", "0")]:
         raise RuntimeError(f"{name}: expected one actual passed test, got {rows}")
+
+
+def require_positive_facts(output: str) -> dict[str, int]:
+    rows = re.findall(r"^CLIP_SOURCE_FACTS C=([0-9]{1,20}) S=([0-9]{1,20}) J=([0-9]{1,20}) J_limit=([0-9]{1,20}) M0=([0-9]{1,20}) M0_native=([0-9]{1,20}) status=checked$", output, re.MULTILINE)
+    if len(rows) != 1:
+        raise RuntimeError("expected one actual checked positive source-fact record")
+    cold, search, j, limit, m0, native_m0 = map(int, rows[0])
+    if not (cold > 0 and search > 0 and cold != search and limit == 2_097_152 and j < limit and m0 > 0 and m0 == native_m0):
+        raise RuntimeError("positive source-fact record violates checked envelope/J/M0 predicates")
+    return {"C": cold, "S": search, "J": j, "J_limit": limit, "M0": m0, "M0_native": native_m0}
 
 
 def run(argv: list[str], env: dict[str, str]) -> str:
@@ -39,9 +51,10 @@ def run(argv: list[str], env: dict[str, str]) -> str:
     return result.stdout
 
 
-def exact(binary: Path, fqn: str, env: dict[str, str]) -> None:
+def exact(binary: Path, fqn: str, env: dict[str, str]) -> str:
     output = run([str(binary), "--exact", fqn, "--nocapture", "--test-threads=1"], env)
     require_one_passed(output, fqn)
+    return output
 
 
 def main() -> None:
@@ -79,11 +92,13 @@ def main() -> None:
         fqn = "clip_source_certificate::tests::" + name
         if fqn + ": test" not in listed.splitlines():
             raise RuntimeError(f"missing dependency-owned test {fqn}")
-        exact(binary, fqn, env)
+        output = exact(binary, fqn, env)
+        if name == "admitted_target_public_api_returns_checked_finite_envelopes":
+            require_positive_facts(output)
     hasher = args.output_dir / "source-hasher-tests"
     run(["rustc", "--edition", "2021", "--test", "vendor/clip-regex/build-verify.rs", "-o", str(hasher)], env)
     exact(hasher, "tests::source_hasher_known_vectors", env)
-    print("CLIP source certificate: six dependency-owned tests and build-hasher vector passed")
+    print("CLIP source certificate: original six + mandatory positive dependency test and build-hasher vector passed")
 
 
 if __name__ == "__main__":

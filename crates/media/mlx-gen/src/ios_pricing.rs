@@ -965,7 +965,8 @@ mod native_to_process_tests {
         let unproved = IosHostGrowth::Unproved("tokenizer upper unproved".into());
         let refusal = model.to_process_with_host(slice, &unproved).unwrap_err();
         assert!(refusal.to_string().contains("tokenizer upper unproved"));
-        let certified = IosCertifiedBounds::proven_with_host(vec![native.clone(), native], 9, 0);
+        let certified =
+            IosCertifiedBounds::proven_with_host(vec![native.clone(), native.clone()], 9, 0);
         assert_eq!(
             certified.host,
             IosHostGrowth::Declared(vec![entry("r", 9)]),

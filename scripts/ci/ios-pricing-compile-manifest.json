@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T17:33:42.905334+00:00",
-  "rust_proof_closure_sha256": "9ac024ec417ecbbb7cc200ec30de872049910f5ed82917314967f23704ed831c",
+  "UTC": "2026-10-21T18:10:13.951235+00:00",
+  "rust_proof_closure_sha256": "21c692ffec05ea087dc16218d8a49b2d836a1b07412d7aee00c313178859405e",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -104,7 +104,7 @@
     },
     {
       "path": "crates/contracts/gen-core/src/source_inventory.rs",
-      "sha256": "9e7f6b766f3d64e3e3f31075adba0c95f995fcf633baea657d4c660f0610317c"
+      "sha256": "eeaa5e13b75819031ba82c8a38f8ba5c3a8960ed64481f4863a81ed575f48ca6"
     },
     {
       "path": "crates/contracts/gen-core/src/weightsmeta.rs",
@@ -184,7 +184,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "401aee1e6a869bcc561e295bb89d1c4168618fbb6a770e2fcccaec80c98b6922"
+      "sha256": "155dbc578c9615005530cc6072544bc362f0a4592e5688913c5de8f7593350ef"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -844,7 +844,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
-      "sha256": "6df19257ea6d567dab83247cec8dd1f8c1e2f4d55983c2e54cc44cf1bd36a8e6"
+      "sha256": "dfdd92ecaf13929074f3cac8f7aae111557d2fe83629a0212777525e94f90327"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
@@ -944,7 +944,7 @@
     },
     {
       "path": "scripts/ci/run_clip_regex_certificate_tests.py",
-      "sha256": "63b332b828926c1fac2ea969838bbe730bbc2b337683f365524fad63b2c5f994"
+      "sha256": "5575c925f760e90c0cc613fc5bc7fea2fe5e6c53892198330a7c3d2901adb21d"
     },
     {
       "path": "scripts/clock_assertions_baseline.txt",
@@ -960,7 +960,7 @@
     },
     {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
-      "sha256": "1ba80dec47bc6816056558318a1dfbdb0c808eb3ec9ef56af1383289d723cd63"
+      "sha256": "f18282e35dc2ee7fa45a997bdb3239390a42afc5f19ddf9273856b2e578a058c"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
@@ -968,7 +968,7 @@
     },
     {
       "path": "vendor/clip-regex/SOURCE-AUTHORITY.json",
-      "sha256": "f13b42107734aa9402a780f5e90dcd2d2b13ac020a67abee67593539829db16a"
+      "sha256": "aacf4243523ec5c57b9dce86b3bf94b9c9f93d73828dee117cae42bdb288008f"
     },
     {
       "path": "vendor/clip-regex/build-verify.rs",
@@ -1624,7 +1624,7 @@
     },
     {
       "path": "vendor/clip-regex/regex/source-bindings.sha256",
-      "sha256": "7881ea4af323694b25c9babac66caa8cb1252b792c7ccbd002ebd9a625b4693b"
+      "sha256": "35bd68ef085b968ef8a673d00f78d26675fa8be3a3643bbfc681e3d1c5fb8f65"
     },
     {
       "path": "vendor/clip-regex/regex/src/builders.rs",
@@ -1636,7 +1636,7 @@
     },
     {
       "path": "vendor/clip-regex/regex/src/clip_source_certificate.rs",
-      "sha256": "69e2cf6d0a1a0dd03008644f269f4b3984303267144c406acbfb95f2ad3d9090"
+      "sha256": "6ee4c9aede23d5810cfc98dcf03f3c1b162c098af3ecf88d138076bf74746d8a"
     },
     {
       "path": "vendor/clip-regex/regex/src/error.rs",
@@ -2370,14 +2370,14 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "4d236cf51bfccd2a7e006006cbe6165ca8fd25d1ace2d6c4459b3ea084c215f0",
-    "classification_sha256": "5c37722b4482237554cd51768aa427a2ad7883ed8bd41dac2aadb94ea56619f6",
-    "selected_Rust_FQNs": 214,
-    "HOST_logical": 192,
-    "HOST_expected_PASS_rows": 193,
+    "inventory_sha256": "7a31b1737e4ecc09b76bb8c749c0401e2153b28fe8239279f8083e38411b81df",
+    "classification_sha256": "6176e3173f0a1bcc0ecdf905c3f4de0c54c958ee9430471a1a1719bff7efffd4",
+    "selected_Rust_FQNs": 216,
+    "HOST_logical": 194,
+    "HOST_expected_PASS_rows": 195,
     "native_logical": 22,
     "native_expected_PASS_rows": 44,
-    "Python_exact_tests": 14,
+    "Python_exact_tests": 16,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true
   }

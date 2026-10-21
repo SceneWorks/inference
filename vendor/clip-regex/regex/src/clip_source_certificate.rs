@@ -401,4 +401,49 @@ mod tests {
         assert!(arc_payload(l).unwrap() > Layout::new::<Arc<[u64; 8]>>().size() as u64);
         assert_eq!(tls_upper().unwrap(), 64);
     }
+
+    /// Mandatory hosted admitted-target instantiation. Never accepts an error, skip or fallback.
+    /// Only target layouts and checked arithmetic are evaluated: no Regex, asset, GPU or RSS run.
+    #[test]
+    fn admitted_target_public_api_returns_checked_finite_envelopes() {
+        assert!(
+            cfg!(all(
+                target_vendor = "apple",
+                target_arch = "aarch64",
+                target_pointer_width = "64",
+                target_feature = "neon",
+                target_endian = "little"
+            )),
+            "positive source-fact test must execute on the theorem's admitted Apple ARM64 target"
+        );
+        assert_eq!(
+            env!("CLIP_REGEX_SOURCE_VERIFIED"),
+            SOURCE,
+            "actual build-time source/compiler provenance is required, never fabricated"
+        );
+        let (_, _, _, ra) = regex_automata::__clip_regex_private_layouts();
+        assert!(ra.len() > 15);
+        assert!(
+            regex_automata::__clip_regex_private_layouts().2 && !cfg!(feature = "logging"),
+            "the actual linked feature closure must be admitted"
+        );
+        let i = Layout::new::<LazyStateID>().size() as u64;
+        let z = ra[15].size() as u64;
+        let j = sum(&[(1, 237_931), (6461, i), (10, z)]).expect("checked native J");
+        let m0 = sum(&[
+            (1, 4_435_661_620_096),
+            (68_854_223_672, i),
+            (268_437_504, z),
+        ])
+        .expect("checked noncircular M0");
+        init_model(i, z).expect("strict J and native M0 predicates");
+        assert!(j < K);
+        let m0_native = native(m0).expect("M0 fits actual native usize");
+        let (cold, search) = checked_requested_layouts(PATTERN)
+            .expect("EXACT literal must yield BOTH checked envelopes on the admitted target");
+        assert!(cold > 1_754_183);
+        assert!(search > 20_018_036);
+        assert_ne!(cold, search);
+        println!("CLIP_SOURCE_FACTS C={cold} S={search} J={j} J_limit={K} M0={m0} M0_native={m0_native} status=checked");
+    }
 }
