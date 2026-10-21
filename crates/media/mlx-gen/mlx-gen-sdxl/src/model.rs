@@ -634,8 +634,12 @@ pub fn conditioning_window_count_with_source_capacity(
     let root = tokenizer_root(spec)?;
     let vocab_path = root.join("tokenizer").join("vocab.json");
     let merges_path = root.join("tokenizer").join("merges.txt");
-    let vocab = source.member_pin_with_capacity(&vocab_path, next)?;
-    let merges = source.member_pin_with_capacity(&merges_path, next)?;
+    let (vocab, merges) = mlx_gen::ios_pricing::with_core_source_capacity(next, |core_next| {
+        Ok((
+            source.member_pin_with_capacity(&vocab_path, core_next)?,
+            source.member_pin_with_capacity(&merges_path, core_next)?,
+        ))
+    })?;
     // Path lookup storage is source metadata, not a whole-key/RSS certificate.
     crate::tokenizer::count_pinned_with_source_capacity(vocab, merges, prompt, negative, next)
 }

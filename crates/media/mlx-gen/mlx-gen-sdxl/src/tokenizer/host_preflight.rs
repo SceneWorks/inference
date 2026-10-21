@@ -195,11 +195,13 @@ pub(super) fn read_pinned_utf8(
     label: &str,
     next: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<String> {
-    pin.read_unchanged_with_capacity(next, |path, _same_next| -> Result<String> {
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| Error::Msg(format!("sdxl tokenizer: read {label}: {e}")))?;
-        let bound = usize::try_from(pin.target_fingerprint().size).map_err(|_| overflow())?;
-        read_limited_utf8(&mut file, bound, label)
+    mlx_gen::ios_pricing::with_core_source_capacity(next, |core_next| {
+        pin.read_unchanged_with_capacity(core_next, |path, _same_next| -> Result<String> {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| Error::Msg(format!("sdxl tokenizer: read {label}: {e}")))?;
+            let bound = usize::try_from(pin.target_fingerprint().size).map_err(|_| overflow())?;
+            read_limited_utf8(&mut file, bound, label)
+        })
     })
 }
 fn read_limited_utf8(read: &mut impl Read, bound: usize, label: &str) -> Result<String> {

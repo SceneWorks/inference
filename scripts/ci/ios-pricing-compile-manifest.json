@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T16:28:40.549480+00:00",
-  "rust_proof_closure_sha256": "961d0e787d0f5edc224f65edc7c3592fcec0a256a6fb0e824905ccf97362a666",
+  "UTC": "2026-10-21T17:05:11.813344+00:00",
+  "rust_proof_closure_sha256": "48a9db2da216258d30e78106833c469229efc8304e0ff225e698b4a8e971f6a2",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -184,7 +184,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "bdb9a60f770a998ea49842e13641f2792734d8e86a9bb053f7f1aba0ef19e2db"
+      "sha256": "401aee1e6a869bcc561e295bb89d1c4168618fbb6a770e2fcccaec80c98b6922"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -456,7 +456,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/model.rs",
-      "sha256": "673bfba9f9c1b88990f62da7838aa327272be7b1982e1cdfe51ee9a60c4e0972"
+      "sha256": "6ee0a429cd3169be8dfc6837cdb9fbd1c696d9aea1c244fe94d61b4982a92634"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/pipeline.rs",
@@ -516,7 +516,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer/host_preflight.rs",
-      "sha256": "18dfe366a1e3cab9c37f5102d4bf716c184e1c93a157437104e41dd753c7d023"
+      "sha256": "1c7799b07daed27d0781004b2d95975de3d7e3162de0ab847f1441c3a4dbff01"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
@@ -844,7 +844,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
-      "sha256": "61776f8f1bcce19c49b8de1ab984555549d44be560e832577e8ee68ec1397be0"
+      "sha256": "6df19257ea6d567dab83247cec8dd1f8c1e2f4d55983c2e54cc44cf1bd36a8e6"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
@@ -912,7 +912,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "1e5cceab9b6910364836cd0d1404ee6b9768309765dc4ab2255e656d7123933f"
+      "sha256": "56bf1664a70b10f640a88d77889977e0db5b42d6dbd7a54404cd253b0029985e"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -935,12 +935,16 @@
       "sha256": "f9041b3e21c61f3940e387b9981316034a41ca0d8e96404e8479428373ee1b72"
     },
     {
+      "path": "scripts/ci/clip_regex_test_rustc.py",
+      "sha256": "e05bb7f8caa625b556e7a10484d03efaf0a3d0682116f0e308873d5eae6814a7"
+    },
+    {
       "path": "scripts/ci/ios_pricing_compile_only.py",
       "sha256": "56bd4b2b2b6c0568dc8985e84e5e6e78d65ad37510d3ca3ba7ec79c5477b6054"
     },
     {
       "path": "scripts/ci/run_clip_regex_certificate_tests.py",
-      "sha256": "fb1e3768af62fa974df3a9a0e2381d11a06fdebdf2e3c248f05f8da8f9a9b86b"
+      "sha256": "63b332b828926c1fac2ea969838bbe730bbc2b337683f365524fad63b2c5f994"
     },
     {
       "path": "scripts/clock_assertions_baseline.txt",
@@ -956,7 +960,7 @@
     },
     {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
-      "sha256": "64d8056a74e0e42df3e5f961ecf1b2ca53cf3de336f3c21dbf93c62623981b1b"
+      "sha256": "c5415628ac39e0d04b02c6f0978a7d17786bd20ebfb9af9dc67994d9f5ffe571"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
@@ -2366,14 +2370,14 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "7b31be0e9a4f2604a287b9fbaf658a1372a588c0f9950b589a6c8bf9dc3aca2e",
-    "classification_sha256": "2f13f6f6df9f31bfc70054d1bd4ef90371b9b18f928ce977beda05fae5c7ee40",
-    "selected_Rust_FQNs": 211,
-    "HOST_logical": 189,
-    "HOST_expected_PASS_rows": 190,
+    "inventory_sha256": "bbe776101ace618b03159b54264b5a499c1dc47771fc04847bdb7462d70826bb",
+    "classification_sha256": "055f19bc6caf425922ee0cea5be28bfa4aa9c7b1d0e320321d92d15aa03bf29b",
+    "selected_Rust_FQNs": 214,
+    "HOST_logical": 192,
+    "HOST_expected_PASS_rows": 193,
     "native_logical": 22,
     "native_expected_PASS_rows": 44,
-    "Python_exact_tests": 9,
+    "Python_exact_tests": 12,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true
   }

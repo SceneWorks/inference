@@ -65,6 +65,12 @@ def main() -> None:
     features = run(["cargo", "tree", "--locked", "-p", "regex", "--depth", "0", "--format", "{f}"], env)
     if "clip-source-certificate" not in {part.strip() for line in features.splitlines() for part in line.split(",")}:
         raise RuntimeError("the actual locked regex dependency has no clip-source-certificate feature")
+    # Cargo still regards this as a library build and may pass metadata-only externs to the
+    # injected test harness. Build the real rlibs first, then substitute only their exact
+    # same-hash artifact paths for the primary regex --test invocation. No source/feature/
+    # compiler-provenance environment is fabricated and missing rlibs are a hard failure.
+    env["RUSTC_WRAPPER"] = str(ROOT / "scripts/ci/clip_regex_test_rustc.py")
+    run(["cargo", "build", "--locked", "-p", "regex", "--lib"], env)
     run(["cargo", "rustc", "--locked", "-p", "regex", "--lib", "--", "--test", "-o", str(binary)], env)
     if not binary.is_file():
         raise RuntimeError("cargo rustc did not produce the dependency-owned test executable")

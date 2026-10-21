@@ -720,7 +720,13 @@ pub fn evidence_key_with_key_capacity(
     })?;
     with_source_inventory_capacity(next, |next| {
         Ok(source.read_unchanged_with_capacity(next, |same_next| {
-            key_unchecked_using_key_capacity(candidate, machine, route, Some((source, same_next)))
+            let mut provider_next = |bytes| same_next(bytes).map_err(mlx_gen::Error::from);
+            key_unchecked_using_key_capacity(
+                candidate,
+                machine,
+                route,
+                Some((source, &mut provider_next)),
+            )
         }))
     })?
     .map_err(source_metadata_gap_refusal)
@@ -1245,11 +1251,19 @@ fn with_source_metadata_capacity<T>(
 
 fn with_source_inventory_capacity<T>(
     next: KeyCapacity<'_>,
-    work: impl FnOnce(KeyCapacity<'_>) -> mlx_gen::Result<T>,
+    work: impl FnOnce(
+        &mut dyn FnMut(u64) -> mlx_gen::gen_core::Result<()>,
+    ) -> mlx_gen::gen_core::Result<T>,
 ) -> AdmissionResult<T> {
-    with_source_capacity_using(next, work, |error| {
-        source_metadata_gap_refusal(AdmissionError::Failed(error))
-    })
+    with_source_capacity_using(
+        next,
+        |same_next| {
+            mlx_gen::ios_pricing::with_core_source_capacity(same_next, |core_next| {
+                work(core_next).map_err(mlx_gen::Error::from)
+            })
+        },
+        |error| source_metadata_gap_refusal(AdmissionError::Failed(error)),
+    )
 }
 
 fn with_source_capacity_using<T>(
@@ -1272,7 +1286,7 @@ fn with_source_capacity_using<T>(
             "source metadata capacity check refused before pricing allocation",
         ));
     }
-    result.map_err(classify_error)
+    result.map_err(|error| classify_error(error.into()))
 }
 
 fn pricing_error(error: impl Into<Error>) -> AdmissionError {
@@ -1843,11 +1857,9 @@ fn admit_one_using_key_capacity(
         // Source/spec/token cloning and binding need their own checked ownership law.
         // Do not clone first and then pretend a verification check covered that allocation.
         if let Some(next) = next.as_mut() {
-            return SourceInventory::metadata_gap(
-                &mut **next,
-                SourceInventory::PIN_CAPTURE_METADATA_GAP,
-            )
-            .map_err(AdmissionError::from);
+            return with_source_inventory_capacity(&mut **next, |core_next| {
+                SourceInventory::metadata_gap(core_next, SourceInventory::PIN_CAPTURE_METADATA_GAP)
+            });
         }
         let mut spec = candidate.spec.clone();
         if spec.source_inventory().is_none() {
@@ -1869,7 +1881,10 @@ fn admit_one_using_key_capacity(
     };
     match next {
         Some(next) => with_source_inventory_capacity(next, |next| {
-            Ok(guard.read_unchanged_with_capacity(next, |same_next| consume(Some(same_next))))
+            Ok(guard.read_unchanged_with_capacity(next, |same_next| {
+                let mut provider_next = |bytes| same_next(bytes).map_err(mlx_gen::Error::from);
+                consume(Some(&mut provider_next))
+            }))
         })?,
         None => guard.read_unchanged(|| consume(None)),
     }

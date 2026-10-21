@@ -1149,36 +1149,39 @@ impl DeviceProvider<'_> {
             }
             result.map_err(Into::into)
         };
-        SourceInventory::preflight_directory_with_capacity(&self.root, &mut key_next).map_err(
-            |error| {
-                let error = if source_capacity_refused.get() {
-                    runtime_ios::media::AdmissionError::refused(
-                        runtime_ios::media::RefusalKind::Capacity,
-                        error.to_string(),
-                    )
-                } else {
-                    match error {
-                        Error::Unsupported(reason)
-                            if [
-                                SourceInventory::READDIR_METADATA_GAP,
-                                SourceInventory::PIN_VERIFY_METADATA_GAP,
-                                SourceInventory::PIN_CAPTURE_METADATA_GAP,
-                                SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
-                                SourceInventory::MISSING_INVENTORY_METADATA_GAP,
-                            ]
-                            .contains(&reason.as_str()) =>
-                        {
-                            runtime_ios::media::AdmissionError::refused(
-                                runtime_ios::media::RefusalKind::NoEvidence,
-                                reason,
-                            )
-                        }
-                        other => runtime_ios::media::AdmissionError::Failed(other.into()),
+        mlx_gen::ios_pricing::with_core_source_capacity(&mut key_next, |core_next| {
+            SourceInventory::preflight_directory_with_capacity(&self.root, core_next)
+                .map_err(mlx_gen::Error::from)
+        })
+        .map_err(|error| {
+            let error: runtime_ios::gen_core::Error = error.into();
+            let error = if source_capacity_refused.get() {
+                runtime_ios::media::AdmissionError::refused(
+                    runtime_ios::media::RefusalKind::Capacity,
+                    error.to_string(),
+                )
+            } else {
+                match error {
+                    Error::Unsupported(reason)
+                        if [
+                            SourceInventory::READDIR_METADATA_GAP,
+                            SourceInventory::PIN_VERIFY_METADATA_GAP,
+                            SourceInventory::PIN_CAPTURE_METADATA_GAP,
+                            SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
+                            SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+                        ]
+                        .contains(&reason.as_str()) =>
+                    {
+                        runtime_ios::media::AdmissionError::refused(
+                            runtime_ios::media::RefusalKind::NoEvidence,
+                            reason,
+                        )
                     }
-                };
-                classify(&mut self.refusal_kind, error)
-            },
-        )?;
+                    other => runtime_ios::media::AdmissionError::Failed(other.into()),
+                }
+            };
+            classify(&mut self.refusal_kind, error)
+        })?;
         let configured = snapshot(&self.root, c)?;
         let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
         let spec = runtime_ios::media::configured_load_form(

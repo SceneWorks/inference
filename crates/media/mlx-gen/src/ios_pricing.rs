@@ -14,6 +14,40 @@
 
 use crate::gen_core::{GenerationMemory, LoadSpec, MemoryGeometry, MemoryMode, MemorySelection};
 
+/// Reborrow an engine capacity check across a backend-neutral source-reader boundary.
+/// The original engine error stays owned here (never stringified or down-converted): a core
+/// consumer cannot swallow a denial by returning `Ok`. Ordinary core/work errors retain their
+/// existing typed conversion at the call site. This grants no source authority or capacity.
+pub fn with_core_source_capacity<T>(
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    work: impl FnOnce(&mut dyn FnMut(u64) -> crate::gen_core::Result<()>) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let mut original_error = None;
+    let result = {
+        let mut core_next = |bytes| {
+            if original_error.is_some() {
+                return Err(crate::gen_core::Error::Unsupported(
+                    "source metadata capacity already refused".into(),
+                ));
+            }
+            match next(bytes) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    original_error = Some(error);
+                    Err(crate::gen_core::Error::Unsupported(
+                        "source metadata capacity refused".into(),
+                    ))
+                }
+            }
+        };
+        work(&mut core_next)
+    };
+    match original_error {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
 /// The execution phases a request's memory peak is attributed to. Load floors are their own phase
 /// (a load's peak is the component's stored bytes plus its read scratch, not an activation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -947,5 +981,89 @@ mod native_to_process_tests {
             delta(&model.to_process_with_host(slice, &with_stack).unwrap()),
             1105
         );
+    }
+}
+
+#[cfg(test)]
+mod source_capacity_bridge_tests {
+    use super::with_core_source_capacity;
+    use crate::Error;
+
+    #[test]
+    fn original_callback_error_wins_even_if_core_work_recovers() {
+        let mut calls = 0;
+        let mut next = |_| {
+            calls += 1;
+            Err(Error::GeometryRefused {
+                reason: "original callback".into(),
+                requested_width: 17,
+                requested_height: 23,
+                alternative: Some((11, 13)),
+            })
+        };
+        let result = with_core_source_capacity(&mut next, |core_next| {
+            assert!(core_next(3).is_err());
+            assert!(core_next(5).is_err());
+            Ok(7u8)
+        });
+        assert_eq!(
+            calls, 1,
+            "a denied check stays sticky without re-invoking its owner"
+        );
+        match result.unwrap_err() {
+            Error::GeometryRefused {
+                reason,
+                requested_width,
+                requested_height,
+                alternative,
+            } => {
+                assert_eq!(reason, "original callback");
+                assert_eq!(
+                    (requested_width, requested_height, alternative),
+                    (17, 23, Some((11, 13)))
+                );
+            }
+            other => panic!("callback error changed domain: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn core_and_work_io_errors_keep_their_typed_domains() {
+        let mut next = |_| Ok(());
+        let result: crate::Result<()> = with_core_source_capacity(&mut next, |core_next| {
+            core_next(3)?;
+            Err(crate::gen_core::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "original core IO",
+            ))
+            .into())
+        });
+        match result.unwrap_err() {
+            Error::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "original core IO");
+            }
+            other => panic!("core error changed domain: {other:?}"),
+        }
+        let result: crate::Result<()> =
+            with_core_source_capacity(&mut next, |_| Err(Error::Canceled));
+        assert!(matches!(result, Err(Error::Canceled)));
+    }
+
+    #[test]
+    fn successful_core_checks_reborrow_the_same_serial_callback() {
+        let mut calls = Vec::new();
+        let mut next = |bytes| {
+            calls.push(bytes);
+            Ok(())
+        };
+        let value = with_core_source_capacity(&mut next, |core_next| {
+            core_next(3)?;
+            core_next(5)?;
+            Ok(7u8)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(calls, [3, 5]);
     }
 }
