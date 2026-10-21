@@ -27,6 +27,60 @@ use std::sync::Arc;
 #[path = "pid_sources/native_allocations.rs"]
 mod native_allocations;
 
+/// Source-enumerated CPU-stream requests charged to the linked Metal active counter.
+/// This deliberately reuses the native request records and cache-length law, NOT the Metal
+/// operation selectors. No Data retirement or physical task-footprint inference is made here.
+#[derive(Clone, Debug)]
+pub(super) struct ActiveCounterRequests {
+    requests: Vec<native_allocations::Request>,
+    upper: u64,
+    page: u64,
+}
+impl ActiveCounterRequests {
+    pub(super) fn new(page: u64) -> Result<Self> {
+        if !page.is_power_of_two() {
+            return Err(Error::Msg(
+                "CPU counter certificate: invalid allocator page".into(),
+            ));
+        }
+        Ok(Self {
+            requests: Vec::new(),
+            upper: 0,
+            page,
+        })
+    }
+    pub(super) fn charge(&mut self, rule: &'static str, site: &str, bytes: u64) -> Result<()> {
+        use native_allocations::CacheLengthBound;
+        let charge = match native_allocations::cached_length_bound(bytes, Some(self.page), 64)? {
+            CacheLengthBound::Empty => 0,
+            CacheLengthBound::Cached {
+                upper_exclusive, ..
+            } => upper_exclusive,
+            CacheLengthBound::Unbound(reason) => return Err(Error::Unsupported(reason.into())),
+        };
+        self.upper = self
+            .upper
+            .checked_add(charge)
+            .ok_or_else(|| Error::Msg("CPU active-counter cumulative upper overflow".into()))?;
+        self.requests.push(native_allocations::Request {
+            domain: "native096/CPU-stream/linked-Metal/active-counter",
+            workspace: None,
+            source_value: None,
+            rule,
+            predicate: site.into(),
+            bytes: Some(bytes),
+            existing_output: None,
+            data_size_product: None,
+        });
+        // Every CPU-counter record is numeric; an unknown size must refuse, never become zero.
+        debug_assert!(self.requests.iter().all(|request| request.bytes.is_some()));
+        Ok(())
+    }
+    pub(super) fn upper(&self) -> u64 {
+        self.upper
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Slot(usize);
 #[derive(Clone, Debug)]

@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "a3bee497e846cf3763001feb56b6fc220760607af3f689f46594c2af1afbf9e7",
+  "rust_proof_closure_sha256": "19cca62e242b291d5fd7cf581ab66c28e11a89507b654fcc6c2406b03e79fb93",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -556,19 +556,35 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs",
-      "sha256": "99b1ed13ef73454b5c7c316519670395784a63a0261e65e5134dd7864a43fe50"
+      "sha256": "9e4ebe89f92427e92d506ace101e5702322ef176ac09109d71a64e666fe1f235"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
-      "sha256": "c10aab7f1904276be9d7499f140e3abf21f2a19177026d3274f2ba4cbc84ab3b"
+      "sha256": "02ac6ae3f5ba87851ba591b6931efafa39ee87710666c07746d60cd5421122f2"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
       "sha256": "70949021f7cb76b4b64e4480cfb8eb5eac77d0a5cfe9b210fe7124509cc03d1c"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates.rs",
+      "sha256": "129d3d754c8c63a5f001083f66bb48e36b3921a003e13bba0da8837d8eb8ff4f"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/cpu.rs",
+      "sha256": "9916bb1bcc767710a830ad1f46805129f516464ded958cbc097aed07606d344b"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/vae_graph.rs",
+      "sha256": "dae39bc91f822bddc9ad21af0e6d1b43d527c5693d8d62b99240fe1d087cb4e0"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/certificates/z_graph.rs",
+      "sha256": "25eb72b64620358691eee8ec93f8241e68e0c837c191a641aab9a4d764c92277"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
-      "sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4"
+      "sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources/native_allocations.rs",
@@ -1095,7 +1111,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::same_cache_endpoint_survives_steps_and_count_but_geometry_config_and_domain_do_not_alias",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1107,7 +1123,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::lazy_caption_keeps_full_hidden_parent_and_frozen_old_window_survives_later_graph_detach",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1119,7 +1135,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::initial_noise_and_all_eps_are_distinct_full_resolution_source_factories",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1131,7 +1147,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::row_strip_full_accumulator_and_full_normalizer_remain_coincident_not_tile_sized",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1143,7 +1159,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::composite_consumer_abort_keeps_same_prefix_and_prior_whole_case_only_once",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1307,7 +1323,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_gathered_affine_preserves_actual_batch_rank_layout_and_single_output_source",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,
@@ -1319,7 +1335,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_affine_shape_only_or_wrong_slot_provenance_is_not_a_layout_certificate",
-      "source_sha256": "008c60704cfcdc261fc7c4680c4ad44e6de96be0c1dc0f64211c4549385808b4",
+      "source_sha256": "de6a9ab871078c042827c88bef54d06f1b7bd438d7a87a5dc8261e2b23796f9d",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,
@@ -1434,11 +1450,11 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "97f6d2a23965ee361def742c9944c323cbf943dad974ef52cc6149902ab0ad77",
-    "classification_sha256": "6b09bfd510de0701e09aa83e327b32bd892d8214ddcc2e12e0efd961cb9dc998",
-    "selected_Rust_FQNs": 99,
-    "HOST_logical": 86,
-    "HOST_expected_PASS_rows": 87,
+    "inventory_sha256": "0c35c6fce3c819e39a790c8cb9b039bbaa33423fcc731ac8629f49531490787d",
+    "classification_sha256": "cca9a0d4ffbd1e6489ac053728cf809bbfd000433d57d9ff496b5df9350c2882",
+    "selected_Rust_FQNs": 103,
+    "HOST_logical": 90,
+    "HOST_expected_PASS_rows": 91,
     "native_logical": 13,
     "native_expected_PASS_rows": 26,
     "Python_exact_tests": 1,

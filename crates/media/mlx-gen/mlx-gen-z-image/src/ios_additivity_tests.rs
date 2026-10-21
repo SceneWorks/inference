@@ -1,7 +1,8 @@
 //! Legacy Z-Image additivity regression targets (epic 16774), NOT accepted transfer proofs.
 //! Each repeat now retains its actual baseline, ordered metadata/checks and native intervals.
-//! Native transfer is explicitly INCOMPLETE until a genuine source-owned difference proof exists;
-//! that is a failing positive obligation, never an accepted refusal or passing regression.
+//! Every verdict is computed by the certified law (`ios_anchor_law::derive_certified`) from the
+//! provider's source-proved window certificates. A missing certificate is a failing positive
+//! obligation (`NotDerivable`), never an accepted refusal or passing regression.
 //! Counted logical VAE/control scratch does not certify physical demand or transferable overhead.
 //! Runtime/capture grouping therefore preserves distinct reference/control/control+init families.
 //!
@@ -19,8 +20,8 @@ use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, LoadSpec, MemoryNumericTier, MemoryStrategy,
     MemoryStrategySupport, OffloadPolicy,
 };
-use mlx_gen::ios_anchor_law::MeasuredRun;
-use mlx_gen::ios_pricing::{IosPhase, IosPricing};
+use mlx_gen::ios_anchor_law::{derive_certified, MeasuredAnchor, MeasuredRun};
+use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosWindowBound};
 use mlx_gen::ios_quantum::{with_cpu_diagnostic_headroom, Backend};
 
 use crate::ios_pricing::{fold, ios_quantum_phase, Mode, Model, Route};
@@ -515,19 +516,54 @@ struct Verdict {
     proof_complete: bool,
 }
 
-/// The private capture checkpoint preserves real evidence, but this provider has no source proof
-/// of NativeAllocatorGrowth_request(t) - NativeAllocatorGrowth_anchor(t) at every corresponding
-/// owner/callback instant. Logical price uppers and equal labels are not that proof. Do not
-/// replace it with legacy derive, measured request spread, phase winners, or a synthetic bounder.
-fn verdict(
-    case: &str,
-    selection: &str,
-    tier: &str,
-    anchor: &Measured,
-    at_anchor: &IosPricing,
-    request: &IosPricing,
-    measured: &Measured,
-) -> Verdict {
+/// The law's anchor is ONE actual repeat, never a maximum merged across repeats. Its counter
+/// domain and baseline coordinate are the capture's own (NativeAllocatorGrowth/BeforeModelLoad).
+fn law_anchor(repeat: &NativeRepeat) -> MeasuredAnchor {
+    MeasuredAnchor {
+        domain: repeat.baseline.domain,
+        coordinate: repeat.baseline.coordinate,
+        demand: repeat.native.demand,
+        phases: repeat.native.phases.clone(),
+        area: mlx_gen::ios_anchor_law::area(EDGE, EDGE, 1),
+    }
+}
+
+/// Attach the actual anchor captures so certificate witnesses index real observed checks. The
+/// anchor's pricing ledger itself is unchanged; observations are evidence, not a certificate.
+fn with_observations(pricing: &IosPricing, captures: &Measured) -> IosPricing {
+    let mut observed = pricing.clone();
+    observed.observations = captures
+        .repeats
+        .iter()
+        .map(|repeat| repeat.observed.clone())
+        .collect();
+    observed
+}
+
+/// The certified law decides. `bounds` are the provider's source-proved window certificates; a
+/// missing or invalid certificate is `NotDerivable`, i.e. an INCOMPLETE positive obligation, never a
+/// pass. A complete derivation must cover EVERY request repeat overall and in every phase, with no
+/// tolerance and no merging of repeats: any shortfall is a strict numeric underprediction (the
+/// historical 20,480-byte class of failure). Logical price uppers, equal labels, legacy derive,
+/// measured spread, phase winners, or a synthetic bounder are never substituted for a certificate.
+/// One anchor/request certificate comparison: the measured anchor, its priced windows, the priced
+/// request, the request's measured repeats and the provider certificates.
+struct VerdictInputs<'a> {
+    anchor: &'a Measured,
+    at_anchor: &'a IosPricing,
+    request: &'a IosPricing,
+    measured: &'a Measured,
+    bounds: &'a [IosWindowBound],
+}
+
+fn verdict(case: &str, selection: &str, tier: &str, inputs: VerdictInputs<'_>) -> Verdict {
+    let VerdictInputs {
+        anchor,
+        at_anchor,
+        request,
+        measured,
+        bounds,
+    } = inputs;
     let counts = |captures: &Measured| {
         captures
             .repeats
@@ -543,8 +579,6 @@ fn verdict(
             .collect::<Vec<_>>()
     };
     // Actual role metadata is a compatibility check, NOT native owner/correspondence proof.
-    // The old standalone q8 intermediate still retains its original caller and fails explicitly
-    // rather than borrowing a Text measurement or relabeling itself as a resident endpoint.
     let roles = |captures: &Measured| {
         captures
             .repeats
@@ -566,24 +600,77 @@ fn verdict(
     };
     let anchor_roles = roles(anchor);
     let request_roles = roles(measured);
-    let compatibility = if anchor_roles == request_roles && anchor_roles.iter().all(Option::is_some)
-    {
-        "same observed roles; native source coverage still required"
+    let id = format!("{case} {selection} {tier}");
+    let mut failures = Vec::new();
+    let mut complete = !anchor.repeats.is_empty() && !measured.repeats.is_empty();
+    if !complete {
+        failures.push(format!("{id}: missing an actual anchor or request repeat"));
+    }
+    if anchor_roles != request_roles || !anchor_roles.iter().all(Option::is_some) {
+        complete = false;
+        failures.push(format!(
+            "{id}: REJECTED cross-family/missing actual-role anchor (no borrowing); anchor roles={anchor_roles:?}, request roles={request_roles:?}"
+        ));
+    }
+    let at_anchor = with_observations(at_anchor, anchor);
+    let mut derived = Vec::new();
+    for (a, repeat) in anchor.repeats.iter().enumerate() {
+        let derivation = match derive_certified(&law_anchor(repeat), &at_anchor, request, bounds) {
+            Ok(derivation) => derivation,
+            Err(error) => {
+                complete = false;
+                failures.push(format!(
+                    "{id}: anchor repeat {a}: NOT DERIVABLE under the certified law: {error}"
+                ));
+                continue;
+            }
+        };
+        derived.push(derivation.demand);
+        for (r, actual) in measured.repeats.iter().enumerate() {
+            if actual.baseline.domain != derivation.domain
+                || actual.baseline.coordinate != derivation.coordinate
+            {
+                complete = false;
+                failures.push(format!(
+                    "{id}: request repeat {r} counter {:?}/{:?} is not the derivation's {:?}/{:?}",
+                    actual.baseline.domain,
+                    actual.baseline.coordinate,
+                    derivation.domain,
+                    derivation.coordinate,
+                ));
+                continue;
+            }
+            if derivation.demand < actual.native.demand {
+                failures.push(format!(
+                    "{id}: UNDERPREDICTED overall: anchor repeat {a} derived {} B < request repeat {r} measured {} B (deficit {} B)",
+                    derivation.demand, actual.native.demand, actual.native.demand - derivation.demand,
+                ));
+            }
+            for phase in &derivation.phases {
+                let measured_phase = actual.native.phases.get(&phase.phase).copied().unwrap_or(0);
+                if phase.bytes < measured_phase {
+                    failures.push(format!(
+                        "{id}: UNDERPREDICTED phase {}: anchor repeat {a} derived {} B < request repeat {r} measured {} B (deficit {} B)",
+                        phase.phase.as_key(), phase.bytes, measured_phase, measured_phase - phase.bytes,
+                    ));
+                }
+            }
+        }
+    }
+    let status = if !complete {
+        "INCOMPLETE"
+    } else if failures.is_empty() {
+        "COVERED"
     } else {
-        "REJECTED cross-family/missing actual-role anchor; no Text borrowing"
+        "UNDERPREDICTED"
     };
-    let reason = format!(
-        "{case} {selection} {tier}: INCOMPLETE native transfer proof: {} anchor repeats and {} request repeats retained individually; {} anchor windows / {} request windows are source-logical only. Missing source-correlated native owner/difference-upper proof and compatible baseline inventory, separately from Native-to-Process physical charge premise26569",
-        anchor.repeats.len(), measured.repeats.len(), at_anchor.windows.len(), request.windows.len(),
-    );
-    let reason=format!("{reason}; {compatibility}; actual anchor roles={anchor_roles:?}, request roles={request_roles:?}");
     Verdict {
         line: format!(
-            "| {case} | {selection} | {tier} | {:?} | {:?} | UNPROVED | INCOMPLETE | per-repeat (actual baseline, native growth, checks, metadata); no merged phase maxima or empirical allowance |",
+            "| {case} | {selection} | {tier} | {:?} | {:?} | {derived:?} | {status} | per-repeat (actual baseline, native growth, checks, metadata); certified law, no merged maxima or allowance |",
             counts(anchor), counts(measured),
         ),
-        failures: vec![reason],
-        proof_complete: false,
+        failures,
+        proof_complete: complete,
     }
 }
 
@@ -613,9 +700,10 @@ fn cases() -> Vec<(String, Mode, mlx_gen::Image)> {
 const OPTIMIZED: usize = 0;
 const RUNG_0: usize = 1;
 
-/// Derive every case in `cases` from the `z_image_turbo` text anchor (measured once per tier) at
-/// selection `selection` on each tier named in `tiers`, printing the table. `tamper` edits each
-/// derived request's pricing (the mutation check). Returns each case's verdict.
+/// Derive every case in `cases` from its SAME actual source-family anchor (captured once per family
+/// and tier) at selection `selection` on each tier named in `tiers`, printing the table. `tamper`
+/// edits each derived request's source map (the mutation check). Returns each case's verdict, which
+/// the certified law computes from the provider's window certificates.
 fn prove(
     selection: usize,
     tier_names: &[&str],
@@ -684,15 +772,30 @@ fn prove(
                 "ACTUAL_FAMILY_SOURCE_POINT_COMPARISONS {}",
                 request_map.point_comparisons(anchor_map).unwrap()
             );
+            let certificates = provider_certificates(
+                &snap,
+                spec,
+                &actual_route,
+                measured_anchor,
+                at_anchor,
+                &request,
+            );
             let mut value = verdict(
                 case,
                 name,
                 tier.name,
-                measured_anchor,
-                at_anchor,
-                &request,
-                &actual,
+                VerdictInputs {
+                    anchor: measured_anchor,
+                    at_anchor,
+                    request: &request,
+                    measured: &actual,
+                    bounds: &certificates.bounds,
+                },
             );
+            value
+                .failures
+                .extend(certificates.blocked_failures(case, name, tier.name));
+            value.proof_complete &= certificates.blocked.is_empty();
             value
                 .failures
                 .extend(request_map.outstanding(anchor_map).unwrap());
@@ -703,6 +806,51 @@ fn prove(
     out
 }
 
+/// The provider's certificates for deriving `request` from this actual anchor. The anchor's real
+/// observations are attached so every witness indexes an actual check. A class the provider cannot
+/// source-prove is returned as BLOCKED with its exact missing premise; it is never certified from a
+/// logical upper, eval/drop, RSS, or an empirical residual.
+fn provider_certificates(
+    snap: &Snapshot,
+    spec: &LoadSpec,
+    route: &Route,
+    anchor: &Measured,
+    at_anchor: &IosPricing,
+    request: &IosPricing,
+) -> crate::ios_pricing::certificates::WindowCertificates {
+    let facts = snap.facts_for_spec(route.mode.control(), spec);
+    let model = Model::new(facts).unwrap();
+    // The EXACT original run_request sampling program: three-step static-shift curated Euler and
+    // its manual init tail. Never production strength resolution, route defaults or a step bound.
+    let mut sampling = crate::sampling::resolve_full(&mlx_gen::GenerationRequest {
+        steps: Some(3),
+        sampler: Some(mlx_gen::Solver::Euler.name().into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let end = sampling.sigmas().len();
+    sampling
+        .window(usize::from(route.mode.img2img()), end)
+        .unwrap();
+    crate::ios_pricing::certificates::window_certificates(
+        &model,
+        route,
+        &sampling,
+        crate::ios_pricing::certificates::CertifiedExecution {
+            // The original fixture quantizes the composed transformer BEFORE loading the VAE.
+            load_order: crate::ios_pricing::certificates::HeavyLoadOrder::QuantizeBeforeVae,
+            // measure() runs run_request inside with_cpu_diagnostic_headroom: the iOS scope.
+            ios_quantum_scope: true,
+            // in_cpu_child() pins the global default device/stream to CPU and installs no
+            // task-local override; run_request executes in that child.
+            cpu_stream: true,
+        },
+        &with_observations(at_anchor, anchor),
+        request,
+    )
+    .unwrap()
+}
+
 fn failures(verdicts: &[(String, Verdict)]) -> Vec<String> {
     verdicts
         .iter()
@@ -710,9 +858,10 @@ fn failures(verdicts: &[(String, Verdict)]) -> Vec<String> {
         .collect()
 }
 
-/// REQUIRED positive obligation: every Z-Image mode (reference; control and control + reference for each kind) is
-/// covered by its derivation from the `z_image_turbo` text anchor, overall and in every phase, at
-/// the fully optimized selection and at rung 0. Dense tier; the packed tiers are
+/// REQUIRED positive obligation: every Z-Image mode (reference; control and control + reference for
+/// each kind) is covered by its certified derivation from its SAME actual source-family anchor
+/// (the historical name says "text anchor"; Text borrowing is rejected), overall and in every
+/// phase, at the fully optimized selection and at rung 0. Dense tier; the packed tiers are
 /// [`packed_tier_matrix`].
 #[cfg(target_os = "macos")]
 #[test]
@@ -837,8 +986,12 @@ fn deferred_full_cover_unstaged(provider: &str, tier: &Tier) -> (GenerationMemor
     (execution, spec)
 }
 
-/// Preserve the unresolved original q8 Control conditioning case after correcting endpoint labels.
-/// This is one CPU intermediate regression, not a third device anchor or a measured geometry grid.
+/// Preserve the unresolved original q8 Control conditioning case (the historical 20,480-byte
+/// underprediction). The request stays the ORIGINAL Sequential+Deferred full-cover unstaged
+/// INTERMEDIATE; it is derived from BOTH actual endpoints of its OWN Control family (optimized and
+/// literal resident), never from a Text anchor. Each derivation must be complete under the certified
+/// law and cover every request repeat overall and in every phase. One CPU intermediate regression,
+/// not a third device anchor or a measured geometry grid.
 #[test]
 #[ignore = "CPU intermediate regression; run explicitly after native-test admission"]
 fn q8_deferred_full_cover_unstaged_control_conditioning_regression() {
@@ -849,27 +1002,56 @@ fn q8_deferred_full_cover_unstaged_control_conditioning_regression() {
     let snap = snapshot();
     let all_tiers = tiers(&snap);
     let tier = all_tiers.iter().find(|tier| tier.name == "q8").unwrap();
-    let (base_execution, base_spec) = deferred_full_cover_unstaged(crate::model::MODEL_ID, tier);
     let (control_execution, control_spec) =
         deferred_full_cover_unstaged(crate::model_control::MODEL_ID, tier);
-    let base = route(Mode::Text, base_execution);
+    let hint = control_image("pose", EDGE);
     let control = route(Mode::Control, control_execution);
-    let anchor = measure(&snap, &base_spec, &base, &image(EDGE, 1));
-    let actual = measure(&snap, &control_spec, &control, &control_image("pose", EDGE));
-    let verdict = verdict(
-        "q8 deferred/full-cover unstaged control",
-        "INTERMEDIATE (not resident)",
-        "q8",
-        &anchor,
-        &pricing(&snap, &base_spec, &base),
-        &pricing(&snap, &control_spec, &control),
-        &actual,
-    );
-    println!("{}", verdict.line);
+    let actual = measure(&snap, &control_spec, &control, &hint);
+    let request = pricing(&snap, &control_spec, &control);
+    let endpoints = selections(crate::model_control::MODEL_ID, &tier.root, tier.bits);
+    let mut failures = Vec::new();
+    for (index, (name, execution, spec)) in endpoints.iter().enumerate() {
+        let position = if index == RUNG_0 {
+            "resident"
+        } else {
+            "optimized"
+        };
+        let anchor_route = route(Mode::Control, *execution);
+        let anchor = measure(&snap, spec, &anchor_route, &hint);
+        let at_anchor = pricing(&snap, spec, &anchor_route);
+        let certificates = provider_certificates(
+            &snap,
+            &control_spec,
+            &control,
+            &anchor,
+            &at_anchor,
+            &request,
+        );
+        let selection =
+            format!("INTERMEDIATE (not resident) from Control-family {position} endpoint {name}");
+        let mut verdict = verdict(
+            "q8 deferred/full-cover unstaged control",
+            &selection,
+            "q8",
+            VerdictInputs {
+                anchor: &anchor,
+                at_anchor: &at_anchor,
+                request: &request,
+                measured: &actual,
+                bounds: &certificates.bounds,
+            },
+        );
+        verdict.failures.extend(certificates.blocked_failures(
+            "q8 deferred/full-cover unstaged control",
+            &selection,
+            "q8",
+        ));
+        println!("{}", verdict.line);
+        failures.extend(verdict.failures);
+    }
     assert!(
-        verdict.failures.is_empty(),
-        "original intermediate remains underderived: {:#?}",
-        verdict.failures
+        failures.is_empty(),
+        "original intermediate remains underderived: {failures:#?}"
     );
 }
 
