@@ -104,19 +104,33 @@ fn witnessed(mut row: AnchorRow) -> AnchorRow {
     ];
     if let AnchorOutcome::Completed { captures } = &mut row.outcome {
         for capture in captures {
-            // Schema witness from this fixture's own actual request key, not native evidence.
-            capture
-                .sampling_coverage
-                .as_mut()
-                .unwrap()
-                .record("ios_capture", "conditioning-roles", &roles)
-                .unwrap();
+            // completed() already owns this schema witness; raw capture() does not. Keep
+            // exactly one, and check any retained witness against this fixture's own key.
+            // Neither branch is native execution or physical evidence.
+            let metadata = capture.sampling_coverage.as_mut().unwrap();
+            let mut existing = metadata
+                .marks
+                .iter()
+                .filter(|mark| mark.provider == "ios_capture" && mark.kind == "conditioning-roles");
+            if let Some(mark) = existing.next() {
+                assert!(existing.next().is_none(), "duplicate fixture role witness");
+                assert_eq!(mark.fields.len(), roles.len());
+                for (name, value) in roles {
+                    assert_eq!(mark.fields.get(name), Some(&value));
+                }
+            } else {
+                metadata
+                    .record("ios_capture", "conditioning-roles", &roles)
+                    .unwrap();
+            }
             let coverage = capture.quantum_coverage.as_mut().unwrap();
             for (phase, label) in SYNTHETIC_CHECKS {
                 coverage.record(Some(phase), label, vec![0]);
             }
         }
     }
+    evidence::validate_rows(std::slice::from_ref(&row))
+        .expect("synthetic window witness must preserve a valid anchor row");
     row
 }
 

@@ -920,6 +920,32 @@ fn exact_key_uses_before_model_load_growth_and_rejects_masked_repeats() {
             );
             let source = root.path().join("unet/diffusion_pytorch_model.safetensors");
             let missing = "down_blocks.1.attentions.0.proj_in.weight";
+            // The shared positive fixture now supplies the complete inspected target graph.
+            // Give this negative control its OWN graph, omitting exactly the sentinel below;
+            // never damage the positive exact-key fixture or weaken the exporter assertion.
+            let incomplete = crate::sdxl::tests::fixture();
+            let incomplete_source = incomplete
+                .path()
+                .join("unet/diffusion_pytorch_model.safetensors");
+            let mut headers =
+                mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&incomplete_source)
+                    .unwrap();
+            let original_count = headers.len();
+            headers.retain(|header| header.name != missing);
+            assert_eq!(
+                headers.len() + 1,
+                original_count,
+                "remove exactly one target"
+            );
+            crate::sdxl::tests::write_header_fixture(
+                &incomplete_source,
+                headers.into_iter().map(|header| {
+                    (
+                        header.name,
+                        header.shape.into_iter().map(|dim| dim as usize).collect(),
+                    )
+                }),
+            );
             let quality_artifact = || mlx_gen::gen_core::MemoryDecodeArtifactIdentity {
                 repository: "synthetic-negative-control".into(),
                 revision: "not-measured".into(),
@@ -943,6 +969,7 @@ fn exact_key_uses_before_model_load_growth_and_rejects_masked_repeats() {
                 "quality_binding",
             ] {
                 let mut configured = candidate.spec.clone();
+                configured.weights = WeightsSource::Dir(incomplete.path().to_owned());
                 match slot {
                     "lora" | "zero_lora" => {
                         configured.adapters.push(mlx_gen::gen_core::AdapterSpec {
