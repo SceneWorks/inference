@@ -709,6 +709,7 @@ pub(crate) fn load_vae_for_spec(spec: &mlx_gen::LoadSpec, root: &Path) -> Result
 /// handles and the device's [`cast_for_load`] rule (a packed snapshot's dense float leaves follow
 /// `dtype` on iOS, whatever host prices them; `cast_all` when `all`), with nothing read or
 /// evaluated. Header-only pricing (`crate::ios_pricing`) builds its components from these.
+#[cfg(test)]
 pub(crate) fn lazy_weights(files: &[PathBuf], dtype: Dtype, all: bool) -> Result<Weights> {
     let mut w = Weights::empty();
     for file in files {

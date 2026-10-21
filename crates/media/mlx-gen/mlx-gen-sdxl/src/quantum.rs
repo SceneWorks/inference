@@ -95,6 +95,7 @@ pub(crate) fn with_backend<T>(backend: Backend, body: impl FnOnce() -> T) -> T {
 pub(crate) type Quanta = Vec<(&'static str, u64)>;
 
 /// `a` promoted with every array's dtype, as MLX promotes an elementwise chain over them.
+#[cfg(test)]
 pub(crate) fn promote_all(a: Dtype, arrays: &[&Array]) -> Dtype {
     arrays
         .iter()
@@ -104,6 +105,7 @@ pub(crate) fn promote_all(a: Dtype, arrays: &[&Array]) -> Dtype {
 /// A shape-and-dtype stand-in for an activation in header-only pricing: a lazy MLX array that is
 /// never evaluated, so it carries the `shape()` / `dtype()` every scratch formula reads and no
 /// payload.
+#[cfg(test)]
 pub(crate) fn shaped(shape: &[i32], dtype: Dtype) -> mlx_gen::Result<Array> {
     Ok(mlx_rs::ops::zeros_dtype(shape, dtype)?)
 }
@@ -652,6 +654,7 @@ impl<'a> EffectScope<'a> {
 /// SceneWorks snapshot's BF16 `.scales` (every packed U-Net / CLIP projection) turn f16 activations
 /// into f32 (measured: `quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks`),
 /// and everything downstream of that projection — residual sums, norms, convolutions — runs at f32.
+#[cfg(test)]
 pub(crate) fn linear_output_dtype(linear: &AdaptableLinear, x: Dtype) -> Dtype {
     LinearWork::of(linear).output_dtype(x)
 }
@@ -744,6 +747,7 @@ impl ConvWork {
 /// bias promotes BOTH half-precision matrix operands; there is no second bias-add output.
 /// Packed matmul casts its unchanged x, scales and quantization offsets to their common compute
 /// dtype, never its U32 codes; a widening ordinary bias add casts the qmm output separately.
+#[cfg(test)]
 pub(crate) fn linear_operand_bytes(linear: &AdaptableLinear, shape: &[i32], input: Dtype) -> u64 {
     #[cfg(test)]
     if let Some((w, b)) = linear.dense_weight() {
@@ -760,6 +764,7 @@ pub(crate) fn linear_operand_bytes(linear: &AdaptableLinear, shape: &[i32], inpu
 /// fallback has two competing live sets: the f32 centering/variance graph, and normalization +
 /// output cast + affine epilogue. Count the larger set, with the three row statistics and the
 /// promoted affine operands, rather than adding every intermediate in the graph.
+#[cfg(test)]
 pub(crate) fn final_norm_bytes(shape: &[i32], input: Dtype, weight: &Array, bias: &Array) -> u64 {
     #[cfg(test)]
     {
