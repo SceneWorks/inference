@@ -452,9 +452,9 @@ fn block(
     x: &Tensor,
     freqs: &Tensor,
     t: Option<&Tensor>,
-    attention: BlockAttention,
+    attention_shape: BlockAttention,
 ) -> Result<Tensor> {
-    let BlockAttention { heads, query_rows } = attention;
+    let BlockAttention { heads, query_rows } = attention_shape;
     let dim = *x.shape.last().unwrap();
     let modulation = if let Some(t) = t {
         let m = c.linear(g, &format!("{p}.adaLN_modulation.0"), t, true)?;
