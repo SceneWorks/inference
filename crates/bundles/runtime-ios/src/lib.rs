@@ -222,7 +222,7 @@ pub mod media {
             if checked.is_err() {
                 source_capacity_refused = true;
             }
-            checked
+            checked.map_err(Into::into)
         };
         let reviewed = evidence::rows_with_source_capacity(&mut source_next);
         reviewed.map_err(|e| {

@@ -1232,13 +1232,14 @@ impl DeviceProvider<'_> {
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if c.provider == "sdxl" {
-            let allowance = runtime_ios::media::source_metadata_allowance()
-                .map_err(|e| AdmissionError::Failed(e))?;
-            let mut next = runtime_ios::media::source_metadata_capacity;
+            let allowance =
+                runtime_ios::media::source_metadata_allowance().map_err(|e| e.to_string())?;
+            let mut next =
+                |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
             let mut budget =
                 runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
             runtime_ios::media::record_source_context(&mut key, &candidate, &mut budget)
-                .map_err(AdmissionError::Failed)?;
+                .map_err(|e| e.to_string())?;
         }
         self.artifact = json!({"layout_sha256": key.layout_sha256});
         self.evidence_key = Some(key);
@@ -1925,7 +1926,8 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         let allowance = retained
             .checked_add(fresh)
             .ok_or("source serialization allowance overflow")?;
-        let mut next = runtime_ios::media::source_metadata_capacity;
+        let mut next =
+            |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
         let mut budget =
             runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
         budget
@@ -1952,7 +1954,8 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                 let allowance = retained
                     .checked_add(fresh)
                     .ok_or("source diagnostic allowance overflow")?;
-                let mut next = runtime_ios::media::source_metadata_capacity;
+                let mut next =
+                    |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
                 let mut budget =
                     runtime_ios::media::SourceRequestBudget::with_capacity(allowance, &mut next);
                 budget
