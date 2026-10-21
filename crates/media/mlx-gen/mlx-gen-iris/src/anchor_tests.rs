@@ -1,21 +1,22 @@
 //! CPU-only Iris anchor-law proofs on tiny dense and packed q4/q8 exports (epic 16774).
 //! Every measurement is a fresh load + run inside diagnostic headroom with Metal trapped.
 //!
-//! The earlier batch-2 Decode counterexample predates the distinct final-clamp Denoise quantum
-//! and is not an established classification of this tree. Collect every tier and endpoint before
-//! classifying batch derivability; keep `IOS_NON_ADDITIVE_BATCH` true until whole-run and every
-//! phase pass. Single-prompt 2x-area and depth second-size checks assert measured ≤ derived.
-//! Restoration remains its own single-mode family: its host planes are visible to the device's
-//! footprint capture but not MLX active memory, so the CPU stand-in cannot prove its derivation.
-//! These assertions and the revised pricing are pending verification after the disk-space stop.
+//! Every derivation goes through `derive_certified` with the source-owned
+//! `ios_pricing::ios_bounder` certificates, witnessed by the anchor run's own actual quantum checks.
+//! Those certificates are native-allocator-counter only (never task footprint). Prompt batches and
+//! serial counts are certified at their ACTUAL rows/count, never scaled from batch 1
+//! (`IOS_NON_ADDITIVE_BATCH` stays true). Single-prompt 2x-area, sampling-epoch and depth
+//! second-size checks assert measured ≤ derived, whole run and per phase. Restoration remains its
+//! own single-mode family: its host planes are outside MLX active memory, so it has no native
+//! certificate and `derive_certified` refuses it with its exact first-uncovered-class reason.
 
 use mlx_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryNumericTier, MemorySelection,
     MemoryStrategy, MemoryStrategySupport,
 };
-use mlx_gen::ios_anchor_law::{area, derive, measure_phases, MeasuredRun, NotDerivable};
-use mlx_gen::ios_pricing::{IosPhase, IosPricing, IosPricingRequest};
+use mlx_gen::ios_anchor_law::{area, derive_certified, measure_phases, MeasuredRun, NotDerivable};
+use mlx_gen::ios_pricing::{IosAnchorObservation, IosPhase, IosPricing, IosPricingRequest};
 use mlx_gen::ios_quantum::{
     with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
 };
@@ -127,27 +128,118 @@ fn proved_selections(
         .collect()
 }
 
+/// One measured run and the actual scalar quantum marks its repeats emitted. The marks are the
+/// anchor's certificate witnesses; they are never Arrays or a planned/replayed observation.
+struct Captured {
+    run: MeasuredRun,
+    observations: Vec<IosAnchorObservation>,
+}
+
+impl std::ops::Deref for Captured {
+    type Target = MeasuredRun;
+    fn deref(&self) -> &MeasuredRun {
+        &self.run
+    }
+}
+
+/// Record the actual production marks of `body` (metadata, and each check's latest mark of every
+/// producer/kind) in the native-allocator domain the Iris certificates are stated in.
+fn observe_marks<T>(body: impl FnOnce() -> T) -> (T, IosAnchorObservation) {
+    use mlx_gen::ios_pricing::{
+        IosMemoryCoordinate, IosMemoryDomain, IosObservedCheck, IosObservedMetadata,
+    };
+    use mlx_gen::ios_quantum::{set_quantum_listener, QuantumMark};
+    type State = (IosAnchorObservation, BTreeMap<(String, String), u32>);
+    let recorded: std::sync::Arc<std::sync::Mutex<State>> =
+        std::sync::Arc::new(std::sync::Mutex::new((
+            IosAnchorObservation {
+                domain: IosMemoryDomain::NativeAllocatorGrowth,
+                coordinate: IosMemoryCoordinate::BeforeModelLoad,
+                ..Default::default()
+            },
+            BTreeMap::new(),
+        )));
+    let sink = std::sync::Arc::clone(&recorded);
+    struct RemoveListener;
+    impl Drop for RemoveListener {
+        fn drop(&mut self) {
+            set_quantum_listener(None);
+        }
+    }
+    assert!(
+        !set_quantum_listener(Some(Box::new(move |mark| {
+            let mut recorded = sink.lock().expect("actual mark collector lock");
+            let (observation, latest) = &mut *recorded;
+            match mark {
+                QuantumMark::Metadata {
+                    provider,
+                    kind,
+                    fields,
+                } => {
+                    let index = u32::try_from(observation.metadata.len())
+                        .expect("bounded fixture metadata");
+                    observation.metadata.push(IosObservedMetadata {
+                        provider: provider.into(),
+                        kind: kind.into(),
+                        fields: fields
+                            .iter()
+                            .map(|&(key, value)| (key.into(), value))
+                            .collect(),
+                    });
+                    latest.insert((provider.into(), kind.into()), index);
+                }
+                QuantumMark::Checked { label, .. } => observation.checks.push(IosObservedCheck {
+                    phase: ios_quantum_phase(label),
+                    label: label.into(),
+                    context: latest.values().copied().collect(),
+                }),
+                QuantumMark::Synchronized { .. } => {}
+            }
+        }))),
+        "an isolated anchor child must not replace another capture listener"
+    );
+    let guard = RemoveListener;
+    let value = body();
+    drop(guard);
+    let observation = recorded
+        .lock()
+        .expect("actual mark collector lock")
+        .0
+        .clone();
+    (value, observation)
+}
+
 /// Use the same repeat-max capture policy for anchor and request. CPU graph scheduling can vary
 /// a phase peak between identical runs; never hide a discrepancy behind an assertion tolerance.
 /// Each repeat loads afresh, and the largest measured demand and each phase are retained, exactly
-/// as `MeasuredAnchor` defines its capture semantics.
-fn measure(mut body: impl FnMut() -> mlx_gen::Result<()>) -> MeasuredRun {
+/// as `MeasuredAnchor` defines its capture semantics. Every repeat's actual marks are kept.
+fn measure(mut body: impl FnMut() -> mlx_gen::Result<()>) -> Captured {
     let mut worst = MeasuredRun {
         demand: 0,
         phases: BTreeMap::new(),
     };
+    let mut observations = Vec::new();
     for repeat in 0..3 {
-        let ((), run) =
+        let (((), run), observation) = observe_marks(|| {
             with_cpu_diagnostic_headroom(AMPLE, || measure_phases(ios_quantum_phase, &mut body))
-                .unwrap();
+                .unwrap()
+        });
         eprintln!("CAPTURE repeat {repeat}: {} {:?}", run.demand, run.phases);
+        assert!(
+            !observation.checks.is_empty(),
+            "a measured run must observe its actual quantum checks"
+        );
+        observations.push(observation);
         worst.demand = worst.demand.max(run.demand);
         for (phase, bytes) in run.phases {
             let slot = worst.phases.entry(phase).or_insert(0);
             *slot = (*slot).max(bytes);
         }
     }
-    worst
+    Captured {
+        run: worst,
+        observations,
+    }
 }
 
 /// A missing measured or priced phase must never turn into a zero or an omitted assertion.
@@ -207,13 +299,36 @@ impl Check {
     }
 }
 
+/// The certified derivation of `request` from `anchor`: the anchor pricing carries the anchor
+/// run's actual marks, and the Iris source bounder supplies every certificate. A bounder error is a
+/// test failure, never a silent refusal.
+fn certify(
+    name: &str,
+    anchor: (&Captured, &IosPricingRequest<'_>, &IosPricing),
+    request: (&IosPricingRequest<'_>, &IosPricing),
+) -> Result<mlx_gen::ios_anchor_law::Derivation, NotDerivable> {
+    let (anchor_run, anchor_ctx, at_anchor) = anchor;
+    let (request_ctx, priced) = request;
+    let mut witnessed = at_anchor.clone();
+    witnessed.observations = anchor_run.observations.clone();
+    let bounds = crate::ios_pricing::ios_bounder(anchor_ctx, &witnessed, request_ctx, priced)
+        .unwrap_or_else(|e| panic!("{name}: the Iris source bounder failed: {e}"));
+    let g = anchor_ctx.geometry;
+    derive_certified(
+        &anchor_run.anchor(area(g.width, g.height, g.batch)),
+        &witnessed,
+        priced,
+        &bounds,
+    )
+}
+
 fn check(
     name: String,
-    anchor: (&MeasuredRun, u64, &IosPricing),
-    request: (&MeasuredRun, u64, &IosPricing),
+    anchor: (&Captured, &IosPricingRequest<'_>, &IosPricing),
+    request: (&Captured, &IosPricingRequest<'_>, &IosPricing),
 ) -> Check {
-    let (anchor_run, anchor_area, at_anchor) = anchor;
-    let (measured, request_area, priced) = request;
+    let (anchor_run, anchor_ctx, at_anchor) = anchor;
+    let (measured, request_ctx, priced) = request;
     let mut c = Check {
         name,
         anchor: anchor_run.demand,
@@ -222,8 +337,8 @@ fn check(
         over: Vec::new(),
     };
     for (side, run, pricing) in [
-        ("anchor", anchor_run, at_anchor),
-        ("request", measured, priced),
+        ("anchor", &anchor_run.run, at_anchor),
+        ("request", &measured.run, priced),
     ] {
         assert_phase_coverage(&format!("{} {side}", c.name), &run.phases, pricing);
         mlx_gen::ios_quantum::assert_tracks_measured(
@@ -250,24 +365,37 @@ fn check(
             );
         }
     }
-    match derive(
-        &anchor_run.anchor(anchor_area),
-        at_anchor,
-        priced,
-        request_area,
+    match certify(
+        &c.name,
+        (anchor_run, anchor_ctx, at_anchor),
+        (request_ctx, priced),
     ) {
         Ok(derived) => {
-            assert_eq!(
-                derived
-                    .phases
-                    .iter()
-                    .map(|p| p.phase)
-                    .collect::<BTreeSet<_>>(),
-                measured.phases.keys().copied().collect::<BTreeSet<_>>(),
-                "{}: derivation omitted a measured phase",
-                c.name
-            );
+            let phases: BTreeSet<_> = derived.phases.iter().map(|p| p.phase).collect();
+            for phase in measured.phases.keys() {
+                assert!(
+                    phases.contains(phase),
+                    "{}: derivation omitted measured phase {}",
+                    c.name,
+                    phase.as_key()
+                );
+            }
+            // A derived phase the run never measures must be an actual absence priced at zero.
             for phase in &derived.phases {
+                if !measured.phases.contains_key(&phase.phase) {
+                    assert!(
+                        priced.absent_phases.contains_key(&phase.phase) && phase.bytes == 0,
+                        "{}: derived unmeasured phase {} is not an actual absence",
+                        c.name,
+                        phase.phase.as_key()
+                    );
+                }
+            }
+            for phase in derived
+                .phases
+                .iter()
+                .filter(|p| measured.phases.contains_key(&p.phase))
+            {
                 let got = measured.phases[&phase.phase];
                 eprintln!(
                     "  {} derived {:<12} measured {:>9} derived {:>9}{}",
@@ -331,18 +459,20 @@ fn generation_request(prompts: &[&str], memory: GenerationMemory) -> GenerationR
 
 /// The iOS pricing admission hands the law: mode `text_to_image`, batch = the prompts, the
 /// artifact-determined window (`token_window` 0, as `ios_admission::token_window` sends for Iris).
-fn generation_pricing(
-    spec: &LoadSpec,
-    selection: &MemorySelection,
-    memory: &GenerationMemory,
+static TEXT_TO_IMAGE: MemoryMode = MemoryMode::TextToImage;
+
+fn generation_ctx<'a>(
+    spec: &'a LoadSpec,
+    selection: &'a MemorySelection,
+    memory: &'a GenerationMemory,
     width: u32,
     batch: u32,
-    actual: &GenerationRequest,
-) -> IosPricing {
-    ios_pricing(&IosPricingRequest {
+    actual: &'a GenerationRequest,
+) -> IosPricingRequest<'a> {
+    IosPricingRequest {
         provider: crate::model::MODEL_ID,
         spec,
-        mode: &MemoryMode::TextToImage,
+        mode: &TEXT_TO_IMAGE,
         geometry: MemoryGeometry {
             width,
             height: H,
@@ -356,7 +486,20 @@ fn generation_pricing(
         transform: None,
         depth: None,
         token_window: 0,
-    })
+    }
+}
+
+fn generation_pricing(
+    spec: &LoadSpec,
+    selection: &MemorySelection,
+    memory: &GenerationMemory,
+    width: u32,
+    batch: u32,
+    actual: &GenerationRequest,
+) -> IosPricing {
+    ios_pricing(&generation_ctx(
+        spec, selection, memory, width, batch, actual,
+    ))
     .unwrap()
 }
 
@@ -610,7 +753,7 @@ fn measure_generation(
     request: &GenerationRequest,
     resident: bool,
     expected_stream: bool,
-) -> MeasuredRun {
+) -> Captured {
     measure(|| run_generation_endpoint(spec, request, resident, expected_stream).map(|_| ()))
 }
 
@@ -636,146 +779,153 @@ pub(crate) fn generation_tiers(root: &std::path::Path) -> Vec<(&'static str, Loa
     tiers
 }
 
-/// How the batch request is priced and scaled for the derivation (the proof's mutation seam).
+/// The batch the request is priced at (the proof's mutation seam).
 #[derive(Clone, Copy)]
 struct BatchScaling {
-    /// The batch the request is priced at.
     priced_batch: u32,
-    /// The batch the request's area counts.
-    area_batch: u32,
 }
 
-const BATCH: BatchScaling = BatchScaling {
-    priced_batch: 2,
-    area_batch: 2,
-};
+const BATCH: BatchScaling = BatchScaling { priced_batch: 2 };
 
-/// Per tier × selection: the 2-prompt batch, and (the comparator) one prompt at twice the width,
-/// each derived from the measured single-prompt text anchor.
-fn prompt_batch_checks(scaling: BatchScaling) -> (Vec<Check>, Vec<Check>) {
+/// Per tier × selection: the 2-prompt batch and the serial count 2 (each with the anchor's own
+/// self-certified single-prompt derivation beside it), and (the comparator) one prompt at twice
+/// the width, each derived from the measured single-prompt text anchor.
+struct PromptBatchChecks {
+    batches: Vec<(Check, u64)>,
+    wides: Vec<Check>,
+}
+
+fn prompt_batch_checks(scaling: BatchScaling) -> PromptBatchChecks {
     let root = tempfile::tempdir().unwrap();
     let text = ["a lighthouse on a cliff at dusk"];
     let batch = ["a red fox in the snow", "golden hour"];
-    let (mut batches, mut wides) = (Vec::new(), Vec::new());
+    let mut out = PromptBatchChecks {
+        batches: Vec::new(),
+        wides: Vec::new(),
+    };
     for (tier, spec) in generation_tiers(root.path()) {
         for (rung, resident, expected_stream, spec, selection, memory) in
             proved_selections(crate::model::MODEL_ID, &spec)
         {
-            let anchor = measure_generation(
-                &spec,
-                &generation_request(&text, memory),
-                resident,
-                expected_stream,
-            );
-            let at_anchor = generation_pricing(
+            let anchor_request = generation_request(&text, memory);
+            let anchor = measure_generation(&spec, &anchor_request, resident, expected_stream);
+            let anchor_ctx = generation_ctx(&spec, &selection, &memory, W, 1, &anchor_request);
+            let at_anchor = ios_pricing(&anchor_ctx).unwrap();
+            let anchor_side = (&anchor, &anchor_ctx, &at_anchor);
+            // The single-prompt request certified from its own anchor: what a batch would price
+            // at if it were derived or priced as batch size 1.
+            let single = certify(
+                &format!("iris_3b text→text {tier} {rung}"),
+                anchor_side,
+                (&anchor_ctx, &at_anchor),
+            )
+            .unwrap()
+            .demand;
+            let batched = generation_request(&batch, memory);
+            let batched_ctx = generation_ctx(
                 &spec,
                 &selection,
                 &memory,
                 W,
-                1,
-                &generation_request(&text, memory),
+                scaling.priced_batch,
+                &batched,
             );
-            let measured = measure_generation(
-                &spec,
-                &generation_request(&batch, memory),
-                resident,
-                expected_stream,
-            );
-            batches.push(check(
-                format!("iris_3b text→batch2 {tier} {rung}"),
-                (&anchor, area(W, H, 1), &at_anchor),
-                (
-                    &measured,
-                    area(W, H, scaling.area_batch),
-                    &generation_pricing(
-                        &spec,
-                        &selection,
-                        &memory,
-                        W,
-                        scaling.priced_batch,
-                        &generation_request(&batch, memory),
+            out.batches.push((
+                check(
+                    format!("iris_3b text→batch2 {tier} {rung}"),
+                    anchor_side,
+                    (
+                        &measure_generation(&spec, &batched, resident, expected_stream),
+                        &batched_ctx,
+                        &ios_pricing(&batched_ctx).unwrap(),
                     ),
                 ),
+                single,
             ));
             // `count` retains each solved f32 batch until the common RGB conversion. It is not
             // the same execution as a prompt batch, although admission counts both as total images.
             let mut counted = generation_request(&text, memory);
             counted.count = 2;
-            batches.push(check(
-                format!("iris_3b text→count2 {tier} {rung}"),
-                (&anchor, area(W, H, 1), &at_anchor),
-                (
-                    &measure_generation(&spec, &counted, resident, expected_stream),
-                    area(W, H, scaling.area_batch),
-                    &generation_pricing(
-                        &spec,
-                        &selection,
-                        &memory,
-                        W,
-                        scaling.priced_batch,
-                        &counted,
+            let counted_ctx = generation_ctx(
+                &spec,
+                &selection,
+                &memory,
+                W,
+                scaling.priced_batch,
+                &counted,
+            );
+            out.batches.push((
+                check(
+                    format!("iris_3b text→count2 {tier} {rung}"),
+                    anchor_side,
+                    (
+                        &measure_generation(&spec, &counted, resident, expected_stream),
+                        &counted_ctx,
+                        &ios_pricing(&counted_ctx).unwrap(),
                     ),
                 ),
+                single,
             ));
             let mut wide = generation_request(&text, memory);
             wide.width = 2 * W;
-            wides.push(check(
+            let wide_ctx = generation_ctx(&spec, &selection, &memory, 2 * W, 1, &wide);
+            out.wides.push(check(
                 format!("iris_3b text→text {}x{H} {tier} {rung}", 2 * W),
-                (&anchor, area(W, H, 1), &at_anchor),
+                anchor_side,
                 (
                     &measure_generation(&spec, &wide, resident, expected_stream),
-                    area(2 * W, H, 1),
-                    &generation_pricing(&spec, &selection, &memory, 2 * W, 1, &wide),
+                    &wide_ctx,
+                    &ios_pricing(&wide_ctx).unwrap(),
                 ),
             ));
         }
     }
-    (batches, wides)
+    out
 }
 
 fn prompt_batch_body() {
     const { assert!(crate::ios_pricing::IOS_NON_ADDITIVE_BATCH) };
-    let (batches, wides) = prompt_batch_checks(BATCH);
+    let PromptBatchChecks { batches, wides } = prompt_batch_checks(BATCH);
     assert_eq!(
         batches.len(),
         12,
         "prompt batch / count × 3 tiers × 2 endpoints"
     );
-    // The derivation carries the batch: every derivation is above the text anchor it starts from.
-    for c in &batches {
-        let derived = *c.derived.as_ref().unwrap();
+    for (c, single) in &batches {
+        let derived = *c
+            .derived
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{}: batch is not certified: {e}", c.name));
+        // The certificate carries the ACTUAL rows/count: it is above the text anchor it starts
+        // from, and above the same anchor's own single-prompt certificate (never batch-1 priced).
         assert!(
             derived > c.anchor,
             "{}: derived {derived} does not scale the text anchor {}",
             c.name,
             c.anchor
         );
-    }
-    // Report the CURRENT whole-run and per-phase evidence, without demanding a stale failure.
-    // The production nonadditivity flag stays true until this complete matrix is validated.
-    let under = failures(&batches);
-    eprintln!(
-        "BATCH CLASSIFICATION: {} / {} whole-run + per-phase checks pass; failures {under:#?}",
-        batches.iter().filter(|c| c.passed()).count(),
-        batches.len()
-    );
-    for c in &batches {
         assert!(
-            c.measured <= *c.derived.as_ref().unwrap(),
-            "{}: batch whole-run demand exceeds its derivation",
+            derived > *single,
+            "{}: derived {derived} is priced as the single-prompt certificate {single}",
             c.name
         );
     }
-    // Single-prompt geometry remains a passing claim, without a measurement tolerance.
+    let batch_checks: Vec<_> = batches.into_iter().map(|(c, _)| c).collect();
+    let under = failures(&batch_checks);
+    assert!(
+        under.is_empty(),
+        "batch/count above its certified derivation: {under:#?}"
+    );
     let under = failures(&wides);
     assert!(under.is_empty(), "2x area above its derivation: {under:#?}");
 }
 
-/// Collect batch whole-run and per-phase classification on the current tree; a prior Decode
-/// counterexample is not required to survive pricing repairs. A single prompt at twice the area
-/// is checked against the same text anchor as well.
+/// Certify the prompt batch and serial count at their actual rows/count (never scaled from batch
+/// 1) and the single prompt at twice the area, each from the measured text anchor, whole run and
+/// per phase.
 ///
-/// Mutation: price/count the batch as batch 1; the derived-demand growth assertion goes red.
+/// Mutation: price the batch/count as batch 1, or certify it from the batch-1 request; the
+/// pricing context or the single-prompt comparison goes red.
 #[test]
 fn prompt_batch_derivability_is_measured_at_both_endpoints_per_phase() {
     in_cpu_child(
@@ -926,7 +1076,8 @@ fn sampling_body() {
                 generation_request(&["a lighthouse on a cliff at dusk"], memory);
             anchor_request.steps = Some(4);
             let anchor = measure_generation(&spec, &anchor_request, resident, expected_stream);
-            let at_anchor = generation_pricing(&spec, &selection, &memory, W, 1, &anchor_request);
+            let anchor_ctx = generation_ctx(&spec, &selection, &memory, W, 1, &anchor_request);
+            let at_anchor = ios_pricing(&anchor_ctx).unwrap();
             // Mechanism classes, not a float grid: both actual solver graphs; no/all/mixed CFG;
             // first-only/last-only guidance; one/two/multistep; prompt rows vs serial count.
             for (name, sampler, steps, guidance, interval, rows, count, width) in [
@@ -1043,21 +1194,12 @@ fn sampling_body() {
                     unguarded,
                     "{tier} {rung} {name}: guarded sampling changed RGB"
                 );
+                let request_ctx =
+                    generation_ctx(&spec, &selection, &memory, width, rows * count, &request);
                 checked.push(check(
                     format!("Iris sampling {tier} {rung} {name}"),
-                    (&anchor, area(W, H, 1), &at_anchor),
-                    (
-                        &measured,
-                        area(width, H, rows * count),
-                        &generation_pricing(
-                            &spec,
-                            &selection,
-                            &memory,
-                            width,
-                            rows * count,
-                            &request,
-                        ),
-                    ),
+                    (&anchor, &anchor_ctx, &at_anchor),
+                    (&measured, &request_ctx, &ios_pricing(&request_ctx).unwrap()),
                 ));
             }
         }
@@ -1122,6 +1264,36 @@ fn downstream_pricing(
     .unwrap()
 }
 
+/// The downstream task's actual work context: a restoration transform or a depth request.
+struct DownstreamWork<'a> {
+    transform: Option<&'a TransformRequest>,
+    depth: Option<&'a mlx_gen::gen_core::iris::depth::DepthRequest>,
+}
+
+fn downstream_ctx<'a>(
+    provider: &'a str,
+    mode: &'a MemoryMode,
+    spec: &'a LoadSpec,
+    selection: &'a MemorySelection,
+    memory: &'a GenerationMemory,
+    geometry: MemoryGeometry,
+    work: DownstreamWork<'a>,
+) -> IosPricingRequest<'a> {
+    let DownstreamWork { transform, depth } = work;
+    IosPricingRequest {
+        provider,
+        spec,
+        mode,
+        geometry,
+        selection,
+        execution: memory,
+        generation: None,
+        transform,
+        depth,
+        token_window: 0,
+    }
+}
+
 fn restore_at(width: u32, height: u32) -> TransformRequest {
     TransformRequest {
         image: Image {
@@ -1141,7 +1313,7 @@ fn measure_restoration(
     spec: &LoadSpec,
     req: &TransformRequest,
     streamed: bool,
-) -> (MeasuredRun, MemoryGeometry) {
+) -> (Captured, MemoryGeometry) {
     let mut geometry = None;
     let run = measure(|| {
         let restorer = crate::restoration::IrisRestorer::load(spec)?;
@@ -1187,7 +1359,7 @@ fn measure_depth(
     width: u32,
     height: u32,
     streamed: bool,
-) -> (MeasuredRun, MemoryGeometry) {
+) -> (Captured, MemoryGeometry) {
     let actual = depth_request(width, height);
     let run = measure(|| {
         let depth = crate::depth::load_depth(spec)?;
@@ -1217,65 +1389,57 @@ fn measure_depth(
     (run, geometry)
 }
 
+/// The first restoration class `derive_certified` reaches uncovered: Load runs first and its
+/// classes are visited in order. Restoration has no native certificate, so this is its exact
+/// current refusal.
+const RESTORATION_REFUSAL_CLASS: &str =
+    "iris.restoration.backbone_load/Iris backbone load/operator0";
+
 fn downstream_body() {
     let root = tempfile::tempdir().unwrap();
     let mut checks = Vec::new();
     let mut restore_host = Vec::new();
     let upscaler = fixtures().join("tiny-snapshot/upscaler");
+    let restore_mode = crate::memory_strategy::memory_mode(IrisTask::Restoration);
     for (tier, spec) in downstream_tiers(root.path(), &upscaler, false) {
         let provider = crate::restoration::MODEL_ID;
         for (rung, _resident, expected_stream, spec, selection, memory) in
             proved_selections(provider, &spec)
         {
             let streamed = expected_stream;
-            let (anchor, at) = measure_restoration(&spec, &restore_request(), streamed);
-            let (measured, second) = measure_restoration(&spec, &restore_at(24, 20), streamed);
+            let (first_request, second_request) = (restore_request(), restore_at(24, 20));
+            let (anchor, at) = measure_restoration(&spec, &first_request, streamed);
+            let (measured, second) = measure_restoration(&spec, &second_request, streamed);
             assert!(area(second.width, second.height, 1) > area(at.width, at.height, 1));
-            let price = |g, actual: &TransformRequest| {
-                downstream_pricing(
+            let ctx = |g, actual| {
+                downstream_ctx(
                     provider,
-                    IrisTask::Restoration,
+                    &restore_mode,
                     &spec,
                     &selection,
                     &memory,
                     g,
-                    (Some(actual), None),
+                    DownstreamWork {
+                        transform: Some(actual),
+                        depth: None,
+                    },
                 )
             };
-            restore_host.push(
-                crate::ios_pricing::restoration_decode_host_bytes(&IosPricingRequest {
-                    provider,
-                    spec: &spec,
-                    mode: &crate::memory_strategy::memory_mode(IrisTask::Restoration),
-                    geometry: at,
-                    selection: &selection,
-                    execution: &memory,
-                    generation: None,
-                    transform: Some(&restore_request()),
-                    depth: None,
-                    token_window: 0,
-                })
-                .unwrap(),
-            );
+            let (anchor_ctx, request_ctx) = (ctx(at, &first_request), ctx(second, &second_request));
+            restore_host
+                .push(crate::ios_pricing::restoration_decode_host_bytes(&anchor_ctx).unwrap());
             checks.push(check(
                 format!(
                     "iris_3b_restore {}x{}→{}x{} {tier} {rung}",
                     at.width, at.height, second.width, second.height
                 ),
-                (
-                    &anchor,
-                    area(at.width, at.height, 1),
-                    &price(at, &restore_request()),
-                ),
-                (
-                    &measured,
-                    area(second.width, second.height, 1),
-                    &price(second, &restore_at(24, 20)),
-                ),
+                (&anchor, &anchor_ctx, &ios_pricing(&anchor_ctx).unwrap()),
+                (&measured, &request_ctx, &ios_pricing(&request_ctx).unwrap()),
             ));
         }
     }
     let depth_src = fixtures().join("tiny-depth");
+    let depth_mode = crate::memory_strategy::memory_mode(IrisTask::Depth);
     for (tier, spec) in downstream_tiers(root.path(), &depth_src, true) {
         let provider = crate::depth::DEPTH_MODEL_ID;
         for (rung, _resident, expected_stream, spec, selection, memory) in
@@ -1284,61 +1448,81 @@ fn downstream_body() {
             let streamed = expected_stream;
             let (anchor, at) = measure_depth(&spec, 24, 16, streamed);
             let (measured, second) = measure_depth(&spec, 48, 32, streamed);
-            let price = |g, actual: &mlx_gen::gen_core::iris::depth::DepthRequest| {
-                downstream_pricing(
+            let (first_request, second_request) = (
+                depth_request(at.width, at.height),
+                depth_request(second.width, second.height),
+            );
+            let ctx = |g, actual| {
+                downstream_ctx(
                     provider,
-                    IrisTask::Depth,
+                    &depth_mode,
                     &spec,
                     &selection,
                     &memory,
                     g,
-                    (None, Some(actual)),
+                    DownstreamWork {
+                        transform: None,
+                        depth: Some(actual),
+                    },
                 )
             };
+            let (anchor_ctx, request_ctx) = (ctx(at, &first_request), ctx(second, &second_request));
+            let (at_anchor, priced) = (
+                ios_pricing(&anchor_ctx).unwrap(),
+                ios_pricing(&request_ctx).unwrap(),
+            );
+            // Without the anchor run's actual marks there is no witness and no certificate.
+            assert!(
+                crate::ios_pricing::ios_bounder(&anchor_ctx, &at_anchor, &request_ctx, &priced)
+                    .is_err(),
+                "{tier} {rung}: an unwitnessed depth anchor was certified"
+            );
             checks.push(check(
                 format!("iris_3b_depth 24x16→48x32 {tier} {rung}"),
-                (
-                    &anchor,
-                    area(at.width, at.height, 1),
-                    &price(at, &depth_request(at.width, at.height)),
-                ),
-                (
-                    &measured,
-                    area(second.width, second.height, 1),
-                    &price(second, &depth_request(second.width, second.height)),
-                ),
+                (&anchor, &anchor_ctx, &at_anchor),
+                (&measured, &request_ctx, &priced),
             ));
         }
     }
     assert_eq!(checks.len(), 12, "2 routes × 3 tiers × 2 selections");
     let (restore, depth) = checks.split_at(6);
-    // Restoration's intended NEGATIVE: invisible Rust host planes do not become process evidence
-    // by subtracting a logical resident/host upper from the native CPU reading. No provider source
-    // certificate is supplied by this legacy call. The separate depth/generation POSITIVE transfer
-    // obligations remain below/in their own tests; this rejection does not satisfy them.
+    // Restoration's intended NEGATIVE: invisible Rust host planes have no native certificate, so
+    // the certified law refuses at its first uncovered class rather than pricing host payload.
     for (c, host) in restore.iter().zip(&restore_host) {
         assert!(
             *host > 0,
             "{}: fixture must actually exercise Rust host planes",
             c.name
         );
-        assert!(
-            matches!(c.derived, Err(NotDerivable::Uncertified)),
-            "{}: uncertified host payload upper {host} gained transfer authority: {:?}",
-            c.name,
-            c.derived
+        assert_eq!(
+            c.derived,
+            Err(NotDerivable::Coverage(RESTORATION_REFUSAL_CLASS.into())),
+            "{}: host payload upper {host} gained transfer authority",
+            c.name
         );
     }
-    // Depth: measured ≤ derived at the second size, whole run and per phase.
+    // Depth: certified at the second size, above its own anchor, and measured ≤ derived whole
+    // run and per phase.
+    for c in depth {
+        let derived = *c
+            .derived
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{}: depth second size is not certified: {e}", c.name));
+        assert!(
+            derived > c.anchor,
+            "{}: derived {derived} ≤ anchor {}",
+            c.name,
+            c.anchor
+        );
+    }
     let under = failures(depth);
     assert!(under.is_empty(), "depth above its derivation: {under:#?}");
 }
 
-/// Restoration and depth, each its own family with one mode. Depth is derived from its own measured
-/// run at a second input size and stays within it (the law's self-consistency on that route).
-/// Restoration is not measurable by this host stand-in (its host planes are priced resident but
-/// invisible to MLX's active memory; a device capture's `phys_footprint` sees them), so only that
-/// is asserted.
+/// Restoration and depth, each its own family with one mode. Depth is certified from its own
+/// measured run at a second input size and stays within it, whole run and per phase. Restoration's
+/// host planes are invisible to MLX's active memory, so it has no native certificate: its exact
+/// `derive_certified` refusal is asserted.
 #[test]
 fn depth_derives_a_second_size_and_restoration_is_host_unmeasurable() {
     in_cpu_child(

@@ -48,6 +48,10 @@ use crate::retention::allocated;
 use crate::stream::{largest_window, BlockRead, CastPolicy};
 use crate::text_encoder::{quanta as te_q, LANGUAGE_TOWER_PREFIX};
 
+mod bounder;
+mod native_ledger;
+pub use bounder::ios_bounder;
+
 /// Canonical Iris sampling recipe. Normalization is exclusively the production
 /// `GenerationParams::resolve` + `plan`; this is not the generic diffusion solver factory.
 #[derive(Clone, Debug)]
@@ -729,12 +733,11 @@ impl GenerationRecipe {
     }
 }
 
-/// Whether an `iris_3b` prompt batch cannot safely derive every phase from the text anchor.
+/// Whether an `iris_3b` prompt batch cannot be derived by scaling the text anchor.
 ///
-/// `true` pending `anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase`.
-/// The earlier Decode counterexample predates final-clamp separation and dynamic sampling/count
-/// accounting. Its survival on this tree is unverified; whole-run coverage alone is never proof of
-/// phase-by-phase additivity.
+/// Prompt rows and serial count retain different owners, so no batch-1 scale or additive law is
+/// claimed. A batch is certified only by [`ios_bounder`], which prices the ACTUAL rows/count with
+/// the cumulative native ledger rather than scaling or reusing a batch-1 certificate.
 pub const IOS_NON_ADDITIVE_BATCH: bool = true;
 
 /// The phase every quantum label of this crate runs in.
