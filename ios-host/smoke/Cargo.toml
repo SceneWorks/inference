@@ -63,3 +63,9 @@ mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
 tempfile = "3"
 # The production Qwen3-4B encoder contract fixture a Z-Image Turbo campaign case validates.
 sceneworks-gen-core-testkit = { path = "../../crates/contracts/gen-core-testkit" }
+
+# This harness is a separate workspace: root patches are not inherited.
+[patch.crates-io]
+regex = { path = "../../vendor/clip-regex/regex" }
+regex-automata = { path = "../../vendor/clip-regex/regex-automata" }
+regex-syntax = { path = "../../vendor/clip-regex/regex-syntax" }

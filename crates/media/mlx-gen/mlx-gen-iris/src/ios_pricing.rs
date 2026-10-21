@@ -50,7 +50,10 @@ use crate::text_encoder::{quanta as te_q, LANGUAGE_TOWER_PREFIX};
 
 mod bounder;
 mod native_ledger;
-pub use bounder::{ios_bounder, ios_bounder_with_replay, IrisReplay};
+pub use bounder::{
+    ios_bounder, ios_bounder_with_replay, ios_bounder_with_replay_analysis, IrisBoundAnalysis,
+    IrisReplay,
+};
 
 /// The request's finite source/request-derived HOST (Rust heap) growth upper outside the MLX
 /// counter, including the caller-stated callback term. Refuses with the exact named gap while
@@ -814,8 +817,8 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
 }
 
 /// Every quantum label the crate checks (the coverage set of [`ios_quantum_phase`]).
-pub fn quantum_labels() -> Vec<&'static str> {
-    let mut labels = vec![
+fn quantum_labels_iter() -> impl Iterator<Item = &'static str> {
+    [
         crate::model::BACKBONE_LOAD_QUANTUM,
         crate::model::IMAGE_QUANTUM,
         crate::adapters::ADAPTER_LOAD_QUANTUM,
@@ -824,11 +827,16 @@ pub fn quantum_labels() -> Vec<&'static str> {
         crate::solver::PLAN_QUANTUM,
         crate::solver::STEP_QUANTUM,
         crate::solver::FINALIZE_QUANTUM,
-    ];
-    labels.extend(te_q::ALL);
-    labels.extend(dit_q::ALL);
-    labels.extend(crate::depth::quanta::ALL);
-    labels.extend(crate::restoration::quanta::ALL);
+    ]
+    .into_iter()
+    .chain(te_q::ALL.iter().copied())
+    .chain(dit_q::ALL.iter().copied())
+    .chain(crate::depth::quanta::ALL.iter().copied())
+    .chain(crate::restoration::quanta::ALL.iter().copied())
+}
+
+pub fn quantum_labels() -> Vec<&'static str> {
+    let mut labels: Vec<_> = quantum_labels_iter().collect();
     labels.sort_unstable();
     labels.dedup();
     labels
@@ -2034,6 +2042,45 @@ fn priced_backbone(
     let real = crate::stream::headers(path)?;
     let artifact = crate::packed::artifact_tier(path)?;
     crate::packed::check_requested("the backbone", artifact, requested)?;
+    priced_backbone_from_headers(
+        BackbonePricingInput {
+            config,
+            prefix,
+            precision,
+            requested,
+            streamed,
+            input_channels,
+            opts,
+        },
+        &real,
+        artifact,
+    )
+}
+
+struct BackbonePricingInput<'a> {
+    config: &'a IrisConfig,
+    prefix: &'static str,
+    precision: Precision,
+    requested: Option<Quant>,
+    streamed: bool,
+    input_channels: u64,
+    opts: Pricing,
+}
+
+fn priced_backbone_from_headers(
+    input: BackbonePricingInput<'_>,
+    real: &[Header],
+    artifact: Option<Quant>,
+) -> Result<PricedBackbone> {
+    let BackbonePricingInput {
+        config,
+        prefix,
+        precision,
+        requested,
+        streamed,
+        input_channels,
+        opts,
+    } = input;
     let requantized = artifact.is_none() && requested.is_some();
     if requantized && streamed && !opts.assume_packed {
         crate::stream::refuse_stream_requantization(
@@ -2044,8 +2091,8 @@ fn priced_backbone(
         )?;
     }
     let built = match (requantized, requested) {
-        (true, Some(quant)) => emulate_packed_backbone(&real, prefix, quant)?,
-        _ => real.clone(),
+        (true, Some(quant)) => emulate_packed_backbone(real, prefix, quant)?,
+        _ => real.to_vec(),
     };
     let skeleton = |name: &str| {
         name.strip_prefix(prefix)
@@ -2053,7 +2100,7 @@ fn priced_backbone(
     };
     let keep = |name: &str| !streamed || skeleton(name);
     // The load floor is the file the load reads: the packed export when one is assumed.
-    let floor_headers = if opts.assume_packed { &built } else { &real };
+    let floor_headers = if opts.assume_packed { &built[..] } else { real };
     let floor = stored(floor_headers, keep);
     let quant = if requantized {
         BackboneQuant::for_load(requested)?
@@ -2061,8 +2108,9 @@ fn priced_backbone(
         None
     };
     let facts = Backbone::new(config, &built, prefix, precision, input_channels)?;
-    let resident = crate::memory_strategy::backbone_bytes_where(path, precision, quant, keep)
-        .map_err(Error::from)?;
+    let resident =
+        crate::memory_strategy::backbone_bytes_from_headers(real, precision, quant, keep)
+            .map_err(Error::from)?;
     Ok(PricedBackbone {
         facts,
         resident,
@@ -2154,12 +2202,414 @@ fn priced_tower(
     })
 }
 
+pub use native_ledger::{
+    host_analysis_without_facts, IrisHostAnalysis, IrisHostGap, IrisMetadataFacts,
+    KnownHostFragments,
+};
+
+/// Guarded source facts are prepared once for one actual request OR its exact recorded replay.
+/// This private carrier cannot be constructed by a catalog caller to bless unrelated bytes.
+struct GuardedSources<'a> {
+    task: GuardedTask,
+    bb: PricedBackbone,
+    raw_headers: std::collections::HashMap<String, Header>,
+    empty_headers: Vec<Header>,
+    metadata: IrisMetadataFacts,
+    replay: Option<IrisReplay<'a>>,
+    caller_bytes: u64,
+}
+
+enum GuardedTask {
+    Restoration {
+        resources: RestorationResources,
+        plan: mlx_gen::gen_core::iris::restoration::RestorationPlanMetadata,
+    },
+    Depth {
+        export: TaskExport,
+        plan: mlx_gen::gen_core::iris::depth::DepthInputPlan,
+    },
+}
+
+impl GuardedSources<'_> {
+    fn check_restoration_token(
+        &self,
+        req: &IosPricingRequest<'_>,
+        token: &RestorationToken,
+    ) -> Result<()> {
+        if req.provider != crate::restoration::MODEL_ID
+            || !matches!(self.replay, Some(IrisReplay::Restoration(expected)) if expected == token)
+        {
+            return Err(Error::Unsupported(
+                "Iris restoration diagnostic token/source mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn export(&self) -> &TaskExport {
+        match &self.task {
+            GuardedTask::Restoration { resources, .. } => &resources.export,
+            GuardedTask::Depth { export, .. } => export,
+        }
+    }
+}
+
+struct GuardedPricingFacts<'a> {
+    facts: PricingFacts,
+    sources: GuardedSources<'a>,
+}
+
+fn guarded_source_read<T>(
+    inventory: &mlx_gen::gen_core::SourceInventory,
+    req: &IosPricingRequest<'_>,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+    read: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> Result<T>,
+) -> Result<T> {
+    // Preserve the original provider callback error over the neutral core error boundary.
+    // Once denied, no second callback invocation or subsequent guarded allocation is allowed.
+    let mut original_error = None;
+    let result = {
+        let mut denied = false;
+        let mut checked = |bytes| {
+            if denied {
+                return Err(mlx_gen::gen_core::Error::Unsupported(
+                    "Iris source metadata capacity already refused".into(),
+                ));
+            }
+            match capacity(bytes) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    denied = true;
+                    original_error = Some(error);
+                    Err(mlx_gen::gen_core::Error::Unsupported(
+                        "Iris source metadata capacity refused".into(),
+                    ))
+                }
+            }
+        };
+        (|| {
+            inventory
+                .verify_for_with_capacity(req.spec, &mut checked)
+                .map_err(Error::from)?;
+            inventory.read_unchanged_with_capacity(&mut checked, |next| {
+                let mut provider_next = |bytes| next(bytes).map_err(Error::from);
+                read(&mut provider_next)
+            })
+        })()
+    };
+    match original_error {
+        Some(error) => Err(error),
+        None => result.map_err(|error| {
+            native_ledger::source_guard_refusal(req, error).unwrap_or_else(std::convert::identity)
+        }),
+    }
+}
+
+fn observed_metadata_read<T>(
+    metadata: &mut IrisMetadataFacts,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+    read: impl FnOnce(
+        &mut mlx_gen::gen_core::weightsmeta::SourceMetadataObserver<'_>,
+    ) -> mlx_gen::gen_core::Result<T>,
+) -> Result<T> {
+    let mut original_error = None;
+    let mut observe = |event| match metadata.observe(event, capacity) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            original_error = Some(error);
+            Err(mlx_gen::gen_core::Error::Unsupported(
+                "Iris source metadata observer refused".into(),
+            ))
+        }
+    };
+    let result = read(&mut observe);
+    match original_error {
+        Some(error) => Err(error),
+        None => result.map_err(Error::from),
+    }
+}
+
+pub fn check_replay_source_capacity(
+    token: &str,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    native_ledger::IrisMetadataFacts::default().check_replay_token(token, capacity)
+}
+
+/// Preserve each existing token constructor's prefix-error order. A prefix-invalid token has
+/// no parser work: its original constructor rejects before serde. This is NOT a certificate or
+/// permission to parse arbitrary JSON. Generation is intentionally refused at aa011 first.
+pub fn check_replay_source_capacity_for_provider(
+    provider: &str,
+    token: &str,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    let prefix = match provider {
+        crate::model::MODEL_ID => "iris-sampling-v1:",
+        crate::restoration::MODEL_ID => "iris-restoration-v1:",
+        crate::depth::DEPTH_MODEL_ID => "iris-depth-v1:",
+        _ => {
+            return Err(Error::Unsupported(
+                "not an Iris guarded replay route".into(),
+            ))
+        }
+    };
+    if !token.starts_with(prefix) {
+        return Ok(());
+    }
+    if provider == crate::model::MODEL_ID {
+        return native_ledger::require_guarded_generation_gap();
+    }
+    check_replay_source_capacity(token, capacity)
+}
+
+/// Guarded source pricing for SDK/catalog callers that possess the actual metadata-capacity
+/// callback. Both ordinary and token-replay routes use the same single-pass held-facts path.
+pub fn pricing_facts_with_source_capacity(
+    req: &IosPricingRequest<'_>,
+    replay: Option<IrisReplay<'_>>,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<PricingFacts> {
+    Ok(guarded_pricing_facts(req, replay, capacity)?.facts)
+}
+
+fn guarded_pricing_facts<'a>(
+    req: &IosPricingRequest<'_>,
+    replay: Option<IrisReplay<'a>>,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<GuardedPricingFacts<'a>> {
+    req.validate_work_context()?;
+    match (req.provider, replay) {
+        (crate::model::MODEL_ID, None | Some(IrisReplay::Generation(_))) => {
+            expect_mode(req.mode, &MemoryMode::TextToImage)?
+        }
+        (crate::restoration::MODEL_ID, None | Some(IrisReplay::Restoration(_))) => expect_mode(
+            req.mode,
+            &crate::memory_strategy::memory_mode(IrisTask::Restoration),
+        )?,
+        (crate::depth::DEPTH_MODEL_ID, None | Some(IrisReplay::Depth(_))) => expect_mode(
+            req.mode,
+            &crate::memory_strategy::memory_mode(IrisTask::Depth),
+        )?,
+        (provider, Some(_)) => {
+            return Err(Error::Unsupported(format!(
+                "{provider}: Iris replay token belongs to another task"
+            )))
+        }
+        _ => return Err(Error::Unsupported("not an Iris guarded host route".into())),
+    }
+    // Generation must fail BEFORE any config/tokenizer/header work; do not reorder aa011.
+    native_ledger::require_guarded_host_route(req)?;
+    native_ledger::check_encoder_free_native_axes(req)?;
+    let inventory = req.spec.source_inventory().ok_or_else(|| {
+        Error::Unsupported("Iris guarded metadata requires retained SourceInventory".into())
+    })?;
+    let mut metadata = IrisMetadataFacts::default();
+    let task = match req.provider {
+        crate::restoration::MODEL_ID => IrisTask::Restoration,
+        crate::depth::DEPTH_MODEL_ID => IrisTask::Depth,
+        _ => return Err(Error::Unsupported("not an Iris guarded host route".into())),
+    };
+    let export = {
+        guarded_source_read(inventory, req, capacity, |next| {
+            observed_metadata_read(&mut metadata, next, |observe| {
+                TaskExport::from_spec_observed(req.spec, task, req.provider, observe)
+            })
+        })?
+    };
+    // Existing readers retain raw JSON. Observe it in place; never reread just for diagnostics.
+    let read = |path: &Path,
+                metadata: &mut IrisMetadataFacts,
+                capacity: &mut dyn FnMut(u64) -> Result<()>| {
+        guarded_source_read(inventory, req, capacity, |next| {
+            observed_metadata_read(metadata, next, |observe| {
+                mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations_observed(
+                    path, observe,
+                )
+            })
+        })
+    };
+    let weights = read(&export.weights_path(), &mut metadata, capacity)?;
+    let real: Vec<_> = weights
+        .tensors
+        .into_iter()
+        .map(|location| location.header)
+        .collect();
+    let artifact =
+        crate::packed::artifact_tier_from_headers(&export.weights_path(), &real, || {
+            metadata.observe(
+                mlx_gen::gen_core::weightsmeta::SourceMetadataRead::Json {
+                    file_bytes: weights.file_len,
+                    bytes: &weights.header_json,
+                },
+                capacity,
+            )?;
+            mlx_gen::gen_core::weightsmeta::safetensors_metadata_from_json(
+                &export.weights_path(),
+                &weights.header_json,
+            )
+            .map_err(Error::from)
+        })?;
+    crate::memory_strategy::refuse_unloadable_quant(req.provider, req.spec).map_err(Error::from)?;
+    crate::packed::refuse_dense_requested_from_tier(
+        req.provider,
+        &export.weights_path(),
+        req.spec.quantize,
+        artifact,
+    )?;
+    if task == IrisTask::Restoration && artifact.is_some() && req.spec.precision != Precision::Bf16
+    {
+        return Err(Error::Unsupported(format!(
+            "iris: {} is a packed {artifact:?} artifact, which runs under the bf16 compute policy",
+            export.weights_path().display()
+        )));
+    }
+    metadata.capture_backbone(weights.file_len, &weights.header_json, &real)?;
+    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+    let prefix = if task == IrisTask::Depth {
+        "pixel."
+    } else {
+        ""
+    };
+    let input_channels = (export.config.model.in_channels as u64)
+        .checked_add(if task == IrisTask::Depth {
+            DEPTH_EXTRA_INPUT_CHANNELS as u64
+        } else {
+            0
+        })
+        .ok_or_else(|| Error::Unsupported("Iris guarded channel extent overflow".into()))?;
+    let bb = priced_backbone_from_headers(
+        BackbonePricingInput {
+            config: &export.config,
+            prefix,
+            precision: req.spec.precision,
+            requested: req.spec.quantize,
+            streamed,
+            input_channels,
+            opts: Pricing::default(),
+        },
+        &real,
+        artifact,
+    )?;
+    let empty = read(&export.empty_prompt_path(), &mut metadata, capacity)?;
+    let empty_headers: Vec<_> = empty
+        .tensors
+        .into_iter()
+        .map(|location| location.header)
+        .collect();
+    metadata.capture_empty(empty.file_len, &empty.header_json, &empty_headers)?;
+    let (task, caller_bytes) = match (task, replay) {
+        (IrisTask::Restoration, None | Some(IrisReplay::Restoration(_))) => {
+            let token = match replay {
+                Some(IrisReplay::Restoration(token)) => Some(token),
+                _ => None,
+            };
+            if let Some(token) = token {
+                metadata.check_replay_token(token.as_str(), capacity)?;
+            }
+            let resources =
+                RestorationResources::from_export(export, req.provider).map_err(Error::from)?;
+            let plan = restoration_priced_plan(req, &resources, token)?;
+            let caller = if let Some(token) = token {
+                token.wire()?.source_capacity_bytes
+            } else {
+                req.transform
+                    .ok_or_else(|| Error::Unsupported("missing restoration host source".into()))?
+                    .image
+                    .pixels
+                    .capacity() as u64
+            };
+            (GuardedTask::Restoration { resources, plan }, caller)
+        }
+        (IrisTask::Depth, None | Some(IrisReplay::Depth(_))) => {
+            let (plan, caller) = if let Some(IrisReplay::Depth(token)) = replay {
+                metadata.check_replay_token(token.as_str(), capacity)?;
+                let wire = token.wire()?;
+                if wire.patch != export.config.model.patch_size as u32 {
+                    return Err(Error::Unsupported(
+                        "Iris depth replay architecture patch mismatch".into(),
+                    ));
+                }
+                (wire.plan()?, wire.source_capacity_bytes)
+            } else {
+                let actual = req
+                    .depth
+                    .ok_or_else(|| Error::Unsupported("missing actual depth context".into()))?;
+                mlx_gen::gen_core::iris::depth::validate_depth_request(actual)
+                    .map_err(Error::from)?;
+                (
+                    mlx_gen::gen_core::iris::depth::plan_depth_input(
+                        actual.image.width,
+                        actual.image.height,
+                        actual.resolution,
+                        export.config.model.patch_size,
+                    )
+                    .map_err(Error::from)?,
+                    actual.image.pixels.capacity() as u64,
+                )
+            };
+            (GuardedTask::Depth { export, plan }, caller)
+        }
+        _ => {
+            return Err(Error::Unsupported(
+                "Iris replay token belongs to another task".into(),
+            ))
+        }
+    };
+    let raw_headers = real.into_iter().map(|h| (h.name.clone(), h)).collect();
+    let sources = GuardedSources {
+        task,
+        bb,
+        raw_headers,
+        empty_headers,
+        metadata,
+        replay,
+        caller_bytes,
+    };
+    let mut priced = match &sources.task {
+        GuardedTask::Restoration { resources, .. } => restoration_with_sources(
+            req,
+            Pricing::default(),
+            resources,
+            match replay {
+                Some(IrisReplay::Restoration(token)) => Some(token),
+                _ => None,
+            },
+            Some(&sources),
+        )?,
+        GuardedTask::Depth { export, .. } => depth_with_sources(
+            req,
+            Pricing::default(),
+            export,
+            match replay {
+                Some(IrisReplay::Depth(token)) => Some(token),
+                _ => None,
+            },
+            Some(&sources),
+        )?,
+    };
+    priced.metadata = Some(sources.metadata);
+    let mut facts = priced.into_facts();
+    facts.host_analysis = Some(native_ledger::host_analysis_from_sources(
+        req,
+        &sources,
+        facts.metadata.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "Iris guarded source pricing lost its captured metadata facts".into(),
+            )
+        })?,
+    )?);
+    Ok(GuardedPricingFacts { facts, sources })
+}
+
 /// A request's pricing and every quantum it was folded from (`(phase, label, scratch)`).
 #[derive(Default)]
 pub(crate) struct Priced {
     pub pricing: IosPricing,
     pub quanta: Vec<(IosPhase, &'static str, u64)>,
     phase_areas: std::collections::BTreeMap<IosPhase, u64>,
+    host_analysis: Option<IrisHostAnalysis>,
+    metadata: Option<IrisMetadataFacts>,
 }
 
 /// Basis coordinate of the NEW internal tensor/host allocation helpers. This is a producer-stage
@@ -2197,6 +2647,8 @@ pub fn input_storage_facts(req: &IosPricingRequest<'_>) -> Result<Option<InputSt
 pub struct PricingFacts {
     pub pricing: IosPricing,
     pub phase_areas: std::collections::BTreeMap<IosPhase, u64>,
+    pub host_analysis: Option<IrisHostAnalysis>,
+    pub metadata: Option<IrisMetadataFacts>,
 }
 
 impl Priced {
@@ -2204,6 +2656,8 @@ impl Priced {
         PricingFacts {
             pricing: self.pricing,
             phase_areas: self.phase_areas,
+            host_analysis: self.host_analysis,
+            metadata: self.metadata,
         }
     }
 }
@@ -3503,10 +3957,20 @@ fn restoration(
     resources: &RestorationResources,
     token: Option<&RestorationToken>,
 ) -> Result<Priced> {
+    restoration_with_sources(req, opts, resources, token, None)
+}
+
+fn restoration_with_sources(
+    req: &IosPricingRequest<'_>,
+    opts: Pricing,
+    resources: &RestorationResources,
+    token: Option<&RestorationToken>,
+    sources: Option<&GuardedSources<'_>>,
+) -> Result<Priced> {
     let spec = req.spec;
     crate::memory_strategy::refuse_unloadable_quant(crate::restoration::MODEL_ID, spec)
         .map_err(Error::from)?;
-    if !opts.assume_packed {
+    if !opts.assume_packed && sources.is_none() {
         crate::packed::refuse_dense_requested_as_packed(
             crate::restoration::MODEL_ID,
             &resources.export.weights_path(),
@@ -3515,37 +3979,73 @@ fn restoration(
     }
     let streamed = spec.load_shape == LoadShape::DeferredMaterialization;
     let config = &resources.export.config;
-    let bb = priced_backbone(
-        config,
-        &resources.export.weights_path(),
-        "",
-        spec.precision,
-        spec.quantize,
-        streamed,
-        config.model.in_channels as u64,
-        opts,
-    )?;
-    let states = held_states(&resources.export.empty_prompt_path())?;
-    let prompt_floor = stored(
-        &crate::stream::headers(&resources.export.empty_prompt_path())?,
-        |_| true,
-    );
-    let p = restoration_priced_plan(req, resources, token)?;
+    let owned_bb;
+    let bb = if let Some(sources) = sources {
+        &sources.bb
+    } else {
+        owned_bb = priced_backbone(
+            config,
+            &resources.export.weights_path(),
+            "",
+            spec.precision,
+            spec.quantize,
+            streamed,
+            config.model.in_channels as u64,
+            opts,
+        )?;
+        &owned_bb
+    };
+    let (states, prompt_floor) = if let Some(sources) = sources {
+        (
+            allocated(
+                sources
+                    .metadata
+                    .empty_embedding_elements
+                    .checked_mul(4)
+                    .ok_or_else(|| {
+                        Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
+                    })?,
+            ),
+            stored(&sources.empty_headers, |_| true),
+        )
+    } else {
+        let states = held_states(&resources.export.empty_prompt_path())?;
+        let prompt_floor = stored(
+            &crate::stream::headers(&resources.export.empty_prompt_path())?,
+            |_| true,
+        );
+        (states, prompt_floor)
+    };
+    let owned_plan;
+    let p = if let Some(GuardedSources {
+        task: GuardedTask::Restoration { plan, .. },
+        ..
+    }) = sources
+    {
+        plan
+    } else {
+        owned_plan = restoration_priced_plan(req, resources, token)?;
+        &owned_plan
+    };
     let (th, tw) = if p.single_pass() {
         (p.padded.height as u64, p.padded.width as u64)
     } else {
         (p.tile as u64, p.tile as u64)
     };
-    let host = crate::restoration::host_plane_bytes_metadata(&p)?;
+    let host = crate::restoration::host_plane_bytes_metadata(p)?;
     let axes = p.axis_bytes().map_err(Error::from)?;
-    let caller_rgb = match token {
-        Some(token) => token.wire()?.source_capacity_bytes,
-        None => req
-            .transform
-            .ok_or_else(|| Error::Unsupported("missing actual restoration context".into()))?
-            .image
-            .pixels
-            .capacity() as u64,
+    let caller_rgb = if let Some(sources) = sources {
+        sources.caller_bytes
+    } else {
+        match token {
+            Some(token) => token.wire()?.source_capacity_bytes,
+            None => req
+                .transform
+                .ok_or_else(|| Error::Unsupported("missing actual restoration context".into()))?
+                .image
+                .pixels
+                .capacity() as u64,
+        }
     };
     let readback = tensor_bytes(4, &[3, th, tw]);
     let tile_host_ambient = host
@@ -3769,10 +4269,20 @@ fn depth(
     export: &TaskExport,
     token: Option<&DepthToken>,
 ) -> Result<Priced> {
+    depth_with_sources(req, opts, export, token, None)
+}
+
+fn depth_with_sources(
+    req: &IosPricingRequest<'_>,
+    opts: Pricing,
+    export: &TaskExport,
+    token: Option<&DepthToken>,
+    sources: Option<&GuardedSources<'_>>,
+) -> Result<Priced> {
     let spec = req.spec;
     crate::memory_strategy::refuse_unloadable_quant(crate::depth::DEPTH_MODEL_ID, spec)
         .map_err(Error::from)?;
-    if !opts.assume_packed {
+    if !opts.assume_packed && sources.is_none() {
         crate::packed::refuse_dense_requested_as_packed(
             crate::depth::DEPTH_MODEL_ID,
             &export.weights_path(),
@@ -3782,21 +4292,43 @@ fn depth(
     let streamed = spec.load_shape == LoadShape::DeferredMaterialization;
     let config = &export.config;
     let input_channels = (config.model.in_channels + DEPTH_EXTRA_INPUT_CHANNELS) as u64;
-    let bb = priced_backbone(
-        config,
-        &export.weights_path(),
-        "pixel.",
-        spec.precision,
-        spec.quantize,
-        streamed,
-        input_channels,
-        opts,
-    )?;
-    let states = held_states(&export.empty_prompt_path())?;
-    let prompt_floor = stored(
-        &crate::stream::headers(&export.empty_prompt_path())?,
-        |_| true,
-    );
+    let owned_bb;
+    let bb = if let Some(sources) = sources {
+        &sources.bb
+    } else {
+        owned_bb = priced_backbone(
+            config,
+            &export.weights_path(),
+            "pixel.",
+            spec.precision,
+            spec.quantize,
+            streamed,
+            input_channels,
+            opts,
+        )?;
+        &owned_bb
+    };
+    let (states, prompt_floor) = if let Some(sources) = sources {
+        (
+            allocated(
+                sources
+                    .metadata
+                    .empty_embedding_elements
+                    .checked_mul(4)
+                    .ok_or_else(|| {
+                        Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
+                    })?,
+            ),
+            stored(&sources.empty_headers, |_| true),
+        )
+    } else {
+        let states = held_states(&export.empty_prompt_path())?;
+        let prompt_floor = stored(
+            &crate::stream::headers(&export.empty_prompt_path())?,
+            |_| true,
+        );
+        (states, prompt_floor)
+    };
     let window = export_window(streamed);
     // A streamed backbone holds a window only inside its forward.
     let db = bb.resident + states;
@@ -3810,7 +4342,13 @@ fn depth(
             "Iris depth has an incompatible work context".into(),
         ));
     }
-    let input_plan = if let Some(token) = token {
+    let input_plan = if let Some(GuardedSources {
+        task: GuardedTask::Depth { plan, .. },
+        ..
+    }) = sources
+    {
+        *plan
+    } else if let Some(token) = token {
         let wire = token.wire()?;
         if wire.patch != config.model.patch_size as u32 {
             return Err(Error::Unsupported(
@@ -3824,7 +4362,18 @@ fn depth(
                 "Iris depth pricing requires actual DepthRequest source/resolution".into(),
             )
         })?;
-        depth_input_plan(spec, actual)?
+        if sources.is_some() {
+            mlx_gen::gen_core::iris::depth::validate_depth_request(actual).map_err(Error::from)?;
+            mlx_gen::gen_core::iris::depth::plan_depth_input(
+                actual.image.width,
+                actual.image.height,
+                actual.resolution,
+                config.model.patch_size,
+            )
+            .map_err(Error::from)?
+        } else {
+            depth_input_plan(spec, actual)?
+        }
     };
     if input_plan.source_width != req.geometry.width
         || input_plan.source_height != req.geometry.height
@@ -3837,14 +4386,18 @@ fn depth(
         u64::from(input_plan.model_height),
         u64::from(input_plan.model_width),
     );
-    let caller_rgb = match token {
-        Some(token) => token.wire()?.source_capacity_bytes,
-        None => req
-            .depth
-            .ok_or_else(|| Error::Unsupported("missing actual depth context".into()))?
-            .image
-            .pixels
-            .capacity() as u64,
+    let caller_rgb = if let Some(sources) = sources {
+        sources.caller_bytes
+    } else {
+        match token {
+            Some(token) => token.wire()?.source_capacity_bytes,
+            None => req
+                .depth
+                .ok_or_else(|| Error::Unsupported("missing actual depth context".into()))?
+                .image
+                .pixels
+                .capacity() as u64,
+        }
     };
     let mut pricing = Priced::default();
     pricing.pricing.phase_not_run(
@@ -4560,5 +5113,267 @@ mod tests {
             assert!(ios_quantum_phase(label).is_some(), "{label} has no phase");
         }
         assert_eq!(ios_quantum_phase("not an Iris quantum"), None);
+    }
+}
+
+#[cfg(test)]
+mod guarded_source_tests {
+    use super::*;
+    use mlx_gen::gen_core::{
+        MemoryGeometry, MemoryNumericTier, MemorySelection, MemoryStrategy,
+        MemoryStrategyParameters,
+    };
+
+    /// HOST-only fixture construction, NOT a served proof issuer. The test deliberately compares
+    /// already-held source arithmetic against legacy loading arithmetic; guarded identity and
+    /// capacity safety are tested separately at their original read boundaries.
+    fn held_restoration<'a>(
+        req: &IosPricingRequest<'_>,
+        token: Option<&'a RestorationToken>,
+    ) -> GuardedSources<'a> {
+        let resources = RestorationResources::from_spec(req.spec, req.provider).unwrap();
+        let plan = restoration_priced_plan(req, &resources, token).unwrap();
+        let weights = mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(
+            resources.export.weights_path(),
+        )
+        .unwrap();
+        let empty = mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(
+            resources.export.empty_prompt_path(),
+        )
+        .unwrap();
+        let real: Vec<_> = weights
+            .tensors
+            .into_iter()
+            .map(|location| location.header)
+            .collect();
+        let empty_headers: Vec<_> = empty
+            .tensors
+            .into_iter()
+            .map(|location| location.header)
+            .collect();
+        let mut metadata = IrisMetadataFacts::default();
+        metadata
+            .capture_backbone(weights.file_len, &weights.header_json, &real)
+            .unwrap();
+        metadata
+            .capture_empty(empty.file_len, &empty.header_json, &empty_headers)
+            .unwrap();
+        let bb = priced_backbone(
+            &resources.export.config,
+            &resources.export.weights_path(),
+            "",
+            req.spec.precision,
+            req.spec.quantize,
+            req.spec.load_shape == LoadShape::DeferredMaterialization,
+            resources.export.config.model.in_channels as u64,
+            Pricing::default(),
+        )
+        .unwrap();
+        let caller_bytes = token
+            .map(|token| token.wire().unwrap().source_capacity_bytes)
+            .unwrap_or_else(|| req.transform.unwrap().image.pixels.capacity() as u64);
+        GuardedSources {
+            task: GuardedTask::Restoration { resources, plan },
+            bb,
+            raw_headers: real.into_iter().map(|h| (h.name.clone(), h)).collect(),
+            empty_headers,
+            metadata,
+            replay: token.map(IrisReplay::Restoration),
+            caller_bytes,
+        }
+    }
+
+    fn selection() -> MemorySelection {
+        MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: MemoryStrategyParameters::default(),
+            tier: MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            },
+        }
+    }
+
+    #[test]
+    fn replay_preflight_preserves_prefix_rejection_and_generation_gap_priority() {
+        let mut calls = 0;
+        let mut capacity = |bytes| {
+            assert!(bytes > 0);
+            calls += 1;
+            Ok(())
+        };
+        let wrong_family = "iris-depth-v1:{}";
+        check_replay_source_capacity_for_provider(
+            crate::restoration::MODEL_ID,
+            wrong_family,
+            &mut capacity,
+        )
+        .unwrap();
+        let original = RestorationToken::from_token(wrong_family).unwrap_err();
+        assert!(matches!(original, Error::Unsupported(ref reason)
+            if reason == "not an Iris restoration token"));
+        let generation = check_replay_source_capacity_for_provider(
+            crate::model::MODEL_ID,
+            "iris-sampling-v1:{}",
+            &mut capacity,
+        )
+        .unwrap_err();
+        assert!(generation
+            .to_string()
+            .contains("tokenizer/regex cold-construction"));
+        assert!(generation.to_string().contains("(aa011)"));
+        // Neither a known-invalid prefix nor the intentionally refused generation route is parsed.
+        assert_eq!(calls, 0);
+        check_replay_source_capacity_for_provider(
+            crate::restoration::MODEL_ID,
+            "iris-restoration-v1:{}",
+            &mut |bytes| {
+                assert!(bytes > 0);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(RestorationToken::from_token("iris-restoration-v1:{}").is_err());
+    }
+
+    #[test]
+    fn held_restoration_request_and_replay_preserve_native_and_host_recipes() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+            fixtures.join("tiny-snapshot/upscaler"),
+        ));
+        let work = mlx_gen::TransformRequest {
+            image: mlx_gen::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![128; 3 * 16 * 16],
+            },
+            target: mlx_gen::TargetSize::Scale(1.0),
+            color_fix: Some(false),
+            input_sizing: mlx_gen::InputSizing::Original,
+            ..Default::default()
+        };
+        let mode = crate::memory_strategy::memory_mode(IrisTask::Restoration);
+        let memory = GenerationMemory::default();
+        let selected = selection();
+        let req = IosPricingRequest {
+            provider: crate::restoration::MODEL_ID,
+            spec: &spec,
+            mode: &mode,
+            selection: &selected,
+            execution: &memory,
+            geometry: MemoryGeometry {
+                width: 16,
+                height: 16,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            generation: None,
+            transform: Some(&work),
+            depth: None,
+            token_window: 0,
+        };
+        let actual = held_restoration(&req, None);
+        let held = match &actual.task {
+            GuardedTask::Restoration { resources, .. } => {
+                restoration_with_sources(&req, Pricing::default(), resources, None, Some(&actual))
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let legacy = ios_pricing(&req).unwrap();
+        assert_eq!(held.pricing.phases, legacy.phases);
+        assert_eq!(held.pricing.windows, legacy.windows);
+        let old_native = native_ledger::cumulative_native_upper_any(&req, 16384).unwrap();
+        let cpu = native_ledger::cumulative_native_upper_from_sources(
+            &req,
+            &actual,
+            16384,
+            native_ledger::NativeBackend::Cpu,
+        )
+        .unwrap();
+        let metal = native_ledger::cumulative_native_upper_from_sources(
+            &req,
+            &actual,
+            16384,
+            native_ledger::NativeBackend::Metal,
+        )
+        .unwrap();
+        assert_eq!(cpu.max(metal), old_native);
+        assert_eq!(
+            native_ledger::host_payload_growth_upper(&req, Some(&actual)).unwrap(),
+            native_ledger::restoration_host_upper(&req).unwrap()
+        );
+        let token = canonical_restoration_token(&spec, &work).unwrap();
+        let replay_req = IosPricingRequest {
+            transform: None,
+            ..req
+        };
+        let replay = held_restoration(&replay_req, Some(&token));
+        assert_eq!(
+            native_ledger::cumulative_native_upper_with_restoration_token(
+                &replay_req,
+                &token,
+                16384,
+                native_ledger::NativeBackend::Cpu,
+                &replay
+            )
+            .unwrap(),
+            cpu
+        );
+        assert_eq!(
+            native_ledger::restoration_host_upper_with_token(&replay_req, &token, &replay).unwrap(),
+            native_ledger::restoration_host_upper(&req).unwrap()
+        );
+    }
+
+    #[test]
+    fn no_facts_host_refusal_never_opens_the_supplied_source() {
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+            Path::new("/this-Iris-source-must-not-be-read").to_owned(),
+        ));
+        let work = mlx_gen::TransformRequest {
+            image: mlx_gen::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 768],
+            },
+            target: mlx_gen::TargetSize::Scale(1.0),
+            ..Default::default()
+        };
+        let mode = crate::memory_strategy::memory_mode(IrisTask::Restoration);
+        let memory = GenerationMemory::default();
+        let selected = selection();
+        let req = IosPricingRequest {
+            provider: crate::restoration::MODEL_ID,
+            spec: &spec,
+            mode: &mode,
+            selection: &selected,
+            execution: &memory,
+            geometry: MemoryGeometry {
+                width: 16,
+                height: 16,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            generation: None,
+            transform: Some(&work),
+            depth: None,
+            token_window: 0,
+        };
+        let analysis = host_analysis_without_facts(
+            &req,
+            Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+        )
+        .unwrap();
+        assert_eq!(analysis.known, KnownHostFragments::default());
+        let reason = analysis.refusal().to_string();
+        assert!(reason.contains("exact libc0.2.183 Apple cfg-chain"));
+        assert!(reason.contains("SourceMetadataCapacity"));
+        assert!(!reason.contains("this-Iris-source"));
+        assert!(reason.len() < 2048);
     }
 }

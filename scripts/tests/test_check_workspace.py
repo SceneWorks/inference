@@ -2086,5 +2086,61 @@ class IosHostLockDriftTests(unittest.TestCase):
         self.gate.check_ios_host_lock_drift(self.gate.ROOT)
 
 
+
+
+class RegexArchiveLockTests(unittest.TestCase):
+    """Upstream archives never grant a blanket nested-lock or vendor-tree exclusion."""
+
+    def setUp(self):
+        self.gate = load_gate_module()
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.gate.ROOT = self.root
+        (self.root / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
+        self.manifest = {"workspace": {"exclude": []}, "patch": {"crates-io": {}}}
+        for name, (directory, version) in self.gate.REGEX_CERTIFICATE_PACKAGES.items():
+            root = self.root / directory
+            root.mkdir(parents=True)
+            (root / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "{version}"\n', encoding="utf-8")
+            (root / "Cargo.lock").write_text(f'[[package]]\nname = "{name}"\nversion = "{version}"\n', encoding="utf-8")
+            self.manifest["workspace"]["exclude"].append(directory)
+            self.manifest["patch"]["crates-io"][name] = {"path": directory}
+
+    def test_accepts_only_exact_registered_archival_locks(self):
+        self.gate.check_lockfile_inventory(self.manifest)
+        self.assertTrue(self.gate._within_workspace(self.root / "vendor/clip-regex/regex/Cargo.lock"))
+
+    def test_rejects_arbitrary_additional_nested_lock(self):
+        extra = self.root / "vendor/another-package/Cargo.lock"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("version = 4\n", encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_unregistered_vendor_archive_paths(self):
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory({})
+
+    def test_rejects_changed_package_version(self):
+        (self.root / "vendor/clip-regex/regex/Cargo.toml").write_text('[package]\nname = "regex"\nversion = "1.13.1"\n', encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_missing_specific_exclusion_or_different_patch_path(self):
+        self.manifest["workspace"]["exclude"].remove("vendor/clip-regex/regex")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+        self.manifest["workspace"]["exclude"].append("vendor/clip-regex/regex")
+        self.manifest["patch"]["crates-io"]["regex"]["path"] = "vendor/another-regex"
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+    def test_rejects_changed_archival_own_package_version(self):
+        (self.root / "vendor/clip-regex/regex/Cargo.lock").write_text('[[package]]\nname = "regex"\nversion = "1.13.1"\n', encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            self.gate.check_lockfile_inventory(self.manifest)
+
+
 if __name__ == "__main__":
     unittest.main()

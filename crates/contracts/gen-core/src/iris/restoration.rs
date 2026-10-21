@@ -149,6 +149,11 @@ impl RestorationResources {
         )
     }
 
+    /// Validate an export already resolved by an observed source reader, without reopening it.
+    pub fn from_export(export: TaskExport, model_id: &str) -> Result<Self> {
+        Self::checked(export, model_id)
+    }
+
     fn checked(export: TaskExport, model_id: &str) -> Result<Self> {
         let settings = RestorationSettings::from_task(&export.settings, model_id)?;
         settings.validate(&export.config, model_id)?;

@@ -577,6 +577,29 @@ pub(crate) fn price_metadata(
     control_count: u32,
     source: Option<&mlx_gen_sdxl::sampling::SamplingSourceFacts>,
 ) -> Result<mlx_gen::ios_pricing::IosPricing> {
+    price_metadata_using_source_capacity(req, token, mask_count, control_count, source, None)
+}
+
+/// The SAME anchor metadata pricing, with a real borrowed guard at existing Iris reads.
+pub(crate) fn price_metadata_with_source_capacity(
+    req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
+    token: &str,
+    mask_count: u32,
+    control_count: u32,
+    source: Option<&mlx_gen_sdxl::sampling::SamplingSourceFacts>,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<mlx_gen::ios_pricing::IosPricing> {
+    price_metadata_using_source_capacity(req, token, mask_count, control_count, source, Some(next))
+}
+
+fn price_metadata_using_source_capacity(
+    req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
+    token: &str,
+    mask_count: u32,
+    control_count: u32,
+    source: Option<&mlx_gen_sdxl::sampling::SamplingSourceFacts>,
+    next: Option<&mut dyn FnMut(u64) -> Result<()>>,
+) -> Result<mlx_gen::ios_pricing::IosPricing> {
     if req.generation.is_some() || req.transform.is_some() || req.depth.is_some() {
         return Err(Error::Unsupported(
             "anchor metadata replay rejects a competing actual work context".into(),
@@ -600,6 +623,26 @@ pub(crate) fn price_metadata(
         return Err(Error::Unsupported(
             "SDXL source context belongs to another provider".into(),
         ));
+    }
+    if let (true, Some(next)) = (
+        matches!(
+            req.provider,
+            "iris_3b" | crate::ios_admission::IRIS_RESTORE_ID | crate::ios_admission::IRIS_DEPTH_ID
+        ),
+        next,
+    ) {
+        mlx_gen_iris::ios_pricing::check_replay_source_capacity_for_provider(
+            req.provider,
+            token,
+            next,
+        )?;
+        let replay = IrisAnchorReplay::parse(req.provider, token)?;
+        return mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
+            req,
+            Some(replay.as_replay()),
+            next,
+        )
+        .map(|facts| facts.pricing);
     }
     match req.provider {
         crate::sdxl::SDXL_ID => {

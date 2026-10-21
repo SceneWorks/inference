@@ -67,15 +67,16 @@ pub mod pricing;
 mod refusal;
 pub mod sampling;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
+pub use ios_admission::{
+    admit, admit_with_baseline, admit_with_boundary, admit_with_boundary_and_key_capacity,
+    build_candidate, capacity_budget, configured_endpoint, configured_load_form, evidence_key,
+    evidence_key_with_key_capacity, execution_for, execution_key, tier_label, token_window,
+    validate_actual, work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork,
+    PremisePolicy, SourceCapacityBoundary, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+};
 /// The labelled bounded device-capture permit; compiled only for the device harness.
 #[cfg(feature = "device-capture")]
-pub use ios_admission::capture_permit;
-pub use ios_admission::{
-    admit, admit_with_baseline, admit_with_boundary, build_candidate, capacity_budget,
-    configured_endpoint, configured_load_form, evidence_key, execution_for, execution_key,
-    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, AdmissionBasis,
-    IosCandidate, IosWork, PremisePolicy, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
-};
+pub use ios_admission::{capture_permit, capture_permit_with_key_capacity};
 pub use layout::{
     architecture_digest, artifact_layout_digest, capture_artifact_stem, configured_variant_digest,
     hex,

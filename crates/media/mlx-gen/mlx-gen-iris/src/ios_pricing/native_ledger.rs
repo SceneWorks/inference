@@ -1752,14 +1752,39 @@ fn generation_upper(
     Ok(())
 }
 
-fn depth_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> {
-    // depth.rs:126-143 refuses installed adapters on the task itself.
-    if !req.spec.adapters.is_empty() {
-        return Err(Error::Unsupported(format!(
-            "{}: LoadSpec::adapters is not supported by the Iris-3B depth task",
-            crate::depth::DEPTH_MODEL_ID
-        )));
+pub(super) fn check_encoder_free_native_axes(req: &IosPricingRequest<'_>) -> Result<()> {
+    if req.provider == crate::depth::DEPTH_MODEL_ID {
+        if !req.spec.adapters.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{}: LoadSpec::adapters is not supported by the Iris-3B depth task",
+                crate::depth::DEPTH_MODEL_ID
+            )));
+        }
+    } else if req.provider == crate::restoration::MODEL_ID {
+        crate::memory_strategy::refuse_unloadable_quant(crate::restoration::MODEL_ID, req.spec)
+            .map_err(Error::from)?;
+        for (field, set) in [
+            ("adapters", !req.spec.adapters.is_empty()),
+            ("text_encoder", req.spec.text_encoder.is_some()),
+            ("control", req.spec.control.is_some()),
+            ("extra_controls", !req.spec.extra_controls.is_empty()),
+            ("ip_adapter", req.spec.ip_adapter.is_some()),
+            ("pid", req.spec.pid.is_some()),
+            ("identity", req.spec.identity.is_some()),
+        ] {
+            if set {
+                return Err(Error::Unsupported(format!(
+                    "{}: LoadSpec::{field} is not supported by the Iris-3B restoration route",
+                    crate::restoration::MODEL_ID
+                )));
+            }
+        }
     }
+    Ok(())
+}
+
+fn depth_upper(req: &IosPricingRequest<'_>, l: &mut NativeLedger) -> Result<()> {
+    check_encoder_free_native_axes(req)?;
     let actual = req.depth.ok_or_else(|| {
         Error::Unsupported("Iris native depth recipe requires actual source/resolution".into())
     })?;
@@ -3084,24 +3109,7 @@ fn restoration_upper_replay(
             "not an Iris restoration native replay".into(),
         ));
     }
-    crate::memory_strategy::refuse_unloadable_quant(crate::restoration::MODEL_ID, req.spec)
-        .map_err(Error::from)?;
-    for (field, set) in [
-        ("adapters", !req.spec.adapters.is_empty()),
-        ("text_encoder", req.spec.text_encoder.is_some()),
-        ("control", req.spec.control.is_some()),
-        ("extra_controls", !req.spec.extra_controls.is_empty()),
-        ("ip_adapter", req.spec.ip_adapter.is_some()),
-        ("pid", req.spec.pid.is_some()),
-        ("identity", req.spec.identity.is_some()),
-    ] {
-        if set {
-            return Err(Error::Unsupported(format!(
-                "{}: LoadSpec::{field} is not supported by the Iris-3B restoration route",
-                crate::restoration::MODEL_ID
-            )));
-        }
-    }
+    check_encoder_free_native_axes(req)?;
     let resources = RestorationResources::from_spec(req.spec, crate::restoration::MODEL_ID)
         .map_err(Error::from)?;
     let config = &resources.export.config;
@@ -3179,6 +3187,146 @@ fn restoration_upper_replay(
     )
 }
 
+fn depth_upper_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &GuardedSources<'_>,
+    l: &mut NativeLedger,
+) -> Result<()> {
+    let GuardedTask::Depth { export, plan } = &sources.task else {
+        return Err(Error::Unsupported(
+            "not an Iris depth source context".into(),
+        ));
+    };
+    let bb = &sources.bb;
+    let channels = export.config.model.in_channels as u64;
+    let (h, w) = (u64::from(plan.model_height), u64::from(plan.model_width));
+    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+    load_backbone_set(
+        l,
+        &sources.raw_headers,
+        bb.facts.cw,
+        "pixel.",
+        |name| !name.starts_with("depth_reducer.") && (!streamed || Stack::of(name).is_none()),
+        None,
+    )?;
+    for name in ["depth_reducer.weight", "depth_reducer.bias"] {
+        let h = sources
+            .raw_headers
+            .get(name)
+            .ok_or_else(|| Error::MissingTensor(name.into()))?;
+        raw_header(l, h)?;
+        cast_header(l, h, compute_dtype(req.spec.precision))?;
+    }
+    // EmptyPrompt::from_path decodes via safetensors host bytes; only its f32 embeddings from_slice
+    // is a native allocation. No raw MLX Load exists for embeddings OR mask on this path.
+    l.array(4, sources.metadata.empty_embedding_elements)?;
+    l.array(4, p!(3, h, w))?; // predict RGB from_slice
+    l.scalar(4)?; // zeros fill scalar
+    l.array(4, p!(DEPTH_EXTRA_INPUT_CHANNELS, h, w))?;
+    l.concat(
+        4,
+        p!(plus(channels, DEPTH_EXTRA_INPUT_CHANNELS as u64)?, h, w),
+        2,
+    )?;
+    l.array(4, 1)?; // t_model from_slice
+                    // Empty prompt broadcast is a view. Host preprocessing, map readback and source resize use
+                    // only Rust Vec storage and intentionally contribute zero to MLX Active.
+    Graph {
+        l: &mut *l,
+        bb: &bb.facts,
+    }
+    .forward(
+        1,
+        h,
+        w,
+        ForwardMode {
+            by_row: false,
+            first: true,
+            streamed,
+        },
+        mlx_gen::AttentionPlan::UNBOUNDED,
+    )?;
+    // depth_reducer_body is addmm, NOT a convolution lowering despite its checkpoint key.
+    l.reshape_copy(4, p!(channels, h, w))?;
+    l.cast(p!(channels, h, w), 4, bb.facts.cw)?;
+    l.matmul(bb.facts.cw, 1, p!(h, w), 1, channels)?;
+    l.cast(p!(h, w), bb.facts.cw, 4)?;
+    Ok(())
+}
+
+fn restoration_upper_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &GuardedSources<'_>,
+    l: &mut NativeLedger,
+) -> Result<()> {
+    let GuardedTask::Restoration { plan, .. } = &sources.task else {
+        return Err(Error::Unsupported(
+            "not an Iris restoration source context".into(),
+        ));
+    };
+    let bb = &sources.bb;
+    let streamed = req.spec.load_shape == LoadShape::DeferredMaterialization;
+    load_backbone_set(
+        l,
+        &sources.raw_headers,
+        bb.facts.cw,
+        "",
+        |name| !streamed || Stack::of(name).is_none(),
+        None,
+    )?;
+    l.array(4, sources.metadata.empty_embedding_elements)?;
+    let (h, w) = if plan.single_pass() {
+        (u64::from(plan.padded.height), u64::from(plan.padded.width))
+    } else {
+        (u64::from(plan.tile), u64::from(plan.tile))
+    };
+    repeated_native_calls(
+        l,
+        plan.forward_count().map_err(Error::from)?,
+        |ledger, first| {
+            ledger.array(4, p!(3, h, w))?; // velocity_body tile upload
+            ledger.array(4, 1)?; // model time from_slice
+            Graph {
+                l: &mut *ledger,
+                bb: &bb.facts,
+            }
+            .forward(
+                1,
+                h,
+                w,
+                ForwardMode {
+                    by_row: false,
+                    first,
+                    streamed,
+                },
+                mlx_gen::AttentionPlan::UNBOUNDED,
+            )
+            // velocity's f32 as_dtype is identity; its flatten/readback creates no new native backing.
+        },
+    )
+}
+
+pub(super) fn cumulative_native_upper_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &GuardedSources<'_>,
+    page: u64,
+    backend: NativeBackend,
+) -> Result<u64> {
+    req.validate_work_context()?;
+    check_encoder_free_native_axes(req)?;
+    if backend == NativeBackend::Metal && std::env::var_os("MLX_SDPA_BLOCKS").is_some() {
+        return Err(Error::Unsupported("Iris native certificate: MLX_SDPA_BLOCKS override is not bound by any execution witness".into()));
+    }
+    let mut ledger = NativeLedger::new(page, backend)?;
+    match &sources.task {
+        GuardedTask::Depth { .. } => depth_upper_from_sources(req, sources, &mut ledger)?,
+        GuardedTask::Restoration { .. } => {
+            restoration_upper_from_sources(req, sources, &mut ledger)?
+        }
+    }
+    Ok(ledger.total)
+}
+
 /// Native recipe replay only. This does NOT itself grant a restoration certificate or combine
 /// native Active with host payload/process heap; the parent bounder owns that separate law.
 pub(super) fn cumulative_native_upper_with_restoration_token(
@@ -3186,13 +3334,10 @@ pub(super) fn cumulative_native_upper_with_restoration_token(
     token: &RestorationToken,
     page: u64,
     backend: NativeBackend,
+    sources: &GuardedSources<'_>,
 ) -> Result<u64> {
-    if backend == NativeBackend::Metal && std::env::var_os("MLX_SDPA_BLOCKS").is_some() {
-        return Err(Error::Unsupported("Iris native certificate: MLX_SDPA_BLOCKS override is not bound by any execution witness".into()));
-    }
-    let mut l = NativeLedger::new(page, backend)?;
-    restoration_upper_replay(req, Some(token), &mut l)?;
-    Ok(l.total)
+    sources.check_restoration_token(req, token)?;
+    cumulative_native_upper_from_sources(req, sources, page, backend)
 }
 
 /// Opaque reserved proof input. No constructor is exposed while aa011's COMPLETE cold
@@ -3214,6 +3359,338 @@ const TOKENIZER_HOST_GAP: &str =
     "tokenizer/regex cold-construction and first-search host allocation upper unproved (aa011)";
 const METADATA_HOST_GAP: &str =
     "Iris metadata host allocation upper unproved: exact libc0.2.183 Apple cfg-chain / pthread_mutex_t requested layout missing";
+
+/// Known requested-layout contributions, not a certificate. All fields are checked u64 sums;
+/// provenance is a closed bit set, never a caller-controlled path or diagnostic string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KnownHostFragments {
+    pub input_buffers: u64,
+    pub normalized_headers: u64,
+    pub yaml_trees: u64,
+    pub streamed_keys: u64,
+    pub json_layouts: u64,
+    pub inventory_vectors: u64,
+    pub payload: u64,
+    pub callbacks: u64,
+    /// Bit 0: retained inventory; 1: held config; 2: held backbone header;
+    /// 3: held empty-prompt header; 4: held task-stamp header.
+    pub provenance: u8,
+}
+
+impl KnownHostFragments {
+    fn total(self) -> Result<u64> {
+        [
+            self.input_buffers,
+            self.normalized_headers,
+            self.yaml_trees,
+            self.streamed_keys,
+            self.json_layouts,
+            self.inventory_vectors,
+            self.payload,
+            self.callbacks,
+        ]
+        .into_iter()
+        .try_fold(0, plus)
+    }
+}
+
+/// Fixed named gaps. No request-provided text is copied into the incomplete analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrisHostGap {
+    CallerCallbacks,
+    TokenizerRegex,
+    AppleMutexAbi,
+    CapturedMetadata,
+    SourceMetadataCapacity,
+    SourceVerification,
+}
+
+/// An incomplete analysis remains useful without ever being returned as a complete host upper.
+/// The fixed array avoids a diagnostic Vec allocation before metadata admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrisHostAnalysis {
+    pub known: KnownHostFragments,
+    pub missing: [Option<IrisHostGap>; 5],
+    /// Native Active only; never part of the known HOST subtotal.
+    pub native_replay_upper: Option<u64>,
+    pub worker_stack_request_bytes: u64,
+    callback_events: CallbackEventUpper,
+    source_guard_gap: Option<&'static str>,
+}
+
+impl IrisHostAnalysis {
+    fn inventory_only(req: &IosPricingRequest<'_>) -> Result<Self> {
+        let mut known = KnownHostFragments::default();
+        if req.spec.source_inventory().is_some() {
+            known.inventory_vectors = known_inventory_verify_vectors(req)?;
+            known.provenance = 1;
+        }
+        Ok(Self {
+            known,
+            native_replay_upper: None,
+            worker_stack_request_bytes: 0,
+            callback_events: CallbackEventUpper::default(),
+            source_guard_gap: None,
+            missing: [
+                Some(IrisHostGap::AppleMutexAbi),
+                Some(IrisHostGap::CapturedMetadata),
+                None,
+                None,
+                None,
+            ],
+        })
+    }
+
+    pub fn with_callback(
+        mut self,
+        callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+    ) -> Result<Self> {
+        match callback {
+            None => {
+                self.missing.rotate_right(1);
+                self.missing[0] = Some(IrisHostGap::CallerCallbacks);
+            }
+            Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating) => {}
+            Some(mlx_gen::ios_pricing::IosCallbackHost::Bounded {
+                fixed_bytes,
+                per_progress_event_bytes,
+                per_preview_event_bytes,
+                per_quantum_mark_bytes,
+                per_quantum_label_byte_bytes,
+            }) => {
+                self.known.callbacks = self.callback_events.priced(
+                    fixed_bytes,
+                    per_progress_event_bytes,
+                    per_preview_event_bytes,
+                    per_quantum_mark_bytes,
+                    per_quantum_label_byte_bytes,
+                )?
+            }
+        }
+        self.known.total()?;
+        Ok(self)
+    }
+
+    /// Bounded formatting: static keys/reasons and at most 20 decimal digits per u64 field.
+    /// The known sum is diagnostic ONLY. The missing Mutex term is never replaced with zero.
+    pub fn refusal(self) -> Error {
+        let prefix = match self.missing.into_iter().flatten().next() {
+            Some(IrisHostGap::CallerCallbacks) => CALLBACK_HOST_GAP,
+            Some(IrisHostGap::TokenizerRegex) => TOKENIZER_HOST_GAP,
+            _ => METADATA_HOST_GAP,
+        };
+        let k = self.known;
+        Error::Unsupported(format!(
+            "{prefix}; known_requested_fragments[not_certificate]: input={:020},normalized={:020},yaml={:020},keys={:020},json={:020},inventory={:020},payload={:020},callbacks={:020},provenance={:03}; missing={:?}; native_replay_upper={:?}; worker_stack_request_bytes={:020}; source_guard_gap={:?}",
+            k.input_buffers, k.normalized_headers, k.yaml_trees, k.streamed_keys,
+            k.json_layouts, k.inventory_vectors, k.payload, k.callbacks, k.provenance,
+            self.missing, self.native_replay_upper, self.worker_stack_request_bytes, self.source_guard_gap,
+        ))
+    }
+}
+
+/// Facts accumulated while existing readers OWN their input bytes. No file path is retained,
+/// no tensor is loaded, and no second read is permitted to manufacture these facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IrisMetadataFacts {
+    pub known: KnownHostFragments,
+    pub config_bytes: u64,
+    pub backbone_file_bytes: u64,
+    pub backbone_header_bytes: u64,
+    pub empty_file_bytes: u64,
+    pub empty_header_bytes: u64,
+    pub empty_embedding_elements: u64,
+}
+
+impl IrisMetadataFacts {
+    fn add_layouts(&mut self, layouts: KnownMetadataLayouts) -> Result<()> {
+        // Check both the component composition and each accumulator; no saturation/drop credit.
+        self.known.input_buffers = plus(self.known.input_buffers, layouts.direct_input_buffers)?;
+        self.known.normalized_headers = plus(
+            self.known.normalized_headers,
+            layouts.normalized_header_vectors,
+        )?;
+        self.known.yaml_trees = plus(
+            self.known.yaml_trees,
+            layouts.config_parser_vecs_and_strings,
+        )?;
+        self.known.streamed_keys = plus(
+            self.known.streamed_keys,
+            layouts.streamed_key_string_payloads,
+        )?;
+        Ok(())
+    }
+}
+
+pub(super) fn source_guard_refusal(req: &IosPricingRequest<'_>, error: Error) -> Result<Error> {
+    use mlx_gen::gen_core::SourceInventory;
+    let gap = match &error {
+        Error::Unsupported(reason) => [
+            SourceInventory::READDIR_METADATA_GAP,
+            SourceInventory::PIN_VERIFY_METADATA_GAP,
+            SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
+            SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+        ]
+        .into_iter()
+        .find(|gap| reason.as_str() == *gap),
+        _ => None,
+    };
+    if let Some(gap) = gap {
+        let mut analysis = IrisHostAnalysis::inventory_only(req)?;
+        analysis.source_guard_gap = Some(gap);
+        analysis.missing[2] = Some(IrisHostGap::SourceVerification);
+        Ok(analysis.refusal())
+    } else {
+        // Never relabel arbitrary IO/invalid JSON/unknown dtype/wrong-task errors as an ABI gap.
+        Ok(error)
+    }
+}
+
+pub fn host_analysis_without_facts(
+    req: &IosPricingRequest<'_>,
+    callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
+) -> Result<IrisHostAnalysis> {
+    req.validate_work_context()?;
+    let mut analysis = IrisHostAnalysis::inventory_only(req)?;
+    if req.provider == crate::model::MODEL_ID {
+        analysis.missing.rotate_right(1);
+        analysis.missing[0] = Some(IrisHostGap::TokenizerRegex);
+    }
+    analysis.missing[3] = Some(IrisHostGap::SourceMetadataCapacity);
+    analysis.with_callback(callback)
+}
+
+pub(super) fn require_guarded_generation_gap() -> Result<()> {
+    required_tokenizer_host_bytes(crate::model::MODEL_ID, None).map(|_| ())
+}
+
+pub(super) fn require_guarded_host_route(req: &IosPricingRequest<'_>) -> Result<()> {
+    required_tokenizer_host_bytes(req.provider, None).map(|_| ())
+}
+
+impl IrisMetadataFacts {
+    pub(super) fn observe(
+        &mut self,
+        event: mlx_gen::gen_core::weightsmeta::SourceMetadataRead<'_>,
+        capacity: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        use mlx_gen::gen_core::weightsmeta::SourceMetadataRead;
+        match event {
+            SourceMetadataRead::Input(bytes) => capacity(bytes),
+            SourceMetadataRead::Yaml(bytes) => {
+                let count = captured_metadata_bytes(bytes.len() as u64, None)?;
+                let layouts = known_metadata_layouts(count.file_bytes, 1, 0, 0, &[], 0)?;
+                capacity(layouts.total()?)?;
+                self.config_bytes = count.file_bytes;
+                self.add_layouts(layouts)?;
+                self.known.provenance |= 2;
+                Ok(())
+            }
+            SourceMetadataRead::YamlParse(bytes) => {
+                capacity(known_yaml_tree_layout(bytes.len() as u64)?)
+            }
+            SourceMetadataRead::Json { file_bytes, bytes } => {
+                captured_metadata_bytes(file_bytes, Some(bytes))?;
+                // No AST, tensor, Vec, String or native allocation in the scanner/layout law.
+                let parser = authenticated_metadata::unvalidated_json_parse_layout(bytes)?;
+                let normalized = authenticated_metadata::normalized_header_layout(bytes)?;
+                capacity(plus(parser, normalized)?)?;
+                self.known.json_layouts = plus(self.known.json_layouts, parser)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn capture_backbone(
+        &mut self,
+        file_bytes: u64,
+        json: &[u8],
+        headers: &[Header],
+    ) -> Result<()> {
+        let captured = captured_metadata_bytes(file_bytes, Some(json))?;
+        self.backbone_file_bytes = captured.file_bytes;
+        self.backbone_header_bytes = captured.header_bytes.ok_or_else(overflow)?;
+        self.add_layouts(known_metadata_layouts(
+            0,
+            0,
+            self.backbone_header_bytes,
+            1,
+            headers,
+            1,
+        )?)?;
+        self.known.provenance |= 4 | 16; // TaskExport's observed task-stamp read preceded this.
+        Ok(())
+    }
+
+    pub(super) fn capture_empty(
+        &mut self,
+        file_bytes: u64,
+        json: &[u8],
+        headers: &[Header],
+    ) -> Result<()> {
+        let captured = captured_metadata_bytes(file_bytes, Some(json))?;
+        self.empty_file_bytes = captured.file_bytes;
+        self.empty_header_bytes = captured.header_bytes.ok_or_else(overflow)?;
+        self.empty_embedding_elements = header_elements(
+            headers
+                .iter()
+                .find(|header| header.name == "embeddings")
+                .ok_or_else(|| Error::MissingTensor("empty-prompt embeddings".into()))?,
+        )?;
+        self.add_layouts(known_metadata_layouts(
+            0,
+            0,
+            self.empty_header_bytes,
+            1,
+            headers,
+            0,
+        )?)?;
+        self.known.provenance |= 8;
+        Ok(())
+    }
+
+    pub(super) fn check_replay_token(
+        &mut self,
+        token: &str,
+        capacity: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        let json = token
+            .split_once(':')
+            .ok_or_else(|| Error::Unsupported("invalid Iris replay token".into()))?
+            .1
+            .as_bytes();
+        let parser = authenticated_metadata::json_parse_layout(json)?;
+        capacity(parser)?;
+        self.known.json_layouts = plus(self.known.json_layouts, parser)?;
+        Ok(())
+    }
+}
+
+pub(super) fn host_analysis_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &GuardedSources<'_>,
+    metadata: &IrisMetadataFacts,
+) -> Result<IrisHostAnalysis> {
+    let mut analysis = IrisHostAnalysis::inventory_only(req)?;
+    analysis.known = metadata.known;
+    analysis.known.inventory_vectors = known_inventory_verify_vectors(req)?;
+    analysis.known.provenance |= 1;
+    analysis.known.payload = host_payload_growth_upper(req, Some(sources))?;
+    analysis.callback_events = callback_events_from_sources(req, sources)?;
+    if let GuardedTask::Restoration { plan, .. } = &sources.task {
+        if plan.color_fix {
+            analysis.worker_stack_request_bytes = product(&[
+                3,
+                mlx_gen::gen_core::iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
+            ])?;
+        }
+    }
+    // CapturedMetadata remains a named gap: observed read fragments are not a proof of EVERY
+    // execution-time parser/key/container call or callback. No constructor silently closes it.
+    analysis.known.total()?;
+    Ok(analysis)
+}
 
 fn required_tokenizer_host_bytes(
     provider: &str,
@@ -3246,7 +3723,11 @@ pub(super) fn host_growth_upper_with_bounds(
     tokenizer: Option<&TokenizerHostBound>,
     callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
 ) -> Result<u64> {
-    host_growth_upper_checked(req, metadata, tokenizer, callback, |_| Ok(()))
+    host_growth_upper_checked(req, metadata, tokenizer, callback, |_| {
+        Err(Error::Unsupported(
+            "Iris source metadata capacity check not supplied".into(),
+        ))
+    })
 }
 
 /// Capacity seam for the SDK caller: supply runtime_ios::media::source_metadata_capacity here
@@ -3264,14 +3745,16 @@ pub(super) fn host_growth_upper_checked(
     req.validate_work_context()?;
     let callback = callback.ok_or_else(|| Error::Unsupported(CALLBACK_HOST_GAP.into()))?;
     let tokenizer = required_tokenizer_host_bytes(req.provider, tokenizer)?;
-    let metadata = metadata
-        .ok_or_else(|| Error::Unsupported(METADATA_HOST_GAP.into()))?
-        .cumulative_requested_bytes;
+    let metadata = match metadata {
+        Some(bound) => bound.cumulative_requested_bytes,
+        None => return Err(IrisHostAnalysis::inventory_only(req)?.refusal()),
+    };
     let source_context = plus(metadata, tokenizer)?;
     source_metadata_capacity(source_context)?;
     let payload = match req.provider {
-        crate::restoration::MODEL_ID => restoration_host_upper(req)?,
-        crate::depth::DEPTH_MODEL_ID => host_payload::depth(req)?,
+        crate::restoration::MODEL_ID | crate::depth::DEPTH_MODEL_ID => {
+            host_payload_growth_upper(req, None)?
+        }
         crate::model::MODEL_ID => host_payload::generation(req)?,
         _ => {
             return Err(Error::Unsupported(
@@ -3300,9 +3783,20 @@ pub(super) fn host_growth_upper_checked(
 
 /// Known requested image/table/axis/plan payload upper ONLY. It excludes unproved parser/key and
 /// tokenizer terms and MUST NOT be substituted for host_growth_upper in a live certificate.
-pub(super) fn host_payload_growth_upper(req: &IosPricingRequest<'_>) -> Result<u64> {
+pub(super) fn host_payload_growth_upper(
+    req: &IosPricingRequest<'_>,
+    sources: Option<&GuardedSources<'_>>,
+) -> Result<u64> {
     req.validate_work_context()?;
     required_tokenizer_host_bytes(req.provider, None)?; // refuse BEFORE invoking an unproved tokenizer
+    if let Some(sources) = sources {
+        return match sources.replay {
+            Some(IrisReplay::Restoration(token)) => {
+                restoration_host_upper_with_token(req, token, sources)
+            }
+            _ => host_payload::from_sources(sources),
+        };
+    }
     match req.provider {
         crate::restoration::MODEL_ID => restoration_host_upper(req),
         crate::depth::DEPTH_MODEL_ID => host_payload::depth(req),
@@ -3322,8 +3816,10 @@ pub(super) fn restoration_host_upper(req: &IosPricingRequest<'_>) -> Result<u64>
 pub(super) fn restoration_host_upper_with_token(
     req: &IosPricingRequest<'_>,
     token: &RestorationToken,
+    sources: &GuardedSources<'_>,
 ) -> Result<u64> {
-    host_payload::restoration(req, Some(token))
+    sources.check_restoration_token(req, token)?;
+    host_payload::from_sources(sources)
 }
 
 mod host_payload {
@@ -3550,6 +4046,59 @@ mod host_payload {
             rgb(p, plan.output)?; // planes.concat
         }
         p.vec::<u8>(product(&[3, pixels(plan.output)?])?) // Planes::to_rgb8, host only
+    }
+
+    pub(super) fn from_sources(sources: &GuardedSources<'_>) -> Result<u64> {
+        let mut p = Payload::default();
+        let config = &sources.export().config;
+        p.growth::<u8>(sources.metadata.empty_file_bytes)?;
+        p.vec::<f32>(sources.metadata.empty_embedding_elements)?;
+        p.vec::<i32>(config.model.text_len as u64)?;
+        p.vec::<i32>(4)?;
+        match &sources.task {
+            GuardedTask::Restoration { plan, .. } => {
+                p.vec::<Vec<i32>>(1)?;
+                restoration_driver(&mut p, plan, sources.caller_bytes)?;
+                let (h, w) = if plan.single_pass() {
+                    (u64::from(plan.padded.height), u64::from(plan.padded.width))
+                } else {
+                    (u64::from(plan.tile), u64::from(plan.tile))
+                };
+                let calls = plan.forward_count().map_err(Error::from)?;
+                backbone(&mut p, &config.model, 1, h, w, true)?;
+                if calls > 1 {
+                    p.repeat(calls - 1, |one| {
+                        backbone(one, &config.model, 1, h, w, false)
+                    })?;
+                }
+            }
+            GuardedTask::Depth { plan, .. } => {
+                let source = Dims::new(plan.source_width, plan.source_height);
+                let model = Dims::new(plan.model_width, plan.model_height);
+                p.bytes(sources.caller_bytes)?;
+                depth_input_planes(&mut p, source, model, plan.resized())?;
+                p.vec::<f32>(1)?;
+                p.vec::<i32>(config.model.text_len as u64)?;
+                p.vec::<Vec<i32>>(1)?;
+                backbone(
+                    &mut p,
+                    &config.model,
+                    1,
+                    u64::from(plan.model_height),
+                    u64::from(plan.model_width),
+                    true,
+                )?;
+                p.vec::<f32>(pixels(model)?)?;
+                if plan.resized() {
+                    p.vec::<(usize, usize, f32, f32)>(plus(
+                        u64::from(plan.source_height),
+                        u64::from(plan.source_width),
+                    )?)?;
+                    p.vec::<f32>(pixels(source)?)?;
+                }
+            }
+        }
+        Ok(p.bytes)
     }
 
     pub(super) fn restoration(
@@ -3995,7 +4544,12 @@ mod host_payload {
                 &req,
                 Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
             ) {
-                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                Err(Error::Unsupported(reason)) => {
+                    assert!(reason.starts_with(METADATA_HOST_GAP));
+                    assert!(reason.contains("known_requested_fragments[not_certificate]"));
+                    assert!(reason.contains("AppleMutexAbi"));
+                    assert!(reason.contains("CapturedMetadata"));
+                }
                 other => panic!("missing metadata proof accepted: {other:?}"),
             }
             let supplied = MetadataHostBound {
@@ -4034,15 +4588,24 @@ mod host_payload {
                 &depth_req,
                 Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
             ) {
-                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                Err(Error::Unsupported(reason)) => {
+                    assert!(reason.starts_with(METADATA_HOST_GAP));
+                    assert!(reason.contains("known_requested_fragments[not_certificate]"));
+                    assert!(reason.contains("AppleMutexAbi"));
+                    assert!(reason.contains("CapturedMetadata"));
+                }
                 other => panic!("depth metadata proof accepted: {other:?}"),
             }
             assert_eq!(
-                host_growth_upper_with_bounds(
+                host_growth_upper_checked(
                     &depth_req,
                     Some(&supplied),
                     None,
-                    Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating)
+                    Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+                    |bytes| {
+                        assert_eq!(bytes, 777);
+                        Ok(())
+                    },
                 )
                 .unwrap(),
                 depth(&depth_req).unwrap().checked_add(777).unwrap()
@@ -4077,7 +4640,12 @@ mod host_payload {
                 Some(&tokenizer),
                 Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
             ) {
-                Err(Error::Unsupported(reason)) => assert_eq!(reason, METADATA_HOST_GAP),
+                Err(Error::Unsupported(reason)) => {
+                    assert!(reason.starts_with(METADATA_HOST_GAP));
+                    assert!(reason.contains("known_requested_fragments[not_certificate]"));
+                    assert!(reason.contains("AppleMutexAbi"));
+                    assert!(reason.contains("CapturedMetadata"));
+                }
                 other => panic!("tokenizer-only bound accepted: {other:?}"),
             }
             // Full generation payload arithmetic with TEST-ONLY proof terms. This creates no
@@ -4103,11 +4671,15 @@ mod host_payload {
                 ..generation_req
             };
             let generation_payload = super::generation(&generation_req).unwrap();
-            let complete = host_growth_upper_with_bounds(
+            let complete = host_growth_upper_checked(
                 &generation_req,
                 Some(&supplied),
                 Some(&tokenizer),
                 Some(mlx_gen::ios_pricing::IosCallbackHost::NonAllocating),
+                |bytes| {
+                    assert_eq!(bytes, 900);
+                    Ok(())
+                },
             )
             .unwrap();
             assert_eq!(
@@ -4130,75 +4702,24 @@ pub(super) struct CapturedMetadataBytes {
     pub(super) header_bytes: Option<u64>,
 }
 
-/// Reuse SourceInventory's before/after identity checks instead of treating a fresh path stat as
-/// immutable proof. Reads a stack-sized safetensors prefix only, never a tensor or serde object.
-/// Existing callers can capture these sizes before invoking source_metadata_capacity; that hook
-/// guards the requested input buffers, not the still-unproved parser/scratch allocation graph.
+/// Convert facts from the existing identity-guarded reader; NEVER reopen/stat a source merely
+/// to produce a refusal. The reader supplies its validated file length and already-held JSON.
+/// Its capacity hook precedes the original buffer allocation/parse, not this scalar conversion.
 pub(super) fn captured_metadata_bytes(
-    req: &IosPricingRequest<'_>,
-    path: &Path,
-    safetensors: bool,
+    file_bytes: u64,
+    header_json: Option<&[u8]>,
 ) -> Result<CapturedMetadataBytes> {
-    use std::io::Read;
-    let inventory = req.spec.source_inventory().ok_or_else(|| {
-        Error::Unsupported(
-            "Iris metadata size capture requires the retained SourceInventory".into(),
-        )
-    })?;
-    inventory.verify_for(req.spec).map_err(Error::from)?;
-    // SourceInventory verifies configured roots, not an arbitrary caller-supplied path. Require
-    // exact configured File membership or a nonhidden, traversal-free descendant of a captured
-    // directory. Its before/after directory-membership checks then cover this file as well.
-    // No canonicalization: the existing pin identity is keyed on the literal loader path.
-    let absolute = std::path::absolute(path).map_err(|e| Error::Msg(e.to_string()))?;
-    let exact_file = req
-        .spec
-        .file_source_paths()
-        .into_iter()
-        .any(|file| std::path::absolute(file).is_ok_and(|file| file == absolute));
-    let in_directory = req.spec.directory_source_paths().into_iter().any(|dir| {
-        std::path::absolute(dir)
-            .ok()
-            .and_then(|dir| absolute.strip_prefix(dir).ok().map(Path::to_path_buf))
-            .is_some_and(|tail| {
-                !tail.as_os_str().is_empty()
-                    && tail.components().all(|part| match part {
-                        std::path::Component::Normal(name) => {
-                            !name.to_string_lossy().starts_with('.')
-                        }
-                        _ => false,
-                    })
-            })
-    });
-    if !exact_file && !in_directory {
+    let header_bytes = header_json
+        .map(|bytes| u64::try_from(bytes.len()).map_err(|_| overflow()))
+        .transpose()?;
+    if header_bytes.is_some_and(|header| header.checked_add(8).is_none_or(|end| end > file_bytes)) {
         return Err(Error::Unsupported(
-            "Iris metadata size path is outside the retained SourceInventory".into(),
+            "Iris captured safetensors header extends past file".into(),
         ));
     }
-    inventory.read_unchanged(|| -> Result<_> {
-        let mut file = std::fs::File::open(path).map_err(|e| Error::Msg(e.to_string()))?;
-        let file_bytes = file
-            .metadata()
-            .map_err(|e| Error::Msg(e.to_string()))?
-            .len();
-        let header_bytes = if safetensors {
-            let mut prefix = [0u8; 8];
-            file.read_exact(&mut prefix)
-                .map_err(|e| Error::Msg(e.to_string()))?;
-            let header = u64::from_le_bytes(prefix);
-            if plus(8, header)? > file_bytes {
-                return Err(Error::Unsupported(
-                    "Iris captured safetensors header extends past file".into(),
-                ));
-            }
-            Some(header)
-        } else {
-            None
-        };
-        Ok(CapturedMetadataBytes {
-            file_bytes,
-            header_bytes,
-        })
+    Ok(CapturedMetadataBytes {
+        file_bytes,
+        header_bytes,
     })
 }
 
@@ -4395,8 +4916,7 @@ impl CallbackEventUpper {
         // (`quantum_labels`, the complete coverage set of `ios_quantum_phase`): each is at most
         // the longest of them.
         let labelled = plus(self.checked, self.synchronized)?;
-        let longest = super::quantum_labels()
-            .iter()
+        let longest = super::quantum_labels_iter()
             .map(|label| label.len() as u64)
             .max()
             .unwrap_or(0);
@@ -4471,6 +4991,41 @@ fn backbone_callback_events(
         synchronized: quanta,
         ..Default::default()
     })
+}
+
+fn callback_events_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &GuardedSources<'_>,
+) -> Result<CallbackEventUpper> {
+    let stream = (req.spec.load_shape == LoadShape::DeferredMaterialization)
+        .then_some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize);
+    let mut count = backbone_callback_events(&sources.export().config.model, 1, false, stream)?;
+    match &sources.task {
+        GuardedTask::Restoration { plan, .. } => {
+            let tiles = plan.forward_count().map_err(Error::from)?;
+            count = count.times(tiles)?;
+            count.add(CallbackEventUpper {
+                progress: plus(tiles, 1)?,
+                checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
+                synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
+                metadata: plus(6, tiles)?,
+                ..Default::default()
+            })?;
+            count.add(CallbackEventUpper {
+                checked: tiles,
+                synchronized: tiles,
+                ..Default::default()
+            })?;
+        }
+        GuardedTask::Depth { plan, .. } => count.add(CallbackEventUpper {
+            progress: 1,
+            metadata: 3,
+            checked: plus(6, u64::from(plan.resized()))?,
+            synchronized: plus(5, u64::from(plan.resized()))?,
+            ..Default::default()
+        })?,
+    }
+    Ok(count)
 }
 
 fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUpper> {
@@ -4799,6 +5354,27 @@ mod authenticated_metadata {
         pub(super) floats: u64,
         pub(super) raw_value_key: bool,
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum MetadataScanError {
+        Invalid,
+        Truncated,
+        Depth,
+        Extent,
+    }
+    impl MetadataScanError {
+        fn reason(self) -> &'static str {
+            match self {
+                Self::Invalid => "invalid JSON for metadata layout scan",
+                Self::Truncated => "truncated metadata JSON",
+                Self::Depth => "metadata JSON exceeds serde default recursion depth",
+                Self::Extent => "metadata JSON extent overflow",
+            }
+        }
+    }
+    type ScanResult<T> = std::result::Result<T, MetadataScanError>;
+    fn scan_add(a: u64, b: u64) -> ScanResult<u64> {
+        a.checked_add(b).ok_or(MetadataScanError::Extent)
+    }
     struct Scan<'a> {
         data: &'a [u8],
         at: usize,
@@ -4810,20 +5386,15 @@ mod authenticated_metadata {
                 self.at += 1;
             }
         }
-        fn bad<T>() -> Result<T> {
-            Err(Error::Unsupported(
-                "invalid JSON for metadata layout scan".into(),
-            ))
+        fn bad<T>() -> ScanResult<T> {
+            Err(MetadataScanError::Invalid)
         }
-        fn byte(&mut self) -> Result<u8> {
-            let b = *self
-                .data
-                .get(self.at)
-                .ok_or_else(|| Error::Unsupported("truncated metadata JSON".into()))?;
+        fn byte(&mut self) -> ScanResult<u8> {
+            let b = *self.data.get(self.at).ok_or(MetadataScanError::Truncated)?;
             self.at += 1;
             Ok(b)
         }
-        fn string(&mut self, key: bool) -> Result<()> {
+        fn string(&mut self, key: bool) -> ScanResult<()> {
             if self.byte()? != b'"' {
                 return Self::bad();
             }
@@ -4878,8 +5449,8 @@ mod authenticated_metadata {
                     }
                 }
             }
-            self.counts.strings = plus(self.counts.strings, 1)?;
-            self.counts.string_source_bytes = plus(
+            self.counts.strings = scan_add(self.counts.strings, 1)?;
+            self.counts.string_source_bytes = scan_add(
                 self.counts.string_source_bytes,
                 (self.at - start - 1) as u64,
             )?;
@@ -4888,17 +5459,15 @@ mod authenticated_metadata {
                     .any(|which| exact[which] && matched[which] == magic[which].len());
             Ok(())
         }
-        fn value(&mut self, depth: u16) -> Result<()> {
+        fn value(&mut self, depth: u16) -> ScanResult<()> {
             if depth > 128 {
-                return Err(Error::Unsupported(
-                    "metadata JSON exceeds serde default recursion depth".into(),
-                ));
+                return Err(MetadataScanError::Depth);
             }
             self.ws();
             match self.data.get(self.at).copied() {
                 Some(b'{') => {
                     self.at += 1;
-                    self.counts.objects = plus(self.counts.objects, 1)?;
+                    self.counts.objects = scan_add(self.counts.objects, 1)?;
                     self.ws();
                     if self.data.get(self.at) == Some(&b'}') {
                         self.at += 1;
@@ -4911,7 +5480,7 @@ mod authenticated_metadata {
                         if self.byte()? != b':' {
                             return Self::bad();
                         }
-                        self.counts.object_entries = plus(self.counts.object_entries, 1)?;
+                        self.counts.object_entries = scan_add(self.counts.object_entries, 1)?;
                         self.value(depth + 1)?;
                         self.ws();
                         match self.byte()? {
@@ -4923,14 +5492,14 @@ mod authenticated_metadata {
                 }
                 Some(b'[') => {
                     self.at += 1;
-                    self.counts.arrays = plus(self.counts.arrays, 1)?;
+                    self.counts.arrays = scan_add(self.counts.arrays, 1)?;
                     self.ws();
                     if self.data.get(self.at) == Some(&b']') {
                         self.at += 1;
                         return Ok(());
                     }
                     loop {
-                        self.counts.array_elements = plus(self.counts.array_elements, 1)?;
+                        self.counts.array_elements = scan_add(self.counts.array_elements, 1)?;
                         self.value(depth + 1)?;
                         self.ws();
                         match self.byte()? {
@@ -4947,7 +5516,14 @@ mod authenticated_metadata {
                         b'f' => b"false",
                         _ => b"null",
                     };
-                    if self.data.get(self.at..self.at + literal.len()) != Some(literal) {
+                    if self.data.get(
+                        self.at
+                            ..self
+                                .at
+                                .checked_add(literal.len())
+                                .ok_or(MetadataScanError::Extent)?,
+                    ) != Some(literal)
+                    {
                         return Self::bad();
                     }
                     self.at += literal.len();
@@ -4961,10 +5537,10 @@ mod authenticated_metadata {
                         float |= matches!(self.data[self.at], b'.' | b'e' | b'E');
                         self.at += 1;
                     }
-                    self.counts.numbers = plus(self.counts.numbers, 1)?;
+                    self.counts.numbers = scan_add(self.counts.numbers, 1)?;
                     self.counts.number_source_bytes =
-                        plus(self.counts.number_source_bytes, (self.at - start) as u64)?;
-                    self.counts.floats = plus(self.counts.floats, u64::from(float))?;
+                        scan_add(self.counts.number_source_bytes, (self.at - start) as u64)?;
+                    self.counts.floats = scan_add(self.counts.floats, u64::from(float))?;
                 }
                 _ => return Self::bad(),
             }
@@ -4973,7 +5549,7 @@ mod authenticated_metadata {
     }
     /// Allocation-free lexical cardinality scan. It does not replace serde validation, expand
     /// strings, allocate an AST, or trust an attacker-supplied cardinality field.
-    pub(super) fn scan_json(data: &[u8]) -> Result<JsonCounts> {
+    pub(super) fn scan_json(data: &[u8]) -> ScanResult<JsonCounts> {
         let mut s = Scan {
             data,
             at: 0,
@@ -5015,7 +5591,11 @@ mod authenticated_metadata {
         )?;
         total = plus(
             total,
-            indexmap_family::<String, serde_json::Value>(c.object_entries)?,
+            if c.objects == 1 {
+                indexmaps::<String, serde_json::Value>(c.object_entries)?
+            } else {
+                indexmap_family::<String, serde_json::Value>(c.object_entries)?
+            },
         )?;
         // Serde #[flatten] Content buffer, then typed leaves: real separate source allocations.
         total = plus(total, growth(content_cell(), c.array_elements, c.arrays)?)?;
@@ -5042,7 +5622,7 @@ mod authenticated_metadata {
     /// uneven Karatsuba creates one result and ceil(y/x) recursive products. Max is over actual
     /// mutually exclusive algorithm paths, NOT a guard scratch maximum or an operation budget.
     fn lexical_multiply_layout(max_words: usize, limb: u64) -> Result<u64> {
-        const MAX: usize = ((4 * 769 + 3 * ((1usize << 14) - 1) + 64 + 31) / 32) + 2;
+        const MAX: usize = (4 * 769 + 3 * ((1usize << 14) - 1) + 64).div_ceil(32) + 2;
         if max_words > MAX {
             return Err(overflow());
         }
@@ -5067,10 +5647,10 @@ mod authenticated_metadata {
                 .into_iter()
                 .try_fold(0, plus)?;
                 let mut uneven = 0;
-                for x in 1..n.div_ceil(2) {
+                for (x, &cost) in cumulative.iter().enumerate().take(n.div_ceil(2)).skip(1) {
                     let path = plus(
                         growth(limb, out, 1)?,
-                        product(&[ceil(n as u64, x as u64)?, cumulative[x]])?,
+                        product(&[ceil(n as u64, x as u64)?, cost])?,
                     )?;
                     uneven = uneven.max(path);
                 }
@@ -5110,7 +5690,11 @@ mod authenticated_metadata {
     /// bytes per pass in B initial bytes. Normal headers without private keys use ONE pass.
     /// This function does not price the provider's execution schedule or std thread/IO wrappers.
     pub(super) fn json_parse_layout(data: &[u8]) -> Result<u64> {
-        let c = scan_json(data)?;
+        let c = scan_json(data).map_err(|error| Error::Unsupported(error.reason().into()))?;
+        json_parse_counts_layout(c)
+    }
+
+    fn json_parse_counts_layout(c: JsonCounts) -> Result<u64> {
         let (one, passes) = if c.raw_value_key {
             let b = c.bytes;
             (
@@ -5137,6 +5721,65 @@ mod authenticated_metadata {
             parsed = plus(parsed, product(&[one.floats, lexical_float_layout()?])?)?;
         }
         product(&[passes, parsed])
+    }
+
+    /// Byte/cardinality-derived envelope for the specific file reader's typed location/header
+    /// projections and the held-header pricing maps. Object entries bound the tensor count;
+    /// all source array elements bound total shape elements, even for malformed typed leaves.
+    /// These requested-layout checks precede their Vec/map materialization, not a late audit.
+    pub(super) fn normalized_header_layout(data: &[u8]) -> Result<u64> {
+        let c = scan_json(data).unwrap_or_else(|_| {
+            let b = data.len() as u64;
+            JsonCounts {
+                object_entries: b,
+                array_elements: b,
+                arrays: b,
+                string_source_bytes: b,
+                ..Default::default()
+            }
+        });
+        let n = c.object_entries;
+        let location = growth(
+            std::mem::size_of::<mlx_gen::gen_core::weightsmeta::SafetensorsTensorLocation>() as u64,
+            n,
+            1,
+        )?;
+        let headers = product(&[3, growth(std::mem::size_of::<Header>() as u64, n, 1)?])?;
+        let shapes = product(&[
+            3,
+            growth(
+                std::mem::size_of::<usize>() as u64,
+                c.array_elements,
+                c.arrays,
+            )?,
+        ])?;
+        let names = product(&[4, c.string_source_bytes])?;
+        let maps = product(&[2, hashmap::<String, Header>(n)?])?;
+        [location, headers, shapes, names, maps]
+            .into_iter()
+            .try_fold(0, plus)
+    }
+
+    pub(super) fn unvalidated_json_parse_layout(data: &[u8]) -> Result<u64> {
+        match scan_json(data) {
+            Ok(_) => json_parse_layout(data),
+            Err(_) => {
+                let b = data.len() as u64;
+                json_parse_counts_layout(JsonCounts {
+                    bytes: b,
+                    objects: b,
+                    object_entries: b,
+                    arrays: b,
+                    array_elements: b,
+                    strings: b,
+                    string_source_bytes: b,
+                    numbers: b,
+                    number_source_bytes: b,
+                    floats: b,
+                    raw_value_key: true,
+                })
+            }
+        }
     }
 
     #[cfg(test)]
@@ -5446,5 +6089,94 @@ mod scoped_thread_layout_tests {
         let payload = aggregate_requested_layout(&[(8, 8), (1, 1), (8, 8)], 8).unwrap();
         assert_eq!(payload, (24, 8));
         assert_eq!(arc_requested_layout(payload).unwrap(), 40);
+    }
+}
+
+#[cfg(test)]
+mod guarded_fragment_tests {
+    use super::*;
+    use mlx_gen::gen_core::weightsmeta::SourceMetadataRead;
+
+    #[test]
+    fn held_metadata_facts_have_checked_provenance_and_no_file_paths() {
+        let raw = br#"{"embeddings":{"dtype":"F32","shape":[1,2,3,4],"data_offsets":[0,96]}}"#;
+        let h = Header {
+            name: "embeddings".into(),
+            dtype: Stored::F32,
+            shape: vec![1, 2, 3, 4],
+            data_bytes: 96,
+        };
+        let mut facts = IrisMetadataFacts::default();
+        let mut checks = Vec::new();
+        let mut capacity = |bytes| {
+            checks.push(bytes);
+            Ok(())
+        };
+        facts
+            .observe(SourceMetadataRead::Input(raw.len() as u64), &mut capacity)
+            .unwrap();
+        facts
+            .observe(
+                SourceMetadataRead::Yaml(b"model:\n  depth: 1\n"),
+                &mut capacity,
+            )
+            .unwrap();
+        facts
+            .observe(
+                SourceMetadataRead::Json {
+                    file_bytes: raw.len() as u64 + 8 + 96,
+                    bytes: raw,
+                },
+                &mut capacity,
+            )
+            .unwrap();
+        facts
+            .capture_backbone(raw.len() as u64 + 8 + 96, raw, std::slice::from_ref(&h))
+            .unwrap();
+        facts
+            .capture_empty(raw.len() as u64 + 8 + 96, raw, &[h])
+            .unwrap();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0], raw.len() as u64);
+        assert!(checks[1] > 0 && checks[2] > raw.len() as u64);
+        assert_eq!(facts.empty_embedding_elements, 24);
+        assert_eq!(facts.known.provenance, 2 | 4 | 8 | 16);
+        assert!(facts.known.json_layouts > 0 && facts.known.yaml_trees > 0);
+        assert!(facts.known.normalized_headers > 0 && facts.known.streamed_keys > 0);
+        assert!(captured_metadata_bytes(8, Some(raw)).is_err());
+    }
+
+    #[test]
+    fn real_capacity_refusal_stops_before_facts_are_recorded() {
+        let mut facts = IrisMetadataFacts::default();
+        let raw = br#"{"x":1}"#;
+        let mut calls = 0;
+        let mut deny = |_| {
+            calls += 1;
+            Err(Error::Unsupported("capacity sentinel".into()))
+        };
+        let error = facts
+            .observe(
+                SourceMetadataRead::Json {
+                    file_bytes: raw.len() as u64 + 8,
+                    bytes: raw,
+                },
+                &mut deny,
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(ref reason) if reason == "capacity sentinel"));
+        assert_eq!(calls, 1);
+        assert_eq!(facts, IrisMetadataFacts::default());
+    }
+
+    #[test]
+    fn malformed_scan_is_allocation_free_and_original_parser_can_keep_its_failure() {
+        assert_eq!(
+            authenticated_metadata::scan_json(b"{"),
+            Err(authenticated_metadata::MetadataScanError::Truncated)
+        );
+        // A byte-derived source envelope lets the ORIGINAL reader report syntax errors after
+        // a successful capacity check; no speculative serde parse is used to price that parse.
+        assert!(authenticated_metadata::unvalidated_json_parse_layout(b"{").unwrap() > 0);
     }
 }

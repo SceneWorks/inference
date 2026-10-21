@@ -24,7 +24,7 @@ mlx-rs = { workspace = true }
 # SDXL ships a CLIP tokenizer as vocab.json + merges.txt (no tokenizer.json), and the vendored
 # reference uses Apple's simplified CLIP BPE with `\p{L}`/`\p{N}` unicode-class splitting. We port
 # that tokenizer to match the reference IDs exactly; `regex` provides the unicode-property pattern.
-regex = "1"
+regex = { version = "=1.13.0", features = ["clip-source-certificate"] }
 # Parse vocab.json (a flat {token: id} object) without pulling a heavy dep.
 serde_json = { workspace = true }
 serde = { workspace = true }

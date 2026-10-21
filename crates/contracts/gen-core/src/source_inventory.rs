@@ -54,7 +54,246 @@ fn collect(path: &Path, entries: &mut Vec<PathBuf>, files: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum DirectoryVerificationOperation {
+    Open,
+    Next,
+    OwnedName,
+    FileType,
+}
+
 impl SourceInventory {
+    /// Exact unresolved filesystem operations; these named gaps never stand for zero bytes.
+    pub const READDIR_METADATA_GAP: &str = "source inventory: READDIR_METADATA_GAP (exact ReadDir/DirEntry/Apple libc allocation law unproved)";
+    pub const PIN_VERIFY_METADATA_GAP: &str = "source inventory: PIN_VERIFY_METADATA_GAP (exact canonicalize/component-check allocation law unproved)";
+    pub const PIN_CAPTURE_METADATA_GAP: &str = "source inventory: PIN_CAPTURE_METADATA_GAP (exact initial seal/canonicalize allocation law unproved)";
+    pub const ABSOLUTE_PATH_METADATA_GAP: &str = "source inventory: ABSOLUTE_PATH_METADATA_GAP (relative-path current-directory allocation law unproved)";
+    pub const MISSING_INVENTORY_METADATA_GAP: &str = "source inventory: MISSING_INVENTORY_METADATA_GAP (guarded reader requires retained source closure)";
+
+    /// Allocate only a checked fixed diagnostic, then refuse BEFORE the unproved operation.
+    /// This is not a successful filesystem allocation certificate or a capacity default.
+    pub(crate) fn metadata_gap<T>(
+        next: &mut dyn FnMut(u64) -> Result<()>,
+        reason: &'static str,
+    ) -> Result<T> {
+        let layout = std::alloc::Layout::array::<u8>(reason.len())
+            .map_err(|_| Error::Msg("source metadata diagnostic layout overflow".into()))?;
+        next(layout.size() as u64)?;
+        Err(Error::Unsupported(reason.into()))
+    }
+
+    fn changed_with_capacity<T>(next: &mut dyn FnMut(u64) -> Result<()>) -> Result<T> {
+        Self::metadata_gap(next, "source inventory changed after admission")
+    }
+
+    /// Earliest borrowed directory-source boundary, before snapshot/configuration/contract
+    /// discovery can open any current member. No inventory, PathBuf or request DTO is built.
+    /// Until the exact filesystem wrapper law closes, refuse the named gap BEFORE that work.
+    pub fn preflight_directory_with_capacity(
+        _directory: &Path,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
+    }
+
+    /// Initial guarded inventory acquisition. No current-directory Vec or seal acquisition runs
+    /// before its real source law. The native `capture` API remains unchanged.
+    pub fn capture_with_capacity(
+        spec: &LoadSpec,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Self> {
+        let mut directory = false;
+        spec.visit_source_paths(|_, is_directory| directory |= is_directory);
+        Self::metadata_gap(
+            next,
+            if directory {
+                Self::READDIR_METADATA_GAP
+            } else {
+                Self::PIN_CAPTURE_METADATA_GAP
+            },
+        )
+    }
+
+    /// Borrow the original member token without path cloning. Relative path normalization remains
+    /// an explicit pre-operation source gap rather than calling unbounded `current_dir` first.
+    pub fn member_pin_with_capacity(
+        &self,
+        loader_path: &Path,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<&PinnedWeightsFile>> {
+        if !loader_path.is_absolute() {
+            return Self::metadata_gap(next, Self::ABSOLUTE_PATH_METADATA_GAP);
+        }
+        Ok(self
+            .pins
+            .iter()
+            .find(|pin| pin.loader_path() == loader_path))
+    }
+
+    /// Check configured root membership without first collecting CURRENT roots into a Vec.
+    pub fn verify_for_with_capacity(
+        &self,
+        spec: &LoadSpec,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        let mut relative = false;
+        let mut mismatch = false;
+        spec.visit_source_paths(|path, _| {
+            relative |= !path.is_absolute();
+            mismatch |= !self.roots.iter().any(|root| root.as_path() == path);
+        });
+        if relative {
+            return Self::metadata_gap(next, Self::ABSOLUTE_PATH_METADATA_GAP);
+        }
+        for expected in &self.roots {
+            let mut present = false;
+            spec.visit_source_paths(|path, _| present |= path == expected.as_path());
+            mismatch |= !present;
+        }
+        if mismatch {
+            return Self::metadata_gap(
+                next,
+                "source inventory does not cover the configured sources",
+            );
+        }
+        self.verify_unchanged_with_capacity(next)
+    }
+
+    fn expected_is_file(&self, path: &Path) -> bool {
+        self.pins.iter().any(|pin| pin.loader_path() == path)
+    }
+
+    fn expected_child_index(&self, directory: &Path, name: &std::ffi::OsStr) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|path| path.parent() == Some(directory) && path.file_name() == Some(name))
+    }
+
+    /// Gate BEFORE std::read_dir, iterator.next or owned entry-name conversion.
+    /// Authenticated std owners are known, but private InnerReadDir ABI, Apple dirent cfg and
+    /// missing helpers/libc183 bytes do NOT yet give a whole requested-layout upper. Never use
+    /// Layout<ReadDir> as the size of its Arc payload, or expected-count as an entry-name limit.
+    fn check_directory_operation(
+        &self,
+        _directory: &Path,
+        _operation: DirectoryVerificationOperation,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
+    }
+
+    /// Streaming expected-member verification. The only owned tracking vector is bounded by the
+    /// SEALED entry count and prechecked; CURRENT entries are never collected into PathBuf Vecs.
+    /// A directory wrapper gap refuses before any ReadDir/private-entry operation. This does NOT
+    /// claim the currently unproved directory capability has been activated.
+    pub fn verify_unchanged_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        // No native vector based on a mutable directory's current cardinality.
+        let has_directories = self.entries.iter().any(|path| !self.expected_is_file(path));
+        if has_directories {
+            // Resolve the private wrapper obligation BEFORE even allocating bounded seen storage.
+            let first = self
+                .entries
+                .iter()
+                .find(|path| !self.expected_is_file(path))
+                .unwrap();
+            self.check_directory_operation(first, DirectoryVerificationOperation::Open, next)?;
+            let layout = std::alloc::Layout::array::<bool>(self.entries.len())
+                .map_err(|_| Error::Msg("source inventory seen layout overflow".into()))?;
+            next(layout.size() as u64)?;
+            let mut seen = Vec::new();
+            seen.try_reserve_exact(self.entries.len())
+                .map_err(|_| Error::Msg("source inventory seen reservation failed".into()))?;
+            seen.resize(self.entries.len(), false);
+            // Configured roots need not appear as a child of another retained directory.
+            for (index, path) in self.entries.iter().enumerate() {
+                if self.roots.contains(path) {
+                    seen[index] = true;
+                }
+            }
+            for directory in self
+                .entries
+                .iter()
+                .filter(|path| !self.expected_is_file(path))
+            {
+                self.check_directory_operation(
+                    directory,
+                    DirectoryVerificationOperation::Open,
+                    next,
+                )?;
+                let mut current = std::fs::read_dir(directory)?;
+                loop {
+                    self.check_directory_operation(
+                        directory,
+                        DirectoryVerificationOperation::Next,
+                        next,
+                    )?;
+                    let Some(entry) = current.next() else {
+                        break;
+                    };
+                    let entry = entry?;
+                    self.check_directory_operation(
+                        directory,
+                        DirectoryVerificationOperation::OwnedName,
+                        next,
+                    )?;
+                    let name = entry.file_name();
+                    let leaf = Path::new(&name);
+                    if crate::weightsmeta::is_hidden_file(leaf)
+                        || crate::weightsmeta::is_hidden_dir(leaf)
+                    {
+                        continue;
+                    }
+                    let Some(index) = self.expected_child_index(directory, &name) else {
+                        // Stop at FIRST extra/renamed member, before path joining or growing any
+                        // collection. No cap depends on how many unexpected entries now exist.
+                        return Self::changed_with_capacity(next);
+                    };
+                    self.check_directory_operation(
+                        directory,
+                        DirectoryVerificationOperation::FileType,
+                        next,
+                    )?;
+                    let kind = entry.file_type()?;
+                    let expected_file = self.expected_is_file(&self.entries[index]);
+                    if kind.is_symlink() && !expected_file {
+                        return Self::metadata_gap(
+                            next,
+                            "source inventory refuses a symlinked subdirectory",
+                        );
+                    }
+                    if (!expected_file && !kind.is_dir()) || (expected_file && kind.is_dir()) {
+                        return Self::changed_with_capacity(next);
+                    }
+                    seen[index] = true;
+                }
+            }
+            if seen.iter().any(|seen| !seen) {
+                return Self::changed_with_capacity(next);
+            }
+        }
+        // File-only verification also must not hide canonicalize/component snapshot allocation.
+        for pin in &self.pins {
+            pin.verify_unchanged_with_capacity(next)?;
+        }
+        Ok(())
+    }
+
+    /// Same source closure and SAME capacity check both before and after the read, including a
+    /// failed read. The closure receives the check explicitly; there is no TLS or no-op fallback.
+    pub fn read_unchanged_with_capacity<T, E: From<Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+        read: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        let result = read(next);
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        result
+    }
+
     /// Scalar facts only, preserving the inventory's replacement-sensitive ownership/identity.
     /// This is requested-layout metadata, NOT a malloc/RSS/process-footprint certificate.
     pub fn allocation_facts(&self) -> Result<SourceInventoryAllocationFacts> {
@@ -155,6 +394,16 @@ impl SourceInventory {
                     })
             })
             .collect()
+    }
+
+    /// Borrow an existing file token using capture's absolute lexical path convention.
+    /// This never re-pins the file, rehashes payloads, canonicalizes a symlink, or builds an inventory.
+    pub fn member_pin(&self, loader_path: &Path) -> Result<Option<&PinnedWeightsFile>> {
+        let absolute = std::path::absolute(loader_path)?;
+        Ok(self
+            .pins
+            .iter()
+            .find(|pin| pin.loader_path() == absolute.as_path()))
     }
 
     pub fn verify_for(&self, spec: &LoadSpec) -> Result<()> {
@@ -304,5 +553,209 @@ mod tests {
                 .map(|p| p.loader_path().as_os_str().as_encoded_bytes().len() as u64)
                 .sum::<u64>()
         );
+    }
+}
+
+#[cfg(test)]
+mod member_pin_tests {
+    use super::*;
+    use crate::WeightsSource;
+
+    #[test]
+    fn borrowed_members_are_original_tokens_and_inventory_still_detects_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let vocab = root.path().join("vocab.json");
+        std::fs::write(&vocab, b"{}").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let inventory = SourceInventory::capture(&spec).unwrap();
+        let first = inventory.member_pin(&vocab).unwrap().unwrap();
+        let second = inventory.member_pin(&vocab).unwrap().unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first.target_fingerprint().size, 2);
+        assert!(inventory
+            .member_pin(&root.path().join("missing"))
+            .unwrap()
+            .is_none());
+        inventory.verify_for(&spec).unwrap();
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, b"{}").unwrap();
+        std::fs::rename(&replacement, &vocab).unwrap();
+        assert!(inventory.verify_unchanged().is_err());
+    }
+}
+
+#[cfg(test)]
+mod guarded_source_inventory_tests {
+    use super::*;
+    use crate::WeightsSource;
+    use std::cell::Cell;
+
+    #[test]
+    fn extra_many_long_named_entries_refuse_before_private_directory_wrapper() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sealed"), b"original").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let inventory = SourceInventory::capture(&spec).unwrap();
+        for index in 0..257 {
+            let name = format!("{index:03}-{}", "x".repeat(240));
+            std::fs::write(root.path().join(name), b"extra").unwrap();
+        }
+        // Legacy semantics still detect directory addition; the guarded implementation
+        // does NOT pretend that retained counts bound that CURRENT-member collection.
+        assert!(inventory.verify_unchanged().is_err());
+        let mut requests = Vec::new();
+        let mut check = |bytes| {
+            requests.push(bytes);
+            if bytes > 4096 {
+                Err(Error::Msg("fixture capacity refusal".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let error = inventory
+            .verify_for_with_capacity(&spec, &mut check)
+            .unwrap_err();
+        match error {
+            Error::Unsupported(reason) => assert_eq!(reason, SourceInventory::READDIR_METADATA_GAP),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            requests,
+            vec![SourceInventory::READDIR_METADATA_GAP.len() as u64]
+        );
+        // No N-current vector/PathBuf reserve, ReadDir or entry-name operation was authorized.
+    }
+
+    #[test]
+    fn source_gap_precedes_read_and_checks_diagnostic_before_owning_it() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("sealed");
+        std::fs::write(&file, b"original").unwrap();
+        let spec = LoadSpec::new(WeightsSource::File(file));
+        let inventory = SourceInventory::capture(&spec).unwrap();
+        let read = Cell::new(false);
+        let mut calls = 0;
+        let mut check = |_bytes| {
+            calls += 1;
+            Err(Error::Msg("fixture capacity refusal".into()))
+        };
+        let result: Result<()> =
+            inventory.read_unchanged_with_capacity(&mut check, |_same_check| {
+                read.set(true);
+                Ok(())
+            });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("fixture capacity refusal"));
+        assert_eq!(calls, 1);
+        assert!(!read.get());
+    }
+
+    #[test]
+    fn replacement_and_missing_members_preserve_native_identity_checks() {
+        for mutation in ["replace", "remove", "rename"] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("sealed");
+            std::fs::write(&file, b"original").unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            let inventory = SourceInventory::capture(&spec).unwrap();
+            match mutation {
+                "replace" => {
+                    let tmp = root.path().join("replacement");
+                    std::fs::write(&tmp, b"original").unwrap();
+                    std::fs::rename(tmp, &file).unwrap();
+                }
+                "remove" => std::fs::remove_file(&file).unwrap(),
+                "rename" => std::fs::rename(&file, root.path().join("renamed")).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(inventory.verify_unchanged().is_err(), "{mutation}");
+            let mut check = |bytes| {
+                if bytes <= 4096 {
+                    Ok(())
+                } else {
+                    Err(Error::Msg("fixture capacity refusal".into()))
+                }
+            };
+            let result = inventory.verify_unchanged_with_capacity(&mut check);
+            assert!(
+                matches!(result, Err(Error::Unsupported(reason)) if reason == SourceInventory::READDIR_METADATA_GAP)
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_child_lookup_rejects_unknown_name_without_path_join_or_growth() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sealed"), b"original").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let inventory = SourceInventory::capture(&spec).unwrap();
+        assert!(inventory
+            .expected_child_index(root.path(), std::ffi::OsStr::new("sealed"))
+            .is_some());
+        let long = "x".repeat(10_000);
+        assert_eq!(
+            inventory.expected_child_index(root.path(), std::ffi::OsStr::new(&long)),
+            None
+        );
+        assert_eq!(
+            inventory.expected_child_index(root.path(), std::ffi::OsStr::new("renamed")),
+            None
+        );
+    }
+
+    #[test]
+    fn guarded_capture_and_relative_path_have_explicit_preoperation_gaps() {
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("relative-snapshot")));
+        let mut requested = Vec::new();
+        let mut check = |bytes| {
+            requested.push(bytes);
+            if bytes <= 4096 {
+                Ok(())
+            } else {
+                Err(Error::Msg("fixture capacity refusal".into()))
+            }
+        };
+        let result = SourceInventory::capture_with_capacity(&spec, &mut check);
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == SourceInventory::READDIR_METADATA_GAP)
+        );
+        assert_eq!(requested.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod source_prelude_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_prelude_checks_capacity_then_refuses_before_any_directory_operation() {
+        // Borrowed nonexistent path is deliberate: this operation must not stat/open it.
+        let root = Path::new("/source-prelude-fixture-never-opened");
+        let mut requested = Vec::new();
+        let mut finite_fixture_check = |bytes| {
+            requested.push(bytes);
+            if bytes == SourceInventory::READDIR_METADATA_GAP.len() as u64 {
+                Ok(())
+            } else {
+                Err(Error::Msg("unexpected fixture allocation".into()))
+            }
+        };
+        let result =
+            SourceInventory::preflight_directory_with_capacity(root, &mut finite_fixture_check);
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == SourceInventory::READDIR_METADATA_GAP)
+        );
+        assert_eq!(
+            requested,
+            vec![SourceInventory::READDIR_METADATA_GAP.len() as u64]
+        );
+        let mut refuse = |_bytes| Err(Error::Msg("real prelude check refused".into()));
+        let result = SourceInventory::preflight_directory_with_capacity(root, &mut refuse);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("real prelude check refused"));
     }
 }

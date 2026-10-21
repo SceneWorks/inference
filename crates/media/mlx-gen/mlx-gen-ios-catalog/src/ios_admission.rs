@@ -475,6 +475,11 @@ pub fn execution_key(candidate: &IosCandidate) -> AdmissionResult<String> {
     ))
 }
 
+fn key_negative_prompt(request: &GenerationRequest) -> Result<Option<&str>> {
+    let cfg_on = crate::sdxl::sampling::ResolvedSampling::resolve(request)?.guidance() > 1.0;
+    Ok(cfg_on.then(|| request.negative_prompt.as_deref().unwrap_or("")))
+}
+
 /// Encoded text window. SDXL's long-prompt path encodes `n` CLIP windows of 77; every other iOS
 /// provider pads to a fixed, artifact-determined window (0 here, covered by the layout digest).
 pub fn token_window(candidate: &IosCandidate) -> Result<u32> {
@@ -482,16 +487,51 @@ pub fn token_window(candidate: &IosCandidate) -> Result<u32> {
         (IosWork::Generate(req), crate::sdxl::SDXL_ID) => {
             // The actual sampler defaults decide CFG (acceleration defaults to guidance 1).
             // SDXL does not tokenize/retain a negative row when effective guidance is off.
-            let cfg_on = crate::sdxl::sampling::ResolvedSampling::resolve(req)?.guidance() > 1.0;
-            let windows = mlx_gen_sdxl::conditioning_window_count(
-                &candidate.spec,
-                &req.prompt,
-                cfg_on.then(|| req.negative_prompt.as_deref().unwrap_or("")),
-            )?;
+            let negative = key_negative_prompt(req)?;
+            let windows =
+                mlx_gen_sdxl::conditioning_window_count(&candidate.spec, &req.prompt, negative)?;
             Ok(windows.saturating_mul(77))
         }
         _ => Ok(0),
     }
+}
+
+type KeyCapacity<'a> = &'a mut dyn FnMut(u64) -> mlx_gen::Result<()>;
+
+fn token_window_using_key_capacity(
+    candidate: &IosCandidate,
+    source: &SourceInventory,
+    next: KeyCapacity<'_>,
+) -> AdmissionResult<u32> {
+    let (IosWork::Generate(request), crate::sdxl::SDXL_ID) =
+        (&candidate.work, candidate.provider.as_str())
+    else {
+        return token_window(candidate).map_err(AdmissionError::Failed);
+    };
+    let negative = key_negative_prompt(request).map_err(pricing_error)?;
+    let mut capacity_refused = false;
+    let mut checked = |bytes| {
+        let result = next(bytes);
+        if result.is_err() {
+            capacity_refused = true;
+        }
+        result
+    };
+    mlx_gen_sdxl::conditioning_window_count_with_source_capacity(
+        &candidate.spec,
+        &request.prompt,
+        negative,
+        source,
+        &mut checked,
+    )
+    .map(|windows| windows.saturating_mul(77))
+    .map_err(|error| {
+        if capacity_refused {
+            AdmissionError::refused(RefusalKind::Capacity, error.to_string())
+        } else {
+            AdmissionError::Failed(error.into())
+        }
+    })
 }
 
 fn route_of(candidate: &IosCandidate) -> AdmissionResult<String> {
@@ -650,10 +690,56 @@ pub fn evidence_key(
     key_unchecked(candidate, machine, route)
 }
 
+/// Capture key for EVERY provider under the real byte-sensitive source callback.
+/// Only token_window uses the SDXL-specific tokenizer guard. Reuses an existing inventory;
+/// otherwise retains the ordinary inventory on the candidate for its later capture permit.
+pub fn evidence_key_with_key_capacity(
+    registry: &ProviderRegistry,
+    candidate: &mut IosCandidate,
+    machine: &str,
+    next: KeyCapacity<'_>,
+) -> AdmissionResult<EvidenceKey> {
+    validate_actual(registry, candidate)?;
+    let route = route_of(candidate)?;
+    if candidate.spec.source_inventory().is_none() {
+        let source = with_source_inventory_capacity(next, |next| {
+            SourceInventory::capture_with_capacity(&candidate.spec, next)
+        })?;
+        with_source_inventory_capacity(next, |next| {
+            candidate
+                .spec
+                .bind_source_inventory_with_capacity(source, next)
+        })?;
+    }
+    let source = candidate
+        .spec
+        .source_inventory()
+        .expect("retained ordinary inventory");
+    with_source_inventory_capacity(next, |next| {
+        source.verify_for_with_capacity(&candidate.spec, next)
+    })?;
+    with_source_inventory_capacity(next, |next| {
+        Ok(source.read_unchanged_with_capacity(next, |same_next| {
+            key_unchecked_using_key_capacity(candidate, machine, route, Some((source, same_next)))
+        }))
+    })?
+    .map_err(source_metadata_gap_refusal)
+}
+
 fn key_unchecked(
     candidate: &IosCandidate,
     machine: &str,
     route: String,
+) -> AdmissionResult<EvidenceKey> {
+    // Metadata-only compatibility API. Real SDK/capture routes supply the callback below.
+    key_unchecked_using_key_capacity(candidate, machine, route, None)
+}
+
+fn key_unchecked_using_key_capacity(
+    candidate: &IosCandidate,
+    machine: &str,
+    route: String,
+    pre_key: Option<(&SourceInventory, KeyCapacity<'_>)>,
 ) -> AdmissionResult<EvidenceKey> {
     let layout = if candidate.provider.starts_with("sana_") {
         artifact(crate::admission::sana_snapshot_profile(&candidate.spec))?.layout_sha256
@@ -731,7 +817,10 @@ fn key_unchecked(
             }
             _ => None,
         },
-        token_window: token_window(candidate)?,
+        token_window: match pre_key {
+            Some((source, next)) => token_window_using_key_capacity(candidate, source, next)?,
+            None => token_window(candidate)?,
+        },
     })
 }
 
@@ -1090,15 +1179,36 @@ fn price_anchor<'row>(
     candidate: &IosCandidate,
     row: &'row AnchorRow,
 ) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
+    price_anchor_using_source_capacity(registry, candidate, row, None)
+}
+
+fn price_anchor_using_source_capacity<'row>(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    row: &'row AnchorRow,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
     let context = anchor_context(registry, candidate, row)?;
-    let mut pricing = crate::sampling::price_metadata(
-        &context.request(),
-        context.token,
-        context.mask_count,
-        context.control_count,
-        context.recorded_source,
-    )
-    .map_err(pricing_error)?;
+    let mut pricing = match next {
+        Some(next) => with_source_metadata_capacity(next, |next| {
+            crate::sampling::price_metadata_with_source_capacity(
+                &context.request(),
+                context.token,
+                context.mask_count,
+                context.control_count,
+                context.recorded_source,
+                next,
+            )
+        })?,
+        None => crate::sampling::price_metadata(
+            &context.request(),
+            context.token,
+            context.mask_count,
+            context.control_count,
+            context.recorded_source,
+        )
+        .map_err(pricing_error)?,
+    };
     anchor::attach_observations(&mut pricing, row).map_err(no_evidence)?;
     Ok((context, pricing))
 }
@@ -1106,6 +1216,65 @@ fn price_anchor<'row>(
 /// A provider's pricing that declines a configuration (`Unsupported`: an adapter stack, a PiD
 /// decode, a layout it does not price) makes it not derivable — a typed `no_evidence`; anything else
 /// (an unreadable header) is a failure.
+// Only these exact unresolved SOURCE-authority reasons are proof-missing refusals.
+// Malformed artifacts, unrelated Unsupported/IO errors and real Capacity stay unchanged.
+fn source_metadata_gap_refusal(error: AdmissionError) -> AdmissionError {
+    match error {
+        AdmissionError::Failed(Error::Unsupported(reason))
+            if [
+                SourceInventory::READDIR_METADATA_GAP,
+                SourceInventory::PIN_VERIFY_METADATA_GAP,
+                SourceInventory::PIN_CAPTURE_METADATA_GAP,
+                SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
+                SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+            ]
+            .contains(&reason.as_str()) =>
+        {
+            no_evidence(reason)
+        }
+        other => other,
+    }
+}
+
+fn with_source_metadata_capacity<T>(
+    next: KeyCapacity<'_>,
+    work: impl FnOnce(KeyCapacity<'_>) -> mlx_gen::Result<T>,
+) -> AdmissionResult<T> {
+    with_source_capacity_using(next, work, pricing_error)
+}
+
+fn with_source_inventory_capacity<T>(
+    next: KeyCapacity<'_>,
+    work: impl FnOnce(KeyCapacity<'_>) -> mlx_gen::Result<T>,
+) -> AdmissionResult<T> {
+    with_source_capacity_using(next, work, |error| {
+        source_metadata_gap_refusal(AdmissionError::Failed(error))
+    })
+}
+
+fn with_source_capacity_using<T>(
+    next: KeyCapacity<'_>,
+    work: impl FnOnce(KeyCapacity<'_>) -> mlx_gen::Result<T>,
+    classify_error: impl FnOnce(Error) -> AdmissionError,
+) -> AdmissionResult<T> {
+    let mut refused = false;
+    let mut checked = |bytes| {
+        let result = next(bytes);
+        if result.is_err() {
+            refused = true;
+        }
+        result
+    };
+    let result = work(&mut checked);
+    if refused {
+        return Err(AdmissionError::refused(
+            RefusalKind::Capacity,
+            "source metadata capacity check refused before pricing allocation",
+        ));
+    }
+    result.map_err(classify_error)
+}
+
 fn pricing_error(error: impl Into<Error>) -> AdmissionError {
     match error.into() {
         Error::Unsupported(reason) => no_evidence(format!("not derivable: {reason}")),
@@ -1130,6 +1299,24 @@ fn anchored_demand(
     key: &EvidenceKey,
     rows: &[AnchorRow],
     evidence: AdmissionEvidence<'_>,
+) -> AdmissionResult<(
+    u64,
+    u64,
+    AdmissionBasis,
+    Calibration,
+    Vec<IosCertificatePremise>,
+)> {
+    anchored_demand_using_source_capacity(registry, candidate, contract, key, rows, evidence, None)
+}
+
+fn anchored_demand_using_source_capacity(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    contract: &MemoryProviderContract,
+    key: &EvidenceKey,
+    rows: &[AnchorRow],
+    evidence: AdmissionEvidence<'_>,
+    mut source_metadata_capacity: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<(
     u64,
     u64,
@@ -1223,7 +1410,23 @@ fn anchored_demand(
             _ => None,
         },
     };
-    let mut request = pricer(&request_context).map_err(pricing_error)?;
+    let iris_source_pricing = matches!(
+        candidate.provider.as_str(),
+        "iris_3b" | IRIS_RESTORE_ID | IRIS_DEPTH_ID,
+    );
+    #[cfg(test)]
+    let iris_source_pricing = iris_source_pricing && !crate::pricing::test_pricing_active();
+    let mut request = match (iris_source_pricing, source_metadata_capacity.as_mut()) {
+        (true, Some(next)) => with_source_metadata_capacity(&mut **next, |next| {
+            mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
+                &request_context,
+                None,
+                next,
+            )
+            .map(|facts| facts.pricing)
+        })?,
+        _ => pricer(&request_context).map_err(pricing_error)?,
+    };
     // A fact from the SDK boundary, not an inferred budget/zero or a process-transfer proof.
     request.request_baseline = request_baseline.cloned();
     let resident = resident.filter(|r| completed(r));
@@ -1258,25 +1461,87 @@ fn anchored_demand(
     };
     gate(&candidate.provider, execution_facts)
         .map_err(|e| no_evidence(format!("{key:?}: execution not certifiable: {e}")))?;
+    // Explicitly borrowed source-allocation check, not TLS, an analysis scheduling
+    // budget, a new arbitrary cap, or a native-to-process premise. The same check
+    // protects request/base and optimized/resident endpoint guarded analyses.
+    let source_capacity_refused = std::cell::Cell::new(false);
+    let certify = |anchor_request: &IosBoundRequest<'_>,
+                   anchor_pricing: &IosPricing,
+                   request: &IosBoundRequest<'_>,
+                   request_pricing: &IosPricing,
+                   source_metadata_capacity: &mut Option<KeyCapacity<'_>>| {
+        if let (true, Some(next)) = (
+            matches!(
+                candidate.provider.as_str(),
+                "iris_3b" | IRIS_RESTORE_ID | IRIS_DEPTH_ID
+            ),
+            source_metadata_capacity.as_mut(),
+        ) {
+            let mut checked = |bytes| {
+                let result = (**next)(bytes);
+                if result.is_err() {
+                    source_capacity_refused.set(true);
+                }
+                result
+            };
+            let result = crate::pricing::iris_certified_bounder_with_source_capacity(
+                anchor_request,
+                anchor_pricing,
+                request,
+                request_pricing,
+                execution_facts,
+                &mut checked,
+            );
+            // A provider may represent refused analysis as an incomplete-host gap.
+            // The real boundary must still refuse Capacity, never reinterpret it
+            // as successful native output or later turn it into NoEvidence.
+            if source_capacity_refused.get() {
+                return Err(Error::Unsupported(
+                    "source metadata capacity check refused before guarded repricing".into(),
+                ));
+            }
+            return result;
+        }
+        // Existing native/metadata compatibility path remains separate. Iris's
+        // five-arg wrapper must record missing capacity as a typed host-proof gap,
+        // not fabricate a successful guarded metadata analysis or perform new reads.
+        bounder(
+            anchor_request,
+            anchor_pricing,
+            request,
+            request_pricing,
+            execution_facts,
+        )
+    };
     let measured = anchor::measured_anchor(base).map_err(no_evidence)?;
-    let (base_context, at_base) = price_anchor(registry, candidate, base)?;
+    let (base_context, at_base) = match source_metadata_capacity.as_mut() {
+        Some(next) => {
+            price_anchor_using_source_capacity(registry, candidate, base, Some(&mut **next))?
+        }
+        None => price_anchor(registry, candidate, base)?,
+    };
     let request_side = IosBoundRequest {
         pricing: &request_context,
         replay: None,
     };
     let base_request = base_context.request();
-    let certified = bounder(
+    let certified = certify(
         &base_context.bound(&base_request)?,
         &at_base,
         &request_side,
         &request,
-        execution_facts,
+        &mut source_metadata_capacity,
     )
     .map_err(|e| {
-        no_evidence(format!(
+        let reason = format!(
             "{key:?}: no transfer certificate from its {:?} anchor: {e}",
-            base.anchor_kind
-        ))
+            base.anchor_kind,
+        );
+        if source_capacity_refused.get() {
+            AdmissionError::refused(RefusalKind::Capacity, reason)
+        } else {
+            no_evidence(reason)
+        }
     })?;
     let (bounds, mut premises) = in_anchor_domain(certified, &measured, premise_policy)
         .map_err(|e| no_evidence(format!("{key:?}: {e}")))?;
@@ -1300,18 +1565,41 @@ fn anchored_demand(
     // the SAME approved model): an under-prediction of the measured resident anchor fails the
     // whole family's derivations closed. This is the model's two-endpoint validation.
     if let Some(resident) = resident {
-        let (optimized_context, at_optimized) = price_anchor(registry, candidate, optimized)?;
-        let (resident_context, at_resident) = price_anchor(registry, candidate, resident)?;
+        let (optimized_context, at_optimized) = match source_metadata_capacity.as_mut() {
+            Some(next) => price_anchor_using_source_capacity(
+                registry,
+                candidate,
+                optimized,
+                Some(&mut **next),
+            )?,
+            None => price_anchor(registry, candidate, optimized)?,
+        };
+        let (resident_context, at_resident) = match source_metadata_capacity.as_mut() {
+            Some(next) => price_anchor_using_source_capacity(
+                registry,
+                candidate,
+                resident,
+                Some(&mut **next),
+            )?,
+            None => price_anchor(registry, candidate, resident)?,
+        };
         let optimized_request = optimized_context.request();
         let resident_request = resident_context.request();
-        let endpoint = bounder(
+        let endpoint = certify(
             &optimized_context.bound(&optimized_request)?,
             &at_optimized,
             &resident_context.bound(&resident_request)?,
             &at_resident,
-            execution_facts,
+            &mut source_metadata_capacity,
         )
-        .map_err(|e| no_evidence(format!("{family:?}: no endpoint transfer certificate: {e}")))?;
+        .map_err(|e| {
+            let reason = format!("{family:?}: no endpoint transfer certificate: {e}");
+            if source_capacity_refused.get() {
+                AdmissionError::refused(RefusalKind::Capacity, reason)
+            } else {
+                no_evidence(reason)
+            }
+        })?;
         let optimized_measured = anchor::measured_anchor(optimized).map_err(no_evidence)?;
         let (endpoint_bounds, endpoint_premises) =
             in_anchor_domain(endpoint, &optimized_measured, premise_policy)
@@ -1365,6 +1653,35 @@ fn admit_one(
     rows: Option<&[AnchorRow]>,
     evidence: AdmissionEvidence<'_>,
 ) -> AdmissionResult<Admission> {
+    admit_one_using_key_capacity(
+        registry,
+        index,
+        candidate,
+        machine,
+        budget,
+        rows,
+        AdmissionAttempt {
+            evidence,
+            next: None,
+        },
+    )
+}
+
+struct AdmissionAttempt<'a> {
+    evidence: AdmissionEvidence<'a>,
+    next: Option<KeyCapacity<'a>>,
+}
+
+fn admit_one_using_key_capacity(
+    registry: &ProviderRegistry,
+    index: usize,
+    candidate: &IosCandidate,
+    machine: &str,
+    budget: MemoryBudget,
+    rows: Option<&[AnchorRow]>,
+    attempt: AdmissionAttempt<'_>,
+) -> AdmissionResult<Admission> {
+    let AdmissionAttempt { evidence, mut next } = attempt;
     validate_actual(registry, candidate)?;
     let route = route_of(candidate)?;
     if let Some(rows) = rows {
@@ -1383,9 +1700,38 @@ fn admit_one(
             ));
         }
     }
-    let guard = SourceInventory::capture(&candidate.spec)?;
-    guard.read_unchanged(|| -> AdmissionResult<Admission> {
-        let key = key_unchecked(candidate, machine, route.clone())?;
+    let fresh_source;
+    let guard = if let Some(source) = candidate.spec.source_inventory() {
+        match next.as_mut() {
+            Some(next) => with_source_inventory_capacity(&mut **next, |next| {
+                source.verify_for_with_capacity(&candidate.spec, next)
+            })?,
+            None => source.verify_for(&candidate.spec)?,
+        }
+        source
+    } else {
+        fresh_source = match next.as_mut() {
+            Some(next) => with_source_inventory_capacity(&mut **next, |next| {
+                SourceInventory::capture_with_capacity(&candidate.spec, next)
+            })?,
+            None => SourceInventory::capture(&candidate.spec)?,
+        };
+        &fresh_source
+    };
+    // One inner body; the outer wrapper supplies guarded before/after source checks
+    // for the real SDK/capture path and preserves native legacy semantics separately.
+    let consume = |mut next: Option<KeyCapacity<'_>>| -> AdmissionResult<Admission> {
+        // Reborrow the SAME callback for the key, retaining it for both guarded
+        // request/anchor repricings below. Never spend it with Option::map.
+        let key = match next.as_mut() {
+            Some(next) => key_unchecked_using_key_capacity(
+                candidate,
+                machine,
+                route.clone(),
+                Some((guard, &mut **next)),
+            ),
+            None => key_unchecked(candidate, machine, route.clone()),
+        }?;
         if let (Some(binding), IosWork::Generate(request)) = (&key.sdxl_work, &candidate.work) {
             binding.validate_actual(request).map_err(pricing_error)?;
         }
@@ -1452,7 +1798,18 @@ fn admit_one(
                 Calibration::new(),
                 Vec::new(),
             ),
-            Some(rows) => anchored_demand(registry, candidate, &contract, &key, rows, evidence)?,
+            Some(rows) => match next.as_mut() {
+                Some(next) => anchored_demand_using_source_capacity(
+                    registry,
+                    candidate,
+                    &contract,
+                    &key,
+                    rows,
+                    evidence,
+                    Some(&mut **next),
+                )?,
+                None => anchored_demand(registry, candidate, &contract, &key, rows, evidence)?,
+            },
         };
         let required_bytes = anchor::with_margin(demand_bytes, margin_bytes).map_err(|error| {
             no_evidence(format!("complete admitted envelope arithmetic: {error}"))
@@ -1483,8 +1840,19 @@ fn admit_one(
         } else {
             context.evidence_revision = "ios-capture-permit:no-evidence-row".into();
         }
+        // Source/spec/token cloning and binding need their own checked ownership law.
+        // Do not clone first and then pretend a verification check covered that allocation.
+        if let Some(next) = next.as_mut() {
+            return SourceInventory::metadata_gap(
+                &mut **next,
+                SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            )
+            .map_err(AdmissionError::from);
+        }
         let mut spec = candidate.spec.clone();
-        spec.bind_source_inventory(guard.clone())?;
+        if spec.source_inventory().is_none() {
+            spec.bind_source_inventory((*guard).clone())?;
+        }
         Ok(Admission {
             index,
             provider: candidate.provider.clone(),
@@ -1498,7 +1866,13 @@ fn admit_one(
             key,
             premises,
         })
-    })
+    };
+    match next {
+        Some(next) => with_source_inventory_capacity(next, |next| {
+            Ok(guard.read_unchanged_with_capacity(next, |same_next| consume(Some(same_next))))
+        })?,
+        None => guard.read_unchanged(|| consume(None)),
+    }
 }
 
 /// First (highest caller preference) candidate admitted against `rows` under `budget`.
@@ -1547,6 +1921,20 @@ pub(crate) fn admit_rows_with_facts(
     rows: &[AnchorRow],
     evidence: AdmissionEvidence<'_>,
 ) -> AdmissionResult<Admission> {
+    admit_rows_with_facts_using_key_capacity(
+        registry, candidates, machine, budget, rows, evidence, None,
+    )
+}
+
+fn admit_rows_with_facts_using_key_capacity(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    rows: &[AnchorRow],
+    evidence: AdmissionEvidence<'_>,
+    mut next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<Admission> {
     if let Some(baseline) = evidence.request_baseline {
         if baseline.domain != IosMemoryDomain::ProcessGrowth
             || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
@@ -1562,15 +1950,30 @@ pub(crate) fn admit_rows_with_facts(
     let mut first_failure: Option<Error> = None;
     let mut reasons = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        match admit_one(
-            registry,
-            index,
-            candidate,
-            machine,
-            budget,
-            Some(rows),
-            evidence,
-        ) {
+        let result = match next.as_mut() {
+            Some(next) => admit_one_using_key_capacity(
+                registry,
+                index,
+                candidate,
+                machine,
+                budget,
+                Some(rows),
+                AdmissionAttempt {
+                    evidence,
+                    next: Some(&mut **next),
+                },
+            ),
+            None => admit_one(
+                registry,
+                index,
+                candidate,
+                machine,
+                budget,
+                Some(rows),
+                evidence,
+            ),
+        };
+        match result {
             Ok(admitted) => return Ok(admitted),
             Err(AdmissionError::Refused(r)) => {
                 first_refusal.get_or_insert(r.kind);
@@ -1662,6 +2065,55 @@ pub fn admit_with_boundary(
     )
 }
 
+/// The real SDK boundary facts and its borrowed byte-sensitive source-allocation check.
+/// No baseline, execution fact, premise approval or capacity default is invented here.
+pub struct SourceCapacityBoundary<'a> {
+    /// Actual BeforeModelLoad process snapshot, unchanged from the SDK boundary.
+    pub request_baseline: &'a IosMemoryBaseline,
+    /// Execution facts for the operation that will really run.
+    pub execution_facts: &'a IosExecutionFacts,
+    /// Explicit caller approvals, never expanded by this context.
+    pub premise_policy: &'a PremisePolicy,
+    /// Real byte-sensitive NEXT requested-layout check; no unlimited default.
+    pub source_metadata_capacity: &'a mut dyn FnMut(u64) -> mlx_gen::Result<()>,
+}
+
+impl std::fmt::Debug for SourceCapacityBoundary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCapacityBoundary")
+            .field("request_baseline", self.request_baseline)
+            .field("execution_facts", self.execution_facts)
+            .field("premise_policy", self.premise_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Full SDK boundary plus the real byte-sensitive guard before fresh key tokenization.
+/// Execution facts, baseline and premise policy are the SAME facts used for admission.
+pub fn admit_with_boundary_and_key_capacity(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    boundary: SourceCapacityBoundary<'_>,
+) -> AdmissionResult<Admission> {
+    let rows = evidence::rows().map_err(no_evidence)?;
+    admit_rows_with_facts_using_key_capacity(
+        registry,
+        candidates,
+        machine,
+        budget,
+        rows,
+        AdmissionEvidence {
+            request_baseline: Some(boundary.request_baseline),
+            execution_facts: Some(boundary.execution_facts),
+            premise_policy: boundary.premise_policy,
+        },
+        Some(boundary.source_metadata_capacity),
+    )
+    .map_err(source_metadata_gap_refusal)
+}
+
 /// Explicitly-labelled capture permit. NOT admission: no evidence row is required (that would be
 /// circular) and none is created. Granted only where `mlx_gen::ios_quantum` bounds every quantum of
 /// this model by live OS headroom BEFORE its graph is constructed; a refusal at quantum k of size N
@@ -1672,6 +2124,28 @@ pub fn capture_permit(
     candidate: &IosCandidate,
     machine: &str,
 ) -> AdmissionResult<Admission> {
+    capture_permit_using_key_capacity(registry, candidate, machine, None)
+}
+
+/// The served device-capture route, guarded before fresh key tokenization.
+#[cfg(feature = "device-capture")]
+pub fn capture_permit_with_key_capacity(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    machine: &str,
+    next: KeyCapacity<'_>,
+) -> AdmissionResult<Admission> {
+    capture_permit_using_key_capacity(registry, candidate, machine, Some(next))
+        .map_err(source_metadata_gap_refusal)
+}
+
+#[cfg(feature = "device-capture")]
+fn capture_permit_using_key_capacity(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    machine: &str,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<Admission> {
     if !mlx_gen::ios_quantum::enabled() {
         return Err(AdmissionError::Failed(Error::Unsupported(
             "iOS capture requires bounded per-quantum execution (a physical iOS device); \
@@ -1679,7 +2153,7 @@ pub fn capture_permit(
                 .into(),
         )));
     }
-    admit_one(
+    admit_one_using_key_capacity(
         registry,
         0,
         candidate,
@@ -1691,10 +2165,13 @@ pub fn capture_permit(
             reserved_headroom_bytes: 0,
         },
         None,
-        AdmissionEvidence {
-            request_baseline: None,
-            execution_facts: None,
-            premise_policy: &PremisePolicy::default(),
+        AdmissionAttempt {
+            evidence: AdmissionEvidence {
+                request_baseline: None,
+                execution_facts: None,
+                premise_policy: &PremisePolicy::default(),
+            },
+            next,
         },
     )
 }
@@ -2938,6 +3415,138 @@ mod original_z_execution_sidecar_tests {
             public_te_epoch(dir.path()),
             te_epoch,
             "PUBLIC_ONE_IMMUTABLE_TE_EPOCH_ACROSS_CASES"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pre_key_cfg_tests {
+    use super::*;
+
+    #[test]
+    fn key_count_uses_resolved_cfg_and_actual_negative_including_empty() {
+        let mut request = GenerationRequest {
+            prompt: "positive".into(),
+            negative_prompt: Some("the actual negative".into()),
+            guidance: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(key_negative_prompt(&request).unwrap(), None);
+        request.guidance = Some(7.5);
+        assert_eq!(
+            key_negative_prompt(&request).unwrap(),
+            Some("the actual negative")
+        );
+        request.negative_prompt = None;
+        assert_eq!(key_negative_prompt(&request).unwrap(), Some(""));
+        request.negative_prompt = Some(String::new());
+        assert_eq!(key_negative_prompt(&request).unwrap(), Some(""));
+        request.guidance = Some(0.0);
+        assert_eq!(key_negative_prompt(&request).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod source_capacity_transport_tests {
+    use super::*;
+
+    #[test]
+    fn swallowed_refusal_cannot_become_native_success_or_no_evidence() {
+        // Finite test check, NOT a production byte cap or certificate.
+        let mut seen = Vec::new();
+        let mut capacity = |bytes| {
+            seen.push(bytes);
+            if bytes == 31 {
+                Err(Error::Msg("fixture allocation refused".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let result = with_source_metadata_capacity(&mut capacity, |next| {
+            next(17)?;
+            // A provider can preserve native bounds with an incomplete-host gap.
+            // The real boundary must not swallow the failed allocation check.
+            let _refused_analysis = next(31);
+            Ok(7u64)
+        });
+        match result {
+            Err(AdmissionError::Refused(refusal)) => {
+                assert_eq!(refusal.kind, RefusalKind::Capacity)
+            }
+            _ => panic!("failed real check must remain Capacity"),
+        }
+        assert_eq!(seen, vec![17, 31]);
+    }
+
+    #[test]
+    fn same_borrowed_check_sees_each_serial_pricing_request() {
+        let mut seen = Vec::new();
+        let mut capacity = |bytes| {
+            seen.push(bytes);
+            if bytes > 100 {
+                Err(Error::Msg("fixture allocation refused".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let first = with_source_metadata_capacity(&mut capacity, |next| {
+            next(13)?;
+            Ok(1u64)
+        })
+        .unwrap();
+        let second = with_source_metadata_capacity(&mut capacity, |next| {
+            next(17)?;
+            Ok(2u64)
+        })
+        .unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(seen, vec![13, 17]);
+    }
+}
+
+#[cfg(test)]
+mod source_gap_classification_tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_five_source_law_gaps_are_no_evidence() {
+        for reason in [
+            SourceInventory::READDIR_METADATA_GAP,
+            SourceInventory::PIN_VERIFY_METADATA_GAP,
+            SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
+            SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+        ] {
+            let mapped = source_metadata_gap_refusal(AdmissionError::Failed(Error::Unsupported(
+                reason.into(),
+            )));
+            assert!(
+                matches!(mapped, AdmissionError::Refused(refusal) if refusal.kind == RefusalKind::NoEvidence && refusal.reason == reason)
+            );
+        }
+        for reason in [
+            "malformed model configuration",
+            "READDIR_METADATA_GAP",
+            "unknown metadata",
+        ] {
+            let mapped = source_metadata_gap_refusal(AdmissionError::Failed(Error::Unsupported(
+                reason.into(),
+            )));
+            assert!(
+                matches!(mapped, AdmissionError::Failed(Error::Unsupported(actual)) if actual == reason)
+            );
+        }
+        let mapped =
+            source_metadata_gap_refusal(AdmissionError::Failed(Error::Msg("read failed".into())));
+        assert!(
+            matches!(mapped, AdmissionError::Failed(Error::Msg(reason)) if reason == "read failed")
+        );
+        let mapped = source_metadata_gap_refusal(AdmissionError::refused(
+            RefusalKind::Capacity,
+            "actual callback refused",
+        ));
+        assert!(
+            matches!(mapped, AdmissionError::Refused(refusal) if refusal.kind == RefusalKind::Capacity)
         );
     }
 }

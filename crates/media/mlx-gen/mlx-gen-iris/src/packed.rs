@@ -101,6 +101,21 @@ fn validate_packed_file(
     use mlx_gen::gen_core::weightsmeta;
     let headers = weightsmeta::safetensors_path_tensor_headers(path)
         .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", path.display())))?;
+    validate_packed_headers(path, &headers, group, in_scope, is_target, || {
+        weightsmeta::safetensors_file_metadata(path)
+            .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", path.display())))
+    })
+}
+
+fn validate_packed_headers(
+    path: &Path,
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    group: u64,
+    in_scope: impl Fn(&str) -> bool,
+    is_target: impl Fn(&str, &[usize], i32) -> bool,
+    metadata: impl FnOnce() -> Result<std::collections::BTreeMap<String, String>>,
+) -> Result<Option<Quant>> {
+    use mlx_gen::gen_core::weightsmeta;
     let headers: Vec<_> = headers.iter().filter(|h| in_scope(&h.name)).collect();
     let shapes: HashMap<&str, &[usize]> = headers
         .iter()
@@ -119,8 +134,7 @@ fn validate_packed_file(
     if packs.is_empty() {
         return Ok(None);
     }
-    let metadata = weightsmeta::safetensors_file_metadata(path)
-        .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", path.display())))?;
+    let metadata = metadata()?;
     let recorded = |key: &str| -> Result<u64> {
         let value = metadata.get(key).ok_or_else(|| {
             refuse(format!(
@@ -256,6 +270,29 @@ pub fn artifact_tier(path: &Path) -> Result<Option<Quant>> {
     )
 }
 
+/// The identical packed validation over headers already held by guarded pricing. Metadata is
+/// parsed lazily from the same held JSON only if the original packed branch requires it.
+pub(crate) fn artifact_tier_from_headers(
+    path: &Path,
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    metadata: impl FnOnce() -> Result<std::collections::BTreeMap<String, String>>,
+) -> Result<Option<Quant>> {
+    validate_packed_headers(
+        path,
+        headers,
+        QUANT_GROUP_SIZE as u64,
+        |_| true,
+        |_, shape, bits| {
+            shape.len() == 2
+                && matches!(
+                    ProjectionLayout::of(shape[1], Some(BackboneQuant { bits })),
+                    ProjectionLayout::Quantized { .. }
+                )
+        },
+        metadata,
+    )
+}
+
 /// The tier of the text-encoder snapshot at `dir`: `None` for a dense snapshot, else its
 /// `text_config.quantization` bits (the pre-quantized layout `mlx_llm` loads as stored), validated
 /// against the tower: the block's group size must be
@@ -348,6 +385,15 @@ pub fn refuse_dense_requested_as_packed(
     requested: Option<Quant>,
 ) -> Result<()> {
     let artifact = artifact_tier(weights)?;
+    refuse_dense_requested_from_tier(id, weights, requested, artifact)
+}
+
+pub(crate) fn refuse_dense_requested_from_tier(
+    id: &str,
+    weights: &Path,
+    requested: Option<Quant>,
+    artifact: Option<Quant>,
+) -> Result<()> {
     check_requested(id, artifact, requested)?;
     if artifact.is_none() {
         if let Some(asked) = requested {

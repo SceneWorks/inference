@@ -678,6 +678,10 @@ jobs:
           # baseline is the 2 GB one that survived the 2026-08-15 eviction; the point of this input
           # is that the others get to survive alongside it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test dependency-owned CLIP certificate and source hasher
+        run: >-
+          python3 scripts/ci/run_clip_regex_certificate_tests.py
+          --output-dir "${{ runner.temp }}/clip-regex-certificate-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Clippy MLX packages
         run: >-
           cargo clippy --locked

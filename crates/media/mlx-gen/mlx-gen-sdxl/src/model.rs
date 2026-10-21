@@ -621,6 +621,25 @@ pub fn conditioning_window_count(
         .map_err(|_| Error::Msg("sdxl: CLIP window count overflows u32".into()))
 }
 
+/// Pure-host pre-key CLIP window count, guarded before fresh requested storage.
+/// Uses borrowed members of the caller's retained source inventory. Both CLIP encoders use
+/// the loader's one shared tokenizer and the existing common-window/empty-probe contract.
+pub fn conditioning_window_count_with_source_capacity(
+    spec: &LoadSpec,
+    prompt: &str,
+    negative: Option<&str>,
+    source: &mlx_gen::gen_core::SourceInventory,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<u32> {
+    let root = tokenizer_root(spec)?;
+    let vocab_path = root.join("tokenizer").join("vocab.json");
+    let merges_path = root.join("tokenizer").join("merges.txt");
+    let vocab = source.member_pin_with_capacity(&vocab_path, next)?;
+    let merges = source.member_pin_with_capacity(&merges_path, next)?;
+    // Path lookup storage is source metadata, not a whole-key/RSS certificate.
+    crate::tokenizer::count_pinned_with_source_capacity(vocab, merges, prompt, negative, next)
+}
+
 /// Construct the concrete generator for the correctness-only production-latent admission harness.
 /// Normal registry callers should use [`load`].
 #[doc(hidden)]

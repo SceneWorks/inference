@@ -1103,14 +1103,56 @@ def check_ios_host_lock_drift(root: Path) -> None:
         )
 
 
-def check_filesystem() -> None:
+# Published upstream lockfiles are retained as archive/source provenance, NOT independent
+# active workspace locks. Register only these exact excluded package paths and versions;
+# arbitrary nested locks, including any other vendor lock, remain errors.
+REGEX_CERTIFICATE_PACKAGES = {
+    "regex": ("vendor/clip-regex/regex", "1.13.0"),
+    "regex-automata": ("vendor/clip-regex/regex-automata", "0.4.15"),
+    "regex-syntax": ("vendor/clip-regex/regex-syntax", "0.8.11"),
+}
+
+
+def registered_regex_archive_locks(root_manifest: dict) -> set[Path]:
+    patches = root_manifest.get("patch", {}).get("crates-io", {})
+    if not any(name in patches for name in REGEX_CERTIFICATE_PACKAGES):
+        return set()
+    excludes = root_manifest.get("workspace", {}).get("exclude", [])
+    registered = set()
+    for name, (directory, version) in REGEX_CERTIFICATE_PACKAGES.items():
+        if patches.get(name, {}).get("path") != directory or directory not in excludes:
+            fail(f"{name} must patch to exactly excluded {directory}")
+        manifest_path = ROOT / directory / "Cargo.toml"
+        lock_path = ROOT / directory / "Cargo.lock"
+        if not manifest_path.is_file() or not lock_path.is_file():
+            fail(f"{directory} must retain its package manifest and upstream archive lock")
+        package = tomllib.loads(manifest_path.read_text(encoding="utf-8"))["package"]
+        if (package.get("name"), package.get("version")) != (name, version):
+            fail(f"{directory} must be {name} {version}, not {package}")
+        own_entries = [
+            item for item in tomllib.loads(lock_path.read_text(encoding="utf-8"))["package"]
+            if item.get("name") == name and "source" not in item
+        ]
+        if len(own_entries) != 1 or own_entries[0].get("version") != version:
+            fail(f"{directory}/Cargo.lock is not the upstream {name} {version} archive lock")
+        registered.add(Path(directory) / "Cargo.lock")
+    return registered
+
+
+def check_lockfile_inventory(root_manifest: dict) -> None:
     lockfiles = sorted(
         path.relative_to(ROOT)
         for path in ROOT.rglob("Cargo.lock")
         if _within_workspace(path)
     )
-    if lockfiles != [Path("Cargo.lock")]:
-        fail(f"expected only the root Cargo.lock, found: {lockfiles}")
+    expected = sorted({Path("Cargo.lock")} | registered_regex_archive_locks(root_manifest))
+    if lockfiles != expected:
+        fail(f"expected root and registered upstream archive locks {expected}, found: {lockfiles}")
+
+
+def check_filesystem() -> None:
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    check_lockfile_inventory(root_manifest)
 
     workspace_manifests = []
     for manifest in ROOT.rglob("Cargo.toml"):
@@ -1217,6 +1259,20 @@ def check_graph(metadata: dict) -> None:
         provenance = ROOT / vendor_dir / "VENDORED.md"
         if not provenance.is_file() or revision not in provenance.read_text(encoding="utf-8"):
             fail(f"{vendor_dir}/VENDORED.md must record the upstream revision {revision}")
+
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    if registered_regex_archive_locks(root_manifest):
+        for name, (directory, version) in REGEX_CERTIFICATE_PACKAGES.items():
+            matches = [package for package in packages if package["name"] == name]
+            if len(matches) != 1 or matches[0]["version"] != version:
+                fail(f"expected one reviewed {name} {version}, found {matches}")
+            package = matches[0]
+            if package["source"] is not None or Path(package["manifest_path"]).resolve() != ROOT / directory / "Cargo.toml":
+                fail(f"{name} must resolve to reviewed local {directory}")
+        for name, version in [("aho-corasick", "1.1.4"), ("memchr", "2.8.3")]:
+            matches = [package for package in packages if package["name"] == name]
+            if len(matches) != 1 or matches[0]["version"] != version:
+                fail(f"CLIP certificate requires reviewed {name} {version}, found {matches}")
 
     tokenizer_minors = {
         ".".join(package["version"].split(".")[:2])

@@ -1,0 +1,74 @@
+{
+  "state": "SOURCE_IMPLEMENTATION_NOT_NATIVE_ACCEPTANCE",
+  "source_compiler_commit": "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+  "literal_sha256": "a785edc83cd9dd0e08b74f1d267950fde9fd291099886c888cd15dc200454afb",
+  "proof_sha256": "4e254aaeb8c28a1ed30bf99f33657cb3a252880e7ce4299f61b30311100a0b84",
+  "base_archive_authority": [
+    {
+      "name": "regex",
+      "version": "1.13.0",
+      "sha256": "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2",
+      "regular_files_byte_compared": 55
+    },
+    {
+      "name": "regex-automata",
+      "version": "0.4.15",
+      "sha256": "1f388202e4b80542a0921078cc23b6333bcf1409c1e3f86404cae4766a6131db",
+      "regular_files_byte_compared": 105
+    },
+    {
+      "name": "regex-syntax",
+      "version": "0.8.11",
+      "sha256": "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4",
+      "regular_files_byte_compared": 42
+    },
+    {
+      "name": "aho-corasick",
+      "version": "1.1.4",
+      "sha256": "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301",
+      "regular_files_byte_compared": 47
+    },
+    {
+      "name": "memchr",
+      "version": "2.8.3",
+      "sha256": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+      "regular_files_byte_compared": 59
+    },
+    {
+      "name": "hashbrown",
+      "version": "0.16.1",
+      "sha256": "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100",
+      "regular_files_byte_compared": 48
+    }
+  ],
+  "versions": {
+    "regex": "1.13.0",
+    "regex-automata": "0.4.15",
+    "regex-syntax": "0.8.11",
+    "aho-corasick": "1.1.4",
+    "memchr": "2.8.3",
+    "std-hashbrown": "0.16.1"
+  },
+  "original_frozen_import_sha256": "cd7865271b5576e6840b6a452e7404ad0ea97c249c8109622a5c1e10c3bc274c",
+  "owned_rustfmt": {
+    "files": [
+      {
+        "path": "vendor/clip-regex/regex/src/clip_source_certificate.rs",
+        "frozen_source_sha256": "67abc0ef465a0587aa9991db23c3aaab66b3909037c47502065f10700d6786eb",
+        "formatted_source_sha256": "69e2cf6d0a1a0dd03008644f269f4b3984303267144c406acbfb95f2ad3d9090",
+        "only_tool": "pinned rustfmt1.96 edition2021; no compilation or fact evaluation"
+      },
+      {
+        "path": "vendor/clip-regex/build-verify.rs",
+        "frozen_source_sha256": "43a2a55d12ab77cdbf9770582936ea621207e4721ca828a6fa1750db57a6e12f",
+        "formatted_source_sha256": "db9087996825bb8be157ecc026e5301e051b87d375b814a2b80c1c26e3c5bb7d",
+        "only_tool": "pinned rustfmt1.96 edition2021; no compilation or fact evaluation"
+      }
+    ],
+    "updated_binding": "vendor/clip-regex/regex/source-bindings.sha256",
+    "frozen_artifacts_unchanged": true,
+    "canonical_changes": false
+  },
+  "matching_semantics": "upstream default features unchanged; identical cache-factory extraction at both Box sites; layout helpers only",
+  "no_native_J_or_totals_or_Iris_full_host_claim": true
+}

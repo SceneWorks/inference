@@ -101,9 +101,9 @@ pub use loader::{
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    conditioning_window_count, descriptor, load, load_concrete, load_from_ldm_file,
-    snapshot_component_footprint, DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID,
-    PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, conditioning_window_count_with_source_capacity, descriptor, load,
+    load_concrete, load_from_ldm_file, snapshot_component_footprint, DecodeQualitySample, Sdxl,
+    LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,

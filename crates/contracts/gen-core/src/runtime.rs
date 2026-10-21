@@ -562,6 +562,29 @@ impl ArtifactSeal {
     /// changes, this deliberately performs one full-content audit before rejecting the source;
     /// callers therefore never continue after a same-size replacement, including one that preserves
     /// an ordinary mtime. The error grammar is shared by Candle and MLX consumers.
+    /// Requested-layout guard before the existing canonicalize/component-check algorithm.
+    /// Exact helpers/libc/private metadata laws remain unproved; no guessed path/canonical target
+    /// bound or public-wrapper-size substitution may authorize that operation.
+    pub fn verify_unchanged_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_VERIFY_METADATA_GAP)
+    }
+
+    /// Same explicit check before and after a pinned read, including failed reads. The existing
+    /// native read_unchanged/verify_unchanged APIs remain unchanged for compatibility.
+    pub fn read_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&Path, &mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        let result = read(&self.loader_path, next);
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        result
+    }
+
     pub fn verify_unchanged(&self) -> crate::Result<()> {
         if self.ensure_unchanged().is_ok() {
             return Ok(());
@@ -1273,6 +1296,46 @@ impl LoadSpec {
         Ok(())
     }
 
+    pub(crate) fn visit_source_paths<'a>(&'a self, mut visit: impl FnMut(&'a Path, bool)) {
+        fn source<'a>(value: &'a WeightsSource, visit: &mut impl FnMut(&'a Path, bool)) {
+            match value {
+                WeightsSource::File(path) => visit(path, false),
+                WeightsSource::Dir(path) => visit(path, true),
+            }
+        }
+        source(&self.weights, &mut visit);
+        if let Some(value) = &self.control {
+            source(value, &mut visit);
+        }
+        for value in &self.extra_controls {
+            source(value, &mut visit);
+        }
+        if let Some(value) = &self.ip_adapter {
+            source(value, &mut visit);
+        }
+        for adapter in &self.adapters {
+            visit(&adapter.path, false);
+        }
+        if let Some(pid) = &self.pid {
+            source(&pid.checkpoint, &mut visit);
+            source(&pid.gemma, &mut visit);
+        }
+        if let Some(identity) = &self.identity {
+            for value in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                source(value, &mut visit);
+            }
+        }
+        if let Some(value) = &self.text_encoder {
+            source(value, &mut visit);
+        }
+        for value in self.components.values() {
+            source(value, &mut visit);
+        }
+    }
+
     /// Every File path configured anywhere on this load spec, in deterministic field order.
     ///
     /// This includes primary weights, typed overlays, adapters, PiD/identity/text-encoder files, and
@@ -1694,6 +1757,39 @@ impl LoadSpec {
     /// during the callback fails closed.
     /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
     /// outside this path-token guarantee.
+    /// Explicit guarded counterpart for metadata readers. Do not enter the legacy directory
+    /// verification/canonicalization path after a one-time retained-count check.
+    pub fn read_prepared_files_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let Some(inventory) = self.source_inventory() else {
+            return crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+            )
+            .map_err(E::from);
+        };
+        inventory
+            .verify_for_with_capacity(self, next)
+            .map_err(E::from)?;
+        inventory.read_unchanged_with_capacity(next, read)
+    }
+
+    /// Bind a source closure without the old unguarded verification occurring underneath.
+    /// It refuses the exact pre-operation metadata gap until those source laws close.
+    pub fn bind_source_inventory_with_capacity(
+        &mut self,
+        inventory: crate::SourceInventory,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        inventory.verify_for_with_capacity(self, next)?;
+        // Binding also clones configured File tokens/creates an Arc. That separate allocation
+        // law is not inferred from verification success or a zero/default certificate.
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_CAPTURE_METADATA_GAP)
+    }
+
     pub fn read_prepared_files_unchanged<T, E>(
         &self,
         read: impl FnOnce() -> std::result::Result<T, E>,

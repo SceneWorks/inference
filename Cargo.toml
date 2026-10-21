@@ -38,6 +38,9 @@ exclude = [
     "crates/media/candle-gen/vendor/candle-core",
     "crates/media/candle-gen/vendor/candle-kernels",
     "crates/media/candle-gen/vendor/candle-metal-kernels",
+    "vendor/clip-regex/regex",
+    "vendor/clip-regex/regex-automata",
+    "vendor/clip-regex/regex-syntax",
 ]
 
 # Internal packages are paths so a checkout has one contract package, one
@@ -142,3 +145,9 @@ opt-level = 3
 candle-core = { path = "crates/media/candle-gen/vendor/candle-core" }
 candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }
 candle-metal-kernels = { path = "crates/media/candle-gen/vendor/candle-metal-kernels" }
+
+# Source-bound CLIP allocation facts, same matcher versions and default behavior.
+[patch.crates-io]
+regex = { path = "vendor/clip-regex/regex" }
+regex-automata = { path = "vendor/clip-regex/regex-automata" }
+regex-syntax = { path = "vendor/clip-regex/regex-syntax" }

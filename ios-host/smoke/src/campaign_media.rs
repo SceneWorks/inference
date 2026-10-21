@@ -1139,6 +1139,46 @@ struct DeviceProvider<'a> {
 }
 impl DeviceProvider<'_> {
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
+        // REAL source boundary BEFORE snapshot/configured-load/contract/work/candidate reads.
+        // A later key or permit check cannot retroactively protect this prelude.
+        let source_capacity_refused = std::cell::Cell::new(false);
+        let mut key_next = |bytes| {
+            let result = runtime_ios::media::source_metadata_capacity(bytes);
+            if result.is_err() {
+                source_capacity_refused.set(true);
+            }
+            result.map_err(Into::into)
+        };
+        SourceInventory::preflight_directory_with_capacity(&self.root, &mut key_next).map_err(
+            |error| {
+                let error = if source_capacity_refused.get() {
+                    runtime_ios::media::AdmissionError::refused(
+                        runtime_ios::media::RefusalKind::Capacity,
+                        error.to_string(),
+                    )
+                } else {
+                    match error {
+                        Error::Unsupported(reason)
+                            if [
+                                SourceInventory::READDIR_METADATA_GAP,
+                                SourceInventory::PIN_VERIFY_METADATA_GAP,
+                                SourceInventory::PIN_CAPTURE_METADATA_GAP,
+                                SourceInventory::ABSOLUTE_PATH_METADATA_GAP,
+                                SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+                            ]
+                            .contains(&reason.as_str()) =>
+                        {
+                            runtime_ios::media::AdmissionError::refused(
+                                runtime_ios::media::RefusalKind::NoEvidence,
+                                reason,
+                            )
+                        }
+                        other => runtime_ios::media::AdmissionError::Failed(other.into()),
+                    }
+                };
+                classify(&mut self.refusal_kind, error)
+            },
+        )?;
         let configured = snapshot(&self.root, c)?;
         let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
         let spec = runtime_ios::media::configured_load_form(
@@ -1217,7 +1257,7 @@ impl DeviceProvider<'_> {
             }
             e
         })?;
-        let candidate = runtime_ios::media::build_candidate(
+        let mut candidate = runtime_ios::media::build_candidate(
             self.registry,
             &c.provider,
             spec,
@@ -1228,10 +1268,12 @@ impl DeviceProvider<'_> {
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         // The memory-relevant key (path-free layout digest, mode, geometry, execution, token
         // window). A malformed artifact is a failure here, before any evidence question.
-        let mut key = runtime_ios::media::evidence_key(
+        // Reuse the authoritative callback installed before the pre-candidate prelude.
+        let mut key = runtime_ios::media::evidence_key_with_key_capacity(
             self.registry,
-            &candidate,
+            &mut candidate,
             &runtime_ios::device_machine(),
+            &mut key_next,
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if c.provider == "sdxl" {

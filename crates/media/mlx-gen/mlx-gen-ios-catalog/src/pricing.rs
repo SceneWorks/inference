@@ -173,25 +173,127 @@ fn iris_certified_bounder(
         request.pricing,
         request_pricing,
     )?;
-    let host =
-        mlx_gen_iris::ios_pricing::host_growth_upper(request.pricing, execution.callback_host)
-            .and_then(|host_bytes| {
-                Ok((
-                    host_bytes,
-                    mlx_gen_iris::ios_pricing::os_stack_request_bytes(request.pricing)?,
-                ))
-            });
-    Ok(iris_host_claim(bounds, host))
+    let analysis = mlx_gen_iris::ios_pricing::host_analysis_without_facts(
+        request.pricing,
+        execution.callback_host,
+    )?;
+    Ok(iris_host_claim(bounds, (&analysis, None)))
+}
+
+pub(crate) fn iris_certified_bounder_with_source_capacity(
+    anchor_request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    anchor_pricing: &mlx_gen::ios_pricing::IosPricing,
+    request: &mlx_gen::ios_pricing::IosBoundRequest<'_>,
+    request_pricing: &mlx_gen::ios_pricing::IosPricing,
+    execution: &IosExecutionFacts,
+    next: &mut dyn FnMut(u64) -> mlx_gen::Result<()>,
+) -> mlx_gen::Result<mlx_gen::ios_pricing::IosCertifiedBounds> {
+    certified_scope(request.pricing.provider, execution)?;
+    // A payload-free catalog anchor resolves from its recorded token, exactly as its token-replay
+    // pricing did. Iris tasks take no reference/mask/control roles; a replay carrying any is not
+    // an Iris anchor and refuses rather than being reinterpreted.
+    let replay = match anchor_request.replay {
+        None => None,
+        Some(replay) => {
+            if (
+                replay.true_reference_count,
+                replay.mask_count,
+                replay.control_count,
+            ) != (0, 0, 0)
+            {
+                return Err(mlx_gen::Error::Unsupported(format!(
+                    "{}: Iris anchor replay carries conditioning roles the task does not take",
+                    anchor_request.pricing.provider
+                )));
+            }
+            if replay.source.is_some() {
+                return Err(mlx_gen::Error::Unsupported(format!(
+                    "{}: Iris anchor replay carries foreign provider source facts",
+                    anchor_request.pricing.provider
+                )));
+            }
+            mlx_gen_iris::ios_pricing::check_replay_source_capacity_for_provider(
+                anchor_request.pricing.provider,
+                replay.token,
+                next,
+            )?;
+            Some(crate::sampling::IrisAnchorReplay::parse(
+                anchor_request.pricing.provider,
+                replay.token,
+            )?)
+        }
+    };
+    let analysis = mlx_gen_iris::ios_pricing::ios_bounder_with_replay_analysis(
+        anchor_request.pricing,
+        replay
+            .as_ref()
+            .map(crate::sampling::IrisAnchorReplay::as_replay),
+        anchor_pricing,
+        request.pricing,
+        request_pricing,
+        next,
+    )?;
+    let request_host = analysis.request.with_callback(execution.callback_host)?;
+    let anchor_host = analysis.anchor;
+    Ok(iris_host_claim(
+        analysis.bounds,
+        (&request_host, Some(&anchor_host)),
+    ))
 }
 
 /// Every Iris task has request-scoped host allocations outside the MLX counter, so its claim is
 /// never Undeclared. A finite upper (host bytes, requested worker-stack bytes) is Declared AND
 /// carries the unapproved Rust toolchain requested-layout premise it rests on, so admission
 /// refuses it unless that exact premise is approved; an unproved term is the exact named gap.
-fn iris_host_claim(
+enum IrisHostClaim<'a> {
+    Complete(mlx_gen::Result<(u64, u64)>),
+    Incomplete(
+        &'a mlx_gen_iris::ios_pricing::IrisHostAnalysis,
+        Option<&'a mlx_gen_iris::ios_pricing::IrisHostAnalysis>,
+    ),
+}
+impl From<mlx_gen::Result<(u64, u64)>> for IrisHostClaim<'_> {
+    fn from(value: mlx_gen::Result<(u64, u64)>) -> Self {
+        Self::Complete(value)
+    }
+}
+impl<'a>
+    From<(
+        &'a mlx_gen_iris::ios_pricing::IrisHostAnalysis,
+        Option<&'a mlx_gen_iris::ios_pricing::IrisHostAnalysis>,
+    )> for IrisHostClaim<'a>
+{
+    fn from(
+        value: (
+            &'a mlx_gen_iris::ios_pricing::IrisHostAnalysis,
+            Option<&'a mlx_gen_iris::ios_pricing::IrisHostAnalysis>,
+        ),
+    ) -> Self {
+        Self::Incomplete(value.0, value.1)
+    }
+}
+
+fn iris_host_claim<'a>(
     bounds: Vec<mlx_gen::ios_pricing::IosWindowBound>,
-    host: mlx_gen::Result<(u64, u64)>,
+    host: impl Into<IrisHostClaim<'a>>,
 ) -> mlx_gen::ios_pricing::IosCertifiedBounds {
+    let host = match host.into() {
+        IrisHostClaim::Complete(result) => result,
+        IrisHostClaim::Incomplete(request, anchor) => {
+            let reason = match anchor {
+                None => request.refusal().to_string(),
+                Some(anchor) => format!(
+                    "{}; anchor_incomplete=[{}]",
+                    request.refusal(),
+                    anchor.refusal()
+                ),
+            };
+            return mlx_gen::ios_pricing::IosCertifiedBounds {
+                host: mlx_gen::ios_pricing::IosHostGrowth::Unproved(reason),
+                ..mlx_gen::ios_pricing::IosCertifiedBounds::proven(bounds)
+            };
+        }
+    };
     match host {
         Ok((host_bytes, stacks)) => {
             let mut certified = mlx_gen::ios_pricing::IosCertifiedBounds::proven_with_host(

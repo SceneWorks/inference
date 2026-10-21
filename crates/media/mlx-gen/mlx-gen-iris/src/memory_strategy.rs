@@ -671,9 +671,18 @@ pub(crate) fn backbone_bytes_where(
     quant: Option<crate::nn::BackboneQuant>,
     keep: impl Fn(&str) -> bool,
 ) -> CoreResult<u64> {
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
+    backbone_bytes_from_headers(&headers, precision, quant, keep)
+}
+
+pub(crate) fn backbone_bytes_from_headers(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    precision: Precision,
+    quant: Option<crate::nn::BackboneQuant>,
+    keep: impl Fn(&str) -> bool,
+) -> CoreResult<u64> {
     let width = u64::from(compute_width(precision));
     let mut total = 0_u64;
-    let mut headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
     // Every projection of the checkpoint (a rank-2 `.weight`, dense or packed), whether or not
     // `keep` retains its weight: its bias is held in the compute dtype.
     let projections: std::collections::HashSet<String> = headers
@@ -681,14 +690,14 @@ pub(crate) fn backbone_bytes_where(
         .filter(|h| h.shape.len() == 2)
         .filter_map(|h| h.name.strip_suffix(".weight").map(str::to_owned))
         .collect();
-    headers.retain(|h| keep(&h.name));
     // A packed artifact (`crate::packed`) is resident exactly as stored: its codes, scales,
     // biases and logical-width markers.
     let packed: std::collections::HashSet<&str> = headers
         .iter()
+        .filter(|h| keep(&h.name))
         .filter_map(|h| h.name.strip_suffix(".scales"))
         .collect();
-    for header in &headers {
+    for header in headers.iter().filter(|h| keep(&h.name)) {
         let position_table =
             header.name == "y_pos_embedding" || header.name.ends_with(".y_pos_embedding");
         let elements = header.shape.iter().map(|&d| d as u64).product::<u64>();

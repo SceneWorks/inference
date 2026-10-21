@@ -58,6 +58,93 @@ pub fn ios_bounder_with_replay(
     request: &IosPricingRequest<'_>,
     request_pricing: &IosPricing,
 ) -> Result<Vec<IosWindowBound>> {
+    bounder_impl(
+        anchor_request,
+        anchor_replay,
+        anchor_pricing,
+        request,
+        request_pricing,
+        None,
+    )
+}
+
+/// Guarded source repricing uses one explicit capacity check for BOTH source sides. Captured
+/// facts remain attached to the actual returned analysis, not thrown away after lint-only calls.
+pub struct IrisBoundAnalysis {
+    pub bounds: Vec<IosWindowBound>,
+    pub request: super::IrisHostAnalysis,
+    pub anchor: super::IrisHostAnalysis,
+}
+
+pub fn ios_bounder_with_replay_analysis(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_replay: Option<IrisReplay<'_>>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<IrisBoundAnalysis> {
+    let mut anchor = super::guarded_pricing_facts(anchor_request, anchor_replay, capacity)?;
+    let actual = super::guarded_pricing_facts(request, None, capacity)?;
+    let prepared = PreparedPair {
+        anchor: &anchor,
+        request: &actual,
+    };
+    let bounds = bounder_impl(
+        anchor_request,
+        anchor_replay,
+        anchor_pricing,
+        request,
+        request_pricing,
+        Some(&prepared),
+    )?;
+    // The request's bound carries the allocator page; this native replay diagnostic is computed
+    // only for a real restoration replay, on its actual source plan, and stays a separate domain.
+    if let Some(IrisReplay::Restoration(_)) = anchor_replay {
+        let identity = AnchorIdentity::from_sources(&anchor.sources);
+        let page = anchor_pricing
+            .observations
+            .iter()
+            .filter(|capture| {
+                capture.domain == IosMemoryDomain::NativeAllocatorGrowth
+                    && capture.coordinate == IosMemoryCoordinate::BeforeModelLoad
+            })
+            .find_map(|capture| {
+                capture
+                    .checks
+                    .iter()
+                    .find_map(|check| witnessed_page(capture, check, &identity))
+            })
+            .ok_or_else(|| Error::Unsupported("Iris replay has no native page witness".into()))?;
+        let upper = native_from_sources(anchor_request, &anchor.sources, page)?;
+        if let Some(analysis) = &mut anchor.facts.host_analysis {
+            analysis.native_replay_upper = Some(upper);
+        }
+    }
+    Ok(IrisBoundAnalysis {
+        bounds,
+        request: actual.facts.host_analysis.ok_or_else(|| {
+            Error::Unsupported("Iris guarded request has no captured host analysis".into())
+        })?,
+        anchor: anchor.facts.host_analysis.ok_or_else(|| {
+            Error::Unsupported("Iris guarded anchor has no captured host analysis".into())
+        })?,
+    })
+}
+
+struct PreparedPair<'a, 'replay> {
+    anchor: &'a super::GuardedPricingFacts<'replay>,
+    request: &'a super::GuardedPricingFacts<'replay>,
+}
+
+fn bounder_impl(
+    anchor_request: &IosPricingRequest<'_>,
+    anchor_replay: Option<IrisReplay<'_>>,
+    anchor_pricing: &IosPricing,
+    request: &IosPricingRequest<'_>,
+    request_pricing: &IosPricing,
+    prepared: Option<&PreparedPair<'_, '_>>,
+) -> Result<Vec<IosWindowBound>> {
     if anchor_request.provider != request.provider || anchor_request.mode != request.mode {
         return Err(Error::Unsupported(
             "Iris native transfer needs one provider family and mode".into(),
@@ -76,21 +163,35 @@ pub fn ios_bounder_with_replay(
     }
     // Profiles must be exactly the source-generated ones: a caller-edited window set must not
     // borrow this certificate.
-    let matches_source = |expected: IosPricing, supplied: &IosPricing| {
+    let matches_source = |expected: &IosPricing, supplied: &IosPricing| {
         expected.phases == supplied.phases
             && expected.windows == supplied.windows
             && expected.absent_phases == supplied.absent_phases
     };
-    if !matches_source(
-        anchor_source_pricing(anchor_request, anchor_replay)?,
-        anchor_pricing,
-    ) || !matches_source(super::ios_pricing(request)?, request_pricing)
+    let legacy_anchor;
+    let legacy_request;
+    let (source_anchor, source_request, identity) = if let Some(prepared) = prepared {
+        (
+            &prepared.anchor.facts.pricing,
+            &prepared.request.facts.pricing,
+            AnchorIdentity::from_sources(&prepared.anchor.sources),
+        )
+    } else {
+        legacy_anchor = anchor_source_pricing(anchor_request, anchor_replay)?;
+        legacy_request = super::ios_pricing(request)?;
+        (
+            &legacy_anchor,
+            &legacy_request,
+            AnchorIdentity::of(anchor_request, anchor_replay)?,
+        )
+    };
+    if !matches_source(source_anchor, anchor_pricing)
+        || !matches_source(source_request, request_pricing)
     {
         return Err(Error::Unsupported(
             "Iris transfer pricing is not the source-generated profile".into(),
         ));
     }
-    let identity = AnchorIdentity::of(anchor_request, anchor_replay)?;
     // Every source-matched anchor check, keyed by its actual label and phase.
     let mut witnesses: BTreeMap<(String, Option<mlx_gen::ios_pricing::IosPhase>), Vec<_>> =
         BTreeMap::new();
@@ -131,7 +232,11 @@ pub fn ios_bounder_with_replay(
     };
     // The actual marks do not attest the executing stream's device, so the delta is the MAX of the
     // CPU-stream and Metal-stream source ledgers; each is computed from its OWN backend lowering.
-    let delta = i128::from(cumulative_native_upper_any(request, page)?);
+    let delta = i128::from(if let Some(prepared) = prepared {
+        native_from_sources(request, &prepared.request.sources, page)?
+    } else {
+        cumulative_native_upper_any(request, page)?
+    });
     // Keep every observed anchor correspondence: the public law takes the MAX over candidates.
     let mut candidates = Vec::new();
     let mut anchor_classes = BTreeSet::new();
@@ -176,6 +281,23 @@ pub fn ios_bounder_with_replay(
             anchor_candidates: candidates.clone(),
         })
         .collect())
+}
+
+fn native_from_sources(
+    req: &IosPricingRequest<'_>,
+    sources: &super::GuardedSources<'_>,
+    page: u64,
+) -> Result<u64> {
+    use super::native_ledger::{self, NativeBackend};
+    let upper = |backend| match sources.replay {
+        Some(IrisReplay::Restoration(token)) => {
+            native_ledger::cumulative_native_upper_with_restoration_token(
+                req, token, page, backend, sources,
+            )
+        }
+        _ => native_ledger::cumulative_native_upper_from_sources(req, sources, page, backend),
+    };
+    Ok(upper(NativeBackend::Cpu)?.max(upper(NativeBackend::Metal)?))
 }
 
 fn overflow() -> Error {
@@ -228,6 +350,24 @@ enum AnchorIdentity {
 }
 
 impl AnchorIdentity {
+    fn from_sources(sources: &super::GuardedSources<'_>) -> Self {
+        match &sources.task {
+            super::GuardedTask::Restoration { plan, .. } => Self::Restoration {
+                source_width: u64::from(plan.source.width),
+                source_height: u64::from(plan.source.height),
+                output_width: u64::from(plan.output.width),
+                output_height: u64::from(plan.output.height),
+                tile: u64::from(plan.tile),
+            },
+            super::GuardedTask::Depth { plan, .. } => Self::Depth {
+                source_width: u64::from(plan.source_width),
+                source_height: u64::from(plan.source_height),
+                model_width: u64::from(plan.model_width),
+                model_height: u64::from(plan.model_height),
+            },
+        }
+    }
+
     fn of(req: &IosPricingRequest<'_>, replay: Option<IrisReplay<'_>>) -> Result<Self> {
         if req.provider == crate::model::MODEL_ID {
             let token = match replay {

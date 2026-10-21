@@ -64,20 +64,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "media")]
 pub mod media {
     #[cfg(feature = "device-capture")]
-    use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
+    use mlx_gen_ios_catalog::capture_permit_with_key_capacity as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::control_required;
     pub use mlx_gen_ios_catalog::{admit, admit_with_baseline, admit_with_boundary, PremisePolicy};
     pub use mlx_gen_ios_catalog::{
         anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
         build_candidate, capacity_budget, capture_adapters, capture_artifact_stem,
-        configured_load_form, configured_variant_digest, evidence, evidence_key, hex,
-        ios_memory_budget, ios_quantum, pricing, record_source_context, sampling, sana_decode_plan,
-        sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory, sana_load_spec,
-        sana_snapshot_profile, sdxl, serialize_capture_failure, serialize_capture_row, work_mode,
-        zimage, Admission, AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth,
-        BoundGenerator, BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal,
-        RefusalKind, SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
+        configured_load_form, configured_variant_digest, evidence, evidence_key,
+        evidence_key_with_key_capacity, hex, ios_memory_budget, ios_quantum, pricing,
+        record_source_context, sampling, sana_decode_plan, sana_decode_tile_edge,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
+        serialize_capture_failure, serialize_capture_row, work_mode, zimage, Admission,
+        AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
+        BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
+        SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
         CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
         IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
         SANA_DEVICE_FOOTPRINTS,
@@ -245,7 +246,7 @@ pub mod media {
         budget.reserved_headroom_bytes = 0;
         // Initialize NEW source-context payloads under the real next-allocation hook, at the
         // existing reviewed-table phase, before catalog admission reaches key tokenization.
-        // General parser/key strings and the tokenizer upper remain separate unfinished terms.
+        // General parser/key strings remain separate; fresh tokenizer work has its own guard.
         let mut source_capacity_refused = false;
         let mut source_next = |bytes| {
             let checked = source_metadata_capacity(bytes);
@@ -268,14 +269,18 @@ pub mod media {
         // The full SDK boundary: baseline AND stated execution facts. The default policy approves
         // no premise, so native certificates still refuse process-domain derivation by default.
         let facts = execution_facts(callbacks)?;
-        let admission = admit_with_boundary(
+        let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
+        let admission = mlx_gen_ios_catalog::admit_with_boundary_and_key_capacity(
             &registry,
             candidates,
             &super::device_machine(),
             budget,
-            &baseline,
-            &facts,
-            &PremisePolicy::default(),
+            mlx_gen_ios_catalog::SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy: &PremisePolicy::default(),
+                source_metadata_capacity: &mut key_next,
+            },
         )?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
         incremental_capacity(admission.required_bytes(), now, now)
@@ -446,13 +451,19 @@ pub mod media {
             require_limits_bound()?;
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        let permit = catalog_capture_permit(&registry, candidate, &super::device_machine())?;
+        let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
+        let permit = catalog_capture_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+            &mut key_next,
+        )?;
         Ok((registry, permit))
     }
 
     /// Requested-layout metadata preflight. This is byte-sensitive, unlike capture_capacity.
     /// It uses a fresh boundary (no old admission growth credit); requested bytes are NOT a
-    /// certificate of malloc/RSS/process growth. Tokenizer preflight is still a separate gap.
+    /// certificate of malloc/RSS/process growth. Fresh tokenizer phases use this same callback.
     pub fn source_metadata_capacity(next_request_bytes: u64) -> Result<()> {
         let now = super::process_memory();
         incremental_capacity(next_request_bytes, now, now)
