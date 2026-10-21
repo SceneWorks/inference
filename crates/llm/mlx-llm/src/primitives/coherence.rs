@@ -91,7 +91,14 @@ pub fn byte_checksum(a: &Array, stream: StreamOrDevice) -> Result<u64> {
 
 /// Verify that the GPU reads every one of `arrays` as the bytes the CPU holds, waiting for the
 /// views to converge. `name` is only for the error.
+///
+/// A process whose MLX default device is the CPU has no GPU view to verify: its forwards read the
+/// buffers on the CPU stream, and probing the GPU would put Metal work into a process that pinned
+/// itself off it (the CPU-pinned test children, sc-25690).
 pub fn verify_gpu_view<'a>(arrays: impl IntoIterator<Item = (&'a str, &'a Array)>) -> Result<()> {
+    if mlx_rs::Device::try_default()? == mlx_rs::Device::cpu() {
+        return Ok(());
+    }
     verify_gpu_view_with(
         arrays,
         |a| byte_checksum(a, StreamOrDevice::gpu()),

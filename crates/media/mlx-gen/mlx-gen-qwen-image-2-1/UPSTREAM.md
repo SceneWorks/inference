@@ -33,7 +33,8 @@ Config keys read: `transformer/config.json` (`in_channels`, `out_channels`, `num
 `out_channels`, `latents_mean`, `latents_std`, `scale_factor_spatial`, `is_residual` must be true,
 `patch_size` must be null); `scheduler/scheduler_config.json` (`base_image_seq_len`,
 `max_image_seq_len`, `base_shift`, `max_shift`, `shift_terminal`, `num_train_timesteps`,
-`use_dynamic_shifting` must be true, `time_shift_type` must be `exponential`).
+`use_dynamic_shifting` must be true, `time_shift_type` must be `exponential`). The distilled Turbo
+snapshot differs here — see *The distilled Turbo checkpoint* below.
 
 ## Production geometry (frozen values)
 
@@ -387,6 +388,9 @@ There is no per-component promotion, no `component_precision_floors` declaration
 | `text_encoder/` `lm_head`, `model.visual.*` | dense, **not loaded** by this route | dense | dense |
 | `vae/` (338 M) | dense f32 | dense f32 | dense f32 |
 
+(The distilled Turbo checkpoint's `vae/` ships bf16 and rides through at bf16 — see *Installable
+tiers of the Turbo checkpoint* below.)
+
 Three decisions, each deliberate:
 
 * **The text encoder is packed**, unlike the 2512 `mlx-gen-qwen-image` crate. 2512 pairs a ~20 B DiT
@@ -454,6 +458,28 @@ real on-device measurements, so filing a derivation there would launder an estim
 asset-facts + generic-headroom estimate path where the estimate safety margin applies. None of it is
 copied from the 2512 route.
 
+**The DiT's activations are priced at the width it computes in on each tier** (sc-25909,
+`derived::dit_compute_width`): bf16 on the dense tier, **f32 on q8 / q4** — a packed Linear has no
+dense weight dtype for the forward to follow, so the transformer computes in f32 there. Until
+sc-25909 the denoise term was priced at bf16 on every tier, which put a packed tier's ten-reference
+2048² cache-shed budget at 11.58 GiB against the 22.12 GiB its f32 tensors need. Every bf16 figure
+and every floor is unchanged; on q8 / q4 the 2048² table row (bounded activation 6.06 → 6.10 GiB)
+and every cache-shed request budget the denoise binds move, and the published
+`activation_dtype_width` architecture fact is 4 there. The autoencoder terms are f32 on every tier.
+
+Two known err-low approximations remain, recorded rather than changed because either fix moves
+every bf16 figure. (1) The retained text conditioning is the tower's **f32** output on every tier
+but is priced at bf16: `rows · 4096 · 2` bytes short per branch — 2 MiB at the 256-row table
+bound, 8 MiB at the 1024-row cache bound, doubled with a negative branch, so at most 16 MiB, under
+1.6 % of the 1 GiB eval slack. (2) The cache-shed budget (the generator's too) assumes 256 text
+rows (`TABLE_CONDITIONING_TOKENS`), while the engine admits 1024 under the cache bound and 4096 in
+general. Where the denoise binds (ten references at a preset) a long prompt's budget is low by
+158.4 MiB at bf16 / 302.4 MiB at q8·q4 for 1024 rows — inside the slack — and by 783.9 MiB at
+bf16 / 1 503.9 MiB at q8·q4 for 4096 rows: bf16 inside the slack, **q8 / q4 outside it by
+0.47 GiB**. A negative branch adds 14 / 62 MiB. All derived: one joint token per row (197 120 B
+at bf16, 393 728 B at f32) plus 16 384 B of f32 conditioning per row, against the 2 MiB the 256
+bf16-priced rows carry.
+
 `memory_strategy::admission_geometry` reports the envelope a consumer must gate on: the largest
 preset **area** (2400×1792, which is neither the widest preset nor the square default), the 16 800
 latent tokens it contributes, and the fact that each of up to 10 reference images adds a further
@@ -463,15 +489,333 @@ The worst-case joint sequence is therefore `256 + 16 800 + 10 × 4 096 = 58 016`
 are **priced** by the memory contract, not refused; the 1..=10 bound and every per-image geometry
 check stay request-time refusals in `reference`.
 
+## The distilled Turbo checkpoint — `qwen_image_2_1_turbo` (sc-25900)
+
+| What | Where | Revision |
+| --- | --- | --- |
+| Weights, `config.json`s, tokenizer, scheduler config, `sample_sigmas`, licence | `Qwen/Qwen-Image-2.1-Turbo` (Hugging Face) | `fc13ba1986fcb905854dc8de2f52eee395f49b5b` |
+| `QwenImage21Pipeline.config.sample_sigmas` ("Configure fixed sampling sigmas on QwenImage21Pipeline", PR 14950) | `huggingface/diffusers` (`src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py`) | `da1d3829cf08d4f329b526d89e17cc035c049d8d` |
+
+A second engine id served by this same crate. `Qwen/Qwen-Image-2.1-Turbo` is a distillation of
+Qwen-Image 2.1 with the **same** `transformer/config.json`, presets, reference/RGBA routes and
+licence (its `LICENSE` is byte-identical to the base repository's). Everything above this section
+applies to it unchanged; what differs is the snapshot, and through it the schedule.
+
+### What the Turbo snapshot carries
+
+* `model_index.json` has one extra key, `sample_sigmas`:
+  `[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]` — eight sigmas, the
+  terminal `0` excluded.
+* `scheduler/scheduler_config.json` turns every scheduler transform off: `use_dynamic_shifting:
+  false`, `shift: 1.0`, `shift_terminal: null` (the base repository has `true` / `1.0` / `0.02`).
+  The remaining keys are identical.
+* `vae/diffusion_pytorch_model.safetensors` is bf16 (base: f32), and `text_encoder/` is a single
+  `model.safetensors` (base: four shards). Neither needs loader code: the VAE computes in its
+  weight dtype and every component loads whatever `*.safetensors` its directory holds.
+
+### What upstream does with it
+
+`QwenImage21Pipeline.__call__` (at the diffusers revision above):
+
+```python
+if sigmas is None:
+    sigmas = self.config.sample_sigmas
+    if sigmas is None:
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+mu = calculate_shift(...)
+timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
+```
+
+and `FlowMatchEulerDiscreteScheduler.set_timesteps`, with dynamic shifting off, applies the static
+shift `shift·σ / (1 + (shift − 1)·σ)` — the identity at `shift: 1.0` — skips the terminal stretch
+(`shift_terminal` is null) and appends `0`. So the schedule **is** the saved list plus a trailing
+zero: `mu` is computed and ignored, and `num_inference_steps` is ignored too (the docstring:
+"Ignored when `sigmas` or the pipeline's configured `sample_sigmas` is used; the length of that
+schedule determines the number of steps"). `true_cfg_scale` still defaults to `1.0`, and a negative
+prompt with a scale above 1 still runs the second forward.
+
+### What this port does
+
+* `qwen_image_2_1_turbo` is registered beside `qwen_image_2_1` (`model::TURBO_REGISTRATION`, its
+  own memory strategy / fixture / behaviour registrations; **no** trainer — training stays on the
+  base checkpoint). `model::Variant` picks the id and `model::Schedule` the schedule family; every
+  other line of the load and render path is shared.
+* The schedule is read from the snapshot at load (`loader::load_saved_sigma_schedule` →
+  `config::SavedSigmaSchedule`), never from constants in this crate. A request with no step count
+  runs one step per saved sigma; `steps` equal to the saved length is the same list, bit for bit.
+* A snapshot of the other checkpoint is a typed refusal that names the mismatch and the id to use:
+  the base id refuses a `model_index.json` that saves `sample_sigmas`; the Turbo id refuses one
+  that does not, and refuses a scheduler config that would move the saved values
+  (`use_dynamic_shifting: true`, `shift` other than `1.0`, a non-null `shift_terminal`).
+* A curated `scheduler` name goes through the same `resolve_flow_schedule` seam as the base id,
+  built over an unshifted flow model (`mu = ln(shift) = 0`). It **replaces** the saved sigmas with
+  that scheduler's own curve at the requested step count — it is the caller leaving the distilled
+  schedule, not a re-spacing of it. The `sampler` axis integrates whichever schedule was chosen.
+* One step is accepted (`[σ₀, 0]`); the base id's `steps >= 2` floor exists only because its
+  terminal stretch divides by zero there.
+
+### What changed for the base id (sc-25900, sc-25905)
+
+Two changes reach `qwen_image_2_1` itself, beyond the Candle twin's approved prefill select (which
+does not exist on this backend — the MLX prefill already selects modulation rows exactly):
+
+* **The base snapshot's `model_index.json` is now read**, for the one discriminating key. A
+  snapshot that saves `sample_sigmas` (any present, non-null value, a malformed list included) is
+  refused under the base id — by the generator, the memory registration **and** the trainer — and
+  so is one whose `model_index.json` is present but **unparsable**, which used to load: it cannot
+  be shown not to be a Turbo snapshot. A snapshot with no `model_index.json` loads as before.
+* **The base descriptor declares a request execution domain**: `capabilities.execution` carries
+  `prefix_kv_cache: [cached, prefill]` (`gen_core::execution_domains`). A request that selects
+  nothing still runs the pre-epic prefill path, byte for byte; a request that selects `cached`
+  was refused at `validate` before this epic and is admitted now.
+
+### Installable tiers of the Turbo checkpoint (sc-25906)
+
+The same converter, with no variant flag: `convert::prequantize_turnkey` reads which checkpoint
+its **source snapshot** is (`convert::source_variant`) from the two signals the loader refuses the
+wrong engine id on — `model_index.json` saving `sample_sigmas`, under a static-shift scheduler
+config — and a source that is neither checkpoint is the loader's own typed refusal, raised before
+anything is written. A Turbo q8/q4 tier is the *Installable tiers* layout above with these
+differences, all inherited from the snapshot rather than decided by the converter:
+
+| in the tier | Turbo | base |
+|---|---|---|
+| `model_index.json` | byte-for-byte copy, `sample_sigmas` included | byte-for-byte copy |
+| `scheduler/scheduler_config.json` | byte-for-byte copy (static identity shift) | byte-for-byte copy (dynamic shift) |
+| `vae/` | byte-for-byte copy, **bf16** | byte-for-byte copy, f32 |
+| `text_encoder/model.safetensors` | packed from upstream's one file | packed from upstream's four shards |
+| `CHANGES.md` | names `Qwen/Qwen-Image-2.1-Turbo` at its pinned revision, and that the tier loads as `qwen_image_2_1_turbo` | names `Qwen/Qwen-Image-2.1` at its pinned revision — wording unchanged by this story |
+| `NOTICE` | the licence's §3(c) attribution notice, verbatim, bound by `SHA256SUMS`; `CHANGES.md` points at it | not written — a base tier is produced byte for byte as before, so published base tiers still reproduce; its attribution is the notice quoted in the `LICENSE` it carries |
+
+Because the schedule signals ride in files a tier copies verbatim, a tier is the same checkpoint as
+its source: a Turbo tier is refused under `qwen_image_2_1` and a base tier under
+`qwen_image_2_1_turbo` with exactly the typed refusals the dense snapshots get, through `load` and
+through the memory registration. The tier/request rules (`quant::needs_load_time_quant`) are the
+base checkpoint's, unchanged, and the bf16 tier is still refused rather than copied.
+
+**Derived memory — nothing here is measured.** The Turbo checkpoint's **only** derived difference
+from the base one is the autoencoder's resident bytes: it ships bf16 and MLX holds it at the
+on-disk dtype (675 480 808 B against 1 350 961 616). `memory_strategy::derived`'s
+`*_for(variant, …)` functions carry that through the totals built on the resident set (resident
+total, staged floor, peak totals, tier tree); the un-suffixed ones remain the base checkpoint's.
+**Every activation and transient term — denoise, decode head and tail, reference encode, the
+request budget — is the base checkpoint's, unchanged.** A bf16 decode stream *may* be cheaper (the
+head's attention matrices would be half as wide), but every `ChannelNorm` still widens to f32, the
+bounded decode's tile term already runs low against its one f32 trace, and nothing has been
+measured on a bf16 VAE; that saving is deliberately not claimed until the terminal story measures
+it.
+
+| Turbo, derived | bf16 | q8 | q4 |
+|---|---|---|---|
+| tower (same as base) | 14.10 GiB | 8.03 GiB | 4.80 GiB |
+| DiT (same as base) | 13.25 GiB | 7.04 GiB | 3.73 GiB |
+| VAE (bf16) | 0.63 GiB | 0.63 GiB | 0.63 GiB |
+| resident total | 27.98 GiB | 15.70 GiB | 9.15 GiB |
+| staged floor `max(tower, DiT + VAE)` — the **tower** binds | 14.10 GiB | 8.03 GiB | 4.80 GiB |
+| default-path peak at the largest-area preset (base less the VAE difference) | 34.35 GiB | 22.08 GiB | 15.53 GiB |
+| tier tree weight files (`derived::tier_tree_bytes`) | 30.21 GiB | 17.94 GiB | 11.39 GiB |
+
+The Turbo id carries its own calibration identity,
+`memory_strategy::TURBO_MEMORY_CALIBRATION_FINGERPRINT`, and registers no activation anchor.
+
+## Prefix KV cache (sc-25903)
+
+Upstream's `use_kv_cache=True` **path** is ported — not its default: a request that selects
+nothing runs prefill here (sc-25905, *Deliberate divergences*). `QwenImage21KVCache` → `PrefixKvCache`
+(`src/transformer.rs`), `kv_cache_mode="extract"` → `forward_joint_extract`, `"cached"` →
+`forward_joint_cached`, and the pipeline's loop → `denoise` / `denoise_reported`
+(`src/pipeline.rs`).
+
+**Why it is valid.** The joint sequence is `[prefix = text + condition-image blocks][target]`.
+Under `causal_condition` the prefix tokens modulate from the `t = 0` row, and block-causal
+attention never lets a prefix token attend to the target. So every block's prefix hidden states —
+and its prefix keys and values — are the same at every model evaluation of a request. The cache is
+refused without `causal_condition` (the transformer returns a typed `Unsupported`; the loop, as
+upstream's `use_kv_cache and transformer.config.causal_condition`, runs the prefill path and
+reports it).
+
+**What is stored.** Per block, exactly what `_qwenimage21_prepare_qkv` stores: the prefix rows of
+`key` **after** QK-norm and RoPE and of `value` (the raw `to_v` projection), as
+`[1, prefix_tokens, heads, head_dim]` in the compute dtype — plus, here, the target block's RoPE
+rows. `2 · blocks · prefix_tokens · inner_dim · itemsize` bytes per prompt branch: at the
+ten-reference boundary in bf16 (`2 · 32 · ~41 200 · 4096 · 2`) about 20 GiB per branch.
+
+**How a cached evaluation runs.** Only the target tokens go through `img_in` and the blocks;
+each block projects/norms/rotates the target's own `q`, `k`, `v`, prepends the cached prefix
+`k`/`v`, and makes one unmasked attention call (the block-causal mask degenerates to full attention
+for target rows). The modulation and `norm_out` rows are the sampled-timestep row for every token.
+Upstream still projects the whole text and image stream on a cached step and then slices it away;
+this port does not compute what it would discard (the projections are row-wise, so the target rows
+are the same).
+
+**When.** Upstream extracts at loop index 0. This port extracts at each branch's **first model
+evaluation** and decodes at every later one: the curated solver axis may evaluate the model more
+than once per step or off the schedule (`heun`, `dpmpp_sde`), and the cache does not depend on the
+step. With true CFG the negative branch has its own, independent cache.
+
+**MLX specifics.** The cache is materialized (`eval`) during the extract forward, **block by
+block** — a lazy cache would re-run the prefix graph on every step and keep it alive, and a cache
+evaluated only at the end of the forward would keep every block's full K/V alive until then (each
+entry is cut from that block's `[1, prefix + target, heads, head_dim]` K and V). Each cached
+tensor is copied into its own buffer: an MLX slice is a view, so caching the slice would pin the
+block's whole prefill K/V (upstream's "`clone()`, not `contiguous()`"). The extract step's live
+set is therefore the prefill forward's plus the cache it is building
+(`2 · blocks · prefix_tokens · inner_dim · itemsize`, and the target's RoPE rows). The
+caches are owned by the denoise loop's velocity closure and are dropped when the loop returns —
+on success, cancellation or error — so nothing of them reaches the VAE decode. A cancellation
+(the shared sampler's step gate) ends the loop, as upstream's `break`; a cache only exists once a
+complete extract has been evaluated, so there is no empty or partial cache to decode from.
+
+**The switch.** `DenoiseInputs::kv_cache` (`KvCacheMode::{On, Off}`). The render path
+(`src/model.rs`) drives it from the request (sc-25905, below): `On` for a request that selects
+`PrefixKvCacheMode::Cached`, `Off` otherwise. `Off` is the prefill loop, bit for bit. `denoise_reported` fills a
+`DenoiseReport`: the path that ran (`KvCachePath`), the bytes the caches held, and every
+transformer forward (`ModelEvaluation`: branch, `Prefill` / `Extract` / `Cached`, tokens the
+blocks ran over). The trainer's preview render stays on `Off`: it runs inside the trainer's
+memory envelope, which prices the prefill path.
+
+**Numerics.** Upstream documents the two paths as equally valid but not bit-identical (on the tiny
+fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
+attention call consumes the same key/value values in the same kernel as the prefill's target call,
+and on Metal the two paths are **bit-identical** at every evaluation and after the whole denoise —
+on the f32 tiny fixture and on a `head_dim = 128` model in f32 and bf16 (the geometry at which MLX
+selects its fused attention kernel on Metal; the dispatch itself is not asserted by the tests).
+`tests/kv_cache.rs` holds that to an absolute +
+relative bound and gates the cached path against upstream's own
+(`tests/fixtures/qwen21_kv_cache.safetensors`, `tools/dump_qwen21_kv_cache.py`).
+
+**Priced per request, selected per request (sc-25905).** Upstream's `use_kv_cache=True` is a
+default with no memory model behind it; here the cache is a **request selection** —
+`GenerationMemory::prefix_kv_cache`, a typed execution domain declared on
+`Capabilities::execution` for both engine ids (`gen_core::execution_domains`) — and it is priced:
+
+* **What it costs.** K and V for all 32 blocks over the prefix (the prompt rows and every
+  reference image), at the width the DiT computes in, once per prompt branch:
+  `2 · 32 · prefix_tokens · 4096 · width`. **The width follows the tier, and the packed tiers are
+  the wide ones**: the bf16 tier computes in bf16 (0.5 MiB per prefix token); q8 and q4 compute in
+  **f32** (1 MiB per token), because `compute_dtype` follows `img_in`'s dense weight dtype and a
+  packed Linear has none (`memory_strategy::derived::dit_compute_width`; observed on the
+  miniature q8 / q4 tiers by `tests/kv_admission.rs`). Quantizing the weights does not shrink the
+  cache; it doubles it.
+* **What is priced: an upper bound.** The real prefix is known only after tokenizing and fitting,
+  so the surcharge (`derived::prefix_kv_cache_demand_bytes(tier, width, height, references,
+  negative)`) is over two published bounds that err high: 1024 text rows per branch
+  (`PREFIX_KV_CACHE_CONDITIONING_TOKENS` — chosen, not measured) and 4920 tokens per reference
+  (`PREFIX_KV_CACHE_REFERENCE_TOKENS` — the largest grid any aspect ratio fits to: 13120×96, 20%
+  above the square 4096; derived by search over the ratios the processor accepts). At bf16:
+  0.5 GiB with no reference, 2.40 GiB more per reference, 24.5 GiB at ten; at q8 / q4: 1.0, 4.80
+  and 49.0 GiB; doubled with a negative branch; plus the target RoPE rows each cache keeps.
+* **A cached render is held to that price.** With the real layouts in hand the generator computes
+  what the caches would hold (`memory_strategy::prefix_kv_cache_overflow`); a request past its
+  priced figure — a prompt branch over the text bound, or a checkpoint computing wider than its
+  tier is priced at — runs **prefill** instead: never cached above its price, never a failed
+  render. The report carries both byte counts (`PrefixKvCacheReport::overflow`) and a
+  `prefix_kv_cache_shed_over_priced_bound` warning.
+* **How a cached request is bounded.** Memory limit = resident + cache-shed transient + priced
+  cache; buffer-cache limit = the cache-shed transient alone (the caches are live arrays, not
+  pooled buffers) — `AllocatorBounds::enter_retaining`. The bound behind the pricing: the extract
+  evaluation's peak is at most the prefill forward's peak plus the caches plus their RoPE rows,
+  and every later evaluation carries the target-only transient plus the caches, which is lower.
+* **What does not move.** The cache-shed budget, the derived table and every floor are the
+  numbers published before the cache existed, to the byte, for both ids (they keep 256 text rows
+  and 4096 tokens per reference; only the surcharge uses the bounds). A request that selects
+  nothing runs the prefill path under that budget — the deliberate divergence from upstream's
+  default, because a request admitted against a budget that never priced the cache must not run
+  above it.
+* **Who decides, and what the engine does not check.** The caller that owns the budget:
+  `PrefixKvCacheMode::select(budget, shed, cache)` answers `Cached` when both fit, `Prefill` when
+  only the shed demand fits (the request is admitted and runs without the cache), and `None` when
+  neither does (the caller refuses as it always did). Two things are the caller's alone. *Order:*
+  the request scope's `configure_request` replaces `GenerationRequest::memory` (with `None` for a
+  `Resident` selection), so the selection must be written **after** it, creating a block if there
+  is none — written before, it is lost and the render runs prefill in silence (pinned by
+  `a_selection_written_before_the_scope_configures_the_request_is_lost`). *Admission:* the engine
+  honours `Cached`; it does not verify the request was admitted against the cached demand.
+* **What ran.** `Generator::generate_with_report` → `GenerationReport::prefix_kv_cache`: the path
+  the denoise loop took (`cached` / `prefill`), the bytes its caches held, and `overflow` when a
+  cached selection was shed at the bound — written from the loop's own `DenoiseReport`.
+* **Approximations that remain.** The cache-shed budget still assumes 256 text rows and a square
+  4096-token reference (pre-existing; errs low for a long prompt or an extreme-aspect reference).
+  A request shed at the bound keeps the allocator bound installed for the cached figure (higher
+  than it needs, never lower).
+
+**Every cache figure above is derived — exact tensor arithmetic over the shapes the cache stores,
+held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The
+peak bound was checked on the CPU device at fixture scale only. The epic's terminal story
+measures one cached ten-reference render.
+
+## The pre-epic golden (AT4, sc-25909)
+
+Epic 25899 refactored the base forward on this backend (`transformer.rs` project / merge /
+`forward_with`, `model.rs` `Schedule`) and is meant to leave the base id's output, with the cache
+shed, **byte for byte** what it was at the pre-epic revision `c1f594203` (the merge base of the
+feature branch). Two things hold it:
+
+* **Committed, every lane:** `kv_cache::the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates`
+  — the base generator's render of a request that selects nothing equals the explicit
+  `KvCacheMode::Off` assembly byte for byte, and that same loop lands on upstream's
+  `use_kv_cache=False` latents (`qwen21_kv_cache.safetensors` `t2i/latents_final_prefill`), on the
+  CPU device in f32. Nothing machine-dependent is committed.
+* **Real weights, once, by the terminal story:** `QWEN_IMAGE_2_1_RENDER_GOLDEN=<dir>` makes the
+  two base real-weight tests (`validation_render_default_preset`, `validation_render_reference_edit`)
+  hold every PNG they write to the PNG **of the same name** in `<dir>`, **byte-equal**, refusing a
+  cached render (the pre-epic revision had no cache). The two tests and their output names are the
+  same at `c1f594203` (`qwen_image_2_1_<W>x<H>_<N>steps_seed42.png`,
+  `qwen_image_2_1_edit_{2,10}refs_<W>x<H>_<N>steps_seed42.png`; `QWEN_IMAGE_2_1_RENDER_SIZE` /
+  `_STEPS` are read identically), so the comparison is mechanical:
+
+```sh
+BASE=…/models--Qwen--Qwen-Image-2.1/snapshots/790c92633540aa0cb11d9abf19eb46d861714758
+git -C ~/Repos/inference worktree add /tmp/qwen21-pre-epic c1f594203
+for t in validation_render_default_preset validation_render_reference_edit; do
+  (cd /tmp/qwen21-pre-epic && MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=$BASE \
+     QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/qwen21-golden-c1f594203 \
+     cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+     e2e_real_weights::$t -- --ignored --exact --nocapture)
+done
+for t in validation_render_default_preset validation_render_reference_edit; do
+  MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=$BASE QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill \
+  QWEN_IMAGE_2_1_RENDER_GOLDEN=~/SceneWorks/qwen21-golden-c1f594203 \
+  QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/qwen21-golden-check \
+    cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+    e2e_real_weights::$t -- --ignored --exact --nocapture
+done
+```
+
+Each comparison prints a `[golden]` line (mean and max |Δ|); any byte off fails. The same
+`QWEN_IMAGE_2_1_RENDER_SIZE` / `QWEN_IMAGE_2_1_RENDER_STEPS` may be set on both sides for a
+quicker default-preset pair. The dry run `the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture`
+drives the comparison (pass, a changed byte, a cached render, a missing file) on the base fixture.
+
+## Cross-lane names and the one deliberate signature difference (sc-25909)
+
+The Turbo seam carries the same names on both backends: `UPSTREAM_TURBO_HF_REPO` /
+`UPSTREAM_TURBO_HF_REVISION` / `UPSTREAM_TURBO_DIFFUSERS_REVISION`, `Variant::id` / `from_id`,
+`scheduler::resample_saved_sigmas`, `SavedSigmaSchedule` / `loader::load_saved_sigma_schedule`, a
+public `Schedule`. One signature differs on purpose: the cache surcharge here is
+`derived::prefix_kv_cache_demand_bytes(tier, width, height, references, negative)` because a
+packed tier computes in f32 on this backend (its cache is twice the bf16 tier's); the candle twin's
+`memory_strategy::prefix_kv_cache_demand_bytes(width, height, references, negative)` takes no tier
+because its width follows the device, never the tier.
+
 ## Deliberate divergences
 
-* No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
-  `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
-  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
-  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
-  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
-  upstream scales with `references + steps`.
+* **Turbo: `steps` is a live knob (sc-25900).** Upstream ignores `num_inference_steps` whenever
+  the pipeline saves `sample_sigmas`, so the distilled checkpoint always runs its eight saved
+  steps. Here a step count other than the saved length `K` **resamples the saved curve**
+  (`scheduler::resample_saved_sigmas`): the knots are the saved sigmas `s_0 … s_{K−1}` followed by
+  `s_K = 0`, at `u_j = j / K`; step `i` of `N` takes the piecewise-linear interpolation at
+  `u = i / N`; a `0` is appended. In integers: `t = i·K`, `j = t div N`, `r = t mod N`,
+  `σ_i = s_j + (s_{j+1} − s_j)·(r / N)` in `f64`, rounded to `f32` at the end. `N = K` reproduces
+  the saved list exactly (upstream's schedule), `σ_0` is the first saved sigma, the list strictly
+  descends and ends on `0`. This is a SceneWorks choice with no upstream counterpart — a resampled
+  schedule is off the distillation's training grid, and the candle twin implements the same
+  arithmetic so both lanes render the same schedule for the same request.
+* Prefix KV cache: extract is keyed on the first model evaluation rather than loop index 0, and a
+  cached step skips the prefix projections upstream computes and discards — see *Prefix KV cache*.
+* Prefix KV cache default (sc-25905): upstream runs the cache unless told otherwise
+  (`use_kv_cache=True`); here a request that selects nothing runs the **prefill** path, and the
+  cache is selected per request by the caller that priced it — see *Prefix KV cache* above.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
 * Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.

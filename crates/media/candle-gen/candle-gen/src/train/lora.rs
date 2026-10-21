@@ -187,7 +187,7 @@ impl AdditiveResidual {
 
 /// 2-D Kronecker product `kron(a[m,n], b[p,q]) = [m·p, n·q]` via broadcast — differentiable, so grads
 /// flow to `a`/`b`. `out[i·p+k, j·q+l] = a[i,j]·b[k,l]`.
-fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+pub(crate) fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
     let (m, n) = a.dims2()?;
     let (p, q) = b.dims2()?;
     let a4 = a.reshape((m, 1, n, 1))?;

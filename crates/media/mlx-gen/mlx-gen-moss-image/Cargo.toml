@@ -1,0 +1,24 @@
+[package]
+name = "mlx-gen-moss-image"
+version = "0.0.0"
+edition = "2021"
+description = "Native MOSS-Image Base/SFT and explicitly selected data-space DMD for MLX."
+license = "Apache-2.0"
+autotests = false
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-rs = { workspace = true }
+mlx-llm = { workspace = true }
+mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+tempfile = { workspace = true }
+sceneworks-gen-core-testkit = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"

@@ -107,8 +107,8 @@ use candle_gen::gen_core::ProviderComponents;
 /// Sorted so a reader can find an id and a future diff stays local; the emitted manifest sorts
 /// independently, so this ordering carries no meaning beyond readability.
 ///
-/// One row per **distinct** id: fourteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
-/// `qwen_image_2_1`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
+/// One row per **distinct** id: fifteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
+/// `qwen_image_2_1`, `iris_3b`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
 /// they appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
 /// and `ltx_2_3` are trainer-**only** ids with no Candle generator, which is why they appear here
 /// and in no generator list.
@@ -209,6 +209,27 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "ideogram_4_turbo",
         components: &["ideogram_4_fp8", "ideogram_4_turbotime_lora"],
     },
+    // --- iris -------------------------------------------------------------------------------
+    // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
+    // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
+    // The same complete row the MLX twin's catalog names (sc-25679 / sc-25680).
+    ProviderComponents {
+        provider_id: "iris_3b",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
+    // The depth trainer (sc-25687) trains the repository's `depth/` export, or the repo-root
+    // backbone as its parent — whose empty-prompt conditioning may be encoded once by the Qwen3-VL
+    // text encoder — so both are rowed. It is not a generator id, hence its own row.
+    ProviderComponents {
+        provider_id: "iris_3b_depth",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
+    // The restoration transform (sc-25683) loads only the same repository's `upscaler/` export —
+    // never the text encoder — so its one component is the repository row.
+    ProviderComponents {
+        provider_id: "iris_3b_restore",
+        components: &["iris_3b"],
+    },
     // --- kolors -----------------------------------------------------------------------------
     // The `Kwai-Kolors/Kolors-diffusers` repository row is an AMBIGUOUS hole (sc-16662 U6), so the
     // UNet, VAE and derived tokenizer contribute nothing. The ChatGLM3-6B text encoder is governed
@@ -287,6 +308,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Frozen MOSS Base transformer uses the SFT bundled encoder/tokenizer/VAE.
+    // Optional DMD is disclosed from actual execution assets, never asserted for ordinary runs.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft"],
+    },
     // --- qwen-image -------------------------------------------------------------------------
     // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
     // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
@@ -304,6 +335,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "qwen_image_2_1",
         components: &["qwen_image_2_1"],
+    },
+    // The distilled checkpoint (sc-25901) is its own repository, `Qwen/Qwen-Image-2.1-Turbo`,
+    // shipping the same three components under the same licence — so its own complete row, not
+    // the base repository's.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1_turbo",
+        components: &["qwen_image_2_1_turbo"],
     },
     // --- sana -------------------------------------------------------------------------------
     // Each SANA repository ships its own DC-AE autoencoder, so the VAE rides the DiT row; the
@@ -505,8 +543,8 @@ mod tests {
     ];
 
     /// Every registered id across every provider kind — the set this mapping is measured against.
-    /// Candle registers generators, trainers, one captioner and two embedders; `transforms` is
-    /// empty here and is still walked so a future registration cannot slip past unmapped.
+    /// Candle registers generators, trainers, one captioner, two embedders and one transform
+    /// (`iris_3b_restore`, sc-25683).
     fn registered_ids() -> BTreeSet<String> {
         let registry = super::super::provider_registry().expect("catalog builds");
         let mut ids: BTreeSet<String> = BTreeSet::new();
@@ -560,7 +598,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 51);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 57);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -592,9 +630,12 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            61,
-            "61 distinct Candle provider ids: 56 generators + 16 trainers (14 of them also \
-             generator ids) + 1 captioner + 2 embedders"
+            67,
+            "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
+             sc-25901) + 19 trainers (15 of them also \
+             generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
+             transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
+             1 transform (iris_3b_restore, sc-25683)"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
@@ -745,11 +786,17 @@ mod tests {
                 "chroma1_base",
                 "chroma1_flash",
                 "chroma1_hd",
+                "iris_3b",
+                "iris_3b_depth",
+                "iris_3b_restore",
                 "ltx_2_3",
                 "ltx_2_3_distilled",
                 "minimax_h3",
                 "mochi_1",
+                "moss_image_base",
+                "moss_image_sft",
                 "qwen_image_2_1",
+                "qwen_image_2_1_turbo",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "seedvr2",
@@ -834,6 +881,7 @@ mod tests {
             "controlnet_openpose_sdxl_1_0",
             // Caller-selected add-ons, deliberately out of scope for a list with no optionality.
             "anima_official_loras",
+            "moss_image_sft_8_steps_dmd",
             "hyper_sd_flux1_dev_8steps_lora",
             "ip_adapter",
             "kolors_ip_adapter_plus",

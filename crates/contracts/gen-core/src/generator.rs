@@ -7,7 +7,10 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
-use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
+use crate::execution_domains::{
+    CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence, PrefixKvCacheMode,
+    PrefixKvCacheReport,
+};
 use crate::hdr::HdrColorSpace;
 use crate::media::{AudioChunk, AudioTrack, Image, RgbaImage};
 use crate::runtime::{
@@ -26,6 +29,27 @@ use crate::{
 pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
+
+    /// Observed sparse-attention outcome of the most recent request, when adopted.
+    fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
+        None
+    }
+
+    /// Actual last successful MOSS execution. Providers clear this under their lifecycle lock
+    /// before every attempt and publish only after all outputs and a final cancellation check.
+    /// Callers must serialize generation and receipt retrieval together; concurrent attempts may
+    /// clear/replace the last-completed receipt. None never implies successful MOSS execution.
+    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
+        None
+    }
+
+    /// MOSS-owned materialized weight buffers retained by this provider, excluding workspace,
+    /// allocator slack, source payloads and other providers. This metadata-only getter never
+    /// evaluates tensors. Call within the serialized cache transaction; warm admission may credit
+    /// at most this value bounded by the current committed snapshot. None grants no extra credit.
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        None
+    }
 
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
@@ -83,6 +107,15 @@ pub trait Generator {
             MemoryPeakBreakdown::from_unattributed(base_predicted_peak_bytes),
             |contract| contract.predicted_peak_from_base(base_predicted_peak_bytes),
         )
+    }
+
+    /// Optional problem-bounded sparse residency. Disabled/absent settings return None without
+    /// loading predictors or allocating device state. Worker admission calls this per queued job.
+    fn veda_workspace_bound(
+        &self,
+        _req: crate::veda::workspace::Request<'_>,
+    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
+        Ok(None)
     }
 
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
@@ -335,6 +368,40 @@ pub enum GenerationOutput {
     Audio(AudioTrack),
 }
 
+/// The caption-overflow policy ([`GenerationRequest::caption_overflow`], epic sc-25678): what a
+/// text encoder with a fixed caption budget does with a prompt that tokenizes past it. The three
+/// values are upstream Iris-3B's `text_encoder.on_caption_overflow` vocabulary, verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CaptionOverflowPolicy {
+    /// Truncate the caption to the budget and log a warning (upstream's release default).
+    Warn,
+    /// Refuse the request: a caption that does not fit is an error, never silently truncated.
+    Error,
+    /// Truncate the caption to the budget without logging.
+    Silent,
+}
+
+impl CaptionOverflowPolicy {
+    /// Parse upstream's lowercase spelling (`warn` / `error` / `silent`); anything else is `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "warn" => Self::Warn,
+            "error" => Self::Error,
+            "silent" => Self::Silent,
+            _ => return None,
+        })
+    }
+
+    /// The lowercase spelling (round-trips with [`Self::from_name`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Silent => "silent",
+        }
+    }
+}
+
 /// How many channels an image generation emits ([`GenerationRequest::output_channels`],
 /// sc-24111).
 ///
@@ -393,6 +460,8 @@ impl HdrRequest {
 pub struct GenerationRequest {
     // --- Core ---
     pub prompt: String,
+    /// Frozen MOSS controls. None means ordinary inference with acceleration OFF.
+    pub moss_image: Option<crate::moss_image::MossImageOptions>,
     pub negative_prompt: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -432,6 +501,25 @@ pub struct GenerationRequest {
     /// APG norm-threshold (`apg` only): clamp the guidance delta to `‖diff‖ ≤ norm_threshold`
     /// (`0` disables the clamp). `None` ⇒ the engine default. Ignored by non-APG methods.
     pub guidance_norm_threshold: Option<f32>,
+    /// Classifier-free-guidance **interval** `(lo, hi)` (epic sc-25678): guidance runs only at the
+    /// model-evaluation times `t` (normalized noise level, `1` = pure noise, `0` = clean) strictly
+    /// inside `lo < t < hi`; every other evaluation is a single conditional forward. `None` ⇒ the
+    /// model's own default interval. Gated by [`Capabilities::supports_cfg_interval`]: a model that
+    /// does not advertise it refuses a `Some` on the shared floor rather than ignoring it. Both
+    /// bounds join the finiteness floor and must satisfy `lo < hi`.
+    pub cfg_interval: Option<(f32, f32)>,
+    /// A **prompt batch** (epic sc-25678): when non-empty, these prompts are rendered together as one
+    /// batched denoise (upstream `generate(prompts=[…])`), one image per prompt, repeated `count`
+    /// times — `prompt_batch.len() × count` images in prompt-minor order. `prompt` must then be empty
+    /// (the batch *is* the prompt list, so a second source of truth is refused, never merged). Empty
+    /// (the default) is the ordinary single-prompt request. Gated by
+    /// [`Capabilities::supports_prompt_batch`] and bounded by [`Capabilities::max_count`] on the
+    /// total image count.
+    pub prompt_batch: Vec<String>,
+    /// What to do when a prompt tokenizes past the model's caption budget (epic sc-25678; upstream
+    /// Iris-3B's `text_encoder.on_caption_overflow`). `None` ⇒ the checkpoint's own configured
+    /// policy. Gated by [`Capabilities::supports_caption_overflow_policy`].
+    pub caption_overflow: Option<CaptionOverflowPolicy>,
 
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
@@ -465,6 +553,11 @@ pub struct GenerationRequest {
     pub fps: Option<u32>,
     pub duration: Option<f32>,
     pub video_mode: Option<String>,
+    /// MiniMax-H3 learned sparse attention; absent/off is the historical dense route.
+    pub veda: Option<crate::VedaRequest>,
+    /// Operator-owned terminal H3 measurement. The worker must never copy this from a job payload.
+    /// Other generators ignore it; false preserves their normal execution path.
+    pub h3_terminal_telemetry: bool,
     /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
     /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
     /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
@@ -800,6 +893,14 @@ pub struct GenerationMemory {
     /// See [`CfgBatching`]: batched CFG doubles exactly the transients rungs 2-4
     /// exist to bound, which is why it is a planner-selectable axis.
     pub cfg_batching: Option<CfgBatching>,
+    /// Whether a block-causal denoiser keeps its prefix key/value cache for this request
+    /// (sc-25905). `None` ⇒ the provider's own default, which for this domain is
+    /// [`PrefixKvCacheMode::Prefill`] — the path that holds nothing, so a request admitted against a
+    /// budget that never priced the cache cannot run above it. A caller that has priced the cache
+    /// and found it fits selects [`PrefixKvCacheMode::Cached`]
+    /// ([`PrefixKvCacheMode::select`]). See [`PrefixKvCacheMode`]: numerically equivalent, not
+    /// bit-identical, and independent of every rung of the ladder.
+    pub prefix_kv_cache: Option<PrefixKvCacheMode>,
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
@@ -990,6 +1091,11 @@ pub struct GenerationReport {
     /// Non-fatal conditions of this render (a truncated phase, a cover-check warning), in the
     /// order they were found. Empty when there is nothing to report.
     pub warnings: Vec<GenerationWarning>,
+    /// Which prefix-KV-cache path the render ran and what its caches held (sc-25905). `None` for
+    /// every provider that declares no
+    /// [`ExecutionSurface::prefix_kv_cache`](crate::ExecutionSurface::prefix_kv_cache) domain;
+    /// `Some` for one that does, on every render, whatever the request selected.
+    pub prefix_kv_cache: Option<PrefixKvCacheReport>,
 }
 
 impl GenerationReport {
@@ -1000,6 +1106,7 @@ impl GenerationReport {
             output: Some(output),
             artifacts: None,
             warnings: Vec::new(),
+            prefix_kv_cache: None,
         }
     }
 }
@@ -1223,6 +1330,7 @@ impl Default for GenerationRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            moss_image: None,
             negative_prompt: None,
             width: 1024,
             height: 1024,
@@ -1239,6 +1347,9 @@ impl Default for GenerationRequest {
             guidance_eta: None,
             guidance_momentum: None,
             guidance_norm_threshold: None,
+            cfg_interval: None,
+            prompt_batch: Vec::new(),
+            caption_overflow: None,
             conditioning: Vec::new(),
             strength: None,
             control_scale: None,
@@ -1248,6 +1359,8 @@ impl Default for GenerationRequest {
             fps: None,
             duration: None,
             video_mode: None,
+            veda: None,
+            h3_terminal_telemetry: false,
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
@@ -1506,6 +1619,8 @@ impl GenerationRequest {
             // Non-float fields: explicitly ignored, but named (no `..`) so a newly-added field breaks
             // the build here and the author must classify it.
             prompt: _,
+            // MOSS sub-block floats join the floor through its exhaustive helper below.
+            moss_image,
             negative_prompt: _,
             width: _,
             height: _,
@@ -1516,10 +1631,17 @@ impl GenerationRequest {
             sampler: _,
             scheduler: _,
             guidance_method: _,
+            // A string list and a unit enum (sc-25681): no floats to classify. `cfg_interval`'s two
+            // bounds join the float floor below.
+            prompt_batch: _,
+            caption_overflow: _,
+            cfg_interval,
             conditioning,
             frames: _,
             fps: _,
             video_mode: _,
+            veda: _,
+            h3_terminal_telemetry: _,
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
@@ -1576,6 +1698,9 @@ impl GenerationRequest {
             pid_capture_sigma,
             text_style_gain,
         } = self;
+        if let Some(nonfinite) = moss_image.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
             ("true_cfg", *true_cfg),
@@ -1594,7 +1719,11 @@ impl GenerationRequest {
             ("pid_capture_sigma", *pid_capture_sigma),
             ("text_style_gain", *text_style_gain),
         ];
-        for (name, v) in floats {
+        let interval: [(&'static str, Option<f32>); 2] = [
+            ("cfg_interval.lo", cfg_interval.map(|(lo, _)| lo)),
+            ("cfg_interval.hi", cfg_interval.map(|(_, hi)| hi)),
+        ];
+        for (name, v) in floats.into_iter().chain(interval) {
             if let Some(x) = v {
                 if !x.is_finite() {
                     return Some((name, x));
@@ -3068,6 +3197,16 @@ pub struct Capabilities {
     /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
     /// playback failure the opt-in exists to prevent.
     pub supports_hdr: bool,
+    /// Whether this model honours [`GenerationRequest::cfg_interval`] (epic sc-25678). `Default` is
+    /// `false`, and the shared floor refuses a `Some` interval against such a model rather than
+    /// letting it be accepted and ignored.
+    pub supports_cfg_interval: bool,
+    /// Whether this model renders a [`GenerationRequest::prompt_batch`] as one batched denoise (epic
+    /// sc-25678). `Default` is `false`; the shared floor refuses a non-empty batch otherwise.
+    pub supports_prompt_batch: bool,
+    /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
+    /// is `false`; the shared floor refuses a `Some` policy otherwise.
+    pub supports_caption_overflow_policy: bool,
     /// Whether this model can emit **RGBA** images with a straight alpha channel through
     /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
     ///
@@ -3529,6 +3668,18 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.moss_image.is_some()
+            && crate::moss_image::MossImageVariant::from_provider_id(id).is_none()
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: MOSS controls require a MOSS-Image provider"
+            )));
+        }
+        if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
+            return Err(Error::Unsupported(format!(
+                "{id}: Veda attention requires MiniMax-H3"
+            )));
+        }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
         // one here means the request renders SDR while the caller believes it asked for HDR — a
@@ -3537,6 +3688,49 @@ impl Capabilities {
         if req.hdr.is_some() && !self.supports_hdr {
             return Err(Error::Unsupported(format!(
                 "{id}: HDR output is not supported by this model"
+            )));
+        }
+        // Guidance interval, prompt batch and caption-overflow policy (epic sc-25678). On the shared
+        // floor for the HDR reason: each is a control a provider that does not read it would accept
+        // and silently ignore. Unset values validate vacuously.
+        if let Some((lo, hi)) = req.cfg_interval {
+            if !self.supports_cfg_interval {
+                return Err(Error::Unsupported(format!(
+                    "{id}: `cfg_interval` is not supported by this model"
+                )));
+            }
+            if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                return Err(Error::Msg(format!(
+                    "{id}: cfg_interval ({lo}, {hi}) must be finite with lo < hi"
+                )));
+            }
+        }
+        if !req.prompt_batch.is_empty() {
+            if !self.supports_prompt_batch {
+                return Err(Error::Unsupported(format!(
+                    "{id}: a `prompt_batch` is not supported by this model; send one request per \
+                     prompt"
+                )));
+            }
+            if !req.prompt.is_empty() {
+                return Err(Error::Msg(format!(
+                    "{id}: a request carries either `prompt` or a non-empty `prompt_batch`, not both"
+                )));
+            }
+            let images = req.prompt_batch.len() as u64 * req.count as u64;
+            if images > self.max_count as u64 {
+                return Err(Error::Msg(format!(
+                    "{id}: prompt_batch of {} × count {} = {images} images exceeds the {} images \
+                     per request this model renders",
+                    req.prompt_batch.len(),
+                    req.count,
+                    self.max_count
+                )));
+            }
+        }
+        if req.caption_overflow.is_some() && !self.supports_caption_overflow_policy {
+            return Err(Error::Unsupported(format!(
+                "{id}: `caption_overflow` is not supported by this model"
             )));
         }
         // RGBA opt-in (sc-24111). On the shared floor for the same reason HDR is: a per-provider
@@ -4435,6 +4629,8 @@ mod tests {
                 graph_eval_cadence: None,
                 ffn_chunk: None,
                 cfg_batching: None,
+                // sc-25905: unset is the prefill path — the cache is opt-in per request.
+                prefix_kv_cache: None,
                 calibration_error_phase: None,
                 calibration_fault_harness_authorized: false,
             }
@@ -4661,6 +4857,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "prefix_kv_cache",
+                GenerationMemory {
+                    prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+                    ..Default::default()
+                },
+            ),
         ] {
             let request = GenerationRequest {
                 memory: Some(memory),
@@ -4703,6 +4906,7 @@ mod tests {
                 graph_eval_cadence_blocks: ExecutionValueDomain::ANY_POSITIVE,
                 ffn_chunk_rows: ExecutionValueDomain::Candidates(vec![2048]),
                 cfg_batching: CfgBatchingDomain::Modes(vec![CfgBatching::Batched]),
+                ..ExecutionSurface::default()
             },
             ..caps()
         };
@@ -6139,6 +6343,79 @@ mod tests {
     }
 
     #[test]
+    fn cfg_interval_prompt_batch_and_caption_overflow_are_gated_on_the_floor() {
+        // sc-25681: each control is refused by a model that does not advertise it, so it can never
+        // be accepted and ignored; an advertising model still gets the shape checks.
+        let plain = Capabilities {
+            min_size: 64,
+            max_size: 2048,
+            max_count: 4,
+            ..Default::default()
+        };
+        let all = Capabilities {
+            supports_cfg_interval: true,
+            supports_prompt_batch: true,
+            supports_caption_overflow_policy: true,
+            ..plain.clone()
+        };
+        let base = || GenerationRequest {
+            prompt: "p".into(),
+            ..Default::default()
+        };
+        let interval = GenerationRequest {
+            cfg_interval: Some((0.1, 0.9)),
+            ..base()
+        };
+        let batch = GenerationRequest {
+            prompt: String::new(),
+            prompt_batch: vec!["a".into(), "b".into()],
+            count: 2,
+            ..Default::default()
+        };
+        let overflow = GenerationRequest {
+            caption_overflow: Some(CaptionOverflowPolicy::Error),
+            ..base()
+        };
+        for req in [&interval, &batch, &overflow] {
+            assert!(matches!(
+                plain.validate_request("m", req),
+                Err(Error::Unsupported(_))
+            ));
+            all.validate_request("m", req).unwrap();
+        }
+        let inverted = GenerationRequest {
+            cfg_interval: Some((0.9, 0.1)),
+            ..base()
+        };
+        assert!(all.validate_request("m", &inverted).is_err());
+        let nan = GenerationRequest {
+            cfg_interval: Some((f32::NAN, 0.5)),
+            ..base()
+        };
+        assert_eq!(
+            nan.first_nonfinite_float().map(|(n, _)| n),
+            Some("cfg_interval.lo")
+        );
+        let both = GenerationRequest {
+            prompt: "p".into(),
+            ..batch.clone()
+        };
+        assert!(all.validate_request("m", &both).is_err());
+        let too_many = GenerationRequest { count: 3, ..batch };
+        assert!(all.validate_request("m", &too_many).is_err());
+        for policy in [
+            CaptionOverflowPolicy::Warn,
+            CaptionOverflowPolicy::Error,
+            CaptionOverflowPolicy::Silent,
+        ] {
+            assert_eq!(
+                CaptionOverflowPolicy::from_name(policy.name()),
+                Some(policy)
+            );
+        }
+    }
+
+    #[test]
     fn generate_with_report_defaults_to_the_bare_output() {
         // sc-22988: the additive entry point wraps `generate` for every provider that does not
         // override it — no record, no warnings, the same output.
@@ -6178,6 +6455,7 @@ mod tests {
                 ..Default::default()
             },
         });
+        assert_eq!(generator.moss_image_owned_weight_bytes(), None);
         let mut progress = Vec::new();
         let report = generator
             .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))

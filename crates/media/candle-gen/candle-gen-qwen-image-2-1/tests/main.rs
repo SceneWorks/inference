@@ -28,6 +28,15 @@ mod edit_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "kv_admission.rs"]
+mod kv_admission;
+
+#[path = "kv_cache.rs"]
+mod kv_cache;
+
+#[path = "metal_reference_latents.rs"]
+mod metal_reference_latents;
+
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
 
@@ -36,6 +45,9 @@ mod pre_epic_golden;
 
 #[path = "registration.rs"]
 mod registration;
+
+#[path = "request_surface.rs"]
+mod request_surface;
 
 #[path = "rgba_parity.rs"]
 mod rgba_parity;
@@ -49,11 +61,20 @@ mod text_encoder_parity;
 #[path = "tiers.rs"]
 mod tiers;
 
+#[path = "train_peak_real_weights.rs"]
+mod train_peak_real_weights;
+
 #[path = "trainer_conformance.rs"]
 mod trainer_conformance;
 
 #[path = "transformer_parity.rs"]
 mod transformer_parity;
+
+#[path = "turbo.rs"]
+mod turbo;
+
+#[path = "turbo_tiers.rs"]
+mod turbo_tiers;
 
 #[path = "vae_parity.rs"]
 mod vae_parity;

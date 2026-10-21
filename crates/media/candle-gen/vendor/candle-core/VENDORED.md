@@ -1,5 +1,12 @@
 # Vendored `candle-core` — CUDA-graph parameter cache (sc-24441)
 
+Dependency maintenance (2026-10-17): the standalone `Cargo.toml` now requires
+`zip = "9"` instead of `7.2.0` to address RUSTSEC-2026-0367, RUSTSEC-2026-0368,
+and RUSTSEC-2026-0369. Features remain disabled by default. `src/npy.rs` and
+`src/pickle.rs` propagate zip 9's fallible filename decoding and own the decoded
+names before reading entries. No tensor or kernel source changes accompany this
+migration. Validate the NPY/NPZ and pickle archive tests when refreshing it.
+
 This directory is `candle-core` `0.10.2` from
 
     https://github.com/huggingface/candle @ 1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d
@@ -51,14 +58,25 @@ evidence.
    value upstream's root manifest at `1e6aa85e` declares; the three sibling crates upstream
    reaches by path (`candle-kernels`, `candle-metal-kernels`, `candle-ug`) are the same crates at
    the same git revision the pin resolved before, so `Cargo.lock` changes by one line (the
-   `source` of `candle-core`). Features, targets, dev-dependencies, benches and examples are
+   `source` of `candle-core`). The root `[patch]` then redirects `candle-kernels` and
+   `candle-metal-kernels` to their own vendored copies (each with its own `VENDORED.md`). Features, targets, dev-dependencies, benches and examples are
    upstream's.
 3. `src/quantized/cuda.rs` — one local fix, not upstream (sc-24446; upstream `main` still has
    the defect as of 2026-10): the four `QCudaStorage` quantizers (`quantize`, `quantize_imatrix`,
    `quantize_imatrix_onto`, `quantize_onto`) allocate their `MATRIX_ROW_PADDING` tail with
    `alloc_zeros` instead of `unsafe alloc`, as `load_quantized` and `QCudaStorage::zeros` already
    do. See *Quantized padding is zeroed* below.
-4. `VENDORED.md` — this file.
+4. `src/backprop.rs` — one local patch, not upstream (sc-25686; upstream `main` still has the
+   behaviour as of 2026-10): `Tensor::backward` computes and stores a gradient only for an operand
+   that is itself in `sorted_nodes` (i.e. leads to a `Var`). Every `if needs_grad(..)` guard in the
+   backward `match`, the `tracked` set and the `needs_grad` closure above it (delimited by
+   `// sc-25686` comments) are the whole change. See *Untracked operands get no gradient* below.
+5. `VENDORED.md` — this file.
+6. `src/backprop.rs` `Op::MaxPool2D` arm + `tests/grad_tests.rs` `max_pool2d_grad` — one local fix,
+   not upstream (sc-25688; upstream `main` still has the defect as of 2026-10): the max-pool
+   backward routes each window's gradient to its maximum (split evenly over ties) and gives the
+   rows / columns a floor-division pool drops zero gradient. See *Max-pool backward routes the
+   window gradient* below.
 
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
@@ -78,6 +96,65 @@ unchanged code path). llama.cpp zeroes the same padding for the same reason. Wit
 the term is an exact `0`, so zeroing it changes no finite result. candle-llm's
 `primitives::quant::cuda_tests::quantize_on_load_zeroes_the_padding_mmq_reads` pins it on the CUDA
 lane.
+
+## Untracked operands get no gradient
+
+Upstream's backward walks only the nodes that lead to a `Var`, but inside a multi-input op's arm it
+computes and accumulates a gradient for **every** floating operand. A frozen (non-`Var`) weight
+used as a matmul rhs — every base projection of an adapter run — therefore costs a full
+weight-gradient GEMM (`lhsᵀ · grad`, `[in, out]`) plus a `zeros_like` accumulator, and since that
+operand is never a node of the walk its entry is never consumed: it stays in the `GradStore` until
+the store drops (sc-25686: the Iris LoRA step peaked at 45 GB on CUDA against MLX's ~15 GB; the
+Qwen-Image 2.1 trainer's `DEAD_WEIGHT_GRAD_COPIES` priced the same retention at 3 copies; re-measured
+on CUDA after this patch it is 0, and 24 of its 36 `BACKWARD_RETAINED_HIDDEN` chain tensors went with
+it). The patch guards each
+operand of the multi-input arms (`Binary` add/sub/mul/div/min/max, `WhereCond`, the convolutions,
+`SliceScatter0`, `Scatter`/`ScatterAdd`/`IndexAdd`, `Matmul`, `Cat`, and the `CustomOp2`/`CustomOp3`
+results) with membership in the walked set; single-input arms are reached only through a walked node
+whose one operand is walked, so they need none. A tracked tensor's gradient is unchanged — the same
+ops accumulated in the same order — so this changes no trained result; it only stops computing and
+storing gradients nobody reads. A `GradStore` from `backward()` now holds `Var` gradients only (the
+root's is consumed as before). `candle-gen-iris`'s
+`train_parity::backward_stores_gradients_only_for_trainable_tensors` pins it (full, LoRA, LoKr), and
+upstream's `grad_tests` / `custom_op_tests` / `conv_tests` / `matmul_tests` / `tensor_tests` pass on
+this copy.
+
+## Max-pool backward routes the window gradient
+
+Upstream's `MaxPool2D` backward builds the "is the window maximum" mask, then multiplies the
+upsampled gradient by `avg_pool(mask)` — the **fraction** of the window that is maximal. A unique
+maximum therefore received `grad / (kh · kw)` (a quarter of the true gradient for the 2×2 pools VGG
+uses), a tie received `grad · ties / (kh · kw)` instead of `grad / ties`, and on an odd input
+(`h` or `w` not a multiple of the kernel) the nearest-upsampled `[oh, ow]` gradient was stretched over
+the whole `[h, w]` input, misaligning every window. The patch divides by the per-window maximum count
+(`avg_pool(mask) · kh · kw`), computes the mask and the routed gradient over the covered
+`[oh·kh, ow·kw]` region only, and zero-pads the dropped trailing rows / columns — the
+`torch.nn.functional.max_pool2d` gradient (which, on ties, picks one index; an even split is the
+same total). Only the pool's own gradient changes; its forward is upstream's.
+
+**Who it changes.** Every backward through a candle `max_pool2d`:
+
+* the latent-LPIPS auxiliary loss (`candle-gen/src/train/latent_lpips.rs` `Op::MaxPool`, built by
+  `candle-gen-perceptual`), whose gradient now reaches the trainer at the true scale — the trainers
+  that declare a latent-LPIPS family are `candle-gen-sdxl` and `candle-gen-kolors` (SDXL),
+  `candle-gen-sd3` (SD3) and `candle-gen-z-image` (Flux); `mage`, `anima`, `krea`, `ltx`,
+  `qwen-image-2-1`, `lens` and `wan` declare none (`latent_lpips: None`, the loss is refused) and
+  run no max-pool backward;
+* the Iris restoration trainer's LPIPS-VGG (`candle-gen-iris/src/train/lpips.rs`), whose gradient is
+  pinned against torch in `restoration_train_parity`.
+
+In E-LatentLPIPS the first three VGG pools are identities and only the fourth is a real 2×2
+max-pool, so before the fix the gradient reaching the latent through the taps behind it was a
+quarter of its true value (and misaligned when that layer's spatial size was odd); the shallower
+taps were unaffected. A run that weights `latent_lpips_loss` now trains that part of the term at the
+strength the weight states. The Iris LPIPS-VGG has five real pools (the last unused), so the fix
+matters there for every tap past the first. `tests/grad_tests.rs::max_pool2d_grad` pins
+a unique maximum, a tie and an odd trailing row / column on CPU, CUDA and Metal; upstream's
+`grad_tests` / `pool_tests` / `conv_tests` / `tensor_tests` pass on this copy. This crate is outside
+the workspace, so CI never runs those tests; the CI-run pin is `candle-gen`'s
+`train::latent_lpips::tests::max_pool_backward_is_the_finite_difference_gradient` (an f64 central
+difference on a tie-free odd input, torch's gradient on the tie case, and the refused stride < kernel
+backward).
 
 ## Eager behaviour is unchanged outside the guard
 
@@ -145,8 +222,10 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
 1. Re-copy `candle-core/` from the new revision over this directory (keep this file).
 2. Re-apply `cabbc301` and `f53ed3bf` unless the new revision contains them (upstream main after
    2026-06-24 does), and the zeroed quantized padding (`src/quantized/cuda.rs`) unless the new
-   revision zeroes it itself — only then can this vendor and its `[patch]` be dropped.
+   revision zeroes it itself, and the untracked-operand backward guards (`src/backprop.rs`) unless
+   the new revision skips untracked operands itself — only then can this vendor and its `[patch]` be
+   dropped.
 3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
 4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
-   `VENDORED_PACKAGES`), re-vendor `candle-kernels` (its own `VENDORED.md`), regenerate the lock,
-   and run the CUDA lane (`gh workflow run ci.yml -f lanes=windows-cuda`).
+   `VENDORED_PACKAGES`), re-vendor `candle-kernels` and `candle-metal-kernels` (their own
+   `VENDORED.md`), regenerate the lock, and run the CUDA lane (`gh workflow run ci.yml -f lanes=windows-cuda`).

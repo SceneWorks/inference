@@ -792,9 +792,15 @@ pub(crate) fn native_dit_transformer_bytes(
     quant: Option<mlx_gen::Quant>,
     shapes: crate::native_remap::DeclaredLogicalShapes<'_>,
 ) -> CoreResult<u64> {
+    let prefix = crate::native_remap::detect_native_prefix(dit_file).map_err(|error| {
+        CoreError::Msg(format!(
+            "{provider_id}: native DiT asset facts for '{}': {error}",
+            dit_file.display()
+        ))
+    })?;
     let plan = mlx_gen::logical_weights::plan_logical_weights(
         dit_file,
-        &crate::native_remap::KreaNativeToDiffusersMapping::new(shapes),
+        &crate::native_remap::KreaNativeToDiffusersMapping::new(prefix, shapes),
     )
     .map_err(|error| {
         CoreError::Msg(format!(

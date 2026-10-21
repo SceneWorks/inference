@@ -447,6 +447,99 @@ mod tests {
         Tensor::from_vec(v, shape, &CPU).unwrap()
     }
 
+    /// `d Σ(w ⊙ max_pool2d(x, k)) / dx`, the backward this net's real max-pool runs (the vendored
+    /// candle-core `Op::MaxPool2D` arm, VENDORED.md change 6).
+    fn max_pool_grad(x: &Tensor, k: usize) -> (Tensor, Tensor) {
+        let v = Var::from_tensor(x).unwrap();
+        let pool = v.as_tensor().max_pool2d(k).unwrap();
+        let n = pool.elem_count();
+        let w = Tensor::arange(1f64, n as f64 + 1.0, &CPU)
+            .unwrap()
+            .to_dtype(x.dtype())
+            .unwrap()
+            .reshape(pool.shape())
+            .unwrap();
+        let grads = (pool * &w).unwrap().sum_all().unwrap().backward().unwrap();
+        (grads.get(v.as_tensor()).expect("input gradient").clone(), w)
+    }
+
+    /// The max-pool backward the fourth VGG stage runs is the true gradient: on a tie-free f64
+    /// input with an odd trailing row and column it equals a central finite difference to 1e-6, and
+    /// on a tie it routes the same per-window total torch does (torch 2.x
+    /// `F.max_pool2d(x, 2).backward(w)` puts it all on the first maximum in scan order; candle — and
+    /// MLX's `max_axes` VJP the MLX twin runs — split it evenly, an equally valid subgradient).
+    /// Mutation: the pre-sc-25688 arm (`grad · avg_pool(mask)` upsampled over the whole input) ⇒
+    /// every unique maximum gets `grad / 4` and the odd input misaligns ⇒ red.
+    #[test]
+    fn max_pool_backward_is_the_finite_difference_gradient() {
+        // Tie-free f64 input, odd h and w (the floor-division pool drops row 4 and column 6).
+        let x = randn(11, (1, 2, 5, 7)).to_dtype(DType::F64).unwrap();
+        let (grad, w) = max_pool_grad(&x, 2);
+        let f = |t: &Tensor| -> f64 {
+            (t.max_pool2d(2).unwrap() * &w)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap()
+        };
+        let base: Vec<f64> = x.flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f64> = grad.flatten_all().unwrap().to_vec1().unwrap();
+        let eps = 1e-6;
+        for i in 0..base.len() {
+            let at = |d: f64| {
+                let mut v = base.clone();
+                v[i] += d;
+                f(&Tensor::from_vec(v, x.shape(), &CPU).unwrap())
+            };
+            let fd = (at(eps) - at(-eps)) / (2.0 * eps);
+            assert!(
+                (got[i] - fd).abs() < 1e-6,
+                "element {i}: backward {} vs finite difference {fd}",
+                got[i]
+            );
+        }
+
+        // Ties + odd size, against torch's gradient for the same input and `w = [[1, 2], [3, 4]]`.
+        #[rustfmt::skip]
+        let x = Tensor::new(&[
+            [0.1f64, 0.2, 9.0, 0.3, 50.0],
+            [0.4,    5.0, 0.5, 9.0, 50.0],
+            [7.0,    0.6, 0.7, 0.8, 50.0],
+            [0.9,    1.0, 1.1, 8.0, 50.0],
+            [60.0,  60.0, 60.0, 60.0, 60.0],
+        ], &CPU).unwrap().reshape((1, 1, 5, 5)).unwrap();
+        let (grad, _) = max_pool_grad(&x, 2);
+        let got = grad.reshape((5, 5)).unwrap().to_vec2::<f64>().unwrap();
+        #[rustfmt::skip]
+        let torch = [
+            [0., 0., 2., 0., 0.],
+            [0., 1., 0., 0., 0.],
+            [3., 0., 0., 0., 0.],
+            [0., 0., 0., 4., 0.],
+            [0., 0., 0., 0., 0.],
+        ];
+        // Unique maxima, the dropped row / column, and every non-maximum match torch exactly.
+        for (r, c) in [(1, 1), (2, 0), (3, 3)] {
+            assert_eq!(got[r][c], torch[r][c], "unique maximum ({r}, {c})");
+        }
+        assert!(got[4].iter().all(|&g| g == 0.0) && got.iter().all(|row| row[4] == 0.0));
+        // The tied window (rows 0-1, cols 2-3): the same total as torch's, split over both 9s.
+        let window = |g: &dyn Fn(usize, usize) -> f64| g(0, 2) + g(0, 3) + g(1, 2) + g(1, 3);
+        assert_eq!(window(&|r, c| got[r][c]), window(&|r, c| torch[r][c]));
+        assert_eq!((got[0][2], got[1][3]), (1.0, 1.0));
+
+        // Overlapping windows (stride < kernel) have no backward: refused, never a wrong gradient.
+        let v = Var::from_tensor(&x).unwrap();
+        let pooled = v
+            .as_tensor()
+            .max_pool2d_with_stride(3, 2)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        assert!(pooled.backward().is_err());
+    }
+
     /// Parity with the upstream PyTorch `ELatentLPIPS.forward` on the formula weights (the same
     /// fixture the MLX twin asserts — so the two backends agree with each other through it): total,
     /// each layer term, the L1 term and the self-distance, for 4- and 16-channel families.

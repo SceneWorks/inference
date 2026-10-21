@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 105
+EXPECTED_MEMBER_COUNT = 109
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -35,8 +35,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "48ff5e78a49e0a513f1976b0b1af70f9a5305f00"),
-    "mlx-sys": ("pmetal-mlx-sys", "48ff5e78a49e0a513f1976b0b1af70f9a5305f00"),
+    "mlx-rs": ("pmetal-mlx-rs", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
+    "mlx-sys": ("pmetal-mlx-sys", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
@@ -50,6 +50,15 @@ VENDORED_PACKAGES = {
     "candle-core": {
         "path": "crates/media/candle-gen/vendor/candle-core",
         "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+    },
+    # The same upstream revision plus the rank > 4 strided-reduce indexing fix (upstream #3873).
+    # candle-core reaches it only under its `metal` feature, so it is absent from the
+    # default-feature `cargo metadata` graph and is checked through Cargo.lock and the root
+    # [patch] instead.
+    "candle-metal-kernels": {
+        "path": "crates/media/candle-gen/vendor/candle-metal-kernels",
+        "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        "feature_gated": True,
     },
 }
 DEFAULT_GRAPH_PINNED_PACKAGES = {
@@ -340,6 +349,79 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "prices its components at the width ITS loader materializes them at). Letting the two "
         "share one fingerprint would let a record built against one backend satisfy the other's "
         "handshake, which is exactly what the identity exists to prevent."
+    ),
+    ("qwen-image-2-1", "TURBO_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "the distilled Turbo id's calibration identity (sc-25901 candle, sc-25906 mlx), per-backend "
+        "by construction for the same reason as this family's MEMORY_CALIBRATION_FINGERPRINT above: "
+        "each backend prices the Turbo checkpoint at the width ITS loader materializes it at — the "
+        "bf16 autoencoder is held at bf16 on mlx and at the lane's compute dtype on candle — so a "
+        "record built against one backend must not satisfy the other's handshake."
+    ),
+    ("iris", "MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, generation) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, generation): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the generation contract (sc-25690): the same "
+        "aggregate as this family's MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the generation contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
+    ),
+    ("iris", "DEPTH_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, depth) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "DEPTH_MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, depth): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "DEPTH_MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the depth contract (sc-25690): the same "
+        "aggregate as this family's DEPTH_MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "DEPTH_MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the depth contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's DEPTH_MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
+    ),
+    ("iris", "RESTORE_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, restoration) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "RESTORE_MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, restoration): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "RESTORE_MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the restoration contract (sc-25690): the same "
+        "aggregate as this family's RESTORE_MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "RESTORE_MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the restoration contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's RESTORE_MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
     ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
@@ -1033,8 +1115,24 @@ def check_graph(metadata: dict) -> None:
         if not source.endswith(f"#{revision}"):
             fail(f"{name} does not resolve at {revision}: {source}")
 
+    lock = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
+    candle_patch = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["patch"][
+        "https://github.com/huggingface/candle"
+    ]
     for name, vendored in VENDORED_PACKAGES.items():
         vendor_dir, revision = vendored["path"], vendored["upstream_rev"]
+        if candle_patch.get(name, {}).get("path") != vendor_dir:
+            fail(f"the root [patch] must redirect {name} to {vendor_dir}: {candle_patch.get(name)}")
+        if vendored.get("feature_gated"):
+            locked = [package for package in lock["package"] if package["name"] == name]
+            if len(locked) != 1:
+                fail(f"expected one locked {name}, found {len(locked)}")
+            if "source" in locked[0]:
+                fail(f"{name} must lock to the vendored copy, not {locked[0]['source']}")
+            provenance = ROOT / vendor_dir / "VENDORED.md"
+            if not provenance.is_file() or revision not in provenance.read_text(encoding="utf-8"):
+                fail(f"{vendor_dir}/VENDORED.md must record the upstream revision {revision}")
+            continue
         matches = [package for package in packages if package["name"] == name]
         if len(matches) != 1:
             fail(f"expected one {name} resolution, found {len(matches)}")

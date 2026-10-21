@@ -1,0 +1,125 @@
+{
+  "provenance": {
+    "repo": "akhaliq/MiniMax-H3-Claymation-Style-LoRA",
+    "revision": "991e08146a349e00b1837e77f81f415586b19063",
+    "file": "checkpoints/full_claymation_h3_v1_claymation_h3_v1.safetensors",
+    "expected_file_sha256": "0fac46be5b3498124f1bb596e9f9050338ae8028425650d5524ed40fce50f2f8",
+    "expected_file_bytes": 155109840,
+    "header_raw_sha256": "b1d333373e768707fcb7a08f96ca90a574c099a18088144f62a16624cf176acd"
+  },
+  "tensor_data_included": false,
+  "header": {
+    "diffusion_model.token_refiner.blocks.0.attn.out_proj.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        7168
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.attn.out_proj.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        5376,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        5376
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.attn.qkv_proj.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        21504,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        5376
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.mlp.fc1.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        28672,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        14336
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        5376,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.attn.out_proj.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        7168
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.attn.out_proj.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        5376,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.attn.qkv_proj.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        5376
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.attn.qkv_proj.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        21504,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.mlp.fc1.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        5376
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.mlp.fc1.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        28672,
+        16
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.mlp.fc2.lora_A.weight": {
+      "dtype": "F16",
+      "shape": [
+        16,
+        14336
+      ]
+    },
+    "diffusion_model.token_refiner.blocks.1.mlp.fc2.lora_B.weight": {
+      "dtype": "F16",
+      "shape": [
+        5376,
+        16
+      ]
+    }
+  }
+}

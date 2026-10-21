@@ -1,6 +1,7 @@
 //! The Qwen-Image 2.1 single-stream DiT — a faithful port of diffusers'
 //! `QwenImage21Transformer2DModel` (`transformer_qwenimage21.py` @
-//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]), prefill path (`QwenImage21AttnProcessor`, no KV cache).
+//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]): the prefill path (`QwenImage21AttnProcessor`) and the
+//! prefix-KV-cached decode path (`QwenImage21KVCache`, sc-25903).
 //!
 //! Text and image latents share **one joint sequence** ([`JointLayout`]): the projected text tokens
 //! in order, condition-image blocks substituted at the vision slots the encoder reserved for them
@@ -13,6 +14,14 @@
 //!   one unmasked call for the target over all keys.
 //! * **`causal_condition`** — the shared modulation is computed for two timestep rows, the sampled
 //!   `t` and `t = 0`; text/condition tokens read the `t = 0` row, target tokens their own.
+//!
+//! Together those two make every block's **prefix** hidden states — and so its prefix keys and
+//! values — independent of the denoise step: a prefix token never attends to the target and never
+//! reads the sampled timestep. [`PrefixKvCache`] is upstream's `QwenImage21KVCache`: the first model
+//! evaluation runs the full joint sequence and keeps each block's prefix K/V
+//! ([`QwenImage21Transformer::forward_joint_extract`]); every later one feeds the blocks the target
+//! tokens only and attends over `[cached prefix, target]`
+//! ([`QwenImage21Transformer::forward_joint_cached`]).
 //!
 //! Numerics: the model runs in the dtype of its weights (bf16 for the released checkpoint, f32 for
 //! the parity fixtures); the zero-centred text norm, RoPE rotation and timestep sinusoids are
@@ -238,15 +247,10 @@ impl Attention {
         ]
     }
 
-    /// Block-causal attention over the joint sequence `x` `[B, S, inner]`.
-    fn forward(
-        &self,
-        x: &Array,
-        cos: &Array,
-        sin: &Array,
-        prefix_segments: &[(usize, usize, bool)],
-        prefix_len: usize,
-    ) -> Result<Array> {
+    /// `_qwenimage21_prepare_qkv` up to the cache bookkeeping: project, split into heads, QK-norm
+    /// and rotate. Returns `(q, k, v)` as `[B, S, heads, head_dim]` — the layout upstream caches the
+    /// prefix in — with `q`/`k` post-norm **and post-RoPE**, `v` the raw projection.
+    fn project(&self, x: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array, Array)> {
         let shape = x.shape().to_vec();
         let (b, s) = (shape[0], shape[1]);
         let heads = |y: Array| y.reshape(&[b, s, self.heads, self.head_dim]);
@@ -255,8 +259,44 @@ impl Attention {
         let v = heads(self.to_v.forward(x)?)?;
         let q = rms_norm(&q, &self.norm_q, self.eps)?.as_dtype(v.dtype())?;
         let k = rms_norm(&k, &self.norm_k, self.eps)?.as_dtype(v.dtype())?;
-        let q = apply_rope(&q, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = apply_rope(&k, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
+        let q = apply_rope(&q, cos, sin)?;
+        let k = apply_rope(&k, cos, sin)?;
+        Ok((q, k, v))
+    }
+
+    /// `[B, heads, S, head_dim]` attention output → `to_out` over `[B, S, inner]`.
+    fn merge(&self, out: &Array, b: i32, s: i32) -> Result<Array> {
+        let out =
+            out.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, self.heads * self.head_dim])?;
+        self.to_out.forward(&out)
+    }
+
+    /// Block-causal attention over the joint sequence `x` `[B, S, inner]` — the prefill. With
+    /// `capture`, the block's prefix `(k, v)` rows (`[B, prefix_len, heads, head_dim]`, exactly what
+    /// the target's attention call below consumes for those keys) are pushed onto it: upstream's
+    /// `kv_cache_mode == "extract"`. Capturing adds two slices and changes nothing else.
+    fn forward(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        capture: Option<&mut Vec<(Array, Array)>>,
+    ) -> Result<Array> {
+        let shape = x.shape().to_vec();
+        let (b, s) = (shape[0], shape[1]);
+        let (q, k, v) = self.project(x, cos, sin)?;
+        if let Some(capture) = capture {
+            let prefix = prefix_len as i32;
+            capture.push((
+                k.index((.., 0..prefix, .., ..)),
+                v.index((.., 0..prefix, .., ..)),
+            ));
+        }
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
         let scale = (self.head_dim as f32).powf(-0.5);
 
@@ -280,10 +320,39 @@ impl Attention {
             &qt, &k, &v, scale, None, None,
         )?);
         let refs: Vec<&Array> = outputs.iter().collect();
-        let out = concatenate_axis(&refs, 2)?
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.heads * self.head_dim])?;
-        self.to_out.forward(&out)
+        self.merge(&concatenate_axis(&refs, 2)?, b, s)
+    }
+
+    /// The cached decode (`kv_cache_mode == "cached"`): `x` is the **target tokens only**
+    /// `[B, T, inner]`, `cos`/`sin` their RoPE rows, and the target attends — unmasked, as the
+    /// block-causal mask degenerates to for target rows — over `[cached prefix, target]` keys and
+    /// values. The same single attention call the prefill makes for the target, over the same keys.
+    fn forward_cached(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        cached_k: &Array,
+        cached_v: &Array,
+    ) -> Result<Array> {
+        let shape = x.shape().to_vec();
+        let (b, s) = (shape[0], shape[1]);
+        let (q, k, v) = self.project(x, cos, sin)?;
+        // A text-free, reference-free layout has an empty prefix: nothing to prepend.
+        let (k, v) = if cached_k.shape()[1] == 0 {
+            (k, v)
+        } else {
+            (
+                concatenate_axis(&[cached_k, &k], 1)?,
+                concatenate_axis(&[cached_v, &v], 1)?,
+            )
+        };
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k = k.transpose_axes(&[0, 2, 1, 3])?;
+        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        self.merge(&out, b, s)
     }
 }
 
@@ -360,6 +429,11 @@ impl AdaptableHost for FeedForward {
 pub struct Trace<'a>(Option<&'a mut Vec<(String, Array)>>);
 
 impl Trace<'_> {
+    /// No capture — the production path.
+    pub(crate) fn none() -> Trace<'static> {
+        Trace(None)
+    }
+
     fn push(&mut self, name: impl Into<String>, value: &Array) -> Result<()> {
         if let Some(sink) = self.0.as_deref_mut() {
             sink.push((name.into(), value.as_dtype(Dtype::Float32)?));
@@ -376,6 +450,20 @@ struct Modulation {
     gate1: Array,
     scale2: Array,
     gate2: Array,
+}
+
+/// How one block's attention runs: the block-causal prefill over the whole joint sequence
+/// (optionally capturing the prefix K/V), or the cached decode over the target tokens.
+enum BlockAttention<'a> {
+    Prefill {
+        prefix_segments: &'a [(usize, usize, bool)],
+        prefix_len: usize,
+        capture: Option<&'a mut Vec<(Array, Array)>>,
+    },
+    Cached {
+        k: &'a Array,
+        v: &'a Array,
+    },
 }
 
 #[derive(Clone)]
@@ -406,14 +494,48 @@ impl Block {
         prefix_len: usize,
         trace: &mut Trace<'_>,
     ) -> Result<Array> {
+        self.forward_with(
+            index,
+            x,
+            m,
+            cos,
+            sin,
+            BlockAttention::Prefill {
+                prefix_segments,
+                prefix_len,
+                capture: None,
+            },
+            trace,
+        )
+    }
+
+    /// The block body, shared by the prefill and the cached decode — only the attention differs.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        index: usize,
+        x: &Array,
+        m: &Modulation,
+        cos: &Array,
+        sin: &Array,
+        attention: BlockAttention<'_>,
+        trace: &mut Trace<'_>,
+    ) -> Result<Array> {
         let h = scale_residual(&layer_norm(x, None, None, self.eps)?, &m.scale1)?;
         #[cfg(test)]
         if index == 0 && crate::q4_diagnostic::capture_enabled() {
             crate::q4_diagnostic::capture_linear("attn.to_k", &self.attn.to_k, &h)?;
         }
-        let a = self
-            .attn
-            .forward(&h, cos, sin, prefix_segments, prefix_len)?;
+        let a = match attention {
+            BlockAttention::Prefill {
+                prefix_segments,
+                prefix_len,
+                capture,
+            } => self
+                .attn
+                .forward(&h, cos, sin, prefix_segments, prefix_len, capture)?,
+            BlockAttention::Cached { k, v } => self.attn.forward_cached(&h, cos, sin, k, v)?,
+        };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = add(x, &multiply(&tanh(&m.gate1)?, &a)?)?;
         let h = scale_residual(&layer_norm(&x, None, None, self.eps)?, &m.scale2)?;
@@ -508,6 +630,73 @@ struct JointInputs {
     prefix_len: usize,
     seq: i32,
     target: i32,
+}
+
+/// A fresh, exactly-sized buffer holding `x`'s values.
+///
+/// An MLX slice is a **view**: it shares (and keeps alive) the buffer it was cut from, so caching a
+/// block's prefix rows as a slice would pin that block's whole prefill K/V — target rows included —
+/// for every later step. This is upstream's `key[:, cache_write_slice].clone()` ("`clone()`, not
+/// `contiguous()`"). `concatenate` always allocates its output, which neither `contiguous` (shares
+/// an already-contiguous view) nor an arithmetic identity (may donate the input buffer) guarantees;
+/// joining the two halves of the last axis back together is value-exact.
+fn owned_copy(x: &Array) -> Result<Array> {
+    let last = (x.ndim() - 1) as i32;
+    let parts = split(x, 2, last)?;
+    Ok(concatenate_axis(&[&parts[0], &parts[1]], last)?)
+}
+
+/// The prefix K/V of every block for one prompt branch — the port of upstream's
+/// `QwenImage21KVCache` (sc-25903).
+///
+/// Built **only** by [`QwenImage21Transformer::forward_joint_extract`], complete and materialized,
+/// and consumed by [`QwenImage21Transformer::forward_joint_cached`]; there is no way to hold an
+/// empty or partly filled one. It belongs to the branch (prompt + references + target geometry) it
+/// was extracted from: true CFG keeps one for the positive branch and an independent one for the
+/// negative branch, whose prompt is a different prefix.
+///
+/// Per block it stores `(k, v)` as `[1, prefix_len, heads, head_dim]` in the model's compute dtype
+/// — `k` post-QK-norm **and post-RoPE**, `v` the raw `to_v` projection, i.e. exactly the rows the
+/// target's attention consumes for the prefix keys (upstream stores the same tensors in the same
+/// layout). The arrays are evaluated and own their buffers: holding a cache holds
+/// [`Self::nbytes`] and nothing else of the forward that produced it.
+pub struct PrefixKvCache {
+    layers: Vec<(Array, Array)>,
+    /// RoPE rows of the target block (`[target_tokens, head_dim / 2]` each).
+    target_cos: Array,
+    target_sin: Array,
+    prefix_len: usize,
+    target_tokens: usize,
+}
+
+impl PrefixKvCache {
+    /// Tokens of the cached prefix (text + condition-image blocks).
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    /// Tokens of the target block this cache decodes for.
+    pub fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+
+    /// Number of blocks cached — always the transformer's block count.
+    pub fn num_blocks(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Block `index`'s cached `(k, v)`, each `[1, prefix_len, heads, head_dim]`.
+    pub fn layer(&self, index: usize) -> Option<(&Array, &Array)> {
+        self.layers.get(index).map(|(k, v)| (k, v))
+    }
+
+    /// Bytes the cached K/V hold: `2 · blocks · prefix_len · inner_dim · itemsize`.
+    pub fn nbytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|(k, v)| k.nbytes() + v.nbytes())
+            .sum()
+    }
 }
 
 /// Every non-block Linear of the DiT, in checkpoint (diffusers) naming — the dotted path an adapter
@@ -750,7 +939,12 @@ impl QwenImage21Transformer {
 
     /// The joint RoPE table `(cos, sin)`, each `[S, head_dim/2]` f32, for `layout`.
     pub fn rope(&self, layout: &JointLayout) -> Result<(Array, Array)> {
-        let ids = layout.position_ids();
+        self.rope_for_ids(&layout.position_ids())
+    }
+
+    /// The RoPE rows for explicit `(frame, height, width)` positions — [`Self::rope`] is this over
+    /// the whole layout, the cached decode over the target block's rows alone.
+    fn rope_for_ids(&self, ids: &[[i32; 3]]) -> Result<(Array, Array)> {
         let flat: Vec<f32> = ids.iter().flatten().map(|&p| p as f32).collect();
         let ids = Array::from_slice(&flat, &[ids.len() as i32, 3]);
         let axes: Vec<i32> = self.cfg.axes_dims_rope.iter().map(|&d| d as i32).collect();
@@ -801,6 +995,38 @@ impl QwenImage21Transformer {
         let mut trace = Vec::new();
         let velocity = self.run_joint(text, images, timestep, layout, Trace(Some(&mut trace)))?;
         Ok((velocity, trace))
+    }
+
+    /// [`Self::forward_joint_traced`] stopped after block `last`: the trace of the joint
+    /// sequence's projections and of blocks `0..=last` only, with no head and no velocity. The
+    /// prefill side of the real-weight suite's cached-vs-prefill block comparison — the whole
+    /// trace of a ten-reference (~42k-token) joint sequence holds every block's `[1, S, inner]`
+    /// f32 intermediates, tens of GiB, where this holds `last + 1` blocks' worth.
+    pub fn forward_joint_traced_through(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+        last: usize,
+    ) -> Result<Vec<(String, Array)>> {
+        let mut sink = Vec::new();
+        let mut trace = Trace(Some(&mut sink));
+        let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
+        let mut x = j.x.clone();
+        for (index, block) in self.blocks.iter().enumerate().take(last + 1) {
+            x = block.forward(
+                index,
+                &x,
+                &j.m,
+                &j.cos,
+                &j.sin,
+                &j.prefix_segments,
+                j.prefix_len,
+                &mut trace,
+            )?;
+        }
+        Ok(sink)
     }
 
     fn run_joint(
@@ -904,26 +1130,7 @@ impl QwenImage21Transformer {
 
         let (cos, sin) = self.rope(layout)?;
 
-        // Timestep rows: the sampled `t` and, under `causal_condition`, an extra `t = 0` row.
-        let ts: Vec<f32> = if self.cfg.causal_condition {
-            vec![timestep * TIME_FACTOR, 0.0]
-        } else {
-            vec![timestep * TIME_FACTOR]
-        };
-        let proj = timestep_sincos(
-            &Array::from_slice(&ts, &[ts.len() as i32]),
-            TIMESTEP_DIM,
-            10_000.0,
-            0.0,
-        )?
-        .as_dtype(dtype)?;
-        let temb = self
-            .time_out
-            .forward(&silu(&self.time_in.forward(&proj)?)?)?;
-        trace.push("temb", &temb)?;
-        let silu_temb = silu(&temb)?;
-        let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
-        trace.push("modulation", &modulation)?;
+        let (modulation, out_rows) = self.modulation_rows(timestep, trace)?;
         let inner = self.cfg.inner_dim() as i32;
         let target_mask: Vec<bool> = layout.target_mask();
         let select = |rows: &Array| -> Result<Array> {
@@ -944,7 +1151,7 @@ impl QwenImage21Transformer {
             scale2: select(&chunks[2])?,
             gate2: select(&chunks[3])?,
         };
-        let out_scale = select(&self.norm_out.forward(&silu_temb)?)?;
+        let out_scale = select(&out_rows)?;
 
         Ok(JointInputs {
             x,
@@ -957,6 +1164,241 @@ impl QwenImage21Transformer {
             seq: s,
             target: layout.target_tokens() as i32,
         })
+    }
+
+    /// The timestep embedding → `(modulation, norm_out)` rows, `[rows, 4·inner]` and
+    /// `[rows, inner]`: row 0 is the sampled `t`; under `causal_condition` a trailing row is `t = 0`
+    /// (the row every prefix token modulates from). Shared by the prefill and the cached decode,
+    /// which keeps the two-row shape so the sampled row is computed identically on both.
+    fn modulation_rows(&self, timestep: f32, trace: &mut Trace<'_>) -> Result<(Array, Array)> {
+        let dtype = self.compute_dtype();
+        // Timestep rows: the sampled `t` and, under `causal_condition`, an extra `t = 0` row.
+        let ts: Vec<f32> = if self.cfg.causal_condition {
+            vec![timestep * TIME_FACTOR, 0.0]
+        } else {
+            vec![timestep * TIME_FACTOR]
+        };
+        let proj = timestep_sincos(
+            &Array::from_slice(&ts, &[ts.len() as i32]),
+            TIMESTEP_DIM,
+            10_000.0,
+            0.0,
+        )?
+        .as_dtype(dtype)?;
+        let temb = self
+            .time_out
+            .forward(&silu(&self.time_in.forward(&proj)?)?)?;
+        trace.push("temb", &temb)?;
+        let silu_temb = silu(&temb)?;
+        let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
+        trace.push("modulation", &modulation)?;
+        Ok((modulation, self.norm_out.forward(&silu_temb)?))
+    }
+
+    /// The first model evaluation of a cached denoise — upstream's `kv_cache_mode="extract"`:
+    /// [`Self::forward_joint`] over the full joint sequence, which also keeps every block's prefix
+    /// K/V. Returns the target's velocity and the branch's [`PrefixKvCache`].
+    ///
+    /// Both are **evaluated** before returning. MLX is lazy: an unevaluated cache would re-run the
+    /// whole prefix graph on every later step (saving nothing) while keeping that graph alive, so
+    /// the K/V are materialized here — block by block, as the forward advances, so that the
+    /// extract never holds more than the prefill forward plus the cache it is building.
+    ///
+    /// Refused unless the model is `causal_condition`: the cache is only valid because the prefix
+    /// tokens modulate from `t = 0`, which is what makes their activations step-independent.
+    pub fn forward_joint_extract(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<(Array, PrefixKvCache)> {
+        let (velocity, cache, _) =
+            self.run_joint_extract(text, images, timestep, layout, Trace(None))?;
+        Ok((velocity, cache))
+    }
+
+    /// Every later model evaluation of a cached denoise — upstream's `kv_cache_mode="cached"`: the
+    /// blocks receive **only** the target tokens `target` `[1, target_tokens, in_channels]`, and
+    /// each block's target attention reads `cache`'s prefix K/V in front of its own. Returns the
+    /// target's velocity `[1, target_tokens, out_channels]` in f32.
+    ///
+    /// Valid at any timestep and in any order — the cache does not depend on the step — so a
+    /// solver that evaluates the model more than once per step, or off the schedule, is served by
+    /// the same cache.
+    pub fn forward_joint_cached(
+        &self,
+        target: &Array,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<Array> {
+        self.run_joint_cached(target, timestep, cache, Trace(None))
+            .map(|(velocity, _)| velocity)
+    }
+
+    /// [`Self::forward_joint_cached`] that also captures the named intermediates (`img_in`, `temb`,
+    /// `modulation`, `block_{i}_attn` / `_mlp` / `_out`, `norm_out`, `proj_out`) in forward order.
+    /// Every joint-sequence stage is `[1, target_tokens, C]`: the tensors the blocks actually ran on.
+    pub fn forward_joint_cached_traced(
+        &self,
+        target: &Array,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<(Array, Vec<(String, Array)>)> {
+        let mut trace = Vec::new();
+        let (velocity, _) =
+            self.run_joint_cached(target, timestep, cache, Trace(Some(&mut trace)))?;
+        Ok((velocity, trace))
+    }
+
+    /// The typed refusal upstream raises for `kv_cache` without `causal_condition`.
+    fn require_causal_condition(&self) -> Result<()> {
+        if self.cfg.causal_condition {
+            return Ok(());
+        }
+        Err(Error::Unsupported(
+            "qwen_image_2_1: the prefix KV cache requires `causal_condition = true` — it is only \
+             valid because text and condition-image tokens modulate from t = 0, which makes their \
+             activations independent of the denoising step"
+                .into(),
+        ))
+    }
+
+    /// [`Self::forward_joint_extract`] plus the token count the block stack ran on (read off the
+    /// stack's own output), for the denoise loop's report.
+    pub(crate) fn run_joint_extract(
+        &self,
+        text: &Array,
+        images: &[&Array],
+        timestep: f32,
+        layout: &JointLayout,
+        mut trace: Trace<'_>,
+    ) -> Result<(Array, PrefixKvCache, usize)> {
+        #[cfg(test)]
+        crate::q4_diagnostic::assert_owner();
+        self.require_causal_condition()?;
+        let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
+        let mut layers: Vec<(Array, Array)> = Vec::with_capacity(self.blocks.len());
+        let mut x = j.x.clone();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let mut captured: Vec<(Array, Array)> = Vec::with_capacity(1);
+            x = block.forward_with(
+                index,
+                &x,
+                &j.m,
+                &j.cos,
+                &j.sin,
+                BlockAttention::Prefill {
+                    prefix_segments: &j.prefix_segments,
+                    prefix_len: j.prefix_len,
+                    capture: Some(&mut captured),
+                },
+                &mut trace,
+            )?;
+            let (k, v) = captured.pop().ok_or_else(|| {
+                Error::Msg(format!(
+                    "qwen_image_2_1: block {index} captured no prefix K/V"
+                ))
+            })?;
+            let owned = (owned_copy(&k)?, owned_copy(&v)?);
+            drop((k, v));
+            // Materialize this block's cache entry — and the block's output — before the next
+            // block is built. A captured slice is a view of the block's full
+            // `[1, prefix + target, heads, head_dim]` K or V; evaluating only at the end of the
+            // forward would keep every block's full K/V alive until then
+            // (`blocks · 2 · (prefix + target) · inner · itemsize` on top of the prefill). After
+            // this eval the copies are plain buffers and the block's K/V are released exactly as
+            // on the prefill path.
+            mlx_rs::transforms::eval([&x, &owned.0, &owned.1])?;
+            layers.push(owned);
+        }
+        let block_tokens = x.shape()[1] as usize;
+        let velocity = self.head(&x, &j, &mut trace)?;
+
+        let ids = layout.position_ids();
+        let (target_cos, target_sin) = self.rope_for_ids(&ids[j.prefix_len..])?;
+        let cache = PrefixKvCache {
+            layers,
+            target_cos,
+            target_sin,
+            prefix_len: j.prefix_len,
+            target_tokens: j.target as usize,
+        };
+        // The K/V are already materialized block by block; this covers the head and the target's
+        // RoPE rows, so the returned velocity and cache are plain buffers.
+        mlx_rs::transforms::eval([&velocity, &cache.target_cos, &cache.target_sin])?;
+        Ok((velocity, cache, block_tokens))
+    }
+
+    /// [`Self::forward_joint_cached`] plus the token count the block stack ran on.
+    pub(crate) fn run_joint_cached(
+        &self,
+        target: &Array,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        mut trace: Trace<'_>,
+    ) -> Result<(Array, usize)> {
+        #[cfg(test)]
+        crate::q4_diagnostic::assert_owner();
+        self.require_causal_condition()?;
+        if cache.layers.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: a {}-block prefix KV cache was given to a {}-block DiT",
+                cache.layers.len(),
+                self.blocks.len()
+            )));
+        }
+        if target.shape()[1] as usize != cache.target_tokens {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the prefix KV cache was extracted for a {}-token target, got {}",
+                cache.target_tokens,
+                target.shape()[1]
+            )));
+        }
+        let dtype = self.compute_dtype();
+        let tokens = cache.target_tokens as i32;
+        let inner = self.cfg.inner_dim() as i32;
+
+        let x = self.img_in.forward(&target.as_dtype(dtype)?)?;
+        trace.push("img_in", &x)?;
+        let (modulation, out_rows) = self.modulation_rows(timestep, &mut trace)?;
+        // `modulation_mask[prefix_len:]`: every remaining token is a target token, so each reads
+        // row 0 — the sampled timestep.
+        let select = |rows: &Array| -> Result<Array> {
+            let real = rows.index((0..1, ..)).reshape(&[1, 1, inner])?;
+            Ok(broadcast_to(&real, &[1, tokens, inner])?)
+        };
+        let chunks = split(&modulation, 4, 1)?;
+        let j = JointInputs {
+            x,
+            m: Modulation {
+                scale1: select(&chunks[0])?,
+                gate1: select(&chunks[1])?,
+                scale2: select(&chunks[2])?,
+                gate2: select(&chunks[3])?,
+            },
+            out_scale: select(&out_rows)?,
+            cos: cache.target_cos.clone(),
+            sin: cache.target_sin.clone(),
+            prefix_segments: Vec::new(),
+            prefix_len: 0,
+            seq: tokens,
+            target: tokens,
+        };
+        let mut x = j.x.clone();
+        for (index, (block, (k, v))) in self.blocks.iter().zip(&cache.layers).enumerate() {
+            x = block.forward_with(
+                index,
+                &x,
+                &j.m,
+                &j.cos,
+                &j.sin,
+                BlockAttention::Cached { k, v },
+                &mut trace,
+            )?;
+        }
+        let block_tokens = x.shape()[1] as usize;
+        Ok((self.head(&x, &j, &mut trace)?, block_tokens))
     }
 
     /// `norm_out` → `proj_out` → the target block's velocity, f32.

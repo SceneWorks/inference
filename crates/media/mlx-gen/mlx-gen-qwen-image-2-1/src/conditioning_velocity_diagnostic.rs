@@ -599,7 +599,7 @@ fn run(binding: Binding) -> Result<()> {
         seed: Some(24163),
         ..Default::default()
     };
-    let scheduler = crate::loader::load_scheduler_config(dense)?;
+    let scheduler = crate::model::Schedule::Shifted(crate::loader::load_scheduler_config(dense)?);
     assert!(!crate::model::resolve_run_params(&scheduler, &req)?.use_negative);
     let vision = crate::loader::load_vision_config(dense)?.expect("fixed vision required");
     let image_bytes = (src.as_raw().len() + target.as_raw().len() + key.as_raw().len()) as u64;

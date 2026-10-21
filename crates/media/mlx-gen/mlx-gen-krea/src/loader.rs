@@ -292,9 +292,10 @@ fn normalized_native_weights_with_options(
     // int8-per-row, scalar fp8 (E4M3/E5M2, described or the plain cast), and MXFP8 all decode
     // through their registered codec rows — the former bespoke int8 arm's math lives in the
     // engine's `int8-per-row-v1` implementation now.
+    let prefix = crate::native_remap::detect_native_prefix(dit_file)?;
     let plan = mlx_gen::logical_weights::plan_logical_weights(
         dit_file,
-        &crate::native_remap::KreaNativeToDiffusersMapping::new(shapes),
+        &crate::native_remap::KreaNativeToDiffusersMapping::new(prefix, shapes),
     )?;
     let mut materialize = Some(materialize);
     let mut eager_materializer = |weights: &mut Weights| -> Result<()> {
@@ -1050,7 +1051,10 @@ mod tests {
         // With the architecture config in scope the plan unpads to the DiT's real geometry.
         let declared = mlx_gen::logical_weights::plan_logical_weights(
             &path,
-            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&cfg),
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+                &cfg,
+            ),
         )
         .expect("the mxfp8 layer plans through the Krea native mapping");
         assert_eq!(declared.tensors.len(), 1);
@@ -1081,7 +1085,9 @@ mod tests {
         // With no config in scope the pre-sc-20644 behaviour is unchanged: the stored padded shape.
         let undeclared = mlx_gen::logical_weights::plan_logical_weights(
             &path,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("an undeclared mxfp8 layer still plans");
         assert_eq!(
@@ -1136,7 +1142,9 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("variant5 plans through the Krea native mapping");
         // variant5 is 415 bf16 + 15 f32 tensors (in/out projections and biases): both dense rows.
@@ -1208,7 +1216,9 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("the fp8 cast plans through the Krea native mapping");
         // ComfyUI's UNETLoader cast converts the big linear weights and leaves norms/biases alone,
@@ -1291,7 +1301,9 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("variant4 plans through the registry int8 codec");
         assert!(plan.codec_ids().contains(&"int8-per-row-v1"));
@@ -1388,7 +1400,9 @@ mod tests {
         // The subset entry corroborates the blob instead of refusing it.
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("the authoritative blob decides the layer; the subset entry must not refuse");
         assert_eq!(
@@ -1447,7 +1461,9 @@ mod tests {
         assert!(dit.is_file(), "{} is not a file", dit.display());
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect("the published scaled fp8 artifact plans through the Krea native mapping");
 
@@ -1618,7 +1634,9 @@ mod tests {
 
         let error = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(),
+            &crate::native_remap::KreaNativeToDiffusersMapping::without_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
         )
         .expect_err("an nvfp4 checkpoint has no registered codec and must refuse");
         let error = error.to_string();

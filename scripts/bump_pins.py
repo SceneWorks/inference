@@ -78,8 +78,12 @@ PIN_GROUPS = {
         manifest_deps=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
         lock_packages=("candle-core", "candle-nn", "candle-transformers", "candle-flash-attn"),
         # sc-24441: candle-core resolves to a vendored copy carrying upstream's CUDA-graph
-        # parameter cache on top of the pinned revision.
-        vendored=("crates/media/candle-gen/vendor/candle-core",),
+        # parameter cache on top of the pinned revision; candle-metal-kernels to one carrying
+        # upstream's rank > 4 strided-reduce indexing fix (#3873).
+        vendored=(
+            "crates/media/candle-gen/vendor/candle-core",
+            "crates/media/candle-gen/vendor/candle-metal-kernels",
+        ),
     ),
 }
 

@@ -24,6 +24,10 @@
 //! | `text_encoder/` token embedding (622 M) | dense | dense | dense | [`crate::text_encoder`]'s `quantize` packs decoder layers only; keeping it dense preserves pre-quantize ≡ quantize-at-load |
 //! | `vae/` (338 M) | dense f32 | dense f32 | dense f32 | all-conv; zero group-quantizable 2-D leaves, and the released file ships f32 |
 //!
+//! The distilled Turbo checkpoint (`qwen_image_2_1_turbo`, sc-25906) tiers the same way through
+//! the same converter, which reads the checkpoint off the source snapshot
+//! ([`crate::convert::source_variant`]). Its `vae/` ships **bf16** and is copied through at bf16.
+//!
 //! **The text encoder is packed here, and it is dense in the 2512 crate.** That is a deliberate
 //! divergence, not an oversight. 2512 pairs a ~20 B DiT with a ~7 B Qwen2.5-VL tower, so a dense
 //! tower is a minority of the footprint and upstream's `skip_quantization` note costs little. Qwen-

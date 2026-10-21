@@ -318,6 +318,36 @@ fn a_converted_tier_is_a_complete_standalone_snapshot() {
 /// pinned instead, here (run-to-run identity) and in
 /// [`packed_codes_equal_the_canonical_quantize`] (identity to the canonical op). Capture the printed
 /// digests when publishing a real tier.
+/// A source without `LICENSE` is refused before anything is written (sc-25909), for both
+/// checkpoints: the shared `copy_turnkey_assets` copies the licence only when it is there, so
+/// without this refusal a tier converted from a stripped tree would be signed (`CHANGES.md`,
+/// `SHA256SUMS`) and distributed without the Agreement. Nothing is created at the destination.
+///
+/// *Mutation that reds this:* deleting the `LICENSE_FILE` check from `prequantize_turnkey` (the
+/// stripped source converts, and a signed tier with no licence appears).
+#[test]
+fn a_source_without_its_licence_is_refused_before_anything_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    mlx_gen::quant::copy_dir(&tiny_snapshot(), &base).unwrap();
+    let turbo = crate::common::turbo_snapshot(&tmp.path().join("turbo-src"));
+    for (label, src) in [("base", base.as_path()), ("turbo", turbo.as_path())] {
+        std::fs::remove_file(src.join("LICENSE")).unwrap();
+        for tier in [Tier::Q8, Tier::Q4] {
+            let dst = tmp.path().join(format!("{label}-{}", tier.dir_name()));
+            let message = prequantize_turnkey(src, &dst, tier)
+                .expect_err("a source without LICENSE must not convert")
+                .to_string();
+            assert!(
+                message.starts_with("qwen_image_2_1 convert: ")
+                    && message.contains("has no `LICENSE`"),
+                "{label} {tier:?}: {message}"
+            );
+            assert!(!dst.exists(), "{label} {tier:?}: nothing is written");
+        }
+    }
+}
+
 #[test]
 fn conversion_is_byte_reproducible_across_runs() {
     let tmp = tempfile::tempdir().unwrap();

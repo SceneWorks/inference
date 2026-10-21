@@ -266,29 +266,37 @@ const BACKWARD_HIDDEN_GRADS: u64 = 4;
 /// `[S, inner]` compute-width tensors the block backward's **retained gradient chains** hold at the
 /// attention peak, beyond [`BLOCK_SAVED_HIDDEN`]'s forward set (sc-24163).
 ///
-/// candle computes a gradient for **every** input of a rule, including inputs that never reach a
-/// trainable leaf: the frozen base weights, the modulation's token mask and the RoPE tables. Those
-/// entries are never consumed, so they live until the segment's backward ends, and each one keeps
-/// the chain it was built from. For example, the weight gradient `xᵀ·g` of a base projection holds
-/// that projection's output cotangent. By the attention peak the SwiGLU, `to_out` and the gated
-/// residuals have already been processed, so their cotangents and the three processed modulation
-/// slots' mask chains are among what is live. This count is **measured**, not enumerated
-/// tensor-by-tensor: a CUDA probe of the real checkpointed step over the production block geometry
-/// (768²…1024², four sizes) fit a per-token term of 352.75 B per channel exactly. That leaves
-/// 70.75 B per channel above the forward and in-flight counts, which is 35.4 bf16 tensors, rounded
-/// up.
-pub const BACKWARD_RETAINED_HIDDEN: u64 = 36;
+/// The cotangents and intermediates of rules already processed that a still-pending gradient entry
+/// keeps alive until the segment's backward ends. This count is **measured**, not enumerated
+/// tensor-by-tensor. sc-24163 fit 36 on upstream candle, where a rule computed a gradient for every
+/// input, including the frozen base weights, the modulation's token mask and the RoPE tables, and
+/// each of those never-consumed entries kept the chain it was built from (a base projection's
+/// `xᵀ·g` held its output cotangent). The vendored `backprop.rs` (sc-25686, see
+/// `vendor/candle-core/VENDORED.md`) computes gradients only for operands that reach a `Var`, so
+/// those chains are no longer built. Re-measured on CUDA after that change (the `qwen-image-2-1-train`
+/// real-weights profile, RTX PRO 6000, `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, the five sc-24163 cells):
+/// past the vanished dead weight gradients ([`DEAD_WEIGHT_GRAD_COPIES`]), every checkpointed cell
+/// fell by 24.0 `[S, inner]` bf16 tensors (768²: 24.03, 1024²: 24.02, 768² edit: 24.16), so 12
+/// remain.
+pub const BACKWARD_RETAINED_HIDDEN: u64 = 12;
 /// `[S, inner]` compute-width cotangent accumulators for q, k and v. They are already live when a
 /// **later** SDPA call's scores backpropagate: an edit layout processes the target call first, then
 /// each condition block, and the target call has already accumulated into q, k and v (sc-24163).
 pub const BACKWARD_QKV_COTANGENTS: u64 = 3;
-/// Copies each frozen base projection's dead weight gradient keeps (sc-24163): the `zeros_like`
-/// accumulator `GradStore::or_insert` made, the `xᵀ·g` product, and their sum. The product carries
-/// an op, so the sum keeps both alive. That is three `[out, in]` copies at the compute width per
-/// projection, held until the segment's backward ends. By the attention peak the SwiGLU's three
-/// projections and `to_out` have been processed. For the production block that is 1.007 GB at
-/// bf16; the probe's constant term measured 1.021 GB.
-pub const DEAD_WEIGHT_GRAD_COPIES: u64 = 3;
+/// `[out, in]` compute-width copies each frozen base projection's dead weight gradient keeps: **0**.
+///
+/// On upstream candle a frozen projection's backward built a weight gradient that nothing consumed:
+/// the `zeros_like` accumulator `GradStore::or_insert` made, the `xᵀ·g` product and their sum, three
+/// copies held until the segment's backward ended (1.007 GB at bf16 for the production block's
+/// SwiGLU and `to_out` at the attention peak; sc-24163 measured 1.021 GB). The vendored
+/// `backprop.rs` (sc-25686) skips every operand that does not reach a `Var`, and this trainer's base
+/// weights are plain tensors, so none of the three is computed. Re-measured on CUDA after that
+/// change (see [`BACKWARD_RETAINED_HIDDEN`]): each checkpointed sc-24163 cell's peak fell by exactly
+/// the 1,006,632,960 bytes this term priced at 3 plus 24 retained `[S, inner]` tensors, and a dense
+/// 256² step, where 31 finished blocks priced all seven projections each (38.8 GiB), measured
+/// 24.73 GiB against the 66.7 GiB the old counts derived. Kept at 0 rather than deleted so the
+/// footprint still names the term a revert of the vendored patch would bring back.
+pub const DEAD_WEIGHT_GRAD_COPIES: u64 = 0;
 /// `[S, inner]` compute-width tensors the retained pre-block forward holds (the text/image
 /// projections and their joint concatenation, adapter residuals included).
 const PRELUDE_SAVED_HIDDEN: u64 = 8;
@@ -983,6 +991,9 @@ impl QwenImage21Trainer {
         // Shared with the MLX twin (sc-24163): one refusal, one message.
         gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
+        // sc-25901: a Turbo snapshot is not a training base. Refused by name here, rather than
+        // incidentally by the scheduler-config reader further down.
+        loader::check_snapshot_variant(crate::config::Variant::Base, &root)?;
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
             return Err(quantized_base_refusal(&format!(
@@ -2003,6 +2014,10 @@ fn render_sample(
             seed,
             cancel,
             references,
+            // The preview renders inside the trainer's own memory envelope, which prices the
+            // prefill path; the prefix cache is the render path's trade (sc-25904), so the
+            // preview keeps the path it is priced for.
+            kv_cache: crate::pipeline::KvCacheMode::Off,
         },
         &mut |_: Progress| {},
     )?;
@@ -3263,16 +3278,18 @@ mod tests {
     /// below it.
     ///
     /// Each cell is the A1 request run through this trainer for 10 steps on CUDA (RTX PRO 6000,
-    /// driver 596.36, one process per cell, budget disabled). The measured value is the driver's
-    /// live high-water `CU_MEMPOOL_ATTR_USED_MEM_HIGH` over the whole run, in bytes. Source:
-    /// SceneWorks `docs/calibration/sc-24163/cuda-measurements.json` (`a5.trainingFootprint`) on
-    /// `feature/sc-24107-qwen-image-2-1-lora`. Before this fix the preflight derived 22.4 / 21.8 /
-    /// 35.1 / 51.1 / 51.4 GiB, 26–45 % under, and admitted a 1024² run it could not hold.
+    /// one process per cell, budget disabled). The measured value is the driver's live high-water
+    /// `CU_MEMPOOL_ATTR_USED_MEM_HIGH` over the whole run, in bytes. sc-24163 first measured these
+    /// cells (SceneWorks `docs/calibration/sc-24163/cuda-measurements.json`); before that fix the
+    /// preflight derived 22.4 / 21.8 / 35.1 / 51.1 / 51.4 GiB, 26–45 % under. The values below are
+    /// the re-measurement after the vendored `backprop.rs` stopped computing gradients for frozen
+    /// operands (sc-25686): `tests/train_peak_real_weights.rs` on the dispatch-only
+    /// `qwen-image-2-1-train` profile of `.github/workflows/real-weights.yml`, run 38262529428.
     ///
     /// *Mutations that red this:* `BACKWARD_SCORE_F32_TENSORS` back to 2, or the score backward
-    /// sized over every call; `BACKWARD_RETAINED_HIDDEN` or `DEAD_WEIGHT_GRAD_COPIES` at 0; the q/k/v
-    /// copies or the pending q/k/v cotangents dropped (the edit cells go under); the backward over
-    /// every call's elements (the edit cells go over 1.15).
+    /// sized over every call; `BACKWARD_RETAINED_HIDDEN` at 0; the q/k/v copies or the pending q/k/v
+    /// cotangents dropped (the edit cells go under); the backward over every call's elements (the
+    /// edit cells go over 1.15).
     #[test]
     fn the_checkpointed_step_covers_the_measured_cuda_peaks() {
         let facts = release_snapshot_facts();
@@ -3292,27 +3309,27 @@ mod tests {
             (
                 "t2i lora 768²",
                 measured_cell(NetworkType::Lora, 768, None),
-                30_361_842_468u64,
+                28_896_654_116u64,
             ),
             (
                 "t2i lokr 768²",
                 measured_cell(NetworkType::Lokr, 768, None),
-                29_850_168_644,
+                28_384_980_292,
             ),
             (
                 "t2i lora 1024²",
                 measured_cell(NetworkType::Lora, 1024, None),
-                54_794_203_428,
+                52_976_693_540,
             ),
             (
                 "edit lokr 768² 1 ref",
                 measured_cell(NetworkType::Lokr, 768, one_ref),
-                69_364_708_316,
+                67_084_183_452,
             ),
             (
                 "edit lora 768² 1 ref",
                 measured_cell(NetworkType::Lora, 768, one_ref),
-                69_641_733_180,
+                67_361_208_316,
             ),
         ];
         for (label, shape, measured) in cells {
@@ -3353,13 +3370,16 @@ mod tests {
     }
 
     /// sc-24163 review: a **dense** (non-checkpointed) step backpropagates one graph in one
-    /// `GradStore`, so at block 0's attention peak every finished block still holds the dead
-    /// gradients of all seven frozen projections (q/k/v, `to_out`, the SwiGLU's three), three copies
-    /// each. Block 0 holds the peak subset (SwiGLU + `to_out`), the same set a checkpointed step
-    /// holds.
+    /// `GradStore`, so every finished block's backward residue accumulates until block 0's attention
+    /// peak. On upstream candle that residue included the dead gradients of all seven frozen
+    /// projections per block; since the vendored `backprop.rs` (sc-25686) builds none,
+    /// [`DEAD_WEIGHT_GRAD_COPIES`] is 0 and the per-block term is the retained forward plus the
+    /// backward chains. The dense 256² cell pins that against CUDA: measured 26,550,138,928 bytes
+    /// (`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, run 38262529428), where the old counts derived 66.7 GiB.
     ///
-    /// *Mutations that red this:* pricing finished blocks with the peak subset (no q/k/v), or
-    /// pricing every block with the full seven.
+    /// *Mutations that red this:* `DEAD_WEIGHT_GRAD_COPIES` back to 3 (the dense cell goes >1.15
+    /// over); `BACKWARD_RETAINED_HIDDEN` at 0 (it goes under); pricing every block with block 0's
+    /// subset, or dropping a block's chains.
     #[test]
     fn the_dense_step_counts_every_finished_blocks_dead_weight_gradients() {
         let facts = release_snapshot_facts();
@@ -3377,6 +3397,28 @@ mod tests {
             )
             .train_phase
         };
+        let dense_256 = TrainingShape {
+            checkpointed: false,
+            ..measured_cell(NetworkType::Lora, 256, None)
+        };
+        let (predicted, measured) = (
+            training_footprint(&facts, &dense_256).peak(),
+            26_550_138_928u64,
+        );
+        eprintln!(
+            "[sc-25678] dense lora 256²: predicted {:.2} GiB, measured {:.2} GiB, ×{:.3}",
+            gib(predicted),
+            gib(measured),
+            predicted as f64 / measured as f64
+        );
+        assert!(
+            predicted >= measured,
+            "dense 256²: {predicted} under {measured}"
+        );
+        assert!(
+            predicted as f64 <= measured as f64 * 1.15,
+            "dense 256²: {predicted} more than 15 % over {measured}"
+        );
         let (inner, mlp, w) = (facts.inner, facts.mlp_ratio, shape.compute_width);
         let all_seven = DEAD_WEIGHT_GRAD_COPIES * w * (3 * mlp * inner * inner + 4 * inner * inner);
         let subset = DEAD_WEIGHT_GRAD_COPIES * w * (3 * mlp * inner * inner + inner * inner);

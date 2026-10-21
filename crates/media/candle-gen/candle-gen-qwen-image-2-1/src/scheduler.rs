@@ -79,6 +79,47 @@ pub fn sigmas_for_image(
     sigmas(cfg, steps, image_tokens(width, height))
 }
 
+/// The Turbo schedule (sc-25901) for `steps` denoising steps over the snapshot's saved
+/// `sample_sigmas`: length `steps + 1`, trailing `0.0`. No `mu` shift and no terminal stretch —
+/// the distilled checkpoint is sampled on the sigmas it was distilled over.
+///
+/// * `steps == saved.len()` (what a request omitting `steps` gets): exactly the saved list, then
+///   `0.0` — upstream's `set_timesteps(sigmas=config.sample_sigmas)` under a static scheduler.
+/// * any other `steps = N >= 1`: the saved curve **resampled** — a SceneWorks choice, not
+///   upstream's (see `UPSTREAM.md`, "Deliberate divergences"). The knots are the `K` saved sigmas
+///   followed by `0.0`, at positions `u_j = j / K` for `j = 0..=K`; `σ_i` is the piecewise-linear
+///   interpolation of the knots at `u = i / N` for `i = 0..N`.
+///
+/// The knot index and the in-segment fraction come from the **integer** product `i · K` (`j = ⌊i·K
+/// / N⌋`, fraction `(i·K mod N) / N`), so a sample that lands on a knot reads it back bit-for-bit
+/// and `N = K` reproduces the saved list exactly rather than to a rounding error. Arithmetic is
+/// `f64`, rounded to `f32` at the end, like [`sigmas`].
+pub fn resample_saved_sigmas(saved: &[f64], steps: usize) -> Result<Vec<f32>> {
+    let k = saved.len();
+    if k == 0 {
+        return Err(Error::Msg(format!(
+            "{}: the snapshot's `sample_sigmas` is empty",
+            crate::TURBO_MODEL_ID
+        )));
+    }
+    if steps == 0 {
+        return Err(Error::Msg(format!(
+            "{}: steps must be >= 1 (got 0)",
+            crate::TURBO_MODEL_ID
+        )));
+    }
+    let knot = |j: usize| saved.get(j).copied().unwrap_or(0.0);
+    let mut out: Vec<f32> = (0..steps)
+        .map(|i| {
+            let (j, rem) = ((i * k) / steps, (i * k) % steps);
+            let fraction = rem as f64 / steps as f64;
+            (knot(j) + fraction * (knot(j + 1) - knot(j))) as f32
+        })
+        .collect();
+    out.push(0.0);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +135,64 @@ mod tests {
         assert!(s.windows(2).all(|w| w[0] > w[1]));
         // The 2K presets extrapolate past the 8192-token knee.
         assert!((mu_for_tokens(&cfg, 16384) - 1.312903).abs() < 1e-5);
+    }
+
+    /// `Qwen/Qwen-Image-2.1-Turbo`'s `model_index.json` `sample_sigmas`, verbatim.
+    const TURBO_SAVED: [f64; 8] = [
+        1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568,
+    ];
+
+    /// The saved step count is the saved list itself — every entry bit-for-bit — plus the `0`.
+    ///
+    /// *Mutation that reds this:* applying any shift or stretch to the saved sigmas.
+    #[test]
+    fn the_saved_step_count_is_the_saved_list_then_zero() {
+        let got = resample_saved_sigmas(&TURBO_SAVED, TURBO_SAVED.len()).unwrap();
+        let mut want: Vec<f32> = TURBO_SAVED.iter().map(|s| *s as f32).collect();
+        want.push(0.0);
+        assert_eq!(got, want);
+    }
+
+    /// Twelve steps over the eight saved sigmas, pinned to literals computed from the algorithm in
+    /// [`saved_sigmas`]'s doc (numpy, f64, rounded to f32) — the cross-backend comparison point.
+    #[test]
+    fn twelve_steps_resample_the_saved_curve() {
+        let got = resample_saved_sigmas(&TURBO_SAVED, 12).unwrap();
+        let want: [f32; 13] = [
+            1.0,
+            0.985_635_33,
+            0.970_362,
+            0.954_18,
+            0.935_810_7,
+            0.916_110_7,
+            0.895_08,
+            0.861_792,
+            0.798_276_67,
+            0.704_534,
+            0.511_223_3,
+            0.276_378_67,
+            0.0,
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn resampling_holds_its_shape_at_every_step_count() {
+        for steps in 1..=40 {
+            let s = resample_saved_sigmas(&TURBO_SAVED, steps).unwrap();
+            assert_eq!(s.len(), steps + 1, "{steps}");
+            assert_eq!(s[0], 1.0, "{steps}: starts on the first saved sigma");
+            assert_eq!(s[steps], 0.0, "{steps}");
+            assert!(s.windows(2).all(|w| w[0] > w[1]), "{steps}: {s:?}");
+        }
+        // One step is the whole interval; a doubled count passes through every saved sigma.
+        assert_eq!(resample_saved_sigmas(&TURBO_SAVED, 1).unwrap(), [1.0, 0.0]);
+        let doubled = resample_saved_sigmas(&TURBO_SAVED, 16).unwrap();
+        for (j, sigma) in TURBO_SAVED.iter().enumerate() {
+            assert_eq!(doubled[2 * j], *sigma as f32, "knot {j}");
+        }
+        assert!(resample_saved_sigmas(&TURBO_SAVED, 0).is_err());
+        assert!(resample_saved_sigmas(&[], 8).is_err());
     }
 
     #[test]

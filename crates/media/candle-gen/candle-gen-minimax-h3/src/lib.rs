@@ -137,6 +137,7 @@ pub mod text_encoder;
 pub mod tier;
 pub mod vae;
 pub mod vae_encoder;
+pub mod veda;
 
 pub use adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,

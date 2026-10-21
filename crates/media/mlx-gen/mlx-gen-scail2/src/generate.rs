@@ -93,6 +93,7 @@ pub(crate) const EXECUTION_SURFACE: mlx_gen::gen_core::ExecutionSurface =
         graph_eval_cadence_blocks: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
         ffn_chunk_rows: mlx_gen::gen_core::ExecutionValueDomain::ANY_POSITIVE,
         cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Unsupported,
+        prefix_kv_cache: mlx_gen::gen_core::PrefixKvCacheDomain::Unsupported,
     };
 /// Inputs must be divisible by 32: the pose path halves spatially (→ ÷16) before the ÷8 VAE stride,
 /// and the 28-channel mask pools 8×, so both the full and half grids must stay integer + even.

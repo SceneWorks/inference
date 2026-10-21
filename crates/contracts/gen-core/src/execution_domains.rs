@@ -6,17 +6,22 @@
 //! 18304's P2 planner selects them per request beside the ladder, so they ride the same
 //! [`crate::GenerationMemory`] block and are gated by the same shared request floor.
 //!
-//! # Why these three, and why they are not rungs
+//! # Why these four, and why they are not rungs
 //!
-//! Each existed already, as a per-provider ad hoc parameter with no shared vocabulary, no
-//! declaration, and therefore no way for a planner to discover it or for a caller to be told it was
-//! ignored:
+//! The first three existed already, as per-provider ad hoc parameters with no shared vocabulary, no
+//! declaration, and therefore no way for a planner to discover them or for a caller to be told one
+//! was ignored; the fourth is a new mechanism declared the same way from the start:
 //!
-//! | domain | pre-sc-18317 ad hoc form | equivalence class |
+//! | domain | prior form | equivalence class |
 //! |---|---|---|
 //! | [graph-evaluation cadence](GraphEvalCadence) | `eval_per_block` — a bool (every block, or never) — on `mlx_gen_flux2::MemoryConfig` (sc-6266) and `mlx_gen_wan::DitMemoryConfig` (sc-5681) | **bit-identical** |
 //! | [CFG batching](CfgBatching) | `mlx_gen_kolors` `cfg_conditioning`/`cfg_batch_*`, `candle_gen_kolors::common::cfg_batch_context` (an implicit `cfg > 1.0` doubling convention) | **bit-identical** |
 //! | [FFN chunking](FfnChunk) | `ffn_seq_chunk` on the same two config structs | *numerically* equivalent (see below) |
+//! | [prefix KV cache](PrefixKvCacheMode) | none — no prefix cache before epic 25899; its port (sc-25903, sc-25904) is selected only through this domain (sc-25905), and an unset request runs the prefill path | *numerically* equivalent (see below) |
+//!
+//! The fourth row joined in sc-25905, for the reason [`CfgBatching`] is here: it trades a
+//! request's activation high-water against its wall time, and a planner can only make that trade
+//! if the knob is declared, selectable and refused where it does not exist.
 //!
 //! What deliberately did **not** become a domain: `DitMemoryConfig::attn_query_chunk`. Bounding
 //! attention scratch is already the memory ladder's rung 3
@@ -64,10 +69,15 @@
 //! own torch parity; see `mlx_gen_flux2::chunk`). A selector that must not perturb pixels at all
 //! therefore leaves [`GenerationMemory::ffn_chunk`](crate::GenerationMemory::ffn_chunk) unset, which
 //! is why the class is declared here rather than left for a caller to rediscover.
+//!
+//! [`PrefixKvCacheMode`] is in the same *numerically* equivalent class: a cached evaluation attends
+//! over the stored prefix keys/values instead of recomputing them, which is the same mathematics
+//! through a GEMM of a different row count (max|Δ| ~1e-6 in the latents on the Qwen-Image 2.1
+//! fixtures — below one 8-bit level, but not bit-identical).
 
 use std::num::NonZeroU32;
 
-use crate::{Error, GenerationMemory, Result};
+use crate::{Error, GenerationMemory, MemoryBudget, Result};
 
 /// How often a provider forces its lazy graph to materialize **inside one denoise forward**, in
 /// transformer blocks per forced evaluation.
@@ -232,6 +242,179 @@ impl CfgBatching {
     }
 }
 
+/// Whether a block-causal denoiser keeps the **prefix key/value cache** across one denoise loop
+/// (sc-25905).
+///
+/// A block-causal joint transformer (Qwen-Image 2.1) attends from the target image's tokens to a
+/// *prefix* — the prompt and every reference image — that does not change between denoise steps.
+/// The two modes are the same mathematics and differ in what is held and what is recomputed:
+///
+/// * [`Cached`](Self::Cached) evaluates the prefix once per prompt branch, keeps every block's
+///   prefix K and V for the length of the denoise loop, and runs every later model evaluation over
+///   the target tokens only. Fewer tokens per step, at the cost of holding
+///   `2 · blocks · prefix_tokens · inner_dim` activations per prompt branch.
+/// * [`Prefill`](Self::Prefill) holds nothing and evaluates the whole joint sequence at every
+///   model evaluation — the path such a provider ran before it had a cache.
+///
+/// This is the axis a planner wants when a request with many reference images does not fit: the
+/// cache is activations at the compute dtype, so no numeric tier shrinks it, and shedding it costs
+/// time, never an image, a reference or a tier. Like [`CfgBatching`] it is a closed enum rather
+/// than a bool, and a provider that implements only one mode declares only that one.
+///
+/// **Numerically equivalent, not bit-identical** — see the module docs.
+///
+/// # The unset field is the prefill path
+///
+/// `None` on [`GenerationMemory::prefix_kv_cache`] means the provider's own default like every
+/// other domain here, and for a cache that default is deliberately the mode that **holds
+/// nothing**: a request admitted against a budget that never priced the cache must not run above
+/// it. The cache is therefore opt-in per request — a caller selects [`Cached`](Self::Cached) after
+/// pricing it ([`Self::select`]).
+///
+/// # What a caller must get right, because nothing checks it for them
+///
+/// * **Write the selection after the request scope has configured the request.**
+///   [`MemoryRequestScope::configure_request`](crate::MemoryRequestScope::configure_request)
+///   *replaces* [`GenerationRequest::memory`](crate::GenerationRequest::memory) with the block
+///   for the admitted ladder selection, and for a `Resident` selection on a provider that
+///   preserves its load defaults that block is `None`. A selection written before that call is
+///   lost and the render runs prefill, in silence — the report says so, the request does not. So:
+///   configure, then set the field, creating a default block if there is none.
+/// * **Admit the cached demand before selecting `Cached`.** A provider honours the field; it
+///   does not verify that the request was admitted against a budget that included the cache.
+///
+/// # A provider prices an upper bound, and holds a cached render to it
+///
+/// The real prefix is known only once the prompt is tokenized and the references are fitted, so
+/// a provider prices the cache over published **bounds** (text rows per branch, tokens per
+/// reference). A `Cached` request whose real caches would exceed that priced figure is run
+/// **prefill** — never cached above its price, never failed — and the render's
+/// [`PrefixKvCacheReport::overflow`] says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrefixKvCacheMode {
+    /// Prefill once per prompt branch, then decode the target tokens against the cached prefix.
+    Cached,
+    /// Evaluate the full joint sequence at every model evaluation; hold no cache.
+    Prefill,
+}
+
+impl PrefixKvCacheMode {
+    /// Every mode, for exhaustive declaration/conformance walks.
+    pub const ALL: [Self; 2] = [Self::Cached, Self::Prefill];
+
+    /// `true` for the mode that holds the cache.
+    pub const fn is_cached(self) -> bool {
+        matches!(self, Self::Cached)
+    }
+
+    /// Stable lower-case label for messages, structured plan events and job records.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Prefill => "prefill",
+        }
+    }
+
+    /// The mode a request runs under `budget`: the cheapest in **time** that fits.
+    ///
+    /// `shed_demand_bytes` is the request's incremental live demand with the cache shed — the
+    /// number [`MemoryBudget::fits`] has always been asked about — and `cache_bytes` is what the
+    /// provider prices the request's caches at on top of it.
+    ///
+    /// * [`Cached`](Self::Cached) when `shed_demand_bytes + cache_bytes` fits;
+    /// * [`Prefill`](Self::Prefill) when only `shed_demand_bytes` fits — the request is still
+    ///   admitted, it runs without the cache;
+    /// * `None` when even the shed demand does not fit: the caller refuses exactly as it did
+    ///   before the cache existed. Nothing here shrinks an image, drops a reference or changes a
+    ///   tier.
+    ///
+    /// The caller stays the owner of the budget and of the ladder; this is only the two-way
+    /// comparison, written once so a provider's tests and its consumer cannot disagree on a
+    /// boundary (exact fits are accepted, as [`MemoryBudget::fits`] accepts them, and an
+    /// overflowing sum does not fit).
+    pub fn select(budget: MemoryBudget, shed_demand_bytes: u64, cache_bytes: u64) -> Option<Self> {
+        if !budget.fits(shed_demand_bytes) {
+            return None;
+        }
+        match shed_demand_bytes.checked_add(cache_bytes) {
+            Some(cached_demand_bytes) if budget.fits(cached_demand_bytes) => Some(Self::Cached),
+            _ => Some(Self::Prefill),
+        }
+    }
+}
+
+/// Which prefix-KV-cache path one render ran, and what its caches held
+/// ([`GenerationReport::prefix_kv_cache`](crate::GenerationReport::prefix_kv_cache), sc-25905).
+///
+/// Written from what the denoise loop did, not from what the request asked for, so a consumer can
+/// record the path on the job and compare it with the mode it selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixKvCacheReport {
+    /// The path the denoise loop took.
+    pub path: PrefixKvCacheMode,
+    /// Bytes of prefix K/V held at once (every prompt branch of one image);
+    /// `0` on [`PrefixKvCacheMode::Prefill`]. A request for several images renders them one after
+    /// another, each with its own caches, so this does not grow with the image count.
+    pub cache_bytes: u64,
+    /// `Some` when the request selected [`PrefixKvCacheMode::Cached`] but the provider ran
+    /// [`PrefixKvCacheMode::Prefill`] because the request's real caches would have exceeded what
+    /// the provider prices for it. `None` on every other render — in particular a `Prefill` path
+    /// with `None` here is prefill **by selection** (or by an unset field).
+    pub overflow: Option<PrefixKvCacheOverflow>,
+}
+
+/// Why a `Cached` selection ran prefill ([`PrefixKvCacheReport::overflow`]): the caches this
+/// request would really have held against the figure the provider prices for it. Both are in the
+/// loaded model's own terms (its block count, width and compute dtype), so they compare directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixKvCacheOverflow {
+    /// Bytes the request's caches would have held, from its real prefix (tokenized prompt rows
+    /// plus every fitted reference grid, per prompt branch) at the model's compute dtype.
+    pub actual_bytes: u64,
+    /// Bytes the provider prices for this request: the same arithmetic over its published
+    /// per-branch text bound and per-reference bound.
+    pub priced_bytes: u64,
+}
+
+/// The production domain of
+/// [`GenerationMemory::prefix_kv_cache`](crate::GenerationMemory::prefix_kv_cache).
+///
+/// A closed mode list, for the reason [`CfgBatchingDomain`] is one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PrefixKvCacheDomain {
+    /// The provider has no selectable prefix KV cache. Every set value is refused.
+    #[default]
+    Unsupported,
+    /// Exactly these modes are implemented. An empty list is a declaration error.
+    Modes(Vec<PrefixKvCacheMode>),
+}
+
+impl PrefixKvCacheDomain {
+    /// Whether the provider declares a selectable prefix KV cache.
+    pub const fn is_supported(&self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    /// Whether `mode` is implemented.
+    pub fn accepts(&self, mode: PrefixKvCacheMode) -> bool {
+        match self {
+            Self::Unsupported => false,
+            Self::Modes(modes) => modes.contains(&mode),
+        }
+    }
+
+    /// Human-readable domain for a refusal message.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unsupported => "unsupported".to_owned(),
+            Self::Modes(modes) => {
+                let labels: Vec<&str> = modes.iter().map(|mode| mode.label()).collect();
+                format!("[{}]", labels.join(", "))
+            }
+        }
+    }
+}
+
 /// The production domain of one **numeric** execution knob.
 ///
 /// Two admitting shapes, because the two knobs here differ in what evidence exists rather than in
@@ -343,6 +526,8 @@ pub struct ExecutionSurface {
     pub ffn_chunk_rows: ExecutionValueDomain,
     /// CFG batching modes this provider implements.
     pub cfg_batching: CfgBatchingDomain,
+    /// Prefix-KV-cache modes this provider implements (sc-25905).
+    pub prefix_kv_cache: PrefixKvCacheDomain,
 }
 
 impl ExecutionSurface {
@@ -351,6 +536,7 @@ impl ExecutionSurface {
         !self.graph_eval_cadence_blocks.is_supported()
             && !self.ffn_chunk_rows.is_supported()
             && !self.cfg_batching.is_supported()
+            && !self.prefix_kv_cache.is_supported()
     }
 
     /// Gate one request's execution selections against this surface.
@@ -402,6 +588,25 @@ impl ExecutionSurface {
                      convention.",
                     mode.label(),
                     self.cfg_batching.describe()
+                )));
+            }
+        }
+        if let Some(mode) = memory.prefix_kv_cache {
+            if !self.prefix_kv_cache.is_supported() {
+                return Err(Error::Unsupported(format!(
+                    "{id}: prefix_kv_cache={} was selected, but this provider declares no \
+                     selectable prefix KV cache. Leave memory.prefix_kv_cache unset to run the \
+                     provider's own default.",
+                    mode.label()
+                )));
+            }
+            if !self.prefix_kv_cache.accepts(mode) {
+                return Err(Error::Unsupported(format!(
+                    "{id}: prefix_kv_cache={} is outside the declared production domain {}. \
+                     Select a declared mode, or leave memory.prefix_kv_cache unset for the \
+                     provider's own default.",
+                    mode.label(),
+                    self.prefix_kv_cache.describe()
                 )));
             }
         }
@@ -477,6 +682,21 @@ impl ExecutionSurface {
                 errors.push("cfg_batching declares duplicate modes".to_owned());
             }
         }
+        if let PrefixKvCacheDomain::Modes(modes) = &self.prefix_kv_cache {
+            if modes.is_empty() {
+                errors.push(
+                    "prefix_kv_cache declares an empty mode list; use Unsupported to declare the \
+                     mechanism absent"
+                        .to_owned(),
+                );
+            }
+            let mut unique = modes.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != modes.len() {
+                errors.push("prefix_kv_cache declares duplicate modes".to_owned());
+            }
+        }
         errors
     }
 }
@@ -495,6 +715,7 @@ mod tests {
         assert_eq!(m.graph_eval_cadence, None);
         assert_eq!(m.ffn_chunk, None);
         assert_eq!(m.cfg_batching, None);
+        assert_eq!(m.prefix_kv_cache, None);
     }
 
     #[test]
@@ -621,6 +842,132 @@ mod tests {
         );
     }
 
+    /// sc-25905: the prefix KV cache is refused by name where it is not declared, and a declared
+    /// surface admits exactly its modes.
+    ///
+    /// *Mutations that red this:* dropping the `prefix_kv_cache` arm of `validate` (an undeclared
+    /// selection is silently accepted); dropping the `accepts` check (an undeclared mode runs).
+    #[test]
+    fn prefix_kv_cache_is_refused_by_name_and_admitted_only_in_its_declared_modes() {
+        let cached = GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+            ..memory()
+        };
+        let text = ExecutionSurface::default()
+            .validate("prov", Some(&cached))
+            .expect_err("an inert surface must refuse a prefix KV cache selection")
+            .to_string();
+        assert!(text.contains("prov"), "{text}");
+        assert!(text.contains("prefix_kv_cache=cached"), "{text}");
+        assert!(text.contains("unset"), "actionable remedy missing: {text}");
+        assert!(
+            text.contains("declares no selectable prefix KV cache"),
+            "an inert surface must refuse for the absent mechanism: {text}"
+        );
+
+        let prefill_only = ExecutionSurface {
+            prefix_kv_cache: PrefixKvCacheDomain::Modes(vec![PrefixKvCacheMode::Prefill]),
+            ..ExecutionSurface::default()
+        };
+        assert!(!prefill_only.is_inert());
+        assert!(prefill_only.declaration_errors().is_empty());
+        let text = prefill_only
+            .validate("prov", Some(&cached))
+            .expect_err("an undeclared mode must be refused")
+            .to_string();
+        assert!(text.contains("prefix_kv_cache=cached"), "{text}");
+        assert!(text.contains("[prefill]"), "domain must be named: {text}");
+        prefill_only
+            .validate(
+                "prov",
+                Some(&GenerationMemory {
+                    prefix_kv_cache: Some(PrefixKvCacheMode::Prefill),
+                    ..memory()
+                }),
+            )
+            .expect("a declared mode must be admitted");
+
+        let both = ExecutionSurface {
+            prefix_kv_cache: PrefixKvCacheDomain::Modes(PrefixKvCacheMode::ALL.to_vec()),
+            ..ExecutionSurface::default()
+        };
+        both.validate("prov", Some(&cached))
+            .expect("a declared mode must be admitted");
+        assert_eq!(PrefixKvCacheMode::Cached.label(), "cached");
+        assert_eq!(PrefixKvCacheMode::Prefill.label(), "prefill");
+        assert!(PrefixKvCacheMode::Cached.is_cached());
+        assert!(!PrefixKvCacheMode::Prefill.is_cached());
+
+        let duplicated = ExecutionSurface {
+            prefix_kv_cache: PrefixKvCacheDomain::Modes(vec![
+                PrefixKvCacheMode::Cached,
+                PrefixKvCacheMode::Cached,
+            ]),
+            ..ExecutionSurface::default()
+        };
+        assert!(
+            duplicated
+                .declaration_errors()
+                .iter()
+                .any(|error| error.contains("prefix_kv_cache") && error.contains("duplicate")),
+            "{:?}",
+            duplicated.declaration_errors()
+        );
+    }
+
+    /// sc-25905: the two-way fit comparison, on its boundaries. Exact fits are accepted, exactly
+    /// as [`MemoryBudget::fits`] accepts them.
+    ///
+    /// *Mutations that red this:* ignoring `cache_bytes` (the between-budget row answers
+    /// `Cached`); answering `Prefill` when the shed demand does not fit (the last rows answer
+    /// `Some`); always answering `Prefill` (the first rows answer `Prefill`).
+    #[test]
+    fn prefix_kv_cache_select_takes_the_cache_only_when_it_fits_and_refuses_when_neither_does() {
+        let budget = |total_bytes| MemoryBudget {
+            total_bytes,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let (shed, cache) = (1_000_u64, 300_u64);
+        for (total, want) in [
+            (u64::MAX, Some(PrefixKvCacheMode::Cached)),
+            (shed + cache, Some(PrefixKvCacheMode::Cached)),
+            (shed + cache - 1, Some(PrefixKvCacheMode::Prefill)),
+            (shed, Some(PrefixKvCacheMode::Prefill)),
+            (shed - 1, None),
+            (0, None),
+        ] {
+            assert_eq!(
+                PrefixKvCacheMode::select(budget(total), shed, cache),
+                want,
+                "budget {total} against shed {shed} + cache {cache}"
+            );
+        }
+        // A zero-byte cache costs nothing: it is taken whenever the request itself fits.
+        assert_eq!(
+            PrefixKvCacheMode::select(budget(shed), shed, 0),
+            Some(PrefixKvCacheMode::Cached)
+        );
+        // An overflowing sum cannot fit, and must not wrap into a small number that does.
+        assert_eq!(
+            PrefixKvCacheMode::select(budget(u64::MAX), u64::MAX, 1),
+            Some(PrefixKvCacheMode::Prefill)
+        );
+        // Headroom and committed bytes are the budget's own arithmetic, not re-derived here.
+        let constrained = MemoryBudget {
+            total_bytes: 2_000,
+            committed_bytes: 600,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 200,
+        };
+        assert_eq!(constrained.effective_bytes(), 1_200);
+        assert_eq!(
+            PrefixKvCacheMode::select(constrained, shed, cache),
+            Some(PrefixKvCacheMode::Prefill)
+        );
+    }
+
     #[test]
     fn unset_fields_validate_vacuously_on_an_inert_surface() {
         let surface = ExecutionSurface::default();
@@ -648,6 +995,7 @@ mod tests {
             graph_eval_cadence_blocks: ExecutionValueDomain::Candidates(vec![1, 2]),
             ffn_chunk_rows: ExecutionValueDomain::ANY_POSITIVE,
             cfg_batching: CfgBatchingDomain::Modes(vec![CfgBatching::Batched]),
+            prefix_kv_cache: PrefixKvCacheDomain::Modes(vec![PrefixKvCacheMode::Prefill]),
         };
         assert!(!surface.is_inert());
         assert!(surface.declaration_errors().is_empty());
@@ -690,6 +1038,7 @@ mod tests {
             graph_eval_cadence_blocks: ExecutionValueDomain::Candidates(Vec::new()),
             ffn_chunk_rows: ExecutionValueDomain::Candidates(vec![0, 8, 8]),
             cfg_batching: CfgBatchingDomain::Modes(Vec::new()),
+            prefix_kv_cache: PrefixKvCacheDomain::Modes(Vec::new()),
         };
         let errors = surface.declaration_errors();
         assert!(
