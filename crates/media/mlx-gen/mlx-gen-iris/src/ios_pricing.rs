@@ -2313,7 +2313,9 @@ fn observed_metadata_read<T>(
     ) -> mlx_gen::gen_core::Result<T>,
 ) -> Result<T> {
     let mut original_error = None;
-    let mut observe = |event| match metadata.observe(event, capacity) {
+    let mut observe = |event: mlx_gen::gen_core::weightsmeta::SourceMetadataRead<'_>| match metadata
+        .observe(event, capacity)
+    {
         Ok(()) => Ok(()),
         Err(error) => {
             original_error = Some(error);

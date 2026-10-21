@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T17:05:11.813344+00:00",
-  "rust_proof_closure_sha256": "48a9db2da216258d30e78106833c469229efc8304e0ff225e698b4a8e971f6a2",
+  "UTC": "2026-10-21T17:33:42.905334+00:00",
+  "rust_proof_closure_sha256": "9ac024ec417ecbbb7cc200ec30de872049910f5ed82917314967f23704ed831c",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -248,7 +248,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "461a4b4a2ef1e461172ab838c6f4030610e321756f1d968b57cd5e131cb1e4be"
+      "sha256": "c033b63152537683c73d1a030475fec19149c8fbe7eb5c8ff4aba74e41bf5275"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
@@ -936,7 +936,7 @@
     },
     {
       "path": "scripts/ci/clip_regex_test_rustc.py",
-      "sha256": "e05bb7f8caa625b556e7a10484d03efaf0a3d0682116f0e308873d5eae6814a7"
+      "sha256": "cc50a86ae2553fc152372d8c2ae75e4670b3c51e21d5328710e2dfef965e7c35"
     },
     {
       "path": "scripts/ci/ios_pricing_compile_only.py",
@@ -960,7 +960,7 @@
     },
     {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
-      "sha256": "c5415628ac39e0d04b02c6f0978a7d17786bd20ebfb9af9dc67994d9f5ffe571"
+      "sha256": "1ba80dec47bc6816056558318a1dfbdb0c808eb3ec9ef56af1383289d723cd63"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
@@ -2370,14 +2370,14 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "bbe776101ace618b03159b54264b5a499c1dc47771fc04847bdb7462d70826bb",
-    "classification_sha256": "055f19bc6caf425922ee0cea5be28bfa4aa9c7b1d0e320321d92d15aa03bf29b",
+    "inventory_sha256": "4d236cf51bfccd2a7e006006cbe6165ca8fd25d1ace2d6c4459b3ea084c215f0",
+    "classification_sha256": "5c37722b4482237554cd51768aa427a2ad7883ed8bd41dac2aadb94ea56619f6",
     "selected_Rust_FQNs": 214,
     "HOST_logical": 192,
     "HOST_expected_PASS_rows": 193,
     "native_logical": 22,
     "native_expected_PASS_rows": 44,
-    "Python_exact_tests": 12,
+    "Python_exact_tests": 14,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true
   }

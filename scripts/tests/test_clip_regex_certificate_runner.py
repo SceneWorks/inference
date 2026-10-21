@@ -58,3 +58,23 @@ class RustcArtifactBridgeTests(unittest.TestCase):
         for args in [["-vV"], ["--crate-name", "regex", "--extern", "x=missing.rmeta"], ["--crate-name", "other", "--test", "--extern", "x=missing.rmeta"], ["--crate-name", "regex", "--test", "--extern", "x=existing.rlib"]]:
             with self.subTest(args=args):
                 self.assertEqual(bridge.linkable_test_args(args), args)
+
+
+class RustcTestArtifactPlanTests(unittest.TestCase):
+    def load_bridge(self):
+        spec = importlib.util.spec_from_file_location("clip_rustc_plan", ROOT / "scripts/ci/clip_regex_test_rustc.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_explicit_test_output_is_bin_link_only_without_cargo_suffix(self):
+        args = ["--crate-name", "regex", "--crate-type", "lib", "--emit=dep-info,metadata,link", "-C", "extra-filename=-cargo", "-C", "metadata=keep", "--out-dir", "/cargo/out", "--test", "-o", "/test/exact"]
+        self.assertEqual(self.load_bridge().linkable_test_args(args), ["--crate-name", "regex", "--crate-type", "bin", "--emit=link", "-C", "metadata=keep", "--test", "-o", "/test/exact"])
+        self.assertIn("extra-filename=-cargo", args, "input arguments remain unchanged")
+
+    def test_inline_output_flags_are_normalized_only_for_explicit_primary_test(self):
+        bridge = self.load_bridge()
+        args = ["--crate-name=regex", "--crate-type=rlib", "--emit", "dep-info,metadata,link", "-Cextra-filename=-cargo", "-Cmetadata=keep", "--out-dir=/cargo/out", "--test", "-o", "/test/exact"]
+        self.assertEqual(bridge.linkable_test_args(args), ["--crate-name=regex", "--crate-type=bin", "--emit", "link", "-Cmetadata=keep", "--test", "-o", "/test/exact"])
+        without_output = args[:-2]
+        self.assertEqual(bridge.linkable_test_args(without_output), without_output)
