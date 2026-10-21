@@ -3474,7 +3474,7 @@ mod source_capacity_transport_tests {
         let mut capacity = |bytes| {
             seen.push(bytes);
             if bytes == 31 {
-                Err(Error::Msg("fixture allocation refused".into()))
+                Err(mlx_gen::Error::Msg("fixture allocation refused".into()))
             } else {
                 Ok(())
             }
@@ -3501,7 +3501,7 @@ mod source_capacity_transport_tests {
         let mut capacity = |bytes| {
             seen.push(bytes);
             if bytes > 100 {
-                Err(Error::Msg("fixture allocation refused".into()))
+                Err(mlx_gen::Error::Msg("fixture allocation refused".into()))
             } else {
                 Ok(())
             }
