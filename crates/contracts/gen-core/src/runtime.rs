@@ -557,7 +557,10 @@ fn volume_identity(path: &Path) -> Option<Vec<u8>> {
         return None;
     }
     // SAFETY: a successful `statvfs` initialized the whole structure.
-    let fsid = u64::from(unsafe { fs.assume_init() }.f_fsid);
+    let fsid = unsafe { fs.assume_init() }.f_fsid;
+    // `f_fsid` is `c_ulong`: `u64` on 64-bit targets, narrower elsewhere.
+    #[allow(clippy::useless_conversion)]
+    let fsid = u64::from(fsid);
     (fsid != 0).then(|| fsid.to_le_bytes().to_vec())
 }
 
