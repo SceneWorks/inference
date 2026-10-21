@@ -417,6 +417,18 @@ impl MiniMaxH3Dit {
         bounded: BoundedAttention<'_>,
         window: Option<(&BlockPlan, &CancelFlag)>,
     ) -> Result<(Array, Array)> {
+        self.forward_packed_windowed_veda(packed, blocks, norm_out, bounded, window, None)
+    }
+
+    fn forward_packed_windowed_veda(
+        &self,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        bounded: BoundedAttention<'_>,
+        window: Option<(&BlockPlan, &CancelFlag)>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+    ) -> Result<(Array, Array)> {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -445,12 +457,12 @@ impl MiniMaxH3Dit {
                 self.assert_one_residency_mode()?;
                 let mut x = x;
                 for (layer, block) in self.blocks.iter().enumerate() {
-                    x = self.run_block(block, layer, x, packed, blocks, bounded)?;
+                    x = self.run_block(block, layer, x, packed, blocks, bounded, veda)?;
                 }
                 x
             }
             Some((plan, cancel)) => {
-                self.run_windowed_stack(x, packed, blocks, bounded, plan, cancel)?
+                self.run_windowed_stack(x, packed, blocks, bounded, plan, cancel, veda)?
             }
         };
 
@@ -477,6 +489,7 @@ impl MiniMaxH3Dit {
 
 impl MiniMaxH3Dit {
     /// One block of the stack, under either residency mode.
+    #[allow(clippy::too_many_arguments)]
     fn run_block(
         &self,
         block: &DitBlock,
@@ -485,24 +498,30 @@ impl MiniMaxH3Dit {
         packed: &PackedForward<'_>,
         blocks: BlockModulation<'_>,
         bounded: BoundedAttention<'_>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<Array> {
         match blocks {
-            BlockModulation::Cached(cache) => block.forward_bounded(
+            BlockModulation::Cached(cache) => block.forward_bounded_veda(
                 &x,
                 cache.modulation(layer)?,
                 packed.adaln_indices,
                 &self.rope,
                 packed.tables,
                 bounded,
+                veda.map(|(v, step)| (v, layer, step)),
             ),
-            BlockModulation::Temb(temb) => block.forward_with_temb_bounded(
-                &x,
-                temb,
-                packed.adaln_indices,
-                &self.rope,
-                packed.tables,
-                bounded,
-            ),
+            BlockModulation::Temb(temb) => {
+                let modulation = block.modulation(temb)?;
+                block.forward_bounded_veda(
+                    &x,
+                    &modulation,
+                    packed.adaln_indices,
+                    &self.rope,
+                    packed.tables,
+                    bounded,
+                    veda.map(|(v, step)| (v, layer, step)),
+                )
+            }
         }
     }
 
@@ -514,6 +533,7 @@ impl MiniMaxH3Dit {
     /// precompute already holds (see [`crate::block_stream`]). A deferred load projects its
     /// modulation once through `block_stream::precompute_adaln_windowed` and denoises from the
     /// cache.
+    #[allow(clippy::too_many_arguments)]
     fn run_windowed_stack(
         &self,
         x: Array,
@@ -522,6 +542,7 @@ impl MiniMaxH3Dit {
         bounded: BoundedAttention<'_>,
         plan: &BlockPlan,
         cancel: &CancelFlag,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<Array> {
         let stream = self.stream.as_ref().ok_or_else(|| {
             Error::Msg(
@@ -566,6 +587,7 @@ impl MiniMaxH3Dit {
                         packed,
                         BlockModulation::Cached(cache),
                         bounded,
+                        veda,
                     )?;
                     // The block drops per iteration rather than per window: at `window > 1` the
                     // alternative holds every block of the window plus the activation.
@@ -720,6 +742,8 @@ enum Modulation {
 /// the modulation source and the two per-row index tensors — so a step is exactly "project, scatter,
 /// 50 blocks, norm, two heads".
 pub struct JointDit {
+    veda_report: Option<crate::veda::ReportSink>,
+    veda: Option<crate::veda::VedaRuntime>,
     dit: MiniMaxH3Dit,
     layout: PackedLayout,
     tables: MmRopeTables,
@@ -867,6 +891,8 @@ impl JointDit {
         dit.verify_body_sources()?;
 
         Ok(Self {
+            veda: None,
+            veda_report: None,
             dit,
             layout,
             tables,
@@ -949,6 +975,8 @@ impl JointDit {
         mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
 
         Ok(Self {
+            veda: None,
+            veda_report: None,
             dit,
             layout,
             tables,
@@ -968,6 +996,45 @@ impl JointDit {
             block_window: Some(plan),
             window_cancel: cancel,
         })
+    }
+
+    /// Enable request-scoped learned attention only after the dense model is established.
+    #[cfg(test)]
+    pub(crate) fn veda_calls(&self) -> Vec<(usize, usize, mlx_gen::gen_core::VedaRequest)> {
+        self.veda
+            .as_ref()
+            .map(|v| v.calls.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn prepare_veda(
+        &mut self,
+        request: &mlx_gen::gen_core::VedaRequest,
+        path: Option<&std::path::Path>,
+        report: crate::veda::ReportSink,
+    ) {
+        self.veda_report = Some(report.clone());
+        let cfg = self.dit.config();
+        self.veda = crate::veda::VedaRuntime::prepare(
+            request,
+            path,
+            &self.layout,
+            cfg.num_layers as usize,
+            cfg.num_attention_heads as usize,
+            cfg.attention_head_dim as usize,
+            report,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_veda_fixture(
+        &mut self,
+        request: &mlx_gen::gen_core::VedaRequest,
+        report: crate::veda::ReportSink,
+        fail: bool,
+    ) {
+        self.veda_report = Some(report.clone());
+        self.veda = crate::veda::VedaRuntime::prepare_fixture(request, &self.layout, report, fail);
     }
 
     /// The block window in force, or `None` on a resident stack.
@@ -1040,6 +1107,19 @@ impl JointDit {
 impl JointVelocity for JointDit {
     fn forward(&mut self, step: &JointStep<'_>) -> Result<(Array, Array)> {
         self.forwards += 1;
+        if self.veda.is_none() {
+            if let Some(report) = &self.veda_report {
+                let mut report = report.borrow_mut();
+                let calls = self.dit.config().num_layers as u64;
+                let pairs = calls
+                    * self.dit.config().num_attention_heads as u64
+                    * self.layout.seq_len() as u64
+                    * self.layout.seq_len() as u64;
+                report.dense_calls += calls;
+                report.selected_token_pairs += pairs;
+                report.dense_token_pairs += pairs;
+            }
+        }
 
         // The two row-addressing tensors. `timestep_indices` is DERIVED from `adaln_indices` rather
         // than rebuilt, so the block stack and `norm_out` cannot be handed inconsistent rows.
@@ -1096,7 +1176,7 @@ impl JointVelocity for JointDit {
                 ))
             }
         };
-        self.dit.forward_packed_windowed(
+        self.dit.forward_packed_windowed_veda(
             &packed,
             blocks,
             &norm_out,
@@ -1104,6 +1184,7 @@ impl JointVelocity for JointDit {
             self.block_window
                 .as_ref()
                 .map(|plan| (plan, &self.window_cancel)),
+            self.veda.as_ref().map(|v| (v, step.index)),
         )
     }
 }

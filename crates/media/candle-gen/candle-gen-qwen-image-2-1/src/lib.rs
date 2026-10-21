@@ -57,6 +57,14 @@
 //! adapters that load back strictly through [`mod@adapters`] with the MLX trainer's key layout. See
 //! [`mod@training`].
 //!
+//! Turbo (sc-25901): the distilled `Qwen/Qwen-Image-2.1-Turbo` checkpoint is a **second engine
+//! id**, [`TURBO_MODEL_ID`] (`qwen_image_2_1_turbo`), served by the same code. It shares the base
+//! transformer config, presets and licence; what differs is the schedule, which is the sigma list
+//! the snapshot itself saves (`model_index.json` `sample_sigmas`, [`SavedSigmaSchedule`]) rather than
+//! one derived from the resolution — see [`scheduler::resample_saved_sigmas`], [`descriptor_turbo`] and
+//! `UPSTREAM.md`. Each snapshot under the other id is a typed refusal
+//! ([`loader::check_snapshot_variant`]).
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -122,21 +130,22 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
     Reserved.";
 
 pub use config::{
-    SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
-    DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES,
-    OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT, VAE_SCALE_FACTOR, VISION_MERGE_SIZE,
-    VISION_PATCH_SIZE,
+    SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig,
+    VaeConfig, Variant, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
+    MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
+    VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
 };
 pub use loader::{
-    load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
-    load_vision_config,
+    check_snapshot_variant, load_saved_sigma_schedule, load_scheduler_config, load_text_encoder,
+    load_tokenizer, load_transformer, load_vae, load_vision_config,
 };
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, encode_prompt,
+    create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, denoise_reported, encode_prompt,
     encode_references, joint_branch, joint_images, joint_layout, missing_vision_tower,
     pack_latents, prepare_conditioning_references, rgba_to_rgb_over_white, text_rows,
-    unpack_latents, DenoiseInputs, JointBranch, ReferenceConditioning, DECODE_OVERLAP,
+    unpack_latents, DenoiseInputs, DenoiseReport, EvaluationPath, JointBranch, KvCacheMode,
+    KvCachePath, ModelEvaluation, PromptBranch, ReferenceConditioning, DECODE_OVERLAP,
     DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
@@ -151,19 +160,91 @@ pub use text_encoder::{
 };
 pub use training::{QwenImage21Trainer, ADAPTER_PROVENANCE, TRAINER_ID};
 pub use transformer::{
-    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+    JointLayout, PrefixKvCache, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS,
+    GLOBAL_ADAPTER_TARGETS,
 };
 pub use vae::QwenImage21Vae;
 
 /// Registry id for Qwen-Image 2.1 (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "qwen_image_2_1";
+/// Registry id for Qwen-Image 2.1 **Turbo** (sc-25901) — the distilled checkpoint, served by the
+/// same code over the sigma list its own snapshot saves. See [`descriptor_turbo`].
+pub const TURBO_MODEL_ID: &str = "qwen_image_2_1_turbo";
+/// Hugging Face repository the Turbo snapshot layout is frozen from.
+pub const UPSTREAM_TURBO_HF_REPO: &str = "Qwen/Qwen-Image-2.1-Turbo";
+/// Pinned `Qwen/Qwen-Image-2.1-Turbo` revision. Its `transformer/config.json`, presets and licence
+/// are the base repository's; it differs in `model_index.json` (`sample_sigmas`), in
+/// `scheduler/scheduler_config.json` (static, unshifted), and in two storage details the loaders
+/// already absorb (a bf16 VAE, a single-file text tower).
+pub const UPSTREAM_TURBO_HF_REVISION: &str = "fc13ba1986fcb905854dc8de2f52eee395f49b5b";
+/// `huggingface/diffusers` commit that taught `QwenImage21Pipeline` to sample over a snapshot's
+/// saved `sample_sigmas` (PR 14950) — the reference for the Turbo schedule.
+pub const UPSTREAM_TURBO_DIFFUSERS_REVISION: &str = "da1d3829cf08d4f329b526d89e17cc035c049d8d";
 /// Descriptor family — distinct from the 2512 crate's `qwen-image`.
 pub const FAMILY: &str = "qwen-image-2-1";
+
+/// The label the family's shared code (transformer, quant, reference, adapters, memory pricing)
+/// starts its refusals with: the base engine id's.
+const BASE_LABEL: &str = "qwen_image_2_1: ";
+
+/// E3 (sc-25909) — **a refusal reached through engine id `id` names `id`**, one rule on both
+/// backends (the MLX twin's `model::label_message`). The family's shared code labels its refusals
+/// with the base id (it serves both and is not told which); every public entry point of a
+/// Turbo-id object — the generator's load, `validate`, `generate`, `generate_with_report` and
+/// request scope, and the Turbo memory registration's contract — rewrites a leading
+/// `qwen_image_2_1: ` to `qwen_image_2_1_turbo: ` on the way out. A base-id refusal, and a
+/// message that does not start with the base label, passes through unchanged.
+pub(crate) fn label_message(id: &str, message: String) -> String {
+    if id == TURBO_MODEL_ID {
+        if let Some(rest) = message.strip_prefix(BASE_LABEL) {
+            return format!("{id}: {rest}");
+        }
+    }
+    message
+}
+
+/// [`label_message`] over gen-core's error type.
+pub(crate) fn labelled(id: &str, error: gen_core::Error) -> gen_core::Error {
+    match error {
+        gen_core::Error::Msg(message) => gen_core::Error::Msg(label_message(id, message)),
+        gen_core::Error::Unsupported(message) => {
+            gen_core::Error::Unsupported(label_message(id, message))
+        }
+        gen_core::Error::GeometryRefused {
+            reason,
+            requested_width,
+            requested_height,
+            alternative,
+        } => gen_core::Error::GeometryRefused {
+            reason: label_message(id, reason),
+            requested_width,
+            requested_height,
+            alternative,
+        },
+        other => other,
+    }
+}
 /// Smallest side upstream's pipeline can render: one vision slot (a 2×2 latent) at 16 px/token.
 pub const MIN_SIZE: u32 = 32;
 
 /// Qwen-Image 2.1's identity + capabilities — constructible without loading weights.
 pub fn descriptor() -> ModelDescriptor {
+    descriptor_for(Variant::Base)
+}
+
+/// Qwen-Image 2.1 **Turbo**'s identity + capabilities (sc-25901). Field for field the base
+/// descriptor under [`TURBO_MODEL_ID`]: one architecture, so one capability surface.
+///
+/// What differs is not expressible on a descriptor and lives in the request defaults instead: a
+/// request omitting `steps` runs one step per sigma the snapshot saves (eight for the pinned
+/// revision) rather than [`DEFAULT_STEPS`], and the step floor is 1 rather than 2 (there is no
+/// terminal stretch to divide by). True CFG defaults off on both ids ([`DEFAULT_TRUE_CFG`]) and
+/// still engages with a negative prompt and a scale above 1.
+pub fn descriptor_turbo() -> ModelDescriptor {
+    descriptor_for(Variant::Turbo)
+}
+
+fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let max_size = PRESETS
         .iter()
         .map(|p| p.width.max(p.height))
@@ -176,7 +257,7 @@ pub fn descriptor() -> ModelDescriptor {
         denoiser_output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
-        id: MODEL_ID,
+        id: variant.id(),
         family: FAMILY,
         backend: "candle",
         modality: Modality::Image,
@@ -232,6 +313,15 @@ pub fn descriptor() -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            // The prefix KV cache (sc-25905) is a request-selected execution domain: both modes
+            // are implemented, an unset field is the prefill path, and the shared floor refuses
+            // nothing this declares.
+            execution: gen_core::ExecutionSurface {
+                prefix_kv_cache: gen_core::PrefixKvCacheDomain::Modes(
+                    memory_strategy::PREFIX_KV_CACHE_MODES.to_vec(),
+                ),
+                ..gen_core::ExecutionSurface::default()
+            },
             ..Default::default()
         },
     }
@@ -246,10 +336,11 @@ pub(crate) struct Heavy {
 /// A loaded Qwen-Image 2.1 generator.
 pub struct QwenImage21 {
     descriptor: ModelDescriptor,
+    variant: Variant,
     tokenizer: TextTokenizer,
     /// Tokens of the system-role prefix the conditioning drops, derived from the tokenizer.
     drop_count: usize,
-    scheduler: SchedulerConfig,
+    schedule: Schedule,
     device: Device,
     residency: Residency<QwenImage21TextEncoder, Heavy>,
     lifecycle: Mutex<()>,
@@ -332,12 +423,47 @@ pub(crate) fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
 /// `Sequential` loads the text encoder, encodes, drops it, then loads the DiT + VAE — bounding
 /// peak memory to `max(text encoder, DiT + VAE)`.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::Base)
+}
+
+/// Construct the **Turbo** generator ([`TURBO_MODEL_ID`], sc-25901) from a
+/// `Qwen/Qwen-Image-2.1-Turbo` snapshot directory. Everything [`load`] says holds; the schedule is
+/// read from the snapshot ([`loader::load_saved_sigma_schedule`]) instead of derived from the
+/// resolution.
+pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::Turbo)
+}
+
+/// The denoise schedule a loaded generator runs — which of the two the snapshot carries is the
+/// whole difference between the registered ids.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Schedule {
+    /// Base: derived per request from the resolution ([`scheduler::sigmas`]).
+    Shifted(SchedulerConfig),
+    /// Turbo: the snapshot's saved sigma list ([`scheduler::resample_saved_sigmas`]).
+    Saved(SavedSigmaSchedule),
+}
+
+fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_unlabelled(spec, variant).map_err(|error| labelled(variant.id(), error))
+}
+
+fn load_variant_unlabelled(
+    spec: &LoadSpec,
+    variant: Variant,
+) -> gen_core::Result<Box<dyn Generator>> {
     validate_load_spec(spec)?;
     let root = loader::snapshot_root(&spec.weights)?;
+    // Before anything is read: a base snapshot under the Turbo id (or the reverse) is a typed
+    // refusal naming the mismatch, not a render over the wrong schedule.
+    loader::check_snapshot_variant(variant, root)?;
     let device = candle_gen::default_device()?;
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
-    let scheduler = loader::load_scheduler_config(root)?;
+    let schedule = match variant {
+        Variant::Base => Schedule::Shifted(loader::load_scheduler_config(root)?),
+        Variant::Turbo => Schedule::Saved(loader::load_saved_sigma_schedule(root)?),
+    };
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
@@ -347,13 +473,14 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // projection and a mis-oriented factor are refused here on EVERY offload policy — under
     // `Sequential` the DiT (and so `adapters::install`) is deferred to the first render, so without
     // this a bad adapter would pass `load` and fail mid-generate.
-    let memory_strategy = memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
+    let memory_strategy = memory_strategy::memory_strategy_contract(variant.id(), spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {
-        descriptor: descriptor(),
+        descriptor: descriptor_for(variant),
+        variant,
         tokenizer,
         drop_count,
-        scheduler,
+        schedule,
         device,
         residency,
         lifecycle: Mutex::new(()),
@@ -416,11 +543,17 @@ impl Generator for QwenImage21 {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        memory_strategy::registered_begin_request(&self.spec, &self.memory_strategy, context)
+        memory_strategy::begin_request_for(
+            self.variant.id(),
+            &self.spec,
+            &self.memory_strategy,
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request_for(self.variant, &self.descriptor.capabilities, req)
+            .map_err(|error| labelled(self.variant.id(), error.into()))
     }
 
     fn generate(
@@ -428,7 +561,27 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let report = self
+            .generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error.into()))?;
+        report.output.ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{}: the render produced no output",
+                self.descriptor.id
+            ))
+        })
+    }
+
+    /// The render plus which prefix-KV-cache path it ran and the bytes its caches held
+    /// (`GenerationReport::prefix_kv_cache`, sc-25905) — the primary implementation;
+    /// [`Self::generate`] is this without the report.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error.into()))
     }
 }
 
@@ -449,6 +602,32 @@ pub(crate) fn resolve_run_params(
     let native = scheduler::sigmas(scheduler, steps, tokens)?;
     let mu = scheduler::mu_for_tokens(scheduler, tokens) as f32;
     let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+    Ok(run_params_over(sigmas, req))
+}
+
+/// The Turbo id's run parameters (sc-25901): the schedule comes from the snapshot's saved sigmas
+/// ([`scheduler::resample_saved_sigmas`]) — as saved when the request omits `steps` or asks for exactly the
+/// saved count, resampled otherwise — with no `mu` shift and no terminal stretch.
+///
+/// The curated `scheduler` axis stays live through the same [`candle_gen::resolve_flow_schedule`]
+/// seam the base id uses, at `mu = 0` (the scheduler config is `shift: 1.0`, and `ln 1 = 0`):
+/// `None`, an unknown name and a native alias run the saved/resampled list; a curated name
+/// (`karras`, `beta`, …) **replaces** it with that scheduler's own unshifted ramp at the same step
+/// count, which is off the sigmas the checkpoint was distilled over.
+pub(crate) fn resolve_turbo_run_params(
+    schedule: &SavedSigmaSchedule,
+    req: &GenerationRequest,
+) -> Result<RunParams> {
+    let steps = req
+        .steps
+        .map_or(schedule.default_steps(), |steps| steps as usize);
+    let native = scheduler::resample_saved_sigmas(&schedule.sample_sigmas, steps)?;
+    let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+    Ok(run_params_over(sigmas, req))
+}
+
+/// The schedule-independent half of the run parameters, shared by both ids.
+fn run_params_over(sigmas: Vec<f32>, req: &GenerationRequest) -> RunParams {
     // `true_cfg_scale`: honour a caller-supplied `true_cfg`, then `guidance`, then the upstream
     // default (off). Guidance engages only with a negative prompt, as upstream's `do_true_cfg`.
     let true_cfg = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_TRUE_CFG);
@@ -456,12 +635,12 @@ pub(crate) fn resolve_run_params(
         .negative_prompt
         .as_deref()
         .is_some_and(|n| !n.trim().is_empty());
-    Ok(RunParams {
+    RunParams {
         true_cfg,
         use_negative: true_cfg > 1.0 && has_negative,
         base_seed: req.seed.unwrap_or_else(gen_core::default_seed),
         sigmas,
-    })
+    }
 }
 
 /// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
@@ -476,9 +655,12 @@ impl QwenImage21 {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
-        let params = resolve_run_params(&self.scheduler, req)?;
+        let params = match &self.schedule {
+            Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
+            Schedule::Saved(schedule) => resolve_turbo_run_params(schedule, req)?,
+        };
         let tiling = crate::pipeline::decode_tiling(req);
         let drop = self.drop_count;
         let device = self.device.clone();
@@ -489,7 +671,12 @@ impl QwenImage21 {
         // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
         // sequential one.
         let stage_residency = stage_residency_for(&self.spec, req);
-        self.residency.run_request_scoped(
+        // sc-25905: the prefix KV cache is a request selection; unset is the prefill path.
+        let kv_cache = memory_strategy::prefix_kv_cache_for(req);
+        // What the denoise loops did, written as they run (one report per image; they agree).
+        let mut ran: Option<gen_core::PrefixKvCacheReport> = None;
+        let mut warnings = Vec::new();
+        let output = self.residency.run_request_scoped(
             stage_residency,
             false,
             &req.cancel,
@@ -509,6 +696,54 @@ impl QwenImage21 {
                     references,
                 } = branches;
                 let channels = heavy.transformer.config().in_channels;
+                // A selection this checkpoint cannot honour is refused, never run as the other
+                // mode: the cache is only valid on a `causal_condition` model (both released
+                // checkpoints are), and a caller that priced a cached render must not be handed a
+                // prefill one in silence.
+                if kv_cache.is_cached() && !heavy.transformer.config().causal_condition {
+                    return Err(Error::Unsupported(format!(
+                        "{}: prefix_kv_cache=cached was selected, but this checkpoint is not \
+                         `causal_condition` and has no prefix to cache. Select prefill, or leave \
+                         memory.prefix_kv_cache unset.",
+                        self.descriptor.id
+                    )));
+                }
+                // sc-25905: a cached render is held to what it was priced at. The real prefix is
+                // known only now (tokenized prompt rows, fitted reference grids), so the caches
+                // this request would hold are computed from the real layouts at the model's own
+                // compute dtype and compared with the priced figure — the same arithmetic over
+                // the published bounds at the build's priced width. Past it, the request runs
+                // prefill: never cached above its price, never a failed render.
+                let overflow = if kv_cache.is_cached() {
+                    let mut prefixes = vec![pos.layout.prefix_len() as u64];
+                    prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
+                    memory_strategy::prefix_kv_cache_overflow(
+                        heavy.transformer.config(),
+                        heavy.transformer.compute_dtype(),
+                        &prefixes,
+                        req.memory_reference_count(),
+                        memory_strategy::image_tokens(req.width, req.height),
+                    )
+                } else {
+                    None
+                };
+                if let Some(overflow) = overflow {
+                    warnings.push(gen_core::GenerationWarning {
+                        code: memory_strategy::PREFIX_KV_CACHE_OVERFLOW_WARNING.to_owned(),
+                        message: format!(
+                            "{}: prefix_kv_cache=cached was selected, but this request's caches \
+                             would hold {} bytes against the {} bytes priced for it (the prompt \
+                             or a reference exceeds the priced prefix bound, or the generator \
+                             runs on a wider device than was priced); rendering prefill",
+                            self.descriptor.id, overflow.actual_bytes, overflow.priced_bytes
+                        ),
+                    });
+                }
+                let loop_mode = if kv_cache.is_cached() && overflow.is_none() {
+                    KvCacheMode::On
+                } else {
+                    KvCacheMode::Off
+                };
                 // The condition latents: both branches share one reference encode, but a
                 // different prompt is a different text length, hence two layouts.
                 let reference_latents =
@@ -525,7 +760,8 @@ impl QwenImage21 {
                 for i in 0..req.count {
                     let seed = candle_gen::image_seed(params.base_seed, i);
                     let latents = create_noise(seed, req.width, req.height, channels, &device)?;
-                    let latents = denoise(
+                    let mut report = DenoiseReport::default();
+                    let latents = denoise_reported(
                         DenoiseInputs {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
@@ -543,9 +779,21 @@ impl QwenImage21 {
                                 layout: &pos.layout,
                                 negative_layout: neg.as_ref().map(|neg| &neg.layout),
                             }),
+                            // The one switch (sc-25904), driven by the request's selection
+                            // (sc-25905): `Off` is the prefill path, byte-for-byte.
+                            kv_cache: loop_mode,
                         },
+                        &mut report,
                         on_progress,
                     )?;
+                    ran = Some(gen_core::PrefixKvCacheReport {
+                        path: match report.kv_cache {
+                            KvCachePath::Cached => gen_core::PrefixKvCacheMode::Cached,
+                            KvCachePath::Prefill => gen_core::PrefixKvCacheMode::Prefill,
+                        },
+                        cache_bytes: report.kv_cache_bytes as u64,
+                        overflow,
+                    });
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
@@ -576,7 +824,13 @@ impl QwenImage21 {
                     Ok(GenerationOutput::Images(images))
                 }
             },
-        )
+        )?;
+        Ok(gen_core::GenerationReport {
+            output: Some(output),
+            artifacts: None,
+            warnings,
+            prefix_kv_cache: ran,
+        })
     }
 }
 
@@ -626,12 +880,24 @@ pub(crate) fn assemble_reference_branches(
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,
 /// negative/guidance support, sampler/scheduler membership, finiteness) plus the family's own
 /// `steps >= 2` (the terminal-sigma stretch is undefined at one step).
+#[cfg(test)]
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    validate_request_for(Variant::Base, caps, req)
+}
+
+/// [`validate_request`] for either registered id. The one variant-specific rule is the step floor:
+/// the base schedule's terminal stretch is undefined at one step, while the Turbo schedule has no
+/// stretch and resamples to any count from 1 (the shared floor already refuses an explicit 0).
+pub(crate) fn validate_request_for(
+    variant: Variant,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
     // The reference list first, so a caller sees the actionable message (the `Mask` workaround,
     // the one-to-ten window) rather than the shared floor's generic "unsupported conditioning",
     // and so a bad count is refused before any weight is touched. Mirrors the MLX twin.
     crate::reference::collect_references(req)?;
-    caps.validate_request(MODEL_ID, req)?;
+    caps.validate_request(variant.id(), req)?;
     if req.prompt.trim().is_empty() && req.negative_prompt.is_none() {
         // Upstream renders an empty prompt as a single space; accept it, but a whitespace-only
         // prompt with nothing else is almost certainly a caller bug, so say so.
@@ -640,7 +906,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                 .into(),
         ));
     }
-    if let Some(steps) = req.steps {
+    if let (Variant::Base, Some(steps)) = (variant, req.steps) {
         if steps < 2 {
             return Err(Error::Msg(format!(
                 "qwen_image_2_1: steps must be >= 2 (got {steps}); the terminal-sigma stretch is undefined at one step"
@@ -653,15 +919,20 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
+candle_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo
+}
 
-/// Add the Candle Qwen-Image 2.1 generator and its LoRA/LoKr trainer (sc-24160) to an explicit
-/// media registry builder.
+/// Add the Candle Qwen-Image 2.1 generators — base and Turbo (sc-25901) — and the base id's
+/// LoRA/LoKr trainer (sc-24160) to an explicit media registry builder. There is no trainer under
+/// the Turbo id: a distilled checkpoint is not a training base.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     register_memory_contract_surfaces(
         registry
             .register_generator(REGISTRATION)
+            .register_generator(TURBO_REGISTRATION)
             .register_trainer(training::TRAINER_REGISTRATION),
     )
 }
@@ -680,6 +951,15 @@ pub fn register_memory_contract_surfaces(
             contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(candle_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: candle_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: TURBO_MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(TURBO_MODEL_ID, spec)
+            },
+        })
+        .register_memory_behavior(memory_strategy::TURBO_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Qwen-Image 2.1 provider catalog.
@@ -782,8 +1062,170 @@ mod tests {
             .generators()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(ids, ["qwen_image_2_1"]);
+        assert_eq!(ids, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
+        // The trainer stays on the base id only (sc-25901): a distilled checkpoint is not a
+        // training base.
+        let trainers: Vec<_> = registry.trainers().map(|r| (r.descriptor)().id).collect();
+        assert_eq!(trainers, ["qwen_image_2_1"]);
+    }
+
+    /// The Turbo descriptor is the base descriptor under its own id — nothing else moves.
+    ///
+    /// *Mutation that reds this:* giving `descriptor_for(Variant::Turbo)` any capability the base
+    /// does not have (or dropping one), or registering it under the base id.
+    #[test]
+    fn the_turbo_descriptor_is_the_base_descriptor_under_its_own_id() {
+        let (base, turbo) = (descriptor(), descriptor_turbo());
+        assert_eq!(base.id, "qwen_image_2_1");
+        assert_eq!(turbo.id, "qwen_image_2_1_turbo");
+        assert_eq!(Variant::from_id(turbo.id), Some(Variant::Turbo));
+        assert_eq!(Variant::from_id(base.id), Some(Variant::Base));
+        assert_eq!(Variant::from_id("qwen_image"), None);
+        let mut renamed = turbo.clone();
+        renamed.id = base.id;
+        assert_eq!(format!("{renamed:?}"), format!("{base:?}"));
+        assert!(gen_core::registry::model_descriptor_errors(&turbo).is_empty());
+        for sha in [
+            UPSTREAM_TURBO_HF_REVISION,
+            UPSTREAM_TURBO_DIFFUSERS_REVISION,
+        ] {
+            assert_eq!(sha.len(), 40);
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    fn turbo_schedule() -> SavedSigmaSchedule {
+        SavedSigmaSchedule::from_values(
+            &serde_json::json!({
+                "_class_name": "QwenImage21Pipeline",
+                "sample_sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+            }),
+            // `Qwen/Qwen-Image-2.1-Turbo` @ UPSTREAM_TURBO_HF_REVISION, the keys that differ from
+            // the base config plus the ones the reader judges.
+            &serde_json::json!({
+                "num_train_timesteps": 1000, "shift": 1.0, "shift_terminal": null,
+                "time_shift_type": "exponential", "use_dynamic_shifting": false,
+                "use_karras_sigmas": false
+            }),
+        )
+        .unwrap()
+    }
+
+    /// The Turbo defaults: a request omitting `steps` runs the saved list (one step per saved
+    /// sigma) with guidance off; `steps` stays a live knob that resamples; a negative prompt plus a
+    /// scale above 1 still engages true CFG.
+    ///
+    /// *Mutations that red this:* defaulting `steps` to [`DEFAULT_STEPS`]; passing the base `mu`
+    /// (or any non-zero one) through a native-alias scheduler name; routing through
+    /// [`resolve_run_params`].
+    #[test]
+    fn turbo_run_params_follow_the_saved_schedule() {
+        let schedule = turbo_schedule();
+        assert_eq!(schedule.default_steps(), 8);
+        let saved: Vec<f32> = [
+            1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0,
+        ]
+        .into_iter()
+        .map(|s: f64| s as f32)
+        .collect();
+
+        let p = resolve_turbo_run_params(&schedule, &req(2048, 2048)).unwrap();
+        assert_eq!(p.sigmas, saved, "steps unset");
+        assert_eq!(p.true_cfg, 1.0);
+        assert!(!p.use_negative);
+
+        let mut r = req(2048, 2048);
+        r.steps = Some(8);
+        assert_eq!(
+            resolve_turbo_run_params(&schedule, &r).unwrap().sigmas,
+            saved
+        );
+        // The schedule is resolution-independent: no `mu` reaches it.
+        let mut small = req(32, 32);
+        small.steps = Some(8);
+        assert_eq!(
+            resolve_turbo_run_params(&schedule, &small).unwrap().sigmas,
+            saved
+        );
+
+        r.steps = Some(12);
+        let p = resolve_turbo_run_params(&schedule, &r).unwrap();
+        assert_eq!(p.sigmas.len(), 13);
+        assert_eq!(
+            p.sigmas,
+            scheduler::resample_saved_sigmas(&schedule.sample_sigmas, 12).unwrap()
+        );
+        r.steps = Some(1);
+        assert_eq!(
+            resolve_turbo_run_params(&schedule, &r).unwrap().sigmas,
+            [1.0, 0.0]
+        );
+
+        r.steps = None;
+        r.negative_prompt = Some("blurry".into());
+        r.true_cfg = Some(2.5);
+        let p = resolve_turbo_run_params(&schedule, &r).unwrap();
+        assert!(p.use_negative);
+        assert_eq!(p.true_cfg, 2.5);
+        assert_eq!(p.sigmas, saved, "guidance never moves the schedule");
+    }
+
+    /// The curated scheduler axis on Turbo: a native alias or an unknown name keeps the saved
+    /// list; a curated name replaces it with that scheduler's own ramp at the same step count.
+    #[test]
+    fn a_curated_scheduler_replaces_the_saved_turbo_list_and_a_native_one_keeps_it() {
+        let schedule = turbo_schedule();
+        let saved = resolve_turbo_run_params(&schedule, &req(2048, 2048))
+            .unwrap()
+            .sigmas;
+        for native in ["flow_match", "flow_match_euler", "not-a-scheduler"] {
+            let mut r = req(2048, 2048);
+            r.scheduler = Some(native.into());
+            assert_eq!(
+                resolve_turbo_run_params(&schedule, &r).unwrap().sigmas,
+                saved,
+                "{native}"
+            );
+        }
+        for curated in candle_gen::curated_scheduler_names() {
+            let mut r = req(2048, 2048);
+            r.scheduler = Some(curated.into());
+            let got = resolve_turbo_run_params(&schedule, &r).unwrap().sigmas;
+            assert_eq!(got.len(), 9, "{curated}: still eight steps");
+            assert_eq!(*got.last().unwrap(), 0.0, "{curated}");
+            assert_ne!(got, saved, "{curated} is its own ramp, not the saved list");
+            // ...and it is the unshifted (`mu = 0`) ramp, not the base id's resolution-shifted one.
+            assert_eq!(
+                got,
+                candle_gen::resolve_flow_schedule(Some(curated), 0.0, 8, &saved),
+                "{curated}"
+            );
+        }
+    }
+
+    /// The step floor is the one request rule that differs: 1 on Turbo, 2 on base.
+    #[test]
+    fn one_step_is_a_turbo_request_and_still_a_base_refusal() {
+        let caps = descriptor_turbo().capabilities;
+        let mut r = req(2048, 2048);
+        r.steps = Some(1);
+        assert!(validate_request_for(Variant::Turbo, &caps, &r).is_ok());
+        let err = validate_request_for(Variant::Base, &caps, &r)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("steps must be >= 2"), "{err}");
+        r.steps = Some(0);
+        let err = validate_request_for(Variant::Turbo, &caps, &r)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("qwen_image_2_1_turbo: steps must be >= 1"),
+            "{err}"
+        );
+        r.steps = None;
+        r.width = 1000;
+        assert!(validate_request_for(Variant::Turbo, &caps, &r).is_err());
     }
 
     #[test]

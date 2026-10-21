@@ -36,7 +36,9 @@
 //!
 //! # Trainers share their generator's row
 //!
-//! All seventeen registered MLX trainer ids are also generator ids, and
+//! Every registered MLX trainer id but `iris_3b_depth` (sc-25687, which has its own row) is also a
+//! generator id or — for `iris_3b_restore` (sc-25688) — the restoration transform's id, whose row
+//! it reuses, and
 //! [`ProviderComponents::provider_id`] is unique across the table — duplicates are rejected by
 //! [`gen_core::license_table_conformance_errors`] because
 //! they are not byte-stable under the manifest's stable sort. One row therefore serves both
@@ -83,7 +85,8 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 61 rows over 71 registered ids: the seventeen trainer ids reuse their generator's row, and ten ids
+/// 62 rows over 72 registered ids: the trainer ids reuse their generator's (or, for
+/// `iris_3b_restore`, transform's) row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -228,6 +231,26 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "nvidia_pid_students",
         ],
     },
+    // --- iris --------------------------------------------------------------------------------
+    // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
+    // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
+    ProviderComponents {
+        provider_id: "iris_3b",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
+    // The restoration transform (sc-25683) loads only the same repository's `upscaler/` export —
+    // never the text encoder — so its one component is the repository row.
+    ProviderComponents {
+        provider_id: "iris_3b_restore",
+        components: &["iris_3b"],
+    },
+    // The depth trainer (sc-25687) trains the repository's `depth/` export, or the repo-root
+    // backbone as its parent — whose empty-prompt conditioning may be encoded once by the Qwen3-VL
+    // text encoder — so both are rowed. It is not a generator id, hence its own row.
+    ProviderComponents {
+        provider_id: "iris_3b_depth",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
     // --- kolors ------------------------------------------------------------------------------
     // The shortest row relative to what the id loads: the `Kwai-Kolors/Kolors-diffusers` repository
     // that supplies the U-Net and the VAE is itself an AMBIGUOUS hole (sc-16662 U6), as are the
@@ -341,6 +364,15 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Exact MOSS bundles, including SFT's optional published distillation package.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft", "moss_image_sft_8_steps_dmd"],
+    },
     // --- pulid -------------------------------------------------------------------------------
     // MLX-only: the Candle twin is a plain struct the worker drives and registers nothing. The row
     // reaches through the unregistered `mlx-gen-face` crate to the artifacts that crate loads, which
@@ -413,6 +445,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "qwen_image_2_1",
         components: &["qwen_image_2_1"],
+    },
+    // The distilled checkpoint (sc-25900) is its own repository, `Qwen/Qwen-Image-2.1-Turbo`, with
+    // the same single declaration over the same three components — so its own row, also complete.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1_turbo",
+        components: &["qwen_image_2_1_turbo"],
     },
     // --- sana --------------------------------------------------------------------------------
     // The DC-AE tensors load from each SANA repository's own `vae/`, so the repository row covers
@@ -637,6 +675,13 @@ mod tests {
         ids.extend(
             registry
                 .text_embedders()
+                .map(|r| (r.descriptor)().id.to_string()),
+        );
+        // sc-25683: transforms are walked too (the Iris-3B restorer is the first), so one cannot
+        // register unmapped.
+        ids.extend(
+            registry
+                .transforms()
                 .map(|r| (r.descriptor)().id.to_string()),
         );
         ids
@@ -896,8 +941,12 @@ mod tests {
             .collect();
 
         // sc-24108: `qwen_image_2_1` registers with its own complete row (71 / 61).
-        assert_eq!(registered.len(), 71, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 61);
+        // sc-25679: `iris_3b` registers with its own complete row (72 / 62).
+        // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
+        // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
+        // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
+        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 67);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -964,9 +1013,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            22,
+            28,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
-             (qwen_image_2_1 joined the complete set in sc-24108)"
+             (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
+             iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
+             sc-25900; MOSS Base/SFT in sc-26323)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -981,8 +1032,9 @@ mod tests {
         }
     }
 
-    /// One row per id, and the seventeen trainer registrations reuse their generator's row rather than
-    /// duplicating it — `provider_id` is unique across the table, so they have to.
+    /// One row per id, and every trainer registration but `iris_3b_depth` (its own row) reuses its
+    /// generator's (or, for `iris_3b_restore`, the transform's) row rather than duplicating it —
+    /// `provider_id` is unique across the table, so they have to.
     #[test]
     fn trainer_ids_reuse_their_generator_row() {
         let registry = crate::provider_registry().unwrap();
@@ -995,11 +1047,22 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(trainers.len(), 17);
-        for id in &trainers {
+        // sc-25685 adds the `iris_3b` trainer (it reuses the iris_3b generator row); sc-25687 adds
+        // `iris_3b_depth`, a trainer whose id is no generator id and so carries its own row;
+        // sc-25688 adds the `iris_3b_restore` trainer, which reuses the iris_3b_restore TRANSFORM
+        // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
+        // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
+        // export).
+        assert_eq!(trainers.len(), 20);
+        let transforms: BTreeSet<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        for id in trainers.iter().filter(|id| id.as_str() != "iris_3b_depth") {
             assert!(
-                generators.contains(id),
-                "trainer {id} is not also a generator id, so it needs its own mapping row"
+                generators.contains(id) || transforms.contains(id),
+                "trainer {id} is neither a generator nor a transform id, so it needs its own \
+                 mapping row"
             );
         }
 
@@ -1142,7 +1205,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 61);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 67);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

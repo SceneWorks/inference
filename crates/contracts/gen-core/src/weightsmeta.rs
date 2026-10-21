@@ -329,6 +329,18 @@ impl CheckpointMeta {
         Ok(me)
     }
 
+    /// Parse an already-owned safetensors buffer. Integrity-sensitive components can hash and
+    /// consume the same bytes without reopening a path between validation and materialization.
+    pub fn from_bytes(buffer: Vec<u8>) -> Result<Self> {
+        let mut me = Self {
+            buffers: Vec::new(),
+            index: BTreeMap::new(),
+            file_metadata: BTreeMap::new(),
+        };
+        me.add_buffer(buffer, Path::new("<validated-buffer>"))?;
+        Ok(me)
+    }
+
     /// Open and merge every `.safetensors` file under `dir` (sharded checkpoints). Keys are unioned;
     /// on a duplicate key the later file (sorted by path) wins — the same merge semantics as
     /// mlx-gen's `Weights::from_dir`.
@@ -362,7 +374,10 @@ impl CheckpointMeta {
         // for lazy random-access tensor reads. This is intended for adapter-sized checkpoints; calling
         // `from_dir` on a multi-GB *base-model* dir would hold every file resident (host RAM). An mmap
         // backing (page on demand) is the efficiency follow-up if base-model use is ever needed (F-038).
-        let buf = std::fs::read(path)?;
+        self.add_buffer(std::fs::read(path)?, path)
+    }
+
+    fn add_buffer(&mut self, buf: Vec<u8>, path: &Path) -> Result<()> {
         // `read_metadata` returns (header_json_len, Metadata); the data region begins at 8 + n and
         // each tensor's data_offsets are relative to it.
         let (n, meta) = SafeTensors::read_metadata(&buf)
@@ -573,13 +588,24 @@ pub struct SafetensorsFileLayout {
 /// byte range, and proves the payload region is contiguous and exactly covers the file. Reads the
 /// header only; never a tensor payload.
 pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<SafetensorsFileLayout> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
     let path = path.as_ref();
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    safetensors_reader_tensor_locations(&mut file, file_len, path)
+}
+
+/// Parse the same bounded, validated header from an already-open reader. `source` labels errors
+/// only; this function never opens it. The reader is left immediately after the header so callers
+/// can authenticate that exact prefix and remaining payload through one handle (sc-26325/F-280).
+pub fn safetensors_reader_tensor_locations(
+    mut reader: impl Read,
+    file_len: u64,
+    source: impl AsRef<Path>,
+) -> Result<SafetensorsFileLayout> {
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+    let path = source.as_ref();
     let mut prefix = [0_u8; 8];
-    file.read_exact(&mut prefix)?;
+    reader.read_exact(&mut prefix)?;
     let header_len = u64::from_le_bytes(prefix);
     if header_len > MAX_HEADER_SIZE {
         return Err(Error::Msg(format!(
@@ -606,7 +632,7 @@ pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<Safet
         ))
     })?;
     let mut header = vec![0_u8; header_len];
-    file.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
         .map_err(|error| {
             Error::Msg(format!("safetensors header in {}: {error}", path.display()))

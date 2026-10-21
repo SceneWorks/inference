@@ -105,6 +105,8 @@ pub struct PackedLayout {
     rows_per_frame: usize,
     num_condition_video_rows: usize,
     num_condition_audio_rows: usize,
+    /// Exact native conditioning segments, retained independently of audio gaps.
+    condition_spans: Vec<std::ops::Range<usize>>,
     seq_len: usize,
     position_rows: Vec<[f64; 3]>,
     position_ids: Tensor,
@@ -211,6 +213,10 @@ impl PackedLayout {
                 rows.len()
             )));
         }
+        let condition_spans = (num_condition_video_rows > 0)
+            .then_some(condition_start..audio_start)
+            .into_iter()
+            .collect();
         let position_ids = to_tensor(&rows, device)?;
 
         // --- indices ---------------------------------------------------------------------------
@@ -232,6 +238,7 @@ impl PackedLayout {
             seq_len,
             rows,
             position_ids,
+            condition_spans,
             text_token_tags,
             video_indices,
             audio_indices,
@@ -257,6 +264,7 @@ impl PackedLayout {
         seq_len: usize,
         rows: Vec<[f64; 3]>,
         position_ids: Tensor,
+        condition_spans: Vec<std::ops::Range<usize>>,
         text_token_tags: &[u32],
         video_indices: Vec<u32>,
         audio_indices: Vec<u32>,
@@ -322,6 +330,7 @@ impl PackedLayout {
             seq_len,
             position_rows: rows,
             position_ids,
+            condition_spans,
             token_tags: tags,
             row_classes: classes,
             video_indices,
@@ -422,6 +431,7 @@ impl PackedLayout {
         let mut audio_indices: Vec<u32> = Vec::new();
         let mut cursor = num_text_tokens;
         // The shared audio/video rotary clock: it starts where the text rows end.
+        let mut condition_spans = Vec::new();
         let mut rotary_time = num_text_tokens as f64;
 
         for (i, r) in references.iter().enumerate() {
@@ -440,10 +450,14 @@ impl PackedLayout {
                 rows.push(row);
                 cursor += 1;
             }
+            let video_start = cursor;
             for row in video_rows {
                 video_indices.push(cursor as u32);
                 rows.push(row);
                 cursor += 1;
+            }
+            if cursor > video_start {
+                condition_spans.push(video_start..cursor);
             }
             rotary_time += advance;
         }
@@ -492,12 +506,77 @@ impl PackedLayout {
             seq_len,
             rows,
             position_ids,
+            condition_spans,
             text_token_tags,
             video_indices,
             audio_indices,
             text_indices,
             device,
         )
+    }
+
+    /// Packed conditioning segments [`Self::veda_layout`] leaves as dense globals, each with
+    /// the engine-observed reason, so an execution report can say why they were not tiled.
+    pub fn veda_dense_segments(&self) -> Vec<String> {
+        use candle_gen::gen_core::veda::contract::segment_grid;
+        let mut reasons = Vec::new();
+        let audio = self.num_condition_audio_rows;
+        if audio > 0 {
+            reasons.push(format!(
+                "reference audio ({audio} rows): no video tile grid; dense global attention"
+            ));
+        }
+        for (i, range) in self.condition_spans.iter().enumerate() {
+            if segment_grid(&self.position_rows[range.clone()]).is_none() {
+                reasons.push(format!(
+                    "reference segment {i} (rows {}..{}): positions do not form a T/H/W \
+                     grid; dense global attention",
+                    range.start, range.end
+                ));
+            }
+        }
+        reasons
+    }
+
+    /// Map actual packed reference/generated rows into the shared frozen Veda contract.
+    /// Reference segments whose positions cannot prove a T/H/W row-major grid stay global.
+    pub fn veda_layout(
+        &self,
+        shape: candle_gen::gen_core::veda::contract::TileShape,
+    ) -> Result<candle_gen::gen_core::veda::contract::Layout> {
+        use candle_gen::gen_core::veda::contract::{
+            least_padding_shape, segment_grid, Layout, TiledSpan,
+        };
+        let mut spans = Vec::new();
+        for range in &self.condition_spans {
+            if let Some(grid) = segment_grid(&self.position_rows[range.clone()]) {
+                spans.push(TiledSpan {
+                    start: range.start,
+                    grid,
+                    shape: least_padding_shape(grid),
+                });
+            }
+        }
+        let grid = [
+            self.geometry.num_latent_frames,
+            self.geometry.latent_height / 2,
+            self.geometry.latent_width / 2,
+        ];
+        let generated = &self.video_indices[self.num_condition_video_rows..];
+        let start = *generated
+            .first()
+            .ok_or_else(|| CandleError::Msg("Veda missing target rows".into()))?
+            as usize;
+        if grid.iter().product::<usize>() != generated.len()
+            || !generated
+                .iter()
+                .enumerate()
+                .all(|(i, &r)| r as usize == start + i)
+        {
+            return Err(CandleError::Msg("Veda generated span/grid mismatch".into()));
+        }
+        spans.push(TiledSpan { start, grid, shape });
+        Layout::from_spans(&spans, self.seq_len).map_err(|e| CandleError::Msg(e.to_string()))
     }
 
     /// Rows in the packed sequence.
@@ -685,6 +764,113 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn veda_multimodal_reference_segments_use_the_shared_contract() {
+        use crate::reference::ReferenceKind;
+        use candle_gen::gen_core::veda::contract::{Budget, TileShape};
+        let refs = [
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 4,
+                latent_width: 6,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: 7,
+                latent_height: 6,
+                latent_width: 4,
+                num_audio_latents: 11,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 9,
+            },
+        ];
+        let packed = PackedLayout::build_ref2va(
+            JointGeometry::new(TEST_FRAMES, 4, 6).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 5],
+            2,
+            &refs,
+            &dev(),
+        )
+        .unwrap();
+        let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
+        assert_eq!(tiled.ref_tokens, 6 + 7 * 6);
+        assert_eq!(tiled.target_tokens, 37 * 6);
+        assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len());
+        assert_eq!(tiled.reference, 2);
+        let masks = tiled
+            .select_with_budgets(
+                &vec![0.0; tiled.video * tiled.video],
+                1,
+                Budget::Tiles(1.0),
+                Budget::Ratio(1.0),
+            )
+            .unwrap();
+        assert!(masks
+            .iter()
+            .all(|keys| (0..tiled.reference).all(|r| keys.contains(&r))));
+        let mut reordered = packed.clone();
+        let range = reordered.condition_spans[0].clone();
+        reordered.position_rows.swap(range.start, range.start + 1);
+        let fallback = reordered.veda_layout(TileShape([2, 4, 16])).unwrap();
+        assert_eq!(fallback.ref_tokens, 7 * 6);
+        assert_eq!(fallback.reference, 1);
+        // Every dense-global conditioning segment carries a visible reason.
+        let audio = format!("reference audio ({} rows)", packed.num_condition_audio_rows);
+        let reasons = packed.veda_dense_segments();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].starts_with(&audio), "{reasons:?}");
+        let reasons = reordered.veda_dense_segments();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[1].starts_with(&format!(
+            "reference segment 0 (rows {}..{})",
+            range.start, range.end
+        )));
+    }
+
+    #[test]
+    fn veda_native_layout_retains_reference_global_and_target_rows() {
+        use candle_gen::gen_core::veda::contract::{Budget, TileShape};
+        for anchors in [
+            vec![],
+            vec![KeyframeAnchor::First],
+            vec![KeyframeAnchor::Last],
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+        ] {
+            let packed = layout(&anchors);
+            let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
+            assert_eq!(tiled.target_tokens, 37 * 6);
+            assert_eq!(tiled.ref_tokens, anchors.len() * 6);
+            assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len());
+            for (row, &slot) in tiled.inverse.iter().enumerate() {
+                assert_eq!(tiled.perm[slot as usize], row as i32);
+            }
+            let masks = tiled
+                .select_with_budgets(
+                    &vec![0.0; tiled.video * tiled.video],
+                    1,
+                    Budget::Tiles(1.0),
+                    Budget::Ratio(1.0),
+                )
+                .unwrap();
+            for (row, keys) in masks.iter().enumerate() {
+                if row < tiled.video {
+                    assert!(keys.contains(&row));
+                    assert!((0..tiled.reference).all(|r| keys.contains(&r)));
+                } else {
+                    assert_eq!(keys.len(), tiled.valid.len());
+                }
+            }
+        }
     }
 
     #[test]

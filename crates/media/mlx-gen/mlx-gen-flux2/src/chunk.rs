@@ -49,7 +49,7 @@ use std::num::NonZeroU32;
 
 use mlx_gen::gen_core::{
     CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk, GenerationMemory,
-    GraphEvalCadence,
+    GraphEvalCadence, PrefixKvCacheDomain,
 };
 use mlx_gen::Result;
 use mlx_rs::ops::concatenate_axis;
@@ -68,6 +68,7 @@ pub const EXECUTION_SURFACE: ExecutionSurface = ExecutionSurface {
     graph_eval_cadence_blocks: ExecutionValueDomain::ANY_POSITIVE,
     ffn_chunk_rows: ExecutionValueDomain::ANY_POSITIVE,
     cfg_batching: CfgBatchingDomain::Unsupported,
+    prefix_kv_cache: PrefixKvCacheDomain::Unsupported,
 };
 
 /// Knobs that bound the per-step activation high-water of the FLUX.2 MMDiT denoise so a long-sequence

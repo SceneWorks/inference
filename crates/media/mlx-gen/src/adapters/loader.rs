@@ -216,7 +216,8 @@ enum LycorisKeyResolution<'t> {
 
 /// Bytes → GiB base for the sc-10678 pre-flight guard's messages.
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-/// The materialized `[out,in]` LoKr/LoHa delta dtype is bf16 (PARITY-BF16, sc-2609): 2 bytes/element.
+/// The materialized `[out,in]` LoKr/LoHa delta dtype is bf16 by default (PARITY-BF16, sc-2609): 2
+/// bytes/element; a host whose [`AdaptableHost::lycoris_dtype`] is f32 materializes 4.
 const DELTA_DTYPE_BYTES: usize = 2;
 /// Fraction of the MLX memory limit the guard treats as usable, leaving headroom for the forward-pass
 /// activation working set (mirrors the sc-4874 training pre-flight's 0.85).
@@ -225,12 +226,16 @@ const MATERIALIZE_BUDGET_HEADROOM: f64 = 0.85;
 /// Bytes a materialized `[out, in]` bf16 delta occupies — the memory a non-deferrable adapter (LoHa /
 /// tucker-LoKr) forces onto a packed base per target (sc-10678). Pure (no MLX state) ⇒ deterministically
 /// unit-testable.
-fn projected_delta_bytes(base_shape: &[i32]) -> usize {
+fn projected_delta_bytes(base_shape: &[i32], dtype: Dtype) -> usize {
+    let element = match dtype {
+        Dtype::Float32 => 4,
+        _ => DELTA_DTYPE_BYTES,
+    };
     base_shape
         .iter()
         .map(|&d| d.max(0) as usize)
         .product::<usize>()
-        * DELTA_DTYPE_BYTES
+        * element
 }
 
 /// Whether materializing `projected_new` more bytes on top of the `active` resident set would cross the
@@ -321,6 +326,7 @@ where
     // allocation-free) and unmatched groups add nothing to `projected_materialize`.
     let mut plans: Vec<LycorisPlan<F>> = Vec::new();
     let mut projected_materialize: usize = 0;
+    let dtype = host.lycoris_dtype();
     // Resolved module path → the raw key that claimed it. Two raw spellings of one module in one file
     // (`lycoris_X` beside `lora_unet_X`, `diffusion_model.X` beside `X`) would otherwise BOTH install
     // and double-apply the delta — refuse instead (sc-24158).
@@ -350,7 +356,7 @@ where
                 match factors(scale, &base_shape)? {
                     Some(f) => plans.push(LycorisPlan::Deferred { dotted, factors: f }),
                     None => {
-                        projected_materialize += projected_delta_bytes(&base_shape);
+                        projected_materialize += projected_delta_bytes(&base_shape, dtype);
                         plans.push(LycorisPlan::Materialize {
                             dotted,
                             base_shape,
@@ -362,7 +368,7 @@ where
             Some(facts) => {
                 // Dense base still materializes the same `[out,in]` bf16 delta as a stacked residual —
                 // the OOM the guard prevents on packed tiers is reachable here too (F-011). Project it.
-                projected_materialize += projected_delta_bytes(&facts.base_shape);
+                projected_materialize += projected_delta_bytes(&facts.base_shape, dtype);
                 plans.push(LycorisPlan::Dense { dotted, delta });
             }
             None => plans.push(LycorisPlan::Unmatched(raw.into())),
@@ -448,14 +454,14 @@ where
 pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Result<ApplyReport> {
     let file = parse_lokr(w)?;
     let file = &file;
+    // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) unless the host
+    // computes wider ([`AdaptableHost::lycoris_dtype`]).
+    let dtype = host.lycoris_dtype();
     let groups = file.groups.iter().map(|(path, factors)| {
-        // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
         (
             path.as_str(),
-            move |base: &[i32]| file.delta(factors, base, Dtype::Bfloat16),
-            move |strength: f32, base: &[i32]| {
-                file.factors(factors, strength, base, Dtype::Bfloat16)
-            },
+            move |base: &[i32]| file.delta(factors, base, dtype),
+            move |strength: f32, base: &[i32]| file.factors(factors, strength, base, dtype),
         )
     });
     install_lycoris_groups(host, groups, scale, LycorisKeyResolution::Dotted)
@@ -655,13 +661,13 @@ pub fn apply_lokr_thirdparty(
 ) -> Result<ApplyReport> {
     let table = kohya_table(&host.adaptable_paths());
     let groups = parse_lokr_thirdparty(w)?;
+    // The host's LyCORIS dtype (bf16 by default, PARITY-BF16, sc-2609) — same as peft `apply_lokr`.
+    let dtype = host.lycoris_dtype();
     let groups = groups.iter().map(|(raw, g)| {
-        // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
-        // peft `apply_lokr`.
         (
             raw.as_str(),
-            move |base: &[i32]| g.delta(base, Dtype::Bfloat16),
-            move |strength: f32, base: &[i32]| g.factors(strength, base, Dtype::Bfloat16),
+            move |base: &[i32]| g.delta(base, dtype),
+            move |strength: f32, base: &[i32]| g.factors(strength, base, dtype),
         )
     });
     install_lycoris_groups(
@@ -808,11 +814,12 @@ pub fn apply_loha_thirdparty(
 ) -> Result<ApplyReport> {
     let table = kohya_table(&host.adaptable_paths());
     let groups = parse_loha_thirdparty(w)?;
+    // Same residual dtype as the LoKr paths (the host's, bf16 by default — PARITY-BF16, sc-2609).
+    let dtype = host.lycoris_dtype();
     let groups = groups.iter().map(|(raw, g)| {
-        // Same bf16 residual as the LoKr paths (PARITY-BF16, sc-2609).
         (
             raw.as_str(),
-            move |base: &[i32]| g.delta(base, Dtype::Bfloat16),
+            move |base: &[i32]| g.delta(base, dtype),
             // Hadamard has no Kronecker structure to defer — never deferrable, on any base.
             |_strength: f32, _base: &[i32]| -> Result<Option<LokrFactors>> { Ok(None) },
         )
@@ -1410,6 +1417,7 @@ where
     // resident deltas with no up-front refusal and OOM the worker mid-load via an uncatchable SIGKILL.
     let mut plans: Vec<BflPlan<F>> = Vec::new();
     let mut projected_materialize: usize = 0;
+    let dtype = host.lycoris_dtype();
     for (module, reconstruct) in groups {
         let Some(targets) = map.get(&module) else {
             report.unmatched_paths.push(module);
@@ -1454,7 +1462,7 @@ where
             report.unmatched_paths.push(module);
             continue;
         };
-        projected_materialize += projected_delta_bytes(&[fused_out, in_dim]);
+        projected_materialize += projected_delta_bytes(&[fused_out, in_dim], dtype);
         plans.push(BflPlan {
             targets: targets.clone(),
             fused_shape: [fused_out, in_dim],
@@ -1519,6 +1527,7 @@ fn apply_lokr_bfl(
 ) -> Result<ApplyReport> {
     let file = parse_lokr(w)?;
     let (alpha, rank) = (file.alpha, file.rank);
+    let dtype = host.lycoris_dtype();
     let groups = file.groups.into_iter().map(|(module, factors)| {
         (module, move |base: &[i32]| {
             reconstruct_lokr_delta(
@@ -1531,7 +1540,7 @@ fn apply_lokr_bfl(
                 factors.get("lokr_w2"),
                 factors.get("lokr_w2_a"),
                 factors.get("lokr_w2_b"),
-                Dtype::Bfloat16,
+                dtype,
             )
         })
     });
@@ -1547,9 +1556,10 @@ fn apply_lokr_thirdparty_bfl(
     scale: f32,
     map: &BTreeMap<String, Vec<BflLycorisTarget>>,
 ) -> Result<ApplyReport> {
+    let dtype = host.lycoris_dtype();
     let groups = parse_lokr_thirdparty(w)?
         .into_iter()
-        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, Dtype::Bfloat16)));
+        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, dtype)));
     install_bfl_lycoris(host, map, groups, scale)
 }
 
@@ -1561,9 +1571,10 @@ fn apply_loha_thirdparty_bfl(
     scale: f32,
     map: &BTreeMap<String, Vec<BflLycorisTarget>>,
 ) -> Result<ApplyReport> {
+    let dtype = host.lycoris_dtype();
     let groups = parse_loha_thirdparty(w)?
         .into_iter()
-        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, Dtype::Bfloat16)));
+        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, dtype)));
     install_bfl_lycoris(host, map, groups, scale)
 }
 
@@ -4755,11 +4766,21 @@ mod tests {
     /// `loha_on_packed_base_falls_back_to_materialization`, whose tiny delta stays under any real budget).
     #[test]
     fn projected_delta_bytes_is_out_times_in_times_bf16() {
-        assert_eq!(projected_delta_bytes(&[2048, 2048]), 2048 * 2048 * 2);
-        assert_eq!(projected_delta_bytes(&[64, 128]), 64 * 128 * 2);
+        assert_eq!(
+            projected_delta_bytes(&[2048, 2048], Dtype::Bfloat16),
+            2048 * 2048 * 2
+        );
+        assert_eq!(
+            projected_delta_bytes(&[64, 128], Dtype::Bfloat16),
+            64 * 128 * 2
+        );
+        assert_eq!(
+            projected_delta_bytes(&[64, 128], Dtype::Float32),
+            64 * 128 * 4
+        );
         // A whole DiT's worth of non-deferrable deltas (Anima: 448 targets ≈ 2048² each) ≈ 3.75 GiB —
         // the memory-lie that motivated the guard (a ~1 GB q4 DiT would balloon past bf16).
-        let whole = 448 * projected_delta_bytes(&[2048, 2048]);
+        let whole = 448 * projected_delta_bytes(&[2048, 2048], Dtype::Bfloat16);
         let gib = whole as f64 / (1024.0 * 1024.0 * 1024.0);
         assert!((3.5..4.0).contains(&gib), "448×2048² bf16 ≈ {gib:.2} GiB");
     }

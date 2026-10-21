@@ -11,6 +11,105 @@
 //! | 3 | [`MemoryStrategy::BoundedAttention`] | not applicable — the DiT's block-causal joint SDPA is a per-segment kernel with no chunked variant on this route |
 //! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | not applicable — this crate has no block-streaming loader |
 //!
+//! One lever is selectable **beside** the ladder, as a typed execution domain
+//! (`gen_core::execution_domains`), not as a rung:
+//!
+//! | domain | request field | this provider |
+//! |---|---|---|
+//! | [`PrefixKvCacheMode`] | `GenerationMemory::prefix_kv_cache` | **implemented, both modes** — `Cached` holds every block's prefix K/V for the denoise loop; `Prefill` (and an unset field) holds nothing and is the pre-cache path, byte-for-byte |
+//!
+//! # The prefix KV cache is priced per request and selected per request (sc-25905)
+//!
+//! The cache ([`crate::pipeline::KvCacheMode`], sc-25903) holds K and V for every block over the
+//! block-causal **prefix** — the prompt rows and every reference image — at the width the DiT
+//! computes in, once per prompt branch. **The width follows the tier, and a packed tier is the
+//! wide one** ([`derived::dit_compute_width`]): the bf16 tier computes in bf16 (0.5 MiB per prefix
+//! token), q8 and q4 compute in **f32** (1 MiB per token), because a packed Linear has no dense
+//! weight dtype for the forward to follow. The cache is activations, not weights: quantizing the
+//! weights does not shrink it, it doubles it.
+//!
+//! **Every cache figure here is derived — exact tensor arithmetic over the shapes the cache
+//! stores — and none is measured.** The shape of the peak is a derived bound too, checked on the
+//! CPU device against the tiny fixture and never on a real checkpoint: the extract evaluation's
+//! peak is at most the prefill forward's peak plus the caches plus the target RoPE rows each cache
+//! keeps, and every later evaluation carries the target-only transient plus the caches, which is
+//! lower. The epic's terminal story measures one cached ten-reference render; until then nothing
+//! here is evidence.
+//!
+//! ## What is priced: an upper bound
+//!
+//! The real prefix is known only once the prompt is tokenized and the references are fitted, so
+//! the surcharge ([`derived::prefix_kv_cache_demand_bytes`]) is priced over two published bounds,
+//! both of which err **high**:
+//!
+//! * [`derived::PREFIX_KV_CACHE_CONDITIONING_TOKENS`] (1024) text rows per branch — chosen, not
+//!   measured; a typical prompt is a small fraction of it;
+//! * [`derived::PREFIX_KV_CACHE_REFERENCE_TOKENS`] (4920) per reference — the largest grid any
+//!   aspect ratio fits to, 20% above the square 4096.
+//!
+//! So at bf16 the surcharge is 0.5 GiB with no reference, 2.40 GiB more per reference and
+//! 24.5 GiB at ten; at q8 / q4 it is 1.0, 4.80 and 49.0 GiB; doubled when a negative branch runs;
+//! plus the target RoPE rows (8 MiB per branch at 2048²).
+//!
+//! The generator **holds a cached render to that price**
+//! ([`prefix_kv_cache_overflow`]): with the real layouts in hand it computes what the caches would
+//! hold, and a request past its priced figure — a prompt branch over the text bound, or a
+//! checkpoint that computes wider than its tier is priced at — runs **prefill** instead. It is
+//! never cached above its price and never failed; the render's report carries the two byte counts
+//! (`PrefixKvCacheReport::overflow`) and a [`PREFIX_KV_CACHE_OVERFLOW_WARNING`] warning.
+//!
+//! ## What the cache did not move
+//!
+//! [`derived::activation_bytes`], [`derived::request_transient_budget_bytes`],
+//! [`derived::table_for`], [`derived::default_path_peak_max_bytes_for`] and every floor built on
+//! them are the cache-shed figures; the cache adds nothing to them (they keep
+//! [`derived::TABLE_CONDITIONING_TOKENS`] and [`derived::REFERENCE_FIT_TOKENS`]; only the
+//! surcharge uses the bounds above). A request that selects nothing runs prefill under that
+//! budget.
+//!
+//! ## The packed tiers' denoise is priced at f32 (sc-25909)
+//!
+//! The same width rule holds for the DiT's activations, not only for the cache:
+//! [`derived::dit_activation_bytes`] prices every hidden tensor at [`derived::dit_compute_width`],
+//! so a q8 / q4 request's denoise is priced at f32. Until sc-25909 it was priced at bf16 on every
+//! tier — at ten references and 2048² a 10.57 GiB denoise against the 21.12 GiB the packed tiers'
+//! f32 tensors hold — and the cache-shed budget `PrefixKvCacheMode::select` compares was low by
+//! the difference. **Every bf16 figure is unchanged, to the byte**, and so is every floor and
+//! every admissible-square peak (the decode head binds at the largest-area preset on every tier).
+//! What moved, on q8 / q4 only, for both ids: the 2048² table row (6.06 → 6.10 GiB bounded
+//! activation; the f32 denoise overtakes the bounded decode there) and the cache-shed request
+//! budget wherever the denoise is the largest term — 2048² with no reference (7.06 → 7.10 GiB),
+//! three or more references at a preset (ten at 2048²: 11.58 → 22.12 GiB), six or more at 1024²
+//! or 512². The published `activation_dtype_width` architecture fact follows the same width.
+//!
+//! ## Who decides, and what the engine does not check
+//!
+//! A caller that has room selects [`PrefixKvCacheMode::Cached`] (`PrefixKvCacheMode::select` is
+//! the comparison), and the generator then bounds the request at the cached figure
+//! ([`AllocatorBounds::enter_retaining`]); a request that fits only without the cache is admitted
+//! and runs prefill; a request that fits neither is refused exactly as before. The cache is
+//! independent of every rung — the surcharge is the same number whichever rung the request runs
+//! under — so a planner that wants the cache shed **last** tries each rung with the cache before
+//! any rung without it. Which path ran is reported on `GenerationReport::prefix_kv_cache`.
+//!
+//! Two things are the caller's and nothing here verifies them:
+//!
+//! * **Order.** The request scope's `configure_request` *replaces* `GenerationRequest::memory`
+//!   (with `None` for a `Resident` selection), so the selection must be written **after** it,
+//!   creating a default block if there is none. A selection written before it is lost and the
+//!   render runs prefill in silence — only the report says so.
+//! * **Admission.** The engine honours `Cached`; it does not check that the request was admitted
+//!   against the cached demand.
+//!
+//! ## Approximations that remain, and their direction
+//!
+//! * The cache-shed budget still assumes [`derived::TABLE_CONDITIONING_TOKENS`] (256) text rows
+//!   and a square [`derived::REFERENCE_FIT_TOKENS`] (4096) per reference — pre-existing, errs
+//!   **low** for a long prompt or an extreme-aspect reference, and untouched here.
+//! * If a `Cached` request sheds at the bound, its allocator bound was installed for the cached
+//!   figure before the layouts were known and stays there: higher than the prefill run needs,
+//!   never lower.
+//!
 //! # Everything numeric here is DERIVED, never measured
 //!
 //! [`derived`] publishes a closed-form estimate of resident weights and of the warm activation
@@ -83,18 +182,33 @@ use mlx_gen::gen_core::{
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
     MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
+    MemoryStrategySupport, PrefixKvCacheMode, ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
 use crate::config::{MAX_REFERENCE_IMAGES, PRESETS};
-use crate::model::MODEL_ID;
+use crate::model::{MODEL_ID, TURBO_MODEL_ID};
 use crate::pipeline::{DECODE_OVERLAP, DECODE_TILE_EDGE};
 use crate::quant::{Tier, GROUP_SIZE};
 
 /// Content fingerprint of this contract. Load shape is a separate typed axis on
 /// [`MemoryCalibrationIdentity`], so it is deliberately absent from the string.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-mlx-derived-2026-09-22-v1";
+/// The distilled Turbo id's own calibration identity (sc-25906). The derived model shares the base
+/// checkpoint's parameter counts and joint-token arithmetic, but it prices a different checkpoint —
+/// a bf16 autoencoder where the base ships f32 ([`derived::TURBO_VAE_BYTES`]) — and a record built
+/// against one id must not satisfy the other's handshake. Named after the Candle twin's Turbo
+/// identity, with this backend's own value: the two backends never share calibration evidence.
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-2-1-turbo-mlx-derived-2026-10-13-v1";
+
+/// The calibration identity `variant`'s contract carries.
+pub const fn calibration_fingerprint(variant: crate::model::Variant) -> &'static str {
+    match variant {
+        crate::model::Variant::Base => MEMORY_CALIBRATION_FINGERPRINT,
+        crate::model::Variant::Turbo => TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+    }
+}
 
 /// The decode tile edges this route publishes — **derived defaults, pending the epic-end
 /// campaign**, not a measured ladder. 512 is the crate's shipped default ([`DECODE_TILE_EDGE`]) and
@@ -116,9 +230,35 @@ pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 256];
 /// structural count of live tensors read off this crate's own forward. They are named individually
 /// so the terminal measurement story can replace them one at a time instead of re-deriving the
 /// whole table.
+///
+/// # The distilled Turbo checkpoint (sc-25906)
+///
+/// `Qwen/Qwen-Image-2.1-Turbo` ([`crate::UPSTREAM_TURBO_HF_REVISION`]) shares the base
+/// checkpoint's transformer config and shard sizes and the same Qwen3-VL tower, so every DiT and
+/// tower count below is its own too. It differs in one component: **its autoencoder ships bf16**
+/// where the base ships f32, and MLX holds a VAE at its on-disk dtype. **Exactly one derived
+/// quantity follows the variant — the autoencoder's resident bytes** ([`derived::TURBO_VAE_BYTES`],
+/// half of [`derived::VAE_BYTES`]) — and with it the totals built on the resident set: the
+/// resident total, the staged floor (the DiT + VAE pair no longer outweighs the tower, so the
+/// **tower** binds at every Turbo tier), the peak totals and the tier tree. Those are the
+/// `*_for(variant, …)` functions: [`derived::resident_weights_for`],
+/// [`derived::default_path_peak_max_bytes_for`], [`derived::admissible_square_peak_bytes_for`],
+/// [`derived::table_for`] and [`derived::tier_tree_bytes`].
+///
+/// **Every activation and transient term is the base checkpoint's, unchanged, for both ids**: the
+/// denoise (the same network at the same dtype), the decode head and tail, the reference encode,
+/// and therefore the request budget the allocator bounds are built from. A bf16 decode stream
+/// *may* be cheaper than the f32 one these terms were derived (and, for two of them, checked)
+/// against — the head's attention matrices would be half as wide — but each `ChannelNorm` of this
+/// VAE still widens to f32, the bounded decode's tile term is already known to run low against
+/// its one f32 trace, and nothing has been measured on a bf16 VAE. Pricing Turbo lower on that
+/// reasoning would under-estimate in the direction admission cannot afford, so it is deliberately
+/// **not claimed** until the terminal story measures it. Every Turbo number is derived and
+/// unmeasured; the un-suffixed functions are the base checkpoint's and are unchanged.
 pub mod derived {
-    use super::{Tier, GROUP_SIZE};
+    use super::{PrefixKvCacheMode, Tier, GROUP_SIZE};
     use crate::config::SizePreset;
+    use crate::model::Variant;
 
     /// Marker every published derived number carries into a report or a story description.
     pub const PROVENANCE: &str =
@@ -151,6 +291,27 @@ pub mod derived {
 
     /// Width of one bf16 element.
     pub const BF16_WIDTH: u64 = 2;
+    /// Width of one f32 element.
+    pub const F32_WIDTH: u64 = 4;
+
+    /// Parameters of the RGBA autoencoder: the base checkpoint's stored f32 bytes over the f32
+    /// width (`1_350_961_616 / 4` = 337 740 404). The Turbo checkpoint's autoencoder is the same
+    /// architecture (`AutoencoderKLQwenImage21`), so this is its parameter count too.
+    pub const VAE_PARAMS: u64 = VAE_BYTES / F32_WIDTH;
+    /// Resident bytes of the **Turbo** checkpoint's autoencoder — **derived**: [`VAE_PARAMS`] at
+    /// bf16, the dtype `Qwen/Qwen-Image-2.1-Turbo` ships its `vae/` in and therefore the dtype
+    /// MLX holds it at (`337_740_404 · 2` = 675 480 808). Consistent with the released file's
+    /// 675 508 656 B ([`TURBO_VAE_FILE_BYTES`]): the 27 848 B between them is its safetensors
+    /// header.
+    pub const TURBO_VAE_BYTES: u64 = VAE_PARAMS * BF16_WIDTH;
+
+    /// Resident bytes of `variant`'s autoencoder at the dtype MLX loads it in.
+    pub const fn vae_bytes(variant: Variant) -> u64 {
+        match variant {
+            Variant::Base => VAE_BYTES,
+            Variant::Turbo => TURBO_VAE_BYTES,
+        }
+    }
 
     /// Resident bytes of a group-quantized weight block: `params · bits / 8` codes plus one bf16
     /// scale and one bf16 bias per group of [`GROUP_SIZE`] (`params / group · 4`). This is exactly
@@ -198,15 +359,118 @@ pub mod derived {
         }
     }
 
-    /// Derived resident weights of `tier`.
+    /// Derived resident weights of the **base** checkpoint's `tier`.
     pub const fn resident_weights(tier: Tier) -> ResidentWeights {
+        resident_weights_for(Variant::Base, tier)
+    }
+
+    /// Derived resident weights of `variant`'s `tier`. The tower and the DiT are the same counts
+    /// for both checkpoints; only the autoencoder's bytes differ ([`vae_bytes`]).
+    ///
+    /// For the Turbo checkpoint the halved VAE flips the staged floor's binding term: the DiT +
+    /// VAE pair (13.88 / 7.67 / 4.36 GiB at bf16 / q8 / q4) falls below the tower (14.10 / 8.03 /
+    /// 4.80 GiB), so [`ResidentWeights::sequential_floor`] is the **tower** at every Turbo tier,
+    /// where the heavy pair binds at every base tier. Derived, not measured.
+    pub const fn resident_weights_for(variant: Variant, tier: Tier) -> ResidentWeights {
         ResidentWeights {
             conditioning: component_bytes(LM_LINEAR_PARAMS, tier.text_encoder_bits())
                 + LM_EMBEDDING_PARAMS * BF16_WIDTH
                 + LM_DENSE_NORM_BYTES,
             transformer: component_bytes(DIT_LINEAR_PARAMS, tier.transformer_bits())
                 + DIT_DENSE_BYTES,
-            decoder: VAE_BYTES,
+            decoder: vae_bytes(variant),
+        }
+    }
+
+    // ── Tier trees on disk ──────────────────────────────────────────────────────────────────────
+    //
+    // File sizes of the two pinned releases, read from the Hub's file listings at
+    // `UPSTREAM_HF_REVISION` / `UPSTREAM_TURBO_HF_REVISION` (file facts, not observations of
+    // memory). They are what `tier_tree_bytes` derives a converted tier's file sizes from.
+
+    /// `transformer/`'s two released shards — identical for both checkpoints.
+    pub const TRANSFORMER_FILE_BYTES: u64 = 9_968_332_504 + 4_261_951_904;
+    /// The base checkpoint's `text_encoder/`: four shards.
+    pub const BASE_TEXT_ENCODER_FILE_BYTES: u64 =
+        4_998_056_552 + 4_915_962_464 + 4_915_962_496 + 2_704_357_976;
+    /// The Turbo checkpoint's `text_encoder/model.safetensors`: one file.
+    pub const TURBO_TEXT_ENCODER_FILE_BYTES: u64 = 17_534_340_584;
+    /// The base checkpoint's `vae/diffusion_pytorch_model.safetensors` (f32).
+    pub const BASE_VAE_FILE_BYTES: u64 = 1_350_989_512;
+    /// The Turbo checkpoint's `vae/diffusion_pytorch_model.safetensors` (bf16).
+    pub const TURBO_VAE_FILE_BYTES: u64 = 675_508_656;
+
+    /// Data-region bytes of a packed component, derived from its dense source: the source's own
+    /// data region with every packed `Linear`'s dense weight (`linear_params · dense_width`)
+    /// replaced by its packed triple ([`packed_bytes`]). Everything the converter does not pack
+    /// rides through verbatim, so this is exact — `tests/turbo_tiers.rs` holds it against the
+    /// files the converter writes.
+    pub const fn packed_component_payload_bytes(
+        source_payload: u64,
+        linear_params: u64,
+        dense_width: u64,
+        bits: u32,
+    ) -> u64 {
+        source_payload - linear_params * dense_width + packed_bytes(linear_params, bits)
+    }
+
+    /// Derived weight-file sizes of one installable tier's snapshot tree.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TierTree {
+        /// `transformer/`'s safetensors (two shards dense, one `model.safetensors` packed).
+        pub transformer: u64,
+        /// `text_encoder/`'s safetensors — the whole checkpoint, including the `lm_head` and
+        /// `model.visual.*` tensors no render loads, which is why it exceeds
+        /// [`ResidentWeights::conditioning`].
+        pub text_encoder: u64,
+        /// `vae/diffusion_pytorch_model.safetensors`, copied verbatim into every tier.
+        pub vae: u64,
+    }
+
+    impl TierTree {
+        /// The three weight components together. The tokenizer/processor/scheduler trees,
+        /// configs, `LICENSE`, `README.md`, `CHANGES.md` and `SHA256SUMS` add a few MB on top.
+        pub const fn weight_bytes(self) -> u64 {
+            self.transformer + self.text_encoder + self.vae
+        }
+    }
+
+    /// **Derived** weight-file sizes of `variant`'s `tier` tree, for comparison against a
+    /// published tier's blobs.
+    ///
+    /// [`Tier::Bf16`] is the released snapshot itself, so its row is the release's file sizes
+    /// exactly. A packed tier's `vae` is that same file (exact — the VAE is copied, never cast),
+    /// and its `transformer` / `text_encoder` are [`packed_component_payload_bytes`] over the
+    /// released file sizes at bf16. Those two are exact in their tensor data and approximate only
+    /// in the safetensors header, which the converter rewrites (the source size includes the
+    /// release's headers, and a packed file names two more tensors per packed `Linear`): tens of
+    /// kB against gigabytes, so compare to within 1 MiB. Not measured: no tier of the Turbo
+    /// checkpoint had been converted when this was written.
+    pub const fn tier_tree_bytes(variant: Variant, tier: Tier) -> TierTree {
+        let (text_encoder, vae) = match variant {
+            Variant::Base => (BASE_TEXT_ENCODER_FILE_BYTES, BASE_VAE_FILE_BYTES),
+            Variant::Turbo => (TURBO_TEXT_ENCODER_FILE_BYTES, TURBO_VAE_FILE_BYTES),
+        };
+        TierTree {
+            transformer: match tier.transformer_bits() {
+                None => TRANSFORMER_FILE_BYTES,
+                Some(bits) => packed_component_payload_bytes(
+                    TRANSFORMER_FILE_BYTES,
+                    DIT_LINEAR_PARAMS,
+                    BF16_WIDTH,
+                    bits as u32,
+                ),
+            },
+            text_encoder: match tier.text_encoder_bits() {
+                None => text_encoder,
+                Some(bits) => packed_component_payload_bytes(
+                    text_encoder,
+                    LM_LINEAR_PARAMS,
+                    BF16_WIDTH,
+                    bits as u32,
+                ),
+            },
+            vae,
         }
     }
 
@@ -297,6 +561,17 @@ pub mod derived {
 
     /// Conditioning tokens the published table assumes — a full 256-token prompt through the T2I
     /// template. The request-time estimate takes the real count.
+    ///
+    /// **The generator's own budget uses this bound too**, while the engine admits up to 1024 text
+    /// rows under the cache's priced bound and 4096 in general. Where the denoise binds (ten
+    /// references at a preset), each row past 256 adds one joint token (197 120 B at bf16,
+    /// 393 728 B at the packed tiers' f32) plus its retained conditioning (16 384 B per row at
+    /// the f32 it is held in, against the 2 MiB the 256 bf16-priced rows carry), so a long
+    /// prompt's cache-shed budget is low by — derived, sc-25909 —
+    /// 158.4 MiB at bf16 / 302.4 MiB at q8·q4 for 1024 rows (inside the 1 GiB
+    /// `MLX_EVAL_SLACK_BYTES`), and 783.9 MiB at bf16 / 1 503.9 MiB at q8·q4 for 4096 rows (bf16
+    /// inside the slack; **q8 / q4 outside it, by 0.47 GiB**); a negative branch adds 14 / 62 MiB.
+    /// Pre-existing and recorded, not changed here: moving it would move every published figure.
     pub const TABLE_CONDITIONING_TOKENS: u64 = 256;
 
     /// Latent tokens **one reference image** contributes to the joint sequence.
@@ -330,23 +605,206 @@ pub mod derived {
         conditioning_tokens: u64,
         reference_count: u32,
     ) -> u64 {
-        conditioning_tokens
-            + image_tokens(width, height)
-            + reference_count as u64 * REFERENCE_FIT_TOKENS
+        prefix_tokens(conditioning_tokens, reference_count) + image_tokens(width, height)
     }
 
-    /// Derived DiT activation transient for a joint sequence of `tokens`, at bf16.
+    /// Tokens of the block-causal **prefix** of the joint sequence: the conditioning tokens and
+    /// [`REFERENCE_FIT_TOKENS`] per reference image — everything [`joint_tokens`] counts except
+    /// the target image. It does not change between denoise steps, which is what makes its K/V
+    /// cacheable, and it is the only length the cache scales with.
+    pub const fn prefix_tokens(conditioning_tokens: u64, reference_count: u32) -> u64 {
+        conditioning_tokens + reference_count as u64 * REFERENCE_FIT_TOKENS
+    }
+
+    // ── Prefix KV cache (sc-25905) ──────────────────────────────────────────────────────────────
+    //
+    // DERIVED, never measured: the exact element count of the tensors `PrefixKvCache` stores
+    // (`crate::transformer`) times the width the DiT computes in. `tests/kv_admission.rs` holds
+    // every function here to the bytes a real cache reports on the tiny fixture.
+
+    /// Transformer blocks of the DiT (`num_layers`): the cache stores one `(k, v)` pair per block.
+    pub const DIT_BLOCKS: u64 = 32;
+
+    /// Bytes per element the DiT **computes** in on `tier` — and therefore the width of every
+    /// cached K and V.
+    ///
+    /// This is `QwenImage21Transformer::compute_dtype` stated per tier: the transformer casts its
+    /// inputs to `img_in`'s dense weight dtype, and falls back to **f32** when that Linear is
+    /// packed (a quantized base has no dense weight to follow). So:
+    ///
+    /// * [`Tier::Bf16`] — the released checkpoints ship the DiT in bf16 → 2 bytes;
+    /// * [`Tier::Q8`] / [`Tier::Q4`] — every Linear is packed → f32 → **4 bytes**. A packed tier's
+    ///   cache is twice the dense tier's, not smaller.
+    ///
+    /// `tests/kv_admission.rs` holds the packed rows to a loaded packed transformer's own
+    /// `compute_dtype`. The dense row is the released checkpoints' stored dtype: a dense snapshot
+    /// stored wider (the f32 miniature fixture) computes wider, and its real cache is then above
+    /// this price — which the generator detects and sheds rather than run (see
+    /// [`prefix_kv_cache_model_bytes`]).
+    pub const fn dit_compute_width(tier: Tier) -> u64 {
+        match tier.transformer_bits() {
+            None => BF16_WIDTH,
+            Some(_) => F32_WIDTH,
+        }
+    }
+
+    /// **Priced** text rows per prompt branch: an upper bound, not an estimate.
+    ///
+    /// The cache covers the real text rows of each branch — the chat wrapper, one
+    /// `<imageN><|vision_start|>…<|vision_end|>` group per reference (the pad slots themselves are
+    /// replaced by the reference's latents and counted there), and the prompt — and nothing caps
+    /// those below the tokenizer's 4096. 1024 is the bound priced: about 700 English words after
+    /// the wrapper and ten reference groups. **Chosen, not measured** — the released tokenizer is
+    /// not in this repository, so no prompt corpus was tokenized against it. A branch past the
+    /// bound is not refused and not under-priced: the request runs prefill
+    /// (`PrefixKvCacheReport::overflow`).
+    ///
+    /// Deliberately not [`TABLE_CONDITIONING_TOKENS`]: that 256 is the cache-shed model's
+    /// assumption and stays what it was.
+    pub const PREFIX_KV_CACHE_CONDITIONING_TOKENS: u64 = 1024;
+
+    /// **Priced** latent tokens per reference image: the largest grid `reference::prepare` can
+    /// fit one to on the released checkpoints — not the square [`REFERENCE_FIT_TOKENS`].
+    ///
+    /// A reference of ratio `r` is fitted to `(32·round(32·√r), 32·round(32/√r))` px
+    /// (`calculate_dimensions` at 1024², each side rounded half-to-even onto the 32-px grid), i.e.
+    /// `4·m·n` tokens with `m·n` near 1024 but not equal to it: rounding the short side **up**
+    /// adds up to half a 32-px row along the whole long side. The Qwen3-VL processor then refuses
+    /// a fit whose sides are more than 200:1 (and one outside its `[256², 4096²]` pixel budget,
+    /// which never binds here). The maximum over every remaining ratio is the 13120×96 fit
+    /// (`m = 410`, `n = 3`, reached just past `32/√r = 2.5`, e.g. an 819×5 source):
+    /// `820 · 6 = 4920` tokens, 20% above the square fit.
+    /// `memory_strategy::tests::the_priced_reference_bound_is_the_largest_fitted_grid` searches
+    /// the ratios and holds this constant to the result.
+    pub const PREFIX_KV_CACHE_REFERENCE_TOKENS: u64 = 4920;
+
+    /// The prefix length one prompt branch is **priced** at for `reference_count` references:
+    /// [`PREFIX_KV_CACHE_CONDITIONING_TOKENS`] plus [`PREFIX_KV_CACHE_REFERENCE_TOKENS`] each.
+    pub const fn prefix_kv_cache_priced_prefix_tokens(reference_count: u32) -> u64 {
+        PREFIX_KV_CACHE_CONDITIONING_TOKENS
+            + reference_count as u64 * PREFIX_KV_CACHE_REFERENCE_TOKENS
+    }
+
+    /// Bytes of the K and V tensors one prefix cache stores for a transformer of `blocks` blocks
+    /// and joint width `inner`, over `prefix_tokens`, at `element_width` bytes per element:
+    /// two tensors per block, each `[1, prefix_tokens, heads, head_dim]`. Exact tensor arithmetic
+    /// — it is `PrefixKvCache::nbytes` for any model shape.
+    pub const fn prefix_kv_cache_tensor_bytes(
+        blocks: u64,
+        inner: u64,
+        prefix_tokens: u64,
+        element_width: u64,
+    ) -> u64 {
+        2 * blocks * prefix_tokens * inner * element_width
+    }
+
+    /// Prompt branches one request evaluates: the positive one, and the negative one under true
+    /// CFG. Each keeps its own cache — a different prompt is a different prefix.
+    const fn prompt_branches(use_negative: bool) -> u64 {
+        if use_negative {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Everything the caches of one request hold, for **any** model shape: per prompt branch,
+    /// the K/V over that branch's prefix ([`prefix_kv_cache_tensor_bytes`]) plus the target
+    /// block's RoPE rows the cache keeps for its decodes (`cos` + `sin`, f32,
+    /// `[target_tokens, head_dim / 2]` each). `branch_prefix_tokens` has one entry per branch.
+    ///
+    /// The one arithmetic behind both sides of the generator's check: the **priced** figure is
+    /// this over [`prefix_kv_cache_priced_prefix_tokens`] at [`dit_compute_width`], the **actual**
+    /// one is this over each branch's real `JointLayout::prefix_len` at the loaded transformer's
+    /// own compute dtype. A `Cached` request whose actual figure exceeds its priced one runs
+    /// prefill.
+    pub fn prefix_kv_cache_model_bytes(
+        blocks: u64,
+        inner: u64,
+        head_dim: u64,
+        element_width: u64,
+        branch_prefix_tokens: &[u64],
+        target_tokens: u64,
+    ) -> u64 {
+        let rope = 2 * target_tokens * (head_dim / 2) * F32_WIDTH;
+        branch_prefix_tokens.iter().fold(0, |total, prefix_tokens| {
+            total
+                + prefix_kv_cache_tensor_bytes(blocks, inner, *prefix_tokens, element_width)
+                + rope
+        })
+    }
+
+    /// **Priced** bytes of prefix K/V one request holds across its denoise loop with the cache on,
+    /// on the released checkpoints at `tier`: one cache per prompt branch over
+    /// [`prefix_kv_cache_priced_prefix_tokens`], at [`dit_compute_width`]. An upper bound on what
+    /// a cached render reports (`GenerationReport::prefix_kv_cache`).
+    ///
+    /// Per prefix token: 0.5 MiB at bf16, **1 MiB at q8 / q4**. At bf16: 0.5 GiB for the text
+    /// bound, 2.40 GiB more per reference, 24.5 GiB at ten references. At q8 / q4: 1.0, 4.80 and
+    /// 49.0 GiB. All doubled when `use_negative`.
+    pub const fn prefix_kv_cache_bytes(
+        tier: Tier,
+        reference_count: u32,
+        use_negative: bool,
+    ) -> u64 {
+        prompt_branches(use_negative)
+            * prefix_kv_cache_tensor_bytes(
+                DIT_BLOCKS,
+                DIT_INNER,
+                prefix_kv_cache_priced_prefix_tokens(reference_count),
+                dit_compute_width(tier),
+            )
+    }
+
+    /// What a request is **priced** above its cache-shed budget when the cache is on:
+    /// [`prefix_kv_cache_bytes`] plus the target block's RoPE rows each branch's cache keeps
+    /// ([`DIT_ROPE_BYTES_PER_TOKEN`] per target token — 8.2 MiB at the largest preset, per
+    /// branch). The number a consumer adds to a request's cache-shed demand, and the number the
+    /// generator holds a cached render to.
+    ///
+    /// The surcharge is additive on the whole request budget, not folded into the denoise term:
+    /// the first evaluation of a branch runs the full joint sequence (the prefill forward the
+    /// shed budget already prices) **while** materializing the cache, and a reference request's
+    /// lazy VAE encodes materialize inside that same evaluation.
+    pub const fn prefix_kv_cache_demand_bytes(
+        tier: Tier,
+        width: u32,
+        height: u32,
+        reference_count: u32,
+        use_negative: bool,
+    ) -> u64 {
+        prefix_kv_cache_bytes(tier, reference_count, use_negative)
+            + prompt_branches(use_negative) * image_tokens(width, height) * DIT_ROPE_BYTES_PER_TOKEN
+    }
+
+    /// Derived DiT activation transient for a joint sequence of `tokens` on `tier`, at the width
+    /// the DiT computes in there ([`dit_compute_width`]: bf16 on the dense tier, **f32 on q8 /
+    /// q4**).
     ///
     /// Linear in `tokens`, hence linear in image **area** — which is the shape the MLX image lane
     /// has consistently shown above 1024². The structural [`DIT_LIVE_HIDDEN_TENSORS`] plus one
     /// `[S, inner]` output per in-flight command buffer ([`MLX_MAX_ACTIVE_TASKS`]): every
     /// per-block op at a preset writes more than `max_mb_per_buffer`, so each is its own command
     /// buffer and the pipeline keeps ten outputs allocated ahead of the GPU, plus the one it is
-    /// scheduling. The `true_cfg`
-    /// negative branch runs sequentially over the same buffers, so it does not double this; it
-    /// doubles only the resident conditioning, which [`activation_bytes`] accounts for separately.
-    pub const fn dit_activation_bytes(tokens: u64) -> u64 {
-        tokens * DIT_INNER * (DIT_LIVE_HIDDEN_TENSORS + MLX_MAX_ACTIVE_TASKS + 1) * BF16_WIDTH
+    /// scheduling. Every one of those `[S, inner]` tensors — the residual stream, the modulated
+    /// hidden state, q / k / v, the FFN halves and the four per-token modulation rows — is held at
+    /// the compute width; only the RoPE table ([`DIT_ROPE_BYTES_PER_TOKEN`]) is f32 on every tier.
+    /// The `true_cfg` negative branch runs sequentially over the same buffers, so it does not
+    /// double this; it doubles only the resident conditioning, which [`activation_bytes`] accounts
+    /// for separately.
+    ///
+    /// sc-25909: until this revision the hidden tensors were priced at bf16 on every tier, so a
+    /// packed tier's denoise was priced at half its width — at ten references and 2048², 10.57 GiB
+    /// against the 21.12 GiB the f32 tensors hold. The bf16 tier's figure is unchanged. The one
+    /// recorded observation agrees in direction: sc-24114's 2048² two-step records (SceneWorks
+    /// `docs/calibration/sc-24114/`) put the denoise transient at 3.02 GiB on bf16 and 5.28 GiB on
+    /// both q8 and q4 — above the 3.05 GiB the bf16-width model priced the packed tiers at, and
+    /// below the 6.10 GiB priced here.
+    pub const fn dit_activation_bytes(tier: Tier, tokens: u64) -> u64 {
+        tokens
+            * DIT_INNER
+            * (DIT_LIVE_HIDDEN_TENSORS + MLX_MAX_ACTIVE_TASKS + 1)
+            * dit_compute_width(tier)
             + tokens * DIT_ROPE_BYTES_PER_TOKEN
     }
 
@@ -444,15 +902,20 @@ pub mod derived {
             * VAE_ELEMENT_WIDTH
     }
 
-    /// The warm activation high-water mark of one request: the largest of the denoise, decode and
-    /// — with references — the fitted-1024² reference encode peaks, plus the conditioning that
-    /// stays resident across all of them.
+    /// The warm activation high-water mark of one request **with the prefix KV cache shed**: the
+    /// largest of the denoise, decode and — with references — the fitted-1024² reference encode
+    /// peaks, plus the conditioning that stays resident across all of them. The cache is priced on
+    /// top of this, per request, by [`prefix_kv_cache_demand_bytes`]; it is never part of this
+    /// function, the table or a floor.
     ///
     /// `use_negative` doubles the retained conditioning (the positive and negative embeddings are
     /// both alive for the whole denoise). `tile_edge` is the bounded-decode tile, `None` for the
     /// untiled decode; [`super::default_decode_is_bounded`] is the policy that picks between them
-    /// when a request does not force tiling.
+    /// when a request does not force tiling. `tier` sets the denoise term's width
+    /// ([`dit_activation_bytes`]); the decode and encode terms are the f32 autoencoder's on every
+    /// tier.
     pub const fn activation_bytes(
+        tier: Tier,
         width: u32,
         height: u32,
         conditioning_tokens: u64,
@@ -461,7 +924,7 @@ pub mod derived {
         tile_edge: Option<u32>,
     ) -> u64 {
         let tokens = joint_tokens(width, height, conditioning_tokens, reference_count);
-        let denoise = dit_activation_bytes(tokens);
+        let denoise = dit_activation_bytes(tier, tokens);
         let decode = match tile_edge {
             Some(edge) => tiled_vae_decode_activation_bytes(width, height, edge, 64),
             None => vae_decode_activation_bytes(width, height),
@@ -475,16 +938,28 @@ pub mod derived {
             0
         };
         let branches = if use_negative { 2 } else { 1 };
+        // Known, deliberate err-low (sc-25909): the retained conditioning is the text tower's
+        // **f32** output on every tier, priced here at bf16 — `rows · 4096 · 2` bytes short per
+        // branch: 2 MiB at the 256-row table bound, 8 MiB at the 1024-row cache bound, doubled
+        // with a negative branch. At most 16 MiB, under 1.6 % of `MLX_EVAL_SLACK_BYTES`; widening
+        // it would move every bf16 figure this module publishes, so it is recorded, not changed.
+        // The larger approximation is the 256-row assumption itself (see `TABLE_CONDITIONING_TOKENS`).
         let retained = branches * conditioning_tokens * DIT_INNER * BF16_WIDTH;
         retained + max(max(denoise, decode), encode)
     }
 
-    /// The transient one request is **budgeted** at — [`activation_bytes`] for the decode the
-    /// request will actually run (forced tile, else the default policy) plus
-    /// [`MLX_EVAL_SLACK_BYTES`]. This is the number [`super::AllocatorBounds`] hands MLX as the
-    /// request's cache limit and, on top of the resident set, as its memory limit; the
-    /// runtime is held to it rather than merely estimated by it.
+    /// The transient one request is **budgeted** at with the prefix KV cache shed —
+    /// [`activation_bytes`] for the decode the request will actually run (forced tile, else the
+    /// default policy) plus [`MLX_EVAL_SLACK_BYTES`]. [`request_transient_budget_bytes_for`] is
+    /// the number [`super::AllocatorBounds`] hands MLX as the request's cache limit and, on top
+    /// of the resident set, as its memory limit — this figure for a prefill render, this plus the
+    /// cache for a cached one; the runtime is held to it rather than merely estimated by it.
+    ///
+    /// `tier` is the loaded tier: a packed tier's denoise is priced at f32
+    /// ([`dit_activation_bytes`]), so its budget is above the bf16 tier's wherever the denoise is
+    /// the largest term (ten references at a preset, or three and more at 2048²).
     pub fn request_transient_budget_bytes(
+        tier: Tier,
         width: u32,
         height: u32,
         conditioning_tokens: u64,
@@ -496,6 +971,7 @@ pub mod derived {
             super::default_decode_is_bounded(width, height).then_some(super::DECODE_TILE_EDGE)
         });
         activation_bytes(
+            tier,
             width,
             height,
             conditioning_tokens,
@@ -503,6 +979,50 @@ pub mod derived {
             use_negative,
             tile_edge,
         ) + MLX_EVAL_SLACK_BYTES
+    }
+
+    /// [`request_transient_budget_bytes`] for the prefix-KV-cache mode the request runs
+    /// (sc-25905): the cache-shed budget at `tier` for [`PrefixKvCacheMode::Prefill`], and that
+    /// plus [`prefix_kv_cache_demand_bytes`] at `tier` for [`PrefixKvCacheMode::Cached`].
+    ///
+    /// `conditioning_tokens` is the cache-shed model's argument and prices only the shed part;
+    /// the cache surcharge always uses its own bounds.
+    ///
+    /// This is the transient the generator bounds a request to on top of its resident set, for
+    /// the mode it is about to run ([`super::AllocatorBounds::enter_retaining`]) — a cached
+    /// render never runs under the prefill budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_transient_budget_bytes_for(
+        kv_cache: PrefixKvCacheMode,
+        tier: Tier,
+        width: u32,
+        height: u32,
+        conditioning_tokens: u64,
+        reference_count: u32,
+        use_negative: bool,
+        forced_tile_edge: Option<u32>,
+    ) -> u64 {
+        let shed = request_transient_budget_bytes(
+            tier,
+            width,
+            height,
+            conditioning_tokens,
+            reference_count,
+            use_negative,
+            forced_tile_edge,
+        );
+        match kv_cache {
+            PrefixKvCacheMode::Prefill => shed,
+            PrefixKvCacheMode::Cached => {
+                shed + prefix_kv_cache_demand_bytes(
+                    tier,
+                    width,
+                    height,
+                    reference_count,
+                    use_negative,
+                )
+            }
+        }
     }
 
     /// One published row of the derived table: a tier at a preset.
@@ -554,11 +1074,12 @@ pub mod derived {
         }
     }
 
-    /// The default-path activation at `width × height` under the table's assumptions
+    /// The default-path activation of `tier` at `width × height` under the table's assumptions
     /// ([`TABLE_CONDITIONING_TOKENS`], no references, no negative branch): the decode the policy
-    /// picks ([`super::default_decode_is_bounded`]) against the denoise.
-    pub fn default_activation_bytes_at(width: u32, height: u32) -> u64 {
+    /// picks ([`super::default_decode_is_bounded`]) against the denoise at `tier`'s width.
+    pub fn default_activation_bytes_at(tier: Tier, width: u32, height: u32) -> u64 {
         activation_bytes(
+            tier,
             width,
             height,
             TABLE_CONDITIONING_TOKENS,
@@ -568,14 +1089,16 @@ pub mod derived {
         )
     }
 
-    /// The preset whose default-path peak is the largest: the largest-**area** preset, 2400×1792,
-    /// because with every preset decoding bounded the peak is the decode head's attention
-    /// (quadratic in the token count, 6.31 GiB there against 6.0 at the 2048² default) and the
-    /// canvas; the denoise (linear in area, 3.16 GiB) is below it at every preset.
-    pub fn default_path_peak_max_preset() -> SizePreset {
+    /// The preset whose default-path peak is the largest on `tier`: the largest-**area** preset,
+    /// 2400×1792, on every tier, because with every preset decoding bounded the peak there is the
+    /// decode head's attention (quadratic in the token count, 6.31 GiB against 6.0 at the 2048²
+    /// default) and the canvas; the denoise (linear in area — 3.16 GiB at bf16, 6.25 GiB at the
+    /// packed tiers' f32) is below it there. (At the 2048² default a packed tier's f32 denoise,
+    /// 6.10 GiB, overtakes that preset's 6.06 GiB bounded decode, still below 2400×1792's.)
+    pub fn default_path_peak_max_preset(tier: Tier) -> SizePreset {
         crate::config::PRESETS
             .into_iter()
-            .max_by_key(|preset| default_activation_bytes_at(preset.width, preset.height))
+            .max_by_key(|preset| default_activation_bytes_at(tier, preset.width, preset.height))
             .expect("the preset table is non-empty")
     }
 
@@ -593,23 +1116,44 @@ pub mod derived {
     /// was; a caller that admits off-preset geometry must price it from
     /// [`default_activation_bytes_at`].
     pub fn default_path_peak_max_bytes(tier: Tier) -> u64 {
-        let preset = default_path_peak_max_preset();
-        resident_weights(tier).resident_total()
-            + default_activation_bytes_at(preset.width, preset.height)
+        default_path_peak_max_bytes_for(Variant::Base, tier)
+    }
+
+    /// [`default_path_peak_max_bytes`] for `variant` — the number a consumer floor for that
+    /// engine id is built from: `variant`'s resident weights plus the **same** default-path
+    /// activation. For the Turbo checkpoint that is the base figure less the autoencoder's
+    /// resident difference ([`VAE_BYTES`] − [`TURBO_VAE_BYTES`]) and nothing else. Derived, not
+    /// measured.
+    pub fn default_path_peak_max_bytes_for(variant: Variant, tier: Tier) -> u64 {
+        let preset = default_path_peak_max_preset(tier);
+        resident_weights_for(variant, tier).resident_total()
+            + default_activation_bytes_at(tier, preset.width, preset.height)
     }
 
     /// The default-path peak of `tier` at the largest admissible square, `max_side²` — off every
     /// preset, published so the gap to the preset-based floor is a stated number, not a surprise.
     pub fn admissible_square_peak_bytes(tier: Tier) -> u64 {
+        admissible_square_peak_bytes_for(Variant::Base, tier)
+    }
+
+    /// [`admissible_square_peak_bytes`] for `variant`: its resident weights, the same activation.
+    pub fn admissible_square_peak_bytes_for(variant: Variant, tier: Tier) -> u64 {
         let side = super::admission_geometry().max_side;
-        resident_weights(tier).resident_total() + default_activation_bytes_at(side, side)
+        resident_weights_for(variant, tier).resident_total()
+            + default_activation_bytes_at(tier, side, side)
     }
 
     /// The full derived table: every tier at every upstream preset, densest tier first.
     pub fn table() -> Vec<TableRow> {
+        table_for(Variant::Base)
+    }
+
+    /// [`table`] for `variant`: its resident weights and staged floor beside the same activation
+    /// columns. Every Turbo row is derived and unmeasured.
+    pub fn table_for(variant: Variant) -> Vec<TableRow> {
         let mut rows = Vec::with_capacity(Tier::ALL.len() * crate::config::PRESETS.len());
         for tier in Tier::ALL {
-            let weights = resident_weights(tier);
+            let weights = resident_weights_for(variant, tier);
             for preset in crate::config::PRESETS {
                 rows.push(TableRow {
                     tier,
@@ -617,6 +1161,7 @@ pub mod derived {
                     resident_weight_bytes: weights.resident_total(),
                     sequential_weight_floor_bytes: weights.sequential_floor(),
                     activation_bytes: activation_bytes(
+                        tier,
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -625,6 +1170,7 @@ pub mod derived {
                         None,
                     ),
                     tiled_activation_bytes: activation_bytes(
+                        tier,
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -710,9 +1256,26 @@ impl AllocatorBounds {
     /// cap `mlx_gen::memory::apply_memory_cap_env` installs, a caller's own cache bound — so each
     /// is installed as `min(previous, request)`: a request can only ever tighten what it found.
     pub fn enter(resident_bytes: u64, transient_budget_bytes: u64) -> Self {
+        Self::enter_retaining(resident_bytes, transient_budget_bytes, 0)
+    }
+
+    /// [`Self::enter`] for a request that also **holds** `retained_bytes` of live arrays for the
+    /// length of its denoise loop — the prefix KV caches (sc-25905). The memory limit is
+    /// `resident + transient_budget + retained`; the cache limit stays `transient_budget`: the
+    /// caches are live arrays the request owns, not freed buffers, so they raise how much may be
+    /// active and leave how much dead memory the allocator may pool where it was.
+    pub fn enter_retaining(
+        resident_bytes: u64,
+        transient_budget_bytes: u64,
+        retained_bytes: u64,
+    ) -> Self {
         let resident = resident_bytes.max(mlx_rs::memory::get_active_memory() as u64);
-        let memory_limit =
-            usize::try_from(resident.saturating_add(transient_budget_bytes)).unwrap_or(usize::MAX);
+        let memory_limit = usize::try_from(
+            resident
+                .saturating_add(transient_budget_bytes)
+                .saturating_add(retained_bytes),
+        )
+        .unwrap_or(usize::MAX);
         let cache_limit = usize::try_from(transient_budget_bytes).unwrap_or(usize::MAX);
         let (previous_memory_limit, previous_cache_limit) = Self::current();
         mlx_rs::memory::set_memory_limit(memory_limit.min(previous_memory_limit));
@@ -736,6 +1299,88 @@ impl Drop for AllocatorBounds {
         mlx_rs::memory::set_memory_limit(self.previous_memory_limit);
         mlx_rs::memory::set_cache_limit(self.previous_cache_limit);
     }
+}
+
+// ================================================================================================
+// The prefix KV cache as a request-selected execution domain (sc-25905).
+// ================================================================================================
+
+/// The prefix-KV-cache modes both engine ids implement, declared on
+/// `Capabilities::execution` so the shared request floor admits them and a planner can discover
+/// them.
+pub const PREFIX_KV_CACHE_MODES: [PrefixKvCacheMode; 2] = PrefixKvCacheMode::ALL;
+
+/// The mode one request runs: its `GenerationMemory::prefix_kv_cache`, or
+/// [`PrefixKvCacheMode::Prefill`] when the request selects nothing.
+///
+/// The unset default is the path that holds no cache, on purpose. A request with no selection was
+/// admitted — if it was admitted at all — against a budget that does not price the cache, and at
+/// ten references the cache is 20 GiB per prompt branch; running it uninvited would put a request
+/// that fitted yesterday over its budget today. The caller that owns the budget opts in.
+pub fn prefix_kv_cache_for(req: &mlx_gen::GenerationRequest) -> PrefixKvCacheMode {
+    req.memory
+        .and_then(|memory| memory.prefix_kv_cache)
+        .unwrap_or(PrefixKvCacheMode::Prefill)
+}
+
+/// `GenerationWarning::code` of the warning a render carries when a `Cached` selection ran
+/// prefill because its real caches exceeded the priced bound (`PrefixKvCacheReport::overflow`).
+pub const PREFIX_KV_CACHE_OVERFLOW_WARNING: &str = "prefix_kv_cache_shed_over_priced_bound";
+
+/// Whether a `Cached` request's real caches exceed what it was priced at — `Some` means the
+/// generator must run prefill.
+///
+/// Both sides are [`derived::prefix_kv_cache_model_bytes`] over the **loaded** transformer's own
+/// shape, so they compare directly whatever the checkpoint's size: `actual` from each branch's
+/// real prefix length at the transformer's compute dtype, `priced` from
+/// [`derived::prefix_kv_cache_priced_prefix_tokens`] at [`derived::dit_compute_width`] for the
+/// loaded `tier`. On the released checkpoints `priced` is exactly
+/// [`derived::prefix_kv_cache_demand_bytes`] — the number the consumer admitted.
+///
+/// Three things can put a request past its price, and all three shed rather than fail: a prompt
+/// branch with more text rows than [`derived::PREFIX_KV_CACHE_CONDITIONING_TOKENS`], a checkpoint
+/// whose fitted reference grid exceeds [`derived::PREFIX_KV_CACHE_REFERENCE_TOKENS`], and a
+/// checkpoint that computes wider than its tier is priced at.
+pub fn prefix_kv_cache_overflow(
+    provider_id: &str,
+    config: &crate::config::TransformerConfig,
+    compute_dtype: mlx_rs::Dtype,
+    tier: Tier,
+    branch_prefix_tokens: &[u64],
+    reference_count: u32,
+    target_tokens: u64,
+) -> mlx_gen::Result<Option<gen_core::PrefixKvCacheOverflow>> {
+    let element_width = match compute_dtype {
+        mlx_rs::Dtype::Float32 => derived::F32_WIDTH,
+        mlx_rs::Dtype::Bfloat16 | mlx_rs::Dtype::Float16 => derived::BF16_WIDTH,
+        other => {
+            return Err(mlx_gen::Error::Msg(format!(
+                "{provider_id}: the prefix KV cache cannot be priced at compute dtype {other:?}"
+            )))
+        }
+    };
+    let bytes = |width: u64, prefixes: &[u64]| {
+        derived::prefix_kv_cache_model_bytes(
+            config.num_layers as u64,
+            (config.num_attention_heads * config.attention_head_dim) as u64,
+            config.attention_head_dim as u64,
+            width,
+            prefixes,
+            target_tokens,
+        )
+    };
+    let actual_bytes = bytes(element_width, branch_prefix_tokens);
+    let priced_prefixes = vec![
+        derived::prefix_kv_cache_priced_prefix_tokens(reference_count);
+        branch_prefix_tokens.len()
+    ];
+    let priced_bytes = bytes(derived::dit_compute_width(tier), &priced_prefixes);
+    Ok(
+        (actual_bytes > priced_bytes).then_some(gen_core::PrefixKvCacheOverflow {
+            actual_bytes,
+            priced_bytes,
+        }),
+    )
 }
 
 // ================================================================================================
@@ -811,7 +1456,11 @@ pub fn admission_geometry() -> AdmissionGeometry {
 // ================================================================================================
 
 /// Architecture axes, read from this crate's frozen config types rather than re-parsed here.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+///
+/// `activation_dtype_width` is the denoise phase's width on `tier` (the axis's contract), through
+/// the one source every derived DiT term reads ([`derived::dit_compute_width`]): bf16 on the
+/// dense tier, f32 on q8 / q4 (sc-25909; it was published as bf16 on every tier).
+fn architecture_facts(tier: Tier) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     use mlx_gen::architecture_facts as af;
     let dit = crate::config::TransformerConfig::production();
     mlx_gen::gen_core::MemoryArchitectureFacts {
@@ -824,7 +1473,10 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
         vae_spatial_scale: af::axis(derived::PIXELS_PER_TOKEN as usize),
         // Structurally absent: a still-image autoencoder with no temporal axis in this route.
         vae_temporal_scale: None,
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        activation_dtype_width: Some(match derived::dit_compute_width(tier) {
+            derived::BF16_WIDTH => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+            _ => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
+        }),
     }
 }
 
@@ -846,7 +1498,8 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 ///   untied `lm_head` and the whole `model.visual.*` tower are on disk but materialized by nothing
 ///   on this route, so they are [`ResidentProjection::Omit`] — charging them would bill ~2.4 GB of
 ///   weights no render touches;
-/// * the VAE prices `Stored`: it ships f32 and MLX loads at the on-disk dtype;
+/// * the VAE prices `Stored`: MLX loads it at the on-disk dtype, f32 for the base checkpoint and
+///   bf16 for the distilled Turbo one, so the same rule prices both;
 /// * a LoRA/LoKr stack (sc-24156) is an overlay, never a base component: it prices into
 ///   `overlay_bytes` (the residual factors plus any materialized LyCORIS delta), never into
 ///   `base_bytes`.
@@ -1131,12 +1784,27 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    // E3 (sc-25909): every refusal priced here names the id it was asked for.
+    memory_strategy_contract_unlabelled(provider_id, spec)
+        .map_err(|error| crate::model::labelled_core(provider_id, error))
+}
+
+fn memory_strategy_contract_unlabelled(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
     let mut contract = weights_free_memory_strategy_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(format!(
-            "{MODEL_ID}: memory facts require a snapshot directory"
+            "{provider_id}: memory facts require a snapshot directory"
         )));
     };
+    // A contract is never priced for a snapshot the id would refuse to load (sc-25906): the same
+    // base/Turbo refusal `load` raises — for a dense snapshot or a converted tier of one, which
+    // carries the same signals — reached through the memory registration too.
+    if let Some(variant) = crate::model::Variant::from_id(provider_id) {
+        crate::model::Schedule::load(variant, root)?;
+    }
     let (facts, overlays) = asset_declaration(spec, root)?;
     contract.asset_facts = facts;
     // An adapter load (sc-24156) declares its overlay on the typed component axis: the shared
@@ -1150,7 +1818,7 @@ pub fn memory_strategy_contract(
             }
             _ => {
                 return Err(CoreError::Msg(format!(
-                    "{MODEL_ID}: the weights-free contract no longer declares a PhaseEnvelope"
+                    "{provider_id}: the weights-free contract no longer declares a PhaseEnvelope"
                 )))
             }
         };
@@ -1171,11 +1839,14 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
+    // Both engine ids — the base checkpoint and the distilled Turbo one (sc-25900) — share this
+    // contract's shape: same components, same tiers, same staged phases. Each carries its own
+    // calibration identity (sc-25906), because the two checkpoints are priced differently.
+    let Some(variant) = crate::model::Variant::from_id(provider_id) else {
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: not a Qwen-Image 2.1 MLX memory provider"
         )));
-    }
+    };
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -1190,9 +1861,10 @@ pub fn weights_free_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts =
+        architecture_facts(Tier::from_selected(spec.quantize).unwrap_or(Tier::Bf16));
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        calibration_fingerprint(variant),
         spec.load_shape,
     ));
     contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
@@ -1254,20 +1926,18 @@ pub fn weights_free_memory_strategy_contract(
     Ok(contract)
 }
 
-fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
+fn validate_decode(id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
     let edge = edge.ok_or_else(|| {
         CoreError::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit tile edge"
+            "{id}: bounded decode requires an explicit tile edge"
         ))
     })?;
     let overlap = overlap.ok_or_else(|| {
-        CoreError::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit overlap"
-        ))
+        CoreError::Unsupported(format!("{id}: bounded decode requires an explicit overlap"))
     })?;
     if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
         return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: decode geometry {edge}/{overlap} is outside the published domain \
+            "{id}: decode geometry {edge}/{overlap} is outside the published domain \
              {DECODE_TILE_EDGES:?} at overlap {DECODE_OVERLAP}"
         )));
     }
@@ -1281,10 +1951,12 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    // E3 (sc-25909): the id the contract was priced for — the base or the Turbo one.
+    let id = contract.provider_id.as_str();
     let route_gate = || {
         if !matches!(context.mode, MemoryMode::TextToImage) {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: this story's route is text-to-image; got {:?}",
+                "{id}: this story's route is text-to-image; got {:?}",
                 context.mode
             )));
         }
@@ -1296,18 +1968,19 @@ pub fn safety_check(
         // a request refusal rather than a memory refusal.
         if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                "{id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
                  can express",
                 context.geometry.reference_count
             )));
         }
         if context.use_pid {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
+                "{id}: there is no PiD decoder on this route"
             )));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
+                id,
                 context.selection.parameters.decode_tile_edge,
                 context.selection.parameters.decode_overlap,
             )?;
@@ -1355,11 +2028,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_for(MODEL_ID, spec, contract, context)
+}
+
+/// [`registered_begin_request`] for the distilled Turbo id (sc-25900).
+pub(crate) fn registered_begin_turbo_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+}
+
+/// The executable admission seam both engine ids share; `provider_id` only labels the scope.
+pub(crate) fn begin_request_for(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
     let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        MODEL_ID,
+        provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
@@ -1367,10 +2059,10 @@ pub(crate) fn registered_begin_request(
         move |use_pid, edge, overlap| {
             if use_pid {
                 return Err(CoreError::Unsupported(format!(
-                    "{MODEL_ID}: there is no PiD decoder on this route"
+                    "{provider_id}: there is no PiD decoder on this route"
                 )));
             }
-            validate_decode(Some(edge), Some(overlap))
+            validate_decode(provider_id, Some(edge), Some(overlap))
         },
     )?;
     Ok(Some(Box::new(
@@ -1394,6 +2086,22 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
         provider_id: MODEL_ID,
         valid_fixtures: registered_valid_fixture,
         begin_request: registered_begin_request,
+    };
+
+/// [`MEMORY_REGISTRATION`] for the distilled Turbo id (sc-25900) — the same contract, priced from
+/// the Turbo snapshot on disk.
+pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(TURBO_MODEL_ID, spec),
+    safety_check,
+};
+
+/// [`MEMORY_BEHAVIOR_REGISTRATION`] for the distilled Turbo id (sc-25900).
+pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: TURBO_MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_turbo_request,
     };
 
 #[cfg(test)]
@@ -1503,9 +2211,9 @@ mod tests {
     #[test]
     fn activation_is_linear_in_area_and_covers_every_preset() {
         // The DiT term is exactly linear in token count, hence in area.
-        let a = dit_activation_bytes(image_tokens(1024, 1024));
-        let b = dit_activation_bytes(image_tokens(2048, 1024));
-        let c = dit_activation_bytes(image_tokens(2048, 2048));
+        let a = dit_activation_bytes(Tier::Bf16, image_tokens(1024, 1024));
+        let b = dit_activation_bytes(Tier::Bf16, image_tokens(2048, 1024));
+        let c = dit_activation_bytes(Tier::Bf16, image_tokens(2048, 2048));
         assert_eq!(b, 2 * a);
         assert_eq!(c, 4 * a);
 
@@ -1525,15 +2233,35 @@ mod tests {
                 assert!(row.bounded_peak_bytes() < row.resident_peak_bytes());
             }
         }
-        // Activation is tier-independent by construction (activations stay bf16 whatever the weight
-        // tier), so only the weight terms separate the tiers.
-        let square: Vec<_> = rows
-            .iter()
-            .filter(|r| r.preset.width == 2048 && r.preset.height == 2048)
-            .collect();
-        assert!(square
-            .windows(2)
-            .all(|w| w[0].activation_bytes == w[1].activation_bytes));
+        // The tiers differ in their activation only through the DiT's compute width (sc-25909):
+        // the untiled column is the f32 decode's 25 maps on every tier, and q8 / q4 price their
+        // f32 denoise identically — so where the denoise binds (the 2048² bounded column, below)
+        // the two packed tiers agree with each other and sit above the bf16 tier.
+        for preset in PRESETS {
+            let at = |tier| {
+                *rows
+                    .iter()
+                    .find(|r| r.preset == preset && r.tier == tier)
+                    .unwrap()
+            };
+            let (bf16, q8, q4) = (at(Tier::Bf16), at(Tier::Q8), at(Tier::Q4));
+            assert_eq!(
+                bf16.activation_bytes, q8.activation_bytes,
+                "{}",
+                preset.ratio
+            );
+            assert_eq!(q8.activation_bytes, q4.activation_bytes, "{}", preset.ratio);
+            assert_eq!(
+                q8.tiled_activation_bytes, q4.tiled_activation_bytes,
+                "{}",
+                preset.ratio
+            );
+            assert!(
+                q8.tiled_activation_bytes >= bf16.tiled_activation_bytes,
+                "{}",
+                preset.ratio
+            );
+        }
     }
 
     #[test]
@@ -1564,10 +2292,13 @@ mod tests {
         assert_eq!(g.max_joint_tokens, 58_016, "256 + 16_800 + 10 x 4_096");
         // A reference adds a fixed block, so the transient grows linearly in the count at a rate
         // the target size does not change — the quantity a consumer must gate on.
-        let bare = dit_activation_bytes(joint_tokens(2048, 2048, 0, 0));
-        let one = dit_activation_bytes(joint_tokens(2048, 2048, 0, 1));
-        let ten = dit_activation_bytes(joint_tokens(2048, 2048, 0, 10));
-        assert_eq!(one - bare, dit_activation_bytes(REFERENCE_FIT_TOKENS));
+        let bare = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 0));
+        let one = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 1));
+        let ten = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 10));
+        assert_eq!(
+            one - bare,
+            dit_activation_bytes(Tier::Bf16, REFERENCE_FIT_TOKENS)
+        );
         assert_eq!(ten - bare, 10 * (one - bare));
         assert!(
             ten < 11 * bare,
@@ -1615,8 +2346,10 @@ mod tests {
             "bounded decode: derived {bounded:.2} GiB vs measured {MEASURED_BOUNDED_2048_GIB} GiB"
         );
 
-        let denoise = dit_activation_bytes(joint_tokens(2048, 2048, TABLE_CONDITIONING_TOKENS, 0))
-            as f64
+        let denoise = dit_activation_bytes(
+            Tier::Bf16,
+            joint_tokens(2048, 2048, TABLE_CONDITIONING_TOKENS, 0),
+        ) as f64
             / GIB;
         assert!((denoise - 3.05).abs() < 0.01, "{denoise}");
         assert!(
@@ -1641,7 +2374,10 @@ mod tests {
         assert!((row.resident_peak_bytes() as f64 / GIB - 84.86).abs() < 0.01);
         // The rule the consumer floors are built from: the default-path peak per tier at the
         // default preset, to 0.01 GiB.
-        for (tier, peak) in [(Tier::Bf16, 34.67), (Tier::Q8, 22.40), (Tier::Q4, 15.85)] {
+        // sc-25909: at q8 / q4 the f32 denoise (6.10 GiB) overtakes the 6.06 GiB bounded decode
+        // at this preset, so their default peaks are 0.04 GiB above the bf16-width figures
+        // (22.40 / 15.85) this test pinned before.
+        for (tier, peak) in [(Tier::Bf16, 34.67), (Tier::Q8, 22.44), (Tier::Q4, 15.89)] {
             let row = table()
                 .into_iter()
                 .find(|r| r.tier == tier && r.preset.width == 2048 && r.preset.height == 2048)
@@ -1698,33 +2434,49 @@ mod tests {
         assert!(table().iter().all(|row| row.default_decode_bounded));
 
         // The budget is the default path's transient plus the slack; a forced tile overrides it.
-        let bounded = request_transient_budget_bytes(2048, 2048, 256, 0, false, None);
+        let bounded = request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 0, false, None);
         assert_eq!(
             bounded,
-            activation_bytes(2048, 2048, 256, 0, false, Some(super::DECODE_TILE_EDGE))
-                + MLX_EVAL_SLACK_BYTES
+            activation_bytes(
+                Tier::Bf16,
+                2048,
+                2048,
+                256,
+                0,
+                false,
+                Some(super::DECODE_TILE_EDGE)
+            ) + MLX_EVAL_SLACK_BYTES
         );
-        let untiled = request_transient_budget_bytes(1024, 1024, 256, 0, false, None);
+        let untiled = request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, None);
         assert_eq!(
             untiled,
-            activation_bytes(1024, 1024, 256, 0, false, Some(super::DECODE_TILE_EDGE))
-                + MLX_EVAL_SLACK_BYTES,
+            activation_bytes(
+                Tier::Bf16,
+                1024,
+                1024,
+                256,
+                0,
+                false,
+                Some(super::DECODE_TILE_EDGE)
+            ) + MLX_EVAL_SLACK_BYTES,
             "1024² decodes bounded by default"
         );
         assert_eq!(
-            request_transient_budget_bytes(512, 512, 256, 0, false, None),
-            activation_bytes(512, 512, 256, 0, false, None) + MLX_EVAL_SLACK_BYTES,
+            request_transient_budget_bytes(Tier::Bf16, 512, 512, 256, 0, false, None),
+            activation_bytes(Tier::Bf16, 512, 512, 256, 0, false, None) + MLX_EVAL_SLACK_BYTES,
             "512² is the single pass"
         );
-        let forced = request_transient_budget_bytes(1024, 1024, 256, 0, false, Some(256));
+        let forced =
+            request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, Some(256));
         assert_eq!(
             forced,
-            activation_bytes(1024, 1024, 256, 0, false, Some(256)) + MLX_EVAL_SLACK_BYTES
+            activation_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, Some(256))
+                + MLX_EVAL_SLACK_BYTES
         );
         assert!(forced < untiled);
         // Ten fitted references raise the denoise term, never the decode term.
         assert!(
-            request_transient_budget_bytes(2048, 2048, 256, 10, false, None) > bounded,
+            request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 10, false, None) > bounded,
             "references are joint tokens and price into the budget"
         );
     }
@@ -1855,12 +2607,14 @@ mod tests {
     #[test]
     fn the_default_path_peak_maximum_binds_at_the_largest_area_preset() {
         // 2400×1792 and its 3:4 twin tie by construction (same area, same token count).
-        let binding = default_path_peak_max_preset();
+        let binding = default_path_peak_max_preset(Tier::Bf16);
         assert_eq!(binding.width * binding.height, 2400 * 1792);
-        let activation = default_activation_bytes_at(2400, 1792) as f64 / GIB;
+        let activation = default_activation_bytes_at(Tier::Bf16, 2400, 1792) as f64 / GIB;
         assert!((activation - 6.37).abs() < 0.01, "{activation}");
         assert!((vae_head_attention_bytes(2400, 1792) as f64 / GIB - 6.31).abs() < 0.01);
         for (tier, expected) in [(Tier::Bf16, 34.99), (Tier::Q8, 22.71), (Tier::Q4, 16.15)] {
+            let binding = default_path_peak_max_preset(tier);
+            assert_eq!(binding.width * binding.height, 2400 * 1792, "{tier:?}");
             let max = default_path_peak_max_bytes(tier);
             assert!(
                 (max as f64 / GIB - expected).abs() < 0.01,
@@ -1881,7 +2635,7 @@ mod tests {
             // The single-pass region tops out at 512²: 3.52 GiB, below the presets' 6.37.
             assert!(
                 max > resident_weights(tier).resident_total()
-                    + default_activation_bytes_at(512, 512)
+                    + default_activation_bytes_at(tier, 512, 512)
             );
         }
         // The floors a consumer derives with its `ceil(peak GiB x 1.25)` rule.
@@ -1907,9 +2661,33 @@ mod tests {
     fn a_reference_request_is_priced_at_the_pipelined_encode_of_the_fitted_grid() {
         let encode = vae_encode_activation_bytes(1024, 1024) as f64 / GIB;
         assert!((encode - 9.375).abs() < 0.001, "{encode}");
-        let plain = activation_bytes(2048, 2048, 256, 0, false, Some(DECODE_TILE_EDGE));
-        let one = activation_bytes(2048, 2048, 256, 1, false, Some(DECODE_TILE_EDGE));
-        let ten = activation_bytes(2048, 2048, 256, 10, false, Some(DECODE_TILE_EDGE));
+        let plain = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            0,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
+        let one = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            1,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
+        let ten = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            10,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
         assert!((plain as f64 / GIB - 6.06).abs() < 0.01);
         assert_eq!(
             one,
@@ -1921,16 +2699,19 @@ mod tests {
         // (10.58 GiB) overtakes the encode.
         assert_eq!(
             ten,
-            256 * DIT_INNER * BF16_WIDTH + dit_activation_bytes(joint_tokens(2048, 2048, 256, 10)),
+            256 * DIT_INNER * BF16_WIDTH
+                + dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 256, 10)),
             "ten references: the denoise binds"
         );
         assert!(ten > one);
         assert!(
-            activation_bytes(1024, 1024, 256, 10, false, None)
+            activation_bytes(Tier::Bf16, 1024, 1024, 256, 10, false, None)
                 == 256 * DIT_INNER * BF16_WIDTH + vae_decode_activation_bytes(1024, 1024),
             "a forced single pass at 1024² still binds over ten references"
         );
-        assert!(request_transient_budget_bytes(2048, 2048, 256, 1, false, None) > plain);
+        assert!(
+            request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 1, false, None) > plain
+        );
     }
 
     #[test]
@@ -2152,12 +2933,12 @@ mod tests {
     fn bounded_decode_publishes_a_domain_and_refuses_everything_outside_it() {
         assert!(DECODE_TILE_EDGES.contains(&DECODE_TILE_EDGE));
         for edge in DECODE_TILE_EDGES {
-            assert!(validate_decode(Some(*edge), Some(DECODE_OVERLAP)).is_ok());
+            assert!(validate_decode(MODEL_ID, Some(*edge), Some(DECODE_OVERLAP)).is_ok());
         }
-        assert!(validate_decode(Some(1024), Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(DECODE_TILE_EDGE), Some(96)).is_err());
-        assert!(validate_decode(None, Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(DECODE_TILE_EDGE), None).is_err());
+        assert!(validate_decode(MODEL_ID, Some(1024), Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(DECODE_TILE_EDGE), Some(96)).is_err());
+        assert!(validate_decode(MODEL_ID, None, Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(DECODE_TILE_EDGE), None).is_err());
     }
 
     /// This route publishes no activation anchor. The registration carrier is measurement-only by
@@ -2171,5 +2952,822 @@ mod tests {
             "a derived estimate must not be filed as a measured anchor"
         );
         assert!(PROVENANCE.contains("NOT measured"));
+    }
+
+    // ── The distilled Turbo checkpoint (sc-25906) ───────────────────────────────────────────────
+
+    /// The Turbo id carries its own calibration identity, on the constant and on the contract.
+    ///
+    /// *Mutations that red this:* giving `TURBO_MEMORY_CALIBRATION_FINGERPRINT` the base value;
+    /// wiring the base constant into the Turbo contract.
+    #[test]
+    fn the_turbo_id_has_its_own_calibration_identity() {
+        assert_ne!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            "qwen-image-2-1-turbo-mlx-derived-2026-10-13-v1"
+        );
+        // The base identity did not move.
+        assert_eq!(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            "qwen-image-2-1-mlx-derived-2026-09-22-v1"
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+        let fingerprint = |id: &str| {
+            weights_free_memory_strategy_contract(id, &spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint
+        };
+        assert_eq!(fingerprint(MODEL_ID), MEMORY_CALIBRATION_FINGERPRINT);
+        assert_eq!(
+            fingerprint(TURBO_MODEL_ID),
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT
+        );
+    }
+
+    /// The Turbo resident table differs from the base one in exactly the autoencoder — bf16 where
+    /// the base ships f32 — and no base number moves. Every figure is derived from the parameter
+    /// counts; the released file sizes are held against them as file facts.
+    ///
+    /// *Mutation that reds this:* `vae_bytes(Variant::Turbo)` returning the base `VAE_BYTES`.
+    #[test]
+    fn the_turbo_resident_table_prices_a_bf16_autoencoder() {
+        use crate::model::Variant;
+
+        assert_eq!(VAE_PARAMS * F32_WIDTH, VAE_BYTES, "the f32 file divides");
+        assert_eq!(VAE_PARAMS, 337_740_404);
+        assert_eq!(TURBO_VAE_BYTES, 675_480_808);
+        // The released files are the derived tensor bytes plus a safetensors header.
+        for (file, tensors) in [
+            (BASE_VAE_FILE_BYTES, VAE_BYTES),
+            (TURBO_VAE_FILE_BYTES, TURBO_VAE_BYTES),
+        ] {
+            assert!(file > tensors && file - tensors < 64 * 1024, "{file}");
+        }
+
+        for tier in Tier::ALL {
+            let base = resident_weights(tier);
+            assert_eq!(resident_weights_for(Variant::Base, tier), base);
+            let turbo = resident_weights_for(Variant::Turbo, tier);
+            assert_eq!(
+                turbo.conditioning, base.conditioning,
+                "{tier:?}: same tower"
+            );
+            assert_eq!(turbo.transformer, base.transformer, "{tier:?}: same DiT");
+            assert_eq!(turbo.decoder, VAE_PARAMS * BF16_WIDTH, "{tier:?}");
+            assert_eq!(
+                turbo.decoder * 2,
+                base.decoder,
+                "{tier:?}: bf16 is half of f32"
+            );
+            assert_eq!(
+                base.resident_total() - turbo.resident_total(),
+                VAE_PARAMS * (F32_WIDTH - BF16_WIDTH),
+                "{tier:?}: the only difference is the VAE's element width"
+            );
+            // The halved VAE flips the staged floor's binding term to the tower.
+            assert!(
+                turbo.conditioning > turbo.transformer + turbo.decoder,
+                "{tier:?}: the tower binds the Turbo staged floor"
+            );
+            assert_eq!(turbo.sequential_floor(), turbo.conditioning);
+        }
+
+        // The published DERIVED Turbo numbers, to 0.01 GiB.
+        for (tier, resident, floor) in [
+            (Tier::Bf16, 27.98, 14.10),
+            (Tier::Q8, 15.70, 8.03),
+            (Tier::Q4, 9.15, 4.80),
+        ] {
+            let w = resident_weights_for(Variant::Turbo, tier);
+            assert!(
+                (w.resident_total() as f64 / GIB - resident).abs() < 0.01,
+                "{tier:?} resident {:.3} GiB != {resident}",
+                w.resident_total() as f64 / GIB
+            );
+            assert!(
+                (w.sequential_floor() as f64 / GIB - floor).abs() < 0.01,
+                "{tier:?} sequential floor {:.3} GiB != {floor}",
+                w.sequential_floor() as f64 / GIB
+            );
+        }
+        assert_eq!(
+            resident_weights_for(Variant::Turbo, Tier::Bf16).resident_total(),
+            30_042_541_288
+        );
+    }
+
+    /// **The Turbo checkpoint's only derived difference from the base one is the autoencoder's
+    /// resident bytes.** Every activation column of its table is the base table's, and its peak
+    /// totals are the base totals less exactly `VAE_BYTES − TURBO_VAE_BYTES` — no decode or
+    /// denoise term is priced lower on the unmeasured assumption that a bf16 stream is cheaper.
+    ///
+    /// *Mutations that red this:* any variant-dependent activation term (e.g. `table_for`
+    /// halving the Turbo `tiled_activation_bytes`); `default_path_peak_max_bytes_for` ignoring
+    /// the variant's resident set.
+    #[test]
+    fn the_turbo_activation_and_transient_terms_are_the_base_checkpoints() {
+        use crate::model::Variant;
+
+        let vae_saving = VAE_BYTES - TURBO_VAE_BYTES;
+        assert_eq!(vae_saving, VAE_PARAMS * (F32_WIDTH - BF16_WIDTH));
+
+        assert_eq!(table_for(Variant::Base), table());
+        let turbo_table = table_for(Variant::Turbo);
+        assert_eq!(turbo_table.len(), table().len());
+        for (turbo, base) in turbo_table.iter().zip(table()) {
+            assert_eq!((turbo.tier, turbo.preset), (base.tier, base.preset));
+            // Every activation column, and the decode policy, unchanged.
+            assert_eq!(turbo.activation_bytes, base.activation_bytes);
+            assert_eq!(turbo.tiled_activation_bytes, base.tiled_activation_bytes);
+            assert_eq!(turbo.default_decode_bounded, base.default_decode_bounded);
+            assert_eq!(
+                turbo.default_activation_bytes(),
+                base.default_activation_bytes()
+            );
+            // The resident columns follow the variant's weights.
+            let weights = resident_weights_for(Variant::Turbo, turbo.tier);
+            assert_eq!(turbo.resident_weight_bytes, weights.resident_total());
+            assert_eq!(
+                turbo.sequential_weight_floor_bytes,
+                weights.sequential_floor()
+            );
+            // So every peak built on the resident set differs by the VAE saving and nothing else.
+            assert_eq!(
+                base.default_peak_bytes() - turbo.default_peak_bytes(),
+                vae_saving
+            );
+            assert_eq!(
+                base.resident_peak_bytes() - turbo.resident_peak_bytes(),
+                vae_saving
+            );
+        }
+
+        for (tier, gib) in [(Tier::Bf16, 34.35), (Tier::Q8, 22.08), (Tier::Q4, 15.53)] {
+            let peak = default_path_peak_max_bytes_for(Variant::Turbo, tier);
+            assert_eq!(
+                peak,
+                default_path_peak_max_bytes(tier) - vae_saving,
+                "{tier:?}"
+            );
+            assert_eq!(
+                default_path_peak_max_bytes_for(Variant::Base, tier),
+                default_path_peak_max_bytes(tier)
+            );
+            assert!(
+                (peak as f64 / GIB - gib).abs() < 0.01,
+                "{tier:?} Turbo default-path peak {:.3} GiB != {gib}",
+                peak as f64 / GIB
+            );
+            assert_eq!(
+                admissible_square_peak_bytes_for(Variant::Turbo, tier),
+                admissible_square_peak_bytes(tier) - vae_saving,
+                "{tier:?}"
+            );
+            assert_eq!(
+                admissible_square_peak_bytes_for(Variant::Base, tier),
+                admissible_square_peak_bytes(tier)
+            );
+        }
+    }
+
+    /// The derived tier-tree sizes: the bf16 row is the release itself, a packed row is the
+    /// release's file sizes with each packed `Linear`'s bf16 bytes replaced by its packed triple,
+    /// and the VAE file is carried through unchanged at every tier.
+    #[test]
+    fn tier_tree_sizes_are_derived_from_the_release_file_sizes() {
+        use crate::model::Variant;
+
+        // The release files against the parameter counts: the gap is safetensors headers (the
+        // DiT's two shards), or the unloaded `lm_head` + `model.visual.*` (the tower).
+        assert_eq!(
+            TRANSFORMER_FILE_BYTES - resident_weights(Tier::Bf16).transformer,
+            34_936
+        );
+        // One file or four shards, the same tensors: the two releases differ by header bytes only.
+        assert_eq!(
+            TURBO_TEXT_ENCODER_FILE_BYTES - BASE_TEXT_ENCODER_FILE_BYTES,
+            1_096
+        );
+        assert!(BASE_TEXT_ENCODER_FILE_BYTES > resident_weights(Tier::Bf16).conditioning);
+
+        for variant in [Variant::Base, Variant::Turbo] {
+            let bf16 = tier_tree_bytes(variant, Tier::Bf16);
+            assert_eq!(bf16.transformer, TRANSFORMER_FILE_BYTES);
+            let mut previous = bf16;
+            for tier in [Tier::Q8, Tier::Q4] {
+                let bits = tier.transformer_bits().unwrap() as u32;
+                let tree = tier_tree_bytes(variant, tier);
+                assert_eq!(
+                    tree.transformer,
+                    resident_weights_for(variant, tier).transformer + 34_936,
+                    "{variant:?} {tier:?}: the packed DiT plus the release's header bytes"
+                );
+                assert_eq!(
+                    bf16.text_encoder - tree.text_encoder,
+                    LM_LINEAR_PARAMS * BF16_WIDTH - packed_bytes(LM_LINEAR_PARAMS, bits),
+                    "{variant:?} {tier:?}: only the decoder projections shrink"
+                );
+                assert_eq!(
+                    tree.vae, bf16.vae,
+                    "{variant:?} {tier:?}: the VAE is copied"
+                );
+                assert!(tree.weight_bytes() < previous.weight_bytes());
+                previous = tree;
+            }
+        }
+        assert_eq!(
+            tier_tree_bytes(Variant::Base, Tier::Bf16).vae,
+            BASE_VAE_FILE_BYTES
+        );
+
+        // The Turbo trees, exactly — DERIVED from the release's file sizes, not read off a
+        // converted tier.
+        assert_eq!(
+            tier_tree_bytes(Variant::Turbo, Tier::Bf16),
+            TierTree {
+                transformer: 14_230_284_408,
+                text_encoder: 17_534_340_584,
+                vae: 675_508_656,
+            }
+        );
+        assert_eq!(
+            tier_tree_bytes(Variant::Turbo, Tier::Q8),
+            TierTree {
+                transformer: 7_559_866_488,
+                text_encoder: 11_022_683_624,
+                vae: 675_508_656,
+            }
+        );
+        assert_eq!(
+            tier_tree_bytes(Variant::Turbo, Tier::Q4),
+            TierTree {
+                transformer: 4_002_310_264,
+                text_encoder: 7_549_799_912,
+                vae: 675_508_656,
+            }
+        );
+    }
+
+    /// The Turbo id registers no measured anchor either: its whole model is derived.
+    #[test]
+    fn no_activation_anchor_is_registered_for_the_turbo_id() {
+        let registry = crate::provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .activation_memory_bytes_1024(TURBO_MODEL_ID)
+                .unwrap(),
+            None,
+            "a derived estimate must not be filed as a measured anchor"
+        );
+    }
+
+    // ── sc-25905: the prefix KV cache, priced per request ───────────────────────────────────────
+
+    /// Bytes per cached element on each tier, stated here rather than read from the function
+    /// under test: the released DiT is bf16 dense, and a packed DiT computes in f32.
+    const TIER_WIDTHS: [(Tier, u64); 3] = [(Tier::Bf16, 2), (Tier::Q8, 4), (Tier::Q4, 4)];
+
+    /// One prompt branch's **priced** cache bytes, derived here from the tensors the cache
+    /// stores: K and V (2) for every block of the production DiT, each
+    /// `[1, prefix_tokens, heads, head_dim]`, over the priced prefix — 1024 text rows plus 4920
+    /// tokens per reference.
+    fn derived_branch_kv_bytes(reference_count: u32, element_width: u64) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let inner = (cfg.num_attention_heads * cfg.attention_head_dim) as u64;
+        let prefix_tokens = 1024 + reference_count as u64 * 4920;
+        2 * cfg.num_layers as u64 * prefix_tokens * inner * element_width
+    }
+
+    /// One prompt branch's target RoPE rows: `cos` and `sin` (2), `[target_tokens, head_dim / 2]`
+    /// each, f32 (4 bytes).
+    fn derived_branch_rope_bytes(width: u32, height: u32) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let target_tokens = (width as u64 / 16) * (height as u64 / 16);
+        2 * target_tokens * (cfg.attention_head_dim as u64 / 2) * 4
+    }
+
+    /// One request's cache-shed budget, derived here from the shapes and widths — not by calling
+    /// the function under test — at `dit_width` bytes per DiT hidden element: the retained
+    /// conditioning (256 rows × 4096, bf16 as the model prices it, per branch) plus the largest
+    /// of the denoise (24 live `[S, 4096]` tensors at `dit_width` plus the f32 RoPE rows, over
+    /// 256 text + target + 4096 per reference), the bounded 512/64 decode (six `[t, t]` f32
+    /// head matrices or 25 f32 144-channel 512² tile maps, plus the RGBA f32 canvas) and, with a
+    /// reference, the encode (25 f32 96-channel 1024² maps); plus the 1 GiB slack. For geometries
+    /// above 512² (the default decode is bounded there).
+    fn derived_shed_budget(
+        width: u32,
+        height: u32,
+        refs: u32,
+        negative: bool,
+        dit_width: u64,
+    ) -> u64 {
+        let (w, h) = (width as u64, height as u64);
+        let target = (w / 16) * (h / 16);
+        let tokens = 256 + target + refs as u64 * 64 * 64;
+        let denoise = tokens * 4096 * (13 + 10 + 1) * dit_width + tokens * 2 * 64 * 4;
+        let head = 6 * target * target * 4;
+        let tile = 25 * 144 * 512 * 512 * 4;
+        let decode = head.max(tile) + 4 * w * h * 4;
+        let encode = if refs > 0 {
+            25 * 96 * 1024 * 1024 * 4
+        } else {
+            0
+        };
+        let branches = if negative { 2 } else { 1 };
+        branches * 256 * 4096 * 2 + denoise.max(decode).max(encode) + (1 << 30)
+    }
+
+    /// The story's first acceptance criterion, on every tier: with the cache on, a `k`-reference
+    /// request's budget exceeds its cache-shed budget by exactly the derived cache bytes for its
+    /// priced prefix (the K/V at the tier's compute width, plus the target RoPE rows the cache
+    /// keeps), and by twice that when a negative branch runs; with the cache shed it is the
+    /// pre-cache number, to the byte, on the bf16 tier — and on q8 / q4 the same derivation with
+    /// the denoise at f32 (sc-25909), derived here from the shapes ([`derived_shed_budget`]).
+    ///
+    /// The geometries are chosen so a wrong token count cannot hide: at 2048² and 2400×1792 the
+    /// target's own token count is neither bound.
+    ///
+    /// *Mutations that red this:* dropping the cache term from the cached budget; not doubling it
+    /// under a negative branch; pricing the prefix at the target's tokens, or a reference at the
+    /// target's token count or at the square 4096 instead of the 4920 bound; pricing the text at
+    /// the table's 256 rows; pricing a packed tier at bf16; adding the cache to
+    /// `request_transient_budget_bytes` (the shed column moves off its pinned value); pricing a
+    /// packed tier's denoise at bf16 (the q8 / q4 shed budget at ten references falls back to
+    /// the bf16 one).
+    #[test]
+    fn a_cached_request_is_budgeted_at_the_shed_budget_plus_its_derived_cache_bytes() {
+        // (width, height, references, negative branch, the bf16 cache-shed budget before sc-25905
+        // — unchanged by sc-25909, which moved only the packed tiers).
+        const SHED: [(u32, u32, u32, bool, u64); 16] = [
+            (2048, 2048, 0, false, 7_585_398_784),
+            (2048, 2048, 0, true, 7_587_495_936),
+            (2048, 2048, 1, false, 11_142_168_576),
+            (2048, 2048, 1, true, 11_144_265_728),
+            (2048, 2048, 2, false, 11_142_168_576),
+            (2048, 2048, 2, true, 11_144_265_728),
+            (2048, 2048, 10, false, 12_429_950_976),
+            (2048, 2048, 10, true, 12_432_048_128),
+            (2400, 1792, 0, false, 7_918_411_776),
+            (2400, 1792, 0, true, 7_920_508_928),
+            (2400, 1792, 1, false, 11_142_168_576),
+            (2400, 1792, 1, true, 11_144_265_728),
+            (2400, 1792, 2, false, 11_142_168_576),
+            (2400, 1792, 2, true, 11_144_265_728),
+            (2400, 1792, 10, false, 12_511_952_896),
+            (2400, 1792, 10, true, 12_514_050_048),
+        ];
+        let cfg = crate::config::TransformerConfig::production();
+        for (tier, element_width) in TIER_WIDTHS {
+            assert_eq!(dit_compute_width(tier), element_width, "{tier:?}");
+            for (width, height, references, negative, bf16_shed_before) in SHED {
+                let tag =
+                    format!("{tier:?} {width}x{height} refs={references} negative={negative}");
+                // The derivation below reproduces the pinned bf16 figure exactly, so it is the
+                // same model; on a packed tier it is that model at the f32 width.
+                assert_eq!(
+                    derived_shed_budget(width, height, references, negative, 2),
+                    bf16_shed_before,
+                    "{tag}: the in-test derivation is the pinned bf16 figure"
+                );
+                let shed_before =
+                    derived_shed_budget(width, height, references, negative, element_width);
+                let budget = |kv_cache| {
+                    request_transient_budget_bytes_for(
+                        kv_cache,
+                        tier,
+                        width,
+                        height,
+                        TABLE_CONDITIONING_TOKENS,
+                        references,
+                        negative,
+                        None,
+                    )
+                };
+                let shed = budget(PrefixKvCacheMode::Prefill);
+                assert_eq!(shed, shed_before, "{tag}: the cache-shed budget");
+                assert_eq!(
+                    shed,
+                    request_transient_budget_bytes(
+                        tier,
+                        width,
+                        height,
+                        TABLE_CONDITIONING_TOKENS,
+                        references,
+                        negative,
+                        None
+                    ),
+                    "{tag}: prefill is the pre-cache budget function"
+                );
+
+                let branches = if negative { 2 } else { 1 };
+                let kv = derived_branch_kv_bytes(references, element_width);
+                let rope = derived_branch_rope_bytes(width, height);
+                assert_eq!(
+                    budget(PrefixKvCacheMode::Cached) - shed,
+                    branches * (kv + rope),
+                    "{tag}: the cached budget is the shed budget plus the derived cache bytes"
+                );
+                assert_eq!(
+                    prefix_kv_cache_bytes(tier, references, negative),
+                    branches * kv,
+                    "{tag}: the priced K/V figure"
+                );
+                assert_eq!(
+                    prefix_kv_cache_demand_bytes(tier, width, height, references, negative),
+                    branches * (kv + rope),
+                    "{tag}"
+                );
+                // The figure the generator holds a cached render to is this same number on the
+                // released checkpoints' shape.
+                let priced_prefixes = vec![1024 + references as u64 * 4920; branches as usize];
+                assert_eq!(
+                    prefix_kv_cache_model_bytes(
+                        cfg.num_layers as u64,
+                        (cfg.num_attention_heads * cfg.attention_head_dim) as u64,
+                        cfg.attention_head_dim as u64,
+                        element_width,
+                        &priced_prefixes,
+                        (width as u64 / 16) * (height as u64 / 16),
+                    ),
+                    prefix_kv_cache_demand_bytes(tier, width, height, references, negative),
+                    "{tag}: the generator's priced figure is the consumer's"
+                );
+            }
+        }
+
+        // The figures the docs quote. bf16: 0.5 MiB per prefix token, so 0.5 GiB for the 1024-row
+        // text bound, 2.40 GiB more per reference, 24.5 GiB at ten. q8 / q4: twice that.
+        const MIB: u64 = 1 << 20;
+        assert_eq!(prefix_kv_cache_bytes(Tier::Bf16, 0, false), 512 * MIB);
+        assert_eq!(
+            prefix_kv_cache_bytes(Tier::Bf16, 1, false),
+            (512 + 2460) * MIB
+        );
+        assert_eq!(
+            prefix_kv_cache_bytes(Tier::Bf16, 10, false),
+            (512 + 24_600) * MIB
+        );
+        assert_eq!(
+            prefix_kv_cache_bytes(Tier::Bf16, 10, true),
+            2 * (512 + 24_600) * MIB
+        );
+        for packed in [Tier::Q8, Tier::Q4] {
+            assert_eq!(prefix_kv_cache_bytes(packed, 0, false), 1024 * MIB);
+            assert_eq!(
+                prefix_kv_cache_bytes(packed, 10, false),
+                2 * (512 + 24_600) * MIB
+            );
+        }
+        // A forced decode tile changes the shed budget and leaves the surcharge alone.
+        assert_eq!(
+            request_transient_budget_bytes_for(
+                PrefixKvCacheMode::Cached,
+                Tier::Bf16,
+                1024,
+                1024,
+                256,
+                2,
+                false,
+                Some(256)
+            ) - request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 2, false, Some(256)),
+            derived_branch_kv_bytes(2, 2) + derived_branch_rope_bytes(1024, 1024)
+        );
+        // The shed model's prefix is the joint sequence less the target — one token accounting.
+        assert_eq!(
+            prefix_tokens(256, 10) + image_tokens(2400, 1792),
+            joint_tokens(2400, 1792, 256, 10)
+        );
+        assert_eq!(DIT_BLOCKS as usize, cfg.num_layers);
+        // The bounds are bounds: never below what the shed model assumes.
+        const { assert!(PREFIX_KV_CACHE_CONDITIONING_TOKENS >= TABLE_CONDITIONING_TOKENS) };
+        const { assert!(PREFIX_KV_CACHE_REFERENCE_TOKENS >= REFERENCE_FIT_TOKENS) };
+    }
+
+    /// The per-reference bound is derived, not guessed: over every source aspect ratio the fit
+    /// can be asked for, the largest latent grid `reference_target_size` produces **that the
+    /// released Qwen3-VL processor accepts unchanged** (`reference_fit`'s refusal rule: the
+    /// processor's `smart_resize` must not rebind it — sides within 200:1, pixels within
+    /// `[256², 4096²]`) is 4920 tokens, at the 13120×96 fit.
+    ///
+    /// *Mutations that red this:* pricing a reference at the square 4096; any constant below the
+    /// searched maximum.
+    #[test]
+    fn the_priced_reference_bound_is_the_largest_fitted_grid() {
+        let processor = mlx_llm::image::Qwen35ImageProcessor::default();
+        assert_eq!(
+            (processor.min_pixels, processor.max_pixels),
+            (256 * 256, 4096 * 4096),
+            "the released processor's pixel budget"
+        );
+        let fitted_tokens = |width: u32, height: u32| -> Option<u64> {
+            let (fit_w, fit_h) = crate::reference::reference_target_size(
+                (width, height),
+                crate::config::OUTPUT_RESOLUTION,
+            )
+            .ok()?;
+            let unchanged = processor
+                .smart_resize(fit_h as usize, fit_w as usize)
+                .is_ok_and(|resized| resized == (fit_h as usize, fit_w as usize));
+            unchanged.then(|| image_tokens(fit_w, fit_h))
+        };
+        // Every ratio w/h with h <= 128 up to past the processor's 200:1 limit, both orientations
+        // (the fit is symmetric, so the transposed scan must agree).
+        let (mut best, mut witness) = (0, (0, 0));
+        for short in 1..=128_u32 {
+            for long in short..=short * 201 {
+                for (width, height) in [(long, short), (short, long)] {
+                    if let Some(tokens) = fitted_tokens(width, height) {
+                        if tokens > best {
+                            (best, witness) = (tokens, (width, height));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            best, PREFIX_KV_CACHE_REFERENCE_TOKENS,
+            "witness {witness:?}"
+        );
+        assert_eq!(best, 4920);
+        // The witness the constant's doc names, and the square and 16:9 fits for scale.
+        assert_eq!(
+            crate::reference::reference_target_size((819, 5), 1024).unwrap(),
+            (13_120, 96)
+        );
+        assert_eq!(fitted_tokens(819, 5), Some(4920));
+        assert_eq!(fitted_tokens(1024, 1024), Some(REFERENCE_FIT_TOKENS));
+        assert_eq!(fitted_tokens(16, 9), Some(4128));
+        // Past 200:1 the processor refuses the fit, so no reference reaches the DiT there.
+        assert_eq!(fitted_tokens(40_000, 100), None);
+    }
+
+    /// A cached request is held to its price, on its boundaries: at the priced prefix it is
+    /// within bound, one token past it on either branch it is not, and a checkpoint that computes
+    /// wider than its tier is priced at is over as soon as its real bytes exceed the priced ones.
+    ///
+    /// *Mutations that red this:* comparing with `>=` (the at-bound request sheds); checking only
+    /// the positive branch; pricing the comparison at the model's own compute width instead of
+    /// the tier's (the wide checkpoint is never caught); ignoring the reference bound.
+    #[test]
+    fn a_cached_request_past_its_priced_prefix_is_an_overflow() {
+        use mlx_rs::Dtype;
+        let cfg = crate::config::TransformerConfig::production();
+        let target = image_tokens(2048, 2048);
+        let check = |dtype, tier, prefixes: &[u64], references| {
+            prefix_kv_cache_overflow(MODEL_ID, &cfg, dtype, tier, prefixes, references, target)
+                .unwrap()
+        };
+        let per_token = |width: u64| 2 * 32 * 4096 * width;
+        let rope = derived_branch_rope_bytes(2048, 2048);
+
+        // Text-to-image: the bound is the 1024 text rows.
+        assert_eq!(check(Dtype::Bfloat16, Tier::Bf16, &[1024], 0), None);
+        assert_eq!(check(Dtype::Bfloat16, Tier::Bf16, &[12], 0), None);
+        assert_eq!(
+            check(Dtype::Bfloat16, Tier::Bf16, &[1025], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: 1025 * per_token(2) + rope,
+                priced_bytes: 1024 * per_token(2) + rope,
+            })
+        );
+        // Two branches: the sum is what is held, so one long branch can be carried by a short one
+        // — and is over only when the two together exceed the two priced.
+        assert_eq!(check(Dtype::Bfloat16, Tier::Bf16, &[1025, 1023], 0), None);
+        assert_eq!(
+            check(Dtype::Bfloat16, Tier::Bf16, &[1024, 1025], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: 2049 * per_token(2) + 2 * rope,
+                priced_bytes: 2048 * per_token(2) + 2 * rope,
+            })
+        );
+        // References: each is priced at 4920 tokens.
+        assert_eq!(
+            check(Dtype::Bfloat16, Tier::Bf16, &[1024 + 2 * 4920], 2),
+            None
+        );
+        assert!(check(Dtype::Bfloat16, Tier::Bf16, &[1025 + 2 * 4920], 2).is_some());
+        assert!(check(Dtype::Bfloat16, Tier::Bf16, &[1024 + 2 * 4920], 1).is_some());
+        // A packed tier is priced at f32 and computes in f32: same token boundary.
+        assert_eq!(check(Dtype::Float32, Tier::Q4, &[1024], 0), None);
+        assert!(check(Dtype::Float32, Tier::Q8, &[1025], 0).is_some());
+        // A dense checkpoint stored (so computed) in f32 under the bf16 tier's price: its real
+        // cache is twice as wide, so it is over from half the priced prefix.
+        assert_eq!(check(Dtype::Float32, Tier::Bf16, &[512], 0), None);
+        assert_eq!(
+            check(Dtype::Float32, Tier::Bf16, &[513], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: 513 * per_token(4) + rope,
+                priced_bytes: 1024 * per_token(2) + rope,
+            })
+        );
+        // A dtype nothing prices is an error, never a silent zero.
+        // …naming the id that asked (E3, sc-25909).
+        for id in [MODEL_ID, TURBO_MODEL_ID] {
+            let err = prefix_kv_cache_overflow(id, &cfg, Dtype::Int32, Tier::Bf16, &[1], 0, target)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!("{id}: the prefix KV cache cannot be priced")),
+                "{err}"
+            );
+        }
+    }
+
+    /// Floors and the published table are computed with the cache shed, and did not move: every
+    /// number a consumer reads as "minimum to run" is pinned to its value before sc-25905, for
+    /// both engine ids.
+    ///
+    /// *Mutation that reds this:* pricing the cache into `activation_bytes` (its `retained`
+    /// term), `default_activation_bytes_at` or `table_for` — every row below moves by 128 MiB.
+    #[test]
+    fn floors_and_the_published_table_are_the_cache_shed_figures_and_did_not_move() {
+        use crate::model::Variant;
+        // (variant, tier, default-path peak maximum, admissible-square peak) before sc-25905.
+        const FLOORS: [(Variant, Tier, u64, u64); 6] = [
+            (Variant::Base, Tier::Bf16, 37_562_692_048, 51_846_408_656),
+            (Variant::Base, Tier::Q8, 24_380_617_168, 38_664_333_776),
+            (Variant::Base, Tier::Q4, 17_350_177_232, 31_633_893_840),
+            (Variant::Turbo, Tier::Bf16, 36_887_211_240, 51_170_927_848),
+            (Variant::Turbo, Tier::Q8, 23_705_136_360, 37_988_852_968),
+            (Variant::Turbo, Tier::Q4, 16_674_696_424, 30_958_413_032),
+        ];
+        for (variant, tier, floor, admissible) in FLOORS {
+            assert_eq!(
+                default_path_peak_max_bytes_for(variant, tier),
+                floor,
+                "{variant:?} {tier:?}: the floor moved"
+            );
+            assert_eq!(
+                admissible_square_peak_bytes_for(variant, tier),
+                admissible,
+                "{variant:?} {tier:?}"
+            );
+        }
+        assert_eq!(
+            default_activation_bytes_at(Tier::Bf16, 2400, 1792),
+            6_844_669_952
+        );
+        // Every table row is its resident set plus the cache-shed activation, for both ids.
+        for variant in [Variant::Base, Variant::Turbo] {
+            for row in table_for(variant) {
+                let (width, height) = (row.preset.width, row.preset.height);
+                assert_eq!(
+                    row.tiled_activation_bytes + MLX_EVAL_SLACK_BYTES,
+                    request_transient_budget_bytes_for(
+                        PrefixKvCacheMode::Prefill,
+                        row.tier,
+                        width,
+                        height,
+                        TABLE_CONDITIONING_TOKENS,
+                        0,
+                        false,
+                        Some(DECODE_TILE_EDGE),
+                    ),
+                    "{variant:?} {:?} {width}x{height}",
+                    row.tier
+                );
+                assert!(
+                    row.default_peak_bytes() <= default_path_peak_max_bytes_for(variant, row.tier)
+                );
+            }
+        }
+        // The calibration identities name the default execution, which is unchanged.
+        assert_eq!(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            "qwen-image-2-1-mlx-derived-2026-09-22-v1"
+        );
+        assert_eq!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            "qwen-image-2-1-turbo-mlx-derived-2026-10-13-v1"
+        );
+    }
+
+    /// sc-25909: the DiT's activation is priced at the width it computes in on each tier — bf16
+    /// on the dense tier, **f32 on q8 / q4** ([`dit_compute_width`], observed on a loaded packed
+    /// transformer by `tests/kv_admission.rs`). Every bf16 figure is the one published before
+    /// this change, to the byte; on the packed tiers only the figures the denoise binds move,
+    /// each to the in-test derivation at f32; and the published architecture fact follows.
+    ///
+    /// *Mutations that red this:* `dit_activation_bytes` back at `BF16_WIDTH` (every packed row
+    /// and the q8 / q4 architecture width fall back to the bf16 figures); pricing the bf16 tier
+    /// at `dit_compute_width` of a packed tier (the bf16 literals move); a constant
+    /// `activation_dtype_width`.
+    #[test]
+    fn packed_tiers_price_the_denoise_at_f32_and_no_bf16_figure_moved() {
+        use crate::model::Variant;
+        // (preset, untiled, bounded) — the activation columns before sc-25909, every tier.
+        const BEFORE: [((u32, u32), u64, u64); 4] = [
+            ((2048, 2048), 60_400_074_752, 6_511_656_960),
+            ((2400, 1792), 61_933_617_152, 6_844_669_952),
+            ((2528, 1696), 61_741_924_352, 6_802_589_056),
+            ((2752, 1536), 60_871_933_952, 6_613_237_760),
+        ];
+        // The 2048² default preset's f32 denoise plus the retained conditioning, from the
+        // shapes: (256 + 128·128) tokens × (24 · 4096 · 4 + 2 · 64 · 4) + 256 · 4096 · 2.
+        let packed_2048 = (256 + 128 * 128) * (24 * 4096 * 4 + 2 * 64 * 4) + 256 * 4096 * 2;
+        assert_eq!(packed_2048, 6_553_731_072);
+        for variant in [Variant::Base, Variant::Turbo] {
+            for row in table_for(variant) {
+                let (w, h) = (row.preset.width, row.preset.height);
+                let (_, untiled, bounded) = BEFORE
+                    .into_iter()
+                    .find(|(size, _, _)| *size == (w, h) || *size == (h, w))
+                    .unwrap();
+                let tag = format!("{variant:?} {:?} {w}x{h}", row.tier);
+                // The untiled column is the f32 decode's on every tier.
+                assert_eq!(row.activation_bytes, untiled, "{tag}");
+                let expected = match row.tier {
+                    Tier::Bf16 => bounded,
+                    // Only at 2048² does the f32 denoise exceed the bounded decode.
+                    Tier::Q8 | Tier::Q4 if (w, h) == (2048, 2048) => packed_2048,
+                    Tier::Q8 | Tier::Q4 => bounded,
+                };
+                assert_eq!(row.tiled_activation_bytes, expected, "{tag}");
+                assert_eq!(
+                    default_activation_bytes_at(row.tier, w, h),
+                    expected,
+                    "{tag}"
+                );
+            }
+        }
+        // The denoise term itself: the hidden part doubles, the f32 RoPE rows do not.
+        let tokens = joint_tokens(2048, 2048, 256, 10);
+        let rope = tokens * 2 * 64 * 4;
+        for packed in [Tier::Q8, Tier::Q4] {
+            assert_eq!(
+                dit_activation_bytes(packed, tokens) - rope,
+                2 * (dit_activation_bytes(Tier::Bf16, tokens) - rope),
+                "{packed:?}"
+            );
+        }
+        // The published denoise width, per loaded tier.
+        for (quant, width) in [
+            (None, 2),
+            (Some(mlx_gen::Quant::Q8), 4),
+            (Some(mlx_gen::Quant::Q4), 4),
+        ] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+            spec.quantize = quant;
+            for id in [MODEL_ID, TURBO_MODEL_ID] {
+                let contract = weights_free_memory_strategy_contract(id, &spec).unwrap();
+                assert_eq!(
+                    contract.architecture_facts.activation_dtype_width,
+                    Some(width),
+                    "{id} {quant:?}"
+                );
+            }
+        }
+    }
+
+    /// A request that selects nothing runs prefill; a selection is read off the request's memory
+    /// block; and both engine ids declare exactly the two modes, so the shared floor admits a
+    /// selection instead of refusing it.
+    ///
+    /// *Mutations that red this:* defaulting an unset request to `Cached`; ignoring the request's
+    /// selection; declaring only one mode (the other is refused at `validate`).
+    #[test]
+    fn the_prefix_kv_cache_is_a_declared_request_selection_and_unset_is_prefill() {
+        use mlx_gen::gen_core::{GenerationMemory, GenerationRequest};
+        let request = |memory: Option<GenerationMemory>| GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            memory,
+            ..Default::default()
+        };
+        assert_eq!(
+            prefix_kv_cache_for(&request(None)),
+            PrefixKvCacheMode::Prefill
+        );
+        assert_eq!(
+            prefix_kv_cache_for(&request(Some(GenerationMemory::default()))),
+            PrefixKvCacheMode::Prefill
+        );
+        for mode in PrefixKvCacheMode::ALL {
+            let selected = request(Some(GenerationMemory {
+                prefix_kv_cache: Some(mode),
+                ..Default::default()
+            }));
+            assert_eq!(prefix_kv_cache_for(&selected), mode);
+            for descriptor in [crate::model::descriptor(), crate::model::descriptor_turbo()] {
+                assert!(descriptor
+                    .capabilities
+                    .execution
+                    .declaration_errors()
+                    .is_empty());
+                descriptor
+                    .capabilities
+                    .validate_request(descriptor.id, &selected)
+                    .unwrap_or_else(|error| {
+                        panic!("{}: {mode:?} must be admitted: {error}", descriptor.id)
+                    });
+            }
+        }
     }
 }

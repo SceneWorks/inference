@@ -22,6 +22,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 safetensors = { workspace = true }
 # JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
 serde_json = { workspace = true }
+serde = { workspace = true }
 # Canonical production-latent tiled-decode quality receipts (SC-18325). This hashes semantic
 # fixture/output bytes only and does not introduce tensor, timing, or memory-measurement code.
 # Canonical semantic fingerprints bind complete alternate snapshots to the retained tokenizer.
@@ -37,11 +38,13 @@ exr = { workspace = true }
 # latent weight map in `train::subject_mask`. Pure Rust and tensor-free, so the zero-tensor invariant
 # holds; already in the lock (every backend kit links it).
 image = { workspace = true }
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
 # same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# Iris training transport sockets plus opt-in H3 process RSS telemetry.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).

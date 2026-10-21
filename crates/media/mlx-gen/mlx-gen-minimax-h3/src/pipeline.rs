@@ -48,8 +48,8 @@ use mlx_gen::gen_core::GenerationRequest;
 use crate::audio_config::{AUDIO_OUTPUT_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, denoise_av, video_latent_num_frames, JointGeometry,
-    JointSchedule, JointVelocity, PackedLayout, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
+    adaln_schedule, align_num_frames, video_latent_num_frames, JointGeometry, JointSchedule,
+    JointVelocity, PackedLayout, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
 };
 use crate::spatial_tiling::SpatialTiling;
 
@@ -685,10 +685,36 @@ pub fn render_latents(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<RenderedLatents> {
+    render_latents_with_observer(
+        model, layout, schedule, video_rows, audio_rows, patch, cancel, on_step, None,
+    )
+}
+
+/// Render with opt-in synchronized denoise-step observation.
+#[allow(clippy::too_many_arguments)]
+pub fn render_latents_with_observer(
+    model: &mut dyn JointVelocity,
+    layout: &PackedLayout,
+    schedule: &JointSchedule,
+    video_rows: &Array,
+    audio_rows: &Array,
+    patch: [i32; 3],
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    on_observed_step: Option<&mut dyn FnMut(usize, std::time::Duration)>,
+) -> Result<RenderedLatents> {
     let g = *layout.geometry();
     let adaln = adaln_schedule(schedule)?;
-    let (video, audio) = denoise_av(
-        model, layout, schedule, &adaln, video_rows, audio_rows, cancel, on_step,
+    let (video, audio) = crate::denoise::denoise_av_with_observer(
+        model,
+        layout,
+        schedule,
+        &adaln,
+        video_rows,
+        audio_rows,
+        cancel,
+        on_step,
+        on_observed_step,
     )?;
 
     if cancel.is_cancelled() {

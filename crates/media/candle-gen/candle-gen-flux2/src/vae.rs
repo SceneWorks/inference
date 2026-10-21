@@ -26,7 +26,7 @@ use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
 const BN_EPS: f64 = 1e-4;
-/// Channel width of each encoder/decoder stage. Public so a provider that decodes through this VAE
+/// Default channel width of each encoder/decoder stage. Public so a provider using this VAE
 /// (Lens) can publish its spatial scale from the stage count the decoder is actually built with.
 pub const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
 /// Latent channels this autoencoder produces and consumes. Public for the same reason.
@@ -35,6 +35,37 @@ pub const LATENT_CHANNELS: usize = 32;
 const DECODER_RESNETS: usize = 3;
 /// Encoder down_blocks have `layers_per_block = 2` resnets each.
 const ENCODER_RESNETS: usize = 2;
+
+/// Decoder widths in encoder stage order (the decoder visits them in reverse).
+/// The encoder remains the standard FLUX.2 `[128, 256, 512, 512]` architecture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Flux2VaeDecoderConfig {
+    pub block_out_channels: [usize; 4],
+}
+
+impl Default for Flux2VaeDecoderConfig {
+    fn default() -> Self {
+        Self {
+            block_out_channels: BLOCK_OUT,
+        }
+    }
+}
+
+impl Flux2VaeDecoderConfig {
+    /// Four stages retain FLUX.2's 8× spatial scale. Every width must support 32-group norm.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .block_out_channels
+            .iter()
+            .any(|&width| width == 0 || width % GN_GROUPS != 0)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "FLUX.2 decoder widths must be positive multiples of 32".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
     let cfg = Conv2dConfig {
@@ -316,16 +347,30 @@ impl Flux2Vae {
     /// Build a **decode-only** VAE from a `vae/` VarBuilder (diffusers AutoencoderKLFlux2 keys, f32) —
     /// the txt2img path (no `encoder.*` / `quant_conv` loaded).
     pub fn new(vb: VarBuilder) -> Result<Self> {
-        Self::build(vb, false)
+        Self::build(vb, false, &Flux2VaeDecoderConfig::default())
     }
 
     /// Build the VAE **with the encoder** (training latents / img2img). Additionally loads `encoder.*`
     /// and `quant_conv`, enabling [`Self::encode`] / [`Self::encode_packed`].
     pub fn new_with_encoder(vb: VarBuilder) -> Result<Self> {
-        Self::build(vb, true)
+        Self::build(vb, true, &Flux2VaeDecoderConfig::default())
     }
 
-    fn build(vb: VarBuilder, with_encoder: bool) -> Result<Self> {
+    /// Build a decode-only VAE with explicit decoder widths, independent of the encoder.
+    pub fn new_with_decoder_config(vb: VarBuilder, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        Self::build(vb, false, config)
+    }
+
+    /// Build the standard encoder together with an independently configured decoder.
+    pub fn new_with_encoder_and_decoder_config(
+        vb: VarBuilder,
+        config: &Flux2VaeDecoderConfig,
+    ) -> Result<Self> {
+        Self::build(vb, true, config)
+    }
+
+    fn build(vb: VarBuilder, with_encoder: bool, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        config.validate()?;
         // bn stats live at the top level (packed 128-ch space).
         let bn_mean = vb.get(128, "bn.running_mean")?.reshape((1, 128, 1, 1))?;
         let bn_var = vb.get(128, "bn.running_var")?;
@@ -334,7 +379,7 @@ impl Flux2Vae {
         let post_quant_conv = conv1x1(LATENT_CHANNELS, LATENT_CHANNELS, vb.pp("post_quant_conv"))?;
 
         let dec = vb.pp("decoder");
-        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let top = config.block_out_channels[3];
         let conv_in = conv3x3(LATENT_CHANNELS, top, dec.pp("conv_in"))?;
 
         let mid = dec.pp("mid_block");
@@ -343,7 +388,7 @@ impl Flux2Vae {
         let mid_resnet1 = Resnet::new(top, top, mid.pp("resnets").pp("1"))?;
 
         // Decoder up_blocks iterate the reversed block_out channels.
-        let reversed: Vec<usize> = BLOCK_OUT.iter().rev().copied().collect(); // [512,512,256,128]
+        let reversed: Vec<usize> = config.block_out_channels.iter().rev().copied().collect();
         let mut up_blocks = Vec::with_capacity(reversed.len());
         let mut prev = top;
         for (i, &out_c) in reversed.iter().enumerate() {
@@ -616,6 +661,65 @@ mod tests {
     use candle_gen::candle_core::Device;
 
     /// The 2×2 unpatchify channel/spatial order matches the fork's `c·4 + ph·2 + pw` pinning.
+    #[test]
+    fn decoder_config_supports_asymmetric_widths_and_preserves_defaults() {
+        assert_eq!(
+            Flux2VaeDecoderConfig::default().block_out_channels,
+            BLOCK_OUT
+        );
+        Flux2VaeDecoderConfig {
+            block_out_channels: [96, 192, 384, 384],
+        }
+        .validate()
+        .unwrap();
+        for widths in [[0, 32, 32, 32], [16, 32, 32, 32]] {
+            assert!(Flux2VaeDecoderConfig {
+                block_out_channels: widths
+            }
+            .validate()
+            .is_err());
+        }
+        let config = Flux2VaeDecoderConfig {
+            block_out_channels: [32, 64, 96, 96],
+        };
+        let vae =
+            Flux2Vae::new_with_decoder_config(VarBuilder::zeros(DType::F32, &Device::Cpu), &config)
+                .unwrap();
+        assert!(vae.encoder.is_none());
+        let packed = Tensor::zeros((1, 128, 1, 1), DType::F32, &Device::Cpu).unwrap();
+        let image = vae.decode_packed(&packed).unwrap();
+        assert_eq!(image.dims(), &[1, 3, 16, 16]);
+    }
+
+    #[test]
+    fn decoder_config_rejects_checkpoint_width_mismatch() {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        for (key, shape) in [
+            ("bn.running_mean", vec![128]),
+            ("bn.running_var", vec![128]),
+            ("post_quant_conv.weight", vec![32, 32, 1, 1]),
+            ("post_quant_conv.bias", vec![32]),
+            ("decoder.conv_in.weight", vec![512, 32, 3, 3]),
+            ("decoder.conv_in.bias", vec![512]),
+        ] {
+            tensors.insert(
+                key.into(),
+                Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        let config = Flux2VaeDecoderConfig {
+            block_out_channels: [96, 192, 384, 384],
+        };
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let error = Flux2Vae::new_with_decoder_config(vb, &config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("decoder.conv_in.weight"), "{error}");
+        assert!(error.contains("384") && error.contains("512"), "{error}");
+    }
+
     #[test]
     fn unpatchify_channel_spatial_order() {
         // Build [1, 8, 1, 1] where channel value = c*4+ph*2+pw for c4=2.

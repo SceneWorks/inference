@@ -628,6 +628,15 @@ fn require_stored(method: zip::CompressionMethod, who: &str) -> Result<()> {
 /// Load a torch `.pth` checkpoint, returning every tensor as an f32 MLX [`Array`] in PyTorch layout
 /// (`torch.load(...).float()` semantics). Conv-weight transposes + key renames are the caller's job.
 pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
+    load_pth_f32_filtered(path, |_| true)
+}
+
+/// [`load_pth_f32`] keeping only the tensors whose name passes `keep`: the others' storage blobs
+/// are never read (a multi-tower checkpoint loads one tower without materializing the rest).
+pub fn load_pth_f32_filtered(
+    path: impl AsRef<Path>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Array>> {
     let path = path.as_ref();
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Msg(format!("open {}: {e}", path.display())))?;
@@ -635,7 +644,11 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         .map_err(|e| Error::Msg(format!("read zip {}: {e}", path.display())))?;
 
     // Locate `<prefix>data.pkl` and derive the storage-blob prefix.
-    let names: Vec<String> = zip.file_names().map(String::from).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Msg(format!("read zip names {}: {e}", path.display())))?;
     let pkl_name = names
         .iter()
         .find(|n| n.ends_with("data.pkl"))
@@ -659,7 +672,10 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         pkl_entry.read_to_end(&mut pkl_bytes)?;
     }
 
-    let specs = parse_pickle(&pkl_bytes)?;
+    let specs: Vec<(String, Val)> = parse_pickle(&pkl_bytes)?
+        .into_iter()
+        .filter(|(name, _)| keep(name))
+        .collect();
 
     // How many tensors still reference each storage `key`. Multiple tensors can be views into one
     // shared storage blob (the case the offset-fix `460d3e7` exists for); without memoization they

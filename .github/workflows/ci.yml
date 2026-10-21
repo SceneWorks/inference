@@ -782,6 +782,18 @@ jobs:
           cargo clippy --locked
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
+      # The only Candle tests any lane RUNS on a Metal device. The vendored candle-metal-kernels
+      # carries upstream's rank > 4 strided-reduce fix (huggingface/candle#3873; its VENDORED.md);
+      # these two weights-free pins are what reds a re-vendor that drops it: the 312-case kernel
+      # sweep (Metal vs CPU, every reduce op, ranks 5 and 6) and the Qwen-Image 2.1 reference
+      # latents it corrupted. Lane selection: both crates and the vendored kernels live under
+      # `crates/media/candle-gen`, which `scripts/ci/select_lanes.py` maps to `macos_metal`.
+      # The filters are pinned to existing integration modules by test_ci_workflow_policy, so a
+      # renamed module cannot turn this into a step that runs zero tests.
+      - name: Test Candle Metal reduce pins
+        run: >-
+          cargo test --locked -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
+          --test integration -- metal_strided_reduce:: metal_reference_latents::
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)
@@ -913,6 +925,9 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Verify native MOSS transport guards without GPU execution
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest
       - name: Install pinned uv for Windows supervisor smoke
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:

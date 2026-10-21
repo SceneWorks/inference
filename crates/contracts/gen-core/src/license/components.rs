@@ -531,6 +531,18 @@ pub const IP_ADAPTER: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// `speridlabs/iris-3b` — the Iris-3B pixel-space DiT backbones (generation at the root, `depth/`,
+/// `upscaler/`). The model card and the code repository both declare Apache-2.0.
+pub const IRIS_3B: ComponentLicense = ComponentLicense {
+    component: "iris_3b",
+    source_url: "https://huggingface.co/speridlabs/iris-3b",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Iris-3B \u{a9} Speridlabs — licensed under Apache-2.0"),
+    retrieved: "2026-10-10",
+};
+
 /// `Kwai-Kolors/Kolors-IP-Adapter-Plus`. Unlike its `Kolors-ControlNet-Pose` sibling, which declares
 /// nothing at all, this repository declares `apache-2.0` — so the absence next door is one
 /// repository's omission and not a Kwai-Kolors-wide policy. Its bundled CLIP-ViT-L/14-336 image
@@ -678,6 +690,18 @@ pub const QWEN3_VL_32B_INSTRUCT: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-12",
 };
 
+/// `Qwen/Qwen3-VL-4B-Instruct` — the frozen text encoder Iris-3B's generation task conditions on
+/// (loaded from the upstream repository itself, pinned by revision).
+pub const QWEN3_VL_4B_INSTRUCT: ComponentLicense = ComponentLicense {
+    component: "qwen3_vl_4b_instruct",
+    source_url: "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Qwen3-VL-4B-Instruct \u{a9} Alibaba Cloud — licensed under Apache-2.0"),
+    retrieved: "2026-10-10",
+};
+
 /// `guozinan/PuLID` → `pulid_flux_v0.9.1.safetensors`.
 pub const PULID: ComponentLicense = ComponentLicense {
     component: "pulid",
@@ -742,6 +766,25 @@ pub const QWEN_IMAGE_2_1: ComponentLicense = ComponentLicense {
          Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.",
     ),
     retrieved: "2026-09-22",
+};
+
+/// `Qwen/Qwen-Image-2.1-Turbo` (sc-25900) — the distilled few-step checkpoint of
+/// [`QWEN_IMAGE_2_1`], published as its own repository: DiT, RGBA VAE and the bundled Qwen3-VL-8B
+/// text tower under one declaration. The card declares the same `qwen-research` licence and the
+/// `LICENSE` beside the weights is byte-identical to the base repository's
+/// (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`), so the family and the
+/// §3(c) attribution are the base row's.
+pub const QWEN_IMAGE_2_1_TURBO: ComponentLicense = ComponentLicense {
+    component: "qwen_image_2_1_turbo",
+    source_url: "https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo",
+    gated: false,
+    declared: "qwen-research",
+    family: "qwen-research",
+    attribution: Some(
+        "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou \
+         Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.",
+    ),
+    retrieved: "2026-10-13",
 };
 
 /// `Qwen/Qwen-Image-Edit`.
@@ -1186,6 +1229,39 @@ pub const Z_IMAGE_TURBO_FUN_CONTROLNET_UNION_2_1: ComponentLicense = ComponentLi
     retrieved: "2026-08-02",
 };
 
+/// Official Base bundle; the frozen LICENSE is Apache-2.0.
+pub const MOSS_IMAGE_BASE: ComponentLicense = ComponentLicense {
+    component: "moss_image_base",
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base/blob/1ceede80badddd6a7812069619edaa5633587192/LICENSE",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-Base by OpenMOSS-Team — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
+/// Official SFT bundle including its shipped text tower, tokenizer and small VAE.
+pub const MOSS_IMAGE_SFT: ComponentLicense = ComponentLicense {
+    component: "moss_image_sft",
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/blob/fc5de0d56fc910cbca6f6625a70f5f582b26deb1/LICENSE",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-SFT by OpenMOSS-Team — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
+/// Optional mixed/full-FP32 distilled package; its frozen card declares apache-2.0.
+pub const MOSS_IMAGE_SFT_8_STEPS_DMD: ComponentLicense = ComponentLicense {
+    component: "moss_image_sft_8_steps_dmd",
+    source_url: "https://huggingface.co/lodestones/MOSS-Image-SFT-8-steps-dmd/blob/5ff314b4c1470876b114b810146085db8a181a6e/README.md",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-SFT-8-steps-dmd by lodestones — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
 /// Every media checkpoint whose licence has been read, ordered by
 /// [`ComponentLicense::component`].
 ///
@@ -1227,6 +1303,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     IDEOGRAM_4_TURBOTIME_LORA,
     INSTANTID,
     IP_ADAPTER,
+    IRIS_3B,
     KOLORS_IP_ADAPTER_PLUS,
     KREA_2_RAW,
     KREA_2_TURBO,
@@ -1234,13 +1311,18 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     LTX_2_3,
     MINIMAX_H3,
     MOCHI_1_PREVIEW,
+    MOSS_IMAGE_BASE,
+    MOSS_IMAGE_SFT,
+    MOSS_IMAGE_SFT_8_STEPS_DMD,
     NVIDIA_PID_STUDENTS,
     PULID,
     QWEN3_VL_32B_INSTRUCT,
+    QWEN3_VL_4B_INSTRUCT,
     QWEN_IMAGE,
     QWEN_IMAGE_2512,
     QWEN_IMAGE_2512_FUN_CONTROLNET_UNION,
     QWEN_IMAGE_2_1,
+    QWEN_IMAGE_2_1_TURBO,
     QWEN_IMAGE_EDIT,
     QWEN_IMAGE_EDIT_2511_LIGHTNING,
     QWEN_IMAGE_LIGHTNING,
@@ -1288,7 +1370,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 74);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 80);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1674,9 +1756,22 @@ mod tests {
         // sweep is 2026-08-02; sc-17147 added the MiniMax-H3 pair after reading that repository's
         // own LICENSE, so its date is the second entry; sc-24108 read the Qwen Research License
         // beside `Qwen/Qwen-Image-2.1` on 2026-09-22
-        // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`). A row carrying any other
-        // date is a row whose provenance nobody can re-read.
-        const EVIDENCE_PACK_DATES: &[&str] = &["2026-08-02", "2026-08-12", "2026-09-22"];
+        // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`); sc-25679 read the
+        // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
+        // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25900 read the
+        // Qwen-Image-2.1-Turbo card and LICENSE on 2026-10-13
+        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`). A row carrying
+        // any other date is a row whose provenance nobody can re-read.
+        // sc-26323 read the frozen MOSS bundles on 2026-10-18; see
+        // docs/licensing/sc-26323-moss-image-licence-evidence.md.
+        const EVIDENCE_PACK_DATES: &[&str] = &[
+            "2026-08-02",
+            "2026-08-12",
+            "2026-09-22",
+            "2026-10-10",
+            "2026-10-13",
+            "2026-10-18",
+        ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(
                 EVIDENCE_PACK_DATES.contains(&row.retrieved),

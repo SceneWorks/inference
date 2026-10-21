@@ -18,6 +18,7 @@ mlx-gen-depth = { path = "../mlx-gen-depth" }
 mlx-gen-face = { path = "../mlx-gen-face" }
 mlx-gen-ideogram = { path = "../mlx-gen-ideogram" }
 mlx-gen-instantid = { path = "../mlx-gen-instantid" }
+mlx-gen-iris = { path = "../mlx-gen-iris" }
 mlx-gen-joycaption = { path = "../mlx-gen-joycaption" }
 mlx-gen-kolors = { path = "../mlx-gen-kolors" }
 mlx-gen-krea = { path = "../mlx-gen-krea" }
@@ -29,6 +30,7 @@ mlx-gen-ltx = { path = "../mlx-gen-ltx" }
 mlx-gen-mage = { path = "../mlx-gen-mage" }
 mlx-gen-minimax-h3 = { path = "../mlx-gen-minimax-h3" }
 mlx-gen-mochi = { path = "../mlx-gen-mochi" }
+mlx-gen-moss-image = { path = "../mlx-gen-moss-image" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-gen-pulid = { path = "../mlx-gen-pulid" }
 mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }

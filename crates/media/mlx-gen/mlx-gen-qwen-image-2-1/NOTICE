@@ -12,6 +12,12 @@ SceneWorks bundle that carries these weights must therefore preserve:
 
 The full agreement ships beside the weights as `LICENSE` in the pinned snapshot.
 
+The same terms and the same notice apply to the distilled Qwen-Image 2.1 Turbo checkpoint
+(https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo, revision
+fc13ba1986fcb905854dc8de2f52eee395f49b5b), which this crate also loads and re-packs: its `LICENSE`
+is the same agreement, and every installable tier derived from either checkpoint carries that file
+plus a `CHANGES.md` naming the checkpoint and revision it is a modified copy of.
+
 The numeric reference for the port is the Apache-2.0 diffusers implementation
 (`QwenImage21Pipeline`, `QwenImage21Transformer2DModel`, `AutoencoderKLQwenImage21`,
 `FlowMatchEulerDiscreteScheduler`) at huggingface/diffusers@8b3c707ebd3ec4881f4190cf42931da07eaf3b65

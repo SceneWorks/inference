@@ -811,6 +811,7 @@ impl FlowMatchTrainer for LensTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfix::{randn_seeded, randomize_vars};
     use candle_gen::candle_nn::{VarBuilder, VarMap};
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
@@ -870,24 +871,23 @@ mod tests {
 
     /// Randomize every var in a fresh `VarMap` — a zero patch/img_in weight makes `hidden ≡ 0` and the
     /// adapter grads vacuously zero; real training loads nonzero weights, so the tiny tests must too.
-    fn randomize_base(vm: &VarMap, dev: &Device) {
-        for v in vm.all_vars() {
-            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), dev).unwrap())
-                .unwrap();
-        }
+    /// Seeded (see [`crate::testfix`]): an unseeded fixture made the depth-anchoring test flake.
+    fn randomize_base(vm: &VarMap, rng: &mut StdRng, dev: &Device) {
+        randomize_vars(vm, rng, 0.1, dev);
     }
 
     /// Tiny synthetic inputs: a packed latent `[1, h·w, in_channels]`, one text-feature layer, noise,
     /// and the latent grid `(h, w)`.
     fn tiny_inputs(
         cfg: &LensDitConfig,
+        rng: &mut StdRng,
         dev: &Device,
     ) -> (Tensor, Vec<Tensor>, Tensor, usize, usize) {
         let (h, w) = (2usize, 2usize);
         let img_len = h * w;
-        let x0 = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), dev).unwrap();
-        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), dev).unwrap();
-        let noise = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), dev).unwrap();
+        let x0 = randn_seeded(rng, 1.0, &[1, img_len, cfg.in_channels], dev);
+        let feat = randn_seeded(rng, 1.0, &[1, 3, cfg.enc_hidden_dim], dev);
+        let noise = randn_seeded(rng, 1.0, &[1, img_len, cfg.in_channels], dev);
         (x0, vec![feat], noise, h, w)
     }
 
@@ -897,19 +897,20 @@ mod tests {
     #[test]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_0001);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-        randomize_base(&vm, &dev);
+        randomize_base(&vm, &mut rng, &dev);
         let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         // Move B off its zero-init so both A and B grads are nonzero.
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims(), &dev))
                 .unwrap();
         }
-        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &mut rng, &dev);
         let (loss, grads) = compute_loss_grads(
             &dit,
             &set.vars,
@@ -945,18 +946,19 @@ mod tests {
     #[test]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_0002);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-        randomize_base(&vm, &dev);
+        randomize_base(&vm, &mut rng, &dev);
         let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims(), &dev))
                 .unwrap();
         }
-        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &mut rng, &dev);
         let (loss_d, g_d) = compute_loss_grads(
             &dit,
             &set.vars,
@@ -1020,18 +1022,19 @@ mod tests {
     #[test]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_0003);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-        randomize_base(&vm, &dev);
+        randomize_base(&vm, &mut rng, &dev);
         let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims(), &dev))
                 .unwrap();
         }
-        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &mut rng, &dev);
         let unpacked = [1usize, cfg.in_channels / 4, 2 * h, 2 * w];
         let map = |m: &[f32]| {
             let u = flow_match::subject_mask_weight(m, 2 * h, 2 * w, &unpacked, &dev).unwrap();
@@ -1170,18 +1173,19 @@ mod tests {
     #[test]
     fn one_optimizer_step_descends() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_0004);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-        randomize_base(&vm, &dev);
+        randomize_base(&vm, &mut rng, &dev);
         let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims(), &dev))
                 .unwrap();
         }
-        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+        let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &mut rng, &dev);
         let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
         let loss_at = |dit: &LensTransformerTrain| {
             compute_loss_grads(
@@ -1234,11 +1238,12 @@ mod tests {
     #[test]
     fn micro_step_uses_each_entrys_grid() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_0005);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-        randomize_base(&vm, &dev);
+        randomize_base(&vm, &mut rng, &dev);
         let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         let trainer = LensTrainer {
@@ -1246,13 +1251,13 @@ mod tests {
             root: "/nonexistent".into(),
             device: dev.clone(),
         };
-        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
         let train_cfg = TrainingConfig {
             train_dtype: "f32".into(),
             ..TrainingConfig::default()
         };
         for (step, (h, w)) in [(2usize, 2usize), (4, 2)].into_iter().enumerate() {
-            let x0 = Tensor::randn(0f32, 1f32, (1, h * w, cfg.in_channels), &dev).unwrap();
+            let x0 = randn_seeded(&mut rng, 1.0, &[1, h * w, cfg.in_channels], &dev);
             let cached = (x0, vec![feat.clone()], (h, w), None);
             let (loss, _) = trainer
                 .micro_step(
@@ -1341,18 +1346,19 @@ mod tests {
 
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x1e45_0006);
             let cfg = tiny_cfg();
             let vm = VarMap::new();
             let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
             let mut dit = LensTransformerTrain::new(&cfg, vb).unwrap();
-            randomize_base(&vm, &dev);
+            randomize_base(&vm, &mut rng, &dev);
             let suffixes: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
             let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims(), &dev))
                     .unwrap();
             }
-            let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &dev);
+            let (x0, feats, noise, h, w) = tiny_inputs(&cfg, &mut rng, &dev);
             Fixture {
                 dit,
                 vars: set.vars,

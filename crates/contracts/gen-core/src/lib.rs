@@ -34,6 +34,7 @@ pub mod guidance;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
+pub mod iris;
 pub mod json_constraint;
 pub mod latent;
 pub mod license;
@@ -43,6 +44,8 @@ mod macros;
 pub mod media;
 pub mod memory_phases;
 pub mod memory_strategy;
+pub mod moss_image;
+mod moss_image_assets;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
@@ -127,7 +130,8 @@ pub use encoder_contract::{
 pub use error::{Error, Result};
 pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
-    GraphEvalCadence,
+    GraphEvalCadence, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheOverflow,
+    PrefixKvCacheReport,
 };
 pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
@@ -135,12 +139,12 @@ pub use generator::{
     default_seed, effective_component_quant, effective_reference_image_short_edge,
     reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
     ArtifactRecord, AudioArtifacts, AudioEditMode, AudioEditRef, AudioParams, Capabilities,
-    ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
-    ConversationRole, ConversationSession, ConversationTurn, GenerationMemory, GenerationOutput,
-    GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning, Generator, HdrRequest,
-    KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter, PhaseAdapter,
-    PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover, SongCoverMode,
-    SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
+    CaptionOverflowPolicy, ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef,
+    ControlKind, ConversationRole, ConversationSession, ConversationTurn, GenerationMemory,
+    GenerationOutput, GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter,
+    PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover,
+    SongCoverMode, SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
     StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
@@ -292,8 +296,13 @@ pub use transcribe::{
     TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
-    TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
+    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
+    TransformRequest,
 };
 
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod veda;
+pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
+pub mod h3_terminal_telemetry;

@@ -52,6 +52,9 @@ mod ref2va_cross_backend;
 #[path = "turbo_lora.rs"]
 mod turbo_lora;
 
+#[path = "veda_ab.rs"]
+mod veda_ab;
+
 #[path = "video_vae_encode_parity.rs"]
 mod video_vae_encode_parity;
 

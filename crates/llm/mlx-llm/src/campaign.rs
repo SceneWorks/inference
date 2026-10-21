@@ -20160,7 +20160,7 @@ pub(crate) mod tests {
         assert_eq!(identity.version, "0.25.8");
         assert_eq!(
             identity.revision,
-            "48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
+            "fe22998bf73e5e785d7659beb2f24d624b785bda"
         );
         assert_eq!(
             identity.source,

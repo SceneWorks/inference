@@ -170,7 +170,10 @@ fn declared_logical_shapes_match_the_reference_dit_header() {
 
     let w = load("dit_golden.safetensors");
     let cfg = tiny_dit_config();
-    let mapping = mlx_gen_krea::KreaNativeToDiffusersMapping::for_config(&cfg);
+    let mapping = mlx_gen_krea::KreaNativeToDiffusersMapping::for_config(
+        mlx_gen_krea::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+        &cfg,
+    );
 
     let mut checked = 0usize;
     for key in w.keys() {

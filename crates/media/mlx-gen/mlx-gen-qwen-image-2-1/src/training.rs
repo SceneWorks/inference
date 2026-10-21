@@ -105,7 +105,7 @@ use crate::model::{FAMILY, MODEL_ID};
 use crate::pipeline::{
     create_noise, decode_rgb, denoise, encode_references, joint_branch, joint_images, joint_layout,
     missing_vision_tower, pack_latents, prepare_conditioning_references, DenoiseInputs,
-    JointBranch, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
+    JointBranch, KvCacheMode, ReferenceConditioning, DECODE_OVERLAP, DECODE_TILE_EDGE,
 };
 use crate::quant::{installed_tier, Tier};
 use crate::reference::{
@@ -867,6 +867,10 @@ impl QwenImage21Trainer {
         // Shared with the candle twin (sc-24163): one refusal, one message.
         gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
+        // sc-25909 (the candle twin's sc-25901 rule): a Turbo snapshot is not a training base.
+        // Refused by name here, before anything else is read — not incidentally by the scheduler
+        // config reader, which a Turbo-shaped tree without `scheduler/` would get past.
+        loader::refuse_saved_sigma_snapshot(&root)?;
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
             return Err(quantized_base_refusal(&format!(
@@ -1923,6 +1927,10 @@ fn render_sample(
             seed,
             cancel,
             references,
+            // The preview renders inside the trainer's own memory envelope
+            // (`training_memory`), which prices the prefill path; the prefix cache is the
+            // render path's trade (sc-25903), so the preview keeps the path it is priced for.
+            kv_cache: KvCacheMode::Off,
         },
         &mut |_: Progress| {},
     )?;

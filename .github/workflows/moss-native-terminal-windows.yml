@@ -1,0 +1,139 @@
+name: MOSS native terminal (Windows)
+on:
+  workflow_dispatch:
+    inputs:
+      sceneworks_revision:
+        description: Exact frozen SceneWorks epic feature head containing the permanent inference-main pin
+        required: true
+        type: string
+      control_json:
+        description: Strict native-only control with exact snapshots, fresh physical GPU0 UUID lease and bounded deadline
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights, cuda-windows-2]
+    timeout-minutes: 240
+    env:
+      MOSS_NATIVE_CONTROL: ${{ inputs.control_json }}
+      MOSS_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      CARGO_BUILD_JOBS: "4"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+      RUSTC_WRAPPER: ""
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - name: Initialize evidence outside both checkouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP ("moss-native-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          New-Item -ItemType Directory -Path $root|Out-Null
+          "MOSS_TRANSPORT_ARTIFACT_ROOT=$root"|Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+          @{status='initialized';workflow_revision=$env:GITHUB_SHA}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $root 'transport-initialization.json') -Encoding UTF8
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ fromJSON(inputs.control_json).inference_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.sceneworks_revision }}
+          path: .terminal-sceneworks
+          fetch-depth: 0
+          persist-credentials: false
+      # This guard is trusted workflow source on main, before executing the pinned checkout's
+      # controller or self-tests. Unrelated newer main commits do not require another product pin.
+      - name: Verify frozen inference source is an exact main ancestor
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT|Out-Null
+          $guard=@{status='failed';workflow_revision=$env:GITHUB_SHA}
+          try {
+            if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Trusted main workflow required' }
+            $control=$env:MOSS_NATIVE_CONTROL|ConvertFrom-Json
+            $revision=[string]$control.inference_revision
+            $guard.inference_revision=$revision
+            if ($revision -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact inference SHA required' }
+            $actual=git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0 -or $actual -cne $revision) { throw 'Inference checkout mismatch' }
+            git merge-base --is-ancestor $revision origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned inference is not a main ancestor' }
+            $guard.status='passed'
+          } catch { $guard.error=$_.Exception.Message;throw }
+          finally { $guard|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT 'source-guard.json') -Encoding UTF8 }
+      - name: Materialize controller from the trusted main workflow revision
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Trusted main workflow required' }
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow source is not a main ancestor' }
+          $object=$env:GITHUB_SHA+':scripts/ci/moss-native-terminal.ps1'
+          $blob=git rev-parse $object
+          if ($LASTEXITCODE -ne 0 -or $blob -cnotmatch '^[0-9a-f]{40}$') { throw 'Missing trusted controller blob' }
+          $path=Join-Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT 'moss-native-terminal.ps1'
+          $start=[Diagnostics.ProcessStartInfo]::new()
+          $start.FileName=(Get-Command git).Source
+          $start.Arguments='cat-file blob '+$blob
+          $start.UseShellExecute=$false
+          $start.RedirectStandardOutput=$true
+          $process=[Diagnostics.Process]::new();$process.StartInfo=$start
+          $file=$null;$started=$false
+          try {
+            $file=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write)
+            $started=$process.Start()
+            if (-not $started) { throw 'Controller extraction did not start' }
+            $null=$process.Handle
+            $copy=$process.StandardOutput.BaseStream.CopyToAsync($file)
+            if (-not $process.WaitForExit(30000)) { throw 'Controller extraction timed out' }
+            if (-not $copy.Wait(5000)) { throw 'Controller extraction output drain timed out' }
+            if ($process.ExitCode -ne 0) { throw 'Controller extraction failed' }
+          } finally {
+            try {
+              if ($started -and -not $process.HasExited) {
+                $process.Kill()
+                if (-not $process.WaitForExit(5000)) { throw 'Controller extraction cleanup timed out' }
+              }
+            } finally { if ($null -ne $file) { $file.Dispose() };$process.Dispose() }
+          }
+          $actual=git hash-object --no-filters $path
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $blob) { throw 'Materialized controller blob mismatch' }
+          $sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{workflow_revision=$env:GITHUB_SHA;controller_blob_sha=$blob;controller_sha256=$sha256;controller_path=$path;inference_revision=(git rev-parse HEAD)}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT 'controller-source.json') -Encoding UTF8
+          "MOSS_NATIVE_CONTROLLER=$path"|Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Verify native-only transport on CPU
+        shell: powershell
+        run: '& $env:MOSS_NATIVE_CONTROLLER -SelfTest'
+      - name: Run the exact pinned native campaign under a fresh physical GPU0 lease
+        shell: powershell
+        run: '& $env:MOSS_NATIVE_CONTROLLER'
+      - name: Preserve native evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-native-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.json
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.jsonl
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.log
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.csv
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/product-worker/*.json
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/product-worker/*.png
+          if-no-files-found: error

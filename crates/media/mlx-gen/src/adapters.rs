@@ -1137,6 +1137,14 @@ pub trait AdaptableHost {
         self.adaptable_mut(path).map(|lin| LinearFacts::of(lin))
     }
 
+    /// The dtype a LyCORIS (LoKr / LoHa) install builds its residual in — the reconstructed
+    /// `[out, in]` delta and the structured Kronecker factors. The default is bf16 (PARITY-BF16,
+    /// sc-2609), which every fork-parity family relies on; a host computing in f32 (e.g. Iris under
+    /// `Precision::Fp32`) overrides it so the adapter is not rounded below its own compute.
+    fn lycoris_dtype(&self) -> Dtype {
+        Dtype::Bfloat16
+    }
+
     /// Resolve a dotted path to the [`AdaptableConv2d`] living there, for conv-layer LoRA merging
     /// (sc-2919) — the conv analog of [`adaptable_mut`](Self::adaptable_mut). The default is empty:
     /// only the SDXL U-Net (the one conv-bearing adapter host) overrides it; DiT/MMDiT families
