@@ -195,15 +195,18 @@ struct HeaderTarget {
     packing: serde_json::Value,
 }
 
+/// Header targets plus the vendored and complete kohya lookup tables built beside them.
+type HeaderTargetTables = (
+    BTreeMap<String, HeaderTarget>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+);
+
 fn header_targets(
     headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
     cfg: &crate::config::UNetConfig,
     spec: &mlx_gen::gen_core::LoadSpec,
-) -> Result<(
-    BTreeMap<String, HeaderTarget>,
-    BTreeMap<String, String>,
-    BTreeMap<String, String>,
-)> {
+) -> Result<HeaderTargetTables> {
     let (vendored, complete, convs) = crate::unet::adapter_target_paths_from_headers(cfg, headers);
     let vendored_table = build_table(vendored);
     let mut complete_paths = complete.clone();
@@ -223,7 +226,8 @@ fn header_targets(
             if let Some((lo, hi)) = rows {
                 shape[0] = hi - lo;
             }
-            let unread = fused || rows.is_some()
+            let unread = fused
+                || rows.is_some()
                 || (streamed && crate::loader::is_streamed_block_tensor(&target));
             targets.insert(target, HeaderTarget {
                 shape, linear: true, source_packed_bits: projection.source_packed_bits,
@@ -240,7 +244,7 @@ fn header_targets(
         let header = headers
             .iter()
             .find(|h| h.name == name)
-            .ok_or_else(|| Error::MissingTensor(name))?;
+            .ok_or(Error::MissingTensor(name))?;
         let mut shape: Vec<i32> = header
             .shape
             .iter()
@@ -541,9 +545,13 @@ pub(crate) fn adapter_residual_shape(residual: &AdapterFacts, input: &[i32]) -> 
         }
         AdapterFacts::Structured { w1, w2, .. } => {
             let bad_shape = || Error::Msg("sdxl structured residual axes disagree".into());
-            if w1.shape.len() != 2 || w2.shape.len() != 2 { return Err(bad_shape()); }
+            if w1.shape.len() != 2 || w2.shape.len() != 2 {
+                return Err(bad_shape());
+            }
             let input_width = w1.shape[1].checked_mul(w2.shape[1]).ok_or_else(bad_shape)?;
-            if input.last() != Some(&input_width) { return Err(bad_shape()); }
+            if input.last() != Some(&input_width) {
+                return Err(bad_shape());
+            }
             let mut shape = input[..input.len() - 1].to_vec();
             shape.push(w1.shape[0].checked_mul(w2.shape[0]).ok_or_else(bad_shape)?);
             Ok(shape)
@@ -557,7 +565,10 @@ pub(crate) enum AdapterWork {
     FileMaterialized(Vec<(String, TensorFacts)>),
     Selected(InstallKind),
     /// Parser-local cast/readback workspace. Its copied scalar result is not a retained Array.
-    AlphaRead { key: String, scratch: u64 },
+    AlphaRead {
+        key: String,
+        scratch: u64,
+    },
     /// Graph operands created before a target guard, retained as logical parents, not backing IDs.
     Preparation(Vec<TensorFacts>),
     /// The guard was reached; reconstruction/validation may still refuse. No installed result.
@@ -623,23 +634,37 @@ impl AdapterInstallWork {
     /// selected operand. Row indices already exist at this point in the current runtime order;
     /// their retained graph input is separate from the take output evaluated INSIDE the guard.
     fn lora(
-        base: Option<TensorFacts>, down: TensorFacts, up: TensorFacts,
-        unread_base: u64, selected_rows: i32, disabled: bool,
+        base: Option<TensorFacts>,
+        down: TensorFacts,
+        up: TensorFacts,
+        unread_base: u64,
+        selected_rows: i32,
+        disabled: bool,
     ) -> Self {
-        let copy = |a: &TensorFacts| if a.dtype == Dtype::Float32 { 0 } else {
-            a.elements().saturating_mul(width(Dtype::Float32))
+        let copy = |a: &TensorFacts| {
+            if a.dtype == Dtype::Float32 {
+                0
+            } else {
+                a.elements().saturating_mul(width(Dtype::Float32))
+            }
         };
         let row_take = if selected_rows == 0 { 0 } else { up.bytes() };
         let mut parents = vec![down.clone(), up.clone()];
         let mut buffers = Vec::new();
-        if selected_rows > 0 { buffers.push(up.clone()); }
+        if selected_rows > 0 {
+            buffers.push(up.clone());
+        }
         let (storage, previous_budget) = match base {
             Some(base) => {
                 let mut chain = lora_chain(up.dtype);
                 chain.extend(linear_merge(base.dtype));
                 let previous = crate::quantum::adapter_install_bytes(
-                    base.elements(), &chain,
-                    copy(&up).saturating_add(copy(&down)).saturating_add(row_take), unread_base,
+                    base.elements(),
+                    &chain,
+                    copy(&up)
+                        .saturating_add(copy(&down))
+                        .saturating_add(row_take),
+                    unread_base,
                 );
                 for input in [&down, &up] {
                     if input.dtype != Dtype::Float32 {
@@ -668,81 +693,139 @@ impl AdapterInstallWork {
             }
             None => {
                 buffers.push(output_fact(Vec::new(), Dtype::Float32));
-                if up.dtype != Dtype::Float32 { buffers.push(output_fact(Vec::new(), up.dtype)); }
+                if up.dtype != Dtype::Float32 {
+                    buffers.push(output_fact(Vec::new(), up.dtype));
+                }
                 buffers.push(output_fact(up.shape.clone(), up.dtype));
-                (AdapterInstallStorage::PackedLora,
-                    crate::quantum::adapter_install_bytes(0, &[], up.bytes().saturating_add(row_take), 0))
+                (
+                    AdapterInstallStorage::PackedLora,
+                    crate::quantum::adapter_install_bytes(
+                        0,
+                        &[],
+                        up.bytes().saturating_add(row_take),
+                        0,
+                    ),
+                )
             }
         };
-        let actual_sequence = buffers.iter().fold(unread_base, |n, a| n.saturating_add(
-            mlx_gen::ios_quantum::allocated_bytes(a.bytes())));
+        let actual_sequence = buffers.iter().fold(unread_base, |n, a| {
+            n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(a.bytes()))
+        });
         // Last declared buffer is the installed result; earlier ones are potential lazy parents.
-        parents.extend(buffers.iter().take(buffers.len().saturating_sub(1)).cloned());
+        parents.extend(
+            buffers
+                .iter()
+                .take(buffers.len().saturating_sub(1))
+                .cloned(),
+        );
         let mut work = Self::from_facts(storage, previous_budget.max(actual_sequence), parents);
         work.disabled = storage == AdapterInstallStorage::PackedLora && disabled;
         work.pre_guard = mlx_gen::ios_quantum::allocated_bytes(
-            (selected_rows.max(0) as u64).saturating_mul(width(Dtype::Int32)));
+            (selected_rows.max(0) as u64).saturating_mul(width(Dtype::Int32)),
+        );
         if selected_rows > 0 {
             work.parents.push(TensorFacts {
                 shape: vec![selected_rows],
-                dtype: Dtype::Int32, strides: vec![1],
+                dtype: Dtype::Int32,
+                strides: vec![1],
             });
         }
         work
     }
 
     fn delta(
-        base: Option<TensorFacts>, delta: TensorFacts, chain: &[u64], small: u64, unread_base: u64,
+        base: Option<TensorFacts>,
+        delta: TensorFacts,
+        chain: &[u64],
+        small: u64,
+        unread_base: u64,
         pre_guard: u64,
     ) -> Self {
         let mut widths = chain.to_vec();
         let mut parents = vec![delta.clone()];
-        let merged_upper = base.as_ref().and_then(|base|
-            broadcast_shape(&base.shape, &delta.shape).ok().map(|shape| output_fact(shape, base.dtype).bytes()))
-            .map_or(unread_base, |bytes| unread_base.saturating_add(mlx_gen::ios_quantum::allocated_bytes(bytes)));
+        let merged_upper = base
+            .as_ref()
+            .and_then(|base| {
+                broadcast_shape(&base.shape, &delta.shape)
+                    .ok()
+                    .map(|shape| output_fact(shape, base.dtype).bytes())
+            })
+            .map_or(unread_base, |bytes| {
+                unread_base.saturating_add(mlx_gen::ios_quantum::allocated_bytes(bytes))
+            });
         let storage = if let Some(base) = base {
             // Preserve the shortcut/view merge's existing non-donation budget.
             widths.push(width(base.dtype));
             parents.insert(0, base);
             AdapterInstallStorage::DenseLinear
-        } else { AdapterInstallStorage::PackedDelta };
-        let mut work = Self::from_facts(storage,
+        } else {
+            AdapterInstallStorage::PackedDelta
+        };
+        let mut work = Self::from_facts(
+            storage,
             crate::quantum::adapter_install_bytes(delta.elements(), &widths, small, unread_base)
-                .max(merged_upper), parents);
+                .max(merged_upper),
+            parents,
+        );
         work.pre_guard = pre_guard;
         work
     }
 
-    fn conv(base: TensorFacts, delta: TensorFacts, source: Dtype, small: u64, unread_base: u64) -> Self {
+    fn conv(
+        base: TensorFacts,
+        delta: TensorFacts,
+        source: Dtype,
+        small: u64,
+        unread_base: u64,
+    ) -> Self {
         let mut chain = lora_chain(source);
         chain.extend(linear_merge(base.dtype));
         chain.push(width(base.dtype));
-        let legacy = crate::quantum::adapter_install_bytes(delta.elements(), &chain, small, unread_base);
+        let legacy =
+            crate::quantum::adapter_install_bytes(delta.elements(), &chain, small, unread_base);
         let mut merged_upper = unread_base;
         if delta.shape.len() == 4 {
-            let ohwi = vec![delta.shape[0], delta.shape[2], delta.shape[3], delta.shape[1]];
+            let ohwi = vec![
+                delta.shape[0],
+                delta.shape[2],
+                delta.shape[3],
+                delta.shape[1],
+            ];
             if let Ok(shape) = broadcast_shape(&base.shape, &ohwi) {
                 // A small broadcast delta can produce a FULL base-sized sum. Its cast remains
                 // delta-sized; the actual merged result must never be priced at delta.elements().
                 merged_upper = merged_upper.saturating_add(mlx_gen::ios_quantum::allocated_bytes(
-                    output_fact(shape, base.dtype).bytes()));
+                    output_fact(shape, base.dtype).bytes(),
+                ));
                 if delta.dtype != base.dtype {
-                    merged_upper = merged_upper.saturating_add(mlx_gen::ios_quantum::allocated_bytes(
-                        output_fact(ohwi, base.dtype).bytes()));
+                    merged_upper =
+                        merged_upper.saturating_add(mlx_gen::ios_quantum::allocated_bytes(
+                            output_fact(ohwi, base.dtype).bytes(),
+                        ));
                 }
             }
         }
-        let mut work = Self::from_facts(AdapterInstallStorage::DenseConv,
-            legacy.max(merged_upper), vec![base, delta]);
+        let mut work = Self::from_facts(
+            AdapterInstallStorage::DenseConv,
+            legacy.max(merged_upper),
+            vec![base, delta],
+        );
         // conv_lora_delta builds its strength scalar before routing to this target guard.
         work.pre_guard = mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32));
         work
     }
 
-    fn dense_lokr(base: TensorFacts, factors: Vec<TensorFacts>, factor: Dtype, products: u64, unread_base: u64) -> Self {
+    fn dense_lokr(
+        base: TensorFacts,
+        factors: Vec<TensorFacts>,
+        factor: Dtype,
+        products: u64,
+        unread_base: u64,
+    ) -> Self {
         let mut chain = kron_chain(factor);
         chain.extend(linear_merge(base.dtype));
-        let scratch = crate::quantum::adapter_install_bytes(base.elements(), &chain, products, unread_base);
+        let scratch =
+            crate::quantum::adapter_install_bytes(base.elements(), &chain, products, unread_base);
         let mut parents = vec![base];
         parents.extend(factors);
         Self::from_facts(AdapterInstallStorage::DenseLinear, scratch, parents)
@@ -751,14 +834,25 @@ impl AdapterInstallWork {
     /// Actual structured build sequence: optional small products, Float32 scalar multiply on w2,
     /// then the two output casts. Full Float32 w2 STILL creates a factor-sized multiply output,
     /// including strength zero. No donation, view-release or backing credit is assumed.
-    fn structured(factors: &BTreeMap<String, TensorFacts>, legacy_small: u64, disabled: bool) -> Self {
+    fn structured(
+        factors: &BTreeMap<String, TensorFacts>,
+        legacy_small: u64,
+        disabled: bool,
+    ) -> Self {
         let mut buffers = Vec::new();
         let mut select = |full: &str, a: &str, b: &str| -> Option<TensorFacts> {
-            if let Some(factor) = factors.get(full) { return Some(factor.clone()); }
+            if let Some(factor) = factors.get(full) {
+                return Some(factor.clone());
+            }
             let (a, b) = (factors.get(a)?, factors.get(b)?);
-            if a.shape.len() != 2 || b.shape.len() != 2 { return None; }
-            let product = TensorFacts::materialized_matrix(a.shape[0], b.shape[1],
-                Dtype::from_promoting_types(a.dtype, b.dtype));
+            if a.shape.len() != 2 || b.shape.len() != 2 {
+                return None;
+            }
+            let product = TensorFacts::materialized_matrix(
+                a.shape[0],
+                b.shape[1],
+                Dtype::from_promoting_types(a.dtype, b.dtype),
+            );
             buffers.push(product.clone());
             Some(product)
         };
@@ -769,24 +863,39 @@ impl AdapterInstallWork {
         if let Some(two) = two {
             let scaled = TensorFacts {
                 shape: two.shape.clone(),
-                dtype: Dtype::from_promoting_types(two.dtype, Dtype::Float32), strides: Vec::new(),
+                dtype: Dtype::from_promoting_types(two.dtype, Dtype::Float32),
+                strides: Vec::new(),
             };
             buffers.push(scaled.clone());
             if scaled.dtype != Dtype::Float32 {
-                buffers.push(TensorFacts { dtype: Dtype::Float32, ..scaled });
+                buffers.push(TensorFacts {
+                    dtype: Dtype::Float32,
+                    ..scaled
+                });
             }
         }
         if let Some(one) = one {
             if one.dtype != Dtype::Float32 {
-                buffers.push(TensorFacts { dtype: Dtype::Float32, ..one });
+                buffers.push(TensorFacts {
+                    dtype: Dtype::Float32,
+                    ..one
+                });
             }
         }
-        buffers.push(TensorFacts { shape: Vec::new(), dtype: Dtype::Float32, strides: Vec::new() });
-        let actual_sequence = buffers.iter().fold(0u64, |n, a| n.saturating_add(
-            mlx_gen::ios_quantum::allocated_bytes(a.bytes())));
+        buffers.push(TensorFacts {
+            shape: Vec::new(),
+            dtype: Dtype::Float32,
+            strides: Vec::new(),
+        });
+        let actual_sequence = buffers.iter().fold(0u64, |n, a| {
+            n.saturating_add(mlx_gen::ios_quantum::allocated_bytes(a.bytes()))
+        });
         let checked_previous = crate::quantum::adapter_install_bytes(0, &[], legacy_small, 0);
-        let mut work = Self::from_facts(AdapterInstallStorage::StructuredLokr,
-            checked_previous.max(actual_sequence), factors.values().cloned().collect());
+        let mut work = Self::from_facts(
+            AdapterInstallStorage::StructuredLokr,
+            checked_previous.max(actual_sequence),
+            factors.values().cloned().collect(),
+        );
         work.disabled = disabled;
         work
     }
@@ -840,11 +949,17 @@ fn dense_base(lin: &AdaptableLinear) -> Result<Array> {
 }
 
 pub(crate) fn install_delta_at(
-    lin: &mut AdaptableLinear, delta: Array, chain: &[u64], small: u64, target: &str, pre_guard: u64,
+    lin: &mut AdaptableLinear,
+    delta: Array,
+    chain: &[u64],
+    small: u64,
+    target: &str,
+    pre_guard: u64,
 ) -> Result<()> {
     if lin.is_quantized() {
         return guarded_install(
-            AdapterInstallWork::delta(None, TensorFacts::of(&delta), chain, small, 0, pre_guard).at(target),
+            AdapterInstallWork::delta(None, TensorFacts::of(&delta), chain, small, 0, pre_guard)
+                .at(target),
             || {
                 lin.push(Adapter::Lokr {
                     delta: delta.clone(),
@@ -856,8 +971,15 @@ pub(crate) fn install_delta_at(
     }
     let base = dense_base(lin)?;
     guarded_install(
-        AdapterInstallWork::delta(Some(TensorFacts::of(&base)), TensorFacts::of(&delta),
-            chain, small, unread(&base), pre_guard).at(target),
+        AdapterInstallWork::delta(
+            Some(TensorFacts::of(&base)),
+            TensorFacts::of(&delta),
+            chain,
+            small,
+            unread(&base),
+            pre_guard,
+        )
+        .at(target),
         || {
             lin.merge_dense_delta(&delta)?;
             Ok(vec![dense_base(lin)?])
@@ -866,12 +988,23 @@ pub(crate) fn install_delta_at(
 }
 
 fn install_lora_at(
-    lin: &mut AdaptableLinear, down: &Array, up: &Array, s: LoraScale,
-    selected_rows: i32, target: &str,
+    lin: &mut AdaptableLinear,
+    down: &Array,
+    up: &Array,
+    s: LoraScale,
+    selected_rows: i32,
+    target: &str,
 ) -> Result<()> {
     if lin.is_quantized() {
-        let work = AdapterInstallWork::lora(None, TensorFacts::of(down), TensorFacts::of(up),
-            0, selected_rows, s.scale == 0.0).at(target);
+        let work = AdapterInstallWork::lora(
+            None,
+            TensorFacts::of(down),
+            TensorFacts::of(up),
+            0,
+            selected_rows,
+            s.scale == 0.0,
+        )
+        .at(target);
         return guarded_install(work, || {
             // `A = downᵀ`, `B = upᵀ` with `alpha/rank` folded into B (Wan's `install_one_lora`);
             // user `scale` stays the residual scale. Fold into an owned `b` (a dtype-matched
@@ -888,24 +1021,37 @@ fn install_lora_at(
         });
     }
     let base = dense_base(lin)?;
-    let work = AdapterInstallWork::lora(Some(TensorFacts::of(&base)), TensorFacts::of(down),
-        TensorFacts::of(up), unread(&base), selected_rows, false).at(target);
-    guarded_install(
-        work,
-        || {
-            let delta = lora_delta(down, up, s.alpha, s.rank, s.scale)?;
-            lin.merge_dense_delta(&delta)?;
-            Ok(vec![dense_base(lin)?])
-        },
+    let work = AdapterInstallWork::lora(
+        Some(TensorFacts::of(&base)),
+        TensorFacts::of(down),
+        TensorFacts::of(up),
+        unread(&base),
+        selected_rows,
+        false,
     )
+    .at(target);
+    guarded_install(work, || {
+        let delta = lora_delta(down, up, s.alpha, s.rank, s.scale)?;
+        lin.merge_dense_delta(&delta)?;
+        Ok(vec![dense_base(lin)?])
+    })
 }
 
 pub(crate) fn install_conv_delta_at(
-    conv: &mut mlx_gen::adapters::AdaptableConv2d, delta_nchw: &Array,
-    src: Dtype, small: u64, target: &str,
+    conv: &mut mlx_gen::adapters::AdaptableConv2d,
+    delta_nchw: &Array,
+    src: Dtype,
+    small: u64,
+    target: &str,
 ) -> Result<()> {
-    let work = AdapterInstallWork::conv(TensorFacts::of(conv.weight()), TensorFacts::of(delta_nchw),
-        src, small, unread(conv.weight())).at(target);
+    let work = AdapterInstallWork::conv(
+        TensorFacts::of(conv.weight()),
+        TensorFacts::of(delta_nchw),
+        src,
+        small,
+        unread(conv.weight()),
+    )
+    .at(target);
     guarded_install(work, || {
         conv.merge_conv_delta(delta_nchw)?;
         Ok(vec![conv.weight().clone()])
@@ -934,8 +1080,14 @@ fn merge_into(
             // A packed base carries the delta as an `Adapter::Lokr` residual `scale·x·δᵀ`; with the
             // `[out,in]` δ and scale 1.0 this is exactly the merged `x·(W+δ)ᵀ − x·Wᵀ`, on a base that
             // cannot be merged into. A dense base merges it (`install_delta_at`).
-            install_delta_at(lin, delta.clone(), chain, small, dotted,
-                mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)))?;
+            install_delta_at(
+                lin,
+                delta.clone(),
+                chain,
+                small,
+                dotted,
+                mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)),
+            )?;
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -1142,8 +1294,15 @@ fn merge_one(
     coverage: LoraCoverage,
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
-    merge_one_in_key_order(unet, w, scale, kohya_to_dotted, coverage, report,
-        w.keys().map(str::to_string).collect::<Vec<_>>())
+    merge_one_in_key_order(
+        unet,
+        w,
+        scale,
+        kohya_to_dotted,
+        coverage,
+        report,
+        w.keys().map(str::to_string).collect::<Vec<_>>(),
+    )
 }
 
 // The production wrapper preserves its original unsorted HashMap traversal and Vec allocation.
@@ -1339,11 +1498,16 @@ fn merge_one_lokr(
                     // works on q4/q8 at plain-LoRA memory. The FULL `(alpha/rank)·scale` bakes into the
                     // structured `w2` (a structured residual carries no separate scale). Priced: the
                     // rebuilt factors, the scaled `w2` and the f32 casts (all factor-sized).
-                    let factor_work = f.iter().map(|(key, array)|
-                        ((*key).to_owned(), TensorFacts::of(array))).collect();
-                    let work = AdapterInstallWork::structured(&factor_work,
+                    let factor_work = f
+                        .iter()
+                        .map(|(key, array)| ((*key).to_owned(), TensorFacts::of(array)))
+                        .collect();
+                    let work = AdapterInstallWork::structured(
+                        &factor_work,
                         products.saturating_mul(2).saturating_add(factor_bytes),
-                        (alpha / rank) * scale == 0.0).at(&path);
+                        (alpha / rank) * scale == 0.0,
+                    )
+                    .at(&path);
                     guarded_install(work, || {
                         match build_lokr_factors(
                             (alpha / rank) * scale,
@@ -1367,8 +1531,14 @@ fn merge_one_lokr(
                     })?;
                 } else {
                     let base = dense_base(lin)?;
-                    let work = AdapterInstallWork::dense_lokr(TensorFacts::of(&base),
-                        f.values().map(TensorFacts::of).collect(), factor, products, unread(&base)).at(&path);
+                    let work = AdapterInstallWork::dense_lokr(
+                        TensorFacts::of(&base),
+                        f.values().map(TensorFacts::of).collect(),
+                        factor,
+                        products,
+                        unread(&base),
+                    )
+                    .at(&path);
                     guarded_install(work, || {
                         let delta = reconstruct_lokr_delta(
                             alpha,
@@ -1428,8 +1598,14 @@ fn merge_thirdparty_delta(
             // (a LoHa in particular is not Kronecker-deferrable), so the reconstructed delta rides
             // as a forward-time `Adapter::Lokr` residual (`x·δᵀ`, scale already folded in) and
             // stays resident; a dense base merges it (`install_delta_at`).
-            install_delta_at(lin, delta, chain, small, path,
-                mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)).saturating_mul(2))?;
+            install_delta_at(
+                lin,
+                delta,
+                chain,
+                small,
+                path,
+                mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)).saturating_mul(2),
+            )?;
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -1523,9 +1699,13 @@ pub fn apply_sdxl_adapters_with(
     coverage: LoraCoverage,
 ) -> Result<SdxlLoraReport> {
     #[cfg(test)]
-    { apply_sdxl_adapters_with_impl(unet, specs, coverage, None) }
+    {
+        apply_sdxl_adapters_with_impl(unet, specs, coverage, None)
+    }
     #[cfg(not(test))]
-    { apply_sdxl_adapters_with_impl(unet, specs, coverage) }
+    {
+        apply_sdxl_adapters_with_impl(unet, specs, coverage)
+    }
 }
 
 /// Supply complete file-key permutations only to the existing CPU-test producer. Validation is
@@ -1537,7 +1717,11 @@ pub(crate) fn apply_sdxl_adapters_in_key_order_for_test(
     coverage: LoraCoverage,
     orders: &[Vec<String>],
 ) -> Result<SdxlLoraReport> {
-    assert_eq!(orders.len(), specs.len(), "one complete order per configured adapter file");
+    assert_eq!(
+        orders.len(),
+        specs.len(),
+        "one complete order per configured adapter file"
+    );
     apply_sdxl_adapters_with_impl(unet, specs, coverage, Some(orders))
 }
 
@@ -1563,14 +1747,19 @@ fn apply_sdxl_adapters_with_impl(
     let lora_table = complete_table.as_ref().unwrap_or(&vendored_table);
 
     let mut report = SdxlLoraReport::default();
+    // One complete supplied order per configured file, consumed in file order (test fixture only).
     #[cfg(test)]
-    let mut file_index = 0usize;
+    let mut orders = orders.map(|orders| orders.iter());
     for spec in specs {
         // sc-26270: the adapter file's header floor is checked before it is read (no-op off device).
         if mlx_gen::ios_quantum::enabled() {
-            let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)
-                .map_err(|e| Error::Msg(e.to_string()))?;
-            mlx_gen::ios_quantum::before(crate::quantum::ADAPTER_LOAD, adapter_file_load_bytes(&headers)?)?;
+            let headers =
+                mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)
+                    .map_err(|e| Error::Msg(e.to_string()))?;
+            mlx_gen::ios_quantum::before(
+                crate::quantum::ADAPTER_LOAD,
+                adapter_file_load_bytes(&headers)?,
+            )?;
         }
         let w = Weights::from_file(&spec.path)?;
         // Adapter tensors are lazy too. Materialize their source payload before the prepared-file
@@ -1578,14 +1767,25 @@ fn apply_sdxl_adapters_with_impl(
         w.materialize()?;
         #[cfg(test)]
         let order = {
-            let order = orders.map(|orders| &orders[file_index]);
-            file_index += 1;
+            let order = orders.as_mut().map(|orders| {
+                orders
+                    .next()
+                    .expect("one complete order per configured adapter file")
+            });
             if let Some(order) = order {
                 let loaded: std::collections::BTreeSet<_> = w.keys().collect();
-                let supplied: std::collections::BTreeSet<_> = order.iter().map(String::as_str).collect();
-                assert_eq!(order.len(), loaded.len(), "complete file order must contain every loaded key exactly once");
+                let supplied: std::collections::BTreeSet<_> =
+                    order.iter().map(String::as_str).collect();
+                assert_eq!(
+                    order.len(),
+                    loaded.len(),
+                    "complete file order must contain every loaded key exactly once"
+                );
                 assert_eq!(supplied.len(), order.len(), "duplicate file-order key");
-                assert_eq!(supplied, loaded, "file order omitted/replaced a loaded alpha, unresolved or skipped key");
+                assert_eq!(
+                    supplied, loaded,
+                    "file order omitted/replaced a loaded alpha, unresolved or skipped key"
+                );
             }
             order
         };
@@ -1621,8 +1821,15 @@ fn apply_sdxl_adapters_with_impl(
             InstallKind::Lora => {
                 #[cfg(test)]
                 if let Some(order) = order {
-                    merge_one_in_key_order(unet, &w, spec.scale, lora_table, coverage, &mut report,
-                        order.iter().cloned())?;
+                    merge_one_in_key_order(
+                        unet,
+                        &w,
+                        spec.scale,
+                        lora_table,
+                        coverage,
+                        &mut report,
+                        order.iter().cloned(),
+                    )?;
                 } else {
                     merge_one(unet, &w, spec.scale, lora_table, coverage, &mut report)?;
                 }
@@ -1648,7 +1855,9 @@ fn apply_sdxl_adapters_with_impl(
 }
 
 fn alpha_cast_bytes(name: &str, elements: u64, is_f32: bool) -> u64 {
-    if is_f32 || !name.ends_with(".alpha") { return 0; }
+    if is_f32 || !name.ends_with(".alpha") {
+        return 0;
+    }
     // scalar_alpha casts the FULL array before taking first(); do not silently narrow accepted
     // third-party alpha shapes or pretend this existing payload read is an <=8-byte control read.
     mlx_gen::ios_quantum::allocated_bytes(elements.saturating_mul(width(Dtype::Float32)))
@@ -1660,57 +1869,92 @@ pub(crate) fn adapter_file_load_bytes(
     let mut raw = 0u64;
     let mut scalar = 0u64;
     for header in headers {
-        raw = raw.checked_add(header.data_bytes)
+        raw = raw
+            .checked_add(header.data_bytes)
             .ok_or_else(|| Error::Unsupported("sdxl adapter file accounting overflow".into()))?;
-        scalar = scalar.max(alpha_cast_bytes(&header.name,
-            header.element_count().map_err(|e| Error::Msg(e.to_string()))?,
-            header.dtype == mlx_gen::gen_core::weightsmeta::Dtype::F32));
+        scalar = scalar.max(alpha_cast_bytes(
+            &header.name,
+            header
+                .element_count()
+                .map_err(|e| Error::Msg(e.to_string()))?,
+            header.dtype == mlx_gen::gen_core::weightsmeta::Dtype::F32,
+        ));
     }
     raw.checked_add(scalar)
         .ok_or_else(|| Error::Unsupported("sdxl adapter alpha accounting overflow".into()))
 }
 
 pub(crate) fn adapter_file_payload_budget(payloads: &[(String, TensorFacts)]) -> (u64, u64) {
-    let raw = payloads.iter().fold(0u64, |n, (_, a)| n.saturating_add(a.bytes()));
-    let scalar = payloads.iter().map(|(name, a)| alpha_cast_bytes(name, a.elements(),
-        a.dtype == Dtype::Float32)).max().unwrap_or(0);
+    let raw = payloads
+        .iter()
+        .fold(0u64, |n, (_, a)| n.saturating_add(a.bytes()));
+    let scalar = payloads
+        .iter()
+        .map(|(name, a)| alpha_cast_bytes(name, a.elements(), a.dtype == Dtype::Float32))
+        .max()
+        .unwrap_or(0);
     (raw, raw.saturating_add(scalar))
 }
 
-fn header_tensor_fact(h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader) -> Result<TensorFacts> {
+fn header_tensor_fact(
+    h: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> Result<TensorFacts> {
     let shape = header_shape(h)?;
     let mut strides = vec![0; shape.len()];
     let mut stride = 1usize;
     for i in (0..shape.len()).rev() {
         strides[i] = stride;
-        stride = stride.checked_mul(shape[i].max(0) as usize)
+        stride = stride
+            .checked_mul(shape[i].max(0) as usize)
             .ok_or_else(|| Error::Msg("sdxl adapter native stride overflow".into()))?;
     }
-    Ok(TensorFacts { shape, dtype: mlx_gen::adapters::facts::native_header_dtype(h.dtype)?, strides })
+    Ok(TensorFacts {
+        shape,
+        dtype: mlx_gen::adapters::facts::native_header_dtype(h.dtype)?,
+        strides,
+    })
 }
 
 fn output_fact(shape: Vec<i32>, dtype: Dtype) -> TensorFacts {
     // A logical output declaration, not a fabricated final stride/backing identity.
-    TensorFacts { shape, dtype, strides: Vec::new() }
+    TensorFacts {
+        shape,
+        dtype,
+        strides: Vec::new(),
+    }
 }
 
 fn header_factor_work(factors: &HeaderFactors<'_>) -> Result<BTreeMap<String, TensorFacts>> {
-    factors.iter().filter(|(role, _)| role.as_str() != "alpha")
-        .map(|(role, header)| Ok((role.clone(), header_tensor_fact(header)?))).collect()
+    factors
+        .iter()
+        .filter(|(role, _)| role.as_str() != "alpha")
+        .map(|(role, header)| Ok((role.clone(), header_tensor_fact(header)?)))
+        .collect()
 }
 
 fn factor_work_products(factors: &BTreeMap<String, TensorFacts>, dtype: Dtype) -> u64 {
-    [("lokr_w1_a", "lokr_w1_b"), ("lokr_w2_a", "lokr_w2_b")].iter()
+    [("lokr_w1_a", "lokr_w1_b"), ("lokr_w2_a", "lokr_w2_b")]
+        .iter()
         .filter_map(|(a, b)| Some((factors.get(*a)?, factors.get(*b)?)))
-        .fold(0u64, |n, (a, b)| n.saturating_add(
-            (a.shape.first().copied().unwrap_or(0).max(0) as u64)
-                .saturating_mul(b.shape.get(1).copied().unwrap_or(0).max(0) as u64)
-                .saturating_mul(width(dtype))))
+        .fold(0u64, |n, (a, b)| {
+            n.saturating_add(
+                (a.shape.first().copied().unwrap_or(0).max(0) as u64)
+                    .saturating_mul(b.shape.get(1).copied().unwrap_or(0).max(0) as u64)
+                    .saturating_mul(width(dtype)),
+            )
+        })
 }
 
 fn target_weight_fact(target: &HeaderTarget) -> TensorFacts {
-    let shape = if target.linear { target.shape.clone() } else {
-        vec![target.shape[0], target.shape[2], target.shape[3], target.shape[1]]
+    let shape = if target.linear {
+        target.shape.clone()
+    } else {
+        vec![
+            target.shape[0],
+            target.shape[2],
+            target.shape[3],
+            target.shape[1],
+        ]
     };
     output_fact(shape, target.weight_dtype)
 }
@@ -1784,8 +2028,12 @@ fn tucker_shape(t: &[i32], a: &[i32], b: &[i32]) -> Result<Vec<i32>> {
     let contracts = |x: i32, y: i32| x == y || (x == 1 && y > 0) || (y == 1 && x > 0);
     // Native einsum broadcasts singleton contracting axes before batch_tensordot. A zero axis
     // cannot broadcast to one at that later operator, while equal zero axes remain native-valid.
-    if t.len() != 4 || a.len() != 2 || b.len() != 2
-        || !contracts(t[0], a[0]) || !contracts(t[1], b[0]) {
+    if t.len() != 4
+        || a.len() != 2
+        || b.len() != 2
+        || !contracts(t[0], a[0])
+        || !contracts(t[1], b[0])
+    {
         return Err(Error::Msg(
             "sdxl adapter tucker operands do not satisfy ijhw,ip,jr->prhw".into(),
         ));
@@ -1824,42 +2072,67 @@ fn factor_product_shape(
 /// Header counterpart of one actual selected factor rebuild. Only completed logical outputs are
 /// appended: a second-factor refusal keeps the first product but never invents the second result.
 fn prepared_factor(
-    factors: &HeaderFactors<'_>, full: &str, a: &str, b: &str, tucker: Option<&str>,
+    factors: &HeaderFactors<'_>,
+    full: &str,
+    a: &str,
+    b: &str,
+    tucker: Option<&str>,
     work: &mut Vec<AdapterWork>,
 ) -> Result<TensorFacts> {
-    if let Some(header) = factors.get(full) { return header_tensor_fact(header); }
+    if let Some(header) = factors.get(full) {
+        return header_tensor_fact(header);
+    }
     let a = header_tensor_fact(required_factor(factors, a)?)?;
     let b = header_tensor_fact(required_factor(factors, b)?)?;
     let result = if let Some(t) = tucker.and_then(|key| factors.get(key)) {
         let t = header_tensor_fact(t)?;
-        output_fact(tucker_shape(&t.shape, &a.shape, &b.shape)?,
-            Dtype::from_promoting_types(t.dtype, Dtype::from_promoting_types(a.dtype, b.dtype)))
+        output_fact(
+            tucker_shape(&t.shape, &a.shape, &b.shape)?,
+            Dtype::from_promoting_types(t.dtype, Dtype::from_promoting_types(a.dtype, b.dtype)),
+        )
     } else {
-        output_fact(matmul_shape(&a.shape, &b.shape)?, Dtype::from_promoting_types(a.dtype, b.dtype))
+        output_fact(
+            matmul_shape(&a.shape, &b.shape)?,
+            Dtype::from_promoting_types(a.dtype, b.dtype),
+        )
     };
     work.push(AdapterWork::Preparation(vec![result.clone()]));
     Ok(result)
 }
 
 fn prepared_kron(
-    factors: &HeaderFactors<'_>, work: &mut Vec<AdapterWork>,
+    factors: &HeaderFactors<'_>,
+    work: &mut Vec<AdapterWork>,
 ) -> Result<(Vec<i32>, Vec<i32>)> {
     let one = prepared_factor(factors, "lokr_w1", "lokr_w1_a", "lokr_w1_b", None, work)?;
-    let two = prepared_factor(factors, "lokr_w2", "lokr_w2_a", "lokr_w2_b", Some("lokr_t2"), work)?;
+    let two = prepared_factor(
+        factors,
+        "lokr_w2",
+        "lokr_w2_a",
+        "lokr_w2_b",
+        Some("lokr_t2"),
+        work,
+    )?;
     let mut left = one.shape.clone();
     left.resize(left.len().max(two.shape.len()), 1);
     let rank = left.len().max(two.shape.len());
     let mut output = vec![1; rank];
     for (shape, _) in [(&left, one.dtype), (&two.shape, two.dtype)] {
         for (out, dim) in output[rank - shape.len()..].iter_mut().zip(shape) {
-            *out = i32::checked_mul(*out, *dim).ok_or_else(|| Error::Msg("sdxl kron dimension overflow".into()))?;
+            *out = i32::checked_mul(*out, *dim)
+                .ok_or_else(|| Error::Msg("sdxl kron dimension overflow".into()))?;
         }
     }
     let dtype = Dtype::from_promoting_types(one.dtype, two.dtype);
-    work.push(AdapterWork::Preparation(vec![output_fact(output.clone(), dtype)]));
+    work.push(AdapterWork::Preparation(vec![output_fact(
+        output.clone(),
+        dtype,
+    )]));
     // Scalar(scale) is created only AFTER kron succeeds, before the final reshape.
-    work.push(AdapterWork::Preparation(vec![output_fact(Vec::new(), Dtype::Float32),
-        output_fact(output, Dtype::from_promoting_types(dtype, Dtype::Float32))]));
+    work.push(AdapterWork::Preparation(vec![
+        output_fact(Vec::new(), Dtype::Float32),
+        output_fact(output, Dtype::from_promoting_types(dtype, Dtype::Float32)),
+    ]));
     Ok((one.shape, two.shape))
 }
 
@@ -1916,7 +2189,11 @@ struct HeaderAdapterFile {
 enum HeaderAdapterStep {
     File(usize),
     Parse(usize, Vec<usize>),
-    Group { file: usize, raw: String, roles: Vec<(String, Vec<usize>)> },
+    Group {
+        file: usize,
+        raw: String,
+        roles: Vec<(String, Vec<usize>)>,
+    },
     End,
 }
 
@@ -1940,19 +2217,39 @@ pub(crate) struct AdapterOutcome<'a> {
 }
 
 fn header_classification(
-    name: &str, kind: InstallKind, lora: &BTreeMap<String, String>,
+    name: &str,
+    kind: InstallKind,
+    lora: &BTreeMap<String, String>,
     vendored: &BTreeMap<String, String>,
 ) -> Option<(String, String)> {
     use mlx_gen::gen_core::weightsmeta::split_factor_key;
     match kind {
-        InstallKind::Lora => classify_key(name, lora).map(|(path, role)| (path,
-            match role { Role::Down => "down", Role::Up => "up", Role::Alpha => "alpha" }.into())),
+        InstallKind::Lora => classify_key(name, lora).map(|(path, role)| {
+            (
+                path,
+                match role {
+                    Role::Down => "down",
+                    Role::Up => "up",
+                    Role::Alpha => "alpha",
+                }
+                .into(),
+            )
+        }),
         InstallKind::Lokr => classify_lokr_key(name, vendored).map(|(p, r)| (p, r.into())),
-        InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha => name.strip_suffix(".alpha")
+        InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha => name
+            .strip_suffix(".alpha")
             .map(|p| (p.to_owned(), "alpha".into()))
-            .or_else(|| split_factor_key(name, if kind == InstallKind::ThirdPartyLokr {
-                &LOKR_TP_SUFFIXES
-            } else { &LOHA_TP_SUFFIXES }).map(|(p, r)| (p.to_owned(), r.to_owned()))),
+            .or_else(|| {
+                split_factor_key(
+                    name,
+                    if kind == InstallKind::ThirdPartyLokr {
+                        &LOKR_TP_SUFFIXES
+                    } else {
+                        &LOHA_TP_SUFFIXES
+                    },
+                )
+                .map(|(p, r)| (p.to_owned(), r.to_owned()))
+            }),
     }
 }
 
@@ -1966,48 +2263,87 @@ pub(crate) fn visit_configured_adapter_outcomes(
     config: &crate::config::UNetConfig,
     mut visit: impl FnMut(AdapterOutcome<'_>) -> Result<()>,
 ) -> Result<()> {
-    use mlx_gen::gen_core::weightsmeta::{safetensors_file_metadata, safetensors_path_tensor_headers};
+    use mlx_gen::gen_core::weightsmeta::{
+        safetensors_file_metadata, safetensors_path_tensor_headers,
+    };
     use serde_json::json;
     let (mut targets, vendored, complete) = header_targets(unet_headers, config, spec)?;
     let coverage = configured_lora_coverage();
-    let lora = if coverage == LoraCoverage::Complete { &complete } else { &vendored };
+    let lora = if coverage == LoraCoverage::Complete {
+        &complete
+    } else {
+        &vendored
+    };
     let mut files = Vec::new();
     let mut steps = Vec::new();
     for (file, adapter) in spec.adapters.iter().enumerate() {
         let captured = (|| -> Result<_> {
-            let headers = safetensors_path_tensor_headers(&adapter.path).map_err(|e| Error::Msg(e.to_string()))?;
-            let metadata = safetensors_file_metadata(&adapter.path).map_err(|e| Error::Msg(e.to_string()))?;
+            let headers = safetensors_path_tensor_headers(&adapter.path)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let metadata =
+                safetensors_file_metadata(&adapter.path).map_err(|e| Error::Msg(e.to_string()))?;
             Ok((headers, metadata))
         })();
         let entry = match captured {
             Ok((headers, metadata)) => {
-                let kind = install_kind(adapter.kind, metadata.get("networkType").map(String::as_str),
-                    headers.iter().map(|h| h.name.as_str())).map_err(|e| e.to_string());
-                HeaderAdapterFile { headers, metadata, kind, capture_error: None }
+                let kind = install_kind(
+                    adapter.kind,
+                    metadata.get("networkType").map(String::as_str),
+                    headers.iter().map(|h| h.name.as_str()),
+                )
+                .map_err(|e| e.to_string());
+                HeaderAdapterFile {
+                    headers,
+                    metadata,
+                    kind,
+                    capture_error: None,
+                }
             }
-            Err(error) => HeaderAdapterFile { headers: Vec::new(), metadata: BTreeMap::new(),
-                kind: Err(error.to_string()), capture_error: Some(error.to_string()) },
+            Err(error) => HeaderAdapterFile {
+                headers: Vec::new(),
+                metadata: BTreeMap::new(),
+                kind: Err(error.to_string()),
+                capture_error: Some(error.to_string()),
+            },
         };
         steps.push(HeaderAdapterStep::File(file));
-        let invalid_alpha = entry.headers.iter().enumerate().filter_map(|(index, header)| {
-            let kind = *entry.kind.as_ref().ok()?;
-            let (_, role) = header_classification(&header.name, kind, lora, &vendored)?;
-            if role != "alpha" { return None; }
-            let count = header.element_count().ok()?;
-            (count == 0 || (kind == InstallKind::Lora && count != 1)).then_some(index)
-        }).collect();
+        let invalid_alpha = entry
+            .headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| {
+                let kind = *entry.kind.as_ref().ok()?;
+                let (_, role) = header_classification(&header.name, kind, lora, &vendored)?;
+                if role != "alpha" {
+                    return None;
+                }
+                let count = header.element_count().ok()?;
+                (count == 0 || (kind == InstallKind::Lora && count != 1)).then_some(index)
+            })
+            .collect();
         steps.push(HeaderAdapterStep::Parse(file, invalid_alpha));
         if let Ok(kind) = &entry.kind {
             let mut groups: BTreeMap<String, BTreeMap<String, Vec<usize>>> = BTreeMap::new();
             for (index, header) in entry.headers.iter().enumerate() {
-                if let Some((raw, role)) = header_classification(&header.name, *kind, lora, &vendored) {
-                    groups.entry(raw).or_default().entry(role).or_default().push(index);
+                if let Some((raw, role)) =
+                    header_classification(&header.name, *kind, lora, &vendored)
+                {
+                    groups
+                        .entry(raw)
+                        .or_default()
+                        .entry(role)
+                        .or_default()
+                        .push(index);
                 }
             }
             // TP groups remain raw-key ordered SEQUENTIAL installs, even when two raw groups resolve
             // to the same module. Only actual classified-role collisions are winner alternatives.
             for (raw, roles) in groups {
-                steps.push(HeaderAdapterStep::Group { file, raw, roles: roles.into_iter().collect() });
+                steps.push(HeaderAdapterStep::Group {
+                    file,
+                    raw,
+                    roles: roles.into_iter().collect(),
+                });
             }
         }
         steps.push(HeaderAdapterStep::End);
@@ -2016,7 +2352,8 @@ pub(crate) fn visit_configured_adapter_outcomes(
     let mut work = Vec::new();
     let mut semantic: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut matched = 0usize;
-    let render = |targets: &BTreeMap<String, HeaderTarget>, semantic: &[(usize, serde_json::Value)]| {
+    let render = |targets: &BTreeMap<String, HeaderTarget>,
+                  semantic: &[(usize, serde_json::Value)]| {
         let target_facts: BTreeMap<_, _> = targets.iter().map(|(name, t)| (name, json!({
             "shape":t.shape,"kind":if t.linear{"linear"}else{"conv"},"source_packed_bits":t.source_packed_bits,
             "weight_dtype":format!("{:?}",t.weight_dtype),"scales_dtype":t.scales_dtype.map(|d|format!("{d:?}")),
@@ -2041,10 +2378,19 @@ pub(crate) fn visit_configured_adapter_outcomes(
             "outcome_authority":"conservative_raw_order_superset"})
     };
     if steps.is_empty() {
-        return visit(AdapterOutcome { work: &work, refusal: None, facts: render(&targets, &semantic) });
+        return visit(AdapterOutcome {
+            work: &work,
+            refusal: None,
+            facts: render(&targets, &semantic),
+        });
     }
     let frame = |step, work_len, semantic_len, matched| HeaderWorldFrame {
-        step, work_len, semantic_len, matched, applied: false, undo: Vec::new(),
+        step,
+        work_len,
+        semantic_len,
+        matched,
+        applied: false,
+        undo: Vec::new(),
         choices: match &steps[step] {
             HeaderAdapterStep::Group { roles, .. } => vec![0; roles.len()],
             HeaderAdapterStep::Parse(_, invalid) if !invalid.is_empty() => vec![0],
@@ -2057,12 +2403,17 @@ pub(crate) fn visit_configured_adapter_outcomes(
             work.truncate(active.work_len);
             semantic.truncate(active.semantic_len);
             matched = active.matched;
-            for (name, target) in active.undo.drain(..) { targets.insert(name, target); }
+            for (name, target) in active.undo.drain(..) {
+                targets.insert(name, target);
+            }
             let mut next = false;
             if let HeaderAdapterStep::Group { roles, .. } = &steps[active.step] {
                 for index in (0..roles.len()).rev() {
                     active.choices[index] += 1;
-                    if active.choices[index] < roles[index].1.len() { next = true; break; }
+                    if active.choices[index] < roles[index].1.len() {
+                        next = true;
+                        break;
+                    }
                     active.choices[index] = 0;
                 }
             }
@@ -2072,16 +2423,26 @@ pub(crate) fn visit_configured_adapter_outcomes(
                     next = active.choices[0] < invalid.len();
                 }
             }
-            if !next { stack.pop(); continue; }
+            if !next {
+                stack.pop();
+                continue;
+            }
         }
         active.applied = true;
         let result = (|| -> Result<()> {
             match &steps[active.step] {
                 HeaderAdapterStep::File(file) => {
                     let entry = &files[*file];
-                    if let Some(error) = &entry.capture_error { return Err(Error::Msg(error.clone())); }
-                    work.push(AdapterWork::FileMaterialized(entry.headers.iter().map(|h|
-                        Ok((h.name.clone(), header_tensor_fact(h)?))).collect::<Result<_>>()?));
+                    if let Some(error) = &entry.capture_error {
+                        return Err(Error::Msg(error.clone()));
+                    }
+                    work.push(AdapterWork::FileMaterialized(
+                        entry
+                            .headers
+                            .iter()
+                            .map(|h| Ok((h.name.clone(), header_tensor_fact(h)?)))
+                            .collect::<Result<_>>()?,
+                    ));
                     let kind = entry.kind.as_ref().map_err(|e| Error::Msg(e.clone()))?;
                     work.push(AdapterWork::Selected(*kind));
                 }
@@ -2089,17 +2450,32 @@ pub(crate) fn visit_configured_adapter_outcomes(
                     let entry = &files[*file];
                     let kind = *entry.kind.as_ref().map_err(|e| Error::Msg(e.clone()))?;
                     for header in &entry.headers {
-                        let Some((_, role)) = header_classification(&header.name, kind, lora, &vendored) else { continue; };
-                        if role != "alpha" { continue; }
+                        let Some((_, role)) =
+                            header_classification(&header.name, kind, lora, &vendored)
+                        else {
+                            continue;
+                        };
+                        if role != "alpha" {
+                            continue;
+                        }
                         let fact = header_tensor_fact(header)?;
                         let count = fact.elements();
                         let valid = count != 0 && (kind != InstallKind::Lora || count == 1);
-                        if !valid { continue; }
+                        if !valid {
+                            continue;
+                        }
                         // Scalar extraction copies f32; its cast is NOT a retained sharedData root.
-                        let scratch = if fact.dtype == Dtype::Float32 { 0 } else {
-                            mlx_gen::ios_quantum::allocated_bytes(count.saturating_mul(width(Dtype::Float32)))
+                        let scratch = if fact.dtype == Dtype::Float32 {
+                            0
+                        } else {
+                            mlx_gen::ios_quantum::allocated_bytes(
+                                count.saturating_mul(width(Dtype::Float32)),
+                            )
                         };
-                        work.push(AdapterWork::AlphaRead { key: header.name.clone(), scratch });
+                        work.push(AdapterWork::AlphaRead {
+                            key: header.name.clone(),
+                            scratch,
+                        });
                     }
                     if !invalid.is_empty() {
                         let header = &entry.headers[invalid[active.choices[0]]];
@@ -2108,35 +2484,78 @@ pub(crate) fn visit_configured_adapter_outcomes(
                         // invalid operand rather than borrowing one invalid key's smaller workspace.
                         if kind == InstallKind::Lora {
                             let fact = header_tensor_fact(header)?;
-                            let scratch = if fact.dtype == Dtype::Float32 { 0 } else {
-                                mlx_gen::ios_quantum::allocated_bytes(fact.elements().saturating_mul(4))
+                            let scratch = if fact.dtype == Dtype::Float32 {
+                                0
+                            } else {
+                                mlx_gen::ios_quantum::allocated_bytes(
+                                    fact.elements().saturating_mul(4),
+                                )
                             };
-                            work.push(AdapterWork::AlphaRead { key: header.name.clone(), scratch });
+                            work.push(AdapterWork::AlphaRead {
+                                key: header.name.clone(),
+                                scratch,
+                            });
                         }
-                        return Err(Error::Msg(format!("sdxl adapter alpha shape violates actual scalar conversion: {}", header.name)));
+                        return Err(Error::Msg(format!(
+                            "sdxl adapter alpha shape violates actual scalar conversion: {}",
+                            header.name
+                        )));
                     }
                 }
                 HeaderAdapterStep::Group { file, raw, roles } => {
                     let entry = &files[*file];
                     let kind = *entry.kind.as_ref().map_err(|e| Error::Msg(e.clone()))?;
-                    let factors: HeaderFactors<'_> = roles.iter().zip(&active.choices)
-                        .map(|((role, candidates), choice)| (role.clone(), &entry.headers[candidates[*choice]])).collect();
-                    let resolved = if matches!(kind, InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha) {
+                    let factors: HeaderFactors<'_> = roles
+                        .iter()
+                        .zip(&active.choices)
+                        .map(|((role, candidates), choice)| {
+                            (role.clone(), &entry.headers[candidates[*choice]])
+                        })
+                        .collect();
+                    let resolved = if matches!(
+                        kind,
+                        InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha
+                    ) {
                         resolve_lokr_path(raw, &vendored).map(str::to_owned)
-                    } else { Some(raw.clone()) };
+                    } else {
+                        Some(raw.clone())
+                    };
                     if let Some(path) = resolved {
-                        let rows = factors.get("up").map(|h| header_shape(h)).transpose()?
-                            .and_then(|shape| shape.first().copied()).unwrap_or(0);
-                        let routes = if kind == InstallKind::Lora { lora_output_rows(&path, rows) }
-                            else { vec![(path, None)] };
+                        let rows = factors
+                            .get("up")
+                            .map(|h| header_shape(h))
+                            .transpose()?
+                            .and_then(|shape| shape.first().copied())
+                            .unwrap_or(0);
+                        let routes = if kind == InstallKind::Lora {
+                            lora_output_rows(&path, rows)
+                        } else {
+                            vec![(path, None)]
+                        };
                         for (name, _) in routes {
-                            if let Some(target) = targets.get(&name) { active.undo.push((name, target.clone())); }
+                            if let Some(target) = targets.get(&name) {
+                                active.undo.push((name, target.clone()));
+                            }
                         }
                     }
                     let mut installed = Vec::new();
-                    let result = selected_header_group(raw, factors, kind, &entry.metadata,
-                        &spec.adapters[*file], coverage, &vendored, &mut targets, &mut work,
-                        &mut installed, &mut matched);
+                    let result = selected_header_group(
+                        raw,
+                        factors,
+                        HeaderGroupContext {
+                            kind,
+                            metadata: &entry.metadata,
+                            adapter: &spec.adapters[*file],
+                            coverage,
+                            vendored: &vendored,
+                        },
+                        HeaderGroupSinks {
+                            targets: &mut targets,
+                            work: &mut work,
+                            installed: &mut installed,
+                            matched: &mut matched,
+                        },
+                    );
                     semantic.extend(installed.into_iter().map(|v| (*file, v)));
                     result?;
                 }
@@ -2146,11 +2565,17 @@ pub(crate) fn visit_configured_adapter_outcomes(
         })();
         let next = active.step + 1;
         if let Err(error) = result {
-            visit(AdapterOutcome { work: &work, refusal: Some(error.to_string()), facts: render(&targets, &semantic) })?;
+            visit(AdapterOutcome {
+                work: &work,
+                refusal: Some(error.to_string()),
+                facts: render(&targets, &semantic),
+            })?;
         } else if next == steps.len() {
-            visit(AdapterOutcome { work: &work,
+            visit(AdapterOutcome {
+                work: &work,
                 refusal: (matched == 0).then(|| "sdxl: no adapter target modules matched".into()),
-                facts: render(&targets, &semantic) })?;
+                facts: render(&targets, &semantic),
+            })?;
         } else {
             stack.push(frame(next, work.len(), semantic.len(), matched));
         }
@@ -2170,12 +2595,18 @@ pub(crate) fn configured_adapter_work_with(
     let mut count = 0u64;
     visit_configured_adapter_outcomes(spec, unet_headers, config, |outcome| {
         count = count.saturating_add(1);
-        if let Some(error) = outcome.refusal { refusal.get_or_insert(error); }
-        else if first.is_none() { first = Some((outcome.facts, outcome.work.to_vec())); }
+        if let Some(error) = outcome.refusal {
+            refusal.get_or_insert(error);
+        } else if first.is_none() {
+            first = Some((outcome.facts, outcome.work.to_vec()));
+        }
         Ok(())
     })?;
-    let Some((mut facts, work)) = first else { return Err(Error::Msg(refusal.unwrap_or_else(||
-        "sdxl adapter outcome visitor returned no world".into()))); };
+    let Some((mut facts, work)) = first else {
+        return Err(Error::Msg(refusal.unwrap_or_else(|| {
+            "sdxl adapter outcome visitor returned no world".into()
+        })));
+    };
     if count > 1 {
         facts["outcome_space"] = serde_json::json!({"kind":"lazy_classified_role_winners",
             "authority":"conservative_superset","selected_outcome_count":count,
@@ -2186,213 +2617,323 @@ pub(crate) fn configured_adapter_work_with(
 
 /// One selected BTree group, sharing the existing install numeric constructors. Mutation is
 /// limited to the routed targets; the visitor journals those targets before entering this function.
+/// The read-only facts one selected header group is installed against.
+#[derive(Clone, Copy)]
+struct HeaderGroupContext<'a> {
+    kind: InstallKind,
+    metadata: &'a BTreeMap<String, String>,
+    adapter: &'a AdapterSpec,
+    coverage: LoraCoverage,
+    vendored: &'a BTreeMap<String, String>,
+}
+
+/// The targets and journals one selected header group mutates.
+struct HeaderGroupSinks<'a> {
+    targets: &'a mut BTreeMap<String, HeaderTarget>,
+    work: &'a mut Vec<AdapterWork>,
+    installed: &'a mut Vec<serde_json::Value>,
+    matched: &'a mut usize,
+}
+
 fn selected_header_group(
-    raw: &str, factors: HeaderFactors<'_>, kind: InstallKind,
-    metadata: &BTreeMap<String, String>, adapter: &AdapterSpec, coverage: LoraCoverage,
-    vendored: &BTreeMap<String, String>, targets: &mut BTreeMap<String, HeaderTarget>,
-    work: &mut Vec<AdapterWork>, installed: &mut Vec<serde_json::Value>, matched: &mut usize,
+    raw: &str,
+    factors: HeaderFactors<'_>,
+    group: HeaderGroupContext<'_>,
+    sinks: HeaderGroupSinks<'_>,
 ) -> Result<()> {
+    let HeaderGroupContext {
+        kind,
+        metadata,
+        adapter,
+        coverage,
+        vendored,
+    } = group;
+    let HeaderGroupSinks {
+        targets,
+        work,
+        installed,
+        matched,
+    } = sinks;
     use serde_json::json;
-    let cfg = LoraAdapterMeta::from_metadata(metadata.get(LORA_ADAPTER_METADATA_KEY).map(String::as_str));
-        for (raw, factors) in std::iter::once((raw.to_owned(), factors)) {
-            let path = if matches!(
-                kind,
-                InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha
-            ) {
-                let Some(path) = resolve_lokr_path(&raw, &vendored) else {
-                    continue;
-                };
-                path.to_owned()
-            } else {
-                raw
+    let cfg =
+        LoraAdapterMeta::from_metadata(metadata.get(LORA_ADAPTER_METADATA_KEY).map(String::as_str));
+    for (raw, factors) in std::iter::once((raw.to_owned(), factors)) {
+        let path = if matches!(
+            kind,
+            InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha
+        ) {
+            let Some(path) = resolve_lokr_path(&raw, vendored) else {
+                continue;
             };
-            if kind == InstallKind::Lora {
-                let (Some(down), Some(up)) = (factors.get("down"), factors.get("up")) else {
+            path.to_owned()
+        } else {
+            raw
+        };
+        if kind == InstallKind::Lora {
+            let (Some(down), Some(up)) = (factors.get("down"), factors.get("up")) else {
+                continue;
+            };
+            let ds = header_shape(down)?;
+            let us = header_shape(up)?;
+            let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+            let _ = cfg_alpha; // Value-only scale operand: it selects no SDXL install/forward graph.
+            if ds.len() == 4 || us.len() == 4 {
+                if coverage != LoraCoverage::Complete {
+                    continue;
+                }
+                if ds.len() != 4
+                    || us.len() != 4
+                    || us[1] != ds[0]
+                    || shape_elements(&us[2..])? != 1
+                {
+                    return Err(Error::Msg(
+                        "sdxl conv LoRA cannot reshape/multiply its actual factors".into(),
+                    ));
+                }
+                let delta = vec![us[0], ds[1], ds[2], ds[3]];
+                // conv_lora_delta executes before routing, including non-routable paths.
+                let down_fact = header_tensor_fact(down)?;
+                let up_fact = header_tensor_fact(up)?;
+                for fact in [&up_fact, &down_fact] {
+                    if fact.dtype != Dtype::Float32 {
+                        work.push(AdapterWork::Preparation(vec![output_fact(
+                            fact.shape.clone(),
+                            Dtype::Float32,
+                        )]));
+                    }
+                }
+                let product = vec![
+                    us[0],
+                    ds[1]
+                        .checked_mul(ds[2])
+                        .and_then(|d| d.checked_mul(ds[3]))
+                        .ok_or_else(|| {
+                            Error::Msg("sdxl conv LoRA reshape dimension overflow".into())
+                        })?,
+                ];
+                work.push(AdapterWork::Preparation(vec![output_fact(
+                    product.clone(),
+                    Dtype::Float32,
+                )]));
+                if up_fact.dtype != Dtype::Float32 {
+                    work.push(AdapterWork::Preparation(vec![
+                        output_fact(product.clone(), up_fact.dtype),
+                        output_fact(product.clone(), Dtype::Float32),
+                    ]));
+                }
+                work.push(AdapterWork::Preparation(vec![
+                    output_fact(Vec::new(), Dtype::Float32),
+                    output_fact(product, Dtype::Float32),
+                ]));
+                let Some(target) = targets.get_mut(&path) else {
                     continue;
                 };
-                let ds = header_shape(down)?;
-                let us = header_shape(up)?;
-                let (cfg_alpha, cfg_rank) =
-                    cfg.as_ref().map_or((None, None), |c| c.effective(&path));
-                let _ = cfg_alpha; // Value-only scale operand: it selects no SDXL install/forward graph.
-                if ds.len() == 4 || us.len() == 4 {
-                    if coverage != LoraCoverage::Complete {
-                        continue;
-                    }
-                    if ds.len() != 4
-                        || us.len() != 4
-                        || us[1] != ds[0]
-                        || shape_elements(&us[2..])? != 1
-                    {
-                        return Err(Error::Msg(
-                            "sdxl conv LoRA cannot reshape/multiply its actual factors".into(),
-                        ));
-                    }
-                    let delta = vec![us[0], ds[1], ds[2], ds[3]];
-                    // conv_lora_delta executes before routing, including non-routable paths.
-                    let down_fact = header_tensor_fact(down)?;
-                    let up_fact = header_tensor_fact(up)?;
-                    for fact in [&up_fact, &down_fact] {
-                        if fact.dtype != Dtype::Float32 {
-                            work.push(AdapterWork::Preparation(vec![output_fact(fact.shape.clone(), Dtype::Float32)]));
-                        }
-                    }
-                    let product = vec![us[0], ds[1].checked_mul(ds[2]).and_then(|d| d.checked_mul(ds[3]))
-                        .ok_or_else(|| Error::Msg("sdxl conv LoRA reshape dimension overflow".into()))?];
-                    work.push(AdapterWork::Preparation(vec![output_fact(product.clone(), Dtype::Float32)]));
-                    if up_fact.dtype != Dtype::Float32 {
-                        work.push(AdapterWork::Preparation(vec![output_fact(product.clone(), up_fact.dtype),
-                            output_fact(product.clone(), Dtype::Float32)]));
-                    }
-                    work.push(AdapterWork::Preparation(vec![output_fact(Vec::new(), Dtype::Float32),
-                        output_fact(product, Dtype::Float32)]));
-                    let Some(target) = targets.get_mut(&path) else {
-                        continue;
-                    };
-                    if target.linear && (delta[2] != 1 || delta[3] != 1) {
-                        continue;
-                    }
-                    let output = if target.linear { delta[..2].to_vec() } else { delta.clone() };
-                    let base = target_weight_fact(target);
-                    let unread_base = if target.unread { base.bytes() } else { 0 };
-                    let down_work = header_tensor_fact(down)?;
-                    let up_work = header_tensor_fact(up)?;
-                    let copy = |a: &TensorFacts| if a.dtype == Dtype::Float32 { 0 } else {
-                        a.elements().saturating_mul(width(Dtype::Float32))
-                    };
-                    let small = copy(&down_work).saturating_add(copy(&up_work));
-                    let packed = target.source_packed_bits.is_some();
-                    let point = if target.linear {
-                        AdapterInstallWork::delta(if packed { None } else { Some(base) },
-                            output_fact(output.clone(), Dtype::Float32), &lora_chain(up_work.dtype),
-                            small, if packed { 0 } else { unread_base },
-                            mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)))
+                if target.linear && (delta[2] != 1 || delta[3] != 1) {
+                    continue;
+                }
+                let output = if target.linear {
+                    delta[..2].to_vec()
+                } else {
+                    delta.clone()
+                };
+                let base = target_weight_fact(target);
+                let unread_base = if target.unread { base.bytes() } else { 0 };
+                let down_work = header_tensor_fact(down)?;
+                let up_work = header_tensor_fact(up)?;
+                let copy = |a: &TensorFacts| {
+                    if a.dtype == Dtype::Float32 {
+                        0
                     } else {
-                        AdapterInstallWork::conv(base, output_fact(delta, Dtype::Float32),
-                            up_work.dtype, small, unread_base)
-                    }.at(&path);
-                    work.push(AdapterWork::GuardAttempt(point));
-                    if !packed {
-                        target.shape = broadcast_shape(&target.shape, &output)?;
-                        target.unread = false;
+                        a.elements().saturating_mul(width(Dtype::Float32))
                     }
-                    if let Some(AdapterWork::GuardAttempt(point)) = work.last_mut() {
-                        point.installed = vec![if packed { output_fact(output, Dtype::Float32) }
-                            else { target_weight_fact(target) }];
-                    }
-                    if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
-                        work.push(AdapterWork::Install(point.clone()));
-                    }
-                    *matched += 1;
-                    installed.push(json!({"target":path,"kind":"conv_lora","reconstruction":"f32_product_source_roundtrip",
+                };
+                let small = copy(&down_work).saturating_add(copy(&up_work));
+                let packed = target.source_packed_bits.is_some();
+                let point = if target.linear {
+                    AdapterInstallWork::delta(
+                        if packed { None } else { Some(base) },
+                        output_fact(output.clone(), Dtype::Float32),
+                        &lora_chain(up_work.dtype),
+                        small,
+                        if packed { 0 } else { unread_base },
+                        mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)),
+                    )
+                } else {
+                    AdapterInstallWork::conv(
+                        base,
+                        output_fact(delta, Dtype::Float32),
+                        up_work.dtype,
+                        small,
+                        unread_base,
+                    )
+                }
+                .at(&path);
+                work.push(AdapterWork::GuardAttempt(point));
+                if !packed {
+                    target.shape = broadcast_shape(&target.shape, &output)?;
+                    target.unread = false;
+                }
+                if let Some(AdapterWork::GuardAttempt(point)) = work.last_mut() {
+                    point.installed = vec![if packed {
+                        output_fact(output, Dtype::Float32)
+                    } else {
+                        target_weight_fact(target)
+                    }];
+                }
+                if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
+                    work.push(AdapterWork::Install(point.clone()));
+                }
+                *matched += 1;
+                installed.push(json!({"target":path,"kind":"conv_lora","reconstruction":"f32_product_source_roundtrip",
                         "target_shape":target.shape,"installed":if target.source_packed_bits.is_some(){"materialized_delta_residual"}else{"merged_dense"},
                         "installed_dtype":if target.source_packed_bits.is_some(){"Float32".to_owned()}else{format!("{:?}",target.weight_dtype)},
                         "factor_layouts":factor_semantic_facts(&factors)?,"configured_zero_branch":false}));
-                    continue;
+                continue;
+            }
+            if ds.len() != 2 || us.len() != 2 {
+                continue;
+            }
+            if coverage == LoraCoverage::Vendored && is_complete_only(&path) {
+                continue;
+            }
+            let rank = cfg_rank.unwrap_or(ds[0] as f32);
+            for (route, rows) in lora_output_rows(&path, us[0]) {
+                if let Some((lo, hi)) = rows {
+                    work.push(AdapterWork::Preparation(vec![
+                        output_fact(vec![hi - lo], Dtype::Int32),
+                        output_fact(vec![hi - lo, us[1]], crate::quant::header_dtype(up.dtype)?),
+                    ]));
                 }
-                if ds.len() != 2 || us.len() != 2 {
+                let Some(target) = targets.get_mut(&route).filter(|t| t.linear) else {
                     continue;
-                }
-                if coverage == LoraCoverage::Vendored && is_complete_only(&path) {
-                    continue;
-                }
-                let rank = cfg_rank.unwrap_or(ds[0] as f32);
-                for (route, rows) in lora_output_rows(&path, us[0]) {
-                    if let Some((lo, hi)) = rows {
-                        work.push(AdapterWork::Preparation(vec![
-                            output_fact(vec![hi - lo], Dtype::Int32),
-                            output_fact(vec![hi - lo, us[1]], crate::quant::header_dtype(up.dtype)?),
-                        ]));
+                };
+                let output_rows = rows.map_or(us[0], |(lo, hi)| hi - lo);
+                let packed = target.source_packed_bits.is_some();
+                let down_work = header_tensor_fact(down)?;
+                let up_work = output_fact(
+                    vec![output_rows, us[1]],
+                    mlx_gen::adapters::facts::native_header_dtype(up.dtype)?,
+                );
+                let base = target_weight_fact(target);
+                let unread_base = if target.unread && !packed {
+                    base.bytes()
+                } else {
+                    0
+                };
+                let point = AdapterInstallWork::lora(
+                    if packed { None } else { Some(base) },
+                    down_work.clone(),
+                    up_work.clone(),
+                    unread_base,
+                    rows.map_or(0, |(lo, hi)| hi - lo),
+                    packed && adapter.scale == 0.0,
+                )
+                .at(&route);
+                work.push(AdapterWork::GuardAttempt(point));
+                if !packed {
+                    if rank == 0.0 {
+                        return Err(Error::Msg(
+                            "lora_delta: zero rank — malformed adapter".into(),
+                        ));
                     }
-                    let Some(target) = targets.get_mut(&route).filter(|t| t.linear) else {
-                        continue;
+                    let output = matmul_shape(&[output_rows, us[1]], &ds)?;
+                    target.shape = broadcast_shape(&target.shape, &output)?;
+                    target.unread = false;
+                }
+                if let Some(AdapterWork::GuardAttempt(point)) = work.last_mut() {
+                    point.installed = if packed {
+                        vec![
+                            output_fact(vec![ds[1], ds[0]], down_work.dtype),
+                            output_fact(vec![us[1], output_rows], up_work.dtype),
+                        ]
+                    } else {
+                        vec![target_weight_fact(target)]
                     };
-                    let output_rows = rows.map_or(us[0], |(lo, hi)| hi - lo);
-                    let packed = target.source_packed_bits.is_some();
-                    let down_work = header_tensor_fact(down)?;
-                    let up_work = output_fact(vec![output_rows, us[1]],
-                        mlx_gen::adapters::facts::native_header_dtype(up.dtype)?);
-                    let base = target_weight_fact(target);
-                    let unread_base = if target.unread && !packed { base.bytes() } else { 0 };
-                    let point = AdapterInstallWork::lora(if packed { None } else { Some(base) },
-                        down_work.clone(), up_work.clone(), unread_base,
-                        rows.map_or(0, |(lo, hi)| hi - lo), packed && adapter.scale == 0.0).at(&route);
-                    work.push(AdapterWork::GuardAttempt(point));
-                    if !packed {
-                        if rank == 0.0 {
-                            return Err(Error::Msg(
-                                "lora_delta: zero rank — malformed adapter".into(),
-                            ));
-                        }
-                        let output = matmul_shape(&[output_rows, us[1]], &ds)?;
-                        target.shape = broadcast_shape(&target.shape, &output)?;
-                        target.unread = false;
-                    }
-                    if let Some(AdapterWork::GuardAttempt(point)) = work.last_mut() {
-                        point.installed = if packed {
-                            vec![output_fact(vec![ds[1], ds[0]], down_work.dtype),
-                                output_fact(vec![us[1], output_rows], up_work.dtype)]
-                        } else { vec![target_weight_fact(target)] };
-                    }
-                    if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
-                        work.push(AdapterWork::Install(point.clone()));
-                    }
-                    *matched += 1;
-                    installed.push(json!({"target":route,"kind":"lora","target_shape":target.shape,
+                }
+                if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
+                    work.push(AdapterWork::Install(point.clone()));
+                }
+                *matched += 1;
+                installed.push(json!({"target":route,"kind":"lora","target_shape":target.shape,
                         "source_packed_bits":target.source_packed_bits,"installed":if packed {"factor_residual"}else{"merged_dense"},
                         "reconstruction":if packed {"transpose_A_fold_alpha_into_B"}else{"f32_product_source_roundtrip"},
                         "down_shape":ds,"up_shape":[output_rows,us[1]],"up_rows":rows,
                         "down_dtype":format!("{:?}",crate::quant::header_dtype(down.dtype)?),
                         "up_dtype":format!("{:?}",crate::quant::header_dtype(up.dtype)?),
                         "configured_zero_branch":packed && adapter.scale==0.0}));
+            }
+            continue;
+        }
+        if is_complete_only(&path) {
+            continue;
+        }
+        let Some(target) = targets.get_mut(&path).filter(|t| t.linear) else {
+            continue;
+        };
+        let factor_work = header_factor_work(&factors)?;
+        let factor = factor_work
+            .values()
+            .map(|a| a.dtype)
+            .reduce(Dtype::from_promoting_types)
+            .unwrap_or(Dtype::Float32);
+        let products = factor_work_products(&factor_work, factor);
+        let base = target_weight_fact(target);
+        let packed = target.source_packed_bits.is_some();
+        let unread_base = if target.unread && !packed {
+            base.bytes()
+        } else {
+            0
+        };
+        let mut native_peft_point = None;
+        if kind == InstallKind::Lokr {
+            let rank = metadata
+                .get("rank")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            let alpha = metadata
+                .get("alpha")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(rank);
+            let casts = factor_work
+                .values()
+                .filter(|a| a.dtype != Dtype::Float32)
+                .fold(0u64, |n, a| {
+                    n.saturating_add(a.elements().saturating_mul(4))
+                });
+            let point = if packed {
+                AdapterInstallWork::structured(
+                    &factor_work,
+                    products.saturating_mul(2).saturating_add(casts),
+                    (alpha / rank) * adapter.scale == 0.0,
+                )
+            } else {
+                AdapterInstallWork::dense_lokr(
+                    base.clone(),
+                    factor_work.values().cloned().collect(),
+                    factor,
+                    products,
+                    unread_base,
+                )
+            }
+            .at(&path);
+            // PEFT reconstruction/validation executes INSIDE the existing target guard.
+            native_peft_point = Some(work.len());
+            work.push(AdapterWork::GuardAttempt(point));
+            // Match the native constructor INSIDE the reached guard: scale validation
+            // precedes factor reconstruction/layout. Packed validates only the FULL scale;
+            // dense PEFT independently requires finite positive rank and finite alpha.
+            if packed {
+                let scale = (alpha / rank) * adapter.scale;
+                if !scale.is_finite() {
+                    return Err(Error::Msg("LoKr: non-finite structured scale".into()));
                 }
-                continue;
+            } else {
+                mlx_gen::adapters::validate_lokr_metadata_scale(alpha, rank)?;
             }
-            if is_complete_only(&path) {
-                continue;
-            }
-            let Some(target) = targets.get_mut(&path).filter(|t| t.linear) else {
-                continue;
-            };
-            let factor_work = header_factor_work(&factors)?;
-            let factor = factor_work.values().map(|a| a.dtype)
-                .reduce(Dtype::from_promoting_types).unwrap_or(Dtype::Float32);
-            let products = factor_work_products(&factor_work, factor);
-            let base = target_weight_fact(target);
-            let packed = target.source_packed_bits.is_some();
-            let unread_base = if target.unread && !packed { base.bytes() } else { 0 };
-            let mut native_peft_point = None;
-            if kind == InstallKind::Lokr {
-                let rank = metadata.get("rank").and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
-                let alpha = metadata.get("alpha").and_then(|s| s.parse::<f32>().ok()).unwrap_or(rank);
-                let casts = factor_work.values().filter(|a| a.dtype != Dtype::Float32)
-                    .fold(0u64, |n, a| n.saturating_add(a.elements().saturating_mul(4)));
-                let point = if packed {
-                    AdapterInstallWork::structured(&factor_work,
-                        products.saturating_mul(2).saturating_add(casts), (alpha / rank) * adapter.scale == 0.0)
-                } else {
-                    AdapterInstallWork::dense_lokr(base.clone(), factor_work.values().cloned().collect(),
-                        factor, products, unread_base)
-                }.at(&path);
-                // PEFT reconstruction/validation executes INSIDE the existing target guard.
-                native_peft_point = Some(work.len());
-                work.push(AdapterWork::GuardAttempt(point));
-                // Match the native constructor INSIDE the reached guard: scale validation
-                // precedes factor reconstruction/layout. Packed validates only the FULL scale;
-                // dense PEFT independently requires finite positive rank and finite alpha.
-                if packed {
-                    let scale = (alpha / rank) * adapter.scale;
-                    if !scale.is_finite() {
-                        return Err(Error::Msg("LoKr: non-finite structured scale".into()));
-                    }
-                } else {
-                    mlx_gen::adapters::validate_lokr_metadata_scale(alpha, rank)?;
-                }
-            }
-            let mut disabled = false;
-            let (reconstruction, storage, shapes) = if kind == InstallKind::Lokr
-                || kind == InstallKind::ThirdPartyLokr
-            {
+        }
+        let mut disabled = false;
+        let (reconstruction, storage, shapes) =
+            if kind == InstallKind::Lokr || kind == InstallKind::ThirdPartyLokr {
                 let thirdparty = kind == InstallKind::ThirdPartyLokr;
                 if thirdparty {
                     let w1a = factors
@@ -2413,8 +2954,11 @@ fn selected_header_group(
                         w2a.as_deref(),
                     )?;
                 }
-                let (one, two) = if thirdparty { prepared_kron(&factors, work)? }
-                    else { kronecker_shapes(&factors, false)? };
+                let (one, two) = if thirdparty {
+                    prepared_kron(&factors, work)?
+                } else {
+                    kronecker_shapes(&factors, false)?
+                };
                 let packed = target.source_packed_bits.is_some();
                 let storage = if packed && !thirdparty {
                     let rank = metadata
@@ -2452,18 +2996,37 @@ fn selected_header_group(
                 let w1b = header_shape(required_factor(&factors, "hada_w1_b")?)?;
                 mlx_gen::adapters::loader::thirdparty_loha_rank(Some(&w1b))?;
                 let tucker = factors.contains_key("hada_t1") && factors.contains_key("hada_t2");
-                let one = prepared_factor(&factors, "hada_w1", "hada_w1_a", "hada_w1_b",
-                    tucker.then_some("hada_t1"), work)?;
-                let two = prepared_factor(&factors, "hada_w2", "hada_w2_a", "hada_w2_b",
-                    tucker.then_some("hada_t2"), work)?;
+                let one = prepared_factor(
+                    &factors,
+                    "hada_w1",
+                    "hada_w1_a",
+                    "hada_w1_b",
+                    tucker.then_some("hada_t1"),
+                    work,
+                )?;
+                let two = prepared_factor(
+                    &factors,
+                    "hada_w2",
+                    "hada_w2_a",
+                    "hada_w2_b",
+                    tucker.then_some("hada_t2"),
+                    work,
+                )?;
                 let combined = broadcast_shape(&one.shape, &two.shape)?;
                 let product_dtype = Dtype::from_promoting_types(one.dtype, two.dtype);
-                work.push(AdapterWork::Preparation(vec![output_fact(combined.clone(), product_dtype)]));
-                work.push(AdapterWork::Preparation(vec![output_fact(Vec::new(), Dtype::Float32),
-                    output_fact(combined.clone(), Dtype::from_promoting_types(product_dtype, Dtype::Float32))]));
+                work.push(AdapterWork::Preparation(vec![output_fact(
+                    combined.clone(),
+                    product_dtype,
+                )]));
+                work.push(AdapterWork::Preparation(vec![
+                    output_fact(Vec::new(), Dtype::Float32),
+                    output_fact(
+                        combined.clone(),
+                        Dtype::from_promoting_types(product_dtype, Dtype::Float32),
+                    ),
+                ]));
                 let (one, two) = (one.shape, two.shape);
-                if shape_elements(&combined)? != shape_elements(&target.shape)?
-                {
+                if shape_elements(&combined)? != shape_elements(&target.shape)? {
                     return Err(Error::Msg(
                         "sdxl LoHa delta cannot reshape to target".into(),
                     ));
@@ -2478,44 +3041,71 @@ fn selected_header_group(
                     vec![one, two],
                 )
             };
-            if matches!(kind, InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha) {
-                // User strength scalar/multiply follows successful delta reshape and output cast.
-                work.push(AdapterWork::Preparation(vec![output_fact(Vec::new(), Dtype::Float32),
-                    output_fact(target.shape.clone(), Dtype::Float32)]));
+        if matches!(
+            kind,
+            InstallKind::ThirdPartyLokr | InstallKind::ThirdPartyLoha
+        ) {
+            // User strength scalar/multiply follows successful delta reshape and output cast.
+            work.push(AdapterWork::Preparation(vec![
+                output_fact(Vec::new(), Dtype::Float32),
+                output_fact(target.shape.clone(), Dtype::Float32),
+            ]));
+        }
+        if let Some(index) = native_peft_point {
+            if let AdapterWork::GuardAttempt(point) = &mut work[index] {
+                point.installed = if packed {
+                    vec![
+                        output_fact(shapes[0].clone(), Dtype::Float32),
+                        output_fact(shapes[1].clone(), Dtype::Float32),
+                    ]
+                } else {
+                    vec![target_weight_fact(target)]
+                };
             }
-            if let Some(index) = native_peft_point {
-                if let AdapterWork::GuardAttempt(point) = &mut work[index] {
-                    point.installed = if packed {
-                        vec![output_fact(shapes[0].clone(), Dtype::Float32),
-                            output_fact(shapes[1].clone(), Dtype::Float32)]
-                    } else { vec![target_weight_fact(target)] };
-                }
+        } else {
+            let small = factor_work.values().fold(0u64, |n, a| {
+                n.saturating_add(a.elements().saturating_mul(4))
+            });
+            let chain = if kind == InstallKind::ThirdPartyLokr {
+                kron_chain(factor)
             } else {
-                let small = factor_work.values().fold(0u64, |n, a|
-                    n.saturating_add(a.elements().saturating_mul(4)));
-                let chain = if kind == InstallKind::ThirdPartyLokr { kron_chain(factor) }
-                    else { hadamard_chain(factor) };
-                let small = if kind == InstallKind::ThirdPartyLokr { small.saturating_add(products) }
-                    else { small };
-                // Third-party reconstruction/shape refusal occurs BEFORE this guarded install.
-                let mut point = AdapterInstallWork::delta(if packed { None } else { Some(base) },
-                    output_fact(target.shape.clone(), Dtype::Float32), &chain, small, unread_base,
-                    mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)).saturating_mul(2)).at(&path);
-                point.parents.extend(factor_work.values().cloned());
-                point.installed = vec![if packed { output_fact(target.shape.clone(), Dtype::Float32) }
-                    else { target_weight_fact(target) }];
-                work.push(AdapterWork::GuardAttempt(point));
-            }
-            if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
-                work.push(AdapterWork::Install(point.clone()));
-            }
-            if !packed { target.unread = false; }
-            *matched += 1;
-            installed.push(json!({"target":path,"kind":format!("{kind:?}"),"target_shape":target.shape,
+                hadamard_chain(factor)
+            };
+            let small = if kind == InstallKind::ThirdPartyLokr {
+                small.saturating_add(products)
+            } else {
+                small
+            };
+            // Third-party reconstruction/shape refusal occurs BEFORE this guarded install.
+            let mut point = AdapterInstallWork::delta(
+                if packed { None } else { Some(base) },
+                output_fact(target.shape.clone(), Dtype::Float32),
+                &chain,
+                small,
+                unread_base,
+                mlx_gen::ios_quantum::allocated_bytes(width(Dtype::Float32)).saturating_mul(2),
+            )
+            .at(&path);
+            point.parents.extend(factor_work.values().cloned());
+            point.installed = vec![if packed {
+                output_fact(target.shape.clone(), Dtype::Float32)
+            } else {
+                target_weight_fact(target)
+            }];
+            work.push(AdapterWork::GuardAttempt(point));
+        }
+        if let Some(AdapterWork::GuardAttempt(point)) = work.last() {
+            work.push(AdapterWork::Install(point.clone()));
+        }
+        if !packed {
+            target.unread = false;
+        }
+        *matched += 1;
+        installed.push(json!({"target":path,"kind":format!("{kind:?}"),"target_shape":target.shape,
                 "source_packed_bits":target.source_packed_bits,"installed":storage,"reconstruction":reconstruction,
                 "reconstructed_factor_shapes":shapes,"factor_layouts":factor_semantic_facts(&factors)?,
                 "configured_zero_branch":disabled}));
-        }
+    }
     Ok(())
 }
 

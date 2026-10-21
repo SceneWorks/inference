@@ -173,27 +173,6 @@ pub(crate) fn before_component_load(
     mlx_gen::ios_quantum::before(label, floor)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mlx_rs::Dtype;
-
-    #[test]
-    #[ignore = "real fused SDXL checkpoint; set SDXL_LDM_CHECKPOINT"]
-    fn real_checkpoint_builds_all_mlx_components() {
-        let path = std::env::var_os("SDXL_LDM_CHECKPOINT")
-            .map(std::path::PathBuf::from)
-            .expect("set SDXL_LDM_CHECKPOINT");
-        let components = split_ldm_checkpoint(&path).expect("split fused checkpoint");
-        crate::loader::load_text_encoder_1_from_weights(components.clip_l, Dtype::Float16)
-            .expect("build CLIP-L");
-        crate::loader::load_text_encoder_2_from_weights(components.clip_bigg, Dtype::Float16)
-            .expect("build OpenCLIP-bigG");
-        crate::loader::load_unet_from_weights(components.unet, Dtype::Float16).expect("build UNet");
-        crate::loader::load_vae_from_weights(components.vae).expect("build VAE");
-    }
-}
-
 /// Exact source-raw guard floor over every mapped source header in the selected actual component
 /// set, including overwritten aliases and full QKV sources. No model/Array/world enumeration.
 pub(crate) fn component_load_floor_from_headers(
@@ -239,4 +218,25 @@ pub(crate) fn component_load_floor_from_headers(
         }
     }
     Ok(total.saturating_add(largest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Dtype;
+
+    #[test]
+    #[ignore = "real fused SDXL checkpoint; set SDXL_LDM_CHECKPOINT"]
+    fn real_checkpoint_builds_all_mlx_components() {
+        let path = std::env::var_os("SDXL_LDM_CHECKPOINT")
+            .map(std::path::PathBuf::from)
+            .expect("set SDXL_LDM_CHECKPOINT");
+        let components = split_ldm_checkpoint(&path).expect("split fused checkpoint");
+        crate::loader::load_text_encoder_1_from_weights(components.clip_l, Dtype::Float16)
+            .expect("build CLIP-L");
+        crate::loader::load_text_encoder_2_from_weights(components.clip_bigg, Dtype::Float16)
+            .expect("build OpenCLIP-bigG");
+        crate::loader::load_unet_from_weights(components.unet, Dtype::Float16).expect("build UNet");
+        crate::loader::load_vae_from_weights(components.vae).expect("build VAE");
+    }
 }

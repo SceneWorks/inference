@@ -90,13 +90,26 @@ impl UNetBlock2D {
         })
     }
 
-    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
         for (index, r) in self.resnets.iter_mut().enumerate() {
-            r.quantize_using(&crate::quant::child_path(prefix, &format!("resnets.{index}")), bits, visit)?;
+            r.quantize_using(
+                &crate::quant::child_path(prefix, &format!("resnets.{index}")),
+                bits,
+                visit,
+            )?;
         }
         if let Some(attns) = &mut self.attentions {
             for (index, a) in attns.iter_mut().enumerate() {
-                a.quantize_using(&crate::quant::child_path(prefix, &format!("attentions.{index}")), bits, visit)?;
+                a.quantize_using(
+                    &crate::quant::child_path(prefix, &format!("attentions.{index}")),
+                    bits,
+                    visit,
+                )?;
             }
         }
         Ok(())
@@ -232,16 +245,22 @@ impl UNetBlock2D {
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,
-        encoder_x: &Array,
-        temb: &Array,
+        inputs: super::pricing::BlockForwardInputs<'_, Array>,
         mut residuals: Option<&mut Vec<Array>>,
-        ip: Option<(&Array, f32)>,
-        plan: crate::plan::SdxlForwardPlan<'_>,
         out: &mut crate::quantum::Quanta,
-        outer_held: u64,
-        mut owners: Option<&mut Vec<u64>>,
+        ownership: super::pricing::BlockOwners<'_>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Array, Vec<Array>)> {
+        let super::pricing::BlockForwardInputs {
+            encoder_x,
+            temb,
+            ip,
+            plan,
+        } = inputs;
+        let super::pricing::BlockOwners {
+            outer_held,
+            mut owners,
+        } = ownership;
         let mut x = x.clone();
         let mut output_states = Vec::with_capacity(self.resnets.len() + 1);
         for i in 0..self.resnets.len() {
@@ -259,16 +278,27 @@ impl UNetBlock2D {
             }
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(&x, Some(temb), &effects.child(&format!("resnets.{i}")))?,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(temb),
+                    &effects.child(&format!("resnets.{i}")),
+                )?,
             ));
             let input = skip.as_ref().map_or(x.dtype(), |s| {
                 Dtype::from_promoting_types(x.dtype(), s.dtype())
             });
-            let shape = resnet.output_shape_with_effects(x.shape(), skip.as_ref().map(Array::shape),
-                &effects.child(&format!("resnets.{i}")))?;
+            let shape = resnet.output_shape_with_effects(
+                x.shape(),
+                skip.as_ref().map(Array::shape),
+                &effects.child(&format!("resnets.{i}")),
+            )?;
             x = crate::quantum::shaped(
                 &shape,
-                resnet.output_dtype_with_effects(input, Some(temb.dtype()), &effects.child(&format!("resnets.{i}")))?,
+                resnet.output_dtype_with_effects(
+                    input,
+                    Some(temb.dtype()),
+                    &effects.child(&format!("resnets.{i}")),
+                )?,
             )?;
             if let Some(attns) = &self.attentions {
                 let first = out.len();
@@ -277,7 +307,14 @@ impl UNetBlock2D {
                 let held = outer_held
                     + output_states.iter().map(crate::quantum::bytes).sum::<u64>()
                     + crate::quantum::bytes(&x);
-                x = attns[i].price_forward_with_effects(&x, encoder_x, ip, plan, out, &effects.child(&format!("attentions.{i}")))?;
+                x = attns[i].price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    ip,
+                    plan,
+                    out,
+                    &effects.child(&format!("attentions.{i}")),
+                )?;
                 if let Some(owners) = owners.as_deref_mut() {
                     owners.extend(std::iter::repeat_n(held, out.len() - first));
                 }
@@ -291,21 +328,33 @@ impl UNetBlock2D {
                 );
             }
             let conv = effects.conv("downsamplers.0.conv", c);
-            out.push((crate::quantum::UNET_DOWNSAMPLE, sampler_scratch(&x, &conv, false)));
-            x = crate::quantum::shaped(&conv.output_shape(x.shape(), 2, 1)?, conv.output_dtype(x.dtype()))?;
+            out.push((
+                crate::quantum::UNET_DOWNSAMPLE,
+                sampler_scratch(&x, &conv, false),
+            ));
+            x = crate::quantum::shaped(
+                &conv.output_shape(x.shape(), 2, 1)?,
+                conv.output_dtype(x.dtype()),
+            )?;
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
-            if let Some(owners) = owners.as_deref_mut() {
+            if let Some(owners) = owners {
                 owners.push(
                     outer_held + output_states.iter().map(crate::quantum::bytes).sum::<u64>(),
                 );
             }
             let conv = effects.conv("upsamplers.0.conv", c);
-            out.push((crate::quantum::UNET_UPSAMPLE, sampler_scratch(&x, &conv, true)));
+            out.push((
+                crate::quantum::UNET_UPSAMPLE,
+                sampler_scratch(&x, &conv, true),
+            ));
             let s = x.shape();
             let input = [s[0], 2 * s[1], 2 * s[2], s[3]];
-            x = crate::quantum::shaped(&conv.output_shape(&input, 1, 1)?, conv.output_dtype(x.dtype()))?;
+            x = crate::quantum::shaped(
+                &conv.output_shape(&input, 1, 1)?,
+                conv.output_dtype(x.dtype()),
+            )?;
             output_states.push(x.clone());
         }
         Ok((x, output_states))
@@ -460,7 +509,7 @@ impl AdaptableHost for UNetBlock2D {
 /// operands; selected-world pricing substitutes only the installed weight facts.
 fn sampler_scratch(x: &Array, work: &crate::quantum::ConvWork, up: bool) -> u64 {
     super::pricing::sampler_scratch(&crate::quantum::activation_facts(x), work, up)
-    }
+}
 
 fn downsample_scratch(x: &Array, c: &AdaptableConv2d) -> u64 {
     #[cfg(test)]

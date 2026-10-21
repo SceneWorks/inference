@@ -1,13 +1,13 @@
 //! UNet/ControlNet pricing hierarchy. Every retained parameter and activation is metadata;
 //! constructors mirror the actual lookup/layout/pack order without native arrays or model graphs.
-use mlx_gen::{Error, Result};
-use mlx_rs::Dtype;
+use super::block::BlockSpec;
+use crate::config::UNetConfig;
+use crate::plan::SdxlForwardPlan;
+use crate::quantum as q;
 use mlx_gen::adapters::facts::TensorFacts as Tensor;
 use mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader;
-use crate::config::UNetConfig;
-use crate::quantum as q;
-use crate::plan::SdxlForwardPlan;
-use super::block::BlockSpec;
+use mlx_gen::{Error, Result};
+use mlx_rs::Dtype;
 
 pub(crate) type MetaVisit<'a> = dyn FnMut(&str, &mut q::LinearWork, i32) -> Result<()> + 'a;
 
@@ -19,32 +19,70 @@ pub(crate) trait FactView {
     fn reshape(&self, shape: &[i32]) -> Result<Tensor>;
 }
 impl FactView for Tensor {
-    fn shape(&self) -> &[i32] { &self.shape }
-    fn dtype(&self) -> Dtype { self.dtype }
-    fn size(&self) -> usize { self.elements() as usize }
+    fn shape(&self) -> &[i32] {
+        &self.shape
+    }
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    fn size(&self) -> usize {
+        self.elements() as usize
+    }
     fn reshape(&self, shape: &[i32]) -> Result<Tensor> {
         let result = tensor(shape, self.dtype)?;
         if result.elements() != self.elements() {
-            return Err(Error::Msg("sdxl metadata reshape element counts differ".into()));
+            return Err(Error::Msg(
+                "sdxl metadata reshape element counts differ".into(),
+            ));
         }
         Ok(result)
     }
 }
 pub(crate) fn tensor(shape: &[i32], dtype: Dtype) -> Result<Tensor> {
     // Native dimensions are signed i32. Negative explicit extents are not accepted by zeros.
-    if shape.iter().any(|&d| d < 0) { return Err(Error::Msg("sdxl metadata tensor has a negative dimension".into())); }
-    Ok(Tensor { shape: shape.to_vec(), dtype, strides: Vec::new() })
+    if shape.iter().any(|&d| d < 0) {
+        return Err(Error::Msg(
+            "sdxl metadata tensor has a negative dimension".into(),
+        ));
+    }
+    Ok(Tensor {
+        shape: shape.to_vec(),
+        dtype,
+        strides: Vec::new(),
+    })
 }
-pub(crate) fn tensor_bytes(tensor: &Tensor) -> u64 { tensor.bytes() }
-fn tensor_elements(tensor: &Tensor) -> u64 { tensor.elements() }
-pub(crate) fn element_bytes(tensor: &Tensor) -> u64 { q::dtype_bytes(tensor.dtype) }
+pub(crate) fn tensor_bytes(tensor: &Tensor) -> u64 {
+    tensor.bytes()
+}
+fn tensor_elements(tensor: &Tensor) -> u64 {
+    tensor.elements()
+}
+pub(crate) fn element_bytes(tensor: &Tensor) -> u64 {
+    q::dtype_bytes(tensor.dtype)
+}
 pub(crate) fn promote(input: Dtype, tensors: &[&Tensor]) -> Dtype {
-    tensors.iter().fold(input, |d, t| Dtype::from_promoting_types(d, t.dtype))
+    tensors
+        .iter()
+        .fold(input, |d, t| Dtype::from_promoting_types(d, t.dtype))
 }
-fn linear_out(linear: &q::LinearWork) -> u64 { linear.output_width() }
+fn linear_out(linear: &q::LinearWork) -> u64 {
+    linear.output_width()
+}
 pub(crate) fn nchw_to_nhwc(weight: &Tensor) -> Result<Tensor> {
-    if weight.shape.len() != 4 { return Err(Error::Msg("sdxl metadata convolution transpose requires four axes".into())); }
-    tensor(&[weight.shape[0], weight.shape[2], weight.shape[3], weight.shape[1]], weight.dtype)
+    if weight.shape.len() != 4 {
+        return Err(Error::Msg(
+            "sdxl metadata convolution transpose requires four axes".into(),
+        ));
+    }
+    tensor(
+        &[
+            weight.shape[0],
+            weight.shape[2],
+            weight.shape[3],
+            weight.shape[1],
+        ],
+        weight.dtype,
+    )
 }
 
 pub(crate) struct HeaderWeights {
@@ -54,9 +92,14 @@ impl HeaderWeights {
     pub(crate) fn new(headers: &[SafetensorsTensorHeader]) -> Result<Self> {
         let mut tensors = std::collections::BTreeMap::new();
         // The native safetensors decoder visits every dtype before model constructor lookups.
-        for header in headers { crate::quant::header_dtype(header.dtype)?; }
         for header in headers {
-            tensors.insert(header.name.clone(), crate::text_encoder::clip_header_tensor(headers, &header.name)?);
+            crate::quant::header_dtype(header.dtype)?;
+        }
+        for header in headers {
+            tensors.insert(
+                header.name.clone(),
+                crate::text_encoder::clip_header_tensor(headers, &header.name)?,
+            );
         }
         Ok(Self { tensors })
     }
@@ -64,68 +107,125 @@ impl HeaderWeights {
     /// the UNet's packed-component exception or substitute the provider's DTYPE for this dtype.
     pub(crate) fn new_all_cast(headers: &[SafetensorsTensorHeader], dtype: Dtype) -> Result<Self> {
         let mut weights = Self::new(headers)?;
-        for tensor in weights.tensors.values_mut() { tensor.dtype = dtype; }
+        for tensor in weights.tensors.values_mut() {
+            tensor.dtype = dtype;
+        }
         Ok(weights)
     }
     pub(crate) fn require(&self, name: &str) -> Result<&Tensor> {
-        self.tensors.get(name).ok_or_else(|| Error::MissingTensor(name.to_owned()))
+        self.tensors
+            .get(name)
+            .ok_or_else(|| Error::MissingTensor(name.to_owned()))
     }
-    pub(crate) fn get(&self, name: &str) -> Option<&Tensor> { self.tensors.get(name) }
+    pub(crate) fn get(&self, name: &str) -> Option<&Tensor> {
+        self.tensors.get(name)
+    }
 }
 fn header_linear(weights: &HeaderWeights, path: &str, biased: bool) -> Result<q::LinearWork> {
     // Exactly quant::lin's lookup order over the constructor's ALREADY cast leaves. This also
     // serves the VAE's optional resnet time projection under its distinct cast_all policy.
-    let bias = if biased { Some(weights.require(&format!("{path}.bias"))?.clone()) } else { None };
+    let bias = if biased {
+        Some(weights.require(&format!("{path}.bias"))?.clone())
+    } else {
+        None
+    };
     if let Some(scales) = weights.get(&format!("{path}.scales")) {
         let codes = weights.require(&format!("{path}.weight"))?;
-        let bits = mlx_gen::quant::packed_bits_from_metadata(&codes.shape, codes.dtype,
-            &scales.shape, scales.dtype, crate::quant::GROUP_SIZE)?;
+        let bits = mlx_gen::quant::packed_bits_from_metadata(
+            &codes.shape,
+            codes.dtype,
+            &scales.shape,
+            scales.dtype,
+            crate::quant::GROUP_SIZE,
+        )?;
         let offsets = weights.require(&format!("{path}.biases"))?;
         let mut work = q::LinearWork::dense(codes.clone(), bias);
         work.base.base_shape = vec![scales.shape[0], scales.shape[1] * crate::quant::GROUP_SIZE];
-        work.base.is_quantized = true; work.bits = Some(bits);
+        work.base.is_quantized = true;
+        work.bits = Some(bits);
         work.weights = vec![codes.clone(), scales.clone(), offsets.clone()];
         Ok(work)
-    } else { Ok(q::LinearWork::dense(weights.require(&format!("{path}.weight"))?.clone(), bias)) }
+    } else {
+        Ok(q::LinearWork::dense(
+            weights.require(&format!("{path}.weight"))?.clone(),
+            bias,
+        ))
+    }
 }
 fn row_slice(tensor: &Tensor, lo: i32, hi: i32) -> Result<Tensor> {
-    let rows = tensor.shape.first().copied().ok_or_else(|| Error::Msg("sdxl metadata take axis0 on a scalar".into()))?;
-    if lo < 0 || hi < lo || hi > rows { return Err(Error::Msg("sdxl metadata take row index out of bounds".into())); }
-    let mut shape = tensor.shape.clone(); shape[0] = hi - lo;
+    let rows = tensor
+        .shape
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Msg("sdxl metadata take axis0 on a scalar".into()))?;
+    if lo < 0 || hi < lo || hi > rows {
+        return Err(Error::Msg(
+            "sdxl metadata take row index out of bounds".into(),
+        ));
+    }
+    let mut shape = tensor.shape.clone();
+    shape[0] = hi - lo;
     self::tensor(&shape, tensor.dtype)
 }
-fn header_geglu_half(weights: &HeaderWeights, base: &str, lo: i32, hi: i32) -> Result<q::LinearWork> {
+fn header_geglu_half(
+    weights: &HeaderWeights,
+    base: &str,
+    lo: i32,
+    hi: i32,
+) -> Result<q::LinearWork> {
     // Match lin_geglu_half: bias and its row selection precede packed selection/validation.
-    let bias = Some(row_slice(weights.require(&format!("{base}.bias"))?, lo, hi)?);
+    let bias = Some(row_slice(
+        weights.require(&format!("{base}.bias"))?,
+        lo,
+        hi,
+    )?);
     if let Some(scales) = weights.get(&format!("{base}.scales")) {
         let codes = weights.require(&format!("{base}.weight"))?;
         let offsets = weights.require(&format!("{base}.biases"))?;
-        let bits = mlx_gen::quant::packed_bits_from_metadata(&codes.shape, codes.dtype,
-            &scales.shape, scales.dtype, crate::quant::GROUP_SIZE)?;
+        let bits = mlx_gen::quant::packed_bits_from_metadata(
+            &codes.shape,
+            codes.dtype,
+            &scales.shape,
+            scales.dtype,
+            crate::quant::GROUP_SIZE,
+        )?;
         let codes = row_slice(codes, lo, hi)?;
         let scales = row_slice(scales, lo, hi)?;
         let offsets = row_slice(offsets, lo, hi)?;
         let mut result = q::LinearWork::dense(codes.clone(), bias);
         result.base.base_shape = vec![scales.shape[0], scales.shape[1] * crate::quant::GROUP_SIZE];
-        result.base.is_quantized = true; result.bits = Some(bits);
+        result.base.is_quantized = true;
+        result.bits = Some(bits);
         result.weights = vec![codes, scales, offsets];
         return Ok(result);
     }
-    Ok(q::LinearWork::dense(row_slice(weights.require(&format!("{base}.weight"))?, lo, hi)?, bias))
+    Ok(q::LinearWork::dense(
+        row_slice(weights.require(&format!("{base}.weight"))?, lo, hi)?,
+        bias,
+    ))
 }
 
-struct SinusoidFacts { _sigmas: Tensor, _host_bytes: u64 }
+struct SinusoidFacts {
+    _sigmas: Tensor,
+    _host_bytes: u64,
+}
 impl SinusoidFacts {
     fn timestep(dim: i32) -> Result<Self> {
         // Exact constructor table shape/dtype, including its retained arange/scalar host graph.
-        Ok(Self { _sigmas: tensor(&[dim / 2], Dtype::Float32)?,
-            _host_bytes: super::SinusoidalPositionalEncoding::timestep_table_bytes(dim) })
+        Ok(Self {
+            _sigmas: tensor(&[dim / 2], Dtype::Float32)?,
+            _host_bytes: super::SinusoidalPositionalEncoding::timestep_table_bytes(dim),
+        })
     }
 }
 #[derive(Clone)]
 pub(crate) struct StreamFacts {
-    prefix: String, headers: Vec<SafetensorsTensorHeader>, n_blocks: usize,
-    dtype: Dtype, quant_bits: Option<i32>, bytes: std::sync::OnceLock<Vec<u64>>,
+    prefix: String,
+    headers: Vec<SafetensorsTensorHeader>,
+    n_blocks: usize,
+    dtype: Dtype,
+    quant_bits: Option<i32>,
+    bytes: std::sync::OnceLock<Vec<u64>>,
 }
 impl StreamFacts {
     fn streamed_bytes(&self, index: usize) -> Result<u64> {
@@ -133,7 +233,12 @@ impl StreamFacts {
         // eager arm-time refusal before a configured adapter outcome has been selected.
         if self.bytes.get().is_none() {
             let bytes = crate::block_stream::streamed_block_bytes_from_headers(
-                &self.headers, &self.prefix, self.n_blocks, self.dtype, self.quant_bits)?;
+                &self.headers,
+                &self.prefix,
+                self.n_blocks,
+                self.dtype,
+                self.quant_bits,
+            )?;
             let _ = self.bytes.set(bytes);
         }
         self.bytes.get().and_then(|bytes| bytes.get(index).copied()).ok_or_else(|| Error::Msg(format!(
@@ -141,66 +246,110 @@ impl StreamFacts {
     }
 }
 
-
 #[derive(Clone)]
 pub(crate) struct ResnetFacts {
-    pub(super) norm1_w: Tensor, pub(super) norm1_b: Tensor,
-    pub(super) conv1: q::ConvWork, pub(super) norm2_w: Tensor, pub(super) norm2_b: Tensor,
-    pub(super) conv2: q::ConvWork, pub(super) time_emb_proj: Option<q::LinearWork>,
+    pub(super) norm1_w: Tensor,
+    pub(super) norm1_b: Tensor,
+    pub(super) conv1: q::ConvWork,
+    pub(super) norm2_w: Tensor,
+    pub(super) norm2_b: Tensor,
+    pub(super) conv2: q::ConvWork,
+    pub(super) time_emb_proj: Option<q::LinearWork>,
     pub(super) shortcut: Option<q::LinearWork>,
 }
 #[derive(Clone)]
-pub(crate) struct TimeFacts { pub(super) linear1: q::LinearWork, pub(super) linear2: q::LinearWork }
+pub(crate) struct TimeFacts {
+    pub(super) linear1: q::LinearWork,
+    pub(super) linear2: q::LinearWork,
+}
 #[derive(Clone)]
 pub(crate) struct AttentionFacts {
-    pub(super) q: q::LinearWork, pub(super) k: q::LinearWork, pub(super) v: q::LinearWork,
-    pub(super) out: q::LinearWork, pub(super) num_heads: i32, pub(super) head_dim: i32,
-    pub(super) to_k_ip: Option<q::LinearWork>, pub(super) to_v_ip: Option<q::LinearWork>,
+    pub(super) q: q::LinearWork,
+    pub(super) k: q::LinearWork,
+    pub(super) v: q::LinearWork,
+    pub(super) out: q::LinearWork,
+    pub(super) num_heads: i32,
+    pub(super) head_dim: i32,
+    pub(super) to_k_ip: Option<q::LinearWork>,
+    pub(super) to_v_ip: Option<q::LinearWork>,
 }
 #[derive(Clone)]
 pub(crate) struct TransformerBlockFacts {
-    pub(super) norm1_w: Tensor, pub(super) norm1_b: Tensor,
-    pub(super) norm2_w: Tensor, pub(super) norm2_b: Tensor,
-    pub(super) norm3_w: Tensor, pub(super) norm3_b: Tensor,
-    pub(super) attn1: AttentionFacts, pub(super) attn2: AttentionFacts,
-    pub(super) linear1: q::LinearWork, pub(super) linear2: q::LinearWork, pub(super) linear3: q::LinearWork,
+    pub(super) norm1_w: Tensor,
+    pub(super) norm1_b: Tensor,
+    pub(super) norm2_w: Tensor,
+    pub(super) norm2_b: Tensor,
+    pub(super) norm3_w: Tensor,
+    pub(super) norm3_b: Tensor,
+    pub(super) attn1: AttentionFacts,
+    pub(super) attn2: AttentionFacts,
+    pub(super) linear1: q::LinearWork,
+    pub(super) linear2: q::LinearWork,
+    pub(super) linear3: q::LinearWork,
 }
 #[derive(Clone)]
 pub(crate) struct TransformerFacts {
-    pub(super) norm_w: Tensor, pub(super) norm_b: Tensor,
-    pub(super) proj_in: q::LinearWork, pub(super) blocks: Vec<TransformerBlockFacts>,
-    pub(super) proj_out: q::LinearWork, pub(super) block_stream: Option<StreamFacts>,
+    pub(super) norm_w: Tensor,
+    pub(super) norm_b: Tensor,
+    pub(super) proj_in: q::LinearWork,
+    pub(super) blocks: Vec<TransformerBlockFacts>,
+    pub(super) proj_out: q::LinearWork,
+    pub(super) block_stream: Option<StreamFacts>,
 }
 #[derive(Clone)]
 pub(crate) struct BlockFacts {
-    pub(super) resnets: Vec<ResnetFacts>, pub(super) attentions: Option<Vec<TransformerFacts>>,
-    pub(super) downsample: Option<q::ConvWork>, pub(super) upsample: Option<q::ConvWork>,
+    pub(super) resnets: Vec<ResnetFacts>,
+    pub(super) attentions: Option<Vec<TransformerFacts>>,
+    pub(super) downsample: Option<q::ConvWork>,
+    pub(super) upsample: Option<q::ConvWork>,
 }
 pub(crate) struct UNetFacts {
-    pub(super) conv_in: q::ConvWork, _timesteps: SinusoidFacts,
-    pub(super) time_embedding: TimeFacts, _add_time_proj: SinusoidFacts,
-    pub(super) add_embedding: TimeFacts, pub(super) down_blocks: Vec<BlockFacts>,
-    pub(super) mid_resnet0: ResnetFacts, pub(super) mid_transformer: TransformerFacts,
-    pub(super) mid_resnet1: ResnetFacts, pub(super) up_blocks: Vec<BlockFacts>,
-    pub(super) conv_norm_out_w: Tensor, pub(super) conv_norm_out_b: Tensor,
-    pub(super) conv_out: q::ConvWork, pub(super) encoder_hid_proj: Option<q::LinearWork>,
+    pub(super) conv_in: q::ConvWork,
+    _timesteps: SinusoidFacts,
+    pub(super) time_embedding: TimeFacts,
+    _add_time_proj: SinusoidFacts,
+    pub(super) add_embedding: TimeFacts,
+    pub(super) down_blocks: Vec<BlockFacts>,
+    pub(super) mid_resnet0: ResnetFacts,
+    pub(super) mid_transformer: TransformerFacts,
+    pub(super) mid_resnet1: ResnetFacts,
+    pub(super) up_blocks: Vec<BlockFacts>,
+    pub(super) conv_norm_out_w: Tensor,
+    pub(super) conv_norm_out_b: Tensor,
+    pub(super) conv_out: q::ConvWork,
+    pub(super) encoder_hid_proj: Option<q::LinearWork>,
 }
 #[derive(Clone)]
-pub(crate) struct ConvFacts { pub(super) weight: Tensor, pub(super) bias: Tensor, pub(super) stride: i32, pub(super) pad: i32 }
+pub(crate) struct ConvFacts {
+    pub(super) weight: Tensor,
+    pub(super) bias: Tensor,
+    pub(super) stride: i32,
+    pub(super) pad: i32,
+}
 #[derive(Clone)]
-pub(crate) struct CondFacts { pub(super) conv_in: ConvFacts, pub(super) blocks: Vec<ConvFacts>, pub(super) conv_out: ConvFacts }
+pub(crate) struct CondFacts {
+    pub(super) conv_in: ConvFacts,
+    pub(super) blocks: Vec<ConvFacts>,
+    pub(super) conv_out: ConvFacts,
+}
 pub(crate) struct ControlFacts {
-    pub(super) conv_in: ConvFacts, _timesteps: SinusoidFacts,
-    pub(super) time_embedding: TimeFacts, _add_time_proj: SinusoidFacts,
-    pub(super) add_embedding: TimeFacts, pub(super) down_blocks: Vec<BlockFacts>,
-    pub(super) mid_resnet0: ResnetFacts, pub(super) mid_transformer: TransformerFacts,
-    pub(super) mid_resnet1: ResnetFacts, pub(super) cond_embedding: CondFacts,
-    pub(super) down_zero: Vec<ConvFacts>, pub(super) mid_zero: ConvFacts,
+    pub(super) conv_in: ConvFacts,
+    _timesteps: SinusoidFacts,
+    pub(super) time_embedding: TimeFacts,
+    _add_time_proj: SinusoidFacts,
+    pub(super) add_embedding: TimeFacts,
+    pub(super) down_blocks: Vec<BlockFacts>,
+    pub(super) mid_resnet0: ResnetFacts,
+    pub(super) mid_transformer: TransformerFacts,
+    pub(super) mid_resnet1: ResnetFacts,
+    pub(super) cond_embedding: CondFacts,
+    pub(super) down_zero: Vec<ConvFacts>,
+    pub(super) mid_zero: ConvFacts,
     pub(super) encoder_hid_proj: Option<q::LinearWork>,
 }
 
 impl ResnetFacts {
-pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
         let shortcut = match w.get(&format!("{prefix}.conv_shortcut.weight")) {
             Some(sw) => {
@@ -219,11 +368,7 @@ pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         let has_time_proj = w.get(&format!("{prefix}.time_emb_proj.weight")).is_some()
             || w.get(&format!("{prefix}.time_emb_proj.scales")).is_some();
         let time_emb_proj = if has_time_proj {
-            Some(header_linear(
-                w,
-                &format!("{prefix}.time_emb_proj"),
-                true,
-            )?)
+            Some(header_linear(w, &format!("{prefix}.time_emb_proj"), true)?)
         } else {
             None
         };
@@ -239,7 +384,12 @@ pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         })
     }
 
-pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut MetaVisit<'_>,
+    ) -> Result<()> {
         if let Some(t) = &mut self.time_emb_proj {
             visit(&crate::quant::child_path(prefix, "time_emb_proj"), t, bits)?;
         }
@@ -257,7 +407,12 @@ pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut Met
         Ok(())
     }
 
-pub(crate) fn quantum_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tensor>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+    pub(crate) fn quantum_scratch_with_effects(
+        &self,
+        x: &Tensor,
+        temb: Option<&Tensor>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         #[cfg(test)]
         {
             trace_facts(crate::quantum::UNET_RESNET, x);
@@ -267,7 +422,9 @@ pub(crate) fn quantum_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tens
         let act_in = element_bytes(x);
         let act_out = match (&self.time_emb_proj, temb) {
             (Some(proj), Some(t)) => {
-                let projected = effects.linear_metadata("time_emb_proj", proj)?.output_dtype(t.dtype());
+                let projected = effects
+                    .linear_metadata("time_emb_proj", proj)?
+                    .output_dtype(t.dtype());
                 crate::quantum::dtype_bytes(Dtype::from_promoting_types(x.dtype(), projected))
             }
             _ => act_in,
@@ -275,7 +432,9 @@ pub(crate) fn quantum_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tens
         let conv1 = effects.conv_metadata("conv1", &self.conv1);
         let conv2 = effects.conv_metadata("conv2", &self.conv2);
         Ok(crate::quantum::resnet_bytes_from_metadata(
-            x.shape(), act_in, act_out,
+            x.shape(),
+            act_in,
+            act_out,
             mlx_gen::ios_quantum::ConvOperandMetadata {
                 shape: &conv1.weight.shape,
                 element_bytes: crate::quantum::dtype_bytes(conv1.weight.dtype),
@@ -289,7 +448,12 @@ pub(crate) fn quantum_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tens
         .saturating_add(self.promotion_scratch_with_effects(x, temb, effects)?))
     }
 
-pub(crate) fn promotion_scratch_with_effects(&self, x: &Tensor, temb: Option<&Tensor>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+    pub(crate) fn promotion_scratch_with_effects(
+        &self,
+        x: &Tensor,
+        temb: Option<&Tensor>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         use crate::quantum as q;
         let casts = |input: Dtype, arrays: &[&Tensor]| {
             let output = promote(input, arrays);
@@ -330,57 +494,88 @@ pub(crate) fn promotion_scratch_with_effects(&self, x: &Tensor, temb: Option<&Te
         if let Some(shortcut) = &self.shortcut {
             let mut shape = x.shape().to_vec();
             *shape.last_mut().expect("NHWC input") = conv1.weight.shape[3];
-            extra += effects.shortcut_metadata("conv_shortcut", shortcut).operand_bytes(&shape, x.dtype());
+            extra += effects
+                .shortcut_metadata("conv_shortcut", shortcut)
+                .operand_bytes(&shape, x.dtype());
         }
         Ok(extra)
     }
 
-pub(crate) fn output_dtype_with_effects(&self, input: Dtype, temb: Option<Dtype>, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        input: Dtype,
+        temb: Option<Dtype>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
         let mut arrays: Vec<&Tensor> = vec![&self.norm1_w, &self.norm1_b];
         arrays.extend(self.conv1.bias());
         arrays.extend([&self.norm2_w, &self.norm2_b]);
         arrays.extend(self.conv2.bias());
         let conv1 = effects.conv_metadata("conv1", &self.conv1);
         let conv2 = effects.conv_metadata("conv2", &self.conv2);
-        let mut y = Dtype::from_promoting_types(promote(input, &arrays),
-            Dtype::from_promoting_types(conv1.weight.dtype, conv2.weight.dtype));
+        let mut y = Dtype::from_promoting_types(
+            promote(input, &arrays),
+            Dtype::from_promoting_types(conv1.weight.dtype, conv2.weight.dtype),
+        );
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
-            y = Dtype::from_promoting_types(y, effects.linear_metadata("time_emb_proj", proj)?.output_dtype(t));
+            y = Dtype::from_promoting_types(
+                y,
+                effects
+                    .linear_metadata("time_emb_proj", proj)?
+                    .output_dtype(t),
+            );
         }
         let residual = match &self.shortcut {
-            Some(sc) => {
-                Dtype::from_promoting_types(input, effects.shortcut_metadata("conv_shortcut", sc).output_dtype(input))
-            }
+            Some(sc) => Dtype::from_promoting_types(
+                input,
+                effects
+                    .shortcut_metadata("conv_shortcut", sc)
+                    .output_dtype(input),
+            ),
             None => input,
         };
         Ok(Dtype::from_promoting_types(residual, y))
     }
 
-pub(crate) fn output_shape_with_effects(
-        &self, input: &[i32], skip: Option<&[i32]>, effects: &crate::quantum::EffectScope<'_>,
+    pub(crate) fn output_shape_with_effects(
+        &self,
+        input: &[i32],
+        skip: Option<&[i32]>,
+        effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Vec<i32>> {
         let mut input = input.to_vec();
         if let Some(skip) = skip {
-            if input[..3] != skip[..3] { return Err(mlx_gen::Error::Msg("sdxl resnet skip concat axes disagree".into())); }
-            input[3] = input[3].checked_add(skip[3]).ok_or_else(|| mlx_gen::Error::Msg("sdxl resnet concat width overflow".into()))?;
+            if input[..3] != skip[..3] {
+                return Err(mlx_gen::Error::Msg(
+                    "sdxl resnet skip concat axes disagree".into(),
+                ));
+            }
+            input[3] = input[3]
+                .checked_add(skip[3])
+                .ok_or_else(|| mlx_gen::Error::Msg("sdxl resnet concat width overflow".into()))?;
         }
-        let first = effects.conv_metadata("conv1", &self.conv1).output_shape(&input, 1, 1)?;
-        let output = effects.conv_metadata("conv2", &self.conv2).output_shape(&first, 1, 1)?;
+        let first = effects
+            .conv_metadata("conv1", &self.conv1)
+            .output_shape(&input, 1, 1)?;
+        let output = effects
+            .conv_metadata("conv2", &self.conv2)
+            .output_shape(&first, 1, 1)?;
         let residual = match &self.shortcut {
-            Some(shortcut) => effects.shortcut_metadata("conv_shortcut", shortcut).output_shape(&input)?,
+            Some(shortcut) => effects
+                .shortcut_metadata("conv_shortcut", shortcut)
+                .output_shape(&input)?,
             None => input,
         };
         crate::adapters::broadcast_shape(&output, &residual)
     }
 
-pub(crate) fn conv_weights(&self) -> (&Tensor, &Tensor) {
+    pub(crate) fn conv_weights(&self) -> (&Tensor, &Tensor) {
         (self.conv1.weight(), self.conv2.weight())
     }
-
 }
 
 impl TimeFacts {
-pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8746): both MLP Linears are quantized in [`Self::quantize`], so a
         // pre-quantized snapshot stores their packed triple — `crate::quant::lin` loads packed or
         // dense automatically.
@@ -390,43 +585,85 @@ pub fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         })
     }
 
-pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
-        visit(&crate::quant::child_path(prefix, "linear_1"), &mut self.linear1, bits)?;
-        visit(&crate::quant::child_path(prefix, "linear_2"), &mut self.linear2, bits)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut MetaVisit<'_>,
+    ) -> Result<()> {
+        visit(
+            &crate::quant::child_path(prefix, "linear_1"),
+            &mut self.linear1,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "linear_2"),
+            &mut self.linear2,
+            bits,
+        )?;
         Ok(())
     }
 
-pub(crate) fn output_dtype_with_effects(&self, x: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
-        let first = effects.linear_metadata("linear_1", &self.linear1)?.output_dtype(x);
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        x: Dtype,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
+        let first = effects
+            .linear_metadata("linear_1", &self.linear1)?
+            .output_dtype(x);
         let first = Dtype::from_promoting_types(x, first);
-        Ok(Dtype::from_promoting_types(first,
-            effects.linear_metadata("linear_2", &self.linear2)?.output_dtype(first)))
+        Ok(Dtype::from_promoting_types(
+            first,
+            effects
+                .linear_metadata("linear_2", &self.linear2)?
+                .output_dtype(first),
+        ))
     }
 
-pub(crate) fn projection_scratch(&self, batch: i32, input: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+    pub(crate) fn projection_scratch(
+        &self,
+        batch: i32,
+        input: Dtype,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         let first = effects.linear_metadata("linear_1", &self.linear1)?;
         let second = effects.linear_metadata("linear_2", &self.linear2)?;
         let shape = [batch, *first.base.base_shape.last().unwrap_or(&0)];
         let hidden = first.output_dtype(input);
         let intermediate = [batch, first.output_width() as i32];
         let output = second.output_dtype(hidden);
-        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(
-            crate::quantum::dtype_bytes(dtype), &[batch.max(0) as u64, width]);
-        Ok(first.operand_bytes(&shape, input)
+        let plane = |dtype, width| {
+            mlx_gen::ios_quantum::tensor_bytes(
+                crate::quantum::dtype_bytes(dtype),
+                &[batch.max(0) as u64, width],
+            )
+        };
+        Ok(first
+            .operand_bytes(&shape, input)
             .saturating_add(plane(hidden, first.output_width()).saturating_mul(3))
             .saturating_add(second.operand_bytes(&intermediate, hidden))
             .saturating_add(plane(output, second.output_width()))
             .saturating_add(crate::quantum::page_slack(4)))
     }
 
-pub(crate) fn out_features_with_effects(&self, effects: &crate::quantum::EffectScope<'_>) -> Result<i32> {
-        Ok(effects.linear_metadata("linear_2", &self.linear2)?.output_width() as i32)
+    pub(crate) fn out_features_with_effects(
+        &self,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<i32> {
+        Ok(effects
+            .linear_metadata("linear_2", &self.linear2)?
+            .output_width() as i32)
     }
-
 }
 
 impl AttentionFacts {
-fn from_weights(w: &HeaderWeights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
+    fn from_weights(
+        w: &HeaderWeights,
+        prefix: &str,
+        model_dims: i32,
+        num_heads: i32,
+    ) -> Result<Self> {
         // Packed-detect (sc-8746): q/k/v (bias-free) + to_out.0 (biased) are all quantized in
         // [`Self::quantize`], so `crate::quant::lin` loads their packed triple or the dense weight.
         let no_bias = |n: &str| header_linear(w, &format!("{prefix}.{n}"), false);
@@ -438,33 +675,56 @@ fn from_weights(w: &HeaderWeights, prefix: &str, model_dims: i32, num_heads: i32
             out: header_linear(w, &format!("{prefix}.to_out.0"), true)?,
             num_heads,
             head_dim,
-            
+
             to_k_ip: None,
             to_v_ip: None,
-            
         })
     }
 
-fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
+    fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
         self.to_k_ip = Some(q::LinearWork::dense(k_ip, None));
         self.to_v_ip = Some(q::LinearWork::dense(v_ip, None));
     }
 
-fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
-        for (name, lin) in [("to_q", &mut self.q), ("to_k", &mut self.k),
-            ("to_v", &mut self.v), ("to_out.0", &mut self.out)] {
+    fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+        for (name, lin) in [
+            ("to_q", &mut self.q),
+            ("to_k", &mut self.k),
+            ("to_v", &mut self.v),
+            ("to_out.0", &mut self.out),
+        ] {
             visit(&crate::quant::child_path(prefix, name), lin, bits)?;
         }
-        for (name, lin) in [("to_k_ip", &mut self.to_k_ip), ("to_v_ip", &mut self.to_v_ip)] {
-            if let Some(lin) = lin { visit(&crate::quant::child_path(prefix, name), lin, bits)?; }
+        for (name, lin) in [
+            ("to_k_ip", &mut self.to_k_ip),
+            ("to_v_ip", &mut self.to_v_ip),
+        ] {
+            if let Some(lin) = lin {
+                visit(&crate::quant::child_path(prefix, name), lin, bits)?;
+            }
         }
         Ok(())
     }
+}
 
+/// One transformer block's query/context batches and token counts.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockGeometry {
+    pub batch: i32,
+    pub context_batch: i32,
+    pub tokens: i32,
+    pub context_tokens: i32,
+}
+
+/// The hidden and text-memory widths a transformer block's projections read.
+#[derive(Clone, Copy)]
+pub(crate) struct ProjectionWidths {
+    pub hidden: i32,
+    pub memory: i32,
 }
 
 impl TransformerBlockFacts {
-pub(crate) fn from_weights(
+    pub(crate) fn from_weights(
         w: &HeaderWeights,
         prefix: &str,
         model_dims: i32,
@@ -511,35 +771,57 @@ pub(crate) fn from_weights(
         })
     }
 
-pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
-        self.attn1.quantize_using(&crate::quant::child_path(prefix, "attn1"), bits, visit)?;
-        self.attn2.quantize_using(&crate::quant::child_path(prefix, "attn2"), bits, visit)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear1"), &mut self.linear1, bits)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear2"), &mut self.linear2, bits)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear3"), &mut self.linear3, bits)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut MetaVisit<'_>,
+    ) -> Result<()> {
+        self.attn1
+            .quantize_using(&crate::quant::child_path(prefix, "attn1"), bits, visit)?;
+        self.attn2
+            .quantize_using(&crate::quant::child_path(prefix, "attn2"), bits, visit)?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear1"),
+            &mut self.linear1,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear2"),
+            &mut self.linear2,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear3"),
+            &mut self.linear3,
+            bits,
+        )?;
         Ok(())
     }
 
-fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
+    fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
         self.attn2.install_ip(k_ip, v_ip);
     }
 
-pub(crate) fn has_ip(&self) -> bool {
+    pub(crate) fn has_ip(&self) -> bool {
         self.attn2.to_k_ip.is_some() && self.attn2.to_v_ip.is_some()
     }
 
-pub(crate) fn quantum_scratch_from_facts(
+    pub(crate) fn quantum_scratch_from_facts(
         &self,
-        batch: i32,
-        context_batch: i32,
-        tokens: i32,
-        context_tokens: i32,
+        geometry: BlockGeometry,
         ip: bool,
         x: Dtype,
         attention: mlx_gen::attention::AttentionPlan<'_>,
         activation: Dtype,
         ff_width: u64,
     ) -> u64 {
+        let BlockGeometry {
+            batch,
+            context_batch,
+            tokens,
+            context_tokens,
+        } = geometry;
         let heads = self.attn1.num_heads;
         let act = crate::quantum::dtype_bytes(activation);
         let dim = self.norm1_w.shape()[0] as u64;
@@ -585,17 +867,33 @@ pub(crate) fn quantum_scratch_from_facts(
         ))
     }
 
-pub(crate) fn projection_work(
-        &self, batch: i32, context_batch: i32, tokens: i32, hidden_width: i32,
-        context_tokens: i32, memory_width: i32,
-        x: Dtype, memory: Dtype, ip: Option<(i32, i32, Dtype)>,
+    pub(crate) fn projection_work(
+        &self,
+        geometry: BlockGeometry,
+        widths: ProjectionWidths,
+        x: Dtype,
+        memory: Dtype,
+        ip: Option<(i32, i32, Dtype)>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Dtype, u64)> {
+        let BlockGeometry {
+            batch,
+            context_batch,
+            tokens,
+            context_tokens,
+        } = geometry;
+        let ProjectionWidths {
+            hidden: hidden_width,
+            memory: memory_width,
+        } = widths;
         // Native projections read ACTIVATIONS, not the pre-install borrowed weight's axes.
         // Selected effects may have changed a dense base before its actual load-time pack.
         let dim = hidden_width;
-        let operand = |_family: &str, _role: &str, linear: &crate::quantum::LinearWork,
-            shape: &[i32], dtype: Dtype| {
+        let operand = |_family: &str,
+                       _role: &str,
+                       linear: &crate::quantum::LinearWork,
+                       shape: &[i32],
+                       dtype: Dtype| {
             let bytes = linear.operand_bytes(shape, dtype);
             #[cfg(test)]
             super::transformer::PROJECTION_OPERAND_LOG.with(|log| {
@@ -614,33 +912,52 @@ pub(crate) fn projection_work(
             let scope = effects.child(name);
             let norm = promote(hidden, &[norm_w, norm_b]);
             let query = [batch, tokens, dim];
-            let key = [if cross { context_batch } else { batch },
+            let key = [
+                if cross { context_batch } else { batch },
                 if cross { context_tokens } else { tokens },
-                if cross { memory_width } else { hidden_width }];
+                if cross { memory_width } else { hidden_width },
+            ];
             let key_dtype = if cross { memory } else { norm };
             let q = scope.linear_metadata("to_q", &attention.q)?;
             let k = scope.linear_metadata("to_k", &attention.k)?;
             let v = scope.linear_metadata("to_v", &attention.v)?;
-            scratch = scratch.saturating_add(operand(name, "to_q", &q, &query, norm))
+            scratch = scratch
+                .saturating_add(operand(name, "to_q", &q, &query, norm))
                 .saturating_add(operand(name, "to_k", &k, &key, key_dtype))
                 .saturating_add(operand(name, "to_v", &v, &key, key_dtype));
-            let mut attended = Dtype::from_promoting_types(q.output_dtype(norm),
-                Dtype::from_promoting_types(k.output_dtype(key_dtype), v.output_dtype(key_dtype)));
+            let mut attended = Dtype::from_promoting_types(
+                q.output_dtype(norm),
+                Dtype::from_promoting_types(k.output_dtype(key_dtype), v.output_dtype(key_dtype)),
+            );
             if cross {
                 if let Some((ip_tokens, ip_width, ip_dtype)) = ip {
-                    for (name, projection) in [("to_k_ip", &attention.to_k_ip), ("to_v_ip", &attention.to_v_ip)] {
+                    for (name, projection) in [
+                        ("to_k_ip", &attention.to_k_ip),
+                        ("to_v_ip", &attention.to_v_ip),
+                    ] {
                         if let Some(projection) = projection {
                             let work = scope.linear_metadata(name, projection)?;
-                            scratch = scratch.saturating_add(operand("attn2", name, &work,
-                                &[context_batch, ip_tokens, ip_width], ip_dtype));
-                            attended = Dtype::from_promoting_types(attended, work.output_dtype(ip_dtype));
+                            scratch = scratch.saturating_add(operand(
+                                "attn2",
+                                name,
+                                &work,
+                                &[context_batch, ip_tokens, ip_width],
+                                ip_dtype,
+                            ));
+                            attended =
+                                Dtype::from_promoting_types(attended, work.output_dtype(ip_dtype));
                         }
                     }
                 }
             }
             let out = scope.linear_metadata("to_out.0", &attention.out)?;
-            scratch = scratch.saturating_add(operand(name, "to_out.0", &out,
-                &[batch, tokens, attention.num_heads * attention.head_dim], attended));
+            scratch = scratch.saturating_add(operand(
+                name,
+                "to_out.0",
+                &out,
+                &[batch, tokens, attention.num_heads * attention.head_dim],
+                attended,
+            ));
             hidden = Dtype::from_promoting_types(hidden, out.output_dtype(attended));
         }
         let norm = promote(hidden, &[&self.norm3_w, &self.norm3_b]);
@@ -648,26 +965,35 @@ pub(crate) fn projection_work(
         let gate = effects.linear_metadata("ff.linear2", &self.linear2)?;
         let output = effects.linear_metadata("ff.linear3", &self.linear3)?;
         let input = [batch, tokens, dim];
-        scratch = scratch.saturating_add(operand("ff", "linear1", &value, &input, norm))
+        scratch = scratch
+            .saturating_add(operand("ff", "linear1", &value, &input, norm))
             .saturating_add(operand("ff", "linear2", &gate, &input, norm));
-        let product = Dtype::from_promoting_types(value.output_dtype(norm), gate.output_dtype(norm));
-        scratch = scratch.saturating_add(operand("ff", "linear3", &output,
-            &[batch, tokens, value.output_width() as i32], product));
-        Ok((Dtype::from_promoting_types(hidden, output.output_dtype(product)), scratch))
+        let product =
+            Dtype::from_promoting_types(value.output_dtype(norm), gate.output_dtype(norm));
+        scratch = scratch.saturating_add(operand(
+            "ff",
+            "linear3",
+            &output,
+            &[batch, tokens, value.output_width() as i32],
+            product,
+        ));
+        Ok((
+            Dtype::from_promoting_types(hidden, output.output_dtype(product)),
+            scratch,
+        ))
     }
 
-pub(crate) fn context_tokens(&self, memory: &Tensor, ip: Option<(&Tensor, f32)>) -> i32 {
+    pub(crate) fn context_tokens(&self, memory: &Tensor, ip: Option<(&Tensor, f32)>) -> i32 {
         let ip_tokens = match ip {
             Some((tokens, _)) if self.has_ip() => tokens.shape()[1],
             _ => 0,
         };
         memory.shape()[1] + ip_tokens
     }
-
 }
 
 impl TransformerFacts {
-pub fn from_weights(
+    pub fn from_weights(
         w: &HeaderWeights,
         prefix: &str,
         model_dims: i32,
@@ -695,17 +1021,34 @@ pub fn from_weights(
         })
     }
 
-pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut MetaVisit<'_>,
+    ) -> Result<()> {
         // Preserve the actual pack order: BOTH projections precede the transformer blocks.
-        visit(&crate::quant::child_path(prefix, "proj_in"), &mut self.proj_in, bits)?;
-        visit(&crate::quant::child_path(prefix, "proj_out"), &mut self.proj_out, bits)?;
+        visit(
+            &crate::quant::child_path(prefix, "proj_in"),
+            &mut self.proj_in,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "proj_out"),
+            &mut self.proj_out,
+            bits,
+        )?;
         for (index, b) in self.blocks.iter_mut().enumerate() {
-            b.quantize_using(&crate::quant::child_path(prefix, &format!("transformer_blocks.{index}")), bits, visit)?;
+            b.quantize_using(
+                &crate::quant::child_path(prefix, &format!("transformer_blocks.{index}")),
+                bits,
+                visit,
+            )?;
         }
         Ok(())
     }
 
-pub(crate) fn block_price_with_effects(
+    pub(crate) fn block_price_with_effects(
         &self,
         index: usize,
         y: &Tensor,
@@ -716,13 +1059,40 @@ pub(crate) fn block_price_with_effects(
     ) -> Result<u64> {
         let block = &self.blocks[index];
         let scope = effects.child(&format!("transformer_blocks.{index}"));
-        let context_batch = plan.conditioning_batch(y.shape()[0]).max(encoder_x.shape()[0]);
-        let (activation, operands) = block.projection_work(y.shape()[0], context_batch, y.shape()[1], y.shape()[2],
-            encoder_x.shape()[1], encoder_x.shape()[2], y.dtype(), encoder_x.dtype(),
-            ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())), &scope)?;
-        let activations = block.quantum_scratch_from_facts(y.shape()[0], context_batch, y.shape()[1],
-            block.context_tokens(encoder_x, ip), ip.is_some(), y.dtype(), plan.attention,
-            activation, scope.linear_metadata("ff.linear1", &block.linear1)?.output_width());
+        let context_batch = plan
+            .conditioning_batch(y.shape()[0])
+            .max(encoder_x.shape()[0]);
+        let (activation, operands) = block.projection_work(
+            BlockGeometry {
+                batch: y.shape()[0],
+                context_batch,
+                tokens: y.shape()[1],
+                context_tokens: encoder_x.shape()[1],
+            },
+            ProjectionWidths {
+                hidden: y.shape()[2],
+                memory: encoder_x.shape()[2],
+            },
+            y.dtype(),
+            encoder_x.dtype(),
+            ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+            &scope,
+        )?;
+        let activations = block.quantum_scratch_from_facts(
+            BlockGeometry {
+                batch: y.shape()[0],
+                context_batch,
+                tokens: y.shape()[1],
+                context_tokens: block.context_tokens(encoder_x, ip),
+            },
+            ip.is_some(),
+            y.dtype(),
+            plan.attention,
+            activation,
+            scope
+                .linear_metadata("ff.linear1", &block.linear1)?
+                .output_width(),
+        );
         let weights = match &self.block_stream {
             Some(stream) => stream.streamed_bytes(index)?,
             None => 0,
@@ -730,7 +1100,7 @@ pub(crate) fn block_price_with_effects(
         Ok(activations.saturating_add(operands).saturating_add(weights))
     }
 
-pub(crate) fn projection_budgets_with_effects(
+    pub(crate) fn projection_budgets_with_effects(
         &self,
         x: &Tensor,
         encoder_x: &Tensor,
@@ -745,19 +1115,39 @@ pub(crate) fn projection_budgets_with_effects(
         let norm = promote(x.dtype(), &[&self.norm_w, &self.norm_b]);
         let inner = input.output_width() as i32;
         let mut hidden = input.output_dtype(norm);
-        let groups = crate::quantum::group_norm_buffers(crate::quantum::backend(), element_bytes(x));
-        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(crate::quantum::dtype_bytes(dtype),
-            &[s[0] as u64, s[1] as u64, s[2] as u64, width]);
-        let proj_in = plane(x.dtype(), s[3] as u64).saturating_mul(groups)
+        let groups =
+            crate::quantum::group_norm_buffers(crate::quantum::backend(), element_bytes(x));
+        let plane = |dtype, width| {
+            mlx_gen::ios_quantum::tensor_bytes(
+                crate::quantum::dtype_bytes(dtype),
+                &[s[0] as u64, s[1] as u64, s[2] as u64, width],
+            )
+        };
+        let proj_in = plane(x.dtype(), s[3] as u64)
+            .saturating_mul(groups)
             .saturating_add(input.operand_bytes(&shape, norm))
             .saturating_add(plane(hidden, inner as u64))
             .saturating_add(crate::quantum::page_slack(groups + 1));
         let entered = hidden;
         for (index, block) in self.blocks.iter().enumerate() {
-            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
-                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
-                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
-                &effects.child(&format!("transformer_blocks.{index}")))?.0;
+            hidden = block
+                .projection_work(
+                    BlockGeometry {
+                        batch: s[0],
+                        context_batch: plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
+                        tokens: s[1] * s[2],
+                        context_tokens: encoder_x.shape()[1],
+                    },
+                    ProjectionWidths {
+                        hidden: inner,
+                        memory: encoder_x.shape()[2],
+                    },
+                    hidden,
+                    encoder_x.dtype(),
+                    ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+                    &effects.child(&format!("transformer_blocks.{index}")),
+                )?
+                .0;
         }
         let projected = output.output_dtype(hidden);
         let summed = Dtype::from_promoting_types(projected, x.dtype());
@@ -769,7 +1159,7 @@ pub(crate) fn projection_budgets_with_effects(
         Ok((proj_in, proj_out, inner, entered, summed))
     }
 
-pub(crate) fn price_forward_with_effects(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Tensor,
         encoder_x: &Tensor,
@@ -785,18 +1175,34 @@ pub(crate) fn price_forward_with_effects(
         let inner_plan = plan.with_window(None);
         for (index, block) in self.blocks.iter().enumerate() {
             let y = tensor(&[s[0], s[1] * s[2], inner], hidden)?;
-            out.push((crate::quantum::TRANSFORMER_BLOCK,
-                self.block_price_with_effects(index, &y, encoder_x, ip, inner_plan, effects)?));
-            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
-                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
-                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
-                &effects.child(&format!("transformer_blocks.{index}")))?.0;
+            out.push((
+                crate::quantum::TRANSFORMER_BLOCK,
+                self.block_price_with_effects(index, &y, encoder_x, ip, inner_plan, effects)?,
+            ));
+            hidden = block
+                .projection_work(
+                    BlockGeometry {
+                        batch: s[0],
+                        context_batch: plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
+                        tokens: s[1] * s[2],
+                        context_tokens: encoder_x.shape()[1],
+                    },
+                    ProjectionWidths {
+                        hidden: inner,
+                        memory: encoder_x.shape()[2],
+                    },
+                    hidden,
+                    encoder_x.dtype(),
+                    ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+                    &effects.child(&format!("transformer_blocks.{index}")),
+                )?
+                .0;
         }
         out.push((crate::quantum::TRANSFORMER_PROJ_OUT, proj_out));
         tensor(s, summed)
     }
 
-pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
         for block in &mut self.blocks {
             let (k_ip, v_ip) = pairs
                 .next()
@@ -805,11 +1211,24 @@ pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>)
         }
         Ok(())
     }
+}
 
+/// One down/up block's shared conditioning inputs (pricing facts or native test arrays).
+pub(crate) struct BlockForwardInputs<'a, T> {
+    pub encoder_x: &'a T,
+    pub temb: &'a T,
+    pub ip: Option<(&'a T, f32)>,
+    pub plan: crate::plan::SdxlForwardPlan<'a>,
+}
+
+/// The coincident logical owners outside one block, and the optional per-quantum owner sink.
+pub(crate) struct BlockOwners<'a> {
+    pub outer_held: u64,
+    pub owners: Option<&'a mut Vec<u64>>,
 }
 
 impl BlockFacts {
-pub fn from_weights(w: &HeaderWeights, spec: &BlockSpec) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, spec: &BlockSpec) -> Result<Self> {
         let resnets = (0..spec.num_resnets)
             .map(|j| ResnetFacts::from_weights(w, &format!("{}.resnets.{j}", spec.prefix)))
             .collect::<Result<Vec<_>>>()?;
@@ -860,31 +1279,50 @@ pub fn from_weights(w: &HeaderWeights, spec: &BlockSpec) -> Result<Self> {
         })
     }
 
-pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut MetaVisit<'_>,
+    ) -> Result<()> {
         for (index, r) in self.resnets.iter_mut().enumerate() {
-            r.quantize_using(&crate::quant::child_path(prefix, &format!("resnets.{index}")), bits, visit)?;
+            r.quantize_using(
+                &crate::quant::child_path(prefix, &format!("resnets.{index}")),
+                bits,
+                visit,
+            )?;
         }
         if let Some(attns) = &mut self.attentions {
             for (index, a) in attns.iter_mut().enumerate() {
-                a.quantize_using(&crate::quant::child_path(prefix, &format!("attentions.{index}")), bits, visit)?;
+                a.quantize_using(
+                    &crate::quant::child_path(prefix, &format!("attentions.{index}")),
+                    bits,
+                    visit,
+                )?;
             }
         }
         Ok(())
     }
 
-pub(crate) fn price_forward_with_effects(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Tensor,
-        encoder_x: &Tensor,
-        temb: &Tensor,
+        inputs: BlockForwardInputs<'_, Tensor>,
         mut residuals: Option<&mut Vec<Tensor>>,
-        ip: Option<(&Tensor, f32)>,
-        plan: crate::plan::SdxlForwardPlan<'_>,
         out: &mut crate::quantum::Quanta,
-        outer_held: u64,
-        mut owners: Option<&mut Vec<u64>>,
+        ownership: BlockOwners<'_>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Tensor, Vec<Tensor>)> {
+        let BlockForwardInputs {
+            encoder_x,
+            temb,
+            ip,
+            plan,
+        } = inputs;
+        let BlockOwners {
+            outer_held,
+            mut owners,
+        } = ownership;
         let mut x = x.clone();
         let mut output_states = Vec::with_capacity(self.resnets.len() + 1);
         for i in 0..self.resnets.len() {
@@ -896,22 +1334,31 @@ pub(crate) fn price_forward_with_effects(
             };
             let resnet = &self.resnets[i];
             if let Some(owners) = owners.as_deref_mut() {
-                owners.push(
-                    outer_held + output_states.iter().map(tensor_bytes).sum::<u64>(),
-                );
+                owners.push(outer_held + output_states.iter().map(tensor_bytes).sum::<u64>());
             }
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(&x, Some(temb), &effects.child(&format!("resnets.{i}")))?,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(temb),
+                    &effects.child(&format!("resnets.{i}")),
+                )?,
             ));
             let input = skip.as_ref().map_or(x.dtype(), |s| {
                 Dtype::from_promoting_types(x.dtype(), s.dtype())
             });
-            let shape = resnet.output_shape_with_effects(x.shape(), skip.as_ref().map(Tensor::shape),
-                &effects.child(&format!("resnets.{i}")))?;
+            let shape = resnet.output_shape_with_effects(
+                x.shape(),
+                skip.as_ref().map(Tensor::shape),
+                &effects.child(&format!("resnets.{i}")),
+            )?;
             x = tensor(
                 &shape,
-                resnet.output_dtype_with_effects(input, Some(temb.dtype()), &effects.child(&format!("resnets.{i}")))?,
+                resnet.output_dtype_with_effects(
+                    input,
+                    Some(temb.dtype()),
+                    &effects.child(&format!("resnets.{i}")),
+                )?,
             )?;
             if let Some(attns) = &self.attentions {
                 let first = out.len();
@@ -920,7 +1367,14 @@ pub(crate) fn price_forward_with_effects(
                 let held = outer_held
                     + output_states.iter().map(tensor_bytes).sum::<u64>()
                     + tensor_bytes(&x);
-                x = attns[i].price_forward_with_effects(&x, encoder_x, ip, plan, out, &effects.child(&format!("attentions.{i}")))?;
+                x = attns[i].price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    ip,
+                    plan,
+                    out,
+                    &effects.child(&format!("attentions.{i}")),
+                )?;
                 if let Some(owners) = owners.as_deref_mut() {
                     owners.extend(std::iter::repeat_n(held, out.len() - first));
                 }
@@ -929,32 +1383,40 @@ pub(crate) fn price_forward_with_effects(
         }
         if let Some(c) = &self.downsample {
             if let Some(owners) = owners.as_deref_mut() {
-                owners.push(
-                    outer_held + output_states.iter().map(tensor_bytes).sum::<u64>(),
-                );
+                owners.push(outer_held + output_states.iter().map(tensor_bytes).sum::<u64>());
             }
             let conv = effects.conv_metadata("downsamplers.0.conv", c);
-            out.push((crate::quantum::UNET_DOWNSAMPLE, sampler_scratch(&x, &conv, false)));
-            x = tensor(&conv.output_shape(x.shape(), 2, 1)?, conv.output_dtype(x.dtype()))?;
+            out.push((
+                crate::quantum::UNET_DOWNSAMPLE,
+                sampler_scratch(&x, &conv, false),
+            ));
+            x = tensor(
+                &conv.output_shape(x.shape(), 2, 1)?,
+                conv.output_dtype(x.dtype()),
+            )?;
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
-            if let Some(owners) = owners.as_deref_mut() {
-                owners.push(
-                    outer_held + output_states.iter().map(tensor_bytes).sum::<u64>(),
-                );
+            if let Some(owners) = owners {
+                owners.push(outer_held + output_states.iter().map(tensor_bytes).sum::<u64>());
             }
             let conv = effects.conv_metadata("upsamplers.0.conv", c);
-            out.push((crate::quantum::UNET_UPSAMPLE, sampler_scratch(&x, &conv, true)));
+            out.push((
+                crate::quantum::UNET_UPSAMPLE,
+                sampler_scratch(&x, &conv, true),
+            ));
             let s = x.shape();
             let input = [s[0], 2 * s[1], 2 * s[2], s[3]];
-            x = tensor(&conv.output_shape(&input, 1, 1)?, conv.output_dtype(x.dtype()))?;
+            x = tensor(
+                &conv.output_shape(&input, 1, 1)?,
+                conv.output_dtype(x.dtype()),
+            )?;
             output_states.push(x.clone());
         }
         Ok((x, output_states))
     }
 
-pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>) -> Result<()> {
         if let Some(attns) = &mut self.attentions {
             for a in attns {
                 a.install_ip(pairs)?;
@@ -962,11 +1424,18 @@ pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Tensor, Tensor)>)
         }
         Ok(())
     }
+}
 
+/// The U-Net forward's text memory, pooled text, optional ControlNet residuals and IP tokens.
+pub(crate) struct UNetConditioning<'a, T> {
+    pub encoder_x: &'a T,
+    pub text_emb: &'a T,
+    pub control: Option<&'a (Vec<T>, T)>,
+    pub ip: Option<(&'a T, f32)>,
 }
 
 impl UNetFacts {
-pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
         let n = cfg.num_blocks();
         let boc = &cfg.block_out_channels;
         let temb_dim_src = boc[0]; // sinusoidal timestep width
@@ -1008,9 +1477,7 @@ pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
             ),
             _timesteps: SinusoidFacts::timestep(temb_dim_src)?,
             time_embedding: TimeFacts::from_weights(w, "time_embedding")?,
-            _add_time_proj: SinusoidFacts::timestep(
-                cfg.addition_time_embed_dim.unwrap_or(256),
-            )?,
+            _add_time_proj: SinusoidFacts::timestep(cfg.addition_time_embed_dim.unwrap_or(256))?,
             add_embedding: TimeFacts::from_weights(w, "add_embedding")?,
             down_blocks,
             mid_resnet0,
@@ -1041,50 +1508,80 @@ pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
         })
     }
 
-pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
-        self.time_embedding.quantize_using("time_embedding", bits, visit)?;
-        self.add_embedding.quantize_using("add_embedding", bits, visit)?;
+    pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+        self.time_embedding
+            .quantize_using("time_embedding", bits, visit)?;
+        self.add_embedding
+            .quantize_using("add_embedding", bits, visit)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
             visit("encoder_hid_proj", proj, bits)?;
         }
         for (index, b) in self.down_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("down_blocks.{index}"), bits, visit)?;
         }
-        self.mid_resnet0.quantize_using("mid_block.resnets.0", bits, visit)?;
-        self.mid_transformer.quantize_using("mid_block.attentions.0", bits, visit)?;
-        self.mid_resnet1.quantize_using("mid_block.resnets.1", bits, visit)?;
+        self.mid_resnet0
+            .quantize_using("mid_block.resnets.0", bits, visit)?;
+        self.mid_transformer
+            .quantize_using("mid_block.attentions.0", bits, visit)?;
+        self.mid_resnet1
+            .quantize_using("mid_block.resnets.1", bits, visit)?;
         for (index, b) in self.up_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("up_blocks.{index}"), bits, visit)?;
         }
         Ok(())
     }
 
-pub(crate) fn price_forward_with_effects(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Tensor,
-        encoder_x: &Tensor,
-        text_emb: &Tensor,
-        control: Option<&(Vec<Tensor>, Tensor)>,
-        ip: Option<(&Tensor, f32)>,
+        conditioning: UNetConditioning<'_, Tensor>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         pending: crate::quantum::ControlMergeWork,
         out: &mut crate::quantum::Quanta,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Dtype> {
+        let UNetConditioning {
+            encoder_x,
+            text_emb,
+            control,
+            ip,
+        } = conditioning;
         let batch = x.shape()[0];
         let dtype = x.dtype();
         let conv_in = effects.conv_metadata("conv_in", &self.conv_in);
-        out.push((crate::quantum::UNET_STEM, stem_work_bytes(x, encoder_x, &conv_in,
-            self.encoder_hid_proj.as_ref(), 0, crate::quantum::backend())
-            .saturating_add(stem_projection_scratch(&self.time_embedding,
-                &self.add_embedding, self.encoder_hid_proj.as_ref(), plan.conditioning_batch(batch),
-                dtype, text_emb.dtype(), encoder_x, effects)?)));
+        out.push((
+            crate::quantum::UNET_STEM,
+            stem_work_bytes(
+                x,
+                encoder_x,
+                &conv_in,
+                self.encoder_hid_proj.as_ref(),
+                0,
+                crate::quantum::backend(),
+            )
+            .saturating_add(stem_projection_scratch(
+                &self.time_embedding,
+                &self.add_embedding,
+                self.encoder_hid_proj.as_ref(),
+                StemInput {
+                    batch: plan.conditioning_batch(batch),
+                    dtype,
+                    text: text_emb.dtype(),
+                },
+                encoder_x,
+                effects,
+            )?),
+        ));
         let projected = match &self.encoder_hid_proj {
             Some(proj) => {
                 let e = encoder_x.shape();
                 Some(tensor(
-                    &effects.linear_metadata("encoder_hid_proj", proj)?.output_shape(&[e[0], e[1], e[2]])?,
-                    effects.linear_metadata("encoder_hid_proj", proj)?.output_dtype(encoder_x.dtype()),
+                    &effects
+                        .linear_metadata("encoder_hid_proj", proj)?
+                        .output_shape(&[e[0], e[1], e[2]])?,
+                    effects
+                        .linear_metadata("encoder_hid_proj", proj)?
+                        .output_dtype(encoder_x.dtype()),
                 )?)
             }
             None => None,
@@ -1093,7 +1590,8 @@ pub(crate) fn price_forward_with_effects(
         let temb = tensor(
             &[
                 plan.conditioning_batch(batch),
-                self.time_embedding.out_features_with_effects(&effects.child("time_embedding"))?,
+                self.time_embedding
+                    .out_features_with_effects(&effects.child("time_embedding"))?,
             ],
             text_time_temb_dtype_with_effects(
                 &self.time_embedding,
@@ -1104,11 +1602,27 @@ pub(crate) fn price_forward_with_effects(
             )?,
         )?;
         let mut x = tensor(
-            &conv_in.output_shape(x.shape(), 1, 1)?, conv_in.output_dtype(dtype),
+            &conv_in.output_shape(x.shape(), 1, 1)?,
+            conv_in.output_dtype(dtype),
         )?;
         let mut residuals: Vec<Tensor> = vec![x.clone()];
         for (index, block) in self.down_blocks.iter().enumerate() {
-            let (o, res) = block.price_forward_with_effects(&x, encoder_x, &temb, None, ip, plan, out, 0, None, &effects.child(&format!("down_blocks.{index}")))?;
+            let (o, res) = block.price_forward_with_effects(
+                &x,
+                BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                None,
+                out,
+                BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("down_blocks.{index}")),
+            )?;
             x = o;
             residuals.extend(res);
         }
@@ -1130,17 +1644,39 @@ pub(crate) fn price_forward_with_effects(
         for (index, (resnet, attention)) in [
             (&self.mid_resnet0, Some(&self.mid_transformer)),
             (&self.mid_resnet1, None),
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(&x, Some(&temb), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(&temb),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             ));
             x = tensor(
-                &resnet.output_shape_with_effects(x.shape(), None, &effects.child(&format!("mid_block.resnets.{index}")))?,
-                resnet.output_dtype_with_effects(x.dtype(), Some(temb.dtype()), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                &resnet.output_shape_with_effects(
+                    x.shape(),
+                    None,
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
+                resnet.output_dtype_with_effects(
+                    x.dtype(),
+                    Some(temb.dtype()),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             )?;
             if let Some(attention) = attention {
-                x = attention.price_forward_with_effects(&x, encoder_x, ip, plan, out, &effects.child("mid_block.attentions.0"))?;
+                x = attention.price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    ip,
+                    plan,
+                    out,
+                    &effects.child("mid_block.attentions.0"),
+                )?;
             }
         }
         if let Some((_, mid)) = control {
@@ -1154,20 +1690,41 @@ pub(crate) fn price_forward_with_effects(
             )?;
         }
         for (index, block) in self.up_blocks.iter().enumerate() {
-            let (o, _) =
-                block.price_forward_with_effects(&x, encoder_x, &temb, Some(&mut residuals), ip, plan, out, 0, None, &effects.child(&format!("up_blocks.{index}")))?;
+            let (o, _) = block.price_forward_with_effects(
+                &x,
+                BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                Some(&mut residuals),
+                out,
+                BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("up_blocks.{index}")),
+            )?;
             x = o;
         }
         let conv_out = effects.conv_metadata("conv_out", &self.conv_out);
-        out.push((crate::quantum::UNET_CONV_OUT, crate::quantum::norm_conv_bytes(
-            &conv_out.call(x.shape(), element_bytes(&x), 1, 1), crate::quantum::backend())));
+        out.push((
+            crate::quantum::UNET_CONV_OUT,
+            crate::quantum::norm_conv_bytes(
+                &conv_out.call(x.shape(), element_bytes(&x), 1, 1),
+                crate::quantum::backend(),
+            ),
+        ));
         // Validate the final biased convolution's actual broadcast geometry, not its old base shape.
         conv_out.output_shape(x.shape(), 1, 1)?;
-        Ok(conv_out.output_dtype(promote(x.dtype(),
-            &[&self.conv_norm_out_w, &self.conv_norm_out_b])))
+        Ok(conv_out.output_dtype(promote(
+            x.dtype(),
+            &[&self.conv_norm_out_w, &self.conv_norm_out_b],
+        )))
     }
 
-pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
         let expected = pairs.len();
         let mut it = pairs.into_iter();
         for b in &mut self.down_blocks {
@@ -1185,11 +1742,10 @@ pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()>
         }
         Ok(())
     }
-
 }
 
 impl ConvFacts {
-fn load(w: &HeaderWeights, prefix: &str, stride: i32, pad: i32) -> Result<Self> {
+    fn load(w: &HeaderWeights, prefix: &str, stride: i32, pad: i32) -> Result<Self> {
         Ok(Self {
             weight: nchw_to_nhwc(w.require(&format!("{prefix}.weight"))?)?,
             bias: w.require(&format!("{prefix}.bias"))?.clone(),
@@ -1198,17 +1754,18 @@ fn load(w: &HeaderWeights, prefix: &str, stride: i32, pad: i32) -> Result<Self> 
         })
     }
 
-fn call(&self, x: &Tensor) -> crate::quantum::ConvCall {
+    fn call(&self, x: &Tensor) -> crate::quantum::ConvCall {
         crate::quantum::ConvCall::from_metadata(
             x.shape(),
             element_bytes(x),
-            &self.weight.shape, element_bytes(&self.weight),
+            &self.weight.shape,
+            element_bytes(&self.weight),
             self.stride,
             self.pad,
         )
     }
 
-fn price_output(&self, x: &Tensor) -> Result<Tensor> {
+    fn price_output(&self, x: &Tensor) -> Result<Tensor> {
         let s = x.shape();
         let w = self.weight.shape();
         let out = |n: i32, k: i32| (n + 2 * self.pad - k) / self.stride.max(1) + 1;
@@ -1217,11 +1774,10 @@ fn price_output(&self, x: &Tensor) -> Result<Tensor> {
             promote(x.dtype(), &[&self.weight, &self.bias]),
         )
     }
-
 }
 
 impl CondFacts {
-fn load(w: &HeaderWeights) -> Result<Self> {
+    fn load(w: &HeaderWeights) -> Result<Self> {
         let p = "controlnet_cond_embedding";
         let conv_in = ConvFacts::load(w, &format!("{p}.conv_in"), 1, 1)?;
         // blocks 0..6: even = stride 1, odd = stride 2 (the down-projection convs).
@@ -1239,7 +1795,7 @@ fn load(w: &HeaderWeights) -> Result<Self> {
         })
     }
 
-fn price_forward(&self, control: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
+    fn price_forward(&self, control: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
         let mut e = control.clone();
         for (layer, silu) in std::iter::once((&self.conv_in, true))
             .chain(self.blocks.iter().map(|b| (b, true)))
@@ -1258,11 +1814,18 @@ fn price_forward(&self, control: &Tensor, out: &mut crate::quantum::Quanta) -> R
         }
         Ok(e)
     }
+}
 
+/// One ControlNet branch's conditioning embedding and the shared text conditioning tensors.
+#[derive(Clone, Copy)]
+pub(crate) struct ControlConditioning<'a> {
+    pub cond_embed: &'a Tensor,
+    pub encoder_x: &'a Tensor,
+    pub text_emb: &'a Tensor,
 }
 
 impl ControlFacts {
-pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
         let n = cfg.num_blocks();
         let boc = &cfg.block_out_channels;
 
@@ -1295,9 +1858,7 @@ pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
             conv_in: ConvFacts::load(w, "conv_in", 1, 1)?,
             _timesteps: SinusoidFacts::timestep(boc[0])?,
             time_embedding: TimeFacts::from_weights(w, "time_embedding")?,
-            _add_time_proj: SinusoidFacts::timestep(
-                cfg.addition_time_embed_dim.unwrap_or(256),
-            )?,
+            _add_time_proj: SinusoidFacts::timestep(cfg.addition_time_embed_dim.unwrap_or(256))?,
             add_embedding: TimeFacts::from_weights(w, "add_embedding")?,
             down_blocks,
             mid_resnet0,
@@ -1323,7 +1884,7 @@ pub fn from_weights(w: &HeaderWeights, cfg: &UNetConfig) -> Result<Self> {
         })
     }
 
-pub(crate) fn price_embed_cond(
+    pub(crate) fn price_embed_cond(
         &self,
         control: &Tensor,
         out: &mut crate::quantum::Quanta,
@@ -1331,17 +1892,20 @@ pub(crate) fn price_embed_cond(
         self.cond_embedding.price_forward(control, out)
     }
 
-pub(crate) fn price_forward_with_effects(
+    pub(crate) fn price_forward_with_effects(
         &self,
         x: &Tensor,
-        cond_embed: &Tensor,
-        encoder_x: &Tensor,
-        text_emb: &Tensor,
+        conditioning: ControlConditioning<'_>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         out: &mut crate::quantum::Quanta,
         mut owners: Option<&mut Vec<u64>>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Vec<Tensor>, Tensor)> {
+        let ControlConditioning {
+            cond_embed,
+            encoder_x,
+            text_emb,
+        } = conditioning;
         let plan =
             crate::plan::SdxlForwardPlan::with_attention(plan.attention).with_cfg_row(plan.cfg_row);
         let batch = x.shape()[0];
@@ -1351,17 +1915,34 @@ pub(crate) fn price_forward_with_effects(
         }
         out.push((
             crate::quantum::CONTROL_STEM,
-            self.stem_scratch(x, encoder_x, cond_embed).saturating_add(
-                stem_projection_scratch(&self.time_embedding,
-                    &self.add_embedding, self.encoder_hid_proj.as_ref(), plan.conditioning_batch(batch),
-                    dtype, text_emb.dtype(), encoder_x, effects)?),
+            self.stem_scratch(x, encoder_x, cond_embed)
+                .saturating_add(stem_projection_scratch(
+                    &self.time_embedding,
+                    &self.add_embedding,
+                    self.encoder_hid_proj.as_ref(),
+                    StemInput {
+                        batch: plan.conditioning_batch(batch),
+                        dtype,
+                        text: text_emb.dtype(),
+                    },
+                    encoder_x,
+                    effects,
+                )?),
         ));
         let projected = match &self.encoder_hid_proj {
             Some(proj) => {
                 let e = encoder_x.shape();
                 Some(tensor(
-                    &[e[0], e[1], effects.linear_metadata("encoder_hid_proj", proj)?.output_width() as i32],
-                    effects.linear_metadata("encoder_hid_proj", proj)?.output_dtype(encoder_x.dtype()),
+                    &[
+                        e[0],
+                        e[1],
+                        effects
+                            .linear_metadata("encoder_hid_proj", proj)?
+                            .output_width() as i32,
+                    ],
+                    effects
+                        .linear_metadata("encoder_hid_proj", proj)?
+                        .output_dtype(encoder_x.dtype()),
                 )?)
             }
             None => None,
@@ -1370,7 +1951,8 @@ pub(crate) fn price_forward_with_effects(
         let temb = tensor(
             &[
                 plan.conditioning_batch(batch),
-                self.time_embedding.out_features_with_effects(&effects.child("time_embedding"))?,
+                self.time_embedding
+                    .out_features_with_effects(&effects.child("time_embedding"))?,
             ],
             text_time_temb_dtype_with_effects(
                 &self.time_embedding,
@@ -1385,21 +1967,24 @@ pub(crate) fn price_forward_with_effects(
             stem.shape(),
             Dtype::from_promoting_types(stem.dtype(), cond_embed.dtype()),
         )?;
-        let fixed =
-            tensor_bytes(&temb) + projected.as_ref().map_or(0, tensor_bytes);
+        let fixed = tensor_bytes(&temb) + projected.as_ref().map_or(0, tensor_bytes);
         let mut residuals: Vec<Tensor> = vec![x.clone()];
         for (index, block) in self.down_blocks.iter().enumerate() {
             let held = fixed + residuals.iter().map(tensor_bytes).sum::<u64>();
             let (o, res) = block.price_forward_with_effects(
                 &x,
-                encoder_x,
-                &temb,
+                BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip: None,
+                    plan,
+                },
                 None,
-                None,
-                plan,
                 out,
-                held,
-                owners.as_deref_mut(),
+                BlockOwners {
+                    outer_held: held,
+                    owners: owners.as_deref_mut(),
+                },
                 &effects.child(&format!("down_blocks.{index}")),
             )?;
             x = o;
@@ -1409,34 +1994,47 @@ pub(crate) fn price_forward_with_effects(
         for (index, (resnet, attention)) in [
             (&self.mid_resnet0, Some(&self.mid_transformer)),
             (&self.mid_resnet1, None),
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             if let Some(owners) = owners.as_deref_mut() {
                 owners.push(
                     fixed
                         + residuals.iter().map(tensor_bytes).sum::<u64>()
-                        + if mid_distinct {
-                            tensor_bytes(&x)
-                        } else {
-                            0
-                        },
+                        + if mid_distinct { tensor_bytes(&x) } else { 0 },
                 );
             }
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(&x, Some(&temb), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(&temb),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             ));
             let s = x.shape();
             x = tensor(
                 &[s[0], s[1], s[2], resnet.conv_weights().1.shape()[0]],
-                resnet.output_dtype_with_effects(x.dtype(), Some(temb.dtype()), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                resnet.output_dtype_with_effects(
+                    x.dtype(),
+                    Some(temb.dtype()),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             )?;
             mid_distinct = true;
             if let Some(attention) = attention {
                 let first = out.len();
-                let held = fixed
-                    + residuals.iter().map(tensor_bytes).sum::<u64>()
-                    + tensor_bytes(&x);
-                x = attention.price_forward_with_effects(&x, encoder_x, None, plan, out, &effects.child("mid_block.attentions.0"))?;
+                let held =
+                    fixed + residuals.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&x);
+                x = attention.price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    None,
+                    plan,
+                    out,
+                    &effects.child("mid_block.attentions.0"),
+                )?;
                 if let Some(owners) = owners.as_deref_mut() {
                     owners.extend(std::iter::repeat_n(held, out.len() - first));
                 }
@@ -1451,9 +2049,7 @@ pub(crate) fn price_forward_with_effects(
             let o = z.price_output(r)?;
             tensor(o.shape(), Dtype::from_promoting_types(o.dtype(), dtype))
         };
-        let retained = fixed
-            + residuals.iter().map(tensor_bytes).sum::<u64>()
-            + tensor_bytes(&x);
+        let retained = fixed + residuals.iter().map(tensor_bytes).sum::<u64>() + tensor_bytes(&x);
         let mut down = Vec::with_capacity(residuals.len());
         for (r, z) in residuals.iter().zip(&self.down_zero) {
             if let Some(owners) = owners.as_deref_mut() {
@@ -1461,30 +2057,35 @@ pub(crate) fn price_forward_with_effects(
             }
             down.push(scaled(z, r, out)?);
         }
-        if let Some(owners) = owners.as_deref_mut() {
+        if let Some(owners) = owners {
             owners.push(retained + down.iter().map(tensor_bytes).sum::<u64>());
         }
         let mid = scaled(&self.mid_zero, &x, out)?;
         Ok((down, mid))
     }
 
-pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut MetaVisit<'_>) -> Result<()> {
         // ControlFacts's encoder_hid_proj is LAST, unlike the UNet walk. Keep the actual order.
-        self.time_embedding.quantize_using("time_embedding", bits, visit)?;
-        self.add_embedding.quantize_using("add_embedding", bits, visit)?;
+        self.time_embedding
+            .quantize_using("time_embedding", bits, visit)?;
+        self.add_embedding
+            .quantize_using("add_embedding", bits, visit)?;
         for (index, b) in self.down_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("down_blocks.{index}"), bits, visit)?;
         }
-        self.mid_resnet0.quantize_using("mid_block.resnets.0", bits, visit)?;
-        self.mid_transformer.quantize_using("mid_block.attentions.0", bits, visit)?;
-        self.mid_resnet1.quantize_using("mid_block.resnets.1", bits, visit)?;
+        self.mid_resnet0
+            .quantize_using("mid_block.resnets.0", bits, visit)?;
+        self.mid_transformer
+            .quantize_using("mid_block.attentions.0", bits, visit)?;
+        self.mid_resnet1
+            .quantize_using("mid_block.resnets.1", bits, visit)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
             visit("encoder_hid_proj", proj, bits)?;
         }
         Ok(())
     }
 
-fn stem_scratch(&self, x: &Tensor, encoder_x: &Tensor, cond_embed: &Tensor) -> u64 {
+    fn stem_scratch(&self, x: &Tensor, encoder_x: &Tensor, cond_embed: &Tensor) -> u64 {
         stem_bytes(
             x,
             encoder_x,
@@ -1510,12 +2111,15 @@ fn stem_scratch(&self, x: &Tensor, encoder_x: &Tensor, cond_embed: &Tensor) -> u
             ),
         )
     }
-
 }
 
 pub(crate) fn stem_work_bytes(
-    x: &Tensor, encoder_x: &Tensor, conv_in: &crate::quantum::ConvWork,
-    encoder_hid_proj: Option<&q::LinearWork>, extra_out: u64, backend: crate::quantum::Backend,
+    x: &Tensor,
+    encoder_x: &Tensor,
+    conv_in: &crate::quantum::ConvWork,
+    encoder_hid_proj: Option<&q::LinearWork>,
+    extra_out: u64,
+    backend: crate::quantum::Backend,
 ) -> u64 {
     let call = conv_in.call(x.shape(), element_bytes(x), 1, 1);
     let conv = crate::quantum::single_conv_bytes(&call, 0, extra_out, backend);
@@ -1537,7 +2141,10 @@ pub(crate) fn stem_work_bytes(
 
 pub(crate) fn sampler_scratch(x: &Tensor, work: &crate::quantum::ConvWork, up: bool) -> u64 {
     let mut shape = x.shape().to_vec();
-    if up { shape[1] *= 2; shape[2] *= 2; }
+    if up {
+        shape[1] *= 2;
+        shape[2] *= 2;
+    }
     let act = element_bytes(x);
     let call = work.call(&shape, act, if up { 1 } else { 2 }, 1);
     crate::quantum::single_conv_bytes(&call, u64::from(up), 0, crate::quantum::backend())
@@ -1553,25 +2160,49 @@ pub(crate) fn text_time_temb_dtype_with_effects(
 ) -> Result<Dtype> {
     Ok(Dtype::from_promoting_types(
         time_embedding.output_dtype_with_effects(dtype, &effects.child("time_embedding"))?,
-        add_embedding.output_dtype_with_effects(Dtype::from_promoting_types(text_emb_dtype, dtype),
-            &effects.child("add_embedding"))?,
+        add_embedding.output_dtype_with_effects(
+            Dtype::from_promoting_types(text_emb_dtype, dtype),
+            &effects.child("add_embedding"),
+        )?,
     ))
 }
 
+/// The stem projections' conditioning batch, latent dtype and pooled-text dtype.
+#[derive(Clone, Copy)]
+pub(crate) struct StemInput {
+    pub batch: i32,
+    pub dtype: Dtype,
+    pub text: Dtype,
+}
+
 pub(crate) fn stem_projection_scratch(
-    time: &TimeFacts, add: &TimeFacts, encoder: Option<&q::LinearWork>,
-    batch: i32, dtype: Dtype, text: Dtype, memory: &Tensor,
+    time: &TimeFacts,
+    add: &TimeFacts,
+    encoder: Option<&q::LinearWork>,
+    input: StemInput,
+    memory: &Tensor,
     effects: &crate::quantum::EffectScope<'_>,
 ) -> Result<u64> {
-    let mut bytes = time.projection_scratch(batch, dtype, &effects.child("time_embedding"))?
-        .saturating_add(add.projection_scratch(batch, Dtype::from_promoting_types(text, dtype),
-            &effects.child("add_embedding"))?);
+    let StemInput { batch, dtype, text } = input;
+    let mut bytes = time
+        .projection_scratch(batch, dtype, &effects.child("time_embedding"))?
+        .saturating_add(add.projection_scratch(
+            batch,
+            Dtype::from_promoting_types(text, dtype),
+            &effects.child("add_embedding"),
+        )?);
     if let Some(encoder) = encoder {
         let work = effects.linear_metadata("encoder_hid_proj", encoder)?;
-        bytes = bytes.saturating_add(work.operand_bytes(memory.shape(), memory.dtype()))
+        bytes = bytes
+            .saturating_add(work.operand_bytes(memory.shape(), memory.dtype()))
             .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
                 crate::quantum::dtype_bytes(work.output_dtype(memory.dtype())),
-                &[memory.shape()[0].max(0) as u64, memory.shape()[1].max(0) as u64, work.output_width()]));
+                &[
+                    memory.shape()[0].max(0) as u64,
+                    memory.shape()[1].max(0) as u64,
+                    work.output_width(),
+                ],
+            ));
     }
     Ok(bytes)
 }
@@ -1587,7 +2218,7 @@ fn check_residual_zero_pairing(residuals: usize, zero_convs: usize) -> Result<()
 }
 
 impl ResnetFacts {
-pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
             ["time_emb_proj"] => self.time_emb_proj.as_mut(),
             // conv_shortcut is a 1×1 conv stored as a Linear; a conv LoRA merges into it as a
@@ -1596,7 +2227,7 @@ pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWo
             _ => None,
         }
     }
-pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
+    pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
         match path {
             ["conv1"] => Some(&mut self.conv1),
             ["conv2"] => Some(&mut self.conv2),
@@ -1618,7 +2249,7 @@ impl AttentionFacts {
 }
 
 impl TransformerBlockFacts {
-pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
             ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
             ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
@@ -1636,7 +2267,7 @@ pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWo
 }
 
 impl TransformerFacts {
-pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
             ["proj_in"] => Some(&mut self.proj_in),
             ["proj_out"] => Some(&mut self.proj_out),
@@ -1650,7 +2281,7 @@ pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWo
 }
 
 impl BlockFacts {
-pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
             ["resnets", j, rest @ ..] => self
                 .resnets
@@ -1664,7 +2295,7 @@ pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWo
             _ => None,
         }
     }
-pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
+    pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
         match path {
             ["resnets", j, rest @ ..] => self
                 .resnets
@@ -1678,7 +2309,7 @@ pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::Con
 }
 
 impl UNetFacts {
-pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
             ["down_blocks", i, rest @ ..] => self
                 .down_blocks
@@ -1697,7 +2328,7 @@ pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWo
             _ => None,
         }
     }
-pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
+    pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::ConvWork> {
         match path {
             ["conv_in"] => Some(&mut self.conv_in),
             ["conv_out"] => Some(&mut self.conv_out),
@@ -1717,15 +2348,23 @@ pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::Con
 }
 
 impl UNetFacts {
-    pub(crate) fn from_headers(headers: &[SafetensorsTensorHeader], cfg: &UNetConfig) -> Result<Self> {
+    pub(crate) fn from_headers(
+        headers: &[SafetensorsTensorHeader],
+        cfg: &UNetConfig,
+    ) -> Result<Self> {
         Self::from_weights(&HeaderWeights::new(headers)?, cfg)
     }
-    pub(crate) fn arm_block_streams(&mut self, headers: &[SafetensorsTensorHeader], dtype: Dtype,
-        quant_bits: Option<i32>) -> Result<()> {
+    pub(crate) fn arm_block_streams(
+        &mut self,
+        headers: &[SafetensorsTensorHeader],
+        dtype: Dtype,
+        quant_bits: Option<i32>,
+    ) -> Result<()> {
         for (index, block) in self.down_blocks.iter_mut().enumerate() {
             block.arm_streams(headers, &format!("down_blocks.{index}"), dtype, quant_bits)?;
         }
-        self.mid_transformer.arm_stream(headers, "mid_block.attentions.0", dtype, quant_bits)?;
+        self.mid_transformer
+            .arm_stream(headers, "mid_block.attentions.0", dtype, quant_bits)?;
         for (index, block) in self.up_blocks.iter_mut().enumerate() {
             block.arm_streams(headers, &format!("up_blocks.{index}"), dtype, quant_bits)?;
         }
@@ -1733,50 +2372,105 @@ impl UNetFacts {
     }
 }
 impl ControlFacts {
-    pub(crate) fn from_headers(headers: &[SafetensorsTensorHeader], cfg: &UNetConfig) -> Result<Self> {
+    pub(crate) fn from_headers(
+        headers: &[SafetensorsTensorHeader],
+        cfg: &UNetConfig,
+    ) -> Result<Self> {
         Self::from_weights(&HeaderWeights::new(headers)?, cfg)
     }
 }
 impl BlockFacts {
-    fn arm_streams(&mut self, headers: &[SafetensorsTensorHeader], prefix: &str,
-        dtype: Dtype, quant_bits: Option<i32>) -> Result<()> {
+    fn arm_streams(
+        &mut self,
+        headers: &[SafetensorsTensorHeader],
+        prefix: &str,
+        dtype: Dtype,
+        quant_bits: Option<i32>,
+    ) -> Result<()> {
         if let Some(attentions) = &mut self.attentions {
             for (index, attention) in attentions.iter_mut().enumerate() {
-                attention.arm_stream(headers, &format!("{prefix}.attentions.{index}"), dtype, quant_bits)?;
+                attention.arm_stream(
+                    headers,
+                    &format!("{prefix}.attentions.{index}"),
+                    dtype,
+                    quant_bits,
+                )?;
             }
         }
         Ok(())
     }
 }
 impl TransformerFacts {
-    fn arm_stream(&mut self, headers: &[SafetensorsTensorHeader], prefix: &str,
-        dtype: Dtype, quant_bits: Option<i32>) -> Result<()> {
-        self.block_stream = Some(StreamFacts { prefix: prefix.to_owned(), headers: headers.to_vec(),
-            n_blocks: self.blocks.len(), dtype, quant_bits, bytes: std::sync::OnceLock::new() });
+    fn arm_stream(
+        &mut self,
+        headers: &[SafetensorsTensorHeader],
+        prefix: &str,
+        dtype: Dtype,
+        quant_bits: Option<i32>,
+    ) -> Result<()> {
+        self.block_stream = Some(StreamFacts {
+            prefix: prefix.to_owned(),
+            headers: headers.to_vec(),
+            n_blocks: self.blocks.len(),
+            dtype,
+            quant_bits,
+            bytes: std::sync::OnceLock::new(),
+        });
         Ok(())
     }
 }
-pub(crate) fn ip_pairs_from_headers(headers: &[SafetensorsTensorHeader]) -> Result<Vec<(Tensor, Tensor)>> {
+pub(crate) fn ip_pairs_from_headers(
+    headers: &[SafetensorsTensorHeader],
+) -> Result<Vec<(Tensor, Tensor)>> {
     let weights = HeaderWeights::new(headers)?;
-    crate::ip_adapter::ip_kv_indices(weights.tensors.keys().map(String::as_str))?.into_iter().map(|index| {
-        let key = weights.require(&format!("ip_adapter.{index}.to_k_ip.weight"))?.clone();
-        let value = weights.require(&format!("ip_adapter.{index}.to_v_ip.weight"))?.clone();
-        Ok((key, value))
-    }).collect()
+    crate::ip_adapter::ip_kv_indices(weights.tensors.keys().map(String::as_str))?
+        .into_iter()
+        .map(|index| {
+            let key = weights
+                .require(&format!("ip_adapter.{index}.to_k_ip.weight"))?
+                .clone();
+            let value = weights
+                .require(&format!("ip_adapter.{index}.to_v_ip.weight"))?
+                .clone();
+            Ok((key, value))
+        })
+        .collect()
 }
 
-fn stem_bytes(x: &Tensor, encoder_x: &Tensor, conv_in: &Tensor,
-    encoder_hid_proj: Option<&q::LinearWork>, extra_out: u64, backend: q::Backend) -> u64 {
-    stem_work_bytes(x, encoder_x, &q::ConvWork { weight: conv_in.clone(), bias: None },
-        encoder_hid_proj, extra_out, backend)
+fn stem_bytes(
+    x: &Tensor,
+    encoder_x: &Tensor,
+    conv_in: &Tensor,
+    encoder_hid_proj: Option<&q::LinearWork>,
+    extra_out: u64,
+    backend: q::Backend,
+) -> u64 {
+    stem_work_bytes(
+        x,
+        encoder_x,
+        &q::ConvWork {
+            weight: conv_in.clone(),
+            bias: None,
+        },
+        encoder_hid_proj,
+        extra_out,
+        backend,
+    )
 }
 
 #[cfg(test)]
-fn trace_facts(label: &str, tensor: &Tensor) { eprintln!("METADATA {label}: shape={:?} dtype={:?}", tensor.shape, tensor.dtype); }
+fn trace_facts(label: &str, tensor: &Tensor) {
+    eprintln!(
+        "METADATA {label}: shape={:?} dtype={:?}",
+        tensor.shape, tensor.dtype
+    );
+}
 
 pub(crate) fn add(left: &Tensor, right: &Tensor) -> Result<Tensor> {
-    tensor(&crate::adapters::broadcast_shape(&left.shape, &right.shape)?,
-        Dtype::from_promoting_types(left.dtype, right.dtype))
+    tensor(
+        &crate::adapters::broadcast_shape(&left.shape, &right.shape)?,
+        Dtype::from_promoting_types(left.dtype, right.dtype),
+    )
 }
 
 impl ResnetFacts {
@@ -1796,7 +2490,10 @@ impl ResnetFacts {
         out: &mut crate::quantum::Quanta,
     ) -> Result<Tensor> {
         let s = x.shape();
-        let (cin, cout) = (self.conv1.weight.shape[self.conv1.weight.shape.len() - 1], self.conv1.weight.shape[0]);
+        let (cin, cout) = (
+            self.conv1.weight.shape[self.conv1.weight.shape.len() - 1],
+            self.conv1.weight.shape[0],
+        );
         out.push((
             labels.tiled_stage,
             crate::quantum::tiled_stage_bytes(s, cin, cout, element_bytes(x), true),
@@ -1805,18 +2502,20 @@ impl ResnetFacts {
             let (th, tw) = crate::vae::max_conv_tile(input[1], input[2], tile_edge);
             crate::quantum::tile_bytes_from_metadata(
                 &[input[0], th, tw, channels],
-                crate::quantum::TileSource { full_width: input[2], normalized: true },
-                width, &weight.shape, element_bytes(weight), false, crate::quantum::backend(),
+                crate::quantum::TileSource {
+                    full_width: input[2],
+                    normalized: true,
+                },
+                width,
+                &weight.shape,
+                element_bytes(weight),
+                false,
+                crate::quantum::backend(),
             )
         };
         out.push((
             labels.tile,
-            tile(
-                s,
-                s[3],
-                element_bytes(x),
-                self.conv1.weight(),
-            ),
+            tile(s, s[3], element_bytes(x), self.conv1.weight()),
         ));
         let mut conv1 = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
         conv1.extend(self.conv1.bias());
@@ -1844,36 +2543,70 @@ mod attention_adapter_tests {
 
     #[test]
     fn metadata_adapter_targets_match_native_paths_and_mutate_only_selected_linear() {
-        let linear = |input| q::LinearWork::dense(tensor(&[64, input], Dtype::Float16).unwrap(), None);
+        let linear =
+            |input| q::LinearWork::dense(tensor(&[64, input], Dtype::Float16).unwrap(), None);
         let base = AttentionFacts {
-            q: linear(64), k: linear(128), v: linear(192), out: linear(256),
-            num_heads: 1, head_dim: 64,
-            to_k_ip: Some(linear(320)), to_v_ip: Some(linear(384)),
+            q: linear(64),
+            k: linear(128),
+            v: linear(192),
+            out: linear(256),
+            num_heads: 1,
+            head_dim: 64,
+            to_k_ip: Some(linear(320)),
+            to_v_ip: Some(linear(384)),
         };
         // Independent native leaf-to-field inventory. Pointer equality is ONLY Rust metadata
         // object identity, never an Array/NativeData backing or physical-allocation certificate.
         let targets: &[(&[&str], usize)] = &[
-            (&["to_q"], 0), (&["to_k"], 1), (&["to_v"], 2), (&["to_out", "0"], 3),
+            (&["to_q"], 0),
+            (&["to_k"], 1),
+            (&["to_v"], 2),
+            (&["to_out", "0"], 3),
         ];
         for &(path, selected) in targets {
             let mut trial = base.clone();
             let expected = match selected {
-                0 => &mut trial.q, 1 => &mut trial.k, 2 => &mut trial.v, 3 => &mut trial.out,
+                0 => &mut trial.q,
+                1 => &mut trial.k,
+                2 => &mut trial.v,
+                3 => &mut trial.out,
                 _ => unreachable!(),
             } as *mut q::LinearWork;
-            let actual = trial.adaptable_mut(path).expect("native metadata adapter target") as *mut q::LinearWork;
-            assert_eq!(actual, expected, "literal native target must return its actual mutable field: {path:?}");
+            let actual = trial
+                .adaptable_mut(path)
+                .expect("native metadata adapter target")
+                as *mut q::LinearWork;
+            assert_eq!(
+                actual, expected,
+                "literal native target must return its actual mutable field: {path:?}"
+            );
             trial.adaptable_mut(path).unwrap().pack(8).unwrap();
-            let states = [trial.q.bits, trial.k.bits, trial.v.bits, trial.out.bits,
-                trial.to_k_ip.as_ref().unwrap().bits, trial.to_v_ip.as_ref().unwrap().bits];
+            let states = [
+                trial.q.bits,
+                trial.k.bits,
+                trial.v.bits,
+                trial.out.bits,
+                trial.to_k_ip.as_ref().unwrap().bits,
+                trial.to_v_ip.as_ref().unwrap().bits,
+            ];
             for (index, state) in states.into_iter().enumerate() {
                 assert_eq!(state, if index == selected { Some(8) } else { None },
                     "selected-world pack must mutate one actual field, not a clone/alias/default: {path:?}/{index}");
             }
         }
-        for path in [vec![], vec!["to_out"], vec!["to_out", "1"], vec!["to_q", "extra"],
-                     vec!["to_k_ip"], vec!["to_v_ip"], vec!["unknown"]] {
-            assert!(base.clone().adaptable_mut(&path).is_none(), "not a native adaptable leaf: {path:?}");
+        for path in [
+            vec![],
+            vec!["to_out"],
+            vec!["to_out", "1"],
+            vec!["to_q", "extra"],
+            vec!["to_k_ip"],
+            vec!["to_v_ip"],
+            vec!["unknown"],
+        ] {
+            assert!(
+                base.clone().adaptable_mut(&path).is_none(),
+                "not a native adaptable leaf: {path:?}"
+            );
         }
     }
 }

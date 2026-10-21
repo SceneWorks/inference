@@ -1150,12 +1150,7 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
     }
     let sp = spec(&snap, Route::IpAdapter, Selection::Rung0);
     let (sel, memory) = selection(&sp, Selection::Rung0);
-    let ip = regime(
-        &sp,
-        &MemoryMode::Other("ip_adapter".into()),
-        &sel,
-        &memory,
-    );
+    let ip = regime(&sp, &MemoryMode::Other("ip_adapter".into()), &sel, &memory);
     let text = regime(&sp, &MemoryMode::TextToImage, &sel, &memory);
     let mut inputs = snap.inputs(Route::IpAdapter);
     inputs.streamable = false;
@@ -1711,8 +1706,8 @@ fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
             let scale = if name=="lightning" {
                 mlx_gen::gen_core::sampling::LightningPolicy::new(&alpha,config.num_train_steps,steps as usize).init_noise_scale()
             } else { 1.0 };
-            for step in 0..transitions {
-                let c = epochs[step].coefficients;
+            for (step, epoch) in epochs[..transitions].iter().enumerate() {
+                let c = epoch.coefficients;
                 let scaled = sampler.scale_model_input(&x,step)?;
                 let epsilon = unet.forward_planned(&scaled,sampler.timestep(step),&cond,&pooled,&crate::pipeline::text_time_ids(1),None,None,crate::plan::SdxlForwardPlan::UNBOUNDED)?;
                 let actual = sampler.step(&epsilon,&x,step)?;
@@ -1985,8 +1980,8 @@ fn actual_text_finalize_points_match_headers_and_native_transients() {
                 let quant=bits.map(|bits|if bits==4 {mlx_gen::gen_core::Quant::Q4}else{mlx_gen::gen_core::Quant::Q8});
                 let loaded=if fused {
                     crate::model::build_ldm_text_using(
-                        Weights::from_file(&snapshot.file("text_encoder/model.safetensors"))?,
-                        Weights::from_file(&snapshot.file("text_encoder_2/model.safetensors"))?, quant,
+                        Weights::from_file(snapshot.file("text_encoder/model.safetensors"))?,
+                        Weights::from_file(snapshot.file("text_encoder_2/model.safetensors"))?, quant,
                         |weights,dtype| {let encoder=crate::loader::load_clip_from_weights(weights,&snapshot.te1,dtype)?;let mut t=trace.lock().unwrap();t.events.push("load0".into());t.raw.push(encoder.payload_layouts_for_test().1);Ok(encoder)},
                         |weights,dtype| {let encoder=crate::loader::load_clip_from_weights(weights,&snapshot.te2,dtype)?;let mut t=trace.lock().unwrap();t.events.push("load1".into());t.raw.push(encoder.payload_layouts_for_test().1);Ok(encoder)},
                         |encoder| {encoder.materialize_weights()?;let mut t=trace.lock().unwrap();let index=t.materialized.len();t.events.push(format!("materialize{index}"));t.materialized.push(encoder.payload_layouts_for_test().1);Ok(())},
@@ -2026,7 +2021,9 @@ fn actual_text_finalize_points_match_headers_and_native_transients() {
 /// runs use the SAME iOS boundary policy and only the finalize wrapper differs.
 #[test]
 fn actual_text_finalize_preserves_pipeline_rgb_and_dtype() {
-    let Some(mut completion) = completed_cpu_child("pricing::additivity::actual_text_finalize_preserves_pipeline_rgb_and_dtype") else {
+    let Some(mut completion) = completed_cpu_child(
+        "pricing::additivity::actual_text_finalize_preserves_pipeline_rgb_and_dtype",
+    ) else {
         return;
     };
     for (bits, stored) in [
@@ -2062,7 +2059,9 @@ fn actual_text_finalize_preserves_pipeline_rgb_and_dtype() {
 /// pre-load native baseline. Scalar observation cannot make an Array non-donatable.
 #[test]
 fn actual_sampler_epochs_and_denoise_peak_bindings() {
-    let Some(mut completion) = completed_cpu_child("pricing::additivity::actual_sampler_epochs_and_denoise_peak_bindings") else {
+    let Some(mut completion) =
+        completed_cpu_child("pricing::additivity::actual_sampler_epochs_and_denoise_peak_bindings")
+    else {
         return;
     };
     let dense = Snapshot::new(2);

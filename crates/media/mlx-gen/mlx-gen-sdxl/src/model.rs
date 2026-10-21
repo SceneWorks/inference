@@ -2922,9 +2922,7 @@ fn fused_ldm_real_weight_render_is_nonconstant() {
     assert!(max.saturating_sub(min) > 32, "render is nearly constant");
 }
 
-pub(crate) fn reference_inputs<'a>(
-    req: &'a GenerationRequest,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
+pub(crate) fn reference_inputs(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
@@ -2940,7 +2938,7 @@ pub(crate) fn reference_inputs<'a>(
     Ok(reference)
 }
 
-pub(crate) fn mask_input<'a>(req: &'a GenerationRequest) -> Result<Option<&'a Image>> {
+pub(crate) fn mask_input(req: &GenerationRequest) -> Result<Option<&Image>> {
     let mut mask = None;
     for c in &req.conditioning {
         if let Conditioning::Mask { image } = c {
@@ -2955,7 +2953,7 @@ pub(crate) fn mask_input<'a>(req: &'a GenerationRequest) -> Result<Option<&'a Im
     Ok(mask)
 }
 
-pub(crate) fn control_inputs<'a>(req: &'a GenerationRequest) -> Result<Vec<(&'a Image, f32)>> {
+pub(crate) fn control_inputs(req: &GenerationRequest) -> Result<Vec<(&Image, f32)>> {
     let mut controls = Vec::new();
     for c in &req.conditioning {
         if let Conditioning::Control { image, scale, .. } = c {

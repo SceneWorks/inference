@@ -25,14 +25,22 @@ thread_local! {
     pub(super) static PROJECTION_OPERAND_LOG: std::cell::RefCell<Option<Vec<ProjectionOperandRecord>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
-pub(crate) fn with_projection_operands_for_test<T>(body: impl FnOnce() -> T) -> (T, Vec<ProjectionOperandRecord>) {
+pub(crate) fn with_projection_operands_for_test<T>(
+    body: impl FnOnce() -> T,
+) -> (T, Vec<ProjectionOperandRecord>) {
     struct Restore(Option<Vec<ProjectionOperandRecord>>);
     impl Drop for Restore {
-        fn drop(&mut self) { PROJECTION_OPERAND_LOG.with(|log| { log.replace(self.0.take()); }); }
+        fn drop(&mut self) {
+            PROJECTION_OPERAND_LOG.with(|log| {
+                log.replace(self.0.take());
+            });
+        }
     }
     let restore = Restore(PROJECTION_OPERAND_LOG.with(|log| log.replace(Some(Vec::new()))));
     let result = body();
-    let records = PROJECTION_OPERAND_LOG.with(|log| log.replace(None)).unwrap();
+    let records = PROJECTION_OPERAND_LOG
+        .with(|log| log.replace(None))
+        .unwrap();
     drop(restore);
     (result, records)
 }
@@ -71,11 +79,16 @@ struct AttentionMHA {
 impl AttentionMHA {
     fn pricing_facts(&self) -> super::pricing::AttentionFacts {
         use crate::quantum::LinearWork;
-        super::pricing::AttentionFacts { q: LinearWork::of(&self.q), k: LinearWork::of(&self.k),
-            v: LinearWork::of(&self.v), out: LinearWork::of(&self.out),
-            num_heads: self.num_heads, head_dim: self.head_dim,
+        super::pricing::AttentionFacts {
+            q: LinearWork::of(&self.q),
+            k: LinearWork::of(&self.k),
+            v: LinearWork::of(&self.v),
+            out: LinearWork::of(&self.out),
+            num_heads: self.num_heads,
+            head_dim: self.head_dim,
             to_k_ip: self.to_k_ip.as_ref().map(LinearWork::of),
-            to_v_ip: self.to_v_ip.as_ref().map(LinearWork::of) }
+            to_v_ip: self.to_v_ip.as_ref().map(LinearWork::of),
+        }
     }
 
     fn from_weights(w: &Weights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
@@ -120,13 +133,27 @@ impl AttentionMHA {
         self.to_v_ip = Some(AdaptableLinear::dense(v_ip, None));
     }
 
-    fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
-        for (name, lin) in [("to_q", &mut self.q), ("to_k", &mut self.k),
-            ("to_v", &mut self.v), ("to_out.0", &mut self.out)] {
+    fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        for (name, lin) in [
+            ("to_q", &mut self.q),
+            ("to_k", &mut self.k),
+            ("to_v", &mut self.v),
+            ("to_out.0", &mut self.out),
+        ] {
             visit(&crate::quant::child_path(prefix, name), lin, bits)?;
         }
-        for (name, lin) in [("to_k_ip", &mut self.to_k_ip), ("to_v_ip", &mut self.to_v_ip)] {
-            if let Some(lin) = lin { visit(&crate::quant::child_path(prefix, name), lin, bits)?; }
+        for (name, lin) in [
+            ("to_k_ip", &mut self.to_k_ip),
+            ("to_v_ip", &mut self.to_v_ip),
+        ] {
+            if let Some(lin) = lin {
+                visit(&crate::quant::child_path(prefix, name), lin, bits)?;
+            }
         }
         Ok(())
     }
@@ -257,11 +284,16 @@ impl TransformerBlock {
     fn pricing_facts(&self) -> super::pricing::TransformerBlockFacts {
         use crate::quantum::LinearWork;
         super::pricing::TransformerBlockFacts {
-            norm1_w: crate::quantum::activation_facts(&self.norm1_w), norm1_b: crate::quantum::activation_facts(&self.norm1_b),
-            norm2_w: crate::quantum::activation_facts(&self.norm2_w), norm2_b: crate::quantum::activation_facts(&self.norm2_b),
-            norm3_w: crate::quantum::activation_facts(&self.norm3_w), norm3_b: crate::quantum::activation_facts(&self.norm3_b),
-            attn1: self.attn1.pricing_facts(), attn2: self.attn2.pricing_facts(),
-            linear1: LinearWork::of(&self.linear1), linear2: LinearWork::of(&self.linear2),
+            norm1_w: crate::quantum::activation_facts(&self.norm1_w),
+            norm1_b: crate::quantum::activation_facts(&self.norm1_b),
+            norm2_w: crate::quantum::activation_facts(&self.norm2_w),
+            norm2_b: crate::quantum::activation_facts(&self.norm2_b),
+            norm3_w: crate::quantum::activation_facts(&self.norm3_w),
+            norm3_b: crate::quantum::activation_facts(&self.norm3_b),
+            attn1: self.attn1.pricing_facts(),
+            attn2: self.attn2.pricing_facts(),
+            linear1: LinearWork::of(&self.linear1),
+            linear2: LinearWork::of(&self.linear2),
             linear3: LinearWork::of(&self.linear3),
         }
     }
@@ -314,15 +346,36 @@ impl TransformerBlock {
     }
 
     pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+        self.quantize_using("", bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
     }
 
-    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
-        self.attn1.quantize_using(&crate::quant::child_path(prefix, "attn1"), bits, visit)?;
-        self.attn2.quantize_using(&crate::quant::child_path(prefix, "attn2"), bits, visit)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear1"), &mut self.linear1, bits)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear2"), &mut self.linear2, bits)?;
-        visit(&crate::quant::child_path(prefix, "ff.linear3"), &mut self.linear3, bits)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        self.attn1
+            .quantize_using(&crate::quant::child_path(prefix, "attn1"), bits, visit)?;
+        self.attn2
+            .quantize_using(&crate::quant::child_path(prefix, "attn2"), bits, visit)?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear1"),
+            &mut self.linear1,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear2"),
+            &mut self.linear2,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "ff.linear3"),
+            &mut self.linear3,
+            bits,
+        )?;
         Ok(())
     }
 
@@ -447,24 +500,32 @@ impl TransformerBlock {
         x: Dtype,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> u64 {
-        self.quantum_scratch_from_facts(batch, context_batch, tokens, context_tokens,
-            ip, x, attention, self.activation_dtype(x), crate::quantum::linear_out(&self.linear1))
+        self.quantum_scratch_from_facts(
+            super::pricing::BlockGeometry {
+                batch,
+                context_batch,
+                tokens,
+                context_tokens,
+            },
+            ip,
+            x,
+            attention,
+            self.activation_dtype(x),
+            crate::quantum::linear_out(&self.linear1),
+        )
     }
 
     fn quantum_scratch_from_facts(
         &self,
-        batch: i32,
-        context_batch: i32,
-        tokens: i32,
-        context_tokens: i32,
+        geometry: super::pricing::BlockGeometry,
         ip: bool,
         x: Dtype,
         attention: mlx_gen::attention::AttentionPlan<'_>,
         activation: Dtype,
         ff_width: u64,
     ) -> u64 {
-        self.pricing_facts().quantum_scratch_from_facts(batch, context_batch, tokens,
-            context_tokens, ip, x, attention, activation, ff_width)
+        self.pricing_facts()
+            .quantum_scratch_from_facts(geometry, ip, x, attention, activation, ff_width)
     }
 
     /// The dtype this block's hidden state runs at for `x`-typed input: `x`'s, promoted by the
@@ -495,13 +556,16 @@ impl TransformerBlock {
     /// Final per-projection operands over the actual three sublayers. The residual stream and
     /// each norm/projection retain their own dtype; the activation envelope is separate.
     fn projection_work(
-        &self, batch: i32, context_batch: i32, tokens: i32, hidden_width: i32,
-        context_tokens: i32, memory_width: i32,
-        x: Dtype, memory: Dtype, ip: Option<(i32, i32, Dtype)>,
+        &self,
+        geometry: super::pricing::BlockGeometry,
+        widths: super::pricing::ProjectionWidths,
+        x: Dtype,
+        memory: Dtype,
+        ip: Option<(i32, i32, Dtype)>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Dtype, u64)> {
-        self.pricing_facts().projection_work(batch, context_batch, tokens, hidden_width,
-            context_tokens, memory_width, x, memory, ip, effects)
+        self.pricing_facts()
+            .projection_work(geometry, widths, x, memory, ip, effects)
     }
 
     /// The cross-attention key count this block sees for `memory` (+ IP tokens when this block
@@ -593,11 +657,18 @@ pub struct Transformer2D {
 impl Transformer2D {
     fn pricing_facts_without_stream(&self) -> super::pricing::TransformerFacts {
         use crate::quantum::LinearWork;
-        super::pricing::TransformerFacts { norm_w: crate::quantum::activation_facts(&self.norm_w),
-            norm_b: crate::quantum::activation_facts(&self.norm_b), proj_in: LinearWork::of(&self.proj_in),
+        super::pricing::TransformerFacts {
+            norm_w: crate::quantum::activation_facts(&self.norm_w),
+            norm_b: crate::quantum::activation_facts(&self.norm_b),
+            proj_in: LinearWork::of(&self.proj_in),
             proj_out: LinearWork::of(&self.proj_out),
-            blocks: self.blocks.iter().map(TransformerBlock::pricing_facts).collect(),
-            block_stream: None }
+            blocks: self
+                .blocks
+                .iter()
+                .map(TransformerBlock::pricing_facts)
+                .collect(),
+            block_stream: None,
+        }
     }
 
     /// `prefix` addresses the `attentions.{i}` module. `num_layers` = transformer blocks.
@@ -681,15 +752,34 @@ impl Transformer2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+        self.quantize_using("", bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
     }
 
-    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
         // Preserve the actual pack order: BOTH projections precede the transformer blocks.
-        visit(&crate::quant::child_path(prefix, "proj_in"), &mut self.proj_in, bits)?;
-        visit(&crate::quant::child_path(prefix, "proj_out"), &mut self.proj_out, bits)?;
+        visit(
+            &crate::quant::child_path(prefix, "proj_in"),
+            &mut self.proj_in,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "proj_out"),
+            &mut self.proj_out,
+            bits,
+        )?;
         for (index, b) in self.blocks.iter_mut().enumerate() {
-            b.quantize_using(&crate::quant::child_path(prefix, &format!("transformer_blocks.{index}")), bits, visit)?;
+            b.quantize_using(
+                &crate::quant::child_path(prefix, &format!("transformer_blocks.{index}")),
+                bits,
+                visit,
+            )?;
         }
         Ok(())
     }
@@ -747,7 +837,12 @@ impl Transformer2D {
         // sc-26270: GroupNorm + proj_in, each block, and proj_out + residual are guarded iOS
         // quanta (pass-throughs off device), each priced by the shared projection metadata budget.
         let (proj_in_scratch, proj_out_scratch, _, _, _) = self.projection_budgets_with_effects(
-            x, encoder_x, ip, plan, &crate::quantum::EffectScope::native())?;
+            x,
+            encoder_x,
+            ip,
+            plan,
+            &crate::quantum::EffectScope::native(),
+        )?;
         let y = mlx_gen::ios_quantum::run(
             crate::quantum::TRANSFORMER_PROJ_IN,
             proj_in_scratch,
@@ -881,8 +976,14 @@ impl Transformer2D {
         ip: Option<(&Array, f32)>,
         plan: SdxlForwardPlan<'_>,
     ) -> Result<u64> {
-        self.block_price_with_effects(index, y, encoder_x, ip, plan,
-            &crate::quantum::EffectScope::native())
+        self.block_price_with_effects(
+            index,
+            y,
+            encoder_x,
+            ip,
+            plan,
+            &crate::quantum::EffectScope::native(),
+        )
     }
 
     pub(crate) fn block_price_with_effects(
@@ -896,13 +997,38 @@ impl Transformer2D {
     ) -> Result<u64> {
         let block = &self.blocks[index];
         let scope = effects.child(&format!("transformer_blocks.{index}"));
-        let context_batch = plan.conditioning_batch(y.shape()[0]).max(encoder_x.shape()[0]);
-        let (activation, operands) = block.projection_work(y.shape()[0], context_batch, y.shape()[1], y.shape()[2],
-            encoder_x.shape()[1], encoder_x.shape()[2], y.dtype(), encoder_x.dtype(),
-            ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())), &scope)?;
-        let activations = block.quantum_scratch_from_facts(y.shape()[0], context_batch, y.shape()[1],
-            block.context_tokens(encoder_x, ip), ip.is_some(), y.dtype(), plan.attention,
-            activation, scope.linear("ff.linear1", &block.linear1)?.output_width());
+        let context_batch = plan
+            .conditioning_batch(y.shape()[0])
+            .max(encoder_x.shape()[0]);
+        let (activation, operands) = block.projection_work(
+            super::pricing::BlockGeometry {
+                batch: y.shape()[0],
+                context_batch,
+                tokens: y.shape()[1],
+                context_tokens: encoder_x.shape()[1],
+            },
+            super::pricing::ProjectionWidths {
+                hidden: y.shape()[2],
+                memory: encoder_x.shape()[2],
+            },
+            y.dtype(),
+            encoder_x.dtype(),
+            ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+            &scope,
+        )?;
+        let activations = block.quantum_scratch_from_facts(
+            super::pricing::BlockGeometry {
+                batch: y.shape()[0],
+                context_batch,
+                tokens: y.shape()[1],
+                context_tokens: block.context_tokens(encoder_x, ip),
+            },
+            ip.is_some(),
+            y.dtype(),
+            plan.attention,
+            activation,
+            scope.linear("ff.linear1", &block.linear1)?.output_width(),
+        );
         let weights = match &self.block_stream {
             Some(stream) => stream.streamed_bytes(index)?,
             None => 0,
@@ -946,10 +1072,16 @@ impl Transformer2D {
         plan: SdxlForwardPlan<'_>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(u64, u64, i32, Dtype, Dtype)> {
-        self.pricing_facts_without_stream().projection_budgets_with_effects(
-            &crate::quantum::activation_facts(x), &crate::quantum::activation_facts(encoder_x),
-            ip.map(|(tokens, scale)| (crate::quantum::activation_facts(tokens), scale)).as_ref().map(|(tokens, scale)| (tokens, *scale)),
-            plan, effects)
+        self.pricing_facts_without_stream()
+            .projection_budgets_with_effects(
+                &crate::quantum::activation_facts(x),
+                &crate::quantum::activation_facts(encoder_x),
+                ip.map(|(tokens, scale)| (crate::quantum::activation_facts(tokens), scale))
+                    .as_ref()
+                    .map(|(tokens, scale)| (tokens, *scale)),
+                plan,
+                effects,
+            )
     }
 
     #[cfg(test)]
@@ -969,12 +1101,28 @@ impl Transformer2D {
         let inner_plan = plan.with_window(None);
         for (index, block) in self.blocks.iter().enumerate() {
             let y = crate::quantum::shaped(&[s[0], s[1] * s[2], inner], hidden)?;
-            out.push((crate::quantum::TRANSFORMER_BLOCK,
-                self.block_price_with_effects(index, &y, encoder_x, ip, inner_plan, effects)?));
-            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
-                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
-                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
-                &effects.child(&format!("transformer_blocks.{index}")))?.0;
+            out.push((
+                crate::quantum::TRANSFORMER_BLOCK,
+                self.block_price_with_effects(index, &y, encoder_x, ip, inner_plan, effects)?,
+            ));
+            hidden = block
+                .projection_work(
+                    super::pricing::BlockGeometry {
+                        batch: s[0],
+                        context_batch: plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
+                        tokens: s[1] * s[2],
+                        context_tokens: encoder_x.shape()[1],
+                    },
+                    super::pricing::ProjectionWidths {
+                        hidden: inner,
+                        memory: encoder_x.shape()[2],
+                    },
+                    hidden,
+                    encoder_x.dtype(),
+                    ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
+                    &effects.child(&format!("transformer_blocks.{index}")),
+                )?
+                .0;
         }
         out.push((crate::quantum::TRANSFORMER_PROJ_OUT, proj_out));
         crate::quantum::shaped(s, summed)

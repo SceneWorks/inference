@@ -6,8 +6,8 @@
 mod block;
 mod controlnet;
 mod embeddings;
-mod resnet;
 pub(crate) mod pricing;
+mod resnet;
 // `pub(crate)` for ladder rung 4: `crate::block_stream` names `TransformerBlock` so it can rebuild
 // one with the SAME constructor the resident stack used (SC-16355).
 pub(crate) mod transformer;
@@ -100,19 +100,38 @@ pub(crate) fn stem_bytes(
     extra_out: u64,
     backend: crate::quantum::Backend,
 ) -> u64 {
-    stem_work_bytes(x, encoder_x, &crate::quantum::ConvWork {
-        weight: mlx_gen::adapters::facts::TensorFacts::of(conv_in), bias: None,
-    }, encoder_hid_proj, extra_out, backend)
+    stem_work_bytes(
+        x,
+        encoder_x,
+        &crate::quantum::ConvWork {
+            weight: mlx_gen::adapters::facts::TensorFacts::of(conv_in),
+            bias: None,
+        },
+        encoder_hid_proj,
+        extra_out,
+        backend,
+    )
 }
 
 fn stem_work_bytes(
-    x: &Array, encoder_x: &Array, conv_in: &crate::quantum::ConvWork,
-    encoder_hid_proj: Option<&AdaptableLinear>, extra_out: u64, backend: crate::quantum::Backend,
+    x: &Array,
+    encoder_x: &Array,
+    conv_in: &crate::quantum::ConvWork,
+    encoder_hid_proj: Option<&AdaptableLinear>,
+    extra_out: u64,
+    backend: crate::quantum::Backend,
 ) -> u64 {
-    pricing::stem_work_bytes(&crate::quantum::activation_facts(x),
-        &crate::quantum::activation_facts(encoder_x), conv_in,
-        encoder_hid_proj.map(crate::quantum::LinearWork::of).as_ref(), extra_out, backend)
-    }
+    pricing::stem_work_bytes(
+        &crate::quantum::activation_facts(x),
+        &crate::quantum::activation_facts(encoder_x),
+        conv_in,
+        encoder_hid_proj
+            .map(crate::quantum::LinearWork::of)
+            .as_ref(),
+        extra_out,
+        backend,
+    )
+}
 
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
@@ -333,21 +352,32 @@ impl UNet2DConditionModel {
     /// samplers, **and the resnet `conv_shortcut`** (a 1×1 conv stored as a Linear; quantizing it
     /// collapses 1024² renders, sc-3329 — see [`ResnetBlock2D::quantize`]).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_using(bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+        self.quantize_using(bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
     }
 
-    pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
-        self.time_embedding.quantize_using("time_embedding", bits, visit)?;
-        self.add_embedding.quantize_using("add_embedding", bits, visit)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        self.time_embedding
+            .quantize_using("time_embedding", bits, visit)?;
+        self.add_embedding
+            .quantize_using("add_embedding", bits, visit)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
             visit("encoder_hid_proj", proj, bits)?;
         }
         for (index, b) in self.down_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("down_blocks.{index}"), bits, visit)?;
         }
-        self.mid_resnet0.quantize_using("mid_block.resnets.0", bits, visit)?;
-        self.mid_transformer.quantize_using("mid_block.attentions.0", bits, visit)?;
-        self.mid_resnet1.quantize_using("mid_block.resnets.1", bits, visit)?;
+        self.mid_resnet0
+            .quantize_using("mid_block.resnets.0", bits, visit)?;
+        self.mid_transformer
+            .quantize_using("mid_block.attentions.0", bits, visit)?;
+        self.mid_resnet1
+            .quantize_using("mid_block.resnets.1", bits, visit)?;
         for (index, b) in self.up_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("up_blocks.{index}"), bits, visit)?;
         }
@@ -741,11 +771,22 @@ impl UNet2DConditionModel {
         // sc-26270: one iOS quantum scope per forward; every quantum below is checked against live
         // headroom before its graph is built and materialized after. Pass-through off device.
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
-        mlx_gen::ios_quantum::before(crate::quantum::UNET_STEM,
-            self.stem_scratch(x, encoder_x).saturating_add(embeddings::stem_projection_scratch(
-                &self.time_embedding, &self.add_embedding, self.encoder_hid_proj.as_ref(),
-                plan.conditioning_batch(batch), dtype, text_emb.dtype(), encoder_x,
-                &crate::quantum::EffectScope::native())?))?;
+        mlx_gen::ios_quantum::before(
+            crate::quantum::UNET_STEM,
+            self.stem_scratch(x, encoder_x)
+                .saturating_add(embeddings::stem_projection_scratch(
+                    &self.time_embedding,
+                    &self.add_embedding,
+                    self.encoder_hid_proj.as_ref(),
+                    pricing::StemInput {
+                        batch: plan.conditioning_batch(batch),
+                        dtype,
+                        text: text_emb.dtype(),
+                    },
+                    encoder_x,
+                    &crate::quantum::EffectScope::native(),
+                )?),
+        )?;
 
         let (mut x, temb, projected) = self.stem(
             x, timestep, encoder_x, text_emb, time_ids, plan, batch, dtype,
@@ -889,8 +930,16 @@ impl UNet2DConditionModel {
         out: &mut crate::quantum::Quanta,
     ) -> Result<Dtype> {
         self.price_forward_with_effects(
-            x, encoder_x, text_emb, control, ip, plan,
-            crate::quantum::ControlMergeWork::default(), out,
+            x,
+            pricing::UNetConditioning {
+                encoder_x,
+                text_emb,
+                control,
+                ip,
+            },
+            plan,
+            crate::quantum::ControlMergeWork::default(),
+            out,
             &crate::quantum::EffectScope::native(),
         )
     }
@@ -899,29 +948,54 @@ impl UNet2DConditionModel {
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,
-        encoder_x: &Array,
-        text_emb: &Array,
-        control: Option<&(Vec<Array>, Array)>,
-        ip: Option<(&Array, f32)>,
+        conditioning: pricing::UNetConditioning<'_, Array>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         pending: crate::quantum::ControlMergeWork,
         out: &mut crate::quantum::Quanta,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Dtype> {
+        let pricing::UNetConditioning {
+            encoder_x,
+            text_emb,
+            control,
+            ip,
+        } = conditioning;
         let batch = x.shape()[0];
         let dtype = x.dtype();
         let conv_in = effects.conv("conv_in", &self.conv_in);
-        out.push((crate::quantum::UNET_STEM, stem_work_bytes(x, encoder_x, &conv_in,
-            self.encoder_hid_proj.as_ref(), 0, crate::quantum::backend())
-            .saturating_add(embeddings::stem_projection_scratch(&self.time_embedding,
-                &self.add_embedding, self.encoder_hid_proj.as_ref(), plan.conditioning_batch(batch),
-                dtype, text_emb.dtype(), encoder_x, effects)?)));
+        out.push((
+            crate::quantum::UNET_STEM,
+            stem_work_bytes(
+                x,
+                encoder_x,
+                &conv_in,
+                self.encoder_hid_proj.as_ref(),
+                0,
+                crate::quantum::backend(),
+            )
+            .saturating_add(embeddings::stem_projection_scratch(
+                &self.time_embedding,
+                &self.add_embedding,
+                self.encoder_hid_proj.as_ref(),
+                pricing::StemInput {
+                    batch: plan.conditioning_batch(batch),
+                    dtype,
+                    text: text_emb.dtype(),
+                },
+                encoder_x,
+                effects,
+            )?),
+        ));
         let projected = match &self.encoder_hid_proj {
             Some(proj) => {
                 let e = encoder_x.shape();
                 Some(crate::quantum::shaped(
-                    &effects.linear("encoder_hid_proj", proj)?.output_shape(&[e[0], e[1], e[2]])?,
-                    effects.linear("encoder_hid_proj", proj)?.output_dtype(encoder_x.dtype()),
+                    &effects
+                        .linear("encoder_hid_proj", proj)?
+                        .output_shape(&[e[0], e[1], e[2]])?,
+                    effects
+                        .linear("encoder_hid_proj", proj)?
+                        .output_dtype(encoder_x.dtype()),
                 )?)
             }
             None => None,
@@ -930,7 +1004,8 @@ impl UNet2DConditionModel {
         let temb = crate::quantum::shaped(
             &[
                 plan.conditioning_batch(batch),
-                self.time_embedding.out_features_with_effects(&effects.child("time_embedding"))?,
+                self.time_embedding
+                    .out_features_with_effects(&effects.child("time_embedding"))?,
             ],
             embeddings::text_time_temb_dtype_with_effects(
                 &self.time_embedding,
@@ -941,11 +1016,27 @@ impl UNet2DConditionModel {
             )?,
         )?;
         let mut x = crate::quantum::shaped(
-            &conv_in.output_shape(x.shape(), 1, 1)?, conv_in.output_dtype(dtype),
+            &conv_in.output_shape(x.shape(), 1, 1)?,
+            conv_in.output_dtype(dtype),
         )?;
         let mut residuals: Vec<Array> = vec![x.clone()];
         for (index, block) in self.down_blocks.iter().enumerate() {
-            let (o, res) = block.price_forward_with_effects(&x, encoder_x, &temb, None, ip, plan, out, 0, None, &effects.child(&format!("down_blocks.{index}")))?;
+            let (o, res) = block.price_forward_with_effects(
+                &x,
+                pricing::BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                None,
+                out,
+                pricing::BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("down_blocks.{index}")),
+            )?;
             x = o;
             residuals.extend(res);
         }
@@ -967,17 +1058,39 @@ impl UNet2DConditionModel {
         for (index, (resnet, attention)) in [
             (&self.mid_resnet0, Some(&self.mid_transformer)),
             (&self.mid_resnet1, None),
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             out.push((
                 crate::quantum::UNET_RESNET,
-                resnet.quantum_scratch_with_effects(&x, Some(&temb), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                resnet.quantum_scratch_with_effects(
+                    &x,
+                    Some(&temb),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             ));
             x = crate::quantum::shaped(
-                &resnet.output_shape_with_effects(x.shape(), None, &effects.child(&format!("mid_block.resnets.{index}")))?,
-                resnet.output_dtype_with_effects(x.dtype(), Some(temb.dtype()), &effects.child(&format!("mid_block.resnets.{index}")))?,
+                &resnet.output_shape_with_effects(
+                    x.shape(),
+                    None,
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
+                resnet.output_dtype_with_effects(
+                    x.dtype(),
+                    Some(temb.dtype()),
+                    &effects.child(&format!("mid_block.resnets.{index}")),
+                )?,
             )?;
             if let Some(attention) = attention {
-                x = attention.price_forward_with_effects(&x, encoder_x, ip, plan, out, &effects.child("mid_block.attentions.0"))?;
+                x = attention.price_forward_with_effects(
+                    &x,
+                    encoder_x,
+                    ip,
+                    plan,
+                    out,
+                    &effects.child("mid_block.attentions.0"),
+                )?;
             }
         }
         if let Some((_, mid)) = control {
@@ -991,17 +1104,38 @@ impl UNet2DConditionModel {
             )?;
         }
         for (index, block) in self.up_blocks.iter().enumerate() {
-            let (o, _) =
-                block.price_forward_with_effects(&x, encoder_x, &temb, Some(&mut residuals), ip, plan, out, 0, None, &effects.child(&format!("up_blocks.{index}")))?;
+            let (o, _) = block.price_forward_with_effects(
+                &x,
+                pricing::BlockForwardInputs {
+                    encoder_x,
+                    temb: &temb,
+                    ip,
+                    plan,
+                },
+                Some(&mut residuals),
+                out,
+                pricing::BlockOwners {
+                    outer_held: 0,
+                    owners: None,
+                },
+                &effects.child(&format!("up_blocks.{index}")),
+            )?;
             x = o;
         }
         let conv_out = effects.conv("conv_out", &self.conv_out);
-        out.push((crate::quantum::UNET_CONV_OUT, crate::quantum::norm_conv_bytes(
-            &conv_out.call(x.shape(), crate::quantum::element_bytes(&x), 1, 1), crate::quantum::backend())));
+        out.push((
+            crate::quantum::UNET_CONV_OUT,
+            crate::quantum::norm_conv_bytes(
+                &conv_out.call(x.shape(), crate::quantum::element_bytes(&x), 1, 1),
+                crate::quantum::backend(),
+            ),
+        ));
         // Validate the final biased convolution's actual broadcast geometry, not its old base shape.
         conv_out.output_shape(x.shape(), 1, 1)?;
-        Ok(conv_out.output_dtype(crate::quantum::promote_all(x.dtype(),
-            &[&self.conv_norm_out_w, &self.conv_norm_out_b])))
+        Ok(conv_out.output_dtype(crate::quantum::promote_all(
+            x.dtype(),
+            &[&self.conv_norm_out_w, &self.conv_norm_out_b],
+        )))
     }
 
     /// The stem quantum's body: the Kolors context projection (when loaded), the timestep +

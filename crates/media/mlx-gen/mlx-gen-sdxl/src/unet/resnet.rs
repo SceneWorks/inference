@@ -43,13 +43,20 @@ pub struct ResnetBlock2D {
 impl ResnetBlock2D {
     fn pricing_facts(&self) -> super::pricing::ResnetFacts {
         let conv = |c: &AdaptableConv2d| crate::quantum::ConvWork {
-            weight: crate::quantum::activation_facts(c.weight()), bias: c.bias().map(crate::quantum::activation_facts),
+            weight: crate::quantum::activation_facts(c.weight()),
+            bias: c.bias().map(crate::quantum::activation_facts),
         };
         super::pricing::ResnetFacts {
-            norm1_w: crate::quantum::activation_facts(&self.norm1_w), norm1_b: crate::quantum::activation_facts(&self.norm1_b),
-            norm2_w: crate::quantum::activation_facts(&self.norm2_w), norm2_b: crate::quantum::activation_facts(&self.norm2_b),
-            conv1: conv(&self.conv1), conv2: conv(&self.conv2),
-            time_emb_proj: self.time_emb_proj.as_ref().map(crate::quantum::LinearWork::of),
+            norm1_w: crate::quantum::activation_facts(&self.norm1_w),
+            norm1_b: crate::quantum::activation_facts(&self.norm1_b),
+            norm2_w: crate::quantum::activation_facts(&self.norm2_w),
+            norm2_b: crate::quantum::activation_facts(&self.norm2_b),
+            conv1: conv(&self.conv1),
+            conv2: conv(&self.conv2),
+            time_emb_proj: self
+                .time_emb_proj
+                .as_ref()
+                .map(crate::quantum::LinearWork::of),
             shortcut: self.shortcut.as_ref().map(crate::quantum::LinearWork::of),
         }
     }
@@ -94,10 +101,17 @@ impl ResnetBlock2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_using("", bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+        self.quantize_using("", bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
     }
 
-    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
         if let Some(t) = &mut self.time_emb_proj {
             visit(&crate::quant::child_path(prefix, "time_emb_proj"), t, bits)?;
         }
@@ -229,10 +243,17 @@ impl ResnetBlock2D {
             .expect("native projection facts are infallible")
     }
 
-    pub(crate) fn quantum_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+    pub(crate) fn quantum_scratch_with_effects(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         self.pricing_facts().quantum_scratch_with_effects(
             &crate::quantum::activation_facts(x),
-            temb.map(crate::quantum::activation_facts).as_ref(), effects)
+            temb.map(crate::quantum::activation_facts).as_ref(),
+            effects,
+        )
     }
 
     /// Small affine/bias casts and the dense shortcut's addmm operand casts are distinct from
@@ -244,10 +265,17 @@ impl ResnetBlock2D {
     }
 
     #[cfg(test)]
-    fn promotion_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
+    fn promotion_scratch_with_effects(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<u64> {
         self.pricing_facts().promotion_scratch_with_effects(
             &crate::quantum::activation_facts(x),
-            temb.map(crate::quantum::activation_facts).as_ref(), effects)
+            temb.map(crate::quantum::activation_facts).as_ref(),
+            effects,
+        )
     }
 
     /// The dtype [`Self::forward_core`] returns for an `input`-typed input (the up path's
@@ -261,15 +289,25 @@ impl ResnetBlock2D {
     }
 
     #[cfg(test)]
-    pub(crate) fn output_dtype_with_effects(&self, input: Dtype, temb: Option<Dtype>, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
-        self.pricing_facts().output_dtype_with_effects(input, temb, effects)
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        input: Dtype,
+        temb: Option<Dtype>,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
+        self.pricing_facts()
+            .output_dtype_with_effects(input, temb, effects)
     }
 
     #[cfg(test)]
     pub(crate) fn output_shape_with_effects(
-        &self, input: &[i32], skip: Option<&[i32]>, effects: &crate::quantum::EffectScope<'_>,
+        &self,
+        input: &[i32],
+        skip: Option<&[i32]>,
+        effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Vec<i32>> {
-        self.pricing_facts().output_shape_with_effects(input, skip, effects)
+        self.pricing_facts()
+            .output_shape_with_effects(input, skip, effects)
     }
 
     /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).

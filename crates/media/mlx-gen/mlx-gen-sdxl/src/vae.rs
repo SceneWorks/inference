@@ -507,7 +507,6 @@ fn price_upsample_tiled(
     crate::quantum::shaped(&[up[0], up[1], up[2], cout], dtype)
 }
 
-
 /// Header-only pricing of one guarded VAE resnet ([`resnet_quantum`]) under `label`.
 #[cfg(test)]
 fn price_resnet(
@@ -1154,9 +1153,6 @@ impl Encoder {
         )
     }
 
-
-
-
     /// The output GroupNorm + SiLU + `conv_out` over the body's output.
     fn forward_out(&self, x: &Array) -> Result<Array> {
         let x = group_norm(x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
@@ -1471,7 +1467,6 @@ impl Autoencoder {
         };
         crate::quantum::shaped(decoded.shape(), Dtype::Float32)
     }
-
 
     /// The encoder body (through the mid block) and the encode-out quantum's price over it
     /// (sc-26270 proof tests).

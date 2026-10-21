@@ -488,12 +488,12 @@ impl Files {
             let (mut te1, mut te2) = if self.text_ldm {
                 (
                     crate::loader::load_clip_from_weights(
-                        Weights::from_file(&self.root.join("text_encoder/model.safetensors"))?,
+                        Weights::from_file(self.root.join("text_encoder/model.safetensors"))?,
                         &self.te1,
                         crate::model::DTYPE,
                     )?,
                     crate::loader::load_clip_from_weights(
-                        Weights::from_file(&self.root.join("text_encoder_2/model.safetensors"))?,
+                        Weights::from_file(self.root.join("text_encoder_2/model.safetensors"))?,
                         &self.te2,
                         crate::model::DTYPE,
                     )?,
@@ -521,8 +521,8 @@ impl Files {
         });
         if self.text_ldm {
             crate::model::build_ldm_text_using(
-                Weights::from_file(&self.root.join("text_encoder/model.safetensors"))?,
-                Weights::from_file(&self.root.join("text_encoder_2/model.safetensors"))?,
+                Weights::from_file(self.root.join("text_encoder/model.safetensors"))?,
+                Weights::from_file(self.root.join("text_encoder_2/model.safetensors"))?,
                 quant,
                 |weights, dtype| crate::loader::load_clip_from_weights(weights, &self.te1, dtype),
                 |weights, dtype| crate::loader::load_clip_from_weights(weights, &self.te2, dtype),
@@ -1461,8 +1461,7 @@ fn adapter_world_prefix_forward_and_conv_consumer() {
             .unwrap();
         let winner = raw
             .iter()
-            .filter(|(key, _)| key == &up_a || key == &up_b)
-            .last()
+            .rfind(|(key, _)| key == &up_a || key == &up_b)
             .unwrap();
         let coefficient = if winner.0 == up_a { 0.25 } else { 0.375 };
         let linear = native.adaptable_mut(&parts).unwrap();
@@ -3070,7 +3069,7 @@ fn peft_lokr_scale_gate_precedes_factor_reconstruction() {
                             AdapterWork::Install(w) => Some(w),
                             _ => None,
                         })
-                        .last()
+                        .next_back()
                         .unwrap();
                     assert_eq!(
                         actual_last.storage,
@@ -3145,7 +3144,7 @@ fn tp_proof_save_alpha_fixture(
         );
     }
     let mut encoded = serde_json::to_vec(&header).unwrap();
-    while encoded.len() % 8 != 0 {
+    while !encoded.len().is_multiple_of(8) {
         encoded.push(b' ');
     }
     let mut output = std::fs::File::create(file).unwrap();
@@ -4266,9 +4265,12 @@ fn selected_projection_operands_use_actual_context_after_native_pack() {
                 .all(|v| *v == 0.03125));
             // Production model::load installs IP pairs AFTER adapters and BEFORE native quantize.
             let ip_tokens = inputs.ip.as_ref().map(|(_, file)| {
-                let weights =
-                    crate::loader::lazy_weights(&[file.clone()], crate::model::DTYPE, false)
-                        .unwrap();
+                let weights = crate::loader::lazy_weights(
+                    std::slice::from_ref(file),
+                    crate::model::DTYPE,
+                    false,
+                )
+                .unwrap();
                 native
                     .install_ip_adapter(crate::ip_adapter::load_ip_kv_pairs(&weights).unwrap())
                     .unwrap();
@@ -4596,7 +4598,7 @@ fn rgb_actual_vae_returns_preserve_lazy_boundary_and_observe_absolute_peak() {
             weights.materialize().unwrap();
             let vae = crate::vae::Autoencoder::from_weights(&weights, &cfg).unwrap();
             drop(weights); // Match consumed load weights; do not add a retained map of native owners.
-            let latents = Array::from_slice(&[0.25f32; 1 * 4 * 5 * 4], &[1, 4, 5, 4]);
+            let latents = Array::from_slice(&[0.25f32; 4 * 5 * 4], &[1, 4, 5, 4]);
             latents.eval().unwrap();
             rgb_observation_sync_cpu();
             let native = crate::vae::SdxlLatentDecoder::new(&vae);
@@ -5483,7 +5485,7 @@ fn native_free_unet_control_literals_layout_geglu_effects_stream_and_merge_host(
     );
     let mut pending = crate::quantum::ControlMergeWork::default();
     pending
-        .record_outputs_metadata(&[sum.clone()], &sum)
+        .record_outputs_metadata(std::slice::from_ref(&sum), &sum)
         .unwrap();
     assert_eq!(pending.down, mlx_gen::ios_quantum::allocated_bytes(10240));
     assert_eq!(pending.mid, pending.down);
@@ -6608,24 +6610,26 @@ fn ip_reference_work_sidecar_and_scalar_policy_preserve_actual_context_host() {
         1,
         "actual unvalidated len, never width*height*3"
     );
-    let mut controls = mlx_gen::GenerationRequest::default();
-    controls.conditioning = vec![
-        Conditioning::Control {
-            image: Default::default(),
-            kind: mlx_gen::gen_core::ControlKind::Canny,
-            scale: Some(0.0),
-        },
-        Conditioning::Control {
-            image: Default::default(),
-            kind: mlx_gen::gen_core::ControlKind::Canny,
-            scale: Some(0.25),
-        },
-        Conditioning::Control {
-            image: Default::default(),
-            kind: mlx_gen::gen_core::ControlKind::Canny,
-            scale: None,
-        },
-    ];
+    let controls = mlx_gen::GenerationRequest {
+        conditioning: vec![
+            Conditioning::Control {
+                image: Default::default(),
+                kind: mlx_gen::gen_core::ControlKind::Canny,
+                scale: Some(0.0),
+            },
+            Conditioning::Control {
+                image: Default::default(),
+                kind: mlx_gen::gen_core::ControlKind::Canny,
+                scale: Some(0.25),
+            },
+            Conditioning::Control {
+                image: Default::default(),
+                kind: mlx_gen::gen_core::ControlKind::Canny,
+                scale: None,
+            },
+        ],
+        ..Default::default()
+    };
     assert_eq!(
         crate::model::control_inputs(&controls)
             .unwrap()
@@ -7311,7 +7315,7 @@ fn write_header_only_sparse(
         offset = next;
     }
     let mut text = serde_json::to_vec(&map).unwrap();
-    while text.len() % 8 != 0 {
+    while !text.len().is_multiple_of(8) {
         text.push(b' ');
     }
     let mut output = std::fs::File::create(file).unwrap();

@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "aadb7a008248e79a66400613bee406db5c1fe988a1e9dc39b0fdeace12bbc1c1",
+  "rust_proof_closure_sha256": "09b5a8f04c09aae9889ed6ad992923920dac9870a7fecf8d43b7959fa55b3885",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -360,11 +360,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/adapters.rs",
-      "sha256": "0ed627a0632b0ec0f4ee50d9693436851dd557634c763513b276045551265733"
+      "sha256": "ea88f0ceb9bd52d0444c47000ee5409d9ffd2253c2e65ddc52ee8dfb39014722"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/block_stream.rs",
-      "sha256": "f0c8346eb3e02619024e0a4c157df3c14ad208f945b1f251b936da9a17e80ba1"
+      "sha256": "af8e8101671a02f0f907faba886377db10ea2f03b05694155e86d3f750d75337"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/config.rs",
@@ -372,7 +372,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "10c6c3486892de0c8a00b03c9ac5e493f47e4845c2eeff435210a812b2f02f57"
+      "sha256": "8455684b411cc7cc3f203f552a7e064fe7205bc98ead16c36f4b68741e2dfcfa"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -380,7 +380,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ldm.rs",
-      "sha256": "fe15b4991f585cf1e30f8f4520d4fb46747d0c7a216c474f27a1285a279c5409"
+      "sha256": "9f407fba771e0ccacad42bc56808faceb8bface1573e5ed73347d2acba9c3cfb"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs",
@@ -392,7 +392,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/model.rs",
-      "sha256": "354f61cc8e305002a25ed40f465c490a4353b2c2e6d26be1da0e35899f445622"
+      "sha256": "29f4f2e5c8603be834f239889a77043bd3eeb98da91d9513461c26a3aac3a82f"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/pipeline.rs",
@@ -408,15 +408,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
-      "sha256": "95ad020c399d276db3aeee7941eb6e40d91e956cf3ce42f92f81d8fde3c1acbb"
+      "sha256": "da220f2d210b4a5bb233a6598d8df464a21d68fa031745243ade6a67f0164023"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs",
-      "sha256": "bc1dbfc73303bfba568039107d68cf4a2563653f1e152ae51a3a75f774112e8a"
+      "sha256": "63c51ee8c784018068f0fb0bea860c7e7c51a50ef89c240156a70168b83d2eae"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "07ceb2a912dd5afff776087f44f6c93152bbf4661f87dddce55dc757d1984edc"
+      "sha256": "4f5f4083d307633f01eeb92ecc42ca8524208423b4f7d4c80d2a205cd2102834"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -440,43 +440,43 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/text_encoder.rs",
-      "sha256": "03e15c1331d4cbdb4fcdbc3f37c944c74c2e8dbafcc5488440ecea6c675d820b"
+      "sha256": "09adc760b336afc5cdfa56ab0f67c528814d4f34a8039baa7787e425745046f1"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
-      "sha256": "6ae85954cd2cec66b69bba3cd6f28aacc84dcdaa2304392d1ec31691532eeb4e"
+      "sha256": "1cc4b76ea5a18804942f43dfa2a5b64339e3e56cb7636974e7712e645cc3a5b9"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/controlnet.rs",
-      "sha256": "722476d039206e28b076f61a245645c060a0b1b683d138601a017d8695480347"
+      "sha256": "1baf109c930bafa02f9457a97a7c4652d4426ccfcdb622dfa38c5312b66e6f45"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/embeddings.rs",
-      "sha256": "174c1cc1ebe95431603e32fd42e0306b89413527224d156cf04e3062b5830da0"
+      "sha256": "9689361134fc664423d9c2a904e9f66b390148fe15300be4824be060df639e93"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/mod.rs",
-      "sha256": "725417efd062a8232d51acd6ef80d07e34a8fa1c77ca20b693fc0e963411c9dd"
+      "sha256": "832e675c20cf8435e65ef34d4b81da1328b3439e460b259f83b9d35f3e988725"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/pricing.rs",
-      "sha256": "75e0c46efddfd992196f2a3c6d2730ead8be9f8d9e8a975fc39b127240ca6a82"
+      "sha256": "5602ce2a1ec08c3ba1bb1585cbfaf1b1dd0b626ef062cc29ad895f00b512e249"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
-      "sha256": "6c9d6d5139a424d1c87f476700d5b6a7a7492daaf80c7c2b3e9a17f34688e252"
+      "sha256": "0338b51ae78791cf347590fe92b3be470f6593e109209d3f235f125777c11dad"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/transformer.rs",
-      "sha256": "378be745292764c9d1c19b51cec26bd7e767ab9edb5681435e28d3a248727309"
+      "sha256": "4d6feaf979be3c700f07aa931d2488cbb38c75423030f2e00e2c2af1902dcfbf"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae.rs",
-      "sha256": "9fedf235c70d4a86e56b780bdae8f44e0acd796cf2e9d9bcf87edf52571d8efe"
+      "sha256": "8ce7518406b307f303473180d972f978c4558263deeca8442afbed204f15c858"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae/pricing.rs",
-      "sha256": "f4770fc8135085006a907263e34ff7bdfe8a6d49d370984a3ef2be6582144a25"
+      "sha256": "8a9d628ae4ad47e52866a72966d5d10d1e0c9622abb020ad22d5bed9f7c94273"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
@@ -1430,8 +1430,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "d67b14d6bc772502a6a4b210a58b91ba06c5d8048e5d9fcfa0d28fd87ad105c5",
-    "classification_sha256": "55e75040d1002aceb7457ef0861bdf4b4e1b339d862bcac4091d282c048abc33",
+    "inventory_sha256": "35caa7db70f42a6556de87734d575710ce2fb4d7759682de7c80417735354259",
+    "classification_sha256": "deb498033915e4af36367ae710364e179160fceff7f8eeff3f2f2a03c30b7aa6",
     "selected_Rust_FQNs": 97,
     "HOST_logical": 84,
     "HOST_expected_PASS_rows": 85,

@@ -238,8 +238,14 @@ impl SdxlBlockStream {
                 safetensors_path_tensor_headers(file).map_err(|e| Error::Msg(e.to_string()))?,
             );
         }
-        streamed_block_bytes_for_target(&headers, &self.prefix, self.n_blocks,
-            self.quant_bits, target, width)
+        streamed_block_bytes_for_target(
+            &headers,
+            &self.prefix,
+            self.n_blocks,
+            self.quant_bits,
+            target,
+            width,
+        )
     }
 
     pub(crate) fn n_blocks(&self) -> usize {
@@ -379,6 +385,104 @@ impl SdxlBlockStream {
         }
         Ok(block)
     }
+}
+
+// Shared pure header budget. Native reader validation stays before its header reads; the metadata
+// hierarchy uses the same selector and arithmetic without constructing a block stream/model.
+fn stream_target(dtype: Dtype) -> Result<(mlx_gen::gen_core::weightsmeta::Dtype, u64)> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    Ok(match dtype {
+        Dtype::Float16 => (Stored::F16, 2),
+        Dtype::Bfloat16 => (Stored::BF16, 2),
+        Dtype::Float32 => (Stored::F32, 4),
+        other => {
+            return Err(Error::Msg(format!(
+                "sdxl block stream: unsupported compute dtype {other:?}"
+            )))
+        }
+    })
+}
+
+pub(crate) fn streamed_block_bytes_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+    n_blocks: usize,
+    dtype: Dtype,
+    quant_bits: Option<i32>,
+) -> Result<Vec<u64>> {
+    let (target, width) = stream_target(dtype)?;
+    streamed_block_bytes_for_target(headers, prefix, n_blocks, quant_bits, target, width)
+}
+
+fn streamed_block_bytes_for_target(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+    n_blocks: usize,
+    quant_bits: Option<i32>,
+    target: mlx_gen::gen_core::weightsmeta::Dtype,
+    width: u64,
+) -> Result<Vec<u64>> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
+    if quant_bits.is_some() && !packed {
+        return Err(Error::Unsupported(format!(
+            "sdxl block stream `{}`: a load-time quantization replay over a dense snapshot is \
+                 not a streamable load and has no iOS price",
+            prefix
+        )));
+    }
+    let stem = format!("{}.transformer_blocks.", prefix);
+    let mut bytes = vec![0u64; n_blocks];
+    for header in headers {
+        let Some(rest) = header.name.strip_prefix(&stem) else {
+            continue;
+        };
+        let Some((index, leaf)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        let Some(slot) = bytes.get_mut(index) else {
+            continue;
+        };
+        let floating = matches!(
+            header.dtype,
+            Stored::F16 | Stored::BF16 | Stored::F32 | Stored::F64
+        );
+        let companion = header.name.ends_with(".scales") || header.name.ends_with(".biases");
+        let casts = header.dtype != target && (!packed || (floating && !companion));
+        let elements = header
+            .shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d as u64));
+        let page = mlx_gen::ios_quantum::allocated_bytes;
+        let resident = page(if casts {
+            elements.saturating_mul(width)
+        } else {
+            header.data_bytes
+        });
+        let cast_copy = if casts { resident } else { 0 };
+        // The value/gate halves (two row slices together the projection's size) and the two
+        // `[hidden]` i32 row selections that slice them.
+        let geglu = if leaf.starts_with("ff.net.0.proj.") {
+            let half = header.shape.first().copied().unwrap_or(0) as u64 / 2;
+            let selections =
+                if leaf == "ff.net.0.proj.scales" || (leaf == "ff.net.0.proj.weight" && !packed) {
+                    2 * page(half.saturating_mul(4))
+                } else {
+                    0
+                };
+            resident.saturating_add(selections)
+        } else {
+            0
+        };
+        *slot = slot
+            .saturating_add(page(header.data_bytes))
+            .saturating_add(cast_copy)
+            .saturating_add(geglu);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -867,100 +971,4 @@ mod tests {
         }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
-}
-
-
-// Shared pure header budget. Native reader validation stays before its header reads; the metadata
-// hierarchy uses the same selector and arithmetic without constructing a block stream/model.
-fn stream_target(dtype: Dtype) -> Result<(mlx_gen::gen_core::weightsmeta::Dtype, u64)> {
-    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
-    Ok(match dtype {
-        Dtype::Float16 => (Stored::F16, 2),
-        Dtype::Bfloat16 => (Stored::BF16, 2),
-        Dtype::Float32 => (Stored::F32, 4),
-        other => {
-                return Err(Error::Msg(format!(
-                    "sdxl block stream: unsupported compute dtype {other:?}"
-                )))
-            }
-    })
-
-}
-
-pub(crate) fn streamed_block_bytes_from_headers(
-    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], prefix: &str,
-    n_blocks: usize, dtype: Dtype, quant_bits: Option<i32>,
-) -> Result<Vec<u64>> {
-    let (target, width) = stream_target(dtype)?;
-    streamed_block_bytes_for_target(headers, prefix, n_blocks, quant_bits, target, width)
-}
-
-fn streamed_block_bytes_for_target(
-    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], prefix: &str,
-    n_blocks: usize, quant_bits: Option<i32>,
-    target: mlx_gen::gen_core::weightsmeta::Dtype, width: u64,
-) -> Result<Vec<u64>> {
-    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
-        let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
-        if quant_bits.is_some() && !packed {
-            return Err(Error::Unsupported(format!(
-                "sdxl block stream `{}`: a load-time quantization replay over a dense snapshot is \
-                 not a streamable load and has no iOS price",
-                prefix
-            )));
-        }
-        let stem = format!("{}.transformer_blocks.", prefix);
-        let mut bytes = vec![0u64; n_blocks];
-        for header in headers {
-            let Some(rest) = header.name.strip_prefix(&stem) else {
-                continue;
-            };
-            let Some((index, leaf)) = rest.split_once('.') else {
-                continue;
-            };
-            let Ok(index) = index.parse::<usize>() else {
-                continue;
-            };
-            let Some(slot) = bytes.get_mut(index) else {
-                continue;
-            };
-            let floating = matches!(
-                header.dtype,
-                Stored::F16 | Stored::BF16 | Stored::F32 | Stored::F64
-            );
-            let companion = header.name.ends_with(".scales") || header.name.ends_with(".biases");
-            let casts = header.dtype != target && (!packed || (floating && !companion));
-            let elements = header
-                .shape
-                .iter()
-                .fold(1u64, |a, &d| a.saturating_mul(d as u64));
-            let page = mlx_gen::ios_quantum::allocated_bytes;
-            let resident = page(if casts {
-                elements.saturating_mul(width)
-            } else {
-                header.data_bytes
-            });
-            let cast_copy = if casts { resident } else { 0 };
-            // The value/gate halves (two row slices together the projection's size) and the two
-            // `[hidden]` i32 row selections that slice them.
-            let geglu = if leaf.starts_with("ff.net.0.proj.") {
-                let half = header.shape.first().copied().unwrap_or(0) as u64 / 2;
-                let selections = if leaf == "ff.net.0.proj.scales"
-                    || (leaf == "ff.net.0.proj.weight" && !packed)
-                {
-                    2 * page(half.saturating_mul(4))
-                } else {
-                    0
-                };
-                resident.saturating_add(selections)
-            } else {
-                0
-            };
-            *slot = slot
-                .saturating_add(page(header.data_bytes))
-                .saturating_add(cast_copy)
-                .saturating_add(geglu);
-        }
-        Ok(bytes)
-
 }

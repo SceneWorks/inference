@@ -98,7 +98,9 @@ impl Drop for CpuBodyCompletion {
 fn completed_cpu_child(name: &str) -> Option<CpuBodyCompletion> {
     if std::env::var_os("SDXL_IOS_QUANTUM_CPU_CHILD").is_some() {
         assert!(cpu_child(name));
-        return Some(CpuBodyCompletion { body_completed: false });
+        return Some(CpuBodyCompletion {
+            body_completed: false,
+        });
     }
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
@@ -3702,7 +3704,9 @@ mod adapters {
     /// not generation, allocator measurements, or ProcessGrowth evidence.
     #[test]
     fn configured_adapter_facts_match_actual_install_branches() {
-        let Some(mut completion) = completed_cpu_child("adapters::configured_adapter_facts_match_actual_install_branches") else {
+        let Some(mut completion) =
+            completed_cpu_child("adapters::configured_adapter_facts_match_actual_install_branches")
+        else {
             return;
         };
         use mlx_gen::adapters::Adapter;
@@ -4229,7 +4233,11 @@ mod adapters {
 /// widths ensure metadata passes the actual PRE-CAST weight element width, not nbytes or act.
 #[test]
 fn conv_call_metadata_constructor_matches_native_element_width() {
-    let Some(mut completed) = completed_cpu_child("conv_call_metadata_constructor_matches_native_element_width") else { return; };
+    let Some(mut completed) =
+        completed_cpu_child("conv_call_metadata_constructor_matches_native_element_width")
+    else {
+        return;
+    };
     for (input, weight_shape, stride, pad) in [
         ([1, 3, 5, 32], [224, 3, 3, 32], 1, 1),
         ([1, 64, 64, 32], [224, 3, 3, 32], 1, 1),
@@ -4237,20 +4245,36 @@ fn conv_call_metadata_constructor_matches_native_element_width() {
     ] {
         let count = weight_shape.iter().map(|d| *d as usize).product::<usize>();
         for (activation, weight_dtype) in [
-            (Dtype::Float16, Dtype::Float32), (Dtype::Float32, Dtype::Float16),
-            (Dtype::Float16, Dtype::Bfloat16), (Dtype::Float32, Dtype::Float32),
+            (Dtype::Float16, Dtype::Float32),
+            (Dtype::Float32, Dtype::Float16),
+            (Dtype::Float16, Dtype::Bfloat16),
+            (Dtype::Float32, Dtype::Float32),
         ] {
             let weight = Array::from_slice(&vec![0.25f32; count], &weight_shape)
-                .as_dtype(weight_dtype).unwrap();
+                .as_dtype(weight_dtype)
+                .unwrap();
             let native = ConvCall::new(&input, dtype_bytes(activation), &weight, stride, pad);
-            let metadata = ConvCall::from_metadata(&input, dtype_bytes(activation), &weight_shape,
-                dtype_bytes(weight_dtype), stride, pad);
-            let describe = |call: ConvCall| (call.in_bytes(), call.out_bytes(), call.weight_elements(),
-                call.winograd(), call.transient(Backend::Cpu), call.transient(Backend::Metal));
+            let metadata = ConvCall::from_metadata(
+                &input,
+                dtype_bytes(activation),
+                &weight_shape,
+                dtype_bytes(weight_dtype),
+                stride,
+                pad,
+            );
+            let describe = |call: ConvCall| {
+                (
+                    call.in_bytes(),
+                    call.out_bytes(),
+                    call.weight_elements(),
+                    call.winograd(),
+                    call.transient(Backend::Cpu),
+                    call.transient(Backend::Metal),
+                )
+            };
             assert_eq!(describe(native), describe(metadata),
                 "ConvCall metadata element-width equivalence input={input:?} weight={weight_dtype:?} activation={activation:?}");
         }
     }
     completed.body_completed = true;
 }
-

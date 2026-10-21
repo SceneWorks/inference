@@ -80,7 +80,6 @@ impl Conv2dLayer {
         mlx_gen::ios_quantum::run(crate::quantum::CONTROL_COND_CONV, scratch, build)
     }
 
-
     /// One 1x1 zero-conv head scaled by `s`, as a guarded iOS quantum (sc-26270): the output (its
     /// bias add and the scale donate) and the kernel transient.
     fn zero_quantum(&self, x: &Array, s: &Array) -> Result<Array> {
@@ -119,7 +118,6 @@ impl CondEmbedding {
             conv_out,
         })
     }
-
 
     /// `control`: NHWC `[B, H, W, 3]` in `[0,1]` → `[B, H/8, W/8, 320]`.
     ///
@@ -301,8 +299,6 @@ impl ControlNet {
         self.cond_embedding.forward(control)
     }
 
-
-
     /// Compute the control residuals for one denoise step.
     /// - `x`: NHWC latents `[B, H, W, 4]` (the same CFG-batched input the UNet sees).
     /// - `cond_embed`: the precomputed conditioning embedding ([`embed_cond`](Self::embed_cond)) for
@@ -363,9 +359,19 @@ impl ControlNet {
         mlx_gen::ios_quantum::before(
             crate::quantum::CONTROL_STEM,
             self.stem_scratch(x, encoder_x, cond_embed).saturating_add(
-                super::embeddings::stem_projection_scratch(&self.time_embedding,
-                    &self.add_embedding, self.encoder_hid_proj.as_ref(), plan.conditioning_batch(batch),
-                    dtype, text_emb.dtype(), encoder_x, &crate::quantum::EffectScope::native())?),
+                super::embeddings::stem_projection_scratch(
+                    &self.time_embedding,
+                    &self.add_embedding,
+                    self.encoder_hid_proj.as_ref(),
+                    super::pricing::StemInput {
+                        batch: plan.conditioning_batch(batch),
+                        dtype,
+                        text: text_emb.dtype(),
+                    },
+                    encoder_x,
+                    &crate::quantum::EffectScope::native(),
+                )?,
+            ),
         )?;
 
         // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) up front, before
@@ -532,19 +538,30 @@ impl ControlNet {
     /// Quantize the encoder-copy Linears (down/mid attention + FFN + time/add embeddings). The
     /// conv stem, conditioning embedding, and zero-convs stay dense (matching the UNet quant scope).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.quantize_using(bits, &mut |_, linear, bits| crate::quant::quantize_linear(linear, bits))
+        self.quantize_using(bits, &mut |_, linear, bits| {
+            crate::quant::quantize_linear(linear, bits)
+        })
     }
 
-    pub(crate) fn quantize_using(&mut self, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
+    pub(crate) fn quantize_using(
+        &mut self,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
         // ControlNet's encoder_hid_proj is LAST, unlike the UNet walk. Keep the actual order.
-        self.time_embedding.quantize_using("time_embedding", bits, visit)?;
-        self.add_embedding.quantize_using("add_embedding", bits, visit)?;
+        self.time_embedding
+            .quantize_using("time_embedding", bits, visit)?;
+        self.add_embedding
+            .quantize_using("add_embedding", bits, visit)?;
         for (index, b) in self.down_blocks.iter_mut().enumerate() {
             b.quantize_using(&format!("down_blocks.{index}"), bits, visit)?;
         }
-        self.mid_resnet0.quantize_using("mid_block.resnets.0", bits, visit)?;
-        self.mid_transformer.quantize_using("mid_block.attentions.0", bits, visit)?;
-        self.mid_resnet1.quantize_using("mid_block.resnets.1", bits, visit)?;
+        self.mid_resnet0
+            .quantize_using("mid_block.resnets.0", bits, visit)?;
+        self.mid_transformer
+            .quantize_using("mid_block.attentions.0", bits, visit)?;
+        self.mid_resnet1
+            .quantize_using("mid_block.resnets.1", bits, visit)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
             visit("encoder_hid_proj", proj, bits)?;
         }

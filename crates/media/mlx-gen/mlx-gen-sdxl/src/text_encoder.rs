@@ -134,13 +134,13 @@ pub(crate) fn text_pack_facts(
         let weight = headers
             .iter()
             .find(|h| h.name == weight_name)
-            .ok_or_else(|| Error::MissingTensor(weight_name))?;
+            .ok_or(Error::MissingTensor(weight_name))?;
         let bias_bytes = if has_bias {
             let name = format!("{path}.bias");
             headers
                 .iter()
                 .find(|h| h.name == name)
-                .ok_or_else(|| Error::MissingTensor(name))?
+                .ok_or(Error::MissingTensor(name))?
                 .materialized_bytes(2)
                 .map_err(|e| Error::Msg(e.to_string()))?
         } else {

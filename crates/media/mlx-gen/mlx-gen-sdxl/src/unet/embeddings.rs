@@ -115,8 +115,10 @@ pub struct TimestepEmbedding {
 
 impl TimestepEmbedding {
     pub(super) fn pricing_facts(&self) -> super::pricing::TimeFacts {
-        super::pricing::TimeFacts { linear1: crate::quantum::LinearWork::of(&self.linear1),
-            linear2: crate::quantum::LinearWork::of(&self.linear2) }
+        super::pricing::TimeFacts {
+            linear1: crate::quantum::LinearWork::of(&self.linear1),
+            linear2: crate::quantum::LinearWork::of(&self.linear2),
+        }
     }
 
     /// `prefix` is e.g. `time_embedding` or `add_embedding`; leaves are `linear_1`/`linear_2`.
@@ -130,9 +132,22 @@ impl TimestepEmbedding {
         })
     }
 
-    pub(crate) fn quantize_using(&mut self, prefix: &str, bits: i32, visit: &mut crate::quant::QuantizeLinear<'_>) -> Result<()> {
-        visit(&crate::quant::child_path(prefix, "linear_1"), &mut self.linear1, bits)?;
-        visit(&crate::quant::child_path(prefix, "linear_2"), &mut self.linear2, bits)?;
+    pub(crate) fn quantize_using(
+        &mut self,
+        prefix: &str,
+        bits: i32,
+        visit: &mut crate::quant::QuantizeLinear<'_>,
+    ) -> Result<()> {
+        visit(
+            &crate::quant::child_path(prefix, "linear_1"),
+            &mut self.linear1,
+            bits,
+        )?;
+        visit(
+            &crate::quant::child_path(prefix, "linear_2"),
+            &mut self.linear2,
+            bits,
+        )?;
         Ok(())
     }
 
@@ -156,17 +171,21 @@ impl TimestepEmbedding {
     }
 
     #[cfg(test)]
-    pub(crate) fn output_dtype_with_effects(&self, x: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
+    pub(crate) fn output_dtype_with_effects(
+        &self,
+        x: Dtype,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<Dtype> {
         self.pricing_facts().output_dtype_with_effects(x, effects)
     }
 
-
-
     #[cfg(test)]
-    pub(crate) fn out_features_with_effects(&self, effects: &crate::quantum::EffectScope<'_>) -> Result<i32> {
+    pub(crate) fn out_features_with_effects(
+        &self,
+        effects: &crate::quantum::EffectScope<'_>,
+    ) -> Result<i32> {
         self.pricing_facts().out_features_with_effects(effects)
     }
-
 }
 
 /// Pure final projection facts for the existing time/add embedding flow.
@@ -180,22 +199,32 @@ pub(crate) fn text_time_temb_dtype_with_effects(
 ) -> Result<Dtype> {
     Ok(Dtype::from_promoting_types(
         time_embedding.output_dtype_with_effects(dtype, &effects.child("time_embedding"))?,
-        add_embedding.output_dtype_with_effects(Dtype::from_promoting_types(text_emb_dtype, dtype),
-            &effects.child("add_embedding"))?,
+        add_embedding.output_dtype_with_effects(
+            Dtype::from_promoting_types(text_emb_dtype, dtype),
+            &effects.child("add_embedding"),
+        )?,
     ))
 }
 
 /// The actual stem's time/add MLP and optional context projection operands. Shared by the
 /// runtime guard and header overlay; no output graph is built to derive these extents.
 pub(crate) fn stem_projection_scratch(
-    time: &TimestepEmbedding, add: &TimestepEmbedding, encoder: Option<&AdaptableLinear>,
-    batch: i32, dtype: Dtype, text: Dtype, memory: &Array,
+    time: &TimestepEmbedding,
+    add: &TimestepEmbedding,
+    encoder: Option<&AdaptableLinear>,
+    input: super::pricing::StemInput,
+    memory: &Array,
     effects: &crate::quantum::EffectScope<'_>,
 ) -> Result<u64> {
-    super::pricing::stem_projection_scratch(&time.pricing_facts(), &add.pricing_facts(),
-        encoder.map(crate::quantum::LinearWork::of).as_ref(), batch, dtype, text,
-        &crate::quantum::activation_facts(memory), effects)
-    }
+    super::pricing::stem_projection_scratch(
+        &time.pricing_facts(),
+        &add.pricing_facts(),
+        encoder.map(crate::quantum::LinearWork::of).as_ref(),
+        input,
+        &crate::quantum::activation_facts(memory),
+        effects,
+    )
+}
 
 /// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by
 /// [`UNet2DConditionModel::forward_core`](crate::unet::UNet2DConditionModel) and

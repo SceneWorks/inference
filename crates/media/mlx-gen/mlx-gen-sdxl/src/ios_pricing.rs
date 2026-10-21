@@ -2845,9 +2845,11 @@ impl Priced {
                     .map_or_else(q::EffectScope::native, q::EffectScope::root);
                 let (down, mid) = branch.price_forward_with_effects(
                     &x,
-                    &row,
-                    encoder_x,
-                    text_emb,
+                    crate::unet::pricing::ControlConditioning {
+                        cond_embed: &row,
+                        encoder_x,
+                        text_emb,
+                    },
                     plan,
                     quanta,
                     Some(&mut owners),
@@ -2905,10 +2907,12 @@ impl Priced {
             .map_or_else(q::EffectScope::native, q::EffectScope::root);
         let eps = self.unet.price_forward_with_effects(
             &x,
-            encoder_x,
-            text_emb,
-            control.as_ref(),
-            ip_tokens.map(|t| (t, regime.ip_scale)),
+            crate::unet::pricing::UNetConditioning {
+                encoder_x,
+                text_emb,
+                control: control.as_ref(),
+                ip: ip_tokens.map(|t| (t, regime.ip_scale)),
+            },
             plan,
             pending_control,
             quanta,

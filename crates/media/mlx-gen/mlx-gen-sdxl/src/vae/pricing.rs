@@ -1,52 +1,111 @@
 //! Header-only VAE hierarchy, bound to the exact prospective Root metadata APIs in proposal625b.
 //! No native weights/model/activation construction; logical operands are not backing identities.
-use mlx_gen::Result;
-use mlx_rs::Dtype;
-use mlx_gen::adapters::facts::TensorFacts as Tensor;
-use mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader;
+use super::{max_conv_tile, VAE_TILING};
 use crate::config::VaeConfig;
 use crate::quantum as q;
-use crate::unet::pricing::{HeaderWeights, ResnetFacts, FactView, tensor, tensor_bytes,
-    element_bytes, promote, nchw_to_nhwc};
-use super::{VAE_TILING, max_conv_tile};
+use crate::unet::pricing::{
+    element_bytes, nchw_to_nhwc, promote, tensor, tensor_bytes, FactView, HeaderWeights,
+    ResnetFacts,
+};
+use mlx_gen::adapters::facts::TensorFacts as Tensor;
+use mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader;
+use mlx_gen::Result;
+use mlx_rs::Dtype;
 
 struct AttentionFacts {
-    _gn_w: Tensor, _gn_b: Tensor, _q: q::LinearWork, _k: q::LinearWork, _v: q::LinearWork,
+    _gn_w: Tensor,
+    _gn_b: Tensor,
+    _q: q::LinearWork,
+    _k: q::LinearWork,
+    _v: q::LinearWork,
     out: q::LinearWork,
 }
-struct VaeBlockFacts { resnets: Vec<ResnetFacts>, downsample: Option<(Tensor, Tensor)>, upsample: Option<(Tensor, Tensor)> }
+struct VaeBlockFacts {
+    resnets: Vec<ResnetFacts>,
+    downsample: Option<(Tensor, Tensor)>,
+    upsample: Option<(Tensor, Tensor)>,
+}
 struct DecoderFacts {
-    conv_in_w: Tensor, conv_in_b: Tensor, mid_resnet0: ResnetFacts, mid_attn: AttentionFacts,
-    mid_resnet1: ResnetFacts, up_blocks: Vec<VaeBlockFacts>, _norm_out_w: Tensor, _norm_out_b: Tensor,
-    conv_out_w: Tensor, conv_out_b: Tensor,
+    conv_in_w: Tensor,
+    conv_in_b: Tensor,
+    mid_resnet0: ResnetFacts,
+    mid_attn: AttentionFacts,
+    mid_resnet1: ResnetFacts,
+    up_blocks: Vec<VaeBlockFacts>,
+    _norm_out_w: Tensor,
+    _norm_out_b: Tensor,
+    conv_out_w: Tensor,
+    conv_out_b: Tensor,
 }
 struct EncoderFacts {
-    conv_in_w: Tensor, conv_in_b: Tensor, down_blocks: Vec<VaeBlockFacts>, mid_resnet0: ResnetFacts,
-    mid_attn: AttentionFacts, mid_resnet1: ResnetFacts, _norm_out_w: Tensor, _norm_out_b: Tensor,
-    conv_out_w: Tensor, _conv_out_b: Tensor,
+    conv_in_w: Tensor,
+    conv_in_b: Tensor,
+    down_blocks: Vec<VaeBlockFacts>,
+    mid_resnet0: ResnetFacts,
+    mid_attn: AttentionFacts,
+    mid_resnet1: ResnetFacts,
+    _norm_out_w: Tensor,
+    _norm_out_b: Tensor,
+    conv_out_w: Tensor,
+    _conv_out_b: Tensor,
 }
 pub(crate) struct AutoencoderFacts {
-    encoder: EncoderFacts, decoder: DecoderFacts, _quant_proj: q::LinearWork,
-    post_quant_proj: q::LinearWork, _scaling_factor: f32, dtype: Dtype,
+    encoder: EncoderFacts,
+    decoder: DecoderFacts,
+    _quant_proj: q::LinearWork,
+    post_quant_proj: q::LinearWork,
+    _scaling_factor: f32,
+    dtype: Dtype,
 }
-fn linear_output_dtype(linear: &q::LinearWork, input: Dtype) -> Dtype { linear.output_dtype(input) }
-fn conv_channels(weight: &Tensor) -> (i32, i32) { (weight.shape[weight.shape.len() - 1], weight.shape[0]) }
+fn linear_output_dtype(linear: &q::LinearWork, input: Dtype) -> Dtype {
+    linear.output_dtype(input)
+}
+fn conv_channels(weight: &Tensor) -> (i32, i32) {
+    (weight.shape[weight.shape.len() - 1], weight.shape[0])
+}
 fn conv_call(input: &[i32], act: u64, weight: &Tensor, stride: i32, pad: i32) -> q::ConvCall {
-    q::ConvCall::from_metadata(input, act, &weight.shape, element_bytes(weight), stride, pad)
+    q::ConvCall::from_metadata(
+        input,
+        act,
+        &weight.shape,
+        element_bytes(weight),
+        stride,
+        pad,
+    )
 }
-fn tile_bytes(tile: &[i32], source: q::TileSource, act: u64, weight: &Tensor,
-    f32_accum: bool, backend: q::Backend) -> u64 {
-    q::tile_bytes_from_metadata(tile, source, act, &weight.shape, element_bytes(weight), f32_accum, backend)
+fn tile_bytes(
+    tile: &[i32],
+    source: q::TileSource,
+    act: u64,
+    weight: &Tensor,
+    f32_accum: bool,
+    backend: q::Backend,
+) -> u64 {
+    q::tile_bytes_from_metadata(
+        tile,
+        source,
+        act,
+        &weight.shape,
+        element_bytes(weight),
+        f32_accum,
+        backend,
+    )
 }
 fn downsample_tile_bytes(crop: &[i32], act: u64, weight: &Tensor, backend: q::Backend) -> u64 {
     q::downsample_tile_bytes_from_metadata(crop, act, &weight.shape, element_bytes(weight), backend)
 }
 fn tiled_stage_f32_accum(out: &[i32], weight: &Tensor, bias: &Tensor, act: u64) -> u64 {
-    q::tiled_stage_f32_accum_from_metadata(out, &weight.shape, weight.elements(), bias.elements(), act)
+    q::tiled_stage_f32_accum_from_metadata(
+        out,
+        &weight.shape,
+        weight.elements(),
+        bias.elements(),
+        act,
+    )
 }
 
 impl AttentionFacts {
-pub(crate) fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
+    pub(crate) fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         let lin = |n: &str| -> Result<q::LinearWork> {
             Ok(q::LinearWork::dense(
                 w.require(&format!("{prefix}.{n}.weight"))?.clone(),
@@ -63,7 +122,7 @@ pub(crate) fn from_weights(w: &HeaderWeights, prefix: &str) -> Result<Self> {
         })
     }
 
-pub(crate) fn bounded_plan() -> mlx_gen::attention::AttentionPlan<'static> {
+    pub(crate) fn bounded_plan() -> mlx_gen::attention::AttentionPlan<'static> {
         mlx_gen::attention::AttentionPlan::budgeted(
             mlx_gen::attention::AttentionBudget::from_score_elements(
                 crate::quantum::VAE_ATTENTION_SCORE_ELEMENTS,
@@ -72,11 +131,11 @@ pub(crate) fn bounded_plan() -> mlx_gen::attention::AttentionPlan<'static> {
         )
     }
 
-fn scratch(x: &Tensor, plan: mlx_gen::attention::AttentionPlan<'_>) -> u64 {
-    attention_scratch(x.shape(), x.dtype(), plan)
-}
+    fn scratch(x: &Tensor, plan: mlx_gen::attention::AttentionPlan<'_>) -> u64 {
+        attention_scratch(x.shape(), x.dtype(), plan)
+    }
 
-fn price(
+    fn price(
         &self,
         x: &Tensor,
         label: &'static str,
@@ -85,17 +144,13 @@ fn price(
         out.push((label, Self::scratch(x, Self::bounded_plan())));
         tensor(
             x.shape(),
-            Dtype::from_promoting_types(
-                x.dtype(),
-                linear_output_dtype(&self.out, x.dtype()),
-            ),
+            Dtype::from_promoting_types(x.dtype(), linear_output_dtype(&self.out, x.dtype())),
         )
     }
-
 }
 
 impl VaeBlockFacts {
-fn from_weights(
+    fn from_weights(
         w: &HeaderWeights,
         prefix: &str,
         num_resnets: i32,
@@ -126,11 +181,11 @@ fn from_weights(
         })
     }
 
-fn upsamples(&self) -> bool {
+    fn upsamples(&self) -> bool {
         self.upsample.is_some()
     }
 
-fn price_forward(
+    fn price_forward(
         &self,
         x: &Tensor,
         labels: crate::quantum::VaeLabels,
@@ -143,8 +198,7 @@ fn price_forward(
         if let Some((cw, cb)) = &self.downsample {
             let s = x.shape();
             let padded = [s[0], s[1] + 1, s[2] + 1, s[3]];
-            let call =
-                conv_call(&padded, element_bytes(&x), cw, 2, 0);
+            let call = conv_call(&padded, element_bytes(&x), cw, 2, 0);
             out.push((
                 crate::quantum::VAE_DOWNSAMPLE,
                 crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::backend()),
@@ -166,7 +220,7 @@ fn price_forward(
         Ok(x)
     }
 
-fn price_tiled_decode(
+    fn price_tiled_decode(
         &self,
         x: &Tensor,
         tile_edge: i32,
@@ -182,11 +236,10 @@ fn price_tiled_decode(
         }
         Ok(x)
     }
-
 }
 
 impl DecoderFacts {
-fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
+    fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         let n = cfg.block_out_channels.len();
         // decoder layers_per_block = config.layers_per_block + 1.
         let num_resnets = cfg.layers_per_block + 1;
@@ -215,30 +268,18 @@ fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         })
     }
 
-fn conv_out_scratch(&self, x: &Tensor) -> u64 {
-        let call = conv_call(
-            x.shape(),
-            element_bytes(x),
-            &self.conv_out_w,
-            1,
-            1,
-        );
+    fn conv_out_scratch(&self, x: &Tensor) -> u64 {
+        let call = conv_call(x.shape(), element_bytes(x), &self.conv_out_w, 1, 1);
         crate::quantum::norm_conv_bytes(&call, crate::quantum::backend())
     }
 
-fn price_head(
+    fn price_head(
         &self,
         z: &Tensor,
         pending_input: u64,
         out: &mut crate::quantum::Quanta,
     ) -> Result<Tensor> {
-        let call = conv_call(
-            z.shape(),
-            element_bytes(z),
-            &self.conv_in_w,
-            1,
-            1,
-        );
+        let call = conv_call(z.shape(), element_bytes(z), &self.conv_in_w, 1, 1);
         out.push((
             crate::quantum::VAE_DECODE_IN,
             crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::backend())
@@ -256,7 +297,7 @@ fn price_head(
         price_resnet(crate::quantum::VAE_RESNET, &self.mid_resnet1, &x, out)
     }
 
-fn price_conv_out_output(&self, x: &Tensor) -> Result<Tensor> {
+    fn price_conv_out_output(&self, x: &Tensor) -> Result<Tensor> {
         let s = x.shape();
         tensor(
             &[s[0], s[1], s[2], self.conv_out_w.shape()[0]],
@@ -264,7 +305,7 @@ fn price_conv_out_output(&self, x: &Tensor) -> Result<Tensor> {
         )
     }
 
-fn price_tail(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
+    fn price_tail(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
         let mut x = x.clone();
         for ub in &self.up_blocks {
             x = ub.price_forward(&x, crate::quantum::VAE_DECODE_LABELS, out)?;
@@ -273,7 +314,7 @@ fn price_tail(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Ten
         self.price_conv_out_output(&x)
     }
 
-fn price_tail_tiled(
+    fn price_tail_tiled(
         &self,
         x: &Tensor,
         output_tile_edge: i32,
@@ -301,13 +342,7 @@ fn price_tail_tiled(
         let (cin, cout) = conv_channels(&self.conv_out_w);
         out.push((
             crate::quantum::VAE_TILED_STAGE,
-            crate::quantum::tiled_stage_bytes(
-                x.shape(),
-                cin,
-                cout,
-                element_bytes(&x),
-                false,
-            ),
+            crate::quantum::tiled_stage_bytes(x.shape(), cin, cout, element_bytes(&x), false),
         ));
         price_tiles(
             crate::quantum::VAE_TILE,
@@ -315,17 +350,18 @@ fn price_tail_tiled(
             cin,
             &self.conv_out_w,
             output_tile_edge.max(3),
-            false,
-            true,
+            TileMode {
+                f32_accum: false,
+                normalized: true,
+            },
             out,
         );
         self.price_conv_out_output(&x)
     }
-
 }
 
 impl EncoderFacts {
-fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
+    fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         let n = cfg.block_out_channels.len();
         let num_resnets = cfg.layers_per_block;
         let down_blocks = (0..n)
@@ -353,14 +389,8 @@ fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         })
     }
 
-fn price_body(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
-        let call = conv_call(
-            x.shape(),
-            element_bytes(x),
-            &self.conv_in_w,
-            1,
-            1,
-        );
+    fn price_body(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
+        let call = conv_call(x.shape(), element_bytes(x), &self.conv_in_w, 1, 1);
         out.push((
             crate::quantum::VAE_ENCODE_IN,
             crate::quantum::single_conv_bytes(&call, 1, 1, crate::quantum::backend()),
@@ -376,7 +406,7 @@ fn price_body(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Ten
         self.price_mid(&x, out)
     }
 
-fn price_body_tiled(
+    fn price_body_tiled(
         &self,
         x: &Tensor,
         tile: i32,
@@ -400,8 +430,10 @@ fn price_body_tiled(
             cin,
             &self.conv_in_w,
             tile.max(3),
-            false,
-            false,
+            TileMode {
+                f32_accum: false,
+                normalized: false,
+            },
             out,
         );
         let mut x = tensor(
@@ -422,7 +454,7 @@ fn price_body_tiled(
         self.price_mid(&x, out)
     }
 
-fn price_mid(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
+    fn price_mid(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tensor> {
         let x = price_resnet(crate::quantum::VAE_ENCODE_RESNET, &self.mid_resnet0, x, out)?;
         let x = self
             .mid_attn
@@ -435,22 +467,15 @@ fn price_mid(&self, x: &Tensor, out: &mut crate::quantum::Quanta) -> Result<Tens
         )
     }
 
-fn out_scratch(&self, x: &Tensor) -> u64 {
-        let call = conv_call(
-            x.shape(),
-            element_bytes(x),
-            &self.conv_out_w,
-            1,
-            1,
-        );
+    fn out_scratch(&self, x: &Tensor) -> u64 {
+        let call = conv_call(x.shape(), element_bytes(x), &self.conv_out_w, 1, 1);
         crate::quantum::norm_conv_bytes(&call, crate::quantum::backend())
             .saturating_add(call.out_bytes() / call_act(x) * 4 * 4)
     }
-
 }
 
 impl AutoencoderFacts {
-pub fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
+    pub fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         let squeeze_lin = |name: &str| -> Result<q::LinearWork> {
             let cw = w.require(&format!("{name}.weight"))?;
             let sh = cw.shape();
@@ -469,19 +494,19 @@ pub fn from_weights(w: &HeaderWeights, cfg: &VaeConfig) -> Result<Self> {
         })
     }
 
-pub fn dtype(&self) -> Dtype {
+    pub fn dtype(&self) -> Dtype {
         self.dtype
     }
 
-fn compute_dtype(&self, x: Dtype) -> Dtype {
-    compute_dtype(self.dtype, x)
-}
+    fn compute_dtype(&self, x: Dtype) -> Dtype {
+        compute_dtype(self.dtype, x)
+    }
 
-pub(crate) fn decode_input_retained_bytes(&self, latents: &Tensor) -> u64 {
-    input_retained_bytes(self.dtype, latents)
-}
+    pub(crate) fn decode_input_retained_bytes(&self, latents: &Tensor) -> u64 {
+        input_retained_bytes(self.dtype, latents)
+    }
 
-pub(crate) fn price_decode(
+    pub(crate) fn price_decode(
         &self,
         latents: &Tensor,
         tiling: Option<&mlx_gen::tiling::TilingConfig>,
@@ -494,12 +519,8 @@ pub(crate) fn price_decode(
             self.dtype
         };
         let z = Dtype::from_promoting_types(self.compute_dtype(latents.dtype()), scale);
-        let z = tensor(
-            sh,
-            linear_output_dtype(&self.post_quant_proj, z),
-        )?;
-        let pending_input =
-            self.decode_input_retained_bytes(latents) - tensor_bytes(latents);
+        let z = tensor(sh, linear_output_dtype(&self.post_quant_proj, z))?;
+        let pending_input = self.decode_input_retained_bytes(latents) - tensor_bytes(latents);
         let head = self.decoder.price_head(&z, pending_input, out)?;
         let tile = tiling
             .filter(|cfg| cfg.needs_tiling(VAE_TILING, 1, sh[1], sh[2]))
@@ -511,7 +532,7 @@ pub(crate) fn price_decode(
         tensor(decoded.shape(), Dtype::Float32)
     }
 
-pub(crate) fn price_encode(
+    pub(crate) fn price_encode(
         &self,
         image: &Tensor,
         tile_px: i32,
@@ -530,7 +551,13 @@ pub(crate) fn price_encode(
         ));
         Ok(())
     }
+}
 
+/// How one tiled convolution accumulates and whether its input tile is a normalized view.
+#[derive(Clone, Copy)]
+struct TileMode {
+    f32_accum: bool,
+    normalized: bool,
 }
 
 fn price_tiles(
@@ -539,17 +566,23 @@ fn price_tiles(
     channels: i32,
     weight: &Tensor,
     edge: i32,
-    f32_accum: bool,
-    normalized: bool,
+    mode: TileMode,
     out: &mut crate::quantum::Quanta,
 ) {
+    let TileMode {
+        f32_accum,
+        normalized,
+    } = mode;
     let s = x.shape();
     let (th, tw) = max_conv_tile(s[1], s[2], edge);
     out.push((
         label,
         tile_bytes(
             &[s[0], th, tw, channels],
-            q::TileSource { full_width: s[2], normalized },
+            q::TileSource {
+                full_width: s[2],
+                normalized,
+            },
             element_bytes(x),
             weight,
             f32_accum,
@@ -585,8 +618,10 @@ fn price_upsample_tiled(
         s[3],
         weight,
         tile,
-        f32_accum,
-        false,
+        TileMode {
+            f32_accum,
+            normalized: false,
+        },
         out,
     );
     let dtype = if f32_accum {
@@ -657,21 +692,45 @@ fn call_act(x: &Tensor) -> u64 {
     element_bytes(x).max(1)
 }
 
-pub(super) fn attention_scratch(shape: &[i32], dtype: Dtype, plan: mlx_gen::attention::AttentionPlan<'_>) -> u64 {
+pub(super) fn attention_scratch(
+    shape: &[i32],
+    dtype: Dtype,
+    plan: mlx_gen::attention::AttentionPlan<'_>,
+) -> u64 {
     let tokens = shape[1] * shape[2];
     let rows = plan.budget.query_block(shape[0], 1, tokens, tokens);
-    q::vae_attention_bytes(shape[0], tokens, shape[3], rows, q::dtype_bytes(dtype), q::backend())
+    q::vae_attention_bytes(
+        shape[0],
+        tokens,
+        shape[3],
+        rows,
+        q::dtype_bytes(dtype),
+        q::backend(),
+    )
 }
 pub(super) fn compute_dtype(loaded: Dtype, input: Dtype) -> Dtype {
-    if loaded == Dtype::Float32 { input } else { loaded }
+    if loaded == Dtype::Float32 {
+        input
+    } else {
+        loaded
+    }
 }
 pub(super) fn input_retained_bytes(loaded: Dtype, latents: &Tensor) -> u64 {
     let caller = latents.bytes();
     let compute = compute_dtype(loaded, latents.dtype);
-    caller + if compute == latents.dtype { 0 } else { latents.elements() * q::dtype_bytes(compute) }
+    caller
+        + if compute == latents.dtype {
+            0
+        } else {
+            latents.elements() * q::dtype_bytes(compute)
+        }
 }
 impl AutoencoderFacts {
-    pub(crate) fn from_headers(headers: &[SafetensorsTensorHeader], cfg: &VaeConfig, dtype: Dtype) -> Result<Self> {
+    pub(crate) fn from_headers(
+        headers: &[SafetensorsTensorHeader],
+        cfg: &VaeConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
         Self::from_weights(&HeaderWeights::new_all_cast(headers, dtype)?, cfg)
     }
 }
