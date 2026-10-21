@@ -81,9 +81,15 @@ evidence.
 7. `Cargo.toml` — security-only dependency update (sc-26235): `zip` 7.2.0 → 9.0.0 to fix
    RUSTSEC-2026-0367 (privileged extraction permissions), RUSTSEC-2026-0368 (escaping symlink
    targets), and RUSTSEC-2026-0369 (permissions applied through symlinks). Default features remain
-   disabled; only `deflate-flate2-zlib-rs` is enabled for compressed NPZ and torch archive reads
-   (no zopfli writer or other codecs). STORED archives
-   and NPZ writes remain supported. This changes no Candle git revision, tensor math or kernel.
+   disabled; `deflate-flate2` plus an explicit `flate2/rust_backend` selects miniz for compressed
+   NPZ and torch archive reads (no zopfli writer or other codecs). ZIP 9's plain `deflate` feature
+   enables both zopfli and zlib-rs, so it is deliberately not used. No specific zlib backend is
+   required: pickle only reads ZIPs; `Tensor::write_npz` writes STORED entries. DEFLATE writing
+   remains available through flate2. The explicit backend dependency makes this copy buildable
+   without relying on another workspace member to enable flate2's backend. Selecting zlib-rs here
+   previously changed every downstream flate2 encoder through feature unification, including
+   SceneWorks PNG output. Kokoro uses the same feature selection. This changes no Candle git
+   revision, tensor math or kernel.
 8. `src/npy.rs`, `src/pickle.rs` — minimal zip 9 API adaptation: archive entry names are now
    fallible `Result<Cow<str>, ZipError>` values. Propagate decoding failures through the existing
    typed `Error::Zip` conversion and retain owned names for later lookups, rather than ignoring

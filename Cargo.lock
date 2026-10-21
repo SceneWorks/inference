@@ -281,6 +281,7 @@ dependencies = [
  "candle-nn",
  "cmudict-fast",
  "core-llm",
+ "flate2",
  "misaki-rs",
  "rand",
  "rand_distr",
@@ -453,6 +454,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.8",
+ "flate2",
  "float8",
  "gemm 0.19.0",
  "half",
@@ -1761,7 +1763,6 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
- "zlib-rs",
 ]
 
 [[package]]
@@ -4463,12 +4464,6 @@ dependencies = [
  "nix",
  "typed-path",
 ]
-
-[[package]]
-name = "zlib-rs"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
