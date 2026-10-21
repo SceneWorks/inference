@@ -270,26 +270,6 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
     }
 }
 
-/// A background memory sampler, and the two numbers that are actually load-bearing on iOS.
-///
-/// # Why `get_peak_memory` is not one of them
-///
-/// A Z-Image decode reported `MLX peak 2901 MiB` while the process was **4 MiB** from a jetsam kill
-/// against a 6136 MiB cap. Both numbers were correct. `get_peak_memory` tracks MLX's *live*
-/// allocation; jetsam reads `phys_footprint`, which also counts MLX's buffer reuse cache. Reading
-/// only the peak, the decode looked like it had 3 GB to spare while it was in fact pinned at the
-/// limit — and every device figure recorded before this was that same quantity.
-///
-/// So a sampler records, at 100 ms:
-///
-/// * **`min_available_mib`** — the smallest `os_proc_available_memory()` seen. Ground truth: how
-///   close the process actually came to being killed, whatever the allocator believed.
-/// * **`peak_footprint_mib`** — the largest `active + cache` seen. The MLX-side footprint, which is
-///   the term `get_peak_memory` omits.
-///
-/// It samples rather than reads at the end because the failure it exists to explain kills the
-/// process mid-phase; anything computed after the work is exactly the part that never runs.
-#[cfg(any(feature = "media", feature = "zimage"))]
 /// The source-derived host upper of THIS lane's progress callback (`on_progress` below): one
 /// formatted stage String per event, at most the longest `Progress` rendering (`Step` with two
 /// `u32::MAX` values; `Decoding`; `Loading(TextEncoder|Renderer)`), replacing the previous stage
@@ -323,6 +303,26 @@ fn sampler_progress_callback_host() -> runtime_ios::media::IosCallbackHost {
     }
 }
 
+/// A background memory sampler, and the two numbers that are actually load-bearing on iOS.
+///
+/// # Why `get_peak_memory` is not one of them
+///
+/// A Z-Image decode reported `MLX peak 2901 MiB` while the process was **4 MiB** from a jetsam kill
+/// against a 6136 MiB cap. Both numbers were correct. `get_peak_memory` tracks MLX's *live*
+/// allocation; jetsam reads `phys_footprint`, which also counts MLX's buffer reuse cache. Reading
+/// only the peak, the decode looked like it had 3 GB to spare while it was in fact pinned at the
+/// limit — and every device figure recorded before this was that same quantity.
+///
+/// So a sampler records, at 100 ms:
+///
+/// * **`min_available_mib`** — the smallest `os_proc_available_memory()` seen. Ground truth: how
+///   close the process actually came to being killed, whatever the allocator believed.
+/// * **`peak_footprint_mib`** — the largest `active + cache` seen. The MLX-side footprint, which is
+///   the term `get_peak_memory` omits.
+///
+/// It samples rather than reads at the end because the failure it exists to explain kills the
+/// process mid-phase; anything computed after the work is exactly the part that never runs.
+#[cfg(any(feature = "media", feature = "zimage"))]
 struct MemorySampler {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     min_available_kib: std::sync::Arc<std::sync::atomic::AtomicU64>,

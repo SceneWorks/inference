@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T19:20:54.896741+00:00",
-  "rust_proof_closure_sha256": "24ccbd2ca2f38b2f00357d79bd3bf7e5d4d34937fdcb83d6597d999a0149e9e7",
+  "UTC": "2026-10-21T20:06:04.862958+00:00",
+  "rust_proof_closure_sha256": "be1c4da8a9e2634e99c08350bb3aba8706cc45f585d0c6918c576703499c5029",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -924,7 +924,7 @@
     },
     {
       "path": "ios-host/smoke/src/lib.rs",
-      "sha256": "345b5521bae1f4dd52ca2af13c710aee986555e49afbb57acec1ad19cb3ff72f"
+      "sha256": "a5df12e9ee0c012c5e7552dcad6d42d2bd219413b793f5bab94500e05df6a57f"
     },
     {
       "path": "rust-toolchain.toml",
@@ -965,6 +965,10 @@
     {
       "path": "scripts/tests/test_ios_campaign.py",
       "sha256": "7f1261394d83437d5bfb11243e2f2197cd043a8d078944a6fc30aa1b5ed06f75"
+    },
+    {
+      "path": "scripts/tests/test_ios_smoke_freshness.py",
+      "sha256": "1c0b8eb0440c1fe43d1fe7326809f2f89c8df6c3749b00d327c27a4144853a52"
     },
     {
       "path": "vendor/clip-regex/SOURCE-AUTHORITY.json",
@@ -2370,14 +2374,14 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "2150e248771c71dbc6262a1a664629b16864a700dd1ad6559b8209046e706380",
-    "classification_sha256": "3e074c8cb55b6fd85847c7135e00ea01fe545d8ea2dfb8b0811189bd67730e8b",
+    "inventory_sha256": "8c13a3a1d7d7e03dfee50d71e8e6c32934a0c1db11839fb50f3ed2e9a574f570",
+    "classification_sha256": "f42aace4b3ad33c5f38236207cd13d5e216678e43246e0930f318aee1c81ccbb",
     "selected_Rust_FQNs": 216,
     "HOST_logical": 194,
     "HOST_expected_PASS_rows": 195,
     "native_logical": 22,
     "native_expected_PASS_rows": 44,
-    "Python_exact_tests": 16,
+    "Python_exact_tests": 17,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true
   }
