@@ -255,6 +255,30 @@ pub(super) fn missing_member(label: &str) -> Error {
 }
 
 #[cfg(test)]
+pub(super) fn finite_test_fixture() -> RegexSourceFacts {
+    // Arbitrary finite arithmetic fixture ONLY; not native regex certificate values.
+    RegexSourceFacts {
+        constructor_new_peak: Some(64),
+        first_search_new_peak: Some(128),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn native_pin_reader_test_fixture(
+    pin: &PinnedWeightsFile,
+    label: &str,
+    _next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<String> {
+    // ONLY exercises tokenizer/error/window semantics under labeled finite arithmetic fixtures.
+    // This is the original native metadata guard, NOT a guarded filesystem source certificate.
+    pin.read_unchanged(|path| {
+        let mut file = std::fs::File::open(path)?;
+        let bound = usize::try_from(pin.target_fingerprint().size).map_err(|_| overflow())?;
+        read_limited_utf8(&mut file, bound, label)
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -272,8 +296,7 @@ mod tests {
         };
         assert!(unknown
             .constructor()
-            .err()
-            .expect("explicit unknown source term")
+            .expect_err("explicit unknown source term")
             .to_string()
             .contains("unclosed"));
         assert!(unknown.search().is_err());
@@ -353,28 +376,4 @@ mod tests {
                 .contains("valid UTF-8")
         );
     }
-}
-
-#[cfg(test)]
-pub(super) fn finite_test_fixture() -> RegexSourceFacts {
-    // Arbitrary finite arithmetic fixture ONLY; not native regex certificate values.
-    RegexSourceFacts {
-        constructor_new_peak: Some(64),
-        first_search_new_peak: Some(128),
-    }
-}
-
-#[cfg(test)]
-pub(super) fn native_pin_reader_test_fixture(
-    pin: &PinnedWeightsFile,
-    label: &str,
-    _next: &mut dyn FnMut(u64) -> Result<()>,
-) -> Result<String> {
-    // ONLY exercises tokenizer/error/window semantics under labeled finite arithmetic fixtures.
-    // This is the original native metadata guard, NOT a guarded filesystem source certificate.
-    pin.read_unchanged(|path| {
-        let mut file = std::fs::File::open(path)?;
-        let bound = usize::try_from(pin.target_fingerprint().size).map_err(|_| overflow())?;
-        read_limited_utf8(&mut file, bound, label)
-    })
 }

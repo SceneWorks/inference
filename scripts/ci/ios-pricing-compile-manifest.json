@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T20:06:04.862958+00:00",
-  "rust_proof_closure_sha256": "be1c4da8a9e2634e99c08350bb3aba8706cc45f585d0c6918c576703499c5029",
+  "UTC": "2026-10-21T20:50:24.638323+00:00",
+  "rust_proof_closure_sha256": "ef4b15b0346f775b266fe98749ed392bbc6a9459df0238e6bbcc240c89bedffd",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -516,7 +516,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer/host_preflight.rs",
-      "sha256": "1c7799b07daed27d0781004b2d95975de3d7e3162de0ab847f1441c3a4dbff01"
+      "sha256": "0dfc931671a4ec9df747bf1af1c30c677b32144b4a45b1c20bd1a3f72e7f3b00"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
@@ -912,7 +912,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "56bf1664a70b10f640a88d77889977e0db5b42d6dbd7a54404cd253b0029985e"
+      "sha256": "3446e9352a118fd5987f61e6761d7363649a9614f508e3d85d0d9fd36257349b"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -2374,8 +2374,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "8c13a3a1d7d7e03dfee50d71e8e6c32934a0c1db11839fb50f3ed2e9a574f570",
-    "classification_sha256": "f42aace4b3ad33c5f38236207cd13d5e216678e43246e0930f318aee1c81ccbb",
+    "inventory_sha256": "79da2e5cd3213a159018991a93d0282542db6050e7edf345876ef409763e0042",
+    "classification_sha256": "8215bd5ce5e3469670f43258f17a9f3b7e5a8c2ff7b1834076158df616d8103d",
     "selected_Rust_FQNs": 216,
     "HOST_logical": 194,
     "HOST_expected_PASS_rows": 195,

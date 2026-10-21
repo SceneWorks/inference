@@ -1177,7 +1177,7 @@ impl DeviceProvider<'_> {
                             reason,
                         )
                     }
-                    other => runtime_ios::media::AdmissionError::Failed(other.into()),
+                    other => runtime_ios::media::AdmissionError::Failed(other),
                 }
             };
             classify(&mut self.refusal_kind, error)
