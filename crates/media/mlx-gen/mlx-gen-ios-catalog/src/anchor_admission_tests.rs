@@ -215,9 +215,11 @@ fn admit_under(
         DEVICE,
         budget(available_mib),
         rows,
-        Some(&baseline),
-        Some(&cpu_scoped()),
-        policy,
+        AdmissionEvidence {
+            request_baseline: Some(&baseline),
+            execution_facts: Some(&cpu_scoped()),
+            premise_policy: policy,
+        },
     )
 }
 
@@ -865,9 +867,11 @@ fn admit_with_facts(
         DEVICE,
         budget(4096),
         rows,
-        Some(&baseline),
-        facts,
-        &PremisePolicy::default(),
+        AdmissionEvidence {
+            request_baseline: Some(&baseline),
+            execution_facts: facts,
+            premise_policy: &PremisePolicy::default(),
+        },
     )
 }
 

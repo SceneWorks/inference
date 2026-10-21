@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T11:32:41.167750+00:00",
-  "rust_proof_closure_sha256": "ec2059ff48ba5d2c8c4522139cb047c9a59931868f599df4d07b0a1956c4c000",
+  "UTC": "2026-10-21T11:52:39.833217+00:00",
+  "rust_proof_closure_sha256": "fbaaa8a5fa25012ca3ca78a70b50cb96386d3b0f355ee882886dc3c42b647331",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -144,7 +144,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor_admission_tests.rs",
-      "sha256": "b501beb8c98133c7199335bd0d14e81bdc3f7be64fcaf5186a243b88268a5ec6"
+      "sha256": "9954504603894622aa9229150df4ec511f9843c739f46c1b26a86bca0cf4afbe"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/binding.rs",
@@ -164,7 +164,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission.rs",
-      "sha256": "f4038f7a396879d2f199f829273906d71106455388e601b274742d6d67102724"
+      "sha256": "c4cc178eb161e35b64e754e3d5b8eba90d8c80d50073df2995b170dfde5eabdd"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-ios-catalog/src/ios_admission_tests.rs",
@@ -1470,8 +1470,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "4c03c330fce2346df2efda2a494f4224be15477f2c221080b2dc82b0d0442bb5",
-    "classification_sha256": "0b7bda60a28501760fd5fb1b21677cbaf1c127b6016bc5b088926989c8024ab7",
+    "inventory_sha256": "912a4ccaaa7fd65c0b676a953f0d0dc7414c075a1dea5824d23a78debd72f2e3",
+    "classification_sha256": "e3ed18bf58fe89ce02a4de660fe556996d77eaaf6e3dd0f6ca8681138c60bcc8",
     "selected_Rust_FQNs": 150,
     "HOST_logical": 128,
     "HOST_expected_PASS_rows": 129,

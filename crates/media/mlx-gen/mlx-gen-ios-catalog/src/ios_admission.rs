@@ -1090,6 +1090,15 @@ fn pricing_error(error: impl Into<Error>) -> AdmissionError {
     }
 }
 
+/// Borrowed facts from one SDK admission boundary. Grouping preserves absent facts and
+/// the caller's explicit premise policy; it grants no defaults or additional authority.
+#[derive(Clone, Copy)]
+pub(crate) struct AdmissionEvidence<'a> {
+    request_baseline: Option<&'a IosMemoryBaseline>,
+    execution_facts: Option<&'a IosExecutionFacts>,
+    premise_policy: &'a PremisePolicy,
+}
+
 /// Step 3: the request's demand and margin from the anchor table (see the module docs).
 fn anchored_demand(
     registry: &ProviderRegistry,
@@ -1097,9 +1106,7 @@ fn anchored_demand(
     contract: &MemoryProviderContract,
     key: &EvidenceKey,
     rows: &[AnchorRow],
-    request_baseline: Option<&IosMemoryBaseline>,
-    execution_facts: Option<&IosExecutionFacts>,
-    premise_policy: &PremisePolicy,
+    evidence: AdmissionEvidence<'_>,
 ) -> AdmissionResult<(
     u64,
     u64,
@@ -1107,6 +1114,11 @@ fn anchored_demand(
     Calibration,
     Vec<IosCertificatePremise>,
 )> {
+    let AdmissionEvidence {
+        request_baseline,
+        execution_facts,
+        premise_policy,
+    } = evidence;
     if let Some(row) = evidence::lookup(rows, key) {
         return match &row.outcome {
             evidence::AnchorOutcome::Completed { .. } => {
@@ -1322,9 +1334,7 @@ fn admit_one(
     machine: &str,
     budget: MemoryBudget,
     rows: Option<&[AnchorRow]>,
-    request_baseline: Option<&IosMemoryBaseline>,
-    execution_facts: Option<&IosExecutionFacts>,
-    premise_policy: &PremisePolicy,
+    evidence: AdmissionEvidence<'_>,
 ) -> AdmissionResult<Admission> {
     validate_actual(registry, candidate)?;
     let route = route_of(candidate)?;
@@ -1413,16 +1423,7 @@ fn admit_one(
                 Calibration::new(),
                 Vec::new(),
             ),
-            Some(rows) => anchored_demand(
-                registry,
-                candidate,
-                &contract,
-                &key,
-                rows,
-                request_baseline,
-                execution_facts,
-                premise_policy,
-            )?,
+            Some(rows) => anchored_demand(registry, candidate, &contract, &key, rows, evidence)?,
         };
         let required_bytes = anchor::with_margin(demand_bytes, margin_bytes).map_err(|error| {
             no_evidence(format!("complete admitted envelope arithmetic: {error}"))
@@ -1499,9 +1500,11 @@ pub(crate) fn admit_rows_at_boundary(
         machine,
         budget,
         rows,
-        request_baseline,
-        None,
-        &PremisePolicy::default(),
+        AdmissionEvidence {
+            request_baseline,
+            execution_facts: None,
+            premise_policy: &PremisePolicy::default(),
+        },
     )
 }
 
@@ -1513,11 +1516,9 @@ pub(crate) fn admit_rows_with_facts(
     machine: &str,
     budget: MemoryBudget,
     rows: &[AnchorRow],
-    request_baseline: Option<&IosMemoryBaseline>,
-    execution_facts: Option<&IosExecutionFacts>,
-    premise_policy: &PremisePolicy,
+    evidence: AdmissionEvidence<'_>,
 ) -> AdmissionResult<Admission> {
-    if let Some(baseline) = request_baseline {
+    if let Some(baseline) = evidence.request_baseline {
         if baseline.domain != IosMemoryDomain::ProcessGrowth
             || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
             || baseline.bytes == 0
@@ -1539,9 +1540,7 @@ pub(crate) fn admit_rows_with_facts(
             machine,
             budget,
             Some(rows),
-            request_baseline,
-            execution_facts,
-            premise_policy,
+            evidence,
         ) {
             Ok(admitted) => return Ok(admitted),
             Err(AdmissionError::Refused(r)) => {
@@ -1626,9 +1625,11 @@ pub fn admit_with_boundary(
         machine,
         budget,
         rows,
-        Some(request_baseline),
-        Some(execution_facts),
-        premise_policy,
+        AdmissionEvidence {
+            request_baseline: Some(request_baseline),
+            execution_facts: Some(execution_facts),
+            premise_policy,
+        },
     )
 }
 
@@ -1661,9 +1662,11 @@ pub fn capture_permit(
             reserved_headroom_bytes: 0,
         },
         None,
-        None,
-        None,
-        &PremisePolicy::default(),
+        AdmissionEvidence {
+            request_baseline: None,
+            execution_facts: None,
+            premise_policy: &PremisePolicy::default(),
+        },
     )
 }
 
