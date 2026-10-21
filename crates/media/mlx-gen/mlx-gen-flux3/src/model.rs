@@ -1176,7 +1176,7 @@ mod tests {
             std::fs::copy(source.join("model.safetensors"), dir.path().join(shard)).unwrap();
             let weight_map: serde_json::Map<String, serde_json::Value> =
                 gen_core::weightsmeta::safetensors_path_tensor_headers(
-                    &source.join("model.safetensors"),
+                    source.join("model.safetensors"),
                 )
                 .unwrap()
                 .into_iter()
