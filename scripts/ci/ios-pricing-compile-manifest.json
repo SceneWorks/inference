@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "8c35ccc87128586a980506a39510f95febbf6370ca4b7243464a93dad9bec908",
+  "rust_proof_closure_sha256": "3fb0643b3e14b7ce0d1686210ac2978da7ef6297cb79c6d832d0d71616e016e2",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -480,7 +480,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
-      "sha256": "2dfb42f7a051b1afff5f1c2b3b61b3971d13a3ee693d47ce3ba61da4d0023d40"
+      "sha256": "44197d1f1ec72a1f38c6c45885af9dafbe05a90aaef7b255a7aecaf98b273749"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/Cargo.toml",
