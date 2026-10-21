@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T22:38:01.977717+00:00",
-  "rust_proof_closure_sha256": "37215bcb34837df4241bb1589867bab2b5e6f8cf143549ac02da3a1042046793",
+  "rust_proof_closure_sha256": "5c6f90c102805bff83d31d694284d6b61e707a9768c75f32c58b44253dfc3aab",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -844,7 +844,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/sampling/source_context.rs",
-      "sha256": "7af19a30b692b5fcddc33af5bc8b6808485b2454ce63bcb74caacc7338488734"
+      "sha256": "decf783f916f9cfe6adace0ae11fc7ee95e5697a65e085842aeba787d3b7e47a"
     },
     {
       "path": "crates/bundles/runtime-ios/Cargo.toml",

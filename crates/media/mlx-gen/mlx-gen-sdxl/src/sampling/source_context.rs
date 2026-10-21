@@ -112,8 +112,12 @@ impl SamplingSourceFacts {
         }
         let mut previous = None;
         for control in &self.controls {
-            if control.source_index >= total
-                || previous.is_some_and(|p| p >= control.source_index)
+            if control.source_index >= total {
+                return Err(invalid(
+                    "source occurrence is outside its closed role sequence",
+                ));
+            }
+            if previous.is_some_and(|p| p >= control.source_index)
                 || self.reference_index == Some(control.source_index)
                 || self
                     .mask
