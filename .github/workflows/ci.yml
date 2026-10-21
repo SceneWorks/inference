@@ -27,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights)"
         type: choice
-        options: [all, windows-cuda]
+        options: [all, windows-cuda, moss-cuda-unit]
         default: all
 
 permissions:
@@ -72,6 +72,7 @@ jobs:
       candle_cpu: ${{ steps.select.outputs.candle_cpu }}
       macos_metal: ${{ steps.select.outputs.macos_metal }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
+      moss_cuda_unit: ${{ steps.select.outputs.moss_cuda_unit }}
       docs: ${{ steps.select.outputs.docs }}
       release: ${{ steps.select.outputs.release }}
       # Informational only: ordinary CI has no job that consumes this output because privileged
@@ -113,6 +114,8 @@ jobs:
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then
             python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then
+            python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
           else
@@ -1114,6 +1117,82 @@ jobs:
           call "%VCVARS%"
           cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
+  # Manual, one-test CUDA execution of the MOSS production graph (sc-26586). Compiling is not GPU
+  # execution; the single test below is, and it loads no model weights (tiny-author fixture).
+  # Dispatch-only and profile-exclusive: `all`, `windows-cuda`, PRs and tags never schedule it, and a
+  # dispatched run that skips it fails the `CI gate`. The 60 minute job limit covers a cold CUDA
+  # build of unknown duration; the 300 s / 6 GiB execution bounds are enforced by the supervisor
+  # (scripts/ci/moss_cuda_unit.py), which owns and kills only its own process tree. They are safety
+  # limits for a unit process, not calibration, and there is no retry.
+  moss-cuda-unit:
+    name: MOSS CUDA unit test (Windows, manual)
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.lanes == 'moss-cuda-unit' &&
+      needs.changes.outputs.moss_cuda_unit == 'true' &&
+      github.repository == 'SceneWorks/inference' &&
+      github.ref_type == 'branch' &&
+      startsWith(github.ref, 'refs/heads/')
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 60
+    # Job-level, so the workflow's per-sha group is untouched. Serializes only against workflows that
+    # use this group; other repositories and unrelated jobs are not covered.
+    concurrency:
+      group: inference-real-weights-physical-host
+      cancel-in-progress: false
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      RUST_TEST_THREADS: "1"
+      CI: "true"
+      RUSTC_WRAPPER: ""
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned uv for the MOSS unit supervisor
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 for the MOSS unit supervisor
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      # The unit runs only inside a Windows Job Object. Prove that ownership (fake Python children,
+      # no CUDA/Cargo/weights) before any GPU step; the smoke fails if it is unavailable or skipped.
+      - name: Verify Windows Job Object ownership (no GPU)
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit smoke'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      # No `save-if: main`, for the reason given on `windows-cuda`; cache-bin is off for the same
+      # persistent-runner rustup.exe reason.
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Compile the MOSS lib test binary (no GPU execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          "%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit compile
+      - name: Execute the one MOSS CUDA production-graph test
+        shell: cmd
+        timeout-minutes: 6
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit run'
+
   supply-chain:
     name: dependency policy + advisories
     runs-on: ubuntu-latest
@@ -1224,6 +1303,7 @@ jobs:
       - macos-nax
       - windows-cuda-check
       - windows-cuda
+      - moss-cuda-unit
       - supply-chain
       - docs
       - release-metadata
@@ -1234,8 +1314,15 @@ jobs:
       - name: Require every lane to have succeeded or been skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          # A requested profile that was skipped is not a pass (a skip normally reads green below).
+          REQUIRE_MOSS_CUDA_UNIT: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-unit' }}
+          MOSS_CUDA_UNIT_RESULT: ${{ needs.moss-cuda-unit.result }}
         run: |
           echo "lane results: $RESULTS"
+          if [[ "$REQUIRE_MOSS_CUDA_UNIT" == "true" && "$MOSS_CUDA_UNIT_RESULT" != "success" ]]; then
+            echo "::error::the requested moss-cuda-unit profile reported '$MOSS_CUDA_UNIT_RESULT', not success"
+            exit 1
+          fi
           for result in $RESULTS; do
             case "$result" in
               success|skipped) ;;
