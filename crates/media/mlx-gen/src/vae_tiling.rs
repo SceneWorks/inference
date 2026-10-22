@@ -2225,15 +2225,17 @@ mod tests {
     /// covered, within 1.5x. f32 and f16, normalized and raw, crops from 23% to 100% of the row
     /// width, equal and widening channels.
     #[test]
+    #[ignore]
     #[cfg(target_os = "macos")]
     fn tile_formula_tracks_the_measured_tile() {
-        const CHILD: &str = "MLX_TILE_FORMULA_CPU_CHILD";
+        const CHILD: &str = "IOS_CAPTURE_IN_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "vae_tiling::tests::tile_formula_tracks_the_measured_tile",
                     "--nocapture",
+                    "--include-ignored",
                 ])
                 .env(CHILD, "1")
                 .status()
@@ -2330,5 +2332,8 @@ mod tests {
             println!("{label}: formula {formula} B, measured {measured} B");
             crate::ios_quantum::assert_tracks_measured(&label, formula, measured, 1.5);
         }
+        eprintln!(
+            "IOS_CAPTURE_BODY_COMPLETED vae_tiling::tests::tile_formula_tracks_the_measured_tile"
+        );
     }
 }

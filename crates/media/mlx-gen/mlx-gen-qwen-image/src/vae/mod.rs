@@ -516,10 +516,12 @@ mod quantum_tests {
                 .args([
                     "--exact",
                     &format!("vae::quantum_tests::{name}"),
+                    "--include-ignored",
                     "--nocapture",
                     "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success(), "CPU child for {name} failed");
@@ -867,6 +869,7 @@ mod quantum_tests {
     /// stage modules at a shape where activations dominate the (pre-materialized, used-in-place)
     /// weights: head, resnet, attention (unchunked and query-chunked), upsample and output.
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn decode_stage_formulas_track_the_measured_peak() {
         if !in_cpu_child("decode_stage_formulas_track_the_measured_peak") {
             return;
@@ -947,6 +950,7 @@ mod quantum_tests {
             measured(|| resnet.conv1().forward(&act)),
         );
         assert_eq!(ratios.borrow().len(), 8);
+        eprintln!("IOS_CAPTURE_BODY_COMPLETED vae::quantum_tests::decode_stage_formulas_track_the_measured_peak");
     }
 
     /// The query-chunked mid-block attention computes the same attention as the historical single
@@ -1032,6 +1036,7 @@ mod quantum_tests {
     /// measured in situ, between its pre-construction check and its synchronization, and its
     /// counted formula proven against that peak.
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn tile_fold_formula_tracks_the_measured_peak() {
         if !in_cpu_child("tile_fold_formula_tracks_the_measured_peak") {
             return;
@@ -1119,5 +1124,6 @@ mod quantum_tests {
             }
             mlx_gen::ios_quantum::assert_tracks_measured(label, formula, measured, MAX_RATIO);
         }
+        eprintln!("IOS_CAPTURE_BODY_COMPLETED vae::quantum_tests::tile_fold_formula_tracks_the_measured_peak");
     }
 }

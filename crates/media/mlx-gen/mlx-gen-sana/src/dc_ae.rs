@@ -1193,6 +1193,7 @@ pub(crate) mod quantum_proofs {
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn dcae_quanta_track_their_measured_peaks() {
         const CHILD: &str = "SANA_DCAE_QUANTUM_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1200,9 +1201,12 @@ pub(crate) mod quantum_proofs {
                 .args([
                     "--exact",
                     "dc_ae::quantum_proofs::dcae_quanta_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -1287,6 +1291,9 @@ pub(crate) mod quantum_proofs {
         );
         for (label, formula, measured) in proofs {
             assert_tracks_measured(&label, formula, measured, MAX_RATIO);
+        }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED dc_ae::quantum_proofs::dcae_quanta_track_their_measured_peaks");
         }
     }
 
@@ -1383,6 +1390,32 @@ pub(crate) mod quantum_proofs {
             "the halo-free control must diverge: {seam}"
         );
 
+        // The stalled stitch allocation measurement is an individually selected capture below.
+    }
+
+    #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
+    fn encode_stitch_tracks_its_measured_peak() {
+        const CHILD: &str = "SANA_ENCODE_STITCH_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dc_ae::quantum_proofs::encode_stitch_tracks_its_measured_peak",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
         // Stitch proof over a 3x3 grid of materialized 48x40x32 crops (the tiles' prefix outputs are
         // materialized by their own quanta before the stitch; shapes large enough that the
         // allocator's 16 KiB page rounding is negligible).
@@ -1400,5 +1433,8 @@ pub(crate) mod quantum_proofs {
             formula as f64 / measured as f64
         );
         assert_tracks_measured("DC-AE encode stitch", formula, measured, MAX_RATIO);
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED dc_ae::quantum_proofs::encode_stitch_tracks_its_measured_peak");
+        }
     }
 }

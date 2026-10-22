@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def sparse_writer():
-    text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs').read_text()
+    text = (ROOT / 'crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs').read_text(encoding='utf-8')
     start = text.index('    fn sparse_snapshot(')
     end = text.index('\n    /// Write the DiT', start)
     return text[start:end]
@@ -51,12 +51,15 @@ class SparseFixtureFormat(unittest.TestCase):
         source = root / 'fixture.rs'
         source.write_text('use std::path::Path;\n' + body + '\nfn main() {\n'
                           'let dir = std::env::args().nth(1).unwrap();\n'
-                          'sparse_snapshot(Path::new(&dir), &[("even", 1024), ("odd", 1025)]);\n}\n')
+                          'sparse_snapshot(Path::new(&dir), &[("even", 1024), ("odd", 1025)]);\n}\n',
+                          encoding='utf-8')
         result = subprocess.run(['nice', '-n', '10', str(Path.home() / '.cargo/bin/rustc'),
                                  '--edition', '2021', '-C', 'debuginfo=0', str(source),
-                                 '-o', str(root / 'fixture')], capture_output=True, text=True)
+                                 '-o', str(root / 'fixture')], capture_output=True, text=True,
+                                encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = subprocess.run([str(root / 'fixture'), str(root / 'snapshot')], capture_output=True, text=True)
+        result = subprocess.run([str(root / 'fixture'), str(root / 'snapshot')], capture_output=True,
+                                text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
         return root / 'snapshot'
 

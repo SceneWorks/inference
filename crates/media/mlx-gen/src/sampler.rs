@@ -1571,13 +1571,13 @@ mod tests {
     /// the next model eval. Off device it is exactly the unguarded eval (byte-identical output).
     #[cfg(target_os = "macos")]
     #[test]
-    fn curated_solver_steps_are_guarded_quanta() {
+    fn curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation() {
         const CHILD: &str = "MLX_GEN_SAMPLER_STEP_QUANTUM_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "sampler::tests::curated_solver_steps_are_guarded_quanta",
+                    "sampler::tests::curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation",
                 ])
                 .env(CHILD, "1")
                 .status()
@@ -1631,14 +1631,6 @@ mod tests {
             .collect();
         // One boundary per model eval (4 steps) plus the final advancement, each 16 latent buffers.
         assert_eq!(checks, vec![16 * 4 * 4; 5]);
-        // The allowance is never below what one Euler step actually allocates.
-        let x = arr(&[0.3, -1.1, 2.0, 0.5]);
-        let measured = crate::ios_quantum::measured_peak_bytes(|| {
-            let d = mlx_rs::ops::multiply(arr(&eps), Array::from_f32(-4.0))?;
-            Ok(vec![mlx_rs::ops::add(&x, &d)?])
-        })
-        .unwrap();
-        assert!(16 * 4 * 4 >= measured, "{measured}");
         // A refusal stops before the next model eval.
         calls.set(0);
         let _ = crate::ios_quantum::take_refusal();
@@ -1648,6 +1640,41 @@ mod tests {
             SAMPLER_STEP_QUANTUM
         );
         assert_eq!(calls.get(), 0, "no model eval past the refused boundary");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
+    fn curated_solver_steps_are_guarded_quanta() {
+        const CHILD: &str = "MLX_GEN_SAMPLER_STEP_CAPTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sampler::tests::curated_solver_steps_are_guarded_quanta",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = arr(&[0.3, -1.1, 2.0, 0.5]);
+        let eps = [0.7_f32, -0.2, 0.4, 0.1];
+        let measured = crate::ios_quantum::measured_peak_bytes(|| {
+            let d = mlx_rs::ops::multiply(arr(&eps), Array::from_f32(-4.0))?;
+            Ok(vec![mlx_rs::ops::add(&x, &d)?])
+        })
+        .unwrap();
+        assert!(16 * 4 * 4 >= measured, "{measured}");
+        eprintln!(
+            "IOS_CAPTURE_BODY_COMPLETED sampler::tests::curated_solver_steps_are_guarded_quanta"
+        );
     }
 
     #[test]

@@ -2230,6 +2230,7 @@ mod quantum_tests {
     /// tile's materialization to the fold's) against [`crate::quantum::tile_fold_bytes`] at that
     /// tile, and the final normalization against [`crate::quantum::tile_finalize_bytes`].
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn tile_fold_and_finalize_track_their_measured_peaks() {
         const CHILD: &str = "SANA_TILE_FOLD_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2237,9 +2238,12 @@ mod quantum_tests {
                 .args([
                     "--exact",
                     "pipeline::quantum_tests::tile_fold_and_finalize_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -2338,11 +2342,15 @@ mod quantum_tests {
             finalize,
             crate::quantum::MAX_RATIO,
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::tile_fold_and_finalize_track_their_measured_peaks");
+        }
     }
 
     /// One SCM step (the Sprint sampler update the per-step latent quantum materializes) against
     /// [`crate::quantum::scm_step_bytes`], with and without the renoise draw.
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn scm_step_tracks_its_measured_peak() {
         const CHILD: &str = "SANA_SCM_STEP_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2350,9 +2358,12 @@ mod quantum_tests {
                 .args([
                     "--exact",
                     "pipeline::quantum_tests::scm_step_tracks_its_measured_peak",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -2392,6 +2403,9 @@ mod quantum_tests {
                 // The terminal step is a subset of the priced update.
                 assert!(formula >= measured);
             }
+        }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::scm_step_tracks_its_measured_peak");
         }
     }
 
@@ -2541,6 +2555,33 @@ mod quantum_tests {
             label: "SANA reference latent".into(),
             scratch: mlx_gen::ios_quantum::elementwise_bytes(latent_elements + 1, 1),
         }));
+        // The stalled scaling allocation measurement is selected independently below.
+    }
+
+    #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
+    fn reference_latent_scale_tracks_its_measured_peak() {
+        const CHILD: &str = "SANA_REFERENCE_SCALE_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::reference_latent_scale_tracks_its_measured_peak",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
+        let cfg = crate::dc_ae::quantum_proofs::config();
         let raw = rand(&[1, 4, 256, 256], 3);
         raw.eval().unwrap();
         let measured = mlx_gen::ios_quantum::measured_peak_bytes(|| {
@@ -2558,6 +2599,9 @@ mod quantum_tests {
             measured,
             crate::quantum::MAX_RATIO,
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::reference_latent_scale_tracks_its_measured_peak");
+        }
     }
 
     /// The base-rev goldens: outputs of `91ffb4a81`'s default paths (`SanaHeavy::render_one`'s image

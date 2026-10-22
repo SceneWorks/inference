@@ -755,6 +755,7 @@ mod quantum_proofs {
     }
 
     #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
     fn gemma_quanta_track_their_measured_peaks() {
         const CHILD: &str = "GEMMA_QUANTUM_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -762,9 +763,12 @@ mod quantum_proofs {
                 .args([
                     "--exact",
                     "gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -872,5 +876,8 @@ mod quantum_proofs {
             "the largest-copy-only pricing ({single} B) must under-price the measured peak \
              ({measured} B), or this shape cannot tell the models apart"
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks");
+        }
     }
 }

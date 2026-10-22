@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ class SelectedCaptures(unittest.TestCase):
         for family in runner.FAMILIES:
             rows = runner.select(family)
             self.assertTrue(rows)
-            self.assertTrue(all(row['package'] == 'mlx-gen-' + family for row in rows))
+            self.assertTrue(all(row['package'] == runner.FAMILY_PACKAGES[family] for row in rows))
 
     def test_every_exact_binding_is_selectable(self):
         for row in runner.REGISTRY:
@@ -118,29 +119,51 @@ class SelectedCaptures(unittest.TestCase):
             env = dict(self.env, RUNNER_TEMP=temp)
             with patch.dict(runner.os.environ, env, clear=True), patch.object(runner.subprocess, 'run', return_value=subprocess.CompletedProcess([], 23, 'intentional failure\n')):
                 self.assertEqual(runner.run(runner.identity(self.row)), 23)
-            receipt = json.loads((Path(temp) / 'ios-selected-captures/receipt.json').read_text())
+            receipt = json.loads((Path(temp) / 'ios-selected-captures/receipt.json').read_text(encoding='utf-8'))
             self.assertEqual((receipt['selected'], receipt['completed']), (1, 0))
 
     def test_actual_entrypoint_rejects_unknown_selection_without_cargo(self):
-        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'), '--select', 'bad;command'], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'), '--select', 'bad;command'], capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 2)
 
     def test_actual_entrypoint_lists_exact_registry_without_execution(self):
-        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'), '--select', runner.identity(self.row), '--list'], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'), '--select', runner.identity(self.row), '--list'], capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [self.row])
 
     def test_child_helpers_include_ignored_and_body_protocol(self):
         for rel in sorted({row['source'] for row in runner.REGISTRY}):
-            text = (ROOT / rel).read_text()
+            text = (ROOT / rel).read_text(encoding='utf-8')
             if 'fn in_cpu_child' in text or 'fn cpu_child' in text:
                 self.assertIn('--include-ignored', text, rel)
                 self.assertIn('IOS_CAPTURE_IN_CHILD', text, rel)
         for row in runner.REGISTRY:
-            text = (ROOT / row['source']).read_text()
+            text = (ROOT / row['source']).read_text(encoding='utf-8')
             self.assertIn('IOS_CAPTURE_BODY_COMPLETED ' + row['fqn'], text)
             test = text[:text.index('fn ' + row['fqn'].split('::')[-1] + '()')]
             self.assertIn('#[ignore', test[test.rfind('#[test]'):])
+
+    def test_ordinary_cpu_children_do_not_dispatch_ignored_captures(self):
+        cases = [
+            ('crates/media/mlx-gen/src/ios_quantum.rs',
+             'cpu_quantum_materializes_refuses_and_restores_cache',
+             'ios_quantum::cpu_quantum_materializes_refuses_and_restores_cache'),
+            ('crates/media/mlx-gen/src/sampler.rs',
+             'curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation',
+             'sampler::tests::curated_solver_step_guards_preserve_parity_and_refuse_before_evaluation'),
+        ]
+        for path, function, target in cases:
+            source = (ROOT / path).read_text(encoding='utf-8')
+            start = source.index('fn ' + function)
+            dispatch = source[start:start + 800]
+            self.assertIn(target, dispatch, path)
+            self.assertNotIn('--include-ignored', dispatch, path)
+
+    def test_capture_markers_and_registry_are_bidirectionally_complete(self):
+        markers = set()
+        for path in (ROOT / 'crates/media/mlx-gen').rglob('*.rs'):
+            markers.update(re.findall(r'IOS_CAPTURE_BODY_COMPLETED ([\w:]+)', path.read_text(encoding='utf-8')))
+        self.assertEqual(markers, {row['fqn'] for row in runner.REGISTRY})
 
     def test_cheap_guards_remain_ordinary(self):
         rows = [("mlx-gen-iris/src/quantum_proofs.rs", "proof_policy_cannot_be_disabled_by_print_only"),
@@ -148,11 +171,11 @@ class SelectedCaptures(unittest.TestCase):
                 ("mlx-gen-sdxl/src/quantum_tests.rs", "measured_lower_bound_is_hard_and_overpricing_is_report_only"),
                 ("mlx-gen-anima/src/quantum_tests.rs", "sdpa_scores_follow_the_metal_kernel_support")]
         for rel, name in rows:
-            text = (ROOT / 'crates/media/mlx-gen' / rel).read_text().split('fn ' + name + '()')[0]
+            text = (ROOT / 'crates/media/mlx-gen' / rel).read_text(encoding='utf-8').split('fn ' + name + '()')[0]
             self.assertNotIn('#[ignore', text[text.rfind('#[test]'):])
 
     def test_workflow_is_dispatch_only_and_host_enforced(self):
-        text = (ROOT / '.github/workflows/real-weights.yml').read_text()
+        text = (ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8')
         job = text.split('  ios-selected-captures:\n')[1].split('  ios-pricing-compile-only:\n')[0]
         self.assertIn("github.event_name == 'workflow_dispatch'", job)
         self.assertIn('runs-on: [self-hosted, macOS, ARM64, rw-llm]', job)
@@ -177,11 +200,12 @@ class ActualLibtestProtocol(unittest.TestCase):
                 'let status = std::process::Command::new(std::env::current_exe().unwrap())\n'
                 '.args(["--exact", "' + cls.row['fqn'] + '", "--nocapture"' + include + '])\n'
                 '.env("BODY_CHILD", "1").status().unwrap(); assert!(status.success()); return; }\n'
-                'assert_eq!(2 + 2, 4); eprintln!("\\nIOS_CAPTURE_BODY_COMPLETED ' + cls.row['fqn'] + '");\n} }\n')
+                'assert_eq!(2 + 2, 4); eprintln!("\\nIOS_CAPTURE_BODY_COMPLETED ' + cls.row['fqn'] + '");\n} }\n',
+                encoding='utf-8')
             result = subprocess.run(['nice', '-n', '10', str(Path.home() / '.cargo/bin/rustc'),
                                      '--crate-name', 'capture_protocol', '--test', str(source),
                                      '-C', 'debuginfo=0', '-o', str(cls.root / f'capture-{mutation}')],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, encoding='utf-8')
             if result.returncode:
                 raise RuntimeError('CPU Rust protocol fixture did not compile: ' + result.stderr)
 
@@ -192,7 +216,8 @@ class ActualLibtestProtocol(unittest.TestCase):
     def invoke(self, mutation, discover=False):
         result = subprocess.run([str(self.root / f'capture-{mutation}'), '--exact', self.row['fqn'],
                                  '--ignored', '--list' if discover else '--nocapture'],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stdout)
         return result.stdout
 

@@ -920,12 +920,18 @@ pub(crate) mod quantum_metal_guard;
 
 #[cfg(all(test, target_os = "macos"))]
 #[test]
-fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cache() {
+fn cpu_quantum_materializes_refuses_and_restores_cache() {
     const CHILD: &str = "MLX_IOS_QUANTUM_CPU_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ios_quantum::cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cache", "--nocapture"])
-            .env(CHILD,"1").status().unwrap();
+            .args([
+                "--exact",
+                "ios_quantum::cpu_quantum_materializes_refuses_and_restores_cache",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
         assert!(status.success());
         return;
     }
@@ -1011,89 +1017,6 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         take_refusal().map(|r| (r.label, r.available_bytes)),
         Some(("before refused".to_string(), Some(1)))
     );
-    // The measurement every counted formula is proven against: two 256x256 f32 inputs built
-    // inside the quantum plus their sum = three live 256 KiB tensors at the peak.
-    let measured = measured_peak_bytes(|| {
-        let a = Array::ones::<f32>(&[256, 256])?;
-        let b = Array::ones::<f32>(&[256, 256])?;
-        Ok(vec![mlx_rs::ops::add(&a, &b)?])
-    })
-    .unwrap();
-    let three = 3 * tensor_bytes(4, &[256, 256]);
-    assert_tracks_measured("ones + ones", three, measured, 1.5);
-    // The measurement is STALLED, so it realizes the retention worst case whatever this host's
-    // worker speed: a chain of eight 16 KiB matmuls (no donation), each read only by the next, is
-    // encoded in full — every output allocated, every operand held by its queued task — before any
-    // runs, so all eight products are live at once. The ops are tiny, so unstalled this host's
-    // worker keeps up with the encoder and holds only four (measured) — the same 2x run-to-run
-    // swing the CI runner showed on the Anima output quantum.
-    let weight = Array::ones::<f32>(&[64, 64]).unwrap();
-    let start = Array::ones::<f32>(&[64, 64]).unwrap();
-    mlx_rs::transforms::eval([&weight, &start]).unwrap();
-    let chain = measured_peak_bytes(|| {
-        let mut x = start.clone();
-        for _ in 0..8 {
-            x = x.matmul(&weight)?;
-        }
-        Ok(vec![x])
-    })
-    .unwrap();
-    assert_eq!(
-        chain,
-        8 * tensor_bytes(4, &[64, 64]),
-        "a stalled measurement holds the whole encoded chain"
-    );
-    // The load floor is proven against MLX's peak while a safetensors file is read: the stored
-    // bytes land once, with no extra per-tensor copy (no "largest tensor" scratch on top).
-    {
-        let dir = std::env::temp_dir().join(format!("ios-quantum-load-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("w.safetensors");
-        let a = Array::ones::<f32>(&[256, 1024]).unwrap();
-        let b = Array::ones::<f32>(&[512, 1024]).unwrap();
-        let c = Array::ones::<f32>(&[1024, 1024]).unwrap();
-        Array::save_safetensors(vec![("a", &a), ("b", &b), ("c", &c)], None, &file).unwrap();
-        let measured = measured_peak_bytes(|| {
-            let w = crate::weights::Weights::from_file(&file)?;
-            Ok(["a", "b", "c"]
-                .iter()
-                .map(|k| w.require(k).unwrap().clone())
-                .collect())
-        })
-        .unwrap();
-        // Read + upcast: stored f16 bytes and the f32 copies are live together.
-        let half = dir.join("h.safetensors");
-        let h = [&a, &b, &c].map(|x| x.as_dtype(mlx_rs::Dtype::Float16).unwrap());
-        Array::save_safetensors(vec![("a", &h[0]), ("b", &h[1]), ("c", &h[2])], None, &half)
-            .unwrap();
-        let cast_measured = measured_peak_bytes(|| {
-            let w = crate::weights::Weights::from_file(&half)?;
-            Ok(["a", "b", "c"]
-                .iter()
-                .map(|k| {
-                    w.require(k)
-                        .unwrap()
-                        .as_dtype(mlx_rs::Dtype::Float32)
-                        .unwrap()
-                })
-                .collect())
-        })
-        .unwrap();
-        let stored_half = (256 + 512 + 1024) * 1024 * 2;
-        assert_tracks_measured(
-            "safetensors load + f32 cast",
-            stored_half + 2 * stored_half,
-            cast_measured,
-            1.5,
-        );
-        assert_tracks_measured(
-            "safetensors load",
-            load_floor_bytes(std::slice::from_ref(&file), |_| true).unwrap(),
-            measured,
-            1.5,
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
     // A casting load prices stored bytes + the widened copies + the largest widened tensor.
     let dir = std::env::temp_dir().join(format!("ios-quantum-cast-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1129,6 +1052,106 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         ]
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+#[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
+fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cache() {
+    const CHILD: &str = "MLX_IOS_QUANTUM_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ios_quantum::cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cache",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("IOS_CAPTURE_IN_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
+    assert!(quantum_metal_guard::metal_forbidden());
+    let measured = measured_peak_bytes(|| {
+        let a = Array::ones::<f32>(&[256, 256])?;
+        let b = Array::ones::<f32>(&[256, 256])?;
+        Ok(vec![mlx_rs::ops::add(&a, &b)?])
+    })
+    .unwrap();
+    assert_tracks_measured(
+        "ones + ones",
+        3 * tensor_bytes(4, &[256, 256]),
+        measured,
+        1.5,
+    );
+    let weight = Array::ones::<f32>(&[64, 64]).unwrap();
+    let start = Array::ones::<f32>(&[64, 64]).unwrap();
+    mlx_rs::transforms::eval([&weight, &start]).unwrap();
+    let chain = measured_peak_bytes(|| {
+        let mut x = start.clone();
+        for _ in 0..8 {
+            x = x.matmul(&weight)?;
+        }
+        Ok(vec![x])
+    })
+    .unwrap();
+    assert_eq!(
+        chain,
+        8 * tensor_bytes(4, &[64, 64]),
+        "a stalled measurement holds the whole encoded chain"
+    );
+    let dir = std::env::temp_dir().join(format!("ios-quantum-capture-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("w.safetensors");
+    let a = Array::ones::<f32>(&[256, 1024]).unwrap();
+    let b = Array::ones::<f32>(&[512, 1024]).unwrap();
+    let c = Array::ones::<f32>(&[1024, 1024]).unwrap();
+    Array::save_safetensors(vec![("a", &a), ("b", &b), ("c", &c)], None, &file).unwrap();
+    let measured = measured_peak_bytes(|| {
+        let w = crate::weights::Weights::from_file(&file)?;
+        Ok(["a", "b", "c"]
+            .iter()
+            .map(|k| w.require(k).unwrap().clone())
+            .collect())
+    })
+    .unwrap();
+    let half = dir.join("h.safetensors");
+    let h = [&a, &b, &c].map(|x| x.as_dtype(mlx_rs::Dtype::Float16).unwrap());
+    Array::save_safetensors(vec![("a", &h[0]), ("b", &h[1]), ("c", &h[2])], None, &half).unwrap();
+    let cast_measured = measured_peak_bytes(|| {
+        let w = crate::weights::Weights::from_file(&half)?;
+        Ok(["a", "b", "c"]
+            .iter()
+            .map(|k| {
+                w.require(k)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+            })
+            .collect())
+    })
+    .unwrap();
+    let stored_half = (256 + 512 + 1024) * 1024 * 2;
+    assert_tracks_measured(
+        "safetensors load + f32 cast",
+        stored_half + 2 * stored_half,
+        cast_measured,
+        1.5,
+    );
+    assert_tracks_measured(
+        "safetensors load",
+        load_floor_bytes(std::slice::from_ref(&file), |_| true).unwrap(),
+        measured,
+        1.5,
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    eprintln!("IOS_CAPTURE_BODY_COMPLETED ios_quantum::cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cache");
 }
 
 #[cfg(all(test, target_os = "macos"))]

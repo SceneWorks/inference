@@ -411,7 +411,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_STRIP: 'false'
       CARGO_PROFILE_TEST_STRIP: 'false'
-      CARGO_TARGET_DIR: ${{ runner.temp }}/ios-selected-target-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Require the isolated capture host before checkout or compilation
         shell: bash
@@ -425,6 +424,8 @@ jobs:
           persist-credentials: false
       - name: Run only registered ignored fixture captures
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ios-selected-target-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3.12 -I scripts/ci/ios_selected_captures.py --select "$IOS_CAPTURE_SELECTION"
       - name: Upload discovery, completed bodies and exact selected counts
         if: always()

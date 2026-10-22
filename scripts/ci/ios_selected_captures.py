@@ -11,8 +11,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-REGISTRY = tuple(json.loads(Path(__file__).with_name("ios-selected-captures.json").read_text()))
-FAMILIES = ("iris", "anima", "z-image", "sdxl", "sana")
+REGISTRY = tuple(json.loads(Path(__file__).with_name("ios-selected-captures.json").read_text(encoding="utf-8")))
+FAMILIES = ("iris", "anima", "z-image", "sdxl", "sana", "pid", "qwen-image", "shared")
+FAMILY_PACKAGES = {**{family: "mlx-gen-" + family for family in FAMILIES if family != "shared"},
+                   "shared": "mlx-gen"}
 
 
 def identity(row: dict) -> str:
@@ -24,7 +26,7 @@ def select(selection: str) -> tuple[dict, ...]:
     if selection not in choices:
         raise ValueError("selection must name a fixed family or registered package/FQN")
     rows = tuple(row for row in REGISTRY if selection == "all"
-                 or row["package"] == "mlx-gen-" + selection or identity(row) == selection)
+                 or row["package"] == FAMILY_PACKAGES.get(selection) or identity(row) == selection)
     if not rows or len({identity(row) for row in rows}) != len(rows):
         raise ValueError("empty or duplicate capture selection")
     return rows
@@ -76,10 +78,11 @@ def run(selection: str) -> int:
         for index, row in enumerate(rows):
             for discover in (True, False):
                 proc = subprocess.run(command(row, discover), cwd=ROOT,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                      encoding="utf-8")
                 text = proc.stdout
                 log = output / f"{index:03d}-{'discovery' if discover else 'body'}.log"
-                log.write_text(text)
+                log.write_text(text, encoding="utf-8")
                 print(text, end="", flush=True)
                 if proc.returncode:
                     return proc.returncode
@@ -91,7 +94,7 @@ def run(selection: str) -> int:
             raise ValueError("selected/completed capture count mismatch")
         return 0
     finally:
-        (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         print(f"IOS_CAPTURE_COUNTS selected={len(rows)} completed={completed}", flush=True)
 
 
