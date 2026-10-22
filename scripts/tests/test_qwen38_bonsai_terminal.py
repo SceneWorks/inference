@@ -60,9 +60,21 @@ class TerminalEvidenceTests(unittest.TestCase):
              "--cases", "arithmetic", "--output", str(output), "--candle-device", "cpu",
              "--sample-interval", "0.05", "--diagnostic-timeout-seconds", "0.5"]
         )
+        real_cleanup = terminal.terminate_owned_child
+
+        def checked_cleanup(proc):
+            self.assertNotEqual(proc.pid, os.getpgrp())
+            self.assertEqual(os.getpgid(proc.pid), proc.pid)
+            self.assertEqual(os.getsid(proc.pid), proc.pid)
+            child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+            self.assertEqual(os.getpgid(child_pid), proc.pid)
+            self.assertEqual(os.getsid(child_pid), proc.pid)
+            return real_cleanup(proc)
+
         inventory = {"inventory_sha256": "e" * 64}
         sizes = {"language_weight_bytes": 1, "vision_weight_bytes": 0, "projector_bytes": 0}
         with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(terminal, "terminate_owned_child", side_effect=checked_cleanup))
             stack.enter_context(mock.patch.object(terminal, "source_identity", return_value={}))
             stack.enter_context(mock.patch.object(terminal, "load_model", return_value={"revision": "c" * 40, "key": "parent"}))
             stack.enter_context(mock.patch.object(terminal, "validate_variant_paths"))
@@ -105,8 +117,11 @@ class TerminalEvidenceTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX process-group race regression")
     def test_cleanup_still_kills_group_after_root_exits(self) -> None:
         grandchild_pid_path = self.root / "orphan.pid"
+        # Inherit SIGTERM-ignore from birth: publishing a PID does not mean the
+        # grandchild has reached its own signal.signal() call yet.
         script = (
-            "import pathlib,subprocess,sys; "
+            "import pathlib,signal,subprocess,sys; "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             "child=subprocess.Popen([sys.executable,'-c',"
             "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)']); "
             f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid))"
@@ -115,8 +130,11 @@ class TerminalEvidenceTests(unittest.TestCase):
             [sys.executable, "-c", script], start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        proc.wait(timeout=5)
+        self.assertEqual(proc.wait(timeout=5), 0)
         child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(proc.pid, os.getpgrp())
+        self.assertEqual(os.getpgid(child_pid), proc.pid)
+        self.assertEqual(os.getsid(child_pid), proc.pid)
         cleanup = terminal.terminate_owned_child(proc)
         self.assertTrue(cleanup["tree_termination_requested"])
         for _ in range(20):
@@ -129,6 +147,23 @@ class TerminalEvidenceTests(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail(f"owned grandchild {child_pid} survived post-exit cleanup")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group permission contract")
+    def test_cleanup_does_not_hide_group_permission_failure(self) -> None:
+        for rejected_signal in (terminal.signal.SIGTERM, terminal.signal.SIGKILL):
+            with self.subTest(rejected_signal=rejected_signal):
+                proc = mock.Mock(pid=12345, returncode=0)
+                proc.wait.return_value = 0
+                error = PermissionError("owned group signal denied")
+                effects = [error] if rejected_signal == terminal.signal.SIGTERM else [None, error]
+                with mock.patch.object(terminal.os, "killpg", side_effect=effects) as killpg:
+                    with self.assertRaises(PermissionError) as raised:
+                        terminal.terminate_owned_child(proc)
+                self.assertIs(raised.exception, error)
+                expected = [mock.call(proc.pid, terminal.signal.SIGTERM)]
+                if rejected_signal == terminal.signal.SIGKILL:
+                    expected.append(mock.call(proc.pid, terminal.signal.SIGKILL))
+                self.assertEqual(killpg.call_args_list, expected)
 
     def make_run(
         self,

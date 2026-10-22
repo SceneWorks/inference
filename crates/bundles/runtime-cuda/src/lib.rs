@@ -265,6 +265,30 @@ mod tests {
 
     #[cfg(feature = "media")]
     #[test]
+    fn bundle_exposes_host_only_moss_edit_admission() {
+        use super::gen_core::{
+            moss_image::MossImageVariant, moss_image_edit::MossImageEditInputs, GenerationRequest,
+            LoadSpec, WeightsSource,
+        };
+        let peak: fn(
+            MossImageVariant,
+            &LoadSpec,
+            &GenerationRequest,
+            MossImageEditInputs<'_>,
+        ) -> super::gen_core::Result<u64> =
+            super::providers::moss_image::memory_strategy::edit_request_peak;
+        // Empty references fail before any asset or device dispatch through the consumer path.
+        assert!(peak(
+            MossImageVariant::Base,
+            &LoadSpec::new(WeightsSource::Dir("unused-cold-moss-edit".into())),
+            &GenerationRequest::default(),
+            MossImageEditInputs::default(),
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
     fn bundle_exposes_engine_id_vae_geometry() {
         let tiling: super::gen_core::tiling::VaeTiling =
             super::vae_tiling("bernini").expect("modelled video id");

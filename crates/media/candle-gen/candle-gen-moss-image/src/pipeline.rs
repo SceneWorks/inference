@@ -116,32 +116,13 @@ pub(crate) fn sample(
     let device = renderer.transformer.device();
     let count = req.count as usize;
     let images = positive.rows.len() * count;
-    let h = req.height as usize / 16;
-    let w = req.width as usize / 16;
-    let channels = renderer.transformer.channels();
-    let image_len = channels * h * w;
-    let mut noises = Vec::with_capacity(images * image_len);
-    let mut samples = Vec::with_capacity(images);
-    let initial_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    for i in 0..images {
-        check_cancel(&req.cancel)?;
-        let (seed, noise) = if let Some(n) = inputs.noise {
-            (None, n[i * image_len..(i + 1) * image_len].to_vec())
-        } else {
-            let seed = initial_seed.wrapping_add(i as u64);
-            let mut rng = StdRng::seed_from_u64(seed);
-            (
-                Some(seed),
-                candle_gen::seeded_normal_vec(&mut rng, image_len),
-            )
-        };
-        samples.push(MossImageSampleReceipt {
-            seed,
-            noise_sha256: digest_f32(&noise, None),
-        });
-        noises.extend(noise);
-    }
-    let z = Tensor::from_vec(noises, (images, channels, h, w), device)?;
+    let (z, samples) = initial_noise(
+        req,
+        inputs,
+        positive,
+        renderer.transformer.channels(),
+        device,
+    )?;
     let (times, sampling) = if let Some((q, codes)) = &renderer.dataspace {
         let prefix = moss_dmd_step_codes(codes, resolved.steps)?.to_vec();
         let receipt = MossImageSamplingReceipt::Dmd {
@@ -290,4 +271,80 @@ pub(crate) fn decode(
 }
 pub(crate) fn receipts(assets: &[Asset]) -> gen_core::Result<Vec<MossImageAssetReceipt>> {
     assets.iter().map(Asset::receipt).collect()
+}
+
+fn initial_noise(
+    req: &GenerationRequest,
+    inputs: MossImageAdvancedInputs<'_>,
+    positive: &Conditioning,
+    channels: usize,
+    device: &Device,
+) -> Result<(Tensor, Vec<MossImageSampleReceipt>)> {
+    let count = req.count as usize;
+    let images = positive.rows.len() * count;
+    let h = req.height as usize / 16;
+    let w = req.width as usize / 16;
+
+    let image_len = channels * h * w;
+    let mut noises = Vec::with_capacity(images * image_len);
+    let mut samples = Vec::with_capacity(images);
+    let initial_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    for i in 0..images {
+        check_cancel(&req.cancel)?;
+        let (seed, noise) = if let Some(n) = inputs.noise {
+            (None, n[i * image_len..(i + 1) * image_len].to_vec())
+        } else {
+            let seed = initial_seed.wrapping_add(i as u64);
+            let mut rng = StdRng::seed_from_u64(seed);
+            (
+                Some(seed),
+                candle_gen::seeded_normal_vec(&mut rng, image_len),
+            )
+        };
+        samples.push(MossImageSampleReceipt {
+            seed,
+            noise_sha256: digest_f32(&noise, None),
+        });
+        noises.extend(noise);
+    }
+    let z = Tensor::from_vec(noises, (images, channels, h, w), device)?;
+    Ok((z, samples))
+}
+pub(crate) fn sample_edit(
+    renderer: &Renderer,
+    req: &GenerationRequest,
+    resolved: &MossImageResolved,
+    inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
+    conditioning: (&Conditioning, Option<&Conditioning>),
+    references: &[Tensor],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Sampling> {
+    let (positive, negative) = conditioning;
+    let (noise, samples) = initial_noise(
+        req,
+        inputs.advanced,
+        positive,
+        renderer.transformer.channels(),
+        renderer.transformer.device(),
+    )?;
+    let latents = crate::edit::EditSampling {
+        transformer: &renderer.transformer,
+        resolved,
+        positive: &positive.rows,
+        negative: negative.map_or(&[], |n| n.rows.as_slice()),
+        references,
+        use_cache: inputs.use_kv_cache,
+        images_per_prompt: req.count as usize,
+    }
+    .run(&noise, &req.cancel, progress)?;
+    if tensor_f32(&latents)?.iter().any(|v| !v.is_finite()) {
+        return Err(CandleError::Msg("MOSS nonfinite edit latent".into()));
+    }
+    Ok(Sampling {
+        latents,
+        samples,
+        sampling: MossImageSamplingReceipt::Euler {
+            sigmas: moss_image_schedule(resolved.steps, resolved.shift, resolved.training_shift)?,
+        },
+    })
 }
