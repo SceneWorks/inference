@@ -20,6 +20,8 @@ pub(crate) struct Asset {
     pub revision: &'static str,
     pub relative: String,
     pub pin: PinnedWeightsFile,
+    #[cfg(feature = "test-support")]
+    pub fixture_digest: Option<[u8; 32]>,
 }
 impl Asset {
     fn capture(
@@ -51,6 +53,8 @@ impl Asset {
         }
         verify_moss_image_asset(&pin, repo, revision, relative)?;
         Ok(Self {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             role,
             repo,
             revision,
@@ -61,6 +65,16 @@ impl Asset {
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
         self.pin.read_unchanged(|path| {
             let bytes = std::fs::read(path)?;
+            #[cfg(feature = "test-support")]
+            if let Some(expected) = self.fixture_digest {
+                let actual = Sha256::digest(&bytes);
+                if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
+                    return Err(Error::Unsupported(
+                        "synthetic fixture consumed bytes changed".into(),
+                    ));
+                }
+                return Ok(bytes);
+            }
             // Authenticate the same owned buffer used by parsers/tensor copies, closing reopen
             // swap/restore ambiguity. No parser silently reopens the pathname after this check.
             let expected = moss_image_asset(self.repo, self.revision, &self.relative)
@@ -192,6 +206,80 @@ fn transformer_config(
     .map_err(Into::into)
 }
 impl Sources {
+    pub(crate) fn clear_cache(&self) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(());
+        }
+        mlx_rs::memory::clear_cache();
+        Ok(())
+    }
+    pub(crate) fn drain_cache(&self) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(());
+        }
+        mlx_gen::residency::drain_allocator_cache();
+        Ok(())
+    }
+    pub(crate) fn load_staging_bytes(&self) -> Result<u64> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            let facts = crate::training_memory::FootprintFacts::from_sources(self)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+            let encoder = crate::training_memory::encoder_work(&facts.encoder_config, 4096)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+            return encoder
+                .checked_add(facts.largest_source_shard)
+                .ok_or_else(|| Error::Unsupported("fixture load workspace overflow".into()));
+        }
+        Ok(5_362_224_248)
+    }
+    pub(crate) fn working_set_budget(&self) -> Result<Option<u64>> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            return Ok(Some(crate::test_support::HOST_CAP_BYTES));
+        }
+        Ok(mlx_gen::memory::recommended_working_set_bytes())
+    }
+    pub(crate) fn is_fixture(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            return !self.ordinary.is_empty()
+                && self
+                    .ordinary
+                    .iter()
+                    .all(|asset| asset.fixture_digest.is_some());
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            false
+        }
+    }
+    pub(crate) fn source_identity(&self, variant: MossImageVariant) -> String {
+        if self.is_fixture() {
+            let mut hash = Sha256::new();
+            for asset in &self.ordinary {
+                hash.update(asset.relative.as_bytes());
+                hash.update(asset.pin.content_sha256());
+            }
+            format!(
+                "synthetic-moss-full-pipeline-v1:{}:{:x}",
+                variant.provider_id(),
+                hash.finalize()
+            )
+        } else {
+            format!(
+                "{}@{};shared@{}",
+                variant.repository(),
+                variant.revision(),
+                SFT_REVISION
+            )
+        }
+    }
     pub(crate) fn prepare(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
         Self::prepare_inner(variant, spec, None)
     }
@@ -721,6 +809,8 @@ mod cpu_tests {
         let bad = tmp.path().join("ordinary-config");
         std::fs::write(&bad, b"unselected ordinary config must not be consumed").unwrap();
         let ordinary = vec![Asset {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             pin: PinnedWeightsFile::pin(bad).unwrap(),
             role: MossImageAssetRole::Transformer,
             repo: SFT_REPO,

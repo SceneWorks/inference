@@ -8,6 +8,7 @@
 //! operator bounds, not measured calibration, an allocator prediction, or a runtime RSS limit.
 use crate::loader::Sources;
 use candle_gen::gen_core::{
+    self,
     moss_image::{MossImageAssetRole, MossImageConfig},
     moss_image_training::target_paths,
     weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader},
@@ -23,6 +24,10 @@ pub(crate) enum AdmissionError {
     Invalid(String),
     Overflow(&'static str),
     Source(String),
+    HostBudgetExceeded {
+        required: u64,
+        available: u64,
+    },
     BudgetExceeded {
         phase: Phase,
         required: u64,
@@ -35,6 +40,7 @@ impl fmt::Display for AdmissionError {
             Self::Invalid(s) => write!(f, "invalid MOSS training memory facts: {s}"),
             Self::Overflow(s) => write!(f, "MOSS training memory arithmetic overflow: {s}"),
             Self::Source(s) => write!(f, "MOSS training memory metadata: {s}"),
+            Self::HostBudgetExceeded{required,available}=>write!(f,"MOSS encoded/decoder/serialization host bound {required} bytes exceeds {available} available HOST RAM bytes (separate from CUDA VRAM)"),
             Self::BudgetExceeded {
                 phase,
                 required,
@@ -112,6 +118,7 @@ pub(crate) enum Phase {
     Cache,
     Backward,
     Preview,
+    Checkpoint,
 }
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Component diagnostics and peak are optional to the trainer, exercised purely.
@@ -121,6 +128,9 @@ pub(crate) struct MemoryEstimate {
     pub cache: u64,
     pub backward: u64,
     pub preview: u64,
+    pub checkpoint: u64,
+    pub context_token_bound: u64,
+    pub host_peak_bytes: u64,
     /// Auditable components, useful for deterministic guard tests and refusal diagnostics.
     pub cache_bytes: u64,
     pub trainable_elements: u64,
@@ -136,6 +146,7 @@ impl MemoryEstimate {
             Phase::Cache => self.cache,
             Phase::Backward => self.backward,
             Phase::Preview => self.preview,
+            Phase::Checkpoint => self.checkpoint,
         }
     }
     pub fn check(&self, phase: Phase, budget: u64) -> Result<()> {
@@ -150,6 +161,24 @@ impl MemoryEstimate {
             Ok(())
         }
     }
+    pub fn check_host(&self, available: u64, cpu_reference: bool) -> Result<()> {
+        let required = if cpu_reference {
+            sum(
+                [self.host_peak_bytes, self.peak()],
+                "CPU tensor plus host staging",
+            )?
+        } else {
+            self.host_peak_bytes
+        };
+        if required > available {
+            Err(AdmissionError::HostBudgetExceeded {
+                required,
+                available,
+            })
+        } else {
+            Ok(())
+        }
+    }
     pub fn check_all(&self, budget: u64) -> Result<()> {
         for phase in [
             Phase::Load,
@@ -157,6 +186,7 @@ impl MemoryEstimate {
             Phase::Cache,
             Phase::Backward,
             Phase::Preview,
+            Phase::Checkpoint,
         ] {
             self.check(phase, budget)?;
         }
@@ -169,6 +199,7 @@ impl MemoryEstimate {
             .max(self.cache)
             .max(self.backward)
             .max(self.preview)
+            .max(self.checkpoint)
     }
 }
 
@@ -183,6 +214,7 @@ pub(crate) struct FootprintFacts {
     pub backbone_elements: u64,
     pub backbone_source_bytes: u64,
     pub largest_source_shard: u64,
+    pub host_metadata_bytes: u64,
     pub vae_headers: Vec<SafetensorsTensorHeader>,
 }
 impl FootprintFacts {
@@ -225,6 +257,21 @@ impl FootprintFacts {
         s.ensure_unchanged().map_err(source)?;
         let mut facts = Self::from_headers(s.config.clone(), encoder_config, &shards)?;
         facts.largest_source_shard = facts.largest_source_shard.max(largest_file);
+        // Tokenizer/config parsing and lookup-table metadata are host allocations, not CUDA VRAM.
+        for asset in &s.ordinary {
+            if !asset.relative.ends_with(".safetensors") {
+                let bytes = std::fs::metadata(asset.pin.loader_path())
+                    .map_err(source)?
+                    .len();
+                facts.host_metadata_bytes = sum(
+                    [
+                        facts.host_metadata_bytes,
+                        mul(&[bytes, 16], "tokenizer/config lookup metadata")?,
+                    ],
+                    "host metadata",
+                )?;
+            }
+        }
         Ok(facts)
     }
     pub fn from_headers(
@@ -240,6 +287,7 @@ impl FootprintFacts {
             backbone_elements: 0,
             backbone_source_bytes: 0,
             largest_source_shard: 0,
+            host_metadata_bytes: 0,
             vae_headers: Vec::new(),
         };
         for (kind, headers) in shards {
@@ -248,6 +296,10 @@ impl FootprintFacts {
             let shard = sum(headers.iter().map(|h| h.data_bytes), "source shard")?;
             facts.largest_source_shard = facts.largest_source_shard.max(shard);
             for h in headers {
+                facts.host_metadata_bytes = sum(
+                    [facts.host_metadata_bytes, 2048, h.name.len() as u64],
+                    "owned header/tensor metadata",
+                )?;
                 let elements = h.element_count().map_err(source)?;
                 if elements == 0 {
                     return Err(invalid(format!("empty tensor {}", h.name)));
@@ -322,13 +374,32 @@ pub(crate) struct EstimateRequest {
     pub preview_contexts: u64,
     pub preview_edge: u64,
     pub decode_bytes: u64,
+    pub dataset_metadata_bytes: u64,
+    pub cache_token_count: Option<u64>,
+    pub evaluation_canvas: Option<(u64, u64)>,
+    pub evaluation_context_tokens: u64,
+    pub audit_workspace_bytes: u64,
 }
 impl EstimateRequest {
     /// Decode/crop source pixels can exceed the target bucket; inspect only image headers here.
-    pub fn with_image_headers(mut self, req: &TrainingRequest) -> Result<Self> {
-        for item in &req.items {
-            self.decode_bytes = self.decode_bytes.max(image_decode_bytes(&item.image_path)?);
-        }
+    #[cfg(test)]
+    pub fn with_image_headers(self, req: &TrainingRequest) -> Result<Self> {
+        let plan =
+            gen_core::moss_image_training::recovery::DataPlan::from_request(req).map_err(source)?;
+        self.with_plan(req, &plan)
+    }
+    pub fn with_plan(
+        mut self,
+        req: &TrainingRequest,
+        plan: &gen_core::moss_image_training::recovery::DataPlan,
+    ) -> Result<Self> {
+        self.decode_bytes = self
+            .decode_bytes
+            .max(plan.decode_buffer_bound().map_err(source)?);
+        self.dataset_metadata_bytes =
+            gen_core::moss_image_training::recovery::DataPlan::metadata_bound(req)
+                .map_err(source)?;
+        self.cache_token_count = Some(plan.cached_token_count().map_err(source)?);
         Ok(self)
     }
     pub fn from_request(req: &TrainingRequest) -> Result<Self> {
@@ -350,10 +421,16 @@ impl EstimateRequest {
             preview_contexts: if previews > 0 { dim(previews)? + 1 } else { 0 },
             preview_edge: u64::from(candle_gen::train::dataset::bucket_resolution(c.resolution)),
             decode_bytes: 0,
+            dataset_metadata_bytes: 0,
+            cache_token_count: None,
+            evaluation_canvas: None,
+            evaluation_context_tokens: 0,
+            audit_workspace_bytes: 0,
         })
     }
 }
 
+#[cfg(test)]
 pub(crate) fn image_decode_bytes(path: &std::path::Path) -> Result<u64> {
     let (width, height) = image::image_dimensions(path).map_err(source)?;
     if width == 0 || height == 0 {
@@ -478,7 +555,7 @@ fn image_tokens(edge: u64) -> Result<u64> {
 
 /// Whole-layer encoder live tensors plus fresh per-caption KV/recurrent state. The layer hook
 /// evaluates each hidden state, so do not multiply its temporary activation stream by all layers.
-fn encoder_work(c: &Qwen35Config, seq: u64) -> Result<u64> {
+pub(crate) fn encoder_work(c: &Qwen35Config, seq: u64) -> Result<u64> {
     let (hidden, wide, heads, kv, head) = (
         positive(c.hidden_size)?,
         positive(c.intermediate_size)?,
@@ -605,6 +682,14 @@ fn encoder_work(c: &Qwen35Config, seq: u64) -> Result<u64> {
 /// Sum all outputs (a conservative lazy-graph envelope), plus the largest convolution lowering
 /// workspace, not a blanket multiplier on model size. No backward graph exists for cached VAE.
 fn vae_work(headers: &[SafetensorsTensorHeader], edge: u64, decoder: bool) -> Result<u64> {
+    vae_work_canvas(headers, edge, edge, decoder)
+}
+fn vae_work_canvas(
+    headers: &[SafetensorsTensorHeader],
+    width: u64,
+    height: u64,
+    decoder: bool,
+) -> Result<u64> {
     let side = if decoder { "decoder." } else { "encoder." };
     let mut outputs = Vec::new();
     let mut conv_workspace = 0u64;
@@ -644,10 +729,10 @@ fn vae_work(headers: &[SafetensorsTensorHeader], edge: u64, decoder: bool) -> Re
         } else if decoder && (h.name.contains(".conv_out.") || h.name.contains(".conv_norm_out.")) {
             divisor = 1;
         }
-        if divisor == 0 || !edge.is_multiple_of(divisor) {
+        if divisor == 0 || !width.is_multiple_of(divisor) || !height.is_multiple_of(divisor) {
             return Err(invalid("invalid VAE pyramid edge"));
         }
-        let area = mul(&[edge / divisor, edge / divisor], "VAE operator area")?;
+        let area = mul(&[width / divisor, height / divisor], "VAE operator area")?;
         let channels = dim(*h
             .shape
             .first()
@@ -673,8 +758,17 @@ fn vae_work(headers: &[SafetensorsTensorHeader], edge: u64, decoder: bool) -> Re
         };
         outputs.push(mul(&[area, channels, buffers, 4], "VAE output buffers")?);
     }
+    let mid_area = mul(&[width / 8, height / 8], "VAE mid attention sequence")?;
+    let score_bytes = mul(&[mid_area, mid_area, 4], "VAE mid scores")?;
+    let score_bytes = score_bytes.min(
+        (candle_gen::ATTN_SCORES_BUDGET as u64).max(mul(&[mid_area, 4], "one VAE query row")?),
+    );
+    outputs.push(mul(&[score_bytes, 3], "VAE score/softmax temporaries")?);
     // Preprocessing RGB/normalization and raw moments/packed-latent normalization temporaries.
-    let pixels = mul(&[edge, edge, 3, 4, 3], "VAE pixel buffers")?;
+    let pixels = mul(
+        &[width, height, 3, 4, if decoder { 3 } else { 1 }],
+        "VAE device pixel buffers",
+    )?;
     let packed_channels = headers
         .iter()
         .find(|h| h.name == "bn.running_mean")
@@ -682,7 +776,12 @@ fn vae_work(headers: &[SafetensorsTensorHeader], edge: u64, decoder: bool) -> Re
         .element_count()
         .map_err(source)?;
     let moments = mul(
-        &[image_tokens(edge)?, packed_channels, 4, 4],
+        &[
+            mul(&[width / 16, height / 16], "VAE packed grid")?,
+            packed_channels,
+            4,
+            4,
+        ],
         "VAE packing/BN buffers",
     )?;
     sum(
@@ -719,7 +818,7 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
     ]
     .contains(&0)
         || d % heads != 0
-        || r.edges.is_empty()
+        || (r.edges.is_empty() && c.aspect_ratio_buckets.is_empty())
         || c.rank == 0
         || c.rank > i32::MAX as u32
         || c.batch_size == 0
@@ -732,74 +831,139 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
         return Err(invalid("missing component header facts"));
     }
     let width = compute_width(c)?;
-    let mut token_areas = Vec::new();
-    for e in &r.edges {
-        token_areas.push(image_tokens(*e)?);
+    let mut canvases: Vec<(u64, u64)> = if c.aspect_ratio_buckets.is_empty() {
+        r.edges.iter().map(|&edge| (edge, edge)).collect()
+    } else {
+        c.aspect_ratio_buckets
+            .iter()
+            .map(|row| (u64::from(row.width), u64::from(row.height)))
+            .collect()
+    };
+    if let Some(canvas) = r.evaluation_canvas {
+        canvases.push(canvas);
     }
+    let token_areas = canvases
+        .iter()
+        .map(|&(width, height)| {
+            if width == 0 || height == 0 || !width.is_multiple_of(16) || !height.is_multiple_of(16)
+            {
+                return Err(invalid("invalid training canvas"));
+            }
+            mul(&[width / 16, height / 16], "training canvas tokens")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let largest_tokens = token_areas
         .iter()
         .copied()
         .max()
-        .ok_or_else(|| invalid("no buckets"))?;
-    let training_edge = r
-        .edges
-        .iter()
-        .copied()
-        .max()
-        .ok_or_else(|| invalid("no bucket edge"))?;
-    let cached_latents = mul(
-        &[r.items, sum(token_areas, "sum cache areas")?, channels, 4],
-        "latent cache",
-    )?;
+        .ok_or_else(|| invalid("no training canvas"))?;
+    let total_cache_tokens = match r.cache_token_count {
+        Some(tokens) => tokens,
+        None => mul(
+            &[r.items, sum(token_areas, "cache canvas tokens")?],
+            "cache tokens",
+        )?,
+    };
+    let cached_latents = if c.cache_latents {
+        mul(&[total_cache_tokens, channels, 4], "latent cache")?
+    } else {
+        0
+    };
     let mask_cache = if c.subject_mask_loss.is_some() {
         cached_latents
     } else {
         0
     };
+    let context_count = if c.cache_text_embeddings { r.items } else { 1 };
     let contexts = mul(
         &[
-            sum([r.items, r.preview_contexts], "context count")?,
+            sum([context_count, r.preview_contexts], "context count")?,
             r.context_tokens,
             text,
             4,
         ],
         "ragged context cache",
     )?;
-    let cache_bytes = sum([cached_latents, mask_cache, contexts], "persistent caches")?;
+    let evaluation_tokens = if let Some((w, h)) = r.evaluation_canvas {
+        mul(&[w / 16, h / 16], "heldout cached tokens")?
+    } else {
+        0
+    };
+    let evaluation_cache = sum(
+        [
+            mul(&[evaluation_tokens, channels, 4, 2], "heldout latent/mask")?,
+            mul(&[r.evaluation_context_tokens, text, 4], "heldout context")?,
+        ],
+        "heldout cached entry",
+    )?;
+    let cache_bytes = sum(
+        [cached_latents, mask_cache, contexts, evaluation_cache],
+        "persistent caches",
+    )?;
+    let encoding_work = canvases
+        .iter()
+        .map(|&(w, h)| vae_work_canvas(&f.vae_headers, w, h, false))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| invalid("no VAE canvas"))?;
     let backbone_compute = mul(&[f.backbone_elements, width], "compute backbone")?;
     let backbone_bf16 = mul(&[f.backbone_elements, 2], "BF16 source backbone")?;
     let source_backbone = f.backbone_source_bytes.max(backbone_bf16);
     let frozen = sum(
-        [f.vae_bytes, backbone_compute],
+        [
+            if !c.cache_latents || r.preview_contexts > 0 {
+                f.vae_bytes
+            } else {
+                0
+            },
+            if !c.cache_text_embeddings {
+                f.encoder_bytes
+            } else {
+                0
+            },
+            backbone_compute,
+        ],
         "frozen training components",
     )?;
     let loaded = sum(
         [f.encoder_bytes, f.vae_bytes, source_backbone],
         "loaded components",
     )?;
-    let load = sum(
-        [loaded, f.largest_source_shard],
-        "load plus source-shard staging",
-    )?;
+    let load = sum([loaded], "loaded device components")?;
     // Existing projection custom/base handles may coexist with cast outputs; preserve the BF16
     // source and full cast destination until the parent has evaluated/replaced those handles.
-    let cast = sum(
-        [loaded, backbone_compute, f.largest_source_shard],
-        "cast peak",
-    )?;
+    let cast = sum([loaded, backbone_compute], "device cast peak")?;
     let cache = sum(
         [
             f.encoder_bytes,
-            frozen,
+            f.vae_bytes,
+            backbone_compute,
             cache_bytes,
-            r.decode_bytes,
-            encoder_work(&f.encoder_config, r.context_tokens)?.max(vae_work(
-                &f.vae_headers,
-                training_edge,
-                false,
-            )?),
+            encoder_work(&f.encoder_config, r.context_tokens)?.max(encoding_work),
         ],
         "cache phase",
+    )?;
+    let on_demand = sum(
+        [
+            if !c.cache_text_embeddings {
+                encoder_work(&f.encoder_config, r.context_tokens)?
+            } else {
+                0
+            },
+            if !c.cache_latents {
+                sum(
+                    [
+                        encoding_work,
+                        mul(&[largest_tokens, channels, 4, 2], "active latent and mask")?,
+                    ],
+                    "on-demand VAE",
+                )?
+            } else {
+                0
+            },
+        ],
+        "on-demand conditioning",
     )?;
 
     let tokens = sum([largest_tokens, r.context_tokens], "joint sequence")?;
@@ -982,6 +1146,7 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
             frozen,
             cache_bytes,
             factors,
+            on_demand,
             adapter_work_bytes,
             attention_backward_bytes,
             forward,
@@ -1031,12 +1196,151 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
             "preview phase",
         )?
     };
+    // Complete raw-factor/gradient/optimizer serialization plus restore staging. This is
+    // structural residency accounting, not an empirical peak or a new measurement gate.
+    let checkpoint = {
+        sum(
+            [
+                backward,
+                mul(
+                    &[
+                        trainable_elements,
+                        4,
+                        sum(
+                            [
+                                4,
+                                mul(
+                                    &[2, optimizer_states(&c.optimizer)?],
+                                    "checkpoint optimizer copies",
+                                )?,
+                            ],
+                            "checkpoint tensor copies",
+                        )?,
+                    ],
+                    "checkpoint serialization staging",
+                )?,
+            ],
+            "checkpoint phase",
+        )?
+    };
+    let target_pixels = canvases
+        .iter()
+        .map(|&(w, h)| mul(&[w, h], "host training canvas"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| invalid("no host canvas"))?;
+    let host_preprocess = sum(
+        [
+            r.decode_bytes,
+            mul(
+                &[target_pixels, 48],
+                "host Lanczos/CHW normalization staging",
+            )?,
+        ],
+        "host input work",
+    )?;
+    let host_serialization = mul(
+        &[
+            trainable_elements,
+            4,
+            sum(
+                [
+                    8,
+                    mul(
+                        &[4, optimizer_states(&c.optimizer)?],
+                        "host optimizer serialization copies",
+                    )?,
+                ],
+                "host checkpoint copies",
+            )?,
+        ],
+        "host serialization/restore staging",
+    )?;
+    let host_peak_bytes = sum(
+        [
+            f.host_metadata_bytes,
+            r.dataset_metadata_bytes,
+            r.audit_workspace_bytes,
+            f.largest_source_shard
+                .max(host_preprocess)
+                .max(host_serialization),
+        ],
+        "host phase peak",
+    )?;
     Ok(MemoryEstimate {
-        load,
-        cast,
-        cache,
-        backward,
-        preview,
+        load: sum(
+            [
+                load,
+                if r.audit_workspace_bytes > 0 {
+                    16 * 1024 * 1024
+                } else {
+                    0
+                },
+            ],
+            "load audit staging",
+        )?,
+        cast: sum(
+            [
+                cast,
+                if r.audit_workspace_bytes > 0 {
+                    16 * 1024 * 1024
+                } else {
+                    0
+                },
+            ],
+            "cast audit staging",
+        )?,
+        cache: sum(
+            [
+                cache,
+                if r.audit_workspace_bytes > 0 {
+                    16 * 1024 * 1024
+                } else {
+                    0
+                },
+            ],
+            "cache audit staging",
+        )?,
+        backward: sum(
+            [
+                backward,
+                if r.audit_workspace_bytes > 0 {
+                    16 * 1024 * 1024
+                } else {
+                    0
+                },
+            ],
+            "backward audit staging",
+        )?,
+        preview: if preview > 0 {
+            sum(
+                [
+                    preview,
+                    if r.audit_workspace_bytes > 0 {
+                        16 * 1024 * 1024
+                    } else {
+                        0
+                    },
+                ],
+                "preview audit staging",
+            )?
+        } else {
+            0
+        },
+        checkpoint: sum(
+            [
+                checkpoint,
+                if r.audit_workspace_bytes > 0 {
+                    16 * 1024 * 1024
+                } else {
+                    0
+                },
+            ],
+            "checkpoint audit staging",
+        )?,
+        context_token_bound: r.context_tokens,
+        host_peak_bytes,
         cache_bytes,
         trainable_elements,
         adapter_work_bytes,
@@ -1118,6 +1422,11 @@ pub(crate) mod tests {
             preview_contexts: 2,
             preview_edge: 32,
             decode_bytes: 0,
+            dataset_metadata_bytes: 0,
+            cache_token_count: None,
+            evaluation_canvas: None,
+            evaluation_context_tokens: 0,
+            audit_workspace_bytes: 0,
         };
         (f, r)
     }
@@ -1132,6 +1441,7 @@ pub(crate) mod tests {
             Phase::Cache,
             Phase::Backward,
             Phase::Preview,
+            Phase::Checkpoint,
         ] {
             let n = e.bytes(phase);
             assert!(
@@ -1190,15 +1500,23 @@ pub(crate) mod tests {
         };
         let source_bytes = image_decode_bytes(&path).unwrap();
         r = r.with_image_headers(&request).unwrap();
-        assert_eq!(r.decode_bytes, source_bytes);
+        let pinned = gen_core::moss_image_training::recovery::DataPlan::from_request_budget(
+            &request,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(r.decode_bytes, pinned.decode_buffer_bound().unwrap());
+        assert!(r.decode_bytes>=source_bytes,"encoded/decoded buffers must include the captured source and library decoder allowance");
+        let actual = estimate(&f, &r).unwrap();
         assert_eq!(
-            r.decode_bytes,
-            32 * 64 * (4 * 4 * 2 + 3 * 2) + std::fs::metadata(&path).unwrap().len()
+            actual.cache, baseline.cache,
+            "pure host image decode must not raise CUDA VRAM demand"
         );
-        assert_eq!(
-            estimate(&f, &r).unwrap().cache - baseline.cache,
-            r.decode_bytes
-        );
+        assert!(actual.host_peak_bytes > baseline.host_peak_bytes);
+        assert!(actual
+            .check_host(actual.host_peak_bytes - 1, false)
+            .is_err());
+        actual.check_host(actual.host_peak_bytes, false).unwrap();
         std::fs::write(&path, b"not an image").unwrap();
         assert!(image_decode_bytes(&path).is_err());
         assert!(r.with_image_headers(&request).is_err());
@@ -1337,12 +1655,16 @@ pub(crate) mod tests {
         let e = estimate(&f, &r).unwrap();
         assert_eq!(
             e.load,
-            f.encoder_bytes
-                + f.vae_bytes
-                + f.backbone_source_bytes.max(f.backbone_elements * 2)
-                + f.largest_source_shard
+            f.encoder_bytes + f.vae_bytes + f.backbone_source_bytes.max(f.backbone_elements * 2)
         );
         assert_eq!(e.cast, e.load + f.backbone_elements * 2);
+        assert!(e.host_peak_bytes >= f.largest_source_shard + f.host_metadata_bytes);
+        let mut host_growth = f.clone();
+        host_growth.largest_source_shard += e.host_peak_bytes;
+        let host_growth = estimate(&host_growth, &r).unwrap();
+        assert_eq!(host_growth.load, e.load);
+        assert!(host_growth.host_peak_bytes > e.host_peak_bytes);
+
         assert!(e.cache >= f.encoder_bytes + f.vae_bytes + f.backbone_elements * 2 + e.cache_bytes);
         let mut doubled = f.clone();
         doubled.encoder_bytes *= 2;

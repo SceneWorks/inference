@@ -288,6 +288,8 @@ mod cpu_tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
         let asset = |role, relative: &str| Asset {
+            #[cfg(feature = "test-support")]
+            fixture_digest: None,
             role,
             relative: relative.into(),
             pin: pin.clone(),

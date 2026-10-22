@@ -15,6 +15,8 @@
 
 // The pure LR-schedule policy lives here (gen-core); the MLX training kernels
 // (checkpoint/dataset/lora/optim, incl. `TrainOptimizer`) stay in mlx-gen's `train` module.
+pub mod aspect_ratio;
+pub use aspect_ratio::AspectRatioBucket;
 pub mod aux_schedule;
 pub mod body;
 pub mod face_loss;
@@ -220,6 +222,15 @@ pub struct TrainingConfig {
     /// refused by [`validate_training_techniques`]. Memory pre-flights size for
     /// [`max_training_resolution`](Self::max_training_resolution) (E7).
     pub resolution_buckets: Vec<ResolutionBucket>,
+    /// Aspect-assigned rectangular buckets. Mutually exclusive with the legacy square list.
+    pub aspect_ratio_buckets: Vec<AspectRatioBucket>,
+    /// Keep frozen VAE outputs in run-owned RAM; false encodes samples on demand.
+    pub cache_latents: bool,
+    /// Keep frozen caption embeddings in run-owned RAM; false encodes captions on demand.
+    pub cache_text_embeddings: bool,
+    /// Caller-selected GPU/unified-memory ceiling. None uses the physical device budget;
+    /// Some(0) refuses. A caller cap can lower discovery, never replace or raise it.
+    pub memory_limit_bytes: Option<u64>,
     /// **Depth anchoring** (epic 2123, sc-2125) — an auxiliary perceptual loss that keeps the
     /// adapter's predicted geometry consistent with the training image: the model's x0 prediction
     /// is decoded with the family's small differentiable decoder, run through a frozen
@@ -769,6 +780,10 @@ impl Default for TrainingConfig {
             // Resolution buckets are OFF by default (epic 2123 E1): one bucket at `resolution`,
             // walked round-robin exactly as before.
             resolution_buckets: Vec::new(),
+            aspect_ratio_buckets: Vec::new(),
+            cache_latents: true,
+            cache_text_embeddings: true,
+            memory_limit_bytes: None,
             // Subject-masked loss is OFF by default (epic 2123 E1): no mask is read and the loss is
             // the plain unweighted mean.
             subject_mask_loss: None,
@@ -786,6 +801,16 @@ impl Default for TrainingConfig {
             training_adapter: None,
         }
     }
+}
+
+/// Intersect a caller ceiling with actual device discovery; zero is never a guard bypass.
+pub fn effective_memory_budget(physical: u64, cap: Option<u64>) -> crate::Result<u64> {
+    if physical == 0 || cap == Some(0) {
+        return Err(crate::Error::Unsupported(
+            "training memory budget must be positive".into(),
+        ));
+    }
+    Ok(cap.map_or(physical, |limit| physical.min(limit)))
 }
 
 /// Most resolution buckets one training run may declare (epic 2123 sc-2127). Each bucket adds one
@@ -865,6 +890,18 @@ pub struct BucketSchedule {
 type ShuffledEpoch = (usize, Vec<(usize, usize)>);
 
 impl BucketSchedule {
+    /// Shared Fisher–Yates engine for versioned, domain-separated rectangular schedules.
+    /// The legacy square shuffle keeps its historical seed construction unchanged.
+    pub(crate) fn shuffle_items<T>(items: &mut [T], seed: u64, epoch: u64, domain: u64) {
+        let mut state = seed
+            .wrapping_add(epoch.wrapping_mul(0xD6E8_FEB8_6659_FD93))
+            .wrapping_add(domain.wrapping_mul(0xA076_1D64_78BD_642F));
+        for i in (1..items.len()).rev() {
+            let j = (splitmix64_next(&mut state) % (i as u64 + 1)) as usize;
+            items.swap(i, j);
+        }
+    }
+
     /// Build the schedule for `n_items` cached items over `buckets` (from
     /// [`TrainingConfig::training_buckets`]).
     pub fn new(n_items: usize, buckets: &[ResolutionBucket], seed: u64) -> Self {
@@ -1367,6 +1404,11 @@ pub fn validate_training_techniques(
     req: &TrainingRequest,
 ) -> crate::Result<()> {
     let cfg = &req.config;
+    if cfg.memory_limit_bytes == Some(0) {
+        return Err(crate::Error::Unsupported(
+            "training memory cap must be positive; None means no caller cap".into(),
+        ));
+    }
     for (name, value) in [
         ("weight_noise_sigma", cfg.weight_noise_sigma),
         ("gradient_noise_eta", cfg.gradient_noise_eta),
@@ -1462,6 +1504,15 @@ pub fn validate_training_techniques(
     }
     validate_body_losses(desc, req)?;
     validate_resolution_buckets(desc, &cfg.resolution_buckets)?;
+    aspect_ratio::validate(cfg)?;
+    if !cfg.aspect_ratio_buckets.is_empty()
+        && (!desc.techniques.resolution_buckets || desc.family != "moss_image")
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: rectangular aspect-assigned training is not supported by this trainer",
+            desc.id
+        )));
+    }
     if let Some(adapter) = &cfg.training_adapter {
         if cfg.full_finetune {
             return Err(crate::Error::Unsupported(format!(

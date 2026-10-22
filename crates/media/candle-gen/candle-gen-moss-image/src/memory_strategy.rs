@@ -375,6 +375,8 @@ mod tests {
             };
             s.headers.insert(*pin.content_sha256(), vec![h]);
             crate::loader::Asset {
+                #[cfg(feature = "test-support")]
+                fixture_digest: None,
                 pin,
                 role,
                 repo,

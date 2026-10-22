@@ -1,20 +1,25 @@
 //! Native Candle/CUDA transformer-only MOSS Base/SFT training. Source checkpoint precision is
 //! independent of compute precision; frozen Qwen/VAE conditioning is cached before backward.
+#[cfg(feature = "test-support")]
+mod audit;
+mod recovery;
+#[cfg(feature = "test-support")]
+use gen_core_testkit::moss_training_probe::{RunProbe, TrainingProbe};
+
 use crate::{
-    loader::{load_weights, Sources},
+    loader::{load_weights_cancellable, Sources},
     text_encoder::{self, Conditioning},
     training_memory as admission,
     transformer::{check_cancel, Geometry, Transformer},
 };
 use candle_gen::candle_core::{backprop::GradStore, DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, moss_image::*, moss_image_training as contract, BucketSchedule, CancelFlag, LoadSpec,
-    Modality, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest,
+    self, moss_image::*, moss_image_training as contract, CancelFlag, LoadSpec, Modality, Trainer,
+    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::train::{
     checkpoint,
-    dataset::{bucket_edges, decode_square, square_image_tensor},
+    dataset::square_image_tensor,
     flow_match::{prepared_subject_mask_weight, sample_noise},
     lora::{self, LoraSet},
     optim::{accumulate_grads, scale_grads, TrainOptimizer},
@@ -67,12 +72,22 @@ candle_gen::register_trainer! { pub(crate) const SFT_REGISTRATION = sft_descript
 /// Header-only lazy trainer. Device identity is supplied by the allocator, never inferred from a
 /// physical index. The optional native budget is also the explicit CPU numerical-oracle boundary.
 pub struct MossImageTrainer {
+    #[cfg(feature = "test-support")]
+    test_probe: Option<TrainingProbe>,
     descriptor: TrainerDescriptor,
     variant: MossImageVariant,
     sources: Sources,
     facts: admission::FootprintFacts,
     device: Device,
     memory_budget_override: Option<u64>,
+}
+struct Preparation {
+    plan: contract::recovery::DataPlan,
+    estimate: admission::MemoryEstimate,
+    budget: u64,
+    host_budget: u64,
+    #[cfg(feature = "test-support")]
+    evaluation: Option<audit::Snapshot>,
 }
 fn admission_error(e: admission::AdmissionError) -> CandleError {
     CandleError::Unsupported(e.to_string())
@@ -97,6 +112,13 @@ impl MossImageTrainer {
             ));
         }
         let sources = Sources::selected(variant, spec, MossImageAcceleration::Off)?;
+        Self::from_sources(variant, sources, device)
+    }
+    pub(crate) fn from_sources(
+        variant: MossImageVariant,
+        sources: Sources,
+        device: Device,
+    ) -> Result<Self> {
         let facts = admission::FootprintFacts::from_sources(&sources).map_err(admission_error)?;
         Ok(Self {
             descriptor: descriptor(variant),
@@ -105,24 +127,117 @@ impl MossImageTrainer {
             facts,
             device,
             memory_budget_override: None,
+            #[cfg(feature = "test-support")]
+            test_probe: None,
         })
     }
     /// Zero is a zero budget, never a guard bypass. This is not a generic request user-cap field.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_test_probe(&mut self, probe: Option<TrainingProbe>) {
+        self.test_probe = probe;
+    }
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_memory_plan(&self, req: &TrainingRequest) -> Result<serde_json::Value> {
+        let estimate = self.prepare(req)?.estimate;
+        Ok(
+            serde_json::json!({"load_bytes":estimate.load,"cast_bytes":estimate.cast,"cache_bytes":estimate.cache,"backward_bytes":estimate.backward,"preview_bytes":estimate.preview,"checkpoint_bytes":estimate.checkpoint,"encoder_only_peak_bytes":admission::encoder_work(&self.facts.encoder_config,4096).map_err(admission_error)?.checked_add(self.facts.encoder_bytes).and_then(|n|n.checked_add(self.facts.largest_source_shard)).ok_or_else(||CandleError::Msg("encoder-only peak overflow".into()))?,"host_staging_peak_bytes":estimate.host_peak_bytes,"tensor_peak_bytes":estimate.peak(),"context_tokens":estimate.context_token_bound,"source_shard_bytes":self.facts.largest_source_shard,"encoder_resident_bytes":self.facts.encoder_bytes,"vae_resident_bytes":self.facts.vae_bytes,"trainable_elements":estimate.trainable_elements,"cache_bytes_persistent":estimate.cache_bytes}),
+        )
+    }
     pub fn set_memory_budget_override(&mut self, bytes: Option<u64>) {
         self.memory_budget_override = bytes;
     }
-    fn budget(&self) -> Result<u64> {
-        match self.memory_budget_override {
-            Some(bytes) => Ok(admission::resolve_budget(Some(bytes), 0)),
-            None => admission::device_budget_bytes(&self.device).map_err(admission_error),
-        }
+    fn budget(&self, req: &TrainingRequest) -> Result<u64> {
+        // Only the explicitly selected CPU numerical oracle has no CUDA physical discovery.
+        // A runtime override is a lower ceiling on a real device, never a VRAM substitute.
+        let physical = match (&self.device, self.memory_budget_override) {
+            (Device::Cpu, Some(bytes)) => admission::resolve_budget(Some(bytes), 0),
+            _ => {
+                let discovered =
+                    admission::device_budget_bytes(&self.device).map_err(admission_error)?;
+                self.memory_budget_override
+                    .map_or(discovered, |limit| discovered.min(limit))
+            }
+        };
+        gen_core::train::effective_memory_budget(physical, req.config.memory_limit_bytes)
+            .map_err(Into::into)
     }
-    fn estimate(&self, req: &TrainingRequest) -> Result<admission::MemoryEstimate> {
-        let shape = admission::EstimateRequest::from_request(req)
+    fn basic(&self, req: &TrainingRequest) -> Result<()> {
+        validate_request(&self.descriptor, req)?;
+        contract::target_paths(
+            self.sources.config.num_layers,
+            &req.config.lora_target_modules,
+        )?;
+        self.sources.ensure_unchanged()?;
+        check_cancel(&req.cancel)
+    }
+    fn prepare(&self, req: &TrainingRequest) -> Result<Preparation> {
+        let budget = self.budget(req)?;
+        let minimal = self
+            .facts
+            .backbone_elements
+            .checked_mul(2)
+            .ok_or_else(|| CandleError::Msg("minimum backbone residency overflow".into()))?;
+        if minimal > budget {
+            return Err(CandleError::Unsupported(
+                "frozen backbone alone exceeds the physical device/user cap".into(),
+            ));
+        }
+        let available = contract::recovery::host::available_bytes()?;
+        let host_budget = if self.device.is_cpu() {
+            available.min(budget)
+        } else {
+            available
+        };
+        let plan = contract::recovery::DataPlan::from_request_budget(req, host_budget)?;
+        let mut shape = admission::EstimateRequest::from_request(req)
             .map_err(admission_error)?
-            .with_image_headers(req)
+            .with_plan(req, &plan)
             .map_err(admission_error)?;
-        admission::estimate(&self.facts, &shape).map_err(admission_error)
+        shape.context_tokens = text_encoder::token_bound(&self.sources, req)?;
+        #[cfg(feature = "test-support")]
+        let evaluation = self
+            .test_probe
+            .as_ref()
+            .map(|probe| audit::Snapshot::new(req, probe.evaluation(), host_budget))
+            .transpose()?;
+        #[cfg(feature = "test-support")]
+        if let Some(evaluation) = &evaluation {
+            let tokens = text_encoder::token_bound(&self.sources, &evaluation.request)?;
+            let geometry = &evaluation.plan.entries[0];
+            shape.context_tokens = shape.context_tokens.max(tokens);
+            shape.evaluation_context_tokens = tokens;
+            shape.evaluation_canvas = Some((u64::from(geometry.width), u64::from(geometry.height)));
+            shape.audit_workspace_bytes = 64 * 1024 * 1024;
+            shape.decode_bytes = shape
+                .decode_bytes
+                .max(evaluation.plan.decode_buffer_bound()?);
+            shape.dataset_metadata_bytes = shape
+                .dataset_metadata_bytes
+                .checked_add(contract::recovery::DataPlan::metadata_bound(
+                    &evaluation.request,
+                )?)
+                .ok_or_else(|| CandleError::Msg("evaluation metadata overflow".into()))?;
+        }
+        let estimate = admission::estimate(&self.facts, &shape).map_err(admission_error)?;
+        estimate.check_all(budget).map_err(admission_error)?;
+        estimate
+            .check_host(host_budget, self.device.is_cpu())
+            .map_err(admission_error)?;
+        contract::recovery::validate_resume_plan(
+            req,
+            &self.sources.source_identity(self.variant),
+            &plan,
+        )?;
+        Ok(Preparation {
+            plan,
+            estimate,
+            budget,
+            host_budget,
+            #[cfg(feature = "test-support")]
+            evaluation,
+        })
     }
 }
 impl Trainer for MossImageTrainer {
@@ -130,11 +245,8 @@ impl Trainer for MossImageTrainer {
         &self.descriptor
     }
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor, req)?;
-        self.sources.ensure_unchanged()?;
-        self.estimate(req)?
-            .check_all(self.budget()?)
-            .map_err(admission_error)?;
+        self.basic(req)?;
+        self.prepare(req)?;
         Ok(())
     }
     fn train(
@@ -142,8 +254,29 @@ impl Trainer for MossImageTrainer {
         req: &TrainingRequest,
         progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
-        self.validate(req)?;
-        self.train_impl(req, progress).map_err(Into::into)
+        self.basic(req)?;
+        let prepared = self.prepare(req)?;
+        #[cfg(feature = "test-support")]
+        let probe = self
+            .test_probe
+            .as_ref()
+            .map(|p| p.begin(self.device.is_cpu()))
+            .transpose()?;
+        #[cfg(feature = "test-support")]
+        let result = self.train_impl(req, progress, prepared, probe.clone());
+        #[cfg(not(feature = "test-support"))]
+        let result = self.train_impl(req, progress, prepared);
+        // Drain the actual owned context even on cancellation/error, after run locals drop.
+        let synchronized = self.device.synchronize().map_err(CandleError::from);
+        let result = match synchronized {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        };
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = probe {
+            probe.finish(result.as_ref().err().map(ToString::to_string))?;
+        }
+        result.map_err(Into::into)
     }
 }
 fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
@@ -152,6 +285,11 @@ fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::R
     gen_core::train::validate_training_techniques(d, req)?;
     gen_core::train::validate_edit_request(d, req)?;
     let c = &req.config;
+    if !req.file_name.ends_with(".safetensors") {
+        return Err(gen_core::Error::Unsupported(
+            "MOSS adapter output must use .safetensors".into(),
+        ));
+    }
     let refuse = |s: &str| gen_core::Error::Unsupported(format!("MOSS training: {s}"));
     if req.items.is_empty()
         || c.steps == 0
@@ -216,7 +354,6 @@ fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::R
     if c.decompose_factor != -1 && c.decompose_factor <= 0 {
         return Err(refuse("LoKr decomposition must be -1 (auto) or positive"));
     }
-    contract::target_paths(42, &c.lora_target_modules)?;
     for (key, value) in &c.model_options {
         if key != "vae_posterior" || value.as_str() != Some(contract::POSTERIOR) {
             return Err(refuse(&format!(
@@ -224,11 +361,6 @@ fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::R
                 contract::POSTERIOR
             )));
         }
-    }
-    if c.resume && c.save_every > 0 && !c.save_every.is_multiple_of(c.gradient_accumulation) {
-        return Err(refuse(
-            "resumable checkpoints must fall on complete accumulation windows",
-        ));
     }
     if c.sample_every > 0
         && !c.sample_prompts.is_empty()
@@ -328,10 +460,55 @@ pub(crate) fn loss_grads(
     }
     Ok(result)
 }
-struct Entry {
-    latent: Tensor,
-    context: Tensor,
-    mask: Option<Tensor>,
+fn encode_entry(
+    req: &TrainingRequest,
+    geometry: &contract::recovery::EntryGeometry,
+    plan: &contract::recovery::DataPlan,
+    host_budget: u64,
+    vae: &candle_gen_flux2::vae::Flux2Vae,
+    device: &Device,
+) -> Result<(Tensor, Option<Tensor>)> {
+    check_cancel(&req.cancel)?;
+    let source = plan.decode_rgb(geometry.item, host_budget)?;
+    let pixels = if req.config.aspect_ratio_buckets.is_empty() {
+        let crop = geometry.crop_box();
+        let square =
+            image::imageops::crop_imm(&source, crop.x, crop.y, crop.width, crop.height).to_image();
+        square_image_tensor(&square, geometry.width, device)?
+    } else {
+        let row = gen_core::AspectRatioBucket {
+            width: geometry.width,
+            height: geometry.height,
+            repeats: 1,
+        };
+        let rgb = gen_core::train::aspect_ratio::resize_rgb(&source, row)?;
+        Tensor::from_vec(
+            rgb,
+            (1, geometry.height as usize, geometry.width as usize, 3),
+            &Device::Cpu,
+        )?
+        .permute((0, 3, 1, 2))?
+        .affine(1. / 127.5, -1.)?
+        .to_device(device)?
+    };
+    check_cancel(&req.cancel)?;
+    let latent = vae.encode_packed(&pixels)?.detach();
+    check_cancel(&req.cancel)?;
+    crate::adapters::finite(&latent, "encoded training latent")?;
+    let subject = plan.subject_mask(req, geometry.item, host_budget)?;
+    let mask = prepared_subject_mask_weight(
+        "MOSS",
+        subject.as_ref(),
+        |_, _| geometry.crop_box(),
+        latent.dims(),
+        device,
+    )?;
+    if req.config.subject_mask_loss.is_some() && mask.is_none() {
+        return Err(CandleError::Msg(
+            "MOSS configured subject mask was not produced".into(),
+        ));
+    }
+    Ok((latent, mask))
 }
 fn caption(text: &str, trigger: Option<&str>) -> String {
     match trigger.filter(|t| !t.trim().is_empty()) {
@@ -339,12 +516,23 @@ fn caption(text: &str, trigger: Option<&str>) -> String {
         _ => text.into(),
     }
 }
+#[cfg(test)]
 pub(super) fn save(
     model: &Transformer,
     set: &LoraSet,
     variant: MossImageVariant,
     req: &TrainingRequest,
     path: &Path,
+) -> Result<()> {
+    save_with_source(model, set, variant, req, path, None)
+}
+fn save_with_source(
+    model: &Transformer,
+    set: &LoraSet,
+    variant: MossImageVariant,
+    req: &TrainingRequest,
+    path: &Path,
+    identity: Option<&contract::recovery::RunIdentity>,
 ) -> Result<()> {
     let c = &req.config;
     for (_, var) in set.named_vars() {
@@ -355,6 +543,24 @@ pub(super) fn save(
     let mut meta: HashMap<_, _> = contract::metadata(variant, sampler_name(c))
         .into_iter()
         .collect();
+    if let Some(identity) = identity {
+        meta.insert(
+            "source_checkpoint_identity".into(),
+            identity.source_checkpoint.clone(),
+        );
+        meta.insert(
+            "dataset_fingerprint".into(),
+            identity.dataset_fingerprint.clone(),
+        );
+        meta.insert(
+            "effective_training_controls".into(),
+            identity.effective_config.clone(),
+        );
+        meta.insert(
+            "training_stream_version".into(),
+            contract::recovery::STREAM_VERSION.into(),
+        );
+    }
     if !req.trigger_words.is_empty() {
         meta.insert(
             "triggerWords".into(),
@@ -421,13 +627,19 @@ impl MossImageTrainer {
         &mut self,
         req: &TrainingRequest,
         progress: &mut dyn FnMut(TrainingProgress),
+        prepared: Preparation,
+        #[cfg(feature = "test-support")] probe: Option<RunProbe>,
     ) -> Result<TrainingOutput> {
         let c = &req.config;
-        let estimate = self.estimate(req)?;
-        // Snapshot once, before owned allocations. Comparing the total plan with later remaining
-        // free memory would charge this run's own weights twice.
-        let budget = self.budget()?;
-        estimate.check_all(budget).map_err(admission_error)?;
+
+        let plan = prepared.plan;
+        let estimate = prepared.estimate;
+        let budget = prepared.budget;
+        let host_budget = prepared.host_budget;
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            probe.update(|r| r.context_bound = estimate.context_token_bound)?;
+        }
         self.sources.ensure_unchanged()?;
         check_cancel(&req.cancel)?;
         progress(TrainingProgress::Preparing);
@@ -437,59 +649,100 @@ impl MossImageTrainer {
             .map_err(admission_error)?;
         let (encoder, vae) = admitted_load(&estimate, budget, || {
             Ok((
-                self.sources.text(&self.device)?,
-                self.sources.training_vae(&self.device)?,
+                self.sources.text_cancellable(&self.device, &req.cancel)?,
+                self.sources
+                    .training_vae_cancellable(&self.device, &req.cancel)?,
             ))
         })?;
         estimate
             .check(admission::Phase::Cache, budget)
             .map_err(admission_error)?;
-        let edges = bucket_edges(c);
-        let mut cache = Vec::new();
+
+        #[cfg(feature = "test-support")]
+        let te_before = if probe.is_some() {
+            Some(audit::digest(
+                encoder
+                    .frozen_training_tensors()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "test-support")]
+        let vae_before = if probe.is_some() {
+            Some(audit::digest(vae.frozen_training_tensors())?)
+        } else {
+            None
+        };
+        #[cfg(feature = "test-support")]
+        let evaluation = probe
+            .as_ref()
+            .map(|p| {
+                audit::prepare(
+                    &self.sources,
+                    prepared
+                        .evaluation
+                        .as_ref()
+                        .expect("admitted heldout snapshot"),
+                    p,
+                    &encoder,
+                    &vae,
+                    &self.device,
+                    host_budget,
+                )
+            })
+            .transpose()?;
+        let fingerprint = contract::recovery::effective_identity(
+            req,
+            &self.sources.source_identity(self.variant),
+            &plan,
+        )?;
+        let mut cache = Vec::with_capacity(plan.entries.len());
+        let mut contexts = Vec::with_capacity(req.items.len());
         for (index, item) in req.items.iter().enumerate() {
             check_cancel(&req.cancel)?;
-            self.sources.ensure_unchanged()?;
             progress(TrainingProgress::Caching {
                 current: index as u32 + 1,
                 total: req.items.len() as u32,
             });
-            self.estimate(req)?
-                .check(admission::Phase::Cache, budget)
-                .map_err(admission_error)?;
-            let square = decode_square(&item.image_path)?;
-            let context = text_encoder::strings(
-                &self.sources,
-                &encoder,
-                &[caption(&item.caption, c.trigger_word.as_deref())],
-                4096,
-                &self.device,
-                &req.cancel,
-            )?
-            .rows
-            .remove(0)
-            .detach();
-            let subject = gen_core::train::subject_mask::PreparedSubjectMask::load_if_enabled(
-                "MOSS",
-                item,
-                c.subject_mask_loss.as_ref(),
-            )?;
-            for edge in &edges {
+            contexts.push(if c.cache_text_embeddings {
+                Some(
+                    text_encoder::strings(
+                        &self.sources,
+                        &encoder,
+                        &[caption(&item.caption, c.trigger_word.as_deref())],
+                        4096,
+                        &self.device,
+                        &req.cancel,
+                    )?
+                    .rows
+                    .remove(0)
+                    .detach(),
+                )
+            } else {
+                None
+            });
+            for geometry in plan
+                .entries
+                .iter()
+                .filter(|geometry| geometry.item == contexts.len() - 1)
+            {
                 check_cancel(&req.cancel)?;
-                let latent = vae
-                    .encode_packed(&square_image_tensor(&square, *edge, &self.device)?)?
-                    .detach();
-                crate::adapters::finite(&latent, "cached latent")?;
-                let mask = prepared_subject_mask_weight(
-                    "MOSS",
-                    subject.as_ref(),
-                    gen_core::train::subject_mask::CropBox::center_square,
-                    latent.dims(),
-                    &self.device,
-                )?;
-                cache.push(Entry {
-                    latent,
-                    context: context.clone(),
-                    mask,
+                self.sources.ensure_unchanged()?;
+                estimate
+                    .check(admission::Phase::Cache, budget)
+                    .map_err(admission_error)?;
+                cache.push(if c.cache_latents {
+                    Some(encode_entry(
+                        req,
+                        geometry,
+                        &plan,
+                        host_budget,
+                        &vae,
+                        &self.device,
+                    )?)
+                } else {
+                    None
                 });
             }
         }
@@ -529,20 +782,67 @@ impl MossImageTrainer {
                 .detach(),
             )
         };
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            probe.frozen(
+                "text_encoder",
+                te_before.as_ref().expect("observed encoder"),
+                &audit::digest(
+                    encoder
+                        .frozen_training_tensors()
+                        .map_err(|e| CandleError::Msg(e.to_string()))?,
+                )?,
+            )?;
+            probe.frozen(
+                "vae",
+                vae_before.as_ref().expect("observed VAE"),
+                &audit::digest(vae.frozen_training_tensors())?,
+            )?;
+            for context in contexts
+                .iter()
+                .flatten()
+                .chain(previews.iter().map(|(_, c)| c))
+                .chain(negative.iter())
+            {
+                let tokens = context.dim(1)? as u64;
+                probe.update(|r| r.actual_context_max = r.actual_context_max.max(tokens))?;
+            }
+        }
         self.device.synchronize()?;
-        drop(encoder);
+        let encoder = if c.cache_text_embeddings {
+            None
+        } else {
+            Some(encoder)
+        };
+        let vae = if c.cache_latents && previews.is_empty() {
+            None
+        } else {
+            Some(vae)
+        };
         estimate
             .check(admission::Phase::Cast, budget)
             .map_err(admission_error)?;
-        let weights = load_weights(
+        let weights = load_weights_cancellable(
             &self.sources.assets(MossImageAcceleration::Off)?,
             MossImageAssetRole::Transformer,
             &self.device,
             compute_dtype(c)?,
             &[""],
+            &req.cancel,
         )?;
         let mut transformer =
             Transformer::load(&weights, Geometry::from(&self.sources.config), None)?;
+        #[cfg(feature = "test-support")]
+        let frozen_base = if probe.is_some() {
+            Some(audit::base_handles(&weights)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "test-support")]
+        let base_before = frozen_base
+            .as_ref()
+            .map(|values| audit::digest(values.iter().cloned()))
+            .transpose()?;
         drop(weights);
         estimate
             .check(admission::Phase::Backward, budget)
@@ -559,56 +859,108 @@ impl MossImageTrainer {
             },
         )?;
         let stem = checkpoint::file_stem(&req.file_name);
-        let fingerprint = resume_fingerprint(self.variant, req)?;
         let (mut start, mut update) = (0, 0);
-        if c.resume {
-            if let Some((path, _)) = checkpoint::find_latest_resume(&req.output_dir, stem) {
-                let meta = checkpoint::load_resume(&path, &mut opt, &set, c, &fingerprint)?;
-                if meta.step >= c.steps {
-                    return Err(CandleError::Msg(
-                        "MOSS resume already reached requested steps; no new training would run"
-                            .into(),
-                    ));
-                }
-                start = meta.step;
-                update = meta.update_idx;
-                transformer.validate_residuals()?;
-            }
-        }
-        let schedule = BucketSchedule::new(req.items.len(), &c.training_buckets(), c.seed);
-        let (updates, warmup) =
-            schedule_updates(c.steps, c.gradient_accumulation, c.lr_warmup_steps);
         let mut window = GradientWindow::default();
         let mut final_loss = 0.;
+        if c.resume {
+            estimate
+                .check(admission::Phase::Checkpoint, budget)
+                .map_err(admission_error)?;
+            let (state, pending) =
+                recovery::load_complete(req, stem, &plan, &fingerprint, &mut opt, &set)?;
+            start = state.step;
+            update = state.update;
+            final_loss = state.final_loss;
+            window = pending;
+            transformer.validate_residuals()?;
+        }
+        let (updates, warmup) =
+            schedule_updates(c.steps, c.gradient_accumulation, c.lr_warmup_steps);
+
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            let factors = audit::factors(&set)?;
+            let loss =
+                evaluation
+                    .as_ref()
+                    .expect("heldout prepared")
+                    .loss(&transformer, &set, req)?;
+            probe.update(|r| {
+                r.factor_before = factors;
+                r.evaluation_before = Some(loss);
+            })?;
+        }
         for step in start + 1..=c.steps {
             check_cancel(&req.cancel)?;
+            plan.verify_inputs()?;
             estimate
                 .check(admission::Phase::Backward, budget)
                 .map_err(admission_error)?;
             let mut batch_loss = 0.;
             let mut batch_tokens = 0u64;
-            for batch in 0..c.batch_size {
-                let index = (step as usize - 1)
-                    .checked_mul(c.batch_size as usize)
-                    .and_then(|n| n.checked_add(batch as usize))
-                    .ok_or_else(|| CandleError::Msg("MOSS sample index overflow".into()))?;
-                let entry = &cache[schedule.cache_index(index)];
-                let seed = c
-                    .seed
-                    .wrapping_add((index as u64).wrapping_mul(2).wrapping_add(1));
-                let noise = sample_noise(entry.latent.dims(), seed, &self.device)?;
+            let draw = plan.batch(step - 1)?;
+            for (offset, &entry_index) in draw.entries.iter().enumerate() {
+                let geometry = &plan.entries[entry_index];
+                let uncached;
+                let (latent, mask) = if let Some(cached) = &cache[entry_index] {
+                    (&cached.0, cached.1.as_ref())
+                } else {
+                    uncached = encode_entry(
+                        req,
+                        geometry,
+                        &plan,
+                        host_budget,
+                        vae.as_ref().expect("uncached latents retain VAE"),
+                        &self.device,
+                    )?;
+                    (&uncached.0, uncached.1.as_ref())
+                };
+                let fresh_context;
+                let context = if let Some(context) = &contexts[geometry.item] {
+                    context
+                } else {
+                    let item = &req.items[geometry.item];
+                    fresh_context = text_encoder::strings(
+                        &self.sources,
+                        encoder.as_ref().expect("uncached text retains encoder"),
+                        &[caption(&item.caption, c.trigger_word.as_deref())],
+                        4096,
+                        &self.device,
+                        &req.cancel,
+                    )?
+                    .rows
+                    .remove(0)
+                    .detach();
+                    &fresh_context
+                };
+                let index = draw
+                    .sample_cursor
+                    .checked_add(offset as u64)
+                    .ok_or_else(|| CandleError::Msg("MOSS sample draw overflow".into()))?;
+                let seed = c.seed.wrapping_add(index.wrapping_mul(2).wrapping_add(1));
+                let noise = sample_noise(latent.dims(), seed, &self.device)?;
                 let (loss, grads) = loss_grads(
                     &transformer,
                     &set,
                     c,
-                    &entry.latent,
-                    &entry.context,
+                    latent,
+                    context,
                     &noise,
                     sigma(c, seed ^ 0xd1b54a32d192ed03)?,
-                    entry.mask.as_ref(),
+                    mask,
                     &req.cancel,
                 )?;
-                let tokens = token_count(&entry.latent)?;
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = &probe {
+                    audit::gradients(probe, &grads, &set)?;
+                    let tokens = context.dim(1)? as u64;
+                    probe.update(|r| r.actual_context_max = r.actual_context_max.max(tokens))?;
+                }
+                #[cfg(feature = "test-support")]
+                if let (Some(probe), Some(mask)) = (&probe, mask) {
+                    audit::mask(probe, mask, latent)?;
+                }
+                let tokens = token_count(latent)?;
                 window.add(grads, &set.vars, tokens)?;
                 batch_tokens = batch_tokens
                     .checked_add(tokens)
@@ -623,34 +975,40 @@ impl MossImageTrainer {
                 transformer.validate_residuals()?;
                 update += 1;
             }
+            #[cfg(feature = "test-support")]
+            if let Some(probe) = &probe {
+                probe.update(|r| r.microsteps.push(step))?;
+            }
             progress(TrainingProgress::Training {
                 step,
                 total: c.steps,
                 loss: final_loss,
             });
             if c.save_every > 0 && step % c.save_every == 0 && step != c.steps {
+                estimate
+                    .check(admission::Phase::Checkpoint, budget)
+                    .map_err(admission_error)?;
                 std::fs::create_dir_all(&req.output_dir)
                     .map_err(|e| CandleError::Msg(e.to_string()))?;
-                save(
+                save_with_source(
                     &transformer,
                     &set,
                     self.variant,
                     req,
                     &req.output_dir
                         .join(checkpoint::checkpoint_filename(stem, step)),
+                    Some(&fingerprint),
                 )?;
-                if step % c.gradient_accumulation == 0 {
-                    checkpoint::save_resume(
-                        &req.output_dir,
-                        stem,
-                        step,
-                        update,
-                        &opt,
-                        &set,
-                        c,
-                        &fingerprint,
-                    )?;
-                }
+                let state = contract::recovery::RunState::after_step(
+                    req,
+                    &plan,
+                    &fingerprint,
+                    step,
+                    update,
+                    window.tokens,
+                    final_loss,
+                )?;
+                recovery::save_complete(req, stem, &state, &opt, &set, &window)?;
                 progress(TrainingProgress::Checkpoint { step });
             }
             if c.sample_every > 0 && step % c.sample_every == 0 && !previews.is_empty() {
@@ -697,8 +1055,12 @@ impl MossImageTrainer {
                             Some(&negative),
                             &mut |_| {},
                         )?;
-                        let mut images =
-                            crate::pipeline::decode(&vae, &sampled.latents, &request, &mut |_| {})?;
+                        let mut images = crate::pipeline::decode(
+                            vae.as_ref().expect("preview retains VAE"),
+                            &sampled.latents,
+                            &request,
+                            &mut |_| {},
+                        )?;
                         Ok(images.remove(0))
                     })();
                     transformer.freeze_residuals(false);
@@ -712,12 +1074,78 @@ impl MossImageTrainer {
                 }
             }
         }
+
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            let loss =
+                evaluation
+                    .as_ref()
+                    .expect("heldout prepared")
+                    .loss(&transformer, &set, req)?;
+            let factors = audit::factors(&set)?;
+            probe.update(|r| {
+                r.factor_after = factors;
+                r.evaluation_after = Some(loss);
+            })?;
+            probe.frozen(
+                "backbone",
+                base_before.as_ref().expect("observed backbone"),
+                &audit::digest(
+                    frozen_base
+                        .as_ref()
+                        .expect("observed backbone")
+                        .iter()
+                        .cloned(),
+                )?,
+            )?;
+            if let Some(encoder) = &encoder {
+                probe.frozen(
+                    "text_encoder",
+                    te_before.as_ref().expect("observed encoder"),
+                    &audit::digest(
+                        encoder
+                            .frozen_training_tensors()
+                            .map_err(|e| CandleError::Msg(e.to_string()))?,
+                    )?,
+                )?;
+            }
+            if let Some(vae) = &vae {
+                probe.frozen(
+                    "vae",
+                    vae_before.as_ref().expect("observed VAE"),
+                    &audit::digest(vae.frozen_training_tensors())?,
+                )?;
+            }
+        }
         check_cancel(&req.cancel)?;
         self.sources.ensure_unchanged()?;
+        plan.verify_inputs()?;
+        estimate
+            .check(admission::Phase::Checkpoint, budget)
+            .map_err(admission_error)?;
         progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir).map_err(|e| CandleError::Msg(e.to_string()))?;
         let path = req.output_dir.join(&req.file_name);
-        save(&transformer, &set, self.variant, req, &path)?;
+        save_with_source(
+            &transformer,
+            &set,
+            self.variant,
+            req,
+            &path,
+            Some(&fingerprint),
+        )?;
+        if c.save_every > 0 || c.resume {
+            let state = contract::recovery::RunState::after_step(
+                req,
+                &plan,
+                &fingerprint,
+                c.steps,
+                update,
+                window.tokens,
+                final_loss,
+            )?;
+            recovery::save_complete(req, stem, &state, &opt, &set, &window)?;
+        }
         Ok(TrainingOutput {
             adapter_path: path,
             steps: c.steps,
@@ -725,24 +1153,6 @@ impl MossImageTrainer {
         })
     }
 }
-fn resume_fingerprint(variant: MossImageVariant, req: &TrainingRequest) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let mut config = req.config.clone();
-    config.resume = false;
-    config.model_options.insert(
-        "vae_posterior".into(),
-        serde_json::json!(contract::POSTERIOR),
-    );
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(format!(
-            "moss-resume-v1:{}:{}:{config:?}",
-            variant.revision(),
-            gen_core::train::resume::request_fingerprint(req)?
-        ))
-    ))
-}
-
 #[cfg(test)]
 mod control_tests {
     use super::*;

@@ -665,7 +665,16 @@ impl Transformer {
             .map(|a| a.nbytes())
             .sum()
     }
+    #[cfg(test)]
     pub(crate) fn cast_training_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.cast_training_weights_with_cancel(dtype, &CancelFlag::new())
+    }
+    pub(crate) fn cast_training_weights_with_cancel(
+        &mut self,
+        dtype: Dtype,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        check(cancel)?;
         for p in [
             &mut self.video,
             &mut self.text,
@@ -675,11 +684,13 @@ impl Transformer {
             &mut self.head,
             &mut self.output,
         ] {
+            check(cancel)?;
             p.cast(dtype)?;
         }
         self.norm.weight = self.norm.weight.as_dtype(dtype)?;
         for block in &mut self.text_blocks {
             for norm in [&mut block.n1, &mut block.n2, &mut block.qn, &mut block.kn] {
+                check(cancel)?;
                 norm.weight = norm.weight.as_dtype(dtype)?;
             }
             for p in [
@@ -689,20 +700,30 @@ impl Transformer {
                 &mut block.gate,
                 &mut block.down,
             ] {
+                check(cancel)?;
                 p.cast(dtype)?;
             }
         }
         for block in &mut self.blocks {
             for norm in [&mut block.n1, &mut block.n2, &mut block.qn, &mut block.kn] {
+                check(cancel)?;
                 norm.weight = norm.weight.as_dtype(dtype)?;
             }
             for p in &mut block.projections {
+                check(cancel)?;
                 p.cast(dtype)?;
             }
         }
-        self.materialize_owned(&CancelFlag::new())
+        self.materialize_owned(cancel)
     }
     fn owned_arrays(&self) -> Vec<&Array> {
+        self.weight_arrays(true)
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn frozen_training_arrays(&self) -> Vec<Array> {
+        self.weight_arrays(false).into_iter().cloned().collect()
+    }
+    fn weight_arrays(&self, include_adapter: bool) -> Vec<&Array> {
         let mut arrays = vec![&self.norm.weight];
         let mut projections = vec![
             &self.video,
@@ -734,8 +755,10 @@ impl Transformer {
         for projection in projections {
             arrays.push(&projection.weight);
             arrays.extend(projection.bias.as_ref());
-            if let Some((down, up, _)) = &projection.adapter {
-                arrays.extend([down, up]);
+            if include_adapter {
+                if let Some((down, up, _)) = &projection.adapter {
+                    arrays.extend([down, up]);
+                }
             }
         }
         arrays

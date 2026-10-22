@@ -253,6 +253,17 @@ impl PreparedSubjectMask {
             ))
         })?;
         let mask = SubjectMask::load(mask_path)?;
+        Self::from_decoded(label, &item.image_path, (iw, ih), mask, cfg)
+    }
+    /// Validate an already decoded, authenticated mask against its captured image geometry.
+    pub fn from_decoded(
+        label: &str,
+        image_path: &Path,
+        (iw, ih): (u32, u32),
+        mask: SubjectMask,
+        cfg: &SubjectMaskLoss,
+    ) -> crate::Result<Self> {
+        let name = display_name(image_path);
         if (mask.width, mask.height) != (iw, ih) {
             return Err(crate::Error::Msg(format!(
                 "{label}: subject mask for image {name} is {}x{} but the image is {iw}x{ih}; \

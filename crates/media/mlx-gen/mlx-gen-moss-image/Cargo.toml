@@ -7,6 +7,8 @@ license = "Apache-2.0"
 autotests = false
 
 [dependencies]
+# Opt-in cross-crate development fixtures; no runtime bundle enables this feature.
+sceneworks-gen-core-testkit = { workspace = true, optional = true }
 image = { workspace = true }
 mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
@@ -14,6 +16,10 @@ mlx-llm = { workspace = true }
 mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[features]
+default = []
+test-support = ["dep:sceneworks-gen-core-testkit", "mlx-gen-flux2/test-support"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

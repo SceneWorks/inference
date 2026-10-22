@@ -7,16 +7,21 @@ license = "Apache-2.0"
 autotests = false
 
 [dependencies]
+# Opt-in cross-crate development fixtures; no runtime bundle enables this feature.
+sceneworks-gen-core-testkit = { workspace = true, optional = true }
 candle-gen = { path = "../candle-gen" }
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
 candle-llm = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Match candle-core's Tensor/View trait, not gen-core's neutral 0.4 header reader.
+safetensors = "0.7"
 rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 default = []
+test-support = ["dep:sceneworks-gen-core-testkit", "candle-gen-flux2/test-support", "candle-llm/test-support"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]
 metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-llm/metal"]
 

@@ -583,6 +583,8 @@ fn dmd_header_validation_checks_finite_values_coverage_dtype_and_mutation() {
     };
     save(1.0);
     let mut a = loader::Asset {
+        #[cfg(feature = "test-support")]
+        fixture_digest: None,
         pin: PinnedWeightsFile::pin(&p).unwrap(),
         role: MossImageAssetRole::DmdTime,
         repo: DMD_REPO,

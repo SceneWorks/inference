@@ -136,17 +136,31 @@ impl MossImage {
             return Err(Error::Unsupported("MOSS supports resident BF16 official loading; select full-FP32 DMD through explicit MOSS controls. Staging/deferred loading is not implemented".into()));
         }
         let sources = Sources::prepare(variant, spec)?;
+        Self::from_sources(variant, spec, sources)
+    }
+    pub(crate) fn from_sources(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        sources: Sources,
+    ) -> Result<Self> {
         let facts = memory_strategy::facts(&sources)?;
         let custom_adapter_bytes =
             crate::adapters::estimated_bytes(&spec.adapters, &sources.config)?;
-        let (memory, load_peak) =
-            memory_strategy::loaded_admission(variant, facts, custom_adapter_bytes, 5_362_224_248)?;
+        let (memory, load_peak) = memory_strategy::loaded_admission(
+            variant,
+            facts,
+            custom_adapter_bytes,
+            sources.load_staging_bytes()?,
+        )?;
         let custom_pins = spec
             .adapters
             .iter()
             .map(|adapter| spec.file_pin_for(&adapter.path))
             .collect::<gen_core::Result<Vec<_>>>()?;
-        if mlx_gen::memory::recommended_working_set_bytes().is_some_and(|cap| load_peak > cap) {
+        if sources
+            .working_set_budget()?
+            .is_some_and(|cap| load_peak > cap)
+        {
             return Err(Error::Unsupported(format!("MOSS resident load requires approximately {load_peak} bytes including source staging, beyond the admitted MLX working set")));
         }
         let cancel = CancelFlag::new();
@@ -167,7 +181,11 @@ impl MossImage {
         let vae = Flux2Vae::from_weights_decode_only(
             &vae_weights,
             &Flux2VaeDecoderConfig {
-                block_out_channels: [96, 192, 384, 384],
+                block_out_channels: if sources.is_fixture() {
+                    [32; 4]
+                } else {
+                    [96, 192, 384, 384]
+                },
             },
         )?;
         vae_weights.materialize_accessed()?;
@@ -195,6 +213,15 @@ impl MossImage {
         })
     }
     fn selected_sources(&self, mode: MossImageAcceleration) -> Result<Sources> {
+        if self.sources.is_fixture() {
+            if mode != MossImageAcceleration::Off {
+                return Err(Error::Unsupported(
+                    "synthetic test profile has no published DMD assets".into(),
+                ));
+            }
+            self.sources.ensure_unchanged()?;
+            return Ok(self.sources.clone());
+        }
         Sources::selected(self.variant, &self.spec, mode)
     }
     fn validate_inputs(
@@ -322,7 +349,7 @@ impl MossImage {
             let sources = self.selected_sources(resolved.acceleration)?;
             sources.ensure_unchanged()?;
             let peak = self.estimated_request_peak(request, inputs)?;
-            if let Some(cap) = mlx_gen::memory::recommended_working_set_bytes() {
+            if let Some(cap) = self.sources.working_set_budget()? {
                 if peak > cap {
                     return Err(Error::Unsupported(format!("MOSS structural resident peak {peak} exceeds admitted MLX working set {cap}; choose a supported geometry/batch or a larger admitted device")));
                 }
@@ -334,7 +361,7 @@ impl MossImage {
                 .is_some_and(|(mode, _)| *mode != resolved.acceleration)
             {
                 state.renderer = None;
-                mlx_gen::residency::drain_allocator_cache();
+                self.sources.drain_cache()?;
             }
             let batch = inputs
                 .positive
@@ -384,7 +411,7 @@ impl MossImage {
             }
             check(&request.cancel)?;
             state.select(resolved.acceleration, || {
-                mlx_gen::residency::drain_allocator_cache();
+                self.sources.drain_cache()?;
                 let mut transformer =
                     sources.transformer(resolved.acceleration, &request.cancel)?;
                 transformer.custom_reports = crate::adapters::apply_pinned(
@@ -569,6 +596,13 @@ impl MossImage {
             }
             sources.ensure_unchanged()?;
             check(&request.cancel)?;
+            #[cfg(feature = "test-support")]
+            if self.sources.is_fixture() {
+                check(&request.cancel)?;
+                // No sealed author receipt is manufactured for generated synthetic source bytes.
+                state.report = None;
+                return Ok(output);
+            }
             let report = MossImageExecutionReport::new(MossImageExecutionData {
                 execution_device: MossImageExecutionDevice::Mlx,
                 resolved,
@@ -593,7 +627,7 @@ impl MossImage {
         })();
         if result.is_err() {
             state.failed();
-            mlx_gen::residency::drain_allocator_cache();
+            self.sources.drain_cache()?;
         }
         result
     }
@@ -646,6 +680,17 @@ impl Generator for MossImage {
             .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            let state = self
+                .state
+                .lock()
+                .expect("synthetic fixture lifecycle lock poisoned");
+            return state
+                .renderer
+                .as_ref()
+                .map_or_else(Vec::new, |(_, r)| r.custom_reports.clone());
+        }
         self.moss_image_execution_report()
             .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
     }

@@ -529,6 +529,11 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests -j 1 "${packages[@]}"
+          if [[ " $args " == *" -p candle-gen-moss-image "* ]]; then
+            # Compiler budget is separate; each exact CPU fixture child is bounded independently.
+            python3 scripts/ci/moss_fixture_cpu.py compile candle --binary-file "$RUNNER_TEMP/moss-fixture-candle.json"
+            python3 scripts/ci/moss_fixture_cpu.py run candle --binary-file "$RUNNER_TEMP/moss-fixture-candle.json"
+          fi
 
   candle-cpu-conformance:
     name: Candle CPU conformance + SA3 gates (Linux)
@@ -783,6 +788,11 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests "${packages[@]}"
+          if [[ " $args " == *" -p mlx-gen-moss-image "* ]]; then
+            # Explicit CPU device/stream scopes; this is not a Metal or real-weight campaign.
+            python3 scripts/ci/moss_fixture_cpu.py compile mlx --binary-file "$RUNNER_TEMP/moss-fixture-mlx.json"
+            python3 scripts/ci/moss_fixture_cpu.py run mlx --binary-file "$RUNNER_TEMP/moss-fixture-mlx.json"
+          fi
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()

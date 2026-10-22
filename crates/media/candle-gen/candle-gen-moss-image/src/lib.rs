@@ -4,6 +4,9 @@ mod adapters;
 mod loader;
 pub mod memory_strategy;
 mod pipeline;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod text_encoder;
 pub mod training;
 mod training_memory;
@@ -60,6 +63,13 @@ impl MossImageGenerator {
         device: Device,
     ) -> gen_core::Result<Self> {
         let sources = Sources::new(variant, spec)?;
+        Self::from_sources(variant, sources, device)
+    }
+    pub(crate) fn from_sources(
+        variant: MossImageVariant,
+        sources: Sources,
+        device: Device,
+    ) -> gen_core::Result<Self> {
         let contract = memory_strategy::contract_sources(variant, &sources)?;
         Ok(Self {
             descriptor: descriptor(variant),
@@ -367,6 +377,12 @@ impl MossImageGenerator {
             state.vae = None;
         }
         transformer::check_cancel(&req.cancel)?;
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            // Synthetic CPU fixtures execute the actual graph but cannot attest published assets.
+            state.report = None;
+            return Ok(output);
+        }
         let conditioning = positive
             .receipts
             .into_iter()
@@ -429,6 +445,13 @@ impl Generator for MossImageGenerator {
             .and_then(|state| self.cached_resident_bytes(&state).ok())
     }
     fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            return candle_gen::lock_recover(&self.state)
+                .renderer
+                .as_ref()
+                .map_or_else(Vec::new, |r| r.adapter_reports.clone());
+        }
         self.moss_image_execution_report()
             .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
     }
