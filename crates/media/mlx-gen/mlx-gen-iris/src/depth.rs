@@ -181,6 +181,10 @@ fn is_stack_key(key: &str) -> bool {
 }
 
 fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> Result<IrisDepth> {
+    // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+    // generation. Keep this existing enabled-only policy alive through all load evaluations.
+    let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
     let model = &export.config.model;
     let path = export.weights_path();
     // A packed export (`crate::packed`) is read packed, under the bf16 compute its scales are
@@ -193,7 +197,7 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
             path.display()
         )));
     }
-    mlx_gen::ios_quantum::before_load_where(
+    crate::stream::before_materialized_load(
         quanta::LOAD,
         &[path.clone(), export.empty_prompt_path()],
         |name| !streamed || !is_stack_key(name),

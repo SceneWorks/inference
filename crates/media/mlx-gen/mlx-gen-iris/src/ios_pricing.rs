@@ -775,6 +775,7 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         | crate::adapters::ADAPTER_LOAD_QUANTUM
         | mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM
         | crate::adapters::ADAPTER_HOST_QUANTUM
+        | crate::adapters::ADAPTER_WIDTH_QUANTUM
         | crate::adapters::ADAPTER_MATERIALIZE_QUANTUM
         | depth_q::LOAD
         | restore_q::LOAD => IosPhase::Load,
@@ -826,6 +827,7 @@ fn quantum_labels_iter() -> impl Iterator<Item = &'static str> {
         crate::adapters::ADAPTER_LOAD_QUANTUM,
         mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM,
         crate::adapters::ADAPTER_HOST_QUANTUM,
+        crate::adapters::ADAPTER_WIDTH_QUANTUM,
         crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
         crate::solver::PLAN_QUANTUM,
         crate::solver::STEP_QUANTUM,
@@ -1012,7 +1014,11 @@ fn emulate_packed_backbone(headers: &[Header], prefix: &str, quant: Quant) -> Re
     let bq = BackboneQuant::for_load(Some(quant))?;
     let mut out = Vec::with_capacity(headers.len());
     for h in headers {
-        let name = h.name.strip_prefix(prefix).unwrap_or(&h.name);
+        let Some(name) = h.name.strip_prefix(prefix) else {
+            // The converter copies out-of-backbone tensors verbatim (depth's reducer).
+            out.push(h.clone());
+            continue;
+        };
         match h.shape.as_slice() {
             [rows, input] if name.ends_with(".weight") => match ProjectionLayout::of(*input, bq) {
                 ProjectionLayout::Quantized { bits, padded_in } => {
@@ -1113,19 +1119,7 @@ fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
 /// before summing, without saturation. The keep predicate is the actual eager/skeleton selection;
 /// untouched streamed block payloads must not enter the skeleton's load floor.
 fn materialized_load_bytes(headers: &[Header], keep: impl Fn(&str) -> bool) -> Result<u64> {
-    headers
-        .iter()
-        .filter(|header| keep(&header.name))
-        .try_fold(0u64, |total, header| {
-            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
-                header.data_bytes,
-                crate::retention::PAGE_BYTES,
-            )
-            .and_then(|bytes| total.checked_add(bytes))
-            .ok_or_else(|| {
-                Error::Unsupported("Iris materialized load byte arithmetic overflow".into())
-            })
-        })
+    crate::stream::materialized_load_bytes(headers, keep)
 }
 
 /// `(image_and_text_share_parent, text_retains_joined_parent)` after `completed` trunk blocks.
@@ -2201,6 +2195,11 @@ fn priced_tower(
     } else {
         crate::memory_strategy::text_encoder_bytes(dir, requested).map_err(Error::from)?
     };
+    // Both tower forms own build_rope()'s f32 frequency row; it is not a checkpoint tensor
+    // (and the shared decoder's param_groups does not enumerate it).
+    let resident = resident
+        .checked_add(tower_rope_bytes(&cfg)?)
+        .ok_or_else(|| Error::Unsupported("Iris tower resident byte arithmetic overflow".into()))?;
     let floor = if streamed {
         stored(floor_headers, skeleton)
     } else {
@@ -2765,6 +2764,64 @@ fn plan_of(execution: &GenerationMemory) -> mlx_gen::AttentionPlan<'static> {
     }
 }
 
+/// Qwen3-VL's build_rope owns one f32 row over the resolved rotary dimension, in resident AND
+/// streamed form. Per-pass cos/sin tables are separate walk producers, not model parameters.
+fn tower_rope_bytes(cfg: &mlx_llm::ModelConfig) -> Result<u64> {
+    let dim = u64::try_from(cfg.rotary_dim())
+        .map_err(|_| Error::Unsupported("Iris negative rotary dimension".into()))?;
+    dim.checked_mul(4)
+        .and_then(|bytes| {
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
+        })
+        .ok_or_else(|| Error::Unsupported("Iris rotary frequency byte arithmetic overflow".into()))
+}
+
+/// One resident decoder walk's native-owned IDs, rotary tables, hidden states and K/V capacity. Unlike the streamed
+/// picker, CausalLm::hidden_states returns ALL layers and owns a cache for every decoder layer.
+/// Round each independently allocated state/K/V operand before multiplying by its source count.
+/// This is a resident upper, not a simultaneous lower or a cumulative/process certificate.
+fn resident_text_walk_bytes(cfg: &mlx_llm::ModelConfig, tokens: u64) -> Result<u64> {
+    let overflow = || Error::Unsupported("Iris resident text walk byte arithmetic overflow".into());
+    let product = |factors: &[u64]| {
+        factors.iter().try_fold(1u64, |n, factor| {
+            n.checked_mul(*factor).ok_or_else(overflow)
+        })
+    };
+    let allocation = |bytes| {
+        mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
+            .ok_or_else(overflow)
+    };
+    let layers = u64::try_from(cfg.num_layers).map_err(|_| overflow())?;
+    let hidden = allocation(product(&[2, tokens, cfg.hidden_size.max(0) as u64])?)?;
+    let block = mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS as u64;
+    let cache = allocation(product(&[
+        2,
+        tokens.div_ceil(block),
+        block,
+        cfg.num_kv_heads.max(0) as u64,
+        cfg.head_dim.max(0) as u64,
+    ])?)?;
+    let states = layers
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(hidden))
+        .ok_or_else(overflow)?;
+    let caches = layers
+        .checked_mul(2)
+        .and_then(|n| n.checked_mul(cache))
+        .ok_or_else(overflow)?;
+    // resident_states keeps its uploaded IDs; lazy decoder graphs read the one shared per-pass
+    // cosine/sine pair. The model-owned frequency row is already in tower.resident.
+    let ids = allocation(product(&[4, tokens])?)?;
+    let rotary = u64::try_from(cfg.rotary_dim()).map_err(|_| overflow())?;
+    let table = allocation(product(&[2, tokens, rotary])?)?;
+    let rope = table.checked_mul(2).ok_or_else(overflow)?;
+    states
+        .checked_add(caches)
+        .and_then(|n| n.checked_add(ids))
+        .and_then(|n| n.checked_add(rope))
+        .ok_or_else(overflow)
+}
+
 /// The encoded window priced: the request's own when it names one, else the full window (the
 /// chat-template prefix and a caption at the budget, its suffix inside the budget).
 fn token_window(req: &IosPricingRequest<'_>, te_dir: &Path, max_length: u64) -> Result<u64> {
@@ -2992,10 +3049,10 @@ fn generation(
         opts,
     )?;
     let base_bb_resident = bb.resident;
-    let (adapter_inventory, packed_adapter_hosts) = if spec.adapters.is_empty() {
-        (crate::adapters::AdapterHeaderInventory::default(), 0)
+    let (adapter_inventory, packed_adapter_hosts, width_read_bytes) = if spec.adapters.is_empty() {
+        (crate::adapters::AdapterHeaderInventory::default(), 0, 0)
     } else {
-        let (projections, packed) = crate::adapters::projection_shapes_from_headers(
+        let host = crate::adapters::projection_host_facts_from_headers(
             &resources
                 .backbone_dir
                 .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
@@ -3003,12 +3060,13 @@ fn generation(
         (
             crate::adapters::header_inventory(
                 &spec.adapters,
-                &projections,
+                &host.shapes,
                 compute_dtype(spec.precision),
                 IrisTask::Generation,
                 crate::model::MODEL_ID,
             )?,
-            packed,
+            host.packed_projections,
+            host.width_read_bytes,
         )
     };
     let adapter_loads = adapter_inventory.projection_loads()?;
@@ -3105,22 +3163,49 @@ fn generation(
         // Conservative load payload upper: source base inventory and its eventual cast parameters
         // can coexist during build. This is not a coincident physical lower or an anchor credit.
         let base_upper = add(add(load_tower, base_bb_resident)?, bb.floor)?;
-        if host != 0 {
+        if host == 0 {
+            let first = adapter_files
+                .first()
+                .ok_or_else(|| Error::Unsupported("iris: no adapter file read facts".into()))?;
             take_source_at(
                 &mut pricing,
                 IosPhase::Load,
                 base_upper,
                 load_conditioning,
-                &[
-                    (crate::adapters::ADAPTER_HOST_QUANTUM, host), // before lazy width scalar reads
-                    (crate::adapters::ADAPTER_HOST_QUANTUM, host), // before host scalar placeholders
-                ],
+                &[(
+                    crate::adapters::ADAPTER_LOAD_QUANTUM,
+                    first.file_floor_bytes,
+                )],
                 IosWorkBasis::default(),
-                "iris.generation.load/adapter_host",
-                "adapters::install before ProjectionHost constructors",
+                "iris.generation.load/first_dense_adapter_floor",
+                "adapters::install file floor before zero-native host construction",
                 1,
             );
         }
+        if width_read_bytes != 0 {
+            take_source_at(
+                &mut pricing,
+                IosPhase::Load,
+                base_upper,
+                load_conditioning,
+                &[(crate::adapters::ADAPTER_WIDTH_QUANTUM, width_read_bytes)],
+                IosWorkBasis::default(),
+                "iris.generation.load/adapter_width_reads",
+                "adapters::logical_projection_shapes before original try_item source/cast eval",
+                1,
+            );
+        }
+        take_source_at(
+            &mut pricing,
+            IosPhase::Load,
+            base_upper,
+            load_conditioning,
+            &[(crate::adapters::ADAPTER_HOST_QUANTUM, host)],
+            IosWorkBasis::default(),
+            "iris.generation.load/adapter_host",
+            "adapters::install before placeholders; zero-native dense stage is still observed",
+            1,
+        );
         let mut previous_file_payload = 0u64;
         for read in &adapter_files {
             take_source_at(
@@ -3181,7 +3266,7 @@ fn generation(
         .max()
         .unwrap_or(0);
     let mut text = vec![(te_q::CONDITIONING, real_max)];
-    let mut walk = 0;
+    let walk;
     let mut text_weight_window = 0;
     if streamed {
         let run = deepest.min(te_cfg.num_layers);
@@ -3201,6 +3286,11 @@ fn generation(
             + 2 * allocated(2 * n * te_cfg.head_dim.max(0) as u64)
             + text_weight_window;
     } else {
+        // resident_states constructs the complete decoder graph/cache BEFORE its layer checks
+        // and retains every returned hidden-state handle through conditioning. Those sources
+        // are resident at checks, not merely part of layer_scratch's whole-walk guard. Keep a
+        // source-shaped upper here even for an unpicked trailing layer; no retirement credit.
+        walk = resident_text_walk_bytes(te_cfg, n)?;
         let scratch = |k: usize| {
             let (layer, held) = crate::text_encoder::decoder_layer_parts(te_cfg, n_i, k);
             layer.saturating_add(held)
@@ -4063,14 +4153,14 @@ fn restoration_with_sources(
                         Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
                     })?,
             ),
-            stored(&sources.empty_headers, |_| true),
+            materialized_load_bytes(&sources.empty_headers, |_| true)?,
         )
     } else {
         let states = held_states(&resources.export.empty_prompt_path())?;
-        let prompt_floor = stored(
+        let prompt_floor = materialized_load_bytes(
             &crate::stream::headers(&resources.export.empty_prompt_path())?,
             |_| true,
-        );
+        )?;
         (states, prompt_floor)
     };
     let owned_plan;
@@ -4329,6 +4419,65 @@ fn depth(
     depth_with_sources(req, opts, export, token, None)
 }
 
+/// Fresh outputs the depth loader's constructors retain BESIDE source-file buffers until final
+/// parameter evaluation: projection-bias compute casts, f32 norm/modulation/table casts, and the
+/// reducer's compute casts. A raw file floor does not include a newly created target buffer.
+/// Keys are Backbone's already-normalized logical names; no source reopen or string allocation.
+fn depth_constructor_output_bytes(
+    headers: &std::collections::HashMap<String, Header>,
+    precision: Precision,
+    streamed: bool,
+) -> Result<u64> {
+    let compute = match precision {
+        Precision::Bf16 => (2u64, Stored::BF16),
+        Precision::Fp32 => (4u64, Stored::F32),
+    };
+    let overflow = || Error::Unsupported("Iris depth constructor byte arithmetic overflow".into());
+    headers
+        .iter()
+        .filter(|(name, _)| !streamed || Stack::of(name).is_none())
+        .try_fold(0u64, |sum, (name, header)| {
+            let linear_bias = name.strip_suffix(".bias").is_some_and(|base| {
+                headers.iter().any(|(key, sibling)| {
+                    sibling.shape.len() == 2 && key.strip_suffix(".weight") == Some(base)
+                })
+            });
+            let target =
+                if name == "depth_reducer.weight" || name == "depth_reducer.bias" || linear_bias {
+                    Some(compute)
+                } else if name == "y_pos_embedding"
+                    || header.shape.len() == 1 && name.ends_with(".weight")
+                    || name.ends_with(".bias")
+                {
+                    Some((4, Stored::F32))
+                } else {
+                    None
+                };
+            let Some((width, dtype)) = target else {
+                return Ok(sum);
+            };
+            let reducer = name == "depth_reducer.weight" || name == "depth_reducer.bias";
+            let read_dtype = if !reducer
+                && header.shape.len() >= 2
+                && name != "y_pos_embedding"
+                && !crate::stream::is_packed_part_header(header)
+            {
+                compute.1
+            } else {
+                header.dtype
+            };
+            if read_dtype == dtype {
+                return Ok(sum);
+            }
+            let bytes = header.shape.iter().try_fold(width, |n, dim| {
+                n.checked_mul(*dim as u64).ok_or_else(overflow)
+            })?;
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
+                .and_then(|bytes| sum.checked_add(bytes))
+                .ok_or_else(overflow)
+        })
+}
+
 fn depth_with_sources(
     req: &IosPricingRequest<'_>,
     opts: Pricing,
@@ -4376,14 +4525,14 @@ fn depth_with_sources(
                         Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
                     })?,
             ),
-            stored(&sources.empty_headers, |_| true),
+            materialized_load_bytes(&sources.empty_headers, |_| true)?,
         )
     } else {
         let states = held_states(&export.empty_prompt_path())?;
-        let prompt_floor = stored(
+        let prompt_floor = materialized_load_bytes(
             &crate::stream::headers(&export.empty_prompt_path())?,
             |_| true,
-        );
+        )?;
         (states, prompt_floor)
     };
     let window = export_window(streamed);
@@ -4479,15 +4628,18 @@ fn depth_with_sources(
         patch_width: config.model.patch_size as u32,
         patch_height: config.model.patch_size as u32,
     };
+    let constructor_outputs =
+        depth_constructor_output_bytes(&bb.facts.headers, spec.precision, streamed)?;
     take_source_at(
         &mut pricing,
         IosPhase::Load,
         0,
-        caller_rgb,
+        caller_rgb.checked_add(constructor_outputs).ok_or_else(||
+            Error::Unsupported("Iris depth load held byte arithmetic overflow".into()))?,
         &[(crate::depth::quanta::LOAD, bb.floor + prompt_floor)],
         basis.clone(),
         "iris.depth.load",
-        "depth::load_depth_export source closure",
+        "depth::load_depth_export raw floor plus retained constructor-output upper (not entry lower)",
         1,
     );
     let input = crate::depth::depth_input_scratch(1, h as i32, w as i32);
@@ -5212,6 +5364,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actual_zero_native_stage_keeps_coverage_without_inventing_scratch() {
+        let mut priced = Priced::default();
+        take_source_at(
+            &mut priced,
+            IosPhase::Load,
+            12,
+            3,
+            &[(crate::adapters::ADAPTER_HOST_QUANTUM, 0)],
+            IosWorkBasis::default(),
+            "test/actual_zero_stage",
+            "test/retained_owners",
+            1,
+        );
+        assert_eq!(
+            priced.quanta,
+            [(IosPhase::Load, crate::adapters::ADAPTER_HOST_QUANTUM, 0)]
+        );
+        assert_eq!(priced.pricing.windows.len(), 1);
+        assert_eq!(priced.pricing.windows[0].scratch_bytes, 0);
+        assert_eq!(priced.pricing.windows[0].logical_peak_bytes(), 15);
+        let phase = priced.pricing.phase(IosPhase::Load).unwrap();
+        assert_eq!(phase.scratch_bytes, 0);
+        assert_eq!(phase.resident_bytes, 15);
+    }
+
     /// Every quantum label the crate checks is attributed to a phase.
     ///
     /// *Mutation that reds this:* dropping any arm of `ios_quantum_phase`.
@@ -5549,5 +5727,137 @@ mod materialized_load_floor_tests {
         header.data_bytes = u64::MAX - (crate::retention::PAGE_BYTES - 1);
         let headers = [header, core_codes("modulation_cores.adaln_txt.weight", 8)];
         assert!(materialized_load_bytes(&headers, |_| true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod resident_text_walk_tests {
+    use super::*;
+
+    #[test]
+    fn tower_rope_is_a_model_owned_row_not_a_file_projection() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/text_encoder");
+        let cfg = mlx_llm::ModelConfig::from_dir(&dir).unwrap();
+        assert_eq!(
+            tower_rope_bytes(&cfg).unwrap(),
+            allocated(4 * cfg.rotary_dim() as u64)
+        );
+        assert!(tower_rope_bytes(&cfg).unwrap() > 0);
+    }
+
+    #[test]
+    fn resident_walk_prices_every_hidden_state_and_each_layer_kv_pair() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/text_encoder");
+        let cfg = mlx_llm::ModelConfig::from_dir(&dir).unwrap();
+        let tokens = 41;
+        let state = allocated(2 * tokens * cfg.hidden_size as u64);
+        let block = mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS as u64;
+        let one_cache = allocated(
+            2 * tokens.div_ceil(block) * block * cfg.num_kv_heads as u64 * cfg.head_dim as u64,
+        );
+        assert_eq!(
+            resident_text_walk_bytes(&cfg, tokens).unwrap(),
+            (cfg.num_layers as u64 + 1) * state
+                + 2 * cfg.num_layers as u64 * one_cache
+                + allocated(4 * tokens)
+                + 2 * allocated(2 * tokens * cfg.rotary_dim() as u64)
+        );
+        assert!(resident_text_walk_bytes(&cfg, tokens).unwrap() > state);
+    }
+
+    #[test]
+    fn resident_walk_rounds_source_operands_and_rejects_overflow() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot/text_encoder");
+        let cfg = mlx_llm::ModelConfig::from_dir(&dir).unwrap();
+        let tokens = 257;
+        let state = allocated(2 * tokens * cfg.hidden_size as u64);
+        assert!(state > 2 * tokens * cfg.hidden_size as u64);
+        let walk = resident_text_walk_bytes(&cfg, tokens).unwrap();
+        assert!(walk >= (cfg.num_layers as u64 + 1) * state);
+        assert!(resident_text_walk_bytes(&cfg, u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod depth_constructor_output_tests {
+    use super::*;
+
+    fn h(name: &str, dtype: Stored, shape: &[usize], bytes: u64) -> Header {
+        Header {
+            name: name.into(),
+            dtype,
+            shape: shape.to_vec(),
+            data_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn constructor_target_is_compared_with_post_read_dtype() {
+        // A broadcastable matrix-shaped modulation bias is narrowed by the read policy, then
+        // l.f32 restores it to f32. Its stored f32 dtype does NOT make the constructor an alias.
+        let header = h("blocks.0.adaln.bias", Stored::F32, &[1, 384], 1536);
+        let headers = [(header.name.clone(), header)].into_iter().collect();
+        assert_eq!(
+            depth_constructor_output_bytes(&headers, Precision::Bf16, false).unwrap(),
+            1536
+        );
+    }
+
+    #[test]
+    fn constructor_outputs_include_bias_norm_and_reducer_casts_not_file_aliases() {
+        let headers = [
+            h("linear.weight", Stored::U32, &[384, 8], 12288),
+            h("linear.bias", Stored::F32, &[384], 1536),
+            h("norm.weight", Stored::BF16, &[64], 128),
+            h("depth_reducer.weight", Stored::F32, &[1, 3, 1, 1], 12),
+            h("depth_reducer.bias", Stored::F32, &[1], 4),
+        ]
+        .into_iter()
+        .map(|h| (h.name.clone(), h))
+        .collect();
+        assert_eq!(
+            depth_constructor_output_bytes(&headers, Precision::Bf16, false).unwrap(),
+            384 * 2 + 64 * 4 + 3 * 2 + 2
+        );
+    }
+
+    #[test]
+    fn streamed_constructor_upper_excludes_unloaded_stack_parameters() {
+        let headers = [
+            h("blocks.0.proj.weight", Stored::BF16, &[64, 64], 8192),
+            h("blocks.0.proj.bias", Stored::F32, &[64], 256),
+            h("depth_reducer.bias", Stored::F32, &[1], 4),
+        ]
+        .into_iter()
+        .map(|h| (h.name.clone(), h))
+        .collect();
+        assert_eq!(
+            depth_constructor_output_bytes(&headers, Precision::Bf16, true).unwrap(),
+            2
+        );
+        assert_eq!(
+            depth_constructor_output_bytes(&headers, Precision::Bf16, false).unwrap(),
+            130
+        );
+    }
+
+    #[test]
+    fn depth_packing_forecast_keeps_outside_prefix_reducer_verbatim() {
+        let source = [
+            h("depth_reducer.weight", Stored::F32, &[1, 3, 1, 1], 12),
+            h("pixel.proj.weight", Stored::F32, &[64, 64], 16384),
+        ];
+        let packed = emulate_packed_backbone(&source, "pixel.", Quant::Q4).unwrap();
+        let reducer = packed
+            .iter()
+            .find(|h| h.name == "depth_reducer.weight")
+            .unwrap();
+        assert_eq!(reducer.dtype, Stored::F32);
+        assert_eq!(reducer.shape, [1, 3, 1, 1]);
+        assert_eq!(reducer.data_bytes, 12);
+        assert!(packed.iter().any(|h| h.name == "pixel.proj.scales"));
     }
 }

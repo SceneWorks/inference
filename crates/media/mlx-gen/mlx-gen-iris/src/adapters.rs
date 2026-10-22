@@ -88,6 +88,8 @@ pub(crate) const ADAPTER_LOAD_QUANTUM: &str = "Iris adapter load";
 /// Lazy residual reconstruction, guarded immediately before the Loader evaluates its payloads.
 pub(crate) const ADAPTER_MATERIALIZE_QUANTUM: &str = "Iris adapter materialize";
 pub(crate) const ADAPTER_HOST_QUANTUM: &str = "Iris adapter host";
+/// Evaluating packed logical-width arrays and the original try_item(Int32) conversions.
+pub(crate) const ADAPTER_WIDTH_QUANTUM: &str = "Iris adapter width read";
 
 /// The dense adapter install host uses one F32 scalar per packed projection as the backing of its
 /// zero-stride logical placeholder. The BF16 cast/broadcast expressions are never evaluated by
@@ -97,6 +99,17 @@ pub fn host_constructor_bytes(packed_projections: u64) -> Result<u64> {
     packed_projections
         .checked_mul(4)
         .ok_or_else(|| Error::Unsupported("iris: adapter host scalar byte sum overflow".into()))
+}
+
+fn add_width_read_bytes(total: u64, source: u64, cast: u64) -> Result<u64> {
+    let page = crate::retention::PAGE_BYTES;
+    mlx_gen::ios_quantum::fresh_metal_allocation_bytes(source, page)
+        .and_then(|source| {
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(cast, page)
+                .and_then(|cast| source.checked_add(cast))
+        })
+        .and_then(|bytes| total.checked_add(bytes))
+        .ok_or_else(|| Error::Unsupported("iris: logical-width read accounting overflow".into()))
 }
 
 /// Every 2-D `‹path›.weight` of the checkpoint as an [`AdaptableLinear`] (with its `‹path›.bias`),
@@ -115,7 +128,11 @@ impl ProjectionHost {
     /// The host is read through [`peek`], never `Weights::get`/`require`: those mark a key as
     /// consumed, and the backbone build's unused-key check (config vs checkpoint) must see only the
     /// keys the configured architecture reads — not every projection the install could reach.
-    fn from_weights(weights: &mut Weights, compute: Dtype) -> Result<Self> {
+    fn from_weights(
+        weights: &mut Weights,
+        compute: Dtype,
+        shapes: &BTreeMap<String, [i32; 2]>,
+    ) -> Result<Self> {
         let mut keys: Vec<String> = weights
             .keys()
             .filter(|key| key.ends_with(".weight"))
@@ -135,16 +152,12 @@ impl ProjectionHost {
             // placeholder of its LOGICAL `[out, in]` shape (a broadcast scalar — never a dense
             // copy), and [`crate::nn::Loader::linear`] moves the installed adapters onto the
             // stored pack. The adapters never read the base, so this is the dense install exactly.
-            if let Some(scales) = peek(weights, &format!("{path}.scales")) {
-                let group = crate::nn::QUANT_GROUP_SIZE as i32;
-                let padded_in = scales.shape()[1] * group;
-                let in_features = match peek(
-                    weights,
-                    &format!("{path}{}", crate::packed::IN_FEATURES_SUFFIX),
-                ) {
-                    Some(width) => width.item::<i32>(),
-                    None => padded_in,
-                };
+            if peek(weights, &format!("{path}.scales")).is_some() {
+                // Reuse the actual first try_item conversion under this exclusive Weights
+                // borrow. Re-reading a non-I32 marker would allocate another cast buffer.
+                let in_features = shapes.get(path).ok_or_else(|| {
+                    Error::MissingTensor(format!("iris: missing inspected projection {path}"))
+                })?[1];
                 let placeholder = mlx_rs::ops::broadcast_to(
                     Array::from_f32(0.0).as_dtype(compute)?,
                     &[weight.shape()[0], in_features],
@@ -178,9 +191,11 @@ fn peek(weights: &mut Weights, key: &str) -> Option<Array> {
 /// Shapes the actual dense install host exposes, including the logical (unpadded) width of an
 /// already-packed artifact. Only the packed width scalar is read; no base cast/placeholder is built.
 fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, [i32; 2]>, u64)> {
-    // Borrow metadata only: get() would mark consumption and clone key strings; neither a
-    // cloned key list nor a tensor/shape allocation belongs ahead of this native check.
+    // Fully borrowed metadata pass: no get()/consumption, cloned key/shape list, or evaluation.
+    // try_item::<i32> preserves MLX's original numeric conversion surface. Its source eval and
+    // optional Int32 cast are both covered, including any later invalid-single-value rejection.
     let mut packed = 0_u64;
+    let mut read_bytes = 0_u64;
     for key in weights.keys() {
         let Some(path) = key.strip_suffix(".weight") else {
             continue;
@@ -188,20 +203,53 @@ fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, 
         let Some(weight) = weights.peek(key) else {
             continue;
         };
-        if weight.ndim() == 2
-            && weights
-                .keys()
-                .any(|name| name.strip_suffix(".scales") == Some(path))
-        {
-            packed = packed.checked_add(1).ok_or_else(|| {
-                Error::Unsupported("iris: packed adapter-host projection count overflow".into())
+        if weight.ndim() != 2 {
+            continue;
+        }
+        let Some(scales_key) = weights
+            .keys()
+            .find(|name| name.strip_suffix(".scales") == Some(path))
+        else {
+            continue;
+        };
+        let scales = weights
+            .peek(scales_key)
+            .expect("a borrowed existing scales key");
+        if scales.ndim() != 2 {
+            return Err(Error::Unsupported(format!(
+                "iris: {path} has non-matrix packed scales"
+            )));
+        }
+        scales.shape()[1]
+            .checked_mul(crate::nn::QUANT_GROUP_SIZE as i32)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("iris: {path} packed width overflows MLX shape"))
             })?;
+        packed = packed
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("iris: packed host count overflow".into()))?;
+        if let Some(width_key) = weights
+            .keys()
+            .find(|name| name.strip_suffix(crate::packed::IN_FEATURES_SUFFIX) == Some(path))
+        {
+            let width = weights.peek(width_key).expect("a borrowed existing key");
+            let elements = u64::try_from(width.size())
+                .map_err(|_| Error::Unsupported("iris: width element count overflow".into()))?;
+            let source = elements
+                .checked_mul(width.item_size() as u64)
+                .ok_or_else(|| Error::Unsupported("iris: width source byte overflow".into()))?;
+            let cast = if width.dtype() == Dtype::Int32 {
+                0
+            } else {
+                elements
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::Unsupported("iris: width cast byte overflow".into()))?
+            };
+            read_bytes = add_width_read_bytes(read_bytes, source, cast)?;
         }
     }
-    if packed != 0 {
-        // Packed-format width markers are scalar I32 (four bytes); validate that metadata below
-        // before try_item. This guard protects the sum of their native source payloads.
-        mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_constructor_bytes(packed)?)?;
+    if read_bytes != 0 {
+        mlx_gen::ios_quantum::before(ADAPTER_WIDTH_QUANTUM, read_bytes)?;
     }
     let keys: Vec<String> = weights
         .keys()
@@ -228,23 +276,22 @@ fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, 
                 .ok_or_else(|| {
                     Error::Unsupported(format!("iris: {path} packed width overflows MLX shape"))
                 })?;
-            match peek(
+            let input = match peek(
                 weights,
                 &format!("{path}{}", crate::packed::IN_FEATURES_SUFFIX),
             ) {
-                Some(width) => {
-                    if width.dtype() != Dtype::Int32 || !width.shape().is_empty() {
-                        return Err(Error::Unsupported(format!(
-                            "iris: {path} packed width must be a scalar I32"
-                        )));
-                    }
-                    width.try_item::<i32>()?
-                }
+                Some(width) => width.try_item::<i32>()?,
                 None => padded,
-            }
+            };
+            width_from_number(f64::from(input), padded)?
         } else {
             weight.shape()[1]
         };
+        if input <= 0 {
+            return Err(Error::Unsupported(format!(
+                "iris: {path} logical width must be positive"
+            )));
+        }
         shapes.insert(path.to_owned(), [weight.shape()[0], input]);
     }
     Ok((shapes, packed))
@@ -282,6 +329,13 @@ pub fn adapter_identity(path: &Path) -> Result<HashMap<String, String>> {
 /// Install `specs` (in order, stacking) onto the projections of `weights` at the `compute` dtype for
 /// `task` on `base_model`. Returns the adapted projections for the model build and one report per
 /// file. An empty `specs` is `Ok(None)` (the bare build).
+///
+/// Native width guards account for visible scalar payload and Int32 conversion on the closed
+/// file-source path, whose storage extent is known. This public function also preserves arbitrary
+/// caller-supplied views and lazy Arrays: backing/data extents and pending producer allocations
+/// are not inferable from scalar shape or availability alone. Those opaque allocations are NOT
+/// certified by this payload-sized guard; no speculative refusal, graph cap, or trusted-producer
+/// assertion is introduced here.
 pub fn install(
     weights: &mut Weights,
     compute: Dtype,
@@ -299,12 +353,17 @@ pub fn install(
     let load_facts = inventory.projection_loads()?;
     let file_reads = inventory.file_read_facts()?;
     let host_bytes = host_constructor_bytes(packed)?;
-    // Only packed projections construct scalar-backed placeholders. A dense install creates no
-    // native host payload here: its first allocating boundary is the file's ADAPTER_LOAD check.
-    if host_bytes != 0 {
-        mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_bytes)?;
+    // Dense host construction allocates no native payload. Admit the first real file read
+    // before entering its zero-native host stage; keep the stronger source+constructor check
+    // immediately before each strict loader below. Packed hosts were guarded before width reads.
+    if packed == 0 {
+        let first = file_reads
+            .first()
+            .ok_or_else(|| Error::Unsupported("iris: no adapter file read facts".into()))?;
+        mlx_gen::ios_quantum::before(ADAPTER_LOAD_QUANTUM, first.file_floor_bytes)?;
     }
-    let mut host = ProjectionHost::from_weights(weights, compute)?;
+    mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_bytes)?;
+    let mut host = ProjectionHost::from_weights(weights, compute, &shapes)?;
     let mut reports = Vec::with_capacity(specs.len());
     for (spec, read) in specs.iter().zip(&file_reads) {
         // Guard immediately before the strict loader opens this file and creates its lazy graph
@@ -330,11 +389,135 @@ pub fn install(
     )))
 }
 
-/// Logical shapes of the same projections ProjectionHost exposes. Header-only except for the
-/// packed format's optional four-byte `.in_features` scalar, read with the shared bounded payload
-/// reader. No weights or MLX arrays are loaded before admission. The second result is the actual
-/// number of packed candidates whose install host creates a scalar-backed placeholder.
+/// Header-only projection facts. A native logical-width read may evaluate its original dtype
+/// and allocate an Int32 conversion; placeholder construction is a separate native operation.
+pub(crate) struct ProjectionHostHeaderFacts {
+    pub shapes: BTreeMap<String, [i32; 2]>,
+    pub packed_projections: u64,
+    pub width_read_bytes: u64,
+}
+
 pub fn projection_shapes_from_headers(path: &Path) -> Result<(BTreeMap<String, [i32; 2]>, u64)> {
+    let facts = projection_host_facts_from_headers(path)?;
+    Ok((facts.shapes, facts.packed_projections))
+}
+
+fn width_from_number(value: f64, padded: i32) -> Result<i32> {
+    // Native astype(Int32) truncates valid finite numeric values. Outside this range there is no
+    // valid logical MLX dimension: refuse, rather than wrap an integer payload into a small width.
+    let value = value.trunc();
+    if !value.is_finite() || !(1.0..=f64::from(padded)).contains(&value) {
+        return Err(Error::Unsupported(
+            "iris: logical width is outside its packed input".into(),
+        ));
+    }
+    Ok(value as i32)
+}
+
+fn width_from_payload(
+    dtype: mlx_gen::gen_core::weightsmeta::Dtype,
+    bytes: &[u8],
+    padded: i32,
+) -> Result<i32> {
+    width_from_payload_after_read(dtype, bytes, padded, false)
+}
+
+fn width_from_payload_after_read(
+    dtype: mlx_gen::gen_core::weightsmeta::Dtype,
+    bytes: &[u8],
+    padded: i32,
+    matrix_bf16: bool,
+) -> Result<i32> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as S;
+    let bad = || Error::Unsupported("iris: malformed logical-width payload".into());
+    if bytes.len() != dtype.size() {
+        return Err(bad());
+    }
+    let number = match dtype {
+        S::BOOL => {
+            let value = *bytes.first().ok_or_else(bad)?;
+            if value > 1 {
+                return Err(bad());
+            }
+            f64::from(value)
+        }
+        S::U8 => f64::from(*bytes.first().ok_or_else(bad)?),
+        S::I8 => f64::from(i8::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::I16 => f64::from(i16::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::U16 => f64::from(u16::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::I32 => f64::from(i32::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::U32 => f64::from(u32::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::I64 => i64::from_le_bytes(bytes.try_into().map_err(|_| bad())?) as f64,
+        S::U64 => u64::from_le_bytes(bytes.try_into().map_err(|_| bad())?) as f64,
+        S::F32 => f64::from(f32::from_le_bytes(bytes.try_into().map_err(|_| bad())?)),
+        S::F64 => f64::from_le_bytes(bytes.try_into().map_err(|_| bad())?),
+        S::BF16 => f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes(bytes.try_into().map_err(|_| bad())?)) << 16,
+        )),
+        S::F16 => {
+            let bits = u16::from_le_bytes(bytes.try_into().map_err(|_| bad())?);
+            let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+            let exponent = (bits >> 10) & 31;
+            let fraction = bits & 1023;
+            match exponent {
+                0 => sign * f64::from(fraction) * 2.0f64.powi(-24),
+                31 => return Err(bad()),
+                e => sign * (1.0 + f64::from(fraction) / 1024.0) * 2.0f64.powi(i32::from(e) - 15),
+            }
+        }
+        // MLX's dtype/file loader does not provide these safetensors FP8 marker formats.
+        S::F8_E4M3 | S::F8_E5M2 | S::F8_E8M0 => {
+            return Err(Error::Unsupported(
+                "iris: unsupported FP8 logical-width format".into(),
+            ))
+        }
+    };
+    let number = if matrix_bf16 {
+        // read_backbone_tensor converts rank>=2, non-U32 markers to BF16 on the packed
+        // compute policy. Match the exact native bf16.h round-to-nearest-even before item().
+        let value = number as f32;
+        if value.is_nan() {
+            return Err(bad());
+        }
+        let bits = value.to_bits();
+        let rounded = bits.wrapping_add(((bits >> 16) & 1) + 0x7fff) & 0xffff0000;
+        f64::from(f32::from_bits(rounded))
+    } else {
+        number
+    };
+    width_from_number(number, padded)
+}
+
+fn width_read_layout(
+    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> (u64, bool) {
+    use mlx_gen::gen_core::weightsmeta::Dtype as S;
+    // Valid packed file loads run under BF16. Keep the actual existing read policy: U32 is a
+    // stored packed part; other rank>=2 marker arrays pass through read_backbone_tensor's cast.
+    let matrix_bf16 = header.shape.len() >= 2 && header.dtype != S::U32;
+    (if matrix_bf16 { 2 } else { header.data_bytes }, matrix_bf16)
+}
+
+fn validate_width_header(
+    header: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> Result<()> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as S;
+    if header.element_count().map_err(Error::from)? != 1
+        || header.data_bytes != header.dtype.size() as u64
+    {
+        return Err(Error::Unsupported(
+            "iris: logical-width marker must contain one value".into(),
+        ));
+    }
+    if matches!(header.dtype, S::F8_E4M3 | S::F8_E5M2 | S::F8_E8M0) {
+        return Err(Error::Unsupported(
+            "iris: unsupported FP8 logical-width format".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn projection_host_facts_from_headers(path: &Path) -> Result<ProjectionHostHeaderFacts> {
     use mlx_gen::gen_core::weightsmeta as wm;
     let headers = wm::safetensors_path_tensor_headers(path).map_err(Error::from)?;
     let by_name: BTreeMap<&str, &wm::SafetensorsTensorHeader> =
@@ -349,15 +532,33 @@ pub fn projection_shapes_from_headers(path: &Path) -> Result<(BTreeMap<String, [
                 .then(|| format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX))
         })
         .collect();
-    let widths = wm::read_safetensors_tensor_payloads(path, |h| width_keys.contains(&h.name), 4)
-        .map_err(Error::from)?;
+    let mut read_limit = 0;
+    let mut width_read_bytes = 0;
+    for header in headers.iter().filter(|h| width_keys.contains(&h.name)) {
+        validate_width_header(header)?;
+        read_limit = read_limit.max(header.data_bytes);
+        let (post_read_bytes, matrix_bf16) = width_read_layout(header);
+        width_read_bytes = add_width_read_bytes(
+            width_read_bytes,
+            post_read_bytes,
+            if !matrix_bf16 && header.dtype == wm::Dtype::I32 {
+                0
+            } else {
+                4
+            },
+        )?;
+    }
+    // The payload bound is derived from the validated selected scalar formats, not a user cap.
+    let widths =
+        wm::read_safetensors_tensor_payloads(path, |h| width_keys.contains(&h.name), read_limit)
+            .map_err(Error::from)?;
     let to_i32 = |d: usize| {
         i32::try_from(d).map_err(|_| {
             Error::Unsupported("iris: projection dimension exceeds MLX's i32 shape".into())
         })
     };
-    let mut projections = BTreeMap::new();
-    let mut packed = 0_u64;
+    let mut shapes = BTreeMap::new();
+    let mut packed_projections = 0u64;
     for h in &headers {
         let Some(base) = h.name.strip_suffix(".weight") else {
             continue;
@@ -366,52 +567,42 @@ pub fn projection_shapes_from_headers(path: &Path) -> Result<(BTreeMap<String, [
             continue;
         }
         let out = to_i32(h.shape[0])?;
-        let input =
-            if let Some(scales) = by_name.get(format!("{base}.scales").as_str()) {
-                if scales.shape.len() != 2 {
-                    return Err(Error::Unsupported(format!(
-                        "iris: {base} has non-matrix scales"
-                    )));
-                }
-                packed = packed.checked_add(1).ok_or_else(|| {
-                    Error::Unsupported("iris: packed adapter-host projection count overflow".into())
+        let input = if let Some(scales) = by_name.get(format!("{base}.scales").as_str()) {
+            if scales.shape.len() != 2 {
+                return Err(Error::Unsupported(format!(
+                    "iris: {base} has non-matrix scales"
+                )));
+            }
+            packed_projections = packed_projections
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("iris: packed host count overflow".into()))?;
+            let padded = scales.shape[1]
+                .checked_mul(crate::nn::QUANT_GROUP_SIZE)
+                .ok_or_else(|| {
+                    Error::Unsupported("iris: packed projection width overflow".into())
                 })?;
-                let padded = scales.shape[1]
-                    .checked_mul(crate::nn::QUANT_GROUP_SIZE)
-                    .ok_or_else(|| {
-                        Error::Unsupported("iris: packed projection width overflow".into())
-                    })?;
-                let padded = to_i32(padded)?;
-                let key = format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX);
-                if let Some(bytes) = widths.get(&key) {
-                    let header = by_name[key.as_str()];
-                    if header.dtype != wm::Dtype::I32
-                        || header.element_count().map_err(Error::from)? != 1
-                        || bytes.len() != 4
-                    {
-                        return Err(Error::Unsupported(format!(
-                            "iris: {key} must be one I32 logical-width scalar"
-                        )));
-                    }
-                    let width =
-                        i32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
-                            Error::Msg("iris: malformed logical-width payload".into())
-                        })?);
-                    if width <= 0 || width > padded {
-                        return Err(Error::Unsupported(format!(
-                            "iris: {base} logical width {width} is outside its {padded}-wide pack"
-                        )));
-                    }
-                    width
+            let padded = to_i32(padded)?;
+            let key = format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX);
+            if let Some(bytes) = widths.get(&key) {
+                let header = by_name[key.as_str()];
+                if width_read_layout(header).1 {
+                    width_from_payload_after_read(header.dtype, bytes, padded, true)?
                 } else {
-                    padded
+                    width_from_payload(header.dtype, bytes, padded)?
                 }
             } else {
-                to_i32(h.shape[1])?
-            };
-        projections.insert(base.to_owned(), [out, input]);
+                padded
+            }
+        } else {
+            to_i32(h.shape[1])?
+        };
+        shapes.insert(base.to_owned(), [out, input]);
     }
-    Ok((projections, packed))
+    Ok(ProjectionHostHeaderFacts {
+        shapes,
+        packed_projections,
+        width_read_bytes,
+    })
 }
 
 /// Read only JSON headers and metadata — never an adapter tensor payload or MLX array — and describe the
@@ -905,4 +1096,105 @@ fn native_header_dtype(dtype: mlx_gen::gen_core::weightsmeta::Dtype) -> Result<D
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod width_payload_tests {
+    use super::*;
+    use mlx_gen::gen_core::weightsmeta::{Dtype as S, SafetensorsTensorHeader as Header};
+
+    #[test]
+    fn header_numeric_widths_preserve_valid_native_int32_conversions() {
+        let cases = [
+            (S::BOOL, vec![1], 1),
+            (S::U8, vec![128], 128),
+            (S::I8, vec![127], 127),
+            (S::I16, 128i16.to_le_bytes().to_vec(), 128),
+            (S::U16, 128u16.to_le_bytes().to_vec(), 128),
+            (S::I32, 128i32.to_le_bytes().to_vec(), 128),
+            (S::U32, 128u32.to_le_bytes().to_vec(), 128),
+            (S::I64, 128i64.to_le_bytes().to_vec(), 128),
+            (S::U64, 128u64.to_le_bytes().to_vec(), 128),
+            (S::F16, 0x5800u16.to_le_bytes().to_vec(), 128),
+            (S::BF16, 0x4300u16.to_le_bytes().to_vec(), 128),
+            (S::F32, 128.75f32.to_le_bytes().to_vec(), 128),
+            (S::F64, 128.75f64.to_le_bytes().to_vec(), 128),
+        ];
+        for (dtype, bytes, expected) in cases {
+            assert_eq!(
+                width_from_payload(dtype, &bytes, 256).unwrap(),
+                expected,
+                "{dtype:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_metadata_accepts_one_value_at_any_rank_but_rejects_bad_counts() {
+        for shape in [vec![], vec![1], vec![1, 1]] {
+            let header = Header {
+                name: "p.in_features".into(),
+                dtype: S::I64,
+                shape,
+                data_bytes: 8,
+            };
+            validate_width_header(&header).unwrap();
+        }
+        let mut header = Header {
+            name: "p.in_features".into(),
+            dtype: S::I64,
+            shape: vec![2],
+            data_bytes: 16,
+        };
+        assert!(validate_width_header(&header).is_err());
+        header.shape = vec![1];
+        header.data_bytes = 4;
+        assert!(validate_width_header(&header).is_err());
+        assert!(width_from_payload(S::I64, &(-1i64).to_le_bytes(), 256).is_err());
+        assert!(
+            width_from_payload(S::I64, &(i64::from(i32::MAX) + 1).to_le_bytes(), i32::MAX).is_err()
+        );
+        assert!(width_from_payload(S::U64, &u64::MAX.to_le_bytes(), 256).is_err());
+        assert!(width_from_payload(S::F64, &f64::NAN.to_le_bytes(), 256).is_err());
+        assert!(width_from_payload(S::F32, &f32::INFINITY.to_le_bytes(), 256).is_err());
+        assert!(width_from_payload(S::I32, &257i32.to_le_bytes(), 256).is_err());
+        assert!(width_from_payload(S::I32, &[0, 1], 256).is_err());
+    }
+
+    #[test]
+    fn header_matrix_markers_follow_the_existing_bfloat_read_before_item() {
+        let mut header = Header {
+            name: "p.in_features".into(),
+            dtype: S::I32,
+            shape: vec![1, 1],
+            data_bytes: 4,
+        };
+        assert_eq!(width_read_layout(&header), (2, true));
+        assert_eq!(
+            width_from_payload_after_read(S::I32, &257i32.to_le_bytes(), 320, true).unwrap(),
+            256
+        );
+        header.shape = vec![1];
+        assert_eq!(width_read_layout(&header), (4, false));
+        assert_eq!(
+            width_from_payload(S::I32, &257i32.to_le_bytes(), 320).unwrap(),
+            257
+        );
+        header.shape = vec![1, 1];
+        header.dtype = S::U32;
+        assert_eq!(
+            width_read_layout(&header),
+            (4, false),
+            "stored U32 parts are not compute cast"
+        );
+    }
+
+    #[test]
+    fn marker_read_cost_counts_source_and_original_cast_without_a_dtype_cap() {
+        assert_eq!(add_width_read_bytes(0, 4, 0).unwrap(), 4);
+        assert_eq!(add_width_read_bytes(0, 8, 4).unwrap(), 12);
+        assert_eq!(add_width_read_bytes(0, 2, 4).unwrap(), 6);
+        assert!(add_width_read_bytes(u64::MAX, 8, 4).is_err());
+        assert!(add_width_read_bytes(0, u64::MAX, 4).is_err());
+    }
 }

@@ -135,6 +135,10 @@ impl IrisRestorer {
     /// CPU path. `OffloadPolicy` is advisory and this route has a single heavy component, so it is
     /// always resident.
     pub fn load(spec: &LoadSpec) -> Result<Self> {
+        // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+        // generation. Keep this existing enabled-only policy alive through all load evaluations.
+        let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
         refuse_unsupported_spec(spec)?;
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
         let weights = resources.export.weights_path();
@@ -144,7 +148,7 @@ impl IrisRestorer {
         // of [`crate::stream::TRANSFORMER_WINDOW_SIZE`]; the transform has no request channel for
         // a selection, so the load shape is its rung-4 engagement.
         let streamed = spec.load_shape == gen_core::LoadShape::DeferredMaterialization;
-        mlx_gen::ios_quantum::before_load_where(
+        crate::stream::before_materialized_load(
             quanta::LOAD,
             &[
                 resources.export.weights_path(),

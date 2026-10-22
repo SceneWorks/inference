@@ -176,6 +176,10 @@ pub fn load_backbone_quantized(
     base_model: &str,
     quant: Option<Quant>,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
+    // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+    // generation. Keep this existing enabled-only policy alive through all load evaluations.
+    let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
     #[cfg(all(test, target_os = "macos"))]
     crate::anchor_tests::record_generation_loader_entry("backbone");
     let requested = quant;
@@ -193,7 +197,11 @@ pub fn load_backbone_quantized(
         )));
     }
     let quant = if artifact.is_some() { None } else { quant };
-    mlx_gen::ios_quantum::before_load(BACKBONE_LOAD_QUANTUM, std::slice::from_ref(&path))?;
+    crate::stream::before_materialized_load(
+        BACKBONE_LOAD_QUANTUM,
+        std::slice::from_ref(&path),
+        |_| true,
+    )?;
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     // The release ships FP32. Cast every matrix to the compute dtype ONE TENSOR AT A TIME and
@@ -257,6 +265,10 @@ pub fn load_backbone_streamed(
     quant: Option<Quant>,
     default_window: Option<usize>,
 ) -> Result<IrisDiT> {
+    // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+    // generation. Keep this existing enabled-only policy alive through all load evaluations.
+    let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
     #[cfg(all(test, target_os = "macos"))]
     crate::anchor_tests::record_generation_loader_entry("backbone");
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
@@ -270,7 +282,7 @@ pub fn load_backbone_streamed(
         )));
     }
     let skeleton = |name: &str| crate::dit::Stack::of(name).is_none();
-    mlx_gen::ios_quantum::before_load_where(
+    crate::stream::before_materialized_load(
         BACKBONE_LOAD_QUANTUM,
         std::slice::from_ref(&path),
         skeleton,
@@ -345,6 +357,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 /// The concrete loader shared by the public adapter and endpoint-ownership proofs.
 pub(crate) fn load_model(spec: &LoadSpec) -> Result<Iris3b> {
+    // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+    // generation. Keep this existing enabled-only policy alive through all load evaluations.
+    let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
     refuse_unsupported_spec(spec)?;
     let resources = GenerationResources::from_spec(spec, MODEL_ID)?;
     let config = IrisConfig::from_dir(&resources.backbone_dir)?;

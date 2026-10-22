@@ -694,6 +694,10 @@ impl IrisTextEncoder {
         cfg: &TextEncoderConfig,
         quant: Option<Quant>,
     ) -> Result<Self> {
+        // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+        // generation. Keep this existing enabled-only policy alive through all load evaluations.
+        let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
         #[cfg(all(test, target_os = "macos"))]
         crate::anchor_tests::record_generation_loader_entry("tower");
         let model_cfg = checked_config(dir, cfg)?;
@@ -768,6 +772,10 @@ impl IrisTextEncoder {
         cfg: &TextEncoderConfig,
         quant: Option<Quant>,
     ) -> Result<Self> {
+        // Fresh-buffer accounting requires cache-zero BEFORE materialization, not only later
+        // generation. Keep this existing enabled-only policy alive through all load evaluations.
+        let _load_quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+
         #[cfg(all(test, target_os = "macos"))]
         crate::anchor_tests::record_generation_loader_entry("tower");
         let model_cfg = checked_config(dir, cfg)?;

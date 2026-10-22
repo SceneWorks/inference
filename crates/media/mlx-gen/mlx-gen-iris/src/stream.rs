@@ -267,6 +267,46 @@ pub(crate) fn headers(path: &Path) -> Result<Vec<SafetensorsTensorHeader>> {
         .map_err(|e| Error::Msg(format!("iris: reading {} headers: {e}", path.display())))
 }
 
+/// Native allocation floor of the tensors this Iris load actually materializes. This is NOT
+/// the shared raw artifact floor: every kept tensor is a separate allocator request.
+pub(crate) fn materialized_load_bytes(
+    headers: &[SafetensorsTensorHeader],
+    keep: impl Fn(&str) -> bool,
+) -> Result<u64> {
+    headers
+        .iter()
+        .filter(|h| keep(&h.name))
+        .try_fold(0u64, |total, h| {
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
+                h.data_bytes,
+                crate::retention::PAGE_BYTES,
+            )
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| {
+                Error::Unsupported("Iris materialized load byte arithmetic overflow".into())
+            })
+        })
+}
+
+/// The real Iris pre-read guard and the source pricer share the SAME kept tensors and allocation
+/// rule. Keep the generic raw before_load API unchanged (other providers depend on its contract).
+pub(crate) fn before_materialized_load(
+    label: &str,
+    components: &[std::path::PathBuf],
+    keep: impl Fn(&str) -> bool,
+) -> Result<()> {
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let total = components.iter().try_fold(0u64, |total, path| {
+        let bytes = materialized_load_bytes(&headers(path)?, &keep)?;
+        total.checked_add(bytes).ok_or_else(|| {
+            Error::Unsupported("Iris component load byte arithmetic overflow".into())
+        })
+    })?;
+    mlx_gen::ios_quantum::before(label, total)
+}
+
 /// Refuse a streamed load of a DENSE artifact at a packed tier (see the module docs): the
 /// artifact's tier `artifact` must be the requested `requested`, or there must be no request.
 pub(crate) fn refuse_stream_requantization(

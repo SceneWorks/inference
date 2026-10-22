@@ -1053,7 +1053,7 @@ fn adapter_files_are_priced_before_they_are_read() {
     );
 }
 
-fn packed_adapter_host_guard_body() {
+fn packed_adapter_host_guard_case(dtype: Dtype, marker_shape: &[i32]) {
     use mlx_gen::{AdapterKind, AdapterSpec};
     let mut weights = Weights::from_file(backbone_dir().join("model.safetensors")).unwrap();
     weights.materialize().unwrap();
@@ -1086,8 +1086,15 @@ fn packed_adapter_host_guard_body() {
     )
     .as_dtype(Dtype::Bfloat16)
     .unwrap();
-    let left = Array::from_slice(&[input as i32], &[]);
-    let right = Array::from_slice(&[0i32], &[]);
+    let marker = |value: usize| match dtype {
+        Dtype::Int64 => Array::from_slice(&[value as i64], marker_shape),
+        Dtype::Float32 => Array::from_slice(&[value as f32], marker_shape),
+        Dtype::Float64 => Array::from_slice_f64(&[value as f64], marker_shape),
+        Dtype::Int32 => Array::from_slice(&[value as i32], marker_shape),
+        _ => unreachable!("the test's explicit valid marker formats"),
+    };
+    let left = marker(input);
+    let right = marker(0);
     for array in [&codes, &scales, &biases, &left, &right] {
         array.eval().unwrap();
     }
@@ -1118,7 +1125,7 @@ fn packed_adapter_host_guard_body() {
     assert!(denied.is_err());
     assert_eq!(
         take_refusal().unwrap().label,
-        crate::adapters::ADAPTER_HOST_QUANTUM
+        crate::adapters::ADAPTER_WIDTH_QUANTUM
     );
     assert_eq!(
         mlx_rs::memory::get_active_memory(),
@@ -1130,7 +1137,7 @@ fn packed_adapter_host_guard_body() {
     let sink = active.clone();
     let installed = with_cpu_diagnostic_headroom(AMPLE, || with_cpu_diagnostic_observer(
         move |event| {
-            if matches!(event, QuantumEvent::Checked { label, .. } if label == crate::adapters::ADAPTER_HOST_QUANTUM) {
+            if matches!(event, QuantumEvent::Checked { label, .. } if label == crate::adapters::ADAPTER_HOST_QUANTUM || label == crate::adapters::ADAPTER_WIDTH_QUANTUM) {
                 sink.borrow_mut().push(mlx_rs::memory::get_active_memory() - baseline);
             }
         },
@@ -1138,11 +1145,66 @@ fn packed_adapter_host_guard_body() {
             &specs, IrisTask::Generation, crate::model::MODEL_ID),
     )).unwrap();
     assert!(installed.is_some());
+    if dtype == Dtype::Int32 {
+        assert_eq!(
+            &*active.borrow(),
+            &[0, std::mem::size_of::<i32>()],
+            "the original I32 fixture still checks before width allocation and before placeholder"
+        );
+    } else {
+        // A converted temporary may live until the backend releases it; do not assert a guessed
+        // cast-retirement instant. The no-evaluation denial above remains exact for every dtype.
+        assert_eq!(active.borrow().len(), 2);
+        assert_eq!(active.borrow()[0], 0);
+    }
+    drop(installed);
+    take_refusal();
+    let (denied, events) = observed(AMPLE, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_short_at(
+            crate::adapters::ADAPTER_HOST_QUANTUM,
+            || {
+                crate::adapters::install(
+                    &mut weights,
+                    Dtype::Float32,
+                    &specs,
+                    IrisTask::Generation,
+                    crate::model::MODEL_ID,
+                )
+            },
+        )
+    });
+    assert!(denied.is_err());
     assert_eq!(
-        &*active.borrow(),
-        &[0, std::mem::size_of::<i32>()],
-        "the first check precedes the lazy width read; the second precedes the host placeholder"
+        take_refusal().unwrap().label,
+        crate::adapters::ADAPTER_HOST_QUANTUM
     );
+    let checked = checks(&events);
+    assert_eq!(
+        checked.len(),
+        1,
+        "the placeholder refusal must prevent all adapter file reads"
+    );
+    let source = width.item_size() as u64;
+    let cast = if dtype == Dtype::Int32 { 0 } else { 4 };
+    assert_eq!(
+        (checked[0].0.as_str(), checked[0].1),
+        (crate::adapters::ADAPTER_WIDTH_QUANTUM, source + cast)
+    );
+}
+
+fn packed_adapter_host_guard_body() {
+    with_cpu_diagnostic_headroom(AMPLE, || {
+        // This fixture's visible scalar requests must be fresh too; an unrelated cached 6-byte
+        // buffer is allowed to back a 4-byte request outside the existing allocation scope.
+        let _scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        packed_adapter_host_guard_case(Dtype::Int32, &[]);
+        packed_adapter_host_guard_case(Dtype::Int32, &[1]);
+        packed_adapter_host_guard_case(Dtype::Int64, &[1]);
+        packed_adapter_host_guard_case(Dtype::Float32, &[1]);
+        packed_adapter_host_guard_case(Dtype::Float64, &[1]);
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -1150,5 +1212,166 @@ fn packed_adapter_host_guards_both_width_reads_and_placeholders() {
     in_cpu_child(
         "quantum_tests::packed_adapter_host_guards_both_width_reads_and_placeholders",
         packed_adapter_host_guard_body,
+    );
+}
+
+fn seed_larger_reusable_cache() {
+    let page = crate::retention::PAGE_BYTES as usize;
+    // BufferCache accepts this capacity for a 2-page request: 3p < min(4p, 2p+2p).
+    let request = 2 * page;
+    let seed = 3 * page;
+    assert!(seed < (2 * request).min(request + 2 * page));
+    assert_eq!(
+        unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+        0
+    );
+    mlx_rs::memory::clear_cache();
+    let array = Array::from_slice(&vec![0u8; seed], &[seed as i32]);
+    array.eval().unwrap();
+    drop(array);
+    assert_eq!(
+        unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+        0
+    );
+    assert!(
+        mlx_rs::memory::get_cache_memory() >= seed,
+        "the discriminator must start with reusable larger backing"
+    );
+}
+
+fn load_after_larger_cache<T>(limit: usize, body: impl FnOnce() -> Result<T>) -> (T, Observed) {
+    seed_larger_reusable_cache();
+    let (result, events) = observed(AMPLE, body);
+    let result = result.unwrap();
+    assert!(
+        !checks(&events).is_empty(),
+        "an actual component load must reach its pre-read check"
+    );
+    assert_scoped(&events);
+    assert_eq!(
+        mlx_rs::memory::set_cache_limit(limit),
+        limit,
+        "every nested load scope must restore the caller policy"
+    );
+    (result, events)
+}
+
+fn component_load_scope_body() {
+    struct RestoreCache(usize);
+    impl Drop for RestoreCache {
+        fn drop(&mut self) {
+            mlx_rs::memory::clear_cache();
+            mlx_rs::memory::set_cache_limit(self.0);
+        }
+    }
+    let limit = 16 * crate::retention::PAGE_BYTES as usize;
+    let _restore = RestoreCache(mlx_rs::memory::set_cache_limit(limit));
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let baseline = mlx_rs::memory::get_active_memory();
+    let (backbone, _) = load_after_larger_cache(limit, || {
+        crate::model::load_backbone(&backbone_dir(), &config, Dtype::Bfloat16)
+    });
+    let expected = crate::memory_strategy::backbone_bytes(
+        &backbone_dir().join("model.safetensors"),
+        Precision::Bf16,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+        0
+    );
+    let actual = (mlx_rs::memory::get_active_memory() - baseline) as u64;
+    assert!(actual > 0 && actual <= expected,
+        "fresh retained model buffers {actual} exceed source per-buffer A {expected}; cached capacity is not a logical payload");
+    drop(backbone);
+
+    let (streamed, events) = load_after_larger_cache(limit, || {
+        crate::model::load_backbone_streamed(
+            &backbone_dir(),
+            &config,
+            Dtype::Bfloat16,
+            None,
+            Some(1),
+        )
+    });
+    assert!(
+        !checks(&events).iter().any(|c| c.0 == dit_q::BLOCK_READ),
+        "scope setup must not materialize deferred blocks"
+    );
+    drop(streamed);
+    let (tower, _) = load_after_larger_cache(limit, || {
+        crate::text_encoder::IrisTextEncoder::load_quantized(
+            &text_encoder_dir(),
+            &config.text_encoder,
+            None,
+        )
+    });
+    drop(tower);
+    let (tower, events) = load_after_larger_cache(limit, || {
+        crate::text_encoder::IrisTextEncoder::load_streamed(
+            &text_encoder_dir(),
+            &config.text_encoder,
+            None,
+        )
+    });
+    assert!(
+        !checks(&events)
+            .iter()
+            .any(|c| c.0 == crate::text_encoder::quanta::LAYER_READ),
+        "deferred decoder layers must stay unread"
+    );
+    drop(tower);
+
+    let spec =
+        crate::stream_tests::generation_spec(mlx_gen::gen_core::LoadShape::EagerMaterialization);
+    let (nested, _) = load_after_larger_cache(limit, || crate::model::load_model(&spec));
+    drop(nested); // outer model scope plus both nested public component scopes
+    let (depth, _) = load_after_larger_cache(limit, || {
+        crate::depth::load_depth_export(
+            TaskExport::from_dir(
+                &fixtures().join("tiny-depth"),
+                IrisTask::Depth,
+                crate::depth::DEPTH_MODEL_ID,
+            )
+            .unwrap(),
+            Dtype::Bfloat16,
+        )
+    });
+    drop(depth);
+    let spec = LoadSpec::new(WeightsSource::Dir(
+        fixtures().join("tiny-snapshot/upscaler"),
+    ));
+    let (restorer, _) =
+        load_after_larger_cache(limit, || crate::restoration::IrisRestorer::load(&spec));
+    drop(restorer);
+
+    let missing = tempfile::tempdir().unwrap();
+    seed_larger_reusable_cache();
+    let cached = mlx_rs::memory::get_cache_memory();
+    assert!(!mlx_gen::ios_quantum::enabled());
+    assert!(crate::model::load_backbone(missing.path(), &config, Dtype::Bfloat16).is_err());
+    assert_eq!(
+        mlx_rs::memory::get_cache_memory(),
+        cached,
+        "disabled Scope::None must not clear caches"
+    );
+    assert_eq!(mlx_rs::memory::set_cache_limit(limit), limit);
+    let (failed, _) = observed(AMPLE, || {
+        crate::model::load_backbone(missing.path(), &config, Dtype::Bfloat16)
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        mlx_rs::memory::set_cache_limit(limit),
+        limit,
+        "early load error must restore policy too"
+    );
+}
+
+#[test]
+fn component_load_scopes_establish_fresh_backing_before_materialization() {
+    in_cpu_child(
+        "quantum_tests::component_load_scopes_establish_fresh_backing_before_materialization",
+        component_load_scope_body,
     );
 }

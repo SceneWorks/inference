@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T02:24:09.093341+00:00",
-  "rust_proof_closure_sha256": "18e0ab53e2a9c22b1657e239b35f73e0f3e6d6e5248937a8b6c9f668e6e65506",
+  "UTC": "2026-10-22T06:46:23.452580+00:00",
+  "rust_proof_closure_sha256": "60f231e844c019d98a2515ed9c5155649cda082ec184df97aa1c7803f2cee498",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -232,15 +232,15 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapters.rs",
-      "sha256": "2f46b0b506d63a9d46902cf13f9017ee52b07737bf04caf6f3f1bd5a6dbf26ad"
+      "sha256": "c8e1e3a063880bc58e1bc0e3a878a3db507c0e6b1b7f5028d2bc9b4af319389a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
-      "sha256": "a74a2523b093e8030bfefb05809ab07f65aabbe9f2999bace44bf2feb1319200"
+      "sha256": "90647606fc1e2ca490d9667453f27641322a2cbd072e8e489797c13a1db135f4"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
-      "sha256": "d01aa75d210b9077b0497418f80dac36bf669e8aa29b9604619c14d26701dac6"
+      "sha256": "a9d1ed490b90855173c109c9d7ba5d3961de9785b811b01ef8084bcc9656af9e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/dit.rs",
@@ -248,7 +248,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "2769bb22006218702fb3125a59c55588c8165c8fc5a1686460d111be4c2cb2da"
+      "sha256": "c0b104cd0fd6077077df8481d72b321368d5be6fbc030cbaed26184dc0cf5c81"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
@@ -256,7 +256,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/native_ledger.rs",
-      "sha256": "8280f9be256dc8ef1c3774acabc56ce076a62ad64f883d76e9b7f595bab9c2f9"
+      "sha256": "28a8a2bdfb995c8580f121b355cc7af24f4b89b7cb71e6da53337396ca15eea4"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
@@ -264,11 +264,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/model.rs",
-      "sha256": "17c1a8acca8d24facf68230056aa86570646dfe1efa04e66f04ce962abf1744a"
+      "sha256": "24b2621ec7931f3a789194bae4d04d29f1b098433f2c32ae85331b5795be2bc9"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/nn.rs",
-      "sha256": "e0665832e7d1897188caaf375e36abbbb0b53f0a127cea3aee8810fc3d363b32"
+      "sha256": "f53ca43871751ab31a1b793cb050bd15bb9b2fbc62189a28eca62f5e17ff65ec"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/packed.rs",
@@ -284,7 +284,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_tests.rs",
-      "sha256": "d1ee9754049df8e425ab6519e3845b1f3d866abaf267b1387d07a268e874a93c"
+      "sha256": "e421dec40c8eeb885ace5f111e9c742553da96ff3a27ec4bd8517b80c5a26835"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/reachable_sizes.rs",
@@ -292,7 +292,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/restoration.rs",
-      "sha256": "0077d3a86da7cf0cb5df3d54d331980a6e8f670ec06024b17b4525f7bb5a0107"
+      "sha256": "244397ee11d251af1352961c0df3459439b7482337fef54793e41a4402d38d63"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/retention.rs",
@@ -303,12 +303,16 @@
       "sha256": "fe35fd7b48404d8684da8b4ed30d044713de841b9cb2d1998209b0f3f9ae67a4"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream.rs",
+      "sha256": "df69be30cc53c3ad997f5284f0e85903e289161e4cb3bebc87f636b75cae1d96"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs",
       "sha256": "ebe518a92b880fef856f78d3d3bfc4a5470cbd419b7708688727fead70d389a7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs",
-      "sha256": "5aa61c63719ac5ac3dc7eec4df12da7cdb19fc58eeb7d332bf6df2b17012379b"
+      "sha256": "029184a1e495d94b9710ea72bfac498c83bae76a97bb349a516a9fb843bc5f9d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs",
@@ -2374,16 +2378,16 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "9533013f42fddf783527d3efe8377191626cc34099614122b1ca6934f6fc69fa",
-    "classification_sha256": "cd8312f9538bc44408f03b888a2ba63680ba8bd19a479cf8046be431169c318e",
-    "selected_Rust_FQNs": 225,
-    "HOST_logical": 201,
-    "HOST_expected_PASS_rows": 202,
-    "native_logical": 24,
-    "native_expected_PASS_rows": 48,
+    "inventory_sha256": "0b95e7ad6eed5aa6577eadc3683aeef7aa84ad75739e7a87503742f7f1b109ce",
+    "classification_sha256": "6d530e7c079bd2917d834d627b89cea0651dd8d3bee8a7698db610b38ff5d093",
+    "selected_Rust_FQNs": 242,
+    "HOST_logical": 217,
+    "HOST_expected_PASS_rows": 218,
+    "native_logical": 25,
+    "native_expected_PASS_rows": 50,
     "Python_exact_tests": 17,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
-    "diagnostic_checkpoint": "Seven source-backed repairs plus bounded diagnostics; two dense native failures explicitly OPEN. Original requests/matrices/strict assertions and native query/reset sites unchanged. Parent corrects three window API names and binds weights identity test to existing strict CPU child."
+    "diagnostic_checkpoint": "Enabled-only existing load Scope timing repair and source-derived current-root corrections plus expanded fixed samples for same two children. Actual real-work cache controls change; sampler core/API/read sequence unchanged. All current native outcomes and opaque caller-backed/FS/HOST/physical terms remain OPEN. Parent corrects dense first-floor callback join; original74 test bodies retained;17 added."
   }
 }

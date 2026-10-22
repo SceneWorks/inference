@@ -188,7 +188,12 @@ impl Loader<'_> {
     /// codes / scales / biases and the bias at bf16 — exactly what [`pack_projection`] builds from
     /// the dense weight at load — and the zero columns its input is padded by. `None` when the
     /// projection is stored dense.
-    fn packed(&self, prefix: &str, bias: bool) -> Result<Option<(AdaptableLinear, i32)>> {
+    fn packed(
+        &self,
+        prefix: &str,
+        bias: bool,
+        resolved_width: Option<i32>,
+    ) -> Result<Option<(AdaptableLinear, i32)>> {
         let scales_key = format!("{prefix}.scales");
         if !self.has(&scales_key) {
             crate::packed::check_loaded_projection(self.weights, prefix, None)?;
@@ -211,7 +216,13 @@ impl Loader<'_> {
         let padded_in = scales.shape()[1] * group;
         let in_key = format!("{prefix}{}", crate::packed::IN_FEATURES_SUFFIX);
         let in_features = if self.has(&in_key) {
-            self.require(&in_key)?.item::<i32>()
+            let source = self.require(&in_key)?; // Preserve exact consumed-key accounting.
+            match resolved_width {
+                // The install already evaluated this immutable marker with the original
+                // try_item conversion. Reuse the actual value, not a second conversion buffer.
+                Some(width) => width,
+                None => source.item::<i32>(), // Original bare packed-loader conversion path.
+            }
         } else {
             padded_in
         };
@@ -269,7 +280,9 @@ impl Loader<'_> {
                 }
                 // A packed artifact's base is stored packed: the install acted on a zero-stride
                 // placeholder of its logical shape, and the adapters ride on the stored pack.
-                if let Some((mut packed, in_pad)) = self.packed(prefix, bias)? {
+                if let Some((mut packed, in_pad)) =
+                    self.packed(prefix, bias, Some(inner.base_shape()[1]))?
+                {
                     packed.set_adapters(inner.adapters().to_vec());
                     return Ok(Linear {
                         inner: packed,
@@ -307,7 +320,7 @@ impl Loader<'_> {
                 });
             }
         }
-        if let Some((inner, in_pad)) = self.packed(prefix, bias)? {
+        if let Some((inner, in_pad)) = self.packed(prefix, bias, None)? {
             return Ok(Linear {
                 inner,
                 compute: self.compute,

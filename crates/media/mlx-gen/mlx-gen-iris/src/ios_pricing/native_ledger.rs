@@ -1081,6 +1081,17 @@ fn constructor_cast(
     }
 }
 
+/// item::<i32>() materializes an Int32 target for every non-Int32 post-read marker, including
+/// same-width integer casts. Matrix-shaped size-one markers may already have a compute cast.
+/// Source raw storage is charged by load_backbone_set; this helper charges ONLY the new target.
+fn logical_width_cast(l: &mut NativeLedger, header: &Header, compute: mlx_rs::Dtype) -> Result<()> {
+    if header.name.ends_with(crate::packed::IN_FEATURES_SUFFIX) {
+        let matrix_cast = header.shape.len() >= 2 && !crate::stream::is_packed_part_header(header);
+        constructor_cast(l, header, matrix_cast, compute, mlx_rs::Dtype::Int32)?;
+    }
+    Ok(())
+}
+
 /// Read/cast/constructor graph of the actual selected header subset. `.weight` matrices are
 /// projections; 1-D gains, y_pos_embedding and adaLN biases are f32. A packed marker is a raw
 /// native Load read by `.item::<i32>()`, not a free host metadata value.
@@ -1108,6 +1119,7 @@ fn load_backbone_set(
         if matrix_cast {
             cast_header(l, h, compute)?;
         }
+        logical_width_cast(l, h, compute)?;
         if let Some(base) = name.strip_suffix(".weight") {
             if h.shape.len() == 1 {
                 constructor_cast(l, h, matrix_cast, compute, mlx_rs::Dtype::Float32)?;
@@ -4993,6 +5005,39 @@ fn backbone_callback_events(
     })
 }
 
+/// Each new load allocation Scope emits entry+restore metadata. Generation has its outer
+/// factory plus a tower/backbone pair per actual load; depth has one root; restoration has its
+/// root and its public backbone component. Existing request/forward scopes are priced elsewhere.
+fn load_scope_metadata(provider: &str, load_pairs: u64) -> Result<u64> {
+    let scopes = match provider {
+        crate::model::MODEL_ID => plus(1, product(&[2, load_pairs])?)?,
+        crate::depth::DEPTH_MODEL_ID => 1,
+        crate::restoration::MODEL_ID => 2,
+        _ => {
+            return Err(Error::Unsupported(
+                "Iris load-scope metadata has no source route".into(),
+            ))
+        }
+    };
+    product(&[2, scopes])
+}
+
+/// Every real check of a nonempty adapter install, conservatively covering its reached prefixes.
+/// Dense input reaches a distinct first-file floor before HOST0; packed input instead has WIDTH
+/// only when a marker is read. These are event counts, not allocation bytes or fitted allowances.
+fn adapter_checked_events(
+    files: u64,
+    targets: u64,
+    host: &crate::adapters::ProjectionHostHeaderFacts,
+) -> Result<u64> {
+    if files == 0 {
+        return Ok(0); // install's empty-spec branch returns before all three stages.
+    }
+    let stages = plus(1, u64::from(host.packed_projections == 0))?; // HOST + dense first floor
+    let stages = plus(stages, u64::from(host.width_read_bytes != 0))?;
+    plus(plus(stages, product(&[2, files])?)?, targets)
+}
+
 fn callback_events_from_sources(
     req: &IosPricingRequest<'_>,
     sources: &GuardedSources<'_>,
@@ -5008,7 +5053,7 @@ fn callback_events_from_sources(
                 progress: plus(tiles, 1)?,
                 checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
                 synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
-                metadata: plus(6, tiles)?,
+                metadata: plus(plus(6, tiles)?, load_scope_metadata(req.provider, 1)?)?,
                 ..Default::default()
             })?;
             count.add(CallbackEventUpper {
@@ -5019,7 +5064,7 @@ fn callback_events_from_sources(
         }
         GuardedTask::Depth { plan, .. } => count.add(CallbackEventUpper {
             progress: 1,
-            metadata: 3,
+            metadata: plus(3, load_scope_metadata(req.provider, 1)?)?,
             checked: plus(6, u64::from(plan.resized()))?,
             synchronized: plus(5, u64::from(plan.resized()))?,
             ..Default::default()
@@ -5046,7 +5091,10 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                 progress: plus(tiles, 1)?,
                 checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
                 synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
-                metadata: plus(plus(4, 2)?, tiles)?,
+                metadata: plus(
+                    plus(plus(4, 2)?, tiles)?,
+                    load_scope_metadata(req.provider, 1)?,
+                )?,
                 ..Default::default()
             })?;
             // Every velocity has a separate TILE before/finish outside the DiT's own quanta.
@@ -5070,7 +5118,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
             // One LOAD check; PREP,RGB,INPUT,REDUCER,HOST_MAP pairs; optional HOST_POST pair.
             count.add(CallbackEventUpper {
                 progress: 1,
-                metadata: 3,
+                metadata: plus(3, load_scope_metadata(req.provider, 1)?)?,
                 checked: plus(6, u64::from(plan.resized()))?,
                 synchronized: plus(5, u64::from(plan.resized()))?,
                 ..Default::default()
@@ -5105,7 +5153,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                 } else {
                     0
                 },
-                metadata: 3,
+                metadata: plus(3, load_scope_metadata(req.provider, loads)?)?,
                 checked: product(&[2, loads])?,
                 ..Default::default()
             };
@@ -5161,23 +5209,24 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                 let path = resources
                     .backbone_dir
                     .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
-                let (projections, _) = crate::adapters::projection_shapes_from_headers(&path)?;
+                let projection_host = crate::adapters::projection_host_facts_from_headers(&path)?;
                 let inventory = crate::adapters::header_inventory(
                     &req.spec.adapters,
-                    &projections,
+                    &projection_host.shapes,
                     compute_dtype(req.spec.precision),
                     IrisTask::Generation,
                     req.provider,
                 )?;
                 let targets = inventory.projections.len() as u64;
-                // HOST before once; Iris file before AND strict shared-loader before per file;
+                // HOST once, a dense first-file floor or optional WIDTH, and both file checks;
                 // materialization before+finish for every adapted projection, disabled included.
                 count.add(CallbackEventUpper {
                     checked: product(&[
                         loads,
-                        plus(
-                            plus(1, product(&[2, req.spec.adapters.len() as u64])?)?,
+                        adapter_checked_events(
+                            req.spec.adapters.len() as u64,
                             targets,
+                            &projection_host,
                         )?,
                     ])?,
                     synchronized: product(&[loads, targets])?,
@@ -6178,5 +6227,81 @@ mod guarded_fragment_tests {
         // A byte-derived source envelope lets the ORIGINAL reader report syntax errors after
         // a successful capacity check; no speculative serde parse is used to price that parse.
         assert!(authenticated_metadata::unvalidated_json_parse_layout(b"{").unwrap() > 0);
+    }
+}
+
+#[cfg(test)]
+mod load_scope_and_width_cast_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_counts_every_factory_component_and_reload_scope() {
+        assert_eq!(load_scope_metadata(crate::model::MODEL_ID, 1).unwrap(), 6);
+        assert_eq!(load_scope_metadata(crate::model::MODEL_ID, 2).unwrap(), 10);
+        assert_eq!(
+            load_scope_metadata(crate::depth::DEPTH_MODEL_ID, 1).unwrap(),
+            2
+        );
+        assert_eq!(
+            load_scope_metadata(crate::restoration::MODEL_ID, 1).unwrap(),
+            4
+        );
+        assert!(load_scope_metadata(crate::model::MODEL_ID, u64::MAX).is_err());
+        let mut host = crate::adapters::ProjectionHostHeaderFacts {
+            shapes: std::collections::BTreeMap::new(),
+            packed_projections: 0,
+            width_read_bytes: 0,
+        };
+        assert_eq!(adapter_checked_events(0, 2, &host).unwrap(), 0);
+        // Dense: first floor + HOST0 + two file guards + two materialization checks.
+        assert_eq!(adapter_checked_events(1, 2, &host).unwrap(), 6);
+        assert_eq!(adapter_checked_events(2, 2, &host).unwrap(), 8);
+        host.packed_projections = 1;
+        assert_eq!(adapter_checked_events(1, 2, &host).unwrap(), 5);
+        host.width_read_bytes = 4;
+        assert_eq!(adapter_checked_events(1, 2, &host).unwrap(), 6);
+        assert!(adapter_checked_events(u64::MAX, 2, &host).is_err());
+    }
+
+    fn marker(dtype: Stored, shape: Vec<usize>) -> Header {
+        Header {
+            name: "p.in_features".into(),
+            dtype,
+            shape,
+            data_bytes: dtype.size() as u64,
+        }
+    }
+
+    #[test]
+    fn scalar_int32_marker_aliases_but_every_other_numeric_target_allocates() {
+        let mut cast = NativeLedger::new(16384, NativeBackend::Cpu).unwrap();
+        let mut expected = NativeLedger::new(16384, NativeBackend::Cpu).unwrap();
+        logical_width_cast(
+            &mut cast,
+            &marker(Stored::I32, vec![1]),
+            mlx_rs::Dtype::Bfloat16,
+        )
+        .unwrap();
+        assert_eq!(cast.total, 0);
+        for dtype in [Stored::I64, Stored::F64, Stored::U32, Stored::F16] {
+            logical_width_cast(&mut cast, &marker(dtype, vec![]), mlx_rs::Dtype::Bfloat16).unwrap();
+            expected.array(4, 1).unwrap();
+        }
+        assert_eq!(cast.total, expected.total);
+    }
+
+    #[test]
+    fn matrix_marker_cast_uses_post_read_dtype_once_with_resolved_host_width() {
+        let header = marker(Stored::I32, vec![1, 1]);
+        let mut actual = NativeLedger::new(16384, NativeBackend::Cpu).unwrap();
+        let mut expected = NativeLedger::new(16384, NativeBackend::Cpu).unwrap();
+        // Bare Loader::packed OR adapter install's first-pass try_item. The adapted final
+        // constructor reuses that resolved width and must not be charged for a second getter.
+        logical_width_cast(&mut actual, &header, mlx_rs::Dtype::Bfloat16).unwrap();
+        expected.array(4, 1).unwrap();
+        assert_eq!(actual.total, expected.total);
+        let mut fp32 = NativeLedger::new(16384, NativeBackend::Cpu).unwrap();
+        logical_width_cast(&mut fp32, &header, mlx_rs::Dtype::Float32).unwrap();
+        assert!(fp32.total > 0);
     }
 }
