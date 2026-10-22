@@ -267,6 +267,30 @@ fn reference_latent(vae: &Flux2Vae, image: &Array, cancel: &CancelFlag) -> Resul
     check(cancel)?;
     Ok(latent)
 }
+/// Shared production CFG/Euler update. Network predictions may be BF16, but guidance,
+/// integration and the returned accumulator always use FP32.
+fn cfg_euler_step(
+    current: &Array,
+    conditional: &Array,
+    unconditional: Option<&Array>,
+    guidance: f32,
+    delta_sigma: f32,
+) -> Result<Array> {
+    let scalar = |x: f32| Array::from_slice(&[x], &[1]);
+    let mut prediction = conditional.as_dtype(Dtype::Float32)?;
+    if let Some(unconditional) = unconditional {
+        let negative = unconditional.as_dtype(Dtype::Float32)?;
+        prediction = add(
+            &negative,
+            multiply(subtract(prediction, &negative)?, scalar(guidance))?,
+        )?;
+    }
+    Ok(add(
+        current.as_dtype(Dtype::Float32)?,
+        multiply(prediction, scalar(delta_sigma))?,
+    )?)
+}
+
 pub(crate) struct EditSampling<'a> {
     pub transformer: &'a Transformer,
     pub resolved: &'a MossImageResolved,
@@ -295,7 +319,6 @@ impl EditSampling<'_> {
             self.resolved.shift,
             self.resolved.training_shift,
         )?;
-        let scalar = |x: f32| Array::from_slice(&[x], &[1]);
         let mut latents = noise.as_dtype(Dtype::Float32)?;
         for (index, pair) in sigmas.windows(2).enumerate() {
             let mut outputs = Vec::new();
@@ -317,18 +340,19 @@ impl EditSampling<'_> {
                         )?
                         .as_dtype(Dtype::Float32)?)
                 };
-                let mut prediction = predict(positive)?;
-                if self.resolved.guidance != 1.0 {
-                    let negative = predict(&self.negative[sample])?;
-                    prediction = add(
-                        &negative,
-                        multiply(
-                            subtract(prediction, &negative)?,
-                            scalar(self.resolved.guidance),
-                        )?,
-                    )?;
-                }
-                let next = add(&current, multiply(prediction, scalar(pair[1] - pair[0]))?)?;
+                let prediction = predict(positive)?;
+                let negative = if self.resolved.guidance != 1.0 {
+                    Some(predict(&self.negative[sample])?)
+                } else {
+                    None
+                };
+                let next = cfg_euler_step(
+                    &current,
+                    &prediction,
+                    negative.as_ref(),
+                    self.resolved.guidance,
+                    pair[1] - pair[0],
+                )?;
                 mlx_rs::transforms::eval([&next])?;
                 outputs.push(next);
             }
@@ -348,6 +372,93 @@ impl EditSampling<'_> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    #[test]
+    fn frozen_cfg_euler_steps_are_fp32_cpu() {
+        const CHILD: &str = "MOSS_EDIT_SAMPLING_CPU_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "edit::tests::frozen_cfg_euler_steps_are_fp32_cpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "CPU sampling child: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let fixture: Value = serde_json::from_str(include_str!(
+                "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+            ))
+            .unwrap();
+            // Source predictions are retained independently of the native network.
+            // This tests the production update itself without a BF16 network tolerance.
+            const FP32_BOUND: f32 = 1e-6;
+            for case in fixture["cases"].as_array().unwrap() {
+                let sampling = &case["sampling"];
+                let steps = sampling["steps"].as_array().unwrap();
+                let sigmas = values(&sampling["sigmas"]["values"]);
+                let mut current = array(&steps[0]["input"]);
+                for (index, step) in steps.iter().enumerate() {
+                    let expected = values(&step["output"]["values"]);
+                    current = cfg_euler_step(
+                        &current,
+                        &array(&step["conditional"]),
+                        Some(&array(&step["unconditional"])),
+                        sampling["cfg"].as_f64().unwrap() as f32,
+                        sigmas[index + 1] - sigmas[index],
+                    )
+                    .unwrap();
+                    // Check dtype before readback, which intentionally accepts other dtypes.
+                    assert_eq!(
+                        current.dtype(),
+                        Dtype::Float32,
+                        "step {index} accumulator dtype"
+                    );
+                    let actual = logical_f32_readback(&current).unwrap();
+                    let delta = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        delta <= FP32_BOUND,
+                        "step {index}: FP32 error {delta} > {FP32_BOUND}"
+                    );
+                    // A narrowed accumulator, even widened again before readback, must fail
+                    // the very same precision bound at every retained source step.
+                    let narrowed = current
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                        .as_dtype(Dtype::Float32)
+                        .unwrap();
+                    let wrong = logical_f32_readback(&narrowed).unwrap();
+                    let wrong_delta = wrong
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        wrong_delta > 100.0 * FP32_BOUND,
+                        "non-discriminating BF16 control: {wrong_delta}"
+                    );
+                    eprintln!(
+                        "refs={} step={index} fp32_error={delta} bf16_control_error={wrong_delta}",
+                        case["reference_count"]
+                    );
+                }
+            }
+        });
+    }
     fn values(v: &Value) -> Vec<f32> {
         v.as_array()
             .unwrap()

@@ -1616,7 +1616,12 @@ mod edit_fixture_tests {
                     }
                 })
                 .unwrap();
-            compare_bf16(&sampled, &case["sampling"]["final"], "FP32 CFG/Euler trace");
+            assert_eq!(sampled.dtype(), Dtype::Float32, "sampler accumulator dtype");
+            compare_bf16(
+                &sampled,
+                &case["sampling"]["final"],
+                "complete network sampling (BF16 prediction tolerance)",
+            );
             assert_eq!(steps, [(1, 2), (2, 2)]);
             let stop = CancelFlag::new();
             assert!(matches!(
