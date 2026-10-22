@@ -1114,13 +1114,6 @@ fn held_states(path: &Path) -> Result<u64> {
     crate::stream::empty_prompt_upload_bytes(embeddings.element_count().map_err(Error::from)? as u64)
 }
 
-fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
-    headers
-        .iter()
-        .filter(|h| keep(&h.name))
-        .fold(0u64, |a, h| a.saturating_add(h.data_bytes))
-}
-
 /// Model/stream loaders materialize EACH retained safetensors tensor separately. The file's
 /// aggregate payload length is not its allocator charge: each request above PAGE_BYTES rounds
 /// independently (retention::allocated / the native macOS allocator). Apply that same source law
@@ -5831,6 +5824,14 @@ mod guarded_source_tests {
 #[cfg(test)]
 mod materialized_load_floor_tests {
     use super::*;
+
+    // Raw logical fixture sum contrasts with the production per-buffer allocation law.
+    fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
+        headers
+            .iter()
+            .filter(|h| keep(&h.name))
+            .fold(0u64, |a, h| a.saturating_add(h.data_bytes))
+    }
 
     fn core_codes(name: &str, bits: usize) -> Header {
         // Exact production packing: 384 output rows, 64 inputs, u32 code words.
