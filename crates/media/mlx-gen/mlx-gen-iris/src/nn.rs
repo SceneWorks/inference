@@ -28,6 +28,22 @@ use mlx_rs::{Array, Dtype};
 /// release's projection widths (2560, 768, 256, 64, …) divide.
 pub const QUANT_GROUP_SIZE: usize = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
 
+/// Recheck file-backed pending constructor and stored-grid evaluation allocations after build.
+/// The earlier joint check is not a reservation against intervening owned allocations.
+pub(crate) const ADAPTED_BASE_EVAL_QUANTUM: &str = "Iris adapted base evaluation";
+
+/// Called by the file-backed model loader immediately before evaluating the built DiT parameters.
+/// The byte count comes from the same captured-header constructor law as the early load guard.
+/// Its raw base inputs were evaluated by read_backbone_tensor; accepted Iris adapter files attach
+/// residuals without replacing that base (header_inventory rejects diff-patch files). Loader::linear
+/// has already evaluated and synchronized those residuals, so no adapter producer feeds a base cast.
+/// The captured source plan also includes still-pending stored-grid outputs/workspace and excludes
+/// its already-active build scalars. It does not certify arbitrary caller-supplied Array graphs or
+/// oversized incoming backing. Even a zero-target build reaches this real evaluation boundary.
+pub(crate) fn before_adapted_base_eval(pending_constructor_bytes: u64) -> Result<()> {
+    mlx_gen::ios_quantum::before(ADAPTED_BASE_EVAL_QUANTUM, pending_constructor_bytes)
+}
+
 /// The load-time quantization of one backbone build (sc-26266): the affine width of the `q8` /
 /// `q4` tier.
 ///
@@ -130,6 +146,17 @@ pub struct AdaptedLinears {
 }
 
 impl AdaptedLinears {
+    /// All known-file accepted residual materialization allocations still potentially pending.
+    /// Source file inputs are already evaluated. Diff/merged-base adapters are refused upstream.
+    pub(crate) fn pending_materialization_bytes(&self) -> Result<u64> {
+        self.load_facts.values().try_fold(0u64, |sum, facts| {
+            sum.checked_add(facts.materialize_scratch_bytes()?)
+                .ok_or_else(|| {
+                    Error::Unsupported("Iris pending adapter materialization sum overflow".into())
+                })
+        })
+    }
+
     /// `linears` are every projection the install could reach; `adapted` the paths it changed.
     pub fn new(linears: BTreeMap<String, AdaptableLinear>, adapted: BTreeSet<String>) -> Self {
         Self {
@@ -757,4 +784,111 @@ pub fn expect_dims(name: &str, have: &[i32], want: &[i32]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// One source graph serves fresh-A runtime budgets and the conservative-U cumulative ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuantAllocationStage {
+    Build,
+    Evaluate,
+}
+
+pub(crate) fn visit_stored_grid_stages(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+    metal: bool,
+    mut allocate: impl FnMut(QuantAllocationStage, u64) -> Result<()>,
+) -> Result<()> {
+    let overflow = || Error::Unsupported("Iris stored-grid allocation arithmetic overflow".into());
+    if group == 0 || !input.is_multiple_of(group) || !matches!(bits, 2 | 4 | 8) {
+        return Err(overflow());
+    }
+    let n = rows.checked_mul(input).ok_or_else(overflow)?;
+    let groups = n / group;
+    let words = n.checked_mul(bits).ok_or_else(overflow)? / 32;
+    let mut emit = |stage, width: u64, elements: u64, count: u64| {
+        let request = width.checked_mul(elements).ok_or_else(overflow)?;
+        for _ in 0..count {
+            allocate(stage, request)?;
+        }
+        Ok::<(), Error>(())
+    };
+    use QuantAllocationStage::{Build, Evaluate};
+    emit(Evaluate, 2, n, 1)?; // conditional Quantize input contiguity copy
+    emit(Evaluate, 4, words, 1)?;
+    emit(Evaluate, 2, groups, 2)?; // quantized scale/bias siblings, even discarded codes count
+    emit(Evaluate, 4, n, 1)?; // weight -> f32
+    emit(Evaluate, 4, groups, 2)?; // scale and bias -> f32
+    emit(Evaluate, 4, n, 5)?; // subtract, divide, round, max, min
+    emit(Build, 4, 1, 2)?; // clip endpoint from_f32 constructors
+    emit(Evaluate, 4, n, 1)?; // uint32 cast
+    emit(Build, 4, 32 / bits, 1)?; // place Array::from_slice
+    emit(Evaluate, 4, n, 1)?; // disjoint-field multiplication
+                              // Last-axis extent <=16. output==1 implies input<=16, so the native all-reduce
+                              // input>4096 branch is impossible. Preserve CPU zero-output vs Metal minimum-4 semantics.
+    let output = words.checked_mul(4).ok_or_else(overflow)?;
+    allocate(Evaluate, if metal { output.max(4) } else { output })
+}
+
+pub(crate) fn visit_stored_grid_allocations(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+    metal: bool,
+    mut allocate: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    visit_stored_grid_stages(rows, input, group, bits, metal, |_, bytes| allocate(bytes))
+}
+
+pub(crate) fn stored_grid_allocation_parts(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+) -> Result<(u64, u64)> {
+    let mut build = 0u64;
+    let mut evaluate = 0u64;
+    visit_stored_grid_stages(rows, input, group, bits, true, |stage, bytes| {
+        let bytes =
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
+                .ok_or_else(|| {
+                    Error::Unsupported("Iris stored-grid fresh allocation overflow".into())
+                })?;
+        let sum = if stage == QuantAllocationStage::Build {
+            &mut build
+        } else {
+            &mut evaluate
+        };
+        *sum = sum
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Unsupported("Iris stored-grid fresh sum overflow".into()))?;
+        Ok(())
+    })?;
+    Ok((build, evaluate))
+}
+
+pub(crate) fn stored_grid_allocation_bytes(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+) -> Result<u64> {
+    let (build, evaluate) = stored_grid_allocation_parts(rows, input, group, bits)?;
+    build
+        .checked_add(evaluate)
+        .ok_or_else(|| Error::Unsupported("Iris stored-grid complete sum overflow".into()))
+}
+
+pub(crate) const PENDING_CONSTRUCTION_QUANTUM: &str = "Iris pending construction";
+
+/// A real check immediately before constructor graph creation. The closure is intentionally
+/// lazy: disabled execution performs NONE of the new budget-only facts/overflow arithmetic.
+pub(crate) fn before_pending_construction(plan: impl FnOnce() -> Result<u64>) -> Result<()> {
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    mlx_gen::ios_quantum::before(PENDING_CONSTRUCTION_QUANTUM, plan()?)
 }

@@ -972,7 +972,42 @@ fn text_only_shards_body() {
     let te = loaded.unwrap();
     // The load floor prices the tower's tensors only — not the vision tensors that share its
     // shard, not the vision-only shard.
-    assert_eq!(checks(&events), [(te_q::LOAD.to_string(), tower_bytes, 0)]);
+    let model_cfg = mlx_llm::ModelConfig::from_dir(&dir).unwrap();
+    let mut selected = Vec::new();
+    for file in crate::text_encoder::weight_shards(&dir, !model_cfg.tie_word_embeddings).unwrap() {
+        selected.extend(
+            crate::stream::headers(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    crate::text_encoder::is_text_tower_tensor(
+                        &h.name,
+                        !model_cfg.tie_word_embeddings,
+                    )
+                }),
+        );
+    }
+    let (logical, additional) = crate::stream::tower_load_output_bytes(
+        &selected,
+        |_| true,
+        crate::stream::tower_rope_bytes(&model_cfg).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        logical, tower_bytes,
+        "original raw tower tuple excludes every vision tensor"
+    );
+    assert_eq!(
+        checks(&events),
+        [
+            (te_q::LOAD.to_string(), tower_bytes, 0),
+            (
+                crate::stream::LOAD_TARGET_QUANTUM.to_string(),
+                logical + additional,
+                0
+            ),
+        ]
+    );
     // Host output is the unsharded fixture's, bit for bit.
     let reference = IrisTextEncoder::load(&text_encoder_dir(), &config.text_encoder).unwrap();
     for prompt in ["a red fox in the snow", ""] {
@@ -1021,9 +1056,20 @@ fn adapter_read_body() {
     let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&file).unwrap();
     let stored: u64 = headers.iter().map(|h| h.data_bytes).sum();
     let labels: Vec<(String, u64)> = checks(&events).into_iter().map(|c| (c.0, c.1)).collect();
-    assert_eq!(labels[0].0, crate::model::BACKBONE_LOAD_QUANTUM);
+    let base_headers = crate::stream::headers(&backbone_dir().join("model.safetensors")).unwrap();
+    let raw = crate::stream::materialized_load_bytes(&base_headers, |_| true).unwrap();
+    let view = base_headers.iter().map(|h| (h.name.as_str(), h)).collect();
+    let joint = crate::stream::backbone_load_target_bytes(&view, Dtype::Float32, |_| true).unwrap();
+    assert_eq!(
+        labels[0],
+        (crate::model::BACKBONE_LOAD_QUANTUM.to_string(), raw)
+    );
     assert_eq!(
         labels[1],
+        (crate::stream::LOAD_TARGET_QUANTUM.to_string(), joint)
+    );
+    assert_eq!(
+        labels[2],
         (crate::adapters::ADAPTER_LOAD_QUANTUM.to_string(), stored)
     );
     // With no headroom the install refuses at that check, before reading or installing anything.
@@ -1373,5 +1419,321 @@ fn component_load_scopes_establish_fresh_backing_before_materialization() {
     in_cpu_child(
         "quantum_tests::component_load_scopes_establish_fresh_backing_before_materialization",
         component_load_scope_body,
+    );
+}
+
+// The constructor guard must deny AFTER the unchanged raw floor passes, and BEFORE the native
+// file load/read casts/build/internal eval. These are source-authored CPU-child tests, not a
+// replacement for the original raw-floor, adapter-7440, geometry or measured<=derived tests.
+fn load_target_denial_body() {
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let headers = crate::stream::headers(&backbone_dir().join("model.safetensors")).unwrap();
+    let raw = crate::stream::materialized_load_bytes(&headers, |_| true).unwrap();
+    let view = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+    let joint =
+        crate::stream::backbone_load_target_bytes(&view, Dtype::Bfloat16, |_| true).unwrap();
+    assert!(joint > raw);
+    take_refusal();
+    let active = mlx_rs::memory::get_active_memory();
+    let (denied, events) = observed(raw + PROCESS_RESERVE_BYTES, || {
+        crate::model::load_backbone(&backbone_dir(), &config, Dtype::Bfloat16)
+    });
+    assert!(
+        denied.is_err(),
+        "a raw-affordable but target-unaffordable model must not build"
+    );
+    assert_eq!(
+        checks(&events),
+        [(crate::model::BACKBONE_LOAD_QUANTUM.to_string(), raw, 0)]
+    );
+    let refusal = take_refusal().expect("the actual load-target check must refuse");
+    assert_eq!(refusal.label, crate::stream::LOAD_TARGET_QUANTUM);
+    assert_eq!(refusal.scratch_bytes, joint);
+    assert_eq!(
+        mlx_rs::memory::get_active_memory(),
+        active,
+        "no native model target was allocated"
+    );
+
+    let cfg = mlx_llm::ModelConfig::from_dir(text_encoder_dir()).unwrap();
+    let mut tower_headers = Vec::new();
+    for file in
+        crate::text_encoder::weight_shards(&text_encoder_dir(), !cfg.tie_word_embeddings).unwrap()
+    {
+        tower_headers.extend(
+            crate::stream::headers(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    crate::text_encoder::is_text_tower_tensor(&h.name, !cfg.tie_word_embeddings)
+                }),
+        );
+    }
+    let (logical, additional) = crate::stream::tower_load_output_bytes(
+        &tower_headers,
+        |_| true,
+        crate::stream::tower_rope_bytes(&cfg).unwrap(),
+    )
+    .unwrap();
+    assert!(additional > 0);
+    take_refusal();
+    let active = mlx_rs::memory::get_active_memory();
+    let (denied, events) = observed(logical + PROCESS_RESERVE_BYTES, || {
+        crate::text_encoder::IrisTextEncoder::load(&text_encoder_dir(), &config.text_encoder)
+    });
+    assert!(
+        denied.is_err(),
+        "target check precedes CausalLm build_rope and internal eval"
+    );
+    assert_eq!(
+        checks(&events),
+        [(crate::text_encoder::quanta::LOAD.to_string(), logical, 0)]
+    );
+    let refusal = take_refusal().expect("the actual tower load-target check must refuse");
+    assert_eq!(refusal.label, crate::stream::LOAD_TARGET_QUANTUM);
+    assert_eq!(refusal.scratch_bytes, logical + additional);
+    assert_eq!(
+        mlx_rs::memory::get_active_memory(),
+        active,
+        "no tower target/frequency row was created"
+    );
+}
+
+#[test]
+fn load_target_guard_denies_after_raw_pass_before_first_native_target() {
+    in_cpu_child(
+        "quantum_tests::load_target_guard_denies_after_raw_pass_before_first_native_target",
+        load_target_denial_body,
+    );
+}
+
+/// Source plan for one actual eager backbone load: the PURE plan the runtime guard also uses.
+fn backbone_plan(quant: Option<mlx_gen::Quant>, compute: Dtype) -> crate::stream::PendingBackbone {
+    let headers = crate::stream::headers(&backbone_dir().join("model.safetensors")).unwrap();
+    let quant = crate::nn::BackboneQuant::for_load(quant).unwrap();
+    crate::stream::backbone_pending_plan(&vec![headers], "", compute, quant)
+        .unwrap()
+        .1
+}
+
+fn refused_scratch(label: &str, load: impl FnOnce() -> Result<()>) -> (u64, Vec<String>) {
+    let (scratch, labels, available) = refused_capacity(label, load);
+    // short_at offers exactly the stage's own price plus reserve, minus one byte.
+    assert_eq!(
+        available,
+        scratch + PROCESS_RESERVE_BYTES - 1,
+        "{label}: refused at its own price"
+    );
+    (scratch, labels)
+}
+
+fn refused_capacity(label: &str, load: impl FnOnce() -> Result<()>) -> (u64, Vec<String>, u64) {
+    take_refusal();
+    let (denied, events) = observed(AMPLE, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_short_at(label, load)
+    });
+    assert!(denied.is_err(), "{label}: the real stage must refuse");
+    let labels: Vec<String> = checks(&events).into_iter().map(|check| check.0).collect();
+    assert!(
+        !labels.iter().any(|l| l == label),
+        "{label}: a refused check emits no Checked mark"
+    );
+    let refusal = take_refusal().unwrap();
+    assert_eq!(refusal.label, label);
+    (
+        refusal.scratch_bytes,
+        labels,
+        refusal.available_bytes.expect("fixture headroom is known"),
+    )
+}
+
+/// The refused headroom admits the constructor-only law but not the real pending plan: dropping
+/// the stored-grid graph would PASS this budget, so the refusal discriminates the quant term.
+fn assert_discriminates(label: &str, available: u64, constructor_only: u64, pending: u64) {
+    assert!(
+        available >= constructor_only + PROCESS_RESERVE_BYTES,
+        "{label}: a constructor-only law would admit this headroom"
+    );
+    assert!(
+        available < pending + PROCESS_RESERVE_BYTES,
+        "{label}: the real pending plan is refused"
+    );
+}
+
+fn post_adapter_denial_body() {
+    use mlx_gen::{AdapterKind, AdapterSpec, Quant};
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let specs = [AdapterSpec::new(
+        fixtures().join("iris_lora.safetensors"),
+        0.75,
+        AdapterKind::Lora,
+    )];
+    let compute = Dtype::Bfloat16;
+    let unquantized = backbone_plan(None, compute);
+    for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+        for adapted in [false, true] {
+            if quant.is_none() && !adapted {
+                continue;
+            } // bare dense has no pending stage
+            let plan = backbone_plan(quant, compute);
+            let adapters: &[AdapterSpec] = if adapted { &specs } else { &[] };
+            let load = || {
+                crate::model::load_backbone_quantized(
+                    &backbone_dir(),
+                    &config,
+                    compute,
+                    adapters,
+                    IrisTask::Generation,
+                    crate::model::MODEL_ID,
+                    quant,
+                )
+                .map(|_| ())
+            };
+            let (scratch, labels, available) =
+                refused_capacity(crate::nn::PENDING_CONSTRUCTION_QUANTUM, load);
+            if quant.is_some() {
+                let quant_only = plan.constructors - unquantized.constructors;
+                assert_discriminates(
+                    crate::nn::PENDING_CONSTRUCTION_QUANTUM,
+                    available,
+                    scratch - quant_only,
+                    scratch,
+                );
+            }
+            assert_eq!(
+                labels[0],
+                crate::model::BACKBONE_LOAD_QUANTUM,
+                "original raw check first"
+            );
+            assert_eq!(
+                labels[1],
+                crate::stream::LOAD_TARGET_QUANTUM,
+                "early joint check second"
+            );
+            if adapted {
+                let adapter_file = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+                    fixtures().join("iris_lora.safetensors"),
+                )
+                .unwrap()
+                .iter()
+                .map(|h| h.data_bytes)
+                .sum::<u64>();
+                let first_adapter = labels
+                    .iter()
+                    .position(|l| l == crate::adapters::ADAPTER_LOAD_QUANTUM)
+                    .unwrap();
+                assert!(
+                    first_adapter > 1,
+                    "adapter reads follow raw and early joint checks"
+                );
+                let _ = adapter_file; // exact 7440 tuple remains asserted by adapter_read_body
+                                      // Residual materialization is added on top of the source constructor plan.
+                assert!(scratch >= plan.constructors);
+            } else {
+                assert_eq!(
+                    scratch, plan.constructors,
+                    "{quant:?}: exact pending build plan"
+                );
+            }
+            if quant.is_some() {
+                // A constructor-only law (no stored-grid graph) is strictly smaller and would
+                // have admitted a budget this check correctly refuses.
+                assert!(plan.constructors > unquantized.constructors, "{quant:?}");
+            }
+            let (scratch, labels, available) =
+                refused_capacity(crate::nn::ADAPTED_BASE_EVAL_QUANTUM, load);
+            if quant.is_some() {
+                assert_discriminates(
+                    crate::nn::ADAPTED_BASE_EVAL_QUANTUM,
+                    available,
+                    unquantized.evaluation,
+                    scratch,
+                );
+            }
+            assert!(labels
+                .iter()
+                .any(|l| l == crate::nn::PENDING_CONSTRUCTION_QUANTUM));
+            assert_eq!(
+                scratch, plan.evaluation,
+                "{quant:?} adapted={adapted}: post-build pending only"
+            );
+            assert!(
+                plan.evaluation <= plan.constructors,
+                "already-built scalars are not recharged"
+            );
+            if quant.is_some() {
+                assert!(
+                    plan.evaluation > unquantized.evaluation,
+                    "{quant:?}: quant eval graph counted"
+                );
+            }
+        }
+    }
+}
+
+fn export_denial_body() {
+    let elements = |dir: &std::path::Path| {
+        let header = crate::stream::headers(&dir.join("empty_prompt.safetensors"))
+            .unwrap()
+            .into_iter()
+            .find(|h| h.name == "embeddings")
+            .unwrap();
+        header.shape.iter().product::<usize>() as u64
+    };
+    let upscaler = fixtures().join("tiny-snapshot/upscaler");
+    let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(upscaler.clone()));
+    let upload = crate::stream::empty_prompt_upload_bytes(elements(&upscaler)).unwrap();
+    let (scratch, labels) = refused_scratch(crate::stream::EXPORT_TARGET_QUANTUM, || {
+        crate::restoration::IrisRestorer::load(&spec).map(|_| ())
+    });
+    assert_eq!(
+        scratch, upload,
+        "restoration: only the fresh F32 prompt upload remains"
+    );
+    assert!(
+        labels
+            .iter()
+            .filter(|l| *l == crate::stream::LOAD_TARGET_QUANTUM)
+            .count()
+            >= 2,
+        "outer and inner backbone joint checks both passed first"
+    );
+
+    let depth = fixtures().join("tiny-depth");
+    let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(depth.clone()));
+    let model = crate::stream::headers(&depth.join("model.safetensors")).unwrap();
+    let prompt = crate::stream::headers(&depth.join("empty_prompt.safetensors")).unwrap();
+    let plan =
+        crate::stream::backbone_pending_plan(&vec![model, prompt], "pixel.", Dtype::Bfloat16, None)
+            .unwrap()
+            .1;
+    let upload = crate::stream::empty_prompt_upload_bytes(elements(&depth)).unwrap();
+    let (scratch, labels) = refused_scratch(crate::stream::EXPORT_TARGET_QUANTUM, || {
+        crate::depth::load_depth(&spec).map(|_| ())
+    });
+    assert_eq!(
+        scratch,
+        plan.constructors + upload,
+        "depth: pending constructors plus F32 upload"
+    );
+    assert!(plan.constructors > 0);
+    assert!(labels
+        .iter()
+        .any(|l| l == crate::stream::LOAD_TARGET_QUANTUM));
+}
+
+#[test]
+fn export_target_guards_refuse_before_late_restoration_and_depth_uploads() {
+    in_cpu_child(
+        "quantum_tests::export_target_guards_refuse_before_late_restoration_and_depth_uploads",
+        export_denial_body,
+    );
+}
+
+#[test]
+fn adapted_and_dense_quantized_pending_guards_follow_real_intervening_growth() {
+    in_cpu_child(
+        "quantum_tests::adapted_and_dense_quantized_pending_guards_follow_real_intervening_growth",
+        post_adapter_denial_body,
     );
 }

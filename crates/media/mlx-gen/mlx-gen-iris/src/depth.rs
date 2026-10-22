@@ -197,11 +197,13 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
             path.display()
         )));
     }
-    crate::stream::before_materialized_load(
+    let load_sources = crate::stream::before_materialized_load(
         quanta::LOAD,
         &[path.clone(), export.empty_prompt_path()],
         |name| !streamed || !is_stack_key(name),
     )?;
+    let pending =
+        crate::stream::before_backbone_targets(load_sources, BACKBONE_PREFIX, compute, None)?;
     let mut source = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     let mut keys: Vec<String> = source.keys().map(str::to_owned).collect();
@@ -266,6 +268,9 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
 
     let prompt: EmptyPrompt = export.empty_prompt()?;
     let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
+    // Source reducer buffers were explicitly read/evaluated above; no pending raw reducer
+    // input is assumed. Only remaining constructor targets plus the fresh F32 upload remain.
+    crate::stream::before_export_targets(pending.constructors, prompt.embeddings.len())?;
     let embeddings = Array::from_slice(&prompt.embeddings, &shape);
 
     let mut arrays = dit.arrays();

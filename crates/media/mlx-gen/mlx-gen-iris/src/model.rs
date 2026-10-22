@@ -197,11 +197,12 @@ pub fn load_backbone_quantized(
         )));
     }
     let quant = if artifact.is_some() { None } else { quant };
-    crate::stream::before_materialized_load(
+    let load_sources = crate::stream::before_materialized_load(
         BACKBONE_LOAD_QUANTUM,
         std::slice::from_ref(&path),
         |_| true,
     )?;
+    let pending = crate::stream::before_backbone_targets(load_sources, "", compute, quant)?;
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     // The release ships FP32. Cast every matrix to the compute dtype ONE TENSOR AT A TIME and
@@ -222,8 +223,27 @@ pub fn load_backbone_quantized(
         Some((adapted, reports)) => (Some(adapted), reports),
         None => (None, Vec::new()),
     };
+    if adapted.is_some() || quant.is_some() {
+        crate::nn::before_pending_construction(|| {
+            let residuals = adapted.as_ref().map_or(
+                Ok(0),
+                crate::nn::AdaptedLinears::pending_materialization_bytes,
+            )?;
+            // install resolved the entire eligible packed-width set before this point.
+            pending
+                .before_build_targets(adapted.is_some())?
+                .checked_add(residuals)
+                .ok_or_else(|| Error::Unsupported("Iris pending construction byte overflow".into()))
+        })?;
+    }
     let dit =
         IrisDiT::from_weights_quantized(&weights, &config.model, compute, adapted.as_ref(), quant)?;
+    if mlx_gen::ios_quantum::enabled() && (adapted.is_some() || quant.is_some()) {
+        // Successful installed-width resolution (or the successful bare build) already ran
+        // these getters. Dense-requant bare sources have no source packed-marker getter set.
+        // Exclude completed operations from future scratch, not from retained-memory evidence.
+        crate::nn::before_adapted_base_eval(pending.after_build_targets()?)?;
+    }
     drop(adapted);
     // Every derived parameter is evaluated before any forward can read it.
     let arrays = dit.arrays();
@@ -282,11 +302,12 @@ pub fn load_backbone_streamed(
         )));
     }
     let skeleton = |name: &str| crate::dit::Stack::of(name).is_none();
-    crate::stream::before_materialized_load(
+    let load_sources = crate::stream::before_materialized_load(
         BACKBONE_LOAD_QUANTUM,
         std::slice::from_ref(&path),
         skeleton,
     )?;
+    crate::stream::before_backbone_targets(load_sources, "", compute, None)?;
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();

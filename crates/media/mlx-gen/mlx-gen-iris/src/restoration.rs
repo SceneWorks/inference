@@ -148,7 +148,7 @@ impl IrisRestorer {
         // of [`crate::stream::TRANSFORMER_WINDOW_SIZE`]; the transform has no request channel for
         // a selection, so the load shape is its rung-4 engagement.
         let streamed = spec.load_shape == gen_core::LoadShape::DeferredMaterialization;
-        crate::stream::before_materialized_load(
+        let load_sources = crate::stream::before_materialized_load(
             quanta::LOAD,
             &[
                 resources.export.weights_path(),
@@ -156,6 +156,7 @@ impl IrisRestorer {
             ],
             |name| !streamed || crate::dit::Stack::of(name).is_none(),
         )?;
+        crate::stream::before_backbone_targets(load_sources, "", compute_dtype(spec), None)?;
         let prompt = resources.empty_prompt()?;
         let dit = if streamed {
             crate::model::load_backbone_streamed(
@@ -173,6 +174,9 @@ impl IrisRestorer {
             )?
         };
         let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
+        // Backbone parameters are now retained/evaluated. Check fresh live capacity again
+        // immediately before the independent native upload; the early check was no reservation.
+        crate::stream::before_export_targets(0, prompt.embeddings.len())?;
         let states = Array::from_slice(&prompt.embeddings, &shape);
         eval([&states])?;
         let memory_strategy = crate::memory_strategy::export_contract(

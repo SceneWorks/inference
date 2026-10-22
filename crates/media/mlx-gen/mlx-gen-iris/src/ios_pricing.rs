@@ -771,6 +771,10 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     use crate::restoration::quanta as restore_q;
     let phase = match label {
         te_q::LOAD
+        | crate::stream::EXPORT_TARGET_QUANTUM
+        | crate::nn::PENDING_CONSTRUCTION_QUANTUM
+        | crate::nn::ADAPTED_BASE_EVAL_QUANTUM
+        | crate::stream::LOAD_TARGET_QUANTUM
         | crate::model::BACKBONE_LOAD_QUANTUM
         | crate::adapters::ADAPTER_LOAD_QUANTUM
         | mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM
@@ -822,6 +826,10 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
 /// Every quantum label the crate checks (the coverage set of [`ios_quantum_phase`]).
 fn quantum_labels_iter() -> impl Iterator<Item = &'static str> {
     [
+        crate::stream::EXPORT_TARGET_QUANTUM,
+        crate::nn::PENDING_CONSTRUCTION_QUANTUM,
+        crate::nn::ADAPTED_BASE_EVAL_QUANTUM,
+        crate::stream::LOAD_TARGET_QUANTUM,
         crate::model::BACKBONE_LOAD_QUANTUM,
         crate::model::IMAGE_QUANTUM,
         crate::adapters::ADAPTER_LOAD_QUANTUM,
@@ -1103,7 +1111,7 @@ fn held_states(path: &Path) -> Result<u64> {
         .iter()
         .find(|h| h.name == "embeddings")
         .ok_or_else(|| Error::MissingTensor(format!("{}: embeddings", path.display())))?;
-    Ok(allocated(4 * elements(embeddings)))
+    crate::stream::empty_prompt_upload_bytes(embeddings.element_count().map_err(Error::from)? as u64)
 }
 
 fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
@@ -2042,6 +2050,11 @@ struct PricedBackbone {
     facts: Backbone,
     resident: u64,
     floor: u64,
+    load_targets: u64,
+    constructor_outputs: u64,
+    evaluation_outputs: u64,
+    width_outputs: u64,
+    read_sources_upper: u64,
 }
 
 /// Price the backbone `path` (export key prefix `prefix`) for a load at `precision` / `requested`,
@@ -2120,6 +2133,58 @@ fn priced_backbone_from_headers(
     // The load floor is the file the load reads: the packed export when one is assumed.
     let floor_headers = if opts.assume_packed { &built[..] } else { real };
     let floor = materialized_load_bytes(floor_headers, keep)?;
+    let load_view = floor_headers
+        .iter()
+        .map(|h| (h.name.strip_prefix(prefix).unwrap_or(&h.name), h))
+        .collect();
+    let load_constructors: std::collections::HashMap<_, _> = floor_headers
+        .iter()
+        .map(|h| {
+            (
+                h.name.strip_prefix(prefix).unwrap_or(&h.name).to_owned(),
+                h.clone(),
+            )
+        })
+        .collect();
+    let constructor_outputs = if prefix == "pixel." {
+        depth_constructor_output_bytes(&load_constructors, precision, streamed)?
+    } else {
+        backbone_constructor_output_bytes(&load_constructors, precision, |name| {
+            !streamed || Stack::of(name).is_none()
+        })?
+    };
+    let read_sources_upper =
+        crate::stream::backbone_read_bytes(&load_view, compute_dtype(precision), |name| {
+            !streamed || Stack::of(name).is_none()
+        })?;
+    let load_quant = if requantized && !opts.assume_packed {
+        BackboneQuant::for_load(requested)?
+    } else {
+        None
+    };
+    let quantized = crate::stream::backbone_quantization_bytes(
+        &load_view,
+        compute_dtype(precision),
+        load_quant,
+        |name| !streamed || Stack::of(name).is_none(),
+    )?;
+    let eval_quantized = crate::stream::backbone_quantization_evaluation_bytes(
+        &load_view,
+        compute_dtype(precision),
+        load_quant,
+        |name| !streamed || Stack::of(name).is_none(),
+    )?;
+    let width_outputs =
+        crate::stream::installed_width_output_bytes(&load_view, compute_dtype(precision))?;
+    let evaluation_outputs = constructor_outputs
+        .checked_add(eval_quantized)
+        .ok_or_else(|| Error::Unsupported("Iris pending evaluation byte overflow".into()))?;
+    let constructor_outputs = constructor_outputs.checked_add(quantized).ok_or_else(|| {
+        Error::Unsupported("Iris pending quantized constructor byte overflow".into())
+    })?;
+    let load_targets = read_sources_upper
+        .checked_add(constructor_outputs)
+        .ok_or_else(|| Error::Unsupported("Iris joint load target byte overflow".into()))?;
     let quant = if requantized {
         BackboneQuant::for_load(requested)?
     } else {
@@ -2133,6 +2198,11 @@ fn priced_backbone_from_headers(
         facts,
         resident,
         floor,
+        load_targets,
+        constructor_outputs,
+        evaluation_outputs,
+        width_outputs,
+        read_sources_upper,
     })
 }
 
@@ -2141,6 +2211,7 @@ struct PricedTower {
     cfg: mlx_llm::ModelConfig,
     resident: u64,
     floor: u64,
+    load_owned_upper: u64,
     reads: Vec<BlockRead>,
 }
 
@@ -2200,11 +2271,27 @@ fn priced_tower(
     let resident = resident
         .checked_add(tower_rope_bytes(&cfg)?)
         .ok_or_else(|| Error::Unsupported("Iris tower resident byte arithmetic overflow".into()))?;
-    let floor = if streamed {
-        stored(floor_headers, skeleton)
+    // Return the checked logical floor and its same-owner target/rounding upper together;
+    // a saturating source sum must never be treated as an exact subtraction identity.
+    let (floor, load_owned_upper) = tower_load_output_bytes(
+        floor_headers,
+        |name| !streamed || skeleton(name),
+        tower_rope_bytes(&cfg)?,
+    )?;
+    let load_quant = if requantized && !opts.assume_packed {
+        crate::text_encoder::text_encoder_quant_spec(&cfg, requested)?
     } else {
-        stored(floor_headers, |_| true)
+        None
     };
+    let load_owned_upper = load_owned_upper
+        .checked_add(crate::stream::tower_quantization_bytes(
+            floor_headers,
+            |name| !streamed || skeleton(name),
+            load_quant,
+        )?)
+        .ok_or_else(|| {
+            Error::Unsupported("Iris tower pending quantization byte overflow".into())
+        })?;
     let mut grouped: Vec<Vec<&Header>> = vec![Vec::new(); cfg.num_layers];
     for h in &built {
         if let Some(i) = crate::text_encoder::tower_layer_of(&h.name) {
@@ -2221,8 +2308,21 @@ fn priced_tower(
         cfg,
         resident,
         floor,
+        load_owned_upper,
         reads,
     })
+}
+
+/// Qwen3-VL's selected load leaves: fresh BF16 parameter targets, its model-owned rotary row,
+/// and per-source allocator rounding beyond the logical-byte raw guard. Packed codes/scales/
+/// biases are used as stored. This does not claim to price dense-requantization intermediates;
+/// their separate cumulative native graph remains in native_ledger.
+fn tower_load_output_bytes(
+    headers: &[Header],
+    keep: impl Fn(&str) -> bool,
+    rotary_row: u64,
+) -> Result<(u64, u64)> {
+    crate::stream::tower_load_output_bytes(headers, keep, rotary_row)
 }
 
 pub use native_ledger::{
@@ -2767,13 +2867,7 @@ fn plan_of(execution: &GenerationMemory) -> mlx_gen::AttentionPlan<'static> {
 /// Qwen3-VL's build_rope owns one f32 row over the resolved rotary dimension, in resident AND
 /// streamed form. Per-pass cos/sin tables are separate walk producers, not model parameters.
 fn tower_rope_bytes(cfg: &mlx_llm::ModelConfig) -> Result<u64> {
-    let dim = u64::try_from(cfg.rotary_dim())
-        .map_err(|_| Error::Unsupported("Iris negative rotary dimension".into()))?;
-    dim.checked_mul(4)
-        .and_then(|bytes| {
-            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
-        })
-        .ok_or_else(|| Error::Unsupported("Iris rotary frequency byte arithmetic overflow".into()))
+    crate::stream::tower_rope_bytes(cfg)
 }
 
 /// One resident decoder walk's native-owned IDs, rotary tables, hidden states and K/V capacity. Unlike the streamed
@@ -3136,10 +3230,18 @@ fn generation(
         IosPhase::Load,
         0,
         0,
-        &[(te_q::LOAD, te.floor)],
+        &[
+            (te_q::LOAD, te.floor),
+            (
+                crate::stream::LOAD_TARGET_QUANTUM,
+                te.floor.checked_add(te.load_owned_upper).ok_or_else(|| {
+                    Error::Unsupported("Iris tower joint load byte overflow".into())
+                })?,
+            ),
+        ],
         IosWorkBasis::default(),
         "iris.generation.load/text",
-        "model::load_model text component closure",
+        "model::load_model original raw floor then actual joint load-target guard",
         1,
     );
     take_source_at(
@@ -3147,10 +3249,13 @@ fn generation(
         IosPhase::Load,
         load_tower,
         load_conditioning,
-        &[(crate::model::BACKBONE_LOAD_QUANTUM, bb.floor)],
+        &[
+            (crate::model::BACKBONE_LOAD_QUANTUM, bb.floor),
+            (crate::stream::LOAD_TARGET_QUANTUM, bb.load_targets),
+        ],
         IosWorkBasis::default(),
         "iris.generation.load/backbone",
-        "model::load_model backbone component closure",
+        "model::load_model original raw floor then actual joint load-target guard",
         1,
     );
     if !spec.adapters.is_empty() {
@@ -3255,6 +3360,62 @@ fn generation(
                 IosWorkBasis::default(), "iris.generation.load/adapter_materialize",
                 "nn::Loader::linear reconstruction upper; other outputs retained conservatively, not a simultaneous lower", 1);
         }
+    }
+
+    let dense_load_quant = !streamed
+        && spec.quantize.is_some()
+        && crate::packed::artifact_tier(
+            &resources
+                .backbone_dir
+                .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+        )?
+        .is_none();
+    if !spec.adapters.is_empty() || dense_load_quant {
+        let residuals = adapter_loads.values().try_fold(0u64, |sum, load| {
+            sum.checked_add(load.materialize_scratch_bytes()?)
+                .ok_or_else(|| Error::Unsupported("Iris pending residual byte overflow".into()))
+        })?;
+        let stage_plan = crate::stream::PendingBackbone {
+            constructors: bb.constructor_outputs,
+            evaluation: bb.evaluation_outputs,
+            width_outputs: bb.width_outputs,
+        };
+        let pending = stage_plan
+            .before_build_targets(!spec.adapters.is_empty())?
+            .checked_add(residuals)
+            .ok_or_else(|| Error::Unsupported("Iris pending construction byte overflow".into()))?;
+        let held = load_conditioning
+            .checked_add(bb.read_sources_upper)
+            .and_then(|bytes| bytes.checked_add(adapter_resident))
+            .ok_or_else(|| Error::Unsupported("Iris adapted base held byte overflow".into()))?;
+        // Completed operations may still have live buffers. Keep their source upper outside
+        // future-allocation scratch; this is not retirement or common-owner subtraction.
+        let pre_completed = if spec.adapters.is_empty() {
+            0
+        } else {
+            bb.width_outputs
+        };
+        let pre_held = held
+            .checked_add(pre_completed)
+            .ok_or_else(|| Error::Unsupported("Iris completed width held byte overflow".into()))?;
+        take_source_at(
+            &mut pricing,
+            IosPhase::Load,
+            load_tower,
+            pre_held,
+            &[(crate::nn::PENDING_CONSTRUCTION_QUANTUM, pending)],
+            IosWorkBasis::default(),
+            "iris.generation.load/pending_construction",
+            "active source/read inputs and completed installed-width targets; pending build",
+            1,
+        );
+        let late_held = held
+            .checked_add(stage_plan.completed_before_evaluation()?)
+            .ok_or_else(|| Error::Unsupported("Iris completed build held byte overflow".into()))?;
+        take_source_at(&mut pricing, IosPhase::Load, load_tower, late_held,
+            &[(crate::nn::ADAPTED_BASE_EVAL_QUANTUM, stage_plan.after_build_targets()?)],
+            IosWorkBasis::default(), "iris.generation.load/pending_evaluation",
+            "completed getters/build buffers retained conservatively; only pending evaluation scratch", 1);
     }
 
     // Conditioning: every prompt and the CFG null in turn; the conditionings already returned
@@ -4144,15 +4305,7 @@ fn restoration_with_sources(
     };
     let (states, prompt_floor) = if let Some(sources) = sources {
         (
-            allocated(
-                sources
-                    .metadata
-                    .empty_embedding_elements
-                    .checked_mul(4)
-                    .ok_or_else(|| {
-                        Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
-                    })?,
-            ),
+            crate::stream::empty_prompt_upload_bytes(sources.metadata.empty_embedding_elements)?,
             materialized_load_bytes(&sources.empty_headers, |_| true)?,
         )
     } else {
@@ -4223,10 +4376,18 @@ fn restoration_with_sources(
         IosPhase::Load,
         0,
         caller_rgb,
-        &[(crate::restoration::quanta::LOAD, bb.floor + prompt_floor)],
+        &[
+            (crate::restoration::quanta::LOAD, bb.floor + prompt_floor),
+            (
+                crate::stream::LOAD_TARGET_QUANTUM,
+                bb.load_targets.checked_add(states).ok_or_else(|| {
+                    Error::Unsupported("Iris restoration joint load byte overflow".into())
+                })?,
+            ),
+        ],
         basis.clone(),
         "iris.restoration.load",
-        "restoration::load before export/prompt read",
+        "restoration::load raw HOST-inclusive floor then native targets plus explicit F32 upload",
         1,
     );
     take_source_at(
@@ -4234,10 +4395,24 @@ fn restoration_with_sources(
         IosPhase::Load,
         0,
         caller_rgb + states + 4 * config.model.text_len as u64,
-        &[(crate::model::BACKBONE_LOAD_QUANTUM, bb.floor)],
+        &[
+            (crate::model::BACKBONE_LOAD_QUANTUM, bb.floor),
+            (crate::stream::LOAD_TARGET_QUANTUM, bb.load_targets),
+        ],
         basis.clone(),
         "iris.restoration.backbone_load",
-        "restoration::load holds decoded host empty-prompt before backbone",
+        "restoration::load decoded prompt outside the backbone joint guard",
+        1,
+    );
+    take_source_at(
+        &mut pricing,
+        IosPhase::Load,
+        bb.resident,
+        caller_rgb,
+        &[(crate::stream::EXPORT_TARGET_QUANTUM, states)],
+        basis.clone(),
+        "iris.restoration.load/upload",
+        "evaluated backbone retained before fresh F32 prompt upload",
         1,
     );
     if axes != 0 {
@@ -4419,63 +4594,30 @@ fn depth(
     depth_with_sources(req, opts, export, token, None)
 }
 
-/// Fresh outputs the depth loader's constructors retain BESIDE source-file buffers until final
-/// parameter evaluation: projection-bias compute casts, f32 norm/modulation/table casts, and the
-/// reducer's compute casts. A raw file floor does not include a newly created target buffer.
+/// Fresh targets created inside backbone construction: projection-bias compute casts, f32
+/// norm/modulation/table casts, logical-width item targets, and depth-reducer compute casts.
+/// Sum as a conservative load-interval upper, not a claim all targets coexist or an entry lower.
+/// A raw file floor does not include a newly created target buffer.
 /// Keys are Backbone's already-normalized logical names; no source reopen or string allocation.
+fn backbone_constructor_output_bytes(
+    headers: &std::collections::HashMap<String, Header>,
+    precision: Precision,
+    keep: impl Fn(&str) -> bool,
+) -> Result<u64> {
+    let view = headers.iter().map(|(name, h)| (name.as_str(), h)).collect();
+    crate::stream::constructor_output_bytes(&view, compute_dtype(precision), keep)
+}
+
+// Depth uses the identical law, including its out-of-backbone reducer, with the actual
+// eager/deferred selection. Keep this route adapter for the existing depth callers/tests.
 fn depth_constructor_output_bytes(
     headers: &std::collections::HashMap<String, Header>,
     precision: Precision,
     streamed: bool,
 ) -> Result<u64> {
-    let compute = match precision {
-        Precision::Bf16 => (2u64, Stored::BF16),
-        Precision::Fp32 => (4u64, Stored::F32),
-    };
-    let overflow = || Error::Unsupported("Iris depth constructor byte arithmetic overflow".into());
-    headers
-        .iter()
-        .filter(|(name, _)| !streamed || Stack::of(name).is_none())
-        .try_fold(0u64, |sum, (name, header)| {
-            let linear_bias = name.strip_suffix(".bias").is_some_and(|base| {
-                headers.iter().any(|(key, sibling)| {
-                    sibling.shape.len() == 2 && key.strip_suffix(".weight") == Some(base)
-                })
-            });
-            let target =
-                if name == "depth_reducer.weight" || name == "depth_reducer.bias" || linear_bias {
-                    Some(compute)
-                } else if name == "y_pos_embedding"
-                    || header.shape.len() == 1 && name.ends_with(".weight")
-                    || name.ends_with(".bias")
-                {
-                    Some((4, Stored::F32))
-                } else {
-                    None
-                };
-            let Some((width, dtype)) = target else {
-                return Ok(sum);
-            };
-            let reducer = name == "depth_reducer.weight" || name == "depth_reducer.bias";
-            let read_dtype = if !reducer
-                && header.shape.len() >= 2
-                && name != "y_pos_embedding"
-                && !crate::stream::is_packed_part_header(header)
-            {
-                compute.1
-            } else {
-                header.dtype
-            };
-            if read_dtype == dtype {
-                return Ok(sum);
-            }
-            let bytes = header.shape.iter().try_fold(width, |n, dim| {
-                n.checked_mul(*dim as u64).ok_or_else(overflow)
-            })?;
-            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
-                .and_then(|bytes| sum.checked_add(bytes))
-                .ok_or_else(overflow)
-        })
+    backbone_constructor_output_bytes(headers, precision, |name| {
+        !streamed || Stack::of(name).is_none()
+    })
 }
 
 fn depth_with_sources(
@@ -4516,15 +4658,7 @@ fn depth_with_sources(
     };
     let (states, prompt_floor) = if let Some(sources) = sources {
         (
-            allocated(
-                sources
-                    .metadata
-                    .empty_embedding_elements
-                    .checked_mul(4)
-                    .ok_or_else(|| {
-                        Error::Unsupported("Iris guarded empty-prompt extent overflow".into())
-                    })?,
-            ),
+            crate::stream::empty_prompt_upload_bytes(sources.metadata.empty_embedding_elements)?,
             materialized_load_bytes(&sources.empty_headers, |_| true)?,
         )
     } else {
@@ -4628,18 +4762,41 @@ fn depth_with_sources(
         patch_width: config.model.patch_size as u32,
         patch_height: config.model.patch_size as u32,
     };
-    let constructor_outputs =
-        depth_constructor_output_bytes(&bb.facts.headers, spec.precision, streamed)?;
     take_source_at(
         &mut pricing,
         IosPhase::Load,
         0,
-        caller_rgb.checked_add(constructor_outputs).ok_or_else(||
-            Error::Unsupported("Iris depth load held byte arithmetic overflow".into()))?,
-        &[(crate::depth::quanta::LOAD, bb.floor + prompt_floor)],
+        caller_rgb,
+        &[
+            (crate::depth::quanta::LOAD, bb.floor + prompt_floor),
+            (
+                crate::stream::LOAD_TARGET_QUANTUM,
+                bb.load_targets.checked_add(states).ok_or_else(|| {
+                    Error::Unsupported("Iris depth joint load byte overflow".into())
+                })?,
+            ),
+        ],
         basis.clone(),
         "iris.depth.load",
-        "depth::load_depth_export raw floor plus retained constructor-output upper (not entry lower)",
+        "depth::load_depth_export original raw floor then actual joint targets",
+        1,
+    );
+    let late_targets = bb
+        .constructor_outputs
+        .checked_add(states)
+        .ok_or_else(|| Error::Unsupported("Iris depth final targets byte overflow".into()))?;
+    let late_sources = caller_rgb
+        .checked_add(bb.read_sources_upper)
+        .ok_or_else(|| Error::Unsupported("Iris depth final source byte overflow".into()))?;
+    take_source_at(
+        &mut pricing,
+        IosPhase::Load,
+        0,
+        late_sources,
+        &[(crate::stream::EXPORT_TARGET_QUANTUM, late_targets)],
+        basis.clone(),
+        "iris.depth.load/final_targets",
+        "explicitly read source buffers retained; pending constructors and F32 upload",
         1,
     );
     let input = crate::depth::depth_input_scratch(1, h as i32, w as i32);
@@ -5859,5 +6016,166 @@ mod depth_constructor_output_tests {
         assert_eq!(reducer.shape, [1, 3, 1, 1]);
         assert_eq!(reducer.data_bytes, 12);
         assert!(packed.iter().any(|h| h.name == "pixel.proj.scales"));
+    }
+}
+
+#[cfg(test)]
+mod shared_load_target_tests {
+    use super::*;
+
+    fn h(name: &str, dtype: Stored, shape: &[usize], bytes: u64) -> Header {
+        Header {
+            name: name.into(),
+            dtype,
+            shape: shape.to_vec(),
+            data_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn shared_backbone_targets_honor_packed_bias_post_read_norm_and_keep() {
+        let headers = [
+            h("p.weight", Stored::U32, &[384, 8], 12288),
+            h("p.scales", Stored::BF16, &[384, 1], 768),
+            h("p.bias", Stored::F32, &[384], 1536),
+            h("norm.weight", Stored::BF16, &[64], 128),
+            h("blocks.0.adaln.bias", Stored::F32, &[1, 384], 1536),
+        ]
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect();
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Bf16, |name| Stack::of(name)
+                .is_none())
+            .unwrap(),
+            384 * 2 + 64 * 4
+        );
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).unwrap(),
+            384 * 2 + 64 * 4 + 384 * 4
+        );
+        // Packed bias's constructor target is BF16, independent of a bare-linear target.
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Fp32, |name| name == "p.bias")
+                .unwrap(),
+            384 * 2
+        );
+    }
+
+    #[test]
+    fn dense_fp32_identity_targets_do_not_charge_raw_sources_again() {
+        let headers = [
+            h("p.weight", Stored::F32, &[64, 64], 16384),
+            h("p.bias", Stored::F32, &[64], 256),
+            h("norm.weight", Stored::F32, &[64], 256),
+            h("y_pos_embedding", Stored::F32, &[1, 10, 64], 2560),
+        ]
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect();
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Fp32, |_| true).unwrap(),
+            0
+        );
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).unwrap(),
+            128
+        );
+    }
+
+    #[test]
+    fn scalar_and_matrix_width_targets_follow_actual_post_read_dtype() {
+        let headers = [
+            h("a.in_features", Stored::I32, &[1], 4),
+            h("b.in_features", Stored::I64, &[], 8),
+            h("c.in_features", Stored::I32, &[1, 1], 4),
+        ]
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect();
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).unwrap(),
+            8
+        );
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Fp32, |_| true).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn optional_projection_bias_has_no_target_when_absent() {
+        let headers = [h("p.weight", Stored::BF16, &[64, 64], 8192)]
+            .into_iter()
+            .map(|header| (header.name.clone(), header))
+            .collect();
+        assert_eq!(
+            backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn tower_targets_price_dense_casts_and_model_rotary_row() {
+        let headers = [
+            h("embed.weight", Stored::F32, &[25, 32], 3200),
+            h("norm.weight", Stored::F32, &[32], 128),
+        ];
+        assert_eq!(
+            tower_load_output_bytes(&headers, |_| true, 64).unwrap().1,
+            1600 + 64 + 64
+        );
+        let same_dtype = [
+            h("embed.weight", Stored::BF16, &[25, 32], 1600),
+            h("norm.weight", Stored::BF16, &[32], 64),
+        ];
+        assert_eq!(
+            tower_load_output_bytes(&same_dtype, |_| true, 64)
+                .unwrap()
+                .1,
+            64
+        );
+        assert_eq!(
+            tower_load_output_bytes(&headers, |_| false, 64).unwrap().1,
+            64
+        );
+    }
+
+    #[test]
+    fn tower_rounding_is_per_source_and_preserved_pack_parts_are_not_cast() {
+        let headers = [
+            h("dense.weight", Stored::F32, &[384, 16], 24576),
+            h("packed.weight", Stored::U32, &[64, 16], 4096),
+            h("packed.scales", Stored::F32, &[64, 1], 256),
+            h("packed.biases", Stored::BF16, &[64, 1], 128),
+        ];
+        let expected = (allocated(24576) - 24576) + allocated(12288) + 64;
+        assert_eq!(
+            tower_load_output_bytes(&headers, |_| true, 64).unwrap().1,
+            expected
+        );
+    }
+
+    #[test]
+    fn same_width_different_dtype_is_a_fresh_target_not_an_alias() {
+        let headers = [h("norm.weight", Stored::F16, &[32], 64)];
+        assert_eq!(
+            tower_load_output_bytes(&headers, |_| true, 0).unwrap().1,
+            64
+        );
+    }
+
+    #[test]
+    fn shared_target_accumulators_reject_overflow() {
+        let header = h(
+            "blocks.0.adaln.bias",
+            Stored::BF16,
+            &[usize::MAX, usize::MAX],
+            0,
+        );
+        let headers = [(header.name.clone(), header)].into_iter().collect();
+        assert!(backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).is_err());
+        let headers = [h("norm.weight", Stored::BF16, &[32], u64::MAX)];
+        assert!(tower_load_output_bytes(&headers, |_| true, 0).is_err());
     }
 }

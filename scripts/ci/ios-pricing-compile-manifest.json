@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T07:16:17.882418+00:00",
-  "rust_proof_closure_sha256": "b63e1c9a7fddc781b28a2c92ddaa7c55f27148a4842a34920c5f859a36d45fbc",
+  "UTC": "2026-10-22T12:20:44.873830+00:00",
+  "rust_proof_closure_sha256": "acc2b484f2551bd1b59563868bdb0f2198d53000c8afcac0ddd18a0a6bad16b6",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -240,7 +240,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
-      "sha256": "a9d1ed490b90855173c109c9d7ba5d3961de9785b811b01ef8084bcc9656af9e"
+      "sha256": "f17af0efab64aea88315a2e86a0ef7c9a736c92d56c8856aa5e96cb992d18f8b"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/dit.rs",
@@ -248,7 +248,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "c0b104cd0fd6077077df8481d72b321368d5be6fbc030cbaed26184dc0cf5c81"
+      "sha256": "3b8459c6349e630046a3077129339ef2c6773fda96e0cc28dc75cceb4d882aeb"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
@@ -256,7 +256,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/native_ledger.rs",
-      "sha256": "28a8a2bdfb995c8580f121b355cc7af24f4b89b7cb71e6da53337396ca15eea4"
+      "sha256": "ce15a31e57b0aa1c21372d2bd56db61507c67fafaa5dacdcbbfb3d7db757783d"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
@@ -264,11 +264,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/model.rs",
-      "sha256": "24b2621ec7931f3a789194bae4d04d29f1b098433f2c32ae85331b5795be2bc9"
+      "sha256": "805efdf12e909ce1f43a46a76f9bb55d89f0c9bf0d3e8426ba6934fc9ffd0a66"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/nn.rs",
-      "sha256": "f53ca43871751ab31a1b793cb050bd15bb9b2fbc62189a28eca62f5e17ff65ec"
+      "sha256": "2a8f55a19b6bee883b9109b2535da33bcc02e65dbac783c7464ae53612ea9392"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/packed.rs",
@@ -284,7 +284,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_tests.rs",
-      "sha256": "e421dec40c8eeb885ace5f111e9c742553da96ff3a27ec4bd8517b80c5a26835"
+      "sha256": "6f38957bbfac9e6b2a8dc8e176b3fa3f95f697e252c6e728f2f05da49ba0c6cd"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/reachable_sizes.rs",
@@ -292,7 +292,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/restoration.rs",
-      "sha256": "244397ee11d251af1352961c0df3459439b7482337fef54793e41a4402d38d63"
+      "sha256": "1d533ebebd52da85b415db9e9d382e5eef339d5cedfde88da5eaa09e7e141d28"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/retention.rs",
@@ -304,7 +304,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream.rs",
-      "sha256": "df69be30cc53c3ad997f5284f0e85903e289161e4cb3bebc87f636b75cae1d96"
+      "sha256": "7da1c6107284b7366e5b781c1e31d84dba17fe07f9d939650b5bbecf1117eda3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs",
@@ -312,7 +312,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs",
-      "sha256": "029184a1e495d94b9710ea72bfac498c83bae76a97bb349a516a9fb843bc5f9d"
+      "sha256": "64679e232ee6b396e7f51f444487f1025f15440e860be74fde2495393b7581fc"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs",
@@ -2378,17 +2378,17 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "eb286c2d1842681341f811175dff993c4081d5b8919f219db8edbc0381bc357a",
-    "classification_sha256": "237b373f9e4fe9bcd1ced1e6fe753702b535d12ca222953e94989a2c8d510dac",
-    "selected_Rust_FQNs": 243,
-    "HOST_logical": 217,
-    "HOST_expected_PASS_rows": 218,
-    "native_logical": 26,
-    "native_expected_PASS_rows": 52,
+    "inventory_sha256": "32177a71ac92851905812f983ef7d3553b84e9b2ae87a633c00c2c1d40b2706b",
+    "classification_sha256": "071dd96de95b01826eb7db84976e93026e75d2fc359e5b51af9cfc6d940781d8",
+    "selected_Rust_FQNs": 263,
+    "HOST_logical": 234,
+    "HOST_expected_PASS_rows": 235,
+    "native_logical": 29,
+    "native_expected_PASS_rows": 58,
     "Python_exact_tests": 17,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
-    "diagnostic_checkpoint": "Enabled-only existing load Scope timing repair and source-derived current-root corrections plus expanded fixed samples for same two children. Actual real-work cache controls change; sampler core/API/read sequence unchanged. All current native outcomes and opaque caller-backed/FS/HOST/physical terms remain OPEN. Parent corrects dense first-floor callback join; original74 test bodies retained;17 added.",
+    "diagnostic_checkpoint": "Real RAW->EARLYJOINT and source-pending Build/Eval/export guards, raw/Z API unchanged. Single operator visitor retains U semantics and emits fresh-A pending plan. Disabled None skips unused I/O/math. New actual Checked events invoke existing samplers more often; no new sampling API/query site/sync. Two approved exact helper event sequences strengthened.20new tests17HOST/3CPU-child; completed-width and build operations removed from future scratch but retained in held/source upper; runtime outcomes and opaque26662/FS/HOST/physical remain OPEN.",
     "existing_constructor_caller_compile_repair": "Add actual existing adapter format CPU-child FQN/source binding; no new test, no assertion changes; current native/cache/trace execution remains UNOBSERVED."
   }
 }

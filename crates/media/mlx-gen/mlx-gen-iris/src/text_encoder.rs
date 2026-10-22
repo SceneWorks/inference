@@ -705,9 +705,13 @@ impl IrisTextEncoder {
         let files = present_shards(dir, untied_head)?;
         // Only the tower's tensors are priced and read: a shard's other tensors (the vision tower
         // rides in the last shard of the release) are lazy handles dropped unevaluated.
-        mlx_gen::ios_quantum::before_load_where(quanta::LOAD, &files, |name| {
-            is_text_tower_tensor(name, untied_head)
-        })?;
+        crate::stream::before_tower_load(
+            quanta::LOAD,
+            &files,
+            |name| is_text_tower_tensor(name, untied_head),
+            &model_cfg,
+            quant,
+        )?;
         let mut tensors = HashMap::new();
         for file in &files {
             let part = Array::load_safetensors(file).map_err(|e| {
@@ -801,7 +805,7 @@ impl IrisTextEncoder {
         let resident = |name: &str| name == embed_key || name == norm_key;
         // iOS: only the embedding and the final norm are read here; every decoder layer is read
         // inside its own window's priced read quantum.
-        mlx_gen::ios_quantum::before_load_where(quanta::LOAD, &files, resident)?;
+        crate::stream::before_tower_load(quanta::LOAD, &files, resident, &model_cfg, quant)?;
         let (keys, reads) = tower_layer_inventory(&files, model_cfg.num_layers)?;
         let (mut embed, mut norm) = (None, None);
         for file in &files {

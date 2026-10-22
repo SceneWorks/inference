@@ -1199,24 +1199,15 @@ fn quantize_stored_grid(
     group: u64,
     bits: u64,
 ) -> Result<()> {
-    if !input.is_multiple_of(group) || !matches!(bits, 4 | 8) {
+    // Preserve this Iris recipe's original tier validation; the shared public quantizer also
+    // accepts two-bit requests. Every emitted request retains the original U law independently.
+    if group == 0 || !input.is_multiple_of(group) || !matches!(bits, 4 | 8) {
         return Err(overflow());
     }
-    let n = p!(rows, input);
-    let groups = n / group;
-    let words = p!(n, bits) / 32;
-    l.array(2, n)?; // conditional source contiguity copy for native Quantize
-    l.array(4, words)?;
-    l.repeated(2, groups, 2)?; // stored scales and biases
-    l.array(4, n)?; // bf16 weight -> f32
-    l.repeated(4, groups, 2)?; // scales, biases -> f32
-    l.repeated(4, n, 5)?; // subtract, divide, round, max(0), min(top)
-    l.repeated(4, 1, 2)?; // clip scalar endpoints
-    l.array(4, n)?; // uint32 cast
-    l.array(4, 32 / bits)?; // place from_slice
-    l.op(4, n)?; // disjoint-field multiplication
-    l.reduce(4, n, words, 32 / bits, true)?; // sum over word fields
-    Ok(())
+    let metal = l.backend == NativeBackend::Metal;
+    crate::nn::visit_stored_grid_allocations(rows, input, group, bits, metal, |bytes| {
+        l.bytes(bytes)
+    })
 }
 
 struct TowerFacts {
@@ -5051,7 +5042,7 @@ fn callback_events_from_sources(
             count = count.times(tiles)?;
             count.add(CallbackEventUpper {
                 progress: plus(tiles, 1)?,
-                checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
+                checked: plus(7, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
                 synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
                 metadata: plus(plus(6, tiles)?, load_scope_metadata(req.provider, 1)?)?,
                 ..Default::default()
@@ -5065,7 +5056,7 @@ fn callback_events_from_sources(
         GuardedTask::Depth { plan, .. } => count.add(CallbackEventUpper {
             progress: 1,
             metadata: plus(3, load_scope_metadata(req.provider, 1)?)?,
-            checked: plus(6, u64::from(plan.resized()))?,
+            checked: plus(8, u64::from(plan.resized()))?,
             synchronized: plus(5, u64::from(plan.resized()))?,
             ..Default::default()
         })?,
@@ -5089,7 +5080,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
             // have before/finish; HOST_PLANES and POST_TILE only have before, not finish.
             count.add(CallbackEventUpper {
                 progress: plus(tiles, 1)?,
-                checked: plus(4, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
+                checked: plus(7, u64::from(plan.axis_bytes().map_err(Error::from)? != 0))?,
                 synchronized: u64::from(plan.axis_bytes().map_err(Error::from)? != 0),
                 metadata: plus(
                     plus(plus(4, 2)?, tiles)?,
@@ -5119,7 +5110,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
             count.add(CallbackEventUpper {
                 progress: 1,
                 metadata: plus(3, load_scope_metadata(req.provider, 1)?)?,
-                checked: plus(6, u64::from(plan.resized()))?,
+                checked: plus(8, u64::from(plan.resized()))?,
                 synchronized: plus(5, u64::from(plan.resized()))?,
                 ..Default::default()
             })?;
@@ -5154,7 +5145,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                     0
                 },
                 metadata: plus(3, load_scope_metadata(req.provider, loads)?)?,
-                checked: product(&[2, loads])?,
+                checked: product(&[4, loads])?,
                 ..Default::default()
             };
             // The progress +3 is Decoding plus at most TWO conditional Loading events. A warm
@@ -5204,6 +5195,20 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                     })?;
                     count.add(epoch)?;
                 }
+            }
+            let dense_load_quant = !streamed
+                && req.spec.quantize.is_some()
+                && crate::packed::artifact_tier(
+                    &resources
+                        .backbone_dir
+                        .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                )?
+                .is_none();
+            if !req.spec.adapters.is_empty() || dense_load_quant {
+                count.add(CallbackEventUpper {
+                    checked: product(&[2, loads])?,
+                    ..Default::default()
+                })?;
             }
             if !req.spec.adapters.is_empty() {
                 let path = resources
