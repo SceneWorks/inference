@@ -485,18 +485,9 @@ fn architecture_group(
 /// grouped by architecture digest, so checkpoints of one architecture share anchors; without it,
 /// every route is its own family (weights-free, conservative).
 pub fn listing() -> Result<String, String> {
-    let snapshots = std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS")
-        .map(PathBuf::from)
-        .or_else(|| {
-            #[cfg(target_os = "ios")]
-            {
-                super::dirs_documents().map(|docs| docs.join("campaign"))
-            }
-            #[cfg(not(target_os = "ios"))]
-            {
-                None
-            }
-        });
+    let snapshots = std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS").map(PathBuf::from);
+    #[cfg(target_os = "ios")]
+    let snapshots = snapshots.or_else(|| super::dirs_documents().map(|docs| docs.join("campaign")));
     listing_with(snapshots)
 }
 

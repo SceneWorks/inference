@@ -33,7 +33,7 @@ def run_command(command):
     try:
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            errors="replace",
+            encoding="utf-8", errors="replace",
         )
         for line in process.stdout:
             print(line, end="", flush=True)

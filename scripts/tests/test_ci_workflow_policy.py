@@ -4045,7 +4045,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
         # The device-capture surface is tested and linted on the host lane.
         self.assertTrue(
-            any("cargo test --locked --keep-going --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)
+            any("cargo test --locked --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)
         )
         # The capture-gating doctests run both ways (the `--lib` steps never run doctests).
         lines = {
@@ -4055,18 +4055,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in step["run"].splitlines()
         }
         for doc in (
-            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --doc -p runtime-ios --features device-capture",
-            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --doc -p runtime-ios",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --doc -p runtime-ios --features device-capture",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --doc -p runtime-ios",
         ):
             self.assertIn(doc, lines)
         doc_runs = [run for run in metal if "--doc -p runtime-ios" in run]
         self.assertEqual(len(doc_runs), 2)
         for run in doc_runs:
             self.assertTrue(run.startswith(
-                "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast "
+                "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast "
             ))
         self.assertTrue(
-            any("cargo test --locked --keep-going --no-fail-fast --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
+            any("cargo test --locked --no-fail-fast --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
         )
         self.assertTrue(
             any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)

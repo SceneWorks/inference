@@ -3,8 +3,12 @@
 import contextlib
 import errno
 import io
+import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -29,6 +33,7 @@ class CollectionTests(unittest.TestCase):
                 contextlib.redirect_stdout(stream):
             actual = collection.run_command(["cargo", "test", "--unchanged"])
         self.assertEqual(execute.call_args.args[0], ["cargo", "test", "--unchanged"])
+        self.assertEqual(execute.call_args.kwargs["encoding"], "utf-8")
         return actual, stream.getvalue()
 
     def test_success_and_ordinary_failure_keep_actual_exit_codes(self):
@@ -38,7 +43,7 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(actual, code)
 
     def test_combined_command_is_forwarded_without_package_or_feature_rewriting(self):
-        command = ["cargo", "test", "--locked", "--keep-going", "--no-fail-fast",
+        command = ["cargo", "test", "--locked", "--no-fail-fast",
                    "--lib", "--tests", "-p", "mlx-gen-iris", "-p", "mlx-gen-sdxl",
                    "-p", "mlx-gen-z-image"]
         process = type("Process", (), {"stdout": io.StringIO(""), "wait": lambda self: 0})()
@@ -46,6 +51,43 @@ class CollectionTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(collection.run_command(command), 0)
         self.assertEqual(execute.call_args.args[0], command)
+
+    def test_cli_preserves_each_workflow_command_exit_without_latching_ordinary_failure(self):
+        job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]["macos-metal"]
+        commands = [shlex.split(step["run"].split("run_ci_collection.py -- ", 1)[1])
+                    for step in job["steps"]
+                    if "run_ci_collection.py -- " in step.get("run", "")]
+        self.assertTrue(commands)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "fake_command.py"
+            fake.write_text(
+                "import json, os, sys\n"
+                "print('__ARGV__' + json.dumps(sys.argv[1:]), flush=True)\n"
+                "sys.exit(int(os.environ['CI_FAKE_EXIT']))\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ, GITHUB_ENV=str(root / "env"),
+                       GITHUB_STEP_SUMMARY=str(root / "summary"),
+                       CI_COLLECTION_RESOURCE_FAILURE="false", CI_COLLECTION_NATIVE_FATAL="false")
+            for command in commands:
+                # Python stands in for the entire command, including Cargo. No real Cargo,
+                # native test, compiler, dependency harness or build is invoked by this test.
+                for code in (7, 0):
+                    with self.subTest(command=command, code=code):
+                        result = subprocess.run(
+                            [sys.executable, str(ROOT / "scripts/ci/run_ci_collection.py"),
+                             "--", sys.executable, str(fake), *command],
+                            env=dict(env, CI_FAKE_EXIT=str(code)), capture_output=True,
+                            text=True, encoding="utf-8", check=False,
+                        )
+                        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                        rows = [line.removeprefix("__ARGV__") for line in result.stdout.splitlines()
+                                if line.startswith("__ARGV__")]
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(json.loads(rows[0]), command)
+                        self.assertFalse((root / "env").exists(),
+                                         "ordinary failure must not poison later commands")
 
     def test_compile_failure_is_reported_as_blocked_not_executed(self):
         code, output = self.fake_command(101, "error: could not compile `mlx-gen-iris`\n")
@@ -64,9 +106,9 @@ class CollectionTests(unittest.TestCase):
                 with patch.dict(os.environ, {"GITHUB_ENV": str(env), "GITHUB_STEP_SUMMARY": str(summary)}):
                     actual, _ = self.fake_command(code, output)
                 self.assertNotEqual(actual, 0)
-                self.assertEqual(env.read_text(), f"{flag}=true\n")
-                self.assertIn("**blocked**", summary.read_text())
-                self.assertIn("not an independent test failure", summary.read_text())
+                self.assertEqual(env.read_text(encoding="utf-8"), f"{flag}=true\n")
+                self.assertIn("**blocked**", summary.read_text(encoding="utf-8"))
+                self.assertIn("not an independent test failure", summary.read_text(encoding="utf-8"))
 
     def test_recoverable_metal_error_does_not_claim_device_poison(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,7 +146,7 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
 
     def test_existing_lane_requires_all_setup_and_keeps_failing_steps_red(self):
-        job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["macos-metal"]
+        job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]["macos-metal"]
         self.assertEqual(job["runs-on"], "macos-15")
         steps = job["steps"]
         for name in SETUP:
@@ -120,6 +162,11 @@ class CollectionTests(unittest.TestCase):
             if "cargo clippy " in run or " clippy --locked " in run:
                 self.assertIn("--keep-going", run)
                 self.assertTrue(run.rstrip().endswith("-- -D warnings"))
+            if "cargo test " in run or " test --locked " in run:
+                # Pinned Cargo 1.96 rejects --keep-going for test (including doctests).
+                # Runtime continuation is --no-fail-fast; compilation may still block binaries.
+                self.assertNotIn("--keep-going", run)
+                self.assertIn("--no-fail-fast", run)
         broad = next(step["run"] for step in steps if step.get("name") == "Test MLX packages")
         for name in ("sceneworks-gen-core", "mlx-gen", "mlx-llm", "mlx-llm-server",
                      "runtime-ios", "runtime-macos"):

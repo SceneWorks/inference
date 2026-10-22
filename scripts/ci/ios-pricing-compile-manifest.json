@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T14:30:11.566008+00:00",
-  "rust_proof_closure_sha256": "27ecd72849166f739bd189e8c58732fea49565b4010838da07e60787d821fc5e",
+  "UTC": "2026-10-22T15:33:08.135906+00:00",
+  "rust_proof_closure_sha256": "b64ca9e1aae1f7de62d407ef90584f6dded3bdbf36c7cae7dba2058849e7cc0e",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -20,7 +20,7 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "8770f4feceebaab90248f7dce8b5dcaea99e9ac97ab28fbd2533230a78c13351"
+      "sha256": "3b535e5265975c8b8d17dd9d273d9262eb5a0ba7f5ae7a82eb0ab550a86f5b48"
     },
     {
       "path": ".github/workflows/real-weights.yml",
@@ -916,7 +916,7 @@
     },
     {
       "path": "ios-host/smoke/src/campaign_media.rs",
-      "sha256": "3446e9352a118fd5987f61e6761d7363649a9614f508e3d85d0d9fd36257349b"
+      "sha256": "7a0ce41fc1cdaeb895a180af6f21cc8c1e4160832f03b9ea79401e0c368f5b75"
     },
     {
       "path": "ios-host/smoke/src/campaign_media_tests.rs",
@@ -948,7 +948,7 @@
     },
     {
       "path": "scripts/ci/run_ci_collection.py",
-      "sha256": "debef95a5c87e8d89c44112490b8775e901ca4aa2350be4923666cfeec5df41b"
+      "sha256": "f182caae94e5bd2403443d4371f3cbefcb57f5113502bfae279e2d383fb39f5b"
     },
     {
       "path": "scripts/ci/run_clip_regex_certificate_tests.py",
@@ -968,11 +968,11 @@
     },
     {
       "path": "scripts/tests/test_ci_collection.py",
-      "sha256": "1b76d6e0ba5f9073a4e3312d8b3e3abe6ca5185e0f4f6ca834de0963ca2b78d4"
+      "sha256": "21592a4166e65cf522be161ee5a683a86730209b4f7955f931da316a137d7c86"
     },
     {
       "path": "scripts/tests/test_ci_workflow_policy.py",
-      "sha256": "cb89aff0214479baf88cfed62f297037087fbc0699cf1edfdf8fc5be0e575558"
+      "sha256": "8d21a74196a1105a255d7b8e01824dd0ffc60a7aa4097cafa9bb8f788e982cb3"
     },
     {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
@@ -989,6 +989,10 @@
     {
       "path": "scripts/tests/test_ios_smoke_freshness.py",
       "sha256": "1c0b8eb0440c1fe43d1fe7326809f2f89c8df6c3749b00d327c27a4144853a52"
+    },
+    {
+      "path": "scripts/tests/test_script_encoding.py",
+      "sha256": "fe3e5978f6a4ee00db7bbea7e6177649eadca32cd289c2e91c07200dc9abdc60"
     },
     {
       "path": "vendor/clip-regex/SOURCE-AUTHORITY.json",
@@ -2394,21 +2398,22 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "68f109a3aef3185e26ce7471aaa112befe53017ec0f925420918f608de2fc6a0",
-    "classification_sha256": "e1caca7d197e121097575089e079f97f65caacede9257cdc7569cd9b4df7610d",
+    "inventory_sha256": "a16f32bf707aca4019a521cfa255801d3a30ed605eb22cfc9fb676fa8c5a6660",
+    "classification_sha256": "6ce57196eef3f2788ebf3b36ea2eb8694746aa9c15c17e55c8763acbfbbfa976",
     "selected_Rust_FQNs": 272,
     "HOST_logical": 240,
     "HOST_expected_PASS_rows": 241,
     "native_logical": 32,
     "native_expected_PASS_rows": 64,
-    "Python_exact_tests": 29,
+    "Python_exact_tests": 33,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
     "diagnostic_checkpoint": "Real RAW->EARLYJOINT and source-pending Build/Eval/export guards, raw/Z API unchanged. Single operator visitor retains U semantics and emits fresh-A pending plan. Disabled None skips unused I/O/math. New actual Checked events invoke existing samplers more often; no new sampling API/query site/sync. Two approved exact helper event sequences strengthened.20new tests17HOST/3CPU-child; completed-width and build operations removed from future scratch but retained in held/source upper; runtime outcomes and opaque26662/FS/HOST/physical remain OPEN.",
     "existing_constructor_caller_compile_repair": "Add actual existing adapter format CPU-child FQN/source binding; no new test, no assertion changes; current native/cache/trace execution remains UNOBSERVED.",
     "coherent_batch": "sc-26270 tasks26698/26699/26700 source-fix candidate. Actual role/dtype constructor targets, completed width+selected keep, conservative adapter input owners, ordered/count-bearing protocol; same eager/deferred numeric policy, timing, originalstrict matrices. Standard combined CI gathers errors; compiler/native unobserved, feature/model/physical/FS/opaque/HOST obligations remain OPEN.",
-    "critical_execution_bindings_sha256": "3c6a0cda2948748b3b83eb7fbaaa0d2e43097cff9df582f7d1aeacc0c729ec81",
-    "iris_critical_execution_bindings_sha256": "88d577ec3ae0b39b6b639bbef1be76835761f46aa36be4bbb6893fd3f894a7b3",
-    "execution_bindings_are_eligibility_not_observed_PASS": true
+    "critical_execution_bindings_sha256": "b506b56ac2b2d0e8c8dfa6ad2016d900ffc663073e751be55c4b1de3d93eb826",
+    "iris_critical_execution_bindings_sha256": "1dd1b93e77e89e14b867d58bffa17b7eb776907a5221a156aa3f5cba39b9b7ca",
+    "execution_bindings_are_eligibility_not_observed_PASS": true,
+    "collected_CI_repair": "Actual5c12/run39797337118: workspace4encoding reads,9invalid cargo test --keep-going invocations,1smoke lazy-None lint. Remove unsupported test flag only, retain --no-fail-fast and combined graph; strictclippy/doc keep-going preserved. UTF8explicit; iOS listing lazyfallback preserved via sameexistingcfg. No affected native/HOST/doc/smoke binary ran at5c12; source/native/premise obligations remainOPEN."
   }
 }

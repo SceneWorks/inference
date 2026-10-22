@@ -763,7 +763,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --lib --tests
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
@@ -784,7 +784,7 @@ jobs:
           && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
-        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
+        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
       # The non-default `device-capture` surface (`media::capture_permit`), which only the device
       # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
       - name: Test runtime-ios device-capture surface
@@ -805,7 +805,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --lib -p runtime-ios --features device-capture
       - name: Test iOS catalog device-capture unit tests
         if: >-
@@ -815,7 +815,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --lib -p mlx-gen-ios-catalog --features device-capture
       # The compile_fail doctests that keep `capture_permit` out of a product build (and the
       # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
@@ -827,7 +827,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --doc -p runtime-ios
       - name: Doctest runtime-ios enabled capture gating
         if: >-
@@ -837,7 +837,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --doc -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
@@ -858,7 +858,7 @@ jobs:
           && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
-        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
+        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
       # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
       # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
       # only; never fails the job.
@@ -907,7 +907,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
       # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
       # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
@@ -943,7 +943,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: >-
           python3 scripts/ci/run_ci_collection.py -- cargo --config 'profile.dev.package."*".opt-level=3'
-          test --locked --keep-going --no-fail-fast --manifest-path ios-host/smoke/Cargo.toml
+          test --locked --no-fail-fast --manifest-path ios-host/smoke/Cargo.toml
           --features media --lib -- --skip smoke_passes_on_the_host
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after iOS device harness
