@@ -87,6 +87,7 @@ pub(crate) struct Projection {
     weight: Array,
     bias: Option<Array>,
     adapter: Option<(Array, Array, f32)>,
+    edit_adapter: bool,
 }
 impl Projection {
     fn load(w: &Weights, p: &str, input: i32, output: i32, bias: bool) -> Result<Self> {
@@ -98,6 +99,7 @@ impl Projection {
                 None
             },
             adapter: None,
+            edit_adapter: false,
         })
     }
     fn dtype(&self) -> Dtype {
@@ -117,6 +119,13 @@ impl Projection {
             cast.matmul(self.weight.t())?
         };
         if let Some((down, up, scale)) = &self.adapter {
+            if self.edit_adapter {
+                let residual = x.as_dtype(down.dtype())?.matmul(down.t())?.matmul(up.t())?;
+                return Ok(add(
+                    &base,
+                    self::scale(&residual, *scale)?.as_dtype(base.dtype())?,
+                )?);
+            }
             // The original input's FP32 values feed the residual; only the backbone is narrowed.
             let residual = linear_fp32(&linear_fp32(&x.as_dtype(Dtype::Float32)?, down)?, up)?;
             Ok(add(
@@ -888,5 +897,750 @@ mod author_fixture_tests {
             let clean_error = delta(&clean, &expected["x0"]);
             assert!(clean_error < 1e-3, "DMD step={i} x0 max_abs={clean_error}");
         }
+    }
+}
+
+/// Borrowed from one immutable renderer and scoped to one sampling call. No cross-request reuse.
+type EditKeyValue = (Array, Array);
+pub(crate) struct EditCache {
+    keys_values: Vec<EditKeyValue>,
+}
+pub(crate) struct EditConditioning<'a> {
+    pub context: &'a Array,
+    pub references: &'a [Array],
+    pub cache: Option<&'a EditCache>,
+}
+struct EditBodyInput<'a> {
+    rope: &'a Array,
+    modulation: &'a Array,
+    geometry: &'a Geometry,
+    text: i32,
+}
+impl Block {
+    fn edit_qkv(
+        &self,
+        x: &Array,
+        rope: &Array,
+        modulation: &Array,
+        g: &Geometry,
+    ) -> Result<(Array, Array, Array)> {
+        let m =
+            |i| -> Result<Array> { Ok(slice_axis(modulation, 1, i, 1)?.reshape(&[1, 1, g.dim])?) };
+        let y = add(
+            multiply(
+                self.n1.forward(x)?,
+                add(m(1)?, constant(1.0, modulation.dtype())?)?,
+            )?,
+            m(0)?,
+        )?
+        .as_dtype(self.projections[0].dtype())?;
+        let shape = [1, x.shape()[1], g.heads, g.dim / g.heads];
+        let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?.reshape(&shape)?;
+        let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?.reshape(&shape)?;
+        let v = self.projections[2]
+            .forward(&y)?
+            .reshape(&shape)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        Ok((
+            rotate(&q, rope)?
+                .as_dtype(v.dtype())?
+                .transpose_axes(&[0, 2, 1, 3])?,
+            rotate(&k, rope)?
+                .as_dtype(v.dtype())?
+                .transpose_axes(&[0, 2, 1, 3])?,
+            v,
+        ))
+    }
+    fn edit_finish(
+        &self,
+        x: &Array,
+        attention: &Array,
+        modulation: &Array,
+        g: &Geometry,
+    ) -> Result<Array> {
+        let m =
+            |i| -> Result<Array> { Ok(slice_axis(modulation, 1, i, 1)?.reshape(&[1, 1, g.dim])?) };
+        let attention =
+            attention
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[1, x.shape()[1], g.dim])?;
+        let x = add(
+            x,
+            multiply(self.projections[3].forward(&attention)?, m(2)?)?,
+        )?;
+        let y = add(
+            multiply(
+                self.n2.forward(&x)?,
+                add(m(4)?, constant(1.0, modulation.dtype())?)?,
+            )?,
+            m(3)?,
+        )?
+        .as_dtype(self.projections[0].dtype())?;
+        let fused = self.projections[4].forward(&y)?;
+        Ok(add(
+            x,
+            multiply(
+                self.projections[5].forward(&situ(
+                    &slice_axis(&fused, 2, 0, g.ffn)?,
+                    &slice_axis(&fused, 2, g.ffn, g.ffn)?,
+                )?)?,
+                m(5)?,
+            )?,
+        )?)
+    }
+    fn edit_reference(
+        &self,
+        x: &Array,
+        rope: &Array,
+        modulation: &Array,
+        g: &Geometry,
+        cancel: &CancelFlag,
+    ) -> Result<(Array, EditKeyValue)> {
+        check(cancel)?;
+        let (q, k, v) = self.edit_qkv(x, rope, modulation, g)?;
+        let output = edit_attention(&q, &k, &v, g, cancel)?;
+        let next = self.edit_finish(x, &output, modulation, g)?;
+        eval([&next, &k, &v])?;
+        check(cancel)?;
+        Ok((next, (k, v)))
+    }
+    fn edit_body(
+        &self,
+        x: &Array,
+        reference: &EditKeyValue,
+        input: EditBodyInput<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let EditBodyInput {
+            rope,
+            modulation,
+            geometry: g,
+            text,
+        } = input;
+        check(cancel)?;
+        let (q, k, v) = self.edit_qkv(x, rope, modulation, g)?;
+        let insert = |body: &Array, reference: &Array| -> Result<Array> {
+            Ok(concatenate_axis(
+                &[
+                    &slice_axis(body, 2, 0, text)?,
+                    reference,
+                    &slice_axis(body, 2, text, body.shape()[2] - text)?,
+                ],
+                2,
+            )?)
+        };
+        let output = edit_attention(
+            &q,
+            &insert(&k, &reference.0)?,
+            &insert(&v, &reference.1)?,
+            g,
+            cancel,
+        )?;
+        let next = self.edit_finish(x, &output, modulation, g)?;
+        eval([&next])?;
+        check(cancel)?;
+        Ok(next)
+    }
+}
+fn edit_attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Geometry,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    let scale = 1.0 / (g.dim as f32 / g.heads as f32).sqrt();
+    if v.dtype() == Dtype::Float32 {
+        attention_fp32(q, k, v, scale, cancel)
+    } else {
+        Ok(mlx_rs::fast::scaled_dot_product_attention(
+            q, k, v, scale, None, None,
+        )?)
+    }
+}
+impl Transformer {
+    pub(crate) fn install_edit(&mut self, w: &Weights, rank: i32) -> Result<()> {
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            for (projection, name) in
+                block
+                    .projections
+                    .iter_mut()
+                    .zip(["q", "k", "v", "o", "ffn_up_gate", "ffn_down"])
+            {
+                let prefix = format!("layers.{index}.proj.{name}");
+                let a = shaped(
+                    w,
+                    &format!("{prefix}.lora_A"),
+                    &[rank, projection.weight.shape()[1]],
+                )?;
+                let b = shaped(
+                    w,
+                    &format!("{prefix}.lora_B"),
+                    &[projection.weight.shape()[0], rank],
+                )?;
+                if a.dtype() != Dtype::Bfloat16 || b.dtype() != Dtype::Bfloat16 {
+                    return Err(Error::Unsupported(
+                        "MOSS edit requires BF16 A/B tensors".into(),
+                    ));
+                }
+                projection.adapter = Some((a, b, 1.0));
+                projection.edit_adapter = true;
+            }
+        }
+        Ok(())
+    }
+    fn edit_time(&self, normalized: f32) -> Result<(Array, Array)> {
+        if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized) {
+            return Err(Error::Unsupported(
+                "MOSS edit time must be normalized in [0,1]".into(),
+            ));
+        }
+        let half = self.g.freq / 2;
+        let mut features = Vec::new();
+        for sin in [false, true] {
+            for band in 0..half {
+                let phase =
+                    (normalized * 1000.0) as f64 * 10000_f64.powf(-(band as f64) / half as f64);
+                features.push(if sin {
+                    phase.sin() as f32
+                } else {
+                    phase.cos() as f32
+                });
+            }
+        }
+        let time = self
+            .time2
+            .forward(&mlx_rs::fast::silu_exact(
+                &self
+                    .time1
+                    .forward(&Array::from_slice(&features, &[1, self.g.freq]))?,
+            )?)?
+            .as_dtype(Dtype::Float32)?;
+        Ok((
+            self.modulation
+                .forward(&time)?
+                .reshape(&[1, 6, self.g.dim])?,
+            self.head.forward(&time)?.reshape(&[1, 2, self.g.dim])?,
+        ))
+    }
+    fn edit_reference_inputs(&self, references: &[Array]) -> Result<(Array, Array)> {
+        let mut tokens = Vec::new();
+        let mut ropes = Vec::new();
+        for (index, reference) in references.iter().enumerate() {
+            let shape = reference.shape();
+            if shape.len() != 4
+                || shape[0] != 1
+                || shape[1] != self.g.channels
+                || shape[2] < 1
+                || shape[3] < 1
+            {
+                return Err(Error::Unsupported(
+                    "invalid MOSS edit reference latent".into(),
+                ));
+            }
+            let (h, w) = (shape[2], shape[3]);
+            let value =
+                self.video
+                    .forward(&reference.transpose_axes(&[0, 2, 3, 1])?.reshape(&[
+                        1,
+                        h * w,
+                        self.g.channels,
+                    ])?)?;
+            let head = self.g.dim / self.g.heads;
+            let mut phases = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    for sine in [true, false] {
+                        for coordinate in [
+                            index as f32 + 1.0,
+                            0.0,
+                            y as f32 - (h - 1) as f32 / 2.0,
+                            x as f32 - (w - 1) as f32 / 2.0,
+                        ] {
+                            for band in 0..head / 8 {
+                                let phase =
+                                    coordinate / 10000_f32.powf(band as f32 / (head / 8) as f32);
+                                phases.push(if sine { phase.sin() } else { phase.cos() });
+                            }
+                        }
+                    }
+                }
+            }
+            ropes.push(Array::from_slice(&phases, &[1, h * w, head]).as_dtype(value.dtype())?);
+            tokens.push(value);
+        }
+        if tokens.is_empty() {
+            return Err(Error::Unsupported("MOSS edit requires references".into()));
+        }
+        Ok((
+            concatenate_axis(&tokens.iter().collect::<Vec<_>>(), 1)?,
+            concatenate_axis(&ropes.iter().collect::<Vec<_>>(), 1)?,
+        ))
+    }
+    pub(crate) fn prepare_edit_cache(
+        &self,
+        references: &[Array],
+        cancel: &CancelFlag,
+    ) -> Result<EditCache> {
+        check(cancel)?;
+        let (mut prefix, rope) = self.edit_reference_inputs(references)?;
+        let (modulation, _) = self.edit_time(0.0)?;
+        let mut keys_values = Vec::new();
+        for block in &self.blocks {
+            let (next, kv) = block.edit_reference(&prefix, &rope, &modulation, &self.g, cancel)?;
+            prefix = next;
+            keys_values.push(kv);
+        }
+        Ok(EditCache { keys_values })
+    }
+    pub(crate) fn forward_edit(
+        &self,
+        latent: &Array,
+        time: f32,
+        conditioning: EditConditioning<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        let EditConditioning {
+            context,
+            references,
+            cache,
+        } = conditioning;
+        check(cancel)?;
+        let g = &self.g;
+        let s = latent.shape();
+        if s.len() != 4
+            || s[0] != 1
+            || s[1] != g.channels
+            || context.ndim() != 3
+            || context.shape()[0] != 1
+            || context.shape()[1] < 1
+            || context.shape()[2] != g.text
+        {
+            return Err(Error::Unsupported(
+                "MOSS edit latent/context shape mismatch".into(),
+            ));
+        }
+        let (h, w, text_len) = (s[2], s[3], context.shape()[1]);
+        let video = self
+            .video
+            .forward(
+                &latent
+                    .transpose_axes(&[0, 2, 3, 1])?
+                    .reshape(&[1, h * w, g.channels])?,
+            )?;
+        let original = rope(h, w, text_len, g.dim / g.heads)?.as_dtype(video.dtype())?;
+        let text_rope = slice_axis(&original, 1, h * w, text_len)?;
+        let mut text = self.text.forward(context)?;
+        for block in &self.text_blocks {
+            check(cancel)?;
+            text = block.forward(&text, &text_rope, g, cancel)?;
+            eval([&text])?;
+        }
+        let mut body = concatenate_axis(&[&text, &video], 1)?;
+        let body_rope = concatenate_axis(&[&text_rope, &slice_axis(&original, 1, 0, h * w)?], 1)?;
+        let (modulation, head) = self.edit_time(time)?;
+        let mut uncached = if cache.is_none() {
+            Some(self.edit_reference_inputs(references)?)
+        } else {
+            None
+        };
+        let (reference_modulation, _) = self.edit_time(0.0)?;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let temporary;
+            let reference = if let Some(cache) = cache {
+                &cache.keys_values[index]
+            } else {
+                let (prefix, rope) = uncached
+                    .as_mut()
+                    .ok_or_else(|| Error::Msg("missing edit prefix".into()))?;
+                let (next, kv) =
+                    block.edit_reference(prefix, rope, &reference_modulation, g, cancel)?;
+                *prefix = next;
+                temporary = kv;
+                &temporary
+            };
+            body = block.edit_body(
+                &body,
+                reference,
+                EditBodyInput {
+                    rope: &body_rope,
+                    modulation: &modulation,
+                    geometry: g,
+                    text: text_len,
+                },
+                cancel,
+            )?;
+        }
+        let output = self
+            .norm
+            .forward(&slice_axis(&body, 1, text_len, h * w)?.as_dtype(self.norm.weight.dtype())?)?;
+        let output = add(
+            multiply(
+                output,
+                add(slice_axis(&head, 1, 1, 1)?, constant(1.0, head.dtype())?)?,
+            )?,
+            slice_axis(&head, 1, 0, 1)?,
+        )?;
+        let output = self
+            .output
+            .forward(&output)?
+            .reshape(&[1, h, w, g.channels])?
+            .transpose_axes(&[0, 3, 1, 2])?;
+        eval([&output])?;
+        check(cancel)?;
+        Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod edit_fixture_tests {
+    use super::*;
+    use crate::pipeline::logical_f32_readback;
+    use serde_json::Value;
+    fn array(value: &Value) -> Array {
+        let shape = value["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i32)
+            .collect::<Vec<_>>();
+        let values = value["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, &shape)
+            .as_dtype(if value["dtype"] == "bfloat16" {
+                Dtype::Bfloat16
+            } else {
+                Dtype::Float32
+            })
+            .unwrap()
+    }
+    fn compare(actual: &Array, expected: &Value, tolerance: f32, label: &str) {
+        let expected_shape = expected["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i32)
+            .collect::<Vec<_>>();
+        let expected_values = expected["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>();
+        let got = logical_f32_readback(actual).unwrap();
+        let delta = checked_delta(&got, actual.shape(), &expected_values, &expected_shape);
+        eprintln!("{label}: max_abs={delta}, bound={tolerance}");
+        assert!(
+            delta <= tolerance,
+            "{label}: maximum absolute error {delta} > {tolerance}"
+        );
+    }
+    fn bf16_bound(expected: &Value) -> f32 {
+        let magnitude = expected["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v.as_f64().unwrap() as f32).abs())
+            .fold(0.0_f32, f32::max);
+        magnitude / 64.0 + 1.0 / 1024.0
+    }
+    fn compare_bf16(actual: &Array, expected: &Value, label: &str) {
+        compare(actual, expected, bf16_bound(expected), label);
+    }
+    fn time_probes(model: &Transformer, f: &Value) {
+        for probe in f["time_probes"].as_array().unwrap() {
+            // Each stage also receives the independent upstream input, locating
+            // backend rounding without allowing accumulated errors to hide it.
+            for (label, actual, expected) in [
+                (
+                    "time first linear",
+                    model.time1.forward(&array(&probe["time1_input"])).unwrap(),
+                    &probe["time1"],
+                ),
+                (
+                    "time exact SiLU",
+                    mlx_rs::fast::silu_exact(array(&probe["silu_input"])).unwrap(),
+                    &probe["silu"],
+                ),
+                (
+                    "time second linear",
+                    model.time2.forward(&array(&probe["time2_input"])).unwrap(),
+                    &probe["time2"],
+                ),
+                (
+                    "time shared modulation",
+                    model
+                        .modulation
+                        .forward(&array(&probe["modulation_flat_input"]))
+                        .unwrap(),
+                    &probe["modulation_flat"],
+                ),
+                (
+                    "time head modulation",
+                    model
+                        .head
+                        .forward(&array(&probe["head_flat_input"]))
+                        .unwrap(),
+                    &probe["head_flat"],
+                ),
+            ] {
+                compare_bf16(&actual, expected, label);
+            }
+            let (modulation, head) = model
+                .edit_time(probe["normalized_timestep"].as_f64().unwrap() as f32)
+                .unwrap();
+            compare_bf16(
+                &modulation,
+                &probe["modulation"],
+                "complete time modulation",
+            );
+            compare_bf16(&head, &probe["head"], "complete time head");
+        }
+    }
+    fn masked(value: &Value, mask: &Value) -> Array {
+        let indices = mask["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (v.as_f64().unwrap() != 0.0).then_some(i as i32))
+            .collect::<Vec<_>>();
+        array(value)
+            .take_axis(Array::from_slice(&indices, &[indices.len() as i32]), 1)
+            .unwrap()
+    }
+    #[test]
+    fn edit_projection_and_reference_coordinates_cpu() {
+        const CHILD: &str = "MOSS_EDIT_PROJECTION_CPU_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","transformer::edit_fixture_tests::edit_projection_and_reference_coordinates_cpu","--nocapture","--test-threads=1"]).env(CHILD,"1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "CPU edit projection child: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || run_oracle(true));
+    }
+    #[test]
+    #[ignore = "requires coordinator-admitted Metal ownership; exact silu kernel is Metal-only"]
+    fn frozen_edit_oracle_on_metal() {
+        assert_eq!(
+            std::env::var("MOSS_NATIVE_TEST_ADMITTED").as_deref(),
+            Ok("1")
+        );
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || run_oracle(false));
+    }
+    fn run_oracle(cpu_only: bool) {
+        let f: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
+        ))
+        .unwrap();
+        let weights = Weights::from_map(
+            f["weights"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), array(v)))
+                .collect(),
+        );
+        let adapter = Weights::from_map(
+            f["adapter"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), array(v)))
+                .collect(),
+        );
+        let mut model = Transformer::load(
+            &weights,
+            Geometry {
+                dim: 16,
+                ffn: 24,
+                heads: 2,
+                layers: 2,
+                text: 12,
+                freq: 8,
+                channels: 4,
+            },
+        )
+        .unwrap();
+        model.install_edit(&adapter, 2).unwrap();
+        let probe = &f["projection_probe"];
+        let projected = model.blocks[0].projections[0]
+            .forward(&array(&probe["input"]))
+            .unwrap();
+        compare(&projected, &probe["expected"], 0.0, "BF16 edit projection");
+        if !cpu_only {
+            let original: Value = serde_json::from_str(include_str!(
+                "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v1_time_probe/fixture.json"
+            )).unwrap();
+            let original_weights = Weights::from_map(
+                original["weights"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), array(v)))
+                    .collect(),
+            );
+            let original_model = Transformer::load(&original_weights, model.g.clone()).unwrap();
+            time_probes(&original_model, &original);
+            time_probes(&model, &f);
+        }
+        let input = &f["inputs"];
+        let hidden = array(&input["hidden_states"]);
+        let positive = masked(&input["positive"], &input["positive_mask"]);
+        let negative = masked(&input["negative"], &input["negative_mask"]);
+        let references = input["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(array)
+            .collect::<Vec<_>>();
+        let time = input["normalized_timestep"].as_f64().unwrap() as f32;
+        let cancel = CancelFlag::new();
+        for case in f["cases"].as_array().unwrap() {
+            let refs = &references[..case["reference_count"].as_u64().unwrap() as usize];
+            let (tokens, rope) = model.edit_reference_inputs(refs).unwrap();
+            compare(&tokens, &case["reference_tokens"], 0.0, "reference tokens");
+            compare(&rope, &case["reference_rope"], 0.0, "reference coordinates");
+            if cpu_only {
+                continue;
+            }
+            let (reference_modulation, _) = model.edit_time(0.0).unwrap();
+            compare_bf16(
+                &reference_modulation,
+                &case["reference_modulation"],
+                "reference t0",
+            );
+            let (body_modulation, _) = model.edit_time(time).unwrap();
+            compare_bf16(&body_modulation, &case["body_modulation"], "body time");
+            let cache = model.prepare_edit_cache(refs, &cancel).unwrap();
+            for ((key, value), expected) in cache
+                .keys_values
+                .iter()
+                .zip(case["reference_kv"].as_array().unwrap())
+            {
+                compare_bf16(key, &expected["key"], "reference cache key");
+                compare_bf16(value, &expected["value"], "reference cache value");
+            }
+            let cached = model
+                .forward_edit(
+                    &hidden,
+                    time,
+                    EditConditioning {
+                        context: &positive,
+                        references: refs,
+                        cache: Some(&cache),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            let uncached = model
+                .forward_edit(
+                    &hidden,
+                    time,
+                    EditConditioning {
+                        context: &positive,
+                        references: refs,
+                        cache: None,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            compare_bf16(&cached, &case["cached"], "cached prediction");
+            compare_bf16(&uncached, &case["uncached"], "uncached prediction");
+            for (name, control) in case["controls"].as_object().unwrap() {
+                let delta = checked_delta(
+                    &logical_f32_readback(&cached).unwrap(),
+                    cached.shape(),
+                    &logical_f32_readback(&array(&control["output"])).unwrap(),
+                    cached.shape(),
+                );
+                assert!(
+                    delta > 3.0 * bf16_bound(&case["cached"]),
+                    "undiscriminated control {name}: {delta}"
+                );
+            }
+            let negative = model
+                .forward_edit(
+                    &hidden,
+                    time,
+                    EditConditioning {
+                        context: &negative,
+                        references: refs,
+                        cache: Some(&cache),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            compare_bf16(&negative, &case["negative_cached"], "negative prediction");
+            assert_eq!(
+                logical_f32_readback(&cached).unwrap(),
+                logical_f32_readback(&uncached).unwrap()
+            );
+            let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+                mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+                &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                    steps: Some(2),
+                    guidance: Some(4.0),
+                    width: 48,
+                    height: 32,
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let positive_batch = [positive.clone()];
+            let negative_batch = [masked(&input["negative"], &input["negative_mask"])];
+            let sampling = crate::edit::EditSampling {
+                transformer: &model,
+                resolved: &resolved,
+                positive: &positive_batch,
+                negative: &negative_batch,
+                references: refs,
+                use_cache: true,
+            };
+            let mut steps = Vec::new();
+            let sampled = sampling
+                .run(&hidden, &cancel, &mut |p| {
+                    if let mlx_gen::Progress::Step { current, total } = p {
+                        steps.push((current, total))
+                    }
+                })
+                .unwrap();
+            compare_bf16(&sampled, &case["sampling"]["final"], "FP32 CFG/Euler trace");
+            assert_eq!(steps, [(1, 2), (2, 2)]);
+            let stop = CancelFlag::new();
+            assert!(matches!(
+                sampling.run(
+                    &hidden,
+                    &stop,
+                    &mut |p| if matches!(p, mlx_gen::Progress::Step { .. }) {
+                        stop.cancel()
+                    }
+                ),
+                Err(Error::Canceled)
+            ));
+            let reentry = sampling
+                .run(&hidden, &CancelFlag::new(), &mut |_| {})
+                .unwrap();
+            assert_eq!(
+                logical_f32_readback(&sampled).unwrap(),
+                logical_f32_readback(&reentry).unwrap()
+            );
+        }
+        cancel.cancel();
+        assert!(matches!(
+            model.prepare_edit_cache(&references, &cancel),
+            Err(Error::Canceled)
+        ));
     }
 }

@@ -81,3 +81,43 @@ writing three PNGs and three actual receipts. This explicit terminal test is nev
 run by default. For cancellation, optional `MOSS_NATIVE_TEST_WARM_REENTRY=1` resets
 the cancellation token and executes one native step to latent output through the
 same generator, publishing `warm-reentry.json` only on successful reentry.
+
+## Native editing (sc-26753)
+
+Catalog-loaded `Box<dyn Generator>` exposes `generate_moss_image_edit`,
+`moss_image_edit_request_peak` and `moss_image_edit_execution_report`. Provision the
+exact `chinoll/Moss-Image-Edit@e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11`
+package through `LoadSpec.components[gen_core::moss_image_edit::EDIT_COMPONENT]` as
+a directory containing `adapter_config.json` and `adapter_model.safetensors`.
+Prepared sources need finalized pins for both files. Both complete file SHA256s,
+all 252 rank64 projection configurations, and 504 BF16 A/B tensors are validated.
+The weights license is unspecified; the upstream code's GPL license does not license weights.
+
+`MossImageEditInputs` carries one ordered RGB reference, reference maximum edge
+(default 512), a cache toggle (default true), and the existing advanced embedding,
+mask, negative-batch, FP32 noise and latent-output inputs. Keep generic conditioning
+empty to avoid supplying a reference twice. Edit defaults are 30 steps, CFG 4,
+shift 5 and full-layer unconditional CFG. Width/height remain explicit request fields
+(the product default is 512x512). Nonempty skip layers, SLG and edit+DMD are rejected.
+Ordinary generation and both existing DMD policies retain their prior behavior.
+
+Reference pixels use the frozen Pillow Lanczos/no-crop/aligned resize, deterministic
+VAE posterior mode, channel-major 2x2 packing and FP32 BN normalization. Reference queries
+see only references with timestep 0 and their own reference-index coordinates; text
+and target queries see `[text,reference,target]`. Per-layer reference K/V is request-local,
+shared across CFG branches and steps, and discarded on completion/error/cancellation.
+A cached/uncached primitive comparison also covers four mixed-aspect latent references;
+the public one-reference bound widens in sc-26755.
+
+Admission includes adapter bytes, reference encoding/resampling, reference K/V and
+attention workspace. Call the typed edit peak method before dispatch and serialize
+admission/generation/receipt retrieval. Successful edit receipts include exact adapter
+identity, original/resized/latent reference hashes, effective controls and actual noise
+seeds/digests. Supplied noise records no generated seed. Ordinary receipts are absent
+after an edit, and both receipt kinds clear before any new attempt.
+
+Frozen transformer and VAE numerical fixtures require explicit coordinator-admitted Metal
+execution because the exact fused activation is Metal-only. They are synthetic; no real
+weights are loaded. CPU projection, reference-coordinate, package and byte-exact Pillow
+resize checks run independently. Real-weight quality and product acceptance belong to the
+integrated epic-end campaign.

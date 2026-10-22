@@ -207,9 +207,16 @@ pub(crate) fn safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    if context.geometry.reference_count != 0 || context.use_pid || context.has_phases {
+    if (context.geometry.reference_count != 0
+        && !(context.geometry.reference_count == 1
+            && spec
+                .components
+                .contains_key(mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT)))
+        || context.use_pid
+        || context.has_phases
+    {
         return MemorySafetyDecision::Reject {
-            reason: "MOSS supports text-to-image only".into(),
+            reason: "MOSS supports text generation or one typed edit reference with its exact edit component; PID/phases are unsupported".into(),
         };
     }
     default_registered_memory_strategy_safety_check(spec, contract, context)
