@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T06:46:23.452580+00:00",
-  "rust_proof_closure_sha256": "60f231e844c019d98a2515ed9c5155649cda082ec184df97aa1c7803f2cee498",
+  "UTC": "2026-10-22T07:16:17.882418+00:00",
+  "rust_proof_closure_sha256": "b63e1c9a7fddc781b28a2c92ddaa7c55f27148a4842a34920c5f859a36d45fbc",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -224,7 +224,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_facts_tests.rs",
-      "sha256": "8f7213dc7bbf9b6876821c8bc1fabdd0299333d752a6f81c8b1ded7a03e51ea7"
+      "sha256": "e1ff462e70b18f97172e7310d2380185fdfd4c820d104334fd3b47a3d04de4ec"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapter_load.rs",
@@ -2378,16 +2378,17 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "0b95e7ad6eed5aa6577eadc3683aeef7aa84ad75739e7a87503742f7f1b109ce",
-    "classification_sha256": "6d530e7c079bd2917d834d627b89cea0651dd8d3bee8a7698db610b38ff5d093",
-    "selected_Rust_FQNs": 242,
+    "inventory_sha256": "eb286c2d1842681341f811175dff993c4081d5b8919f219db8edbc0381bc357a",
+    "classification_sha256": "237b373f9e4fe9bcd1ced1e6fe753702b535d12ca222953e94989a2c8d510dac",
+    "selected_Rust_FQNs": 243,
     "HOST_logical": 217,
     "HOST_expected_PASS_rows": 218,
-    "native_logical": 25,
-    "native_expected_PASS_rows": 50,
+    "native_logical": 26,
+    "native_expected_PASS_rows": 52,
     "Python_exact_tests": 17,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
-    "diagnostic_checkpoint": "Enabled-only existing load Scope timing repair and source-derived current-root corrections plus expanded fixed samples for same two children. Actual real-work cache controls change; sampler core/API/read sequence unchanged. All current native outcomes and opaque caller-backed/FS/HOST/physical terms remain OPEN. Parent corrects dense first-floor callback join; original74 test bodies retained;17 added."
+    "diagnostic_checkpoint": "Enabled-only existing load Scope timing repair and source-derived current-root corrections plus expanded fixed samples for same two children. Actual real-work cache controls change; sampler core/API/read sequence unchanged. All current native outcomes and opaque caller-backed/FS/HOST/physical terms remain OPEN. Parent corrects dense first-floor callback join; original74 test bodies retained;17 added.",
+    "existing_constructor_caller_compile_repair": "Add actual existing adapter format CPU-child FQN/source binding; no new test, no assertion changes; current native/cache/trace execution remains UNOBSERVED."
   }
 }

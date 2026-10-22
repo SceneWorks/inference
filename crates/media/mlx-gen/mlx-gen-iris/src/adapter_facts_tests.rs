@@ -579,7 +579,8 @@ fn format_specific_vector_gate_matches_actual_strict_loader() {
             .to_string();
             let mut weights = base(Dtype::Bfloat16);
             let mut host =
-                super::ProjectionHost::from_weights(&mut weights, Dtype::Bfloat16).unwrap();
+                super::ProjectionHost::from_weights(&mut weights, Dtype::Bfloat16, &shapes)
+                    .unwrap();
             let native_error =
                 mlx_gen::adapters::loader::apply_adapters_strict(&mut host, &[refused], "iris_3b")
                     .unwrap_err()
