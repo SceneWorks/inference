@@ -14,13 +14,48 @@ $record = [ordered]@{
     host = [Environment]::MachineName; runner = $env:RUNNER_NAME
     run = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT; source = $env:GITHUB_SHA
     startedUtc = [DateTime]::UtcNow.ToString('o'); completed = $false
+    collectionComplete = $false; telemetryComplete = $false; evidenceTruncated = $false
     admission = 'not_evaluated'; applicationJobOwnership = 'unknown'
     physicalGpu = 1; mapping = $null; samples = @(); queries = @(); errors = $issues
 }
+function Evidence-Label($Value) {
+    $text = [string]$Value
+    return $text.Substring(0, [Math]::Min(128, $text.Length))
+}
 function Save-Record {
-    $json = $record | ConvertTo-Json -Depth 16
-    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 4MB) { throw 'Diagnostic JSON exceeded 4 MiB bound' }
-    $json | Set-Content -Encoding UTF8 (Join-Path $root 'evidence.json')
+    # Compact UTF-8, without BOM/newline: the measured bytes are the bytes written.
+    $json = $record | ConvertTo-Json -Depth 16 -Compress
+    $originalBytes = [Text.Encoding]::UTF8.GetByteCount($json)
+    $withinBudget = ($originalBytes -le 4MB)
+    if (-not $withinBudget) {
+        # Stop collection after writing a bounded terminal summary, rather than leaving
+        # an old completed=false snapshot. Every omitted detail is explicit.
+        $summary = [ordered]@{
+            schemaVersion = 1; purpose = 'read-only GPU1 evidence; not admission'
+            completed = $true; collectionComplete = $false; telemetryComplete = $false
+            evidenceTruncated = $true; recordDetailsOmitted = $true
+            terminalReason = 'evidence_budget_exceeded'; completedUtc = [DateTime]::UtcNow.ToString('o')
+            admission = 'not_evaluated'; applicationJobOwnership = 'unknown'; physicalGpu = 1
+            host = (Evidence-Label $record.host); runner = (Evidence-Label $record.runner)
+            run = (Evidence-Label $record.run); attempt = (Evidence-Label $record.attempt)
+            source = (Evidence-Label $record.source); metadataStringLimit = 128
+            originalCompactUtf8Bytes = $originalBytes; limitUtf8Bytes = 4MB
+            originalSampleCount = $record.samples.Count; originalQueryCount = $record.queries.Count
+            originalErrorCount = $issues.Count
+            sampleRows = @($record.samples | Select-Object -First 3 | ForEach-Object {
+                @{ counters = $_.counters.Count; utc = (Evidence-Label $_.utc) }
+            })
+            errors = @('Evidence exceeded 4 MiB; detailed record omitted; collection stopped')
+        }
+        # All variable strings are capped and sampleRows has at most three entries.
+        # The fixed-schema summary stays small even if the original errors/data grow.
+        $json = $summary | ConvertTo-Json -Depth 8 -Compress
+    }
+    $pending = Join-Path $root 'evidence.pending.json'
+    [IO.File]::WriteAllText($pending, $json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $pending -Destination (Join-Path $root 'evidence.json') -Force
+    if (-not $withinBudget) { Write-Host '::error::Evidence budget exceeded; terminal incomplete summary written' }
+    return $withinBudget
 }
 function Smi([string[]]$Arguments) {
     $output = @(& nvidia-smi @Arguments 2>&1 | ForEach-Object { $_.ToString() })
@@ -132,7 +167,7 @@ function Read-Mapped-Counters([string]$Luid, [int]$Count, [bool]$ValidateValues)
     }
     return $result
 }
-Save-Record
+if (-not (Save-Record)) { exit 1 }
 try {
     $identity = Identity '1'
     $uuid = $identity.uuid.Trim(); $pci = $identity.pci.Trim()
@@ -202,12 +237,13 @@ try {
             }
         } catch { $issues.Add('GPU1 sample incomplete'); $sample['error'] = $_.Exception.Message }
         $record.samples += $sample
-        Save-Record
+        if (-not (Save-Record)) { exit 1 }
     }
 } catch { $issues.Add('GPU1 diagnostic incomplete'); $record['error'] = $_.Exception.Message }
 $record['completedUtc'] = [DateTime]::UtcNow.ToString('o')
 $record.completed = $true
+$record.collectionComplete = ($record.samples.Count -eq 3)
 $record['telemetryComplete'] = ($issues.Count -eq 0)
-Save-Record
+if (-not (Save-Record)) { exit 1 }
 Write-Host "GPU1 evidence recorded; admission not evaluated; incomplete flags: $($issues.Count)"
 if ($issues.Count -ne 0) { exit 1 }

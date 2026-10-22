@@ -4,6 +4,7 @@ These exercise event selection and constrain the collector's operation surface.
 Actual Windows SDK compilation, CIM and counters remain Windows-only validation.
 """
 import copy
+import json
 import math
 import re
 import unittest
@@ -99,6 +100,36 @@ def cohort_structure_errors(script):
     return errors
 
 
+EVIDENCE_BUDGET = 4 * 1024 * 1024
+
+
+def evidence_budget_contract(record):
+    """Executable object-level budget oracle, not a PowerShell runtime emulator.
+
+    Full JSON round-trip must be lossless below the byte budget. Overflow must
+    terminate with an explicit incomplete summary independently of input size.
+    Source-wiring checks below bind this contract to the collector's save sites.
+    """
+    encoded = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    if len(encoded) <= EVIDENCE_BUDGET:
+        return encoded, True
+    summary = {
+        'schemaVersion': 1, 'completed': True, 'collectionComplete': False,
+        'telemetryComplete': False, 'evidenceTruncated': True,
+        'recordDetailsOmitted': True, 'terminalReason': 'evidence_budget_exceeded',
+        'admission': 'not_evaluated', 'applicationJobOwnership': 'unknown',
+        'originalCompactUtf8Bytes': len(encoded), 'limitUtf8Bytes': EVIDENCE_BUDGET,
+        'originalSampleCount': len(record.get('samples', [])),
+        'originalQueryCount': len(record.get('queries', [])),
+        'originalErrorCount': len(record.get('errors', [])),
+        'sampleRows': [{'counters': len(sample['counters']), 'utc': sample['utc'][:128]}
+                       for sample in record.get('samples', [])[:3]],
+    }
+    for field in ('host', 'runner', 'run', 'attempt', 'source'):
+        summary[field] = str(record.get(field, ''))[:128]
+    return json.dumps(summary, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), False
+
+
 class WindowsGpu1DiagnosticTests(unittest.TestCase):
     def setUp(self):
         self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
@@ -157,8 +188,8 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         for forbidden in ('Stop-Process', 'taskkill', 'Invoke-WebRequest', 'Invoke-RestMethod', 'CommandLine', 'Get-ChildItem Env:', 'cuInit', 'nvcuda', 'cargo ', 'pip ', 'D3D11CreateDevice', 'CreateDevice'):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden.lower(), commands.lower())
-        self.assertEqual(script.count("admission = 'not_evaluated'"), 1)
-        self.assertEqual(script.count("applicationJobOwnership = 'unknown'"), 1)
+        self.assertEqual(script.count("admission = 'not_evaluated'"), 2)
+        self.assertEqual(script.count("applicationJobOwnership = 'unknown'"), 2)
         self.assertNotRegex(script, r'(?i)(?:\.admission|\[.admission.\]|\.applicationJobOwnership)\s*=')
         self.assertIn("if ($issues.Count -ne 0) { exit 1 }", script)
         self.assertIn("$record['telemetryComplete'] = ($issues.Count -eq 0)", script)
@@ -219,6 +250,75 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         for index, mutated in enumerate(mutations):
             with self.subTest(mutation=index):
                 self.assertNotEqual(cohort_structure_errors(mutated), [])
+
+    def test_evidence_budget_below_exact_and_above_limit(self):
+        envelope = {'completed': False, 'payload': ''}
+        overhead = len(json.dumps(envelope, separators=(',', ':')).encode('utf-8'))
+        for delta in (-1, 0, 1):
+            with self.subTest(delta=delta):
+                record = dict(envelope, payload='x' * (EVIDENCE_BUDGET - overhead + delta))
+                encoded, complete_record = evidence_budget_contract(record)
+                self.assertLessEqual(len(encoded), EVIDENCE_BUDGET)
+                self.assertEqual(complete_record, delta <= 0)
+                decoded = json.loads(encoded)
+                if complete_record:
+                    self.assertEqual(decoded, record)
+                else:
+                    self.assertTrue(decoded['completed'])
+                    self.assertFalse(decoded['telemetryComplete'])
+                    self.assertTrue(decoded['evidenceTruncated'])
+                    self.assertEqual(decoded['originalCompactUtf8Bytes'], EVIDENCE_BUDGET + 1)
+
+    def test_evidence_overflow_uses_utf8_bytes_and_retains_terminal_unknown(self):
+        record = {'completed': False, 'telemetryComplete': True, 'samples': [], 'queries': [],
+                  'errors': ['error' * 1000] * 1000, 'payload': 'é' * (EVIDENCE_BUDGET // 2),
+                  'host': '界' * 10000, 'source': 'x' * 10000}
+        encoded, complete_record = evidence_budget_contract(record)
+        self.assertFalse(complete_record)
+        self.assertLess(len(encoded), 8192)
+        decoded = json.loads(encoded)
+        self.assertTrue(decoded['completed'])
+        self.assertFalse(decoded['collectionComplete'])
+        self.assertFalse(decoded['telemetryComplete'])
+        self.assertTrue(decoded['recordDetailsOmitted'])
+        self.assertEqual(decoded['admission'], 'not_evaluated')
+        self.assertEqual(decoded['applicationJobOwnership'], 'unknown')
+        self.assertEqual(decoded['originalErrorCount'], 1000)
+        self.assertEqual(len(decoded['host']), 128)
+        self.assertFalse(record['completed'], 'saving must not mutate the input into an admission')
+
+    def test_compact_evidence_keeps_all_three_counter_windows(self):
+        row = {'instance': 'pid_12345_luid_0x00000000_0x00001234_phys_0_eng_1_engtype_3D',
+               'counter': r'\GPU Engine(*)\Utilization Percentage', 'utc': '2026-10-22T23:00:00.0000000Z',
+               'value': 0.125, 'rawValue': '0.125', 'status': 1, 'pid': 12345,
+               'valuesValidated': True, 'valid': True}
+        sample = {'utc': row['utc'], 'counters': [row] * 1450, 'counterDiscovery': [row] * 725}
+        record = {'completed': True, 'telemetryComplete': False, 'evidenceTruncated': False,
+                  'samples': [sample] * 3, 'errors': ['ownership unknown']}
+        self.assertGreater(len(json.dumps(record, indent=16).encode('utf-8')), EVIDENCE_BUDGET)
+        encoded, complete_record = evidence_budget_contract(record)
+        self.assertTrue(complete_record)
+        self.assertEqual(json.loads(encoded), record)
+        self.assertEqual([len(x['counters']) for x in json.loads(encoded)['samples']], [1450] * 3)
+
+    def test_collector_save_sites_stop_on_overflow_after_terminal_summary(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        save = script.split('function Save-Record {', 1)[1].split('function Smi(', 1)[0]
+        self.assertIn('ConvertTo-Json -Depth 16 -Compress', save)
+        self.assertIn('[Text.Encoding]::UTF8.GetByteCount($json)', save)
+        self.assertIn('$withinBudget = ($originalBytes -le 4MB)', save)
+        self.assertIn('completed = $true; collectionComplete = $false; telemetryComplete = $false', save)
+        self.assertIn('evidenceTruncated = $true; recordDetailsOmitted = $true', save)
+        self.assertIn("terminalReason = 'evidence_budget_exceeded'", save)
+        self.assertIn('Select-Object -First 3', save)
+        self.assertIn('[Math]::Min(128, $text.Length)', script)
+        self.assertIn('[IO.File]::WriteAllText($pending, $json, [Text.UTF8Encoding]::new($false))', save)
+        self.assertIn('Move-Item -LiteralPath $pending', save)
+        self.assertNotIn('throw', save)
+        self.assertNotIn('Set-Content', save)
+        self.assertEqual(script.count('if (-not (Save-Record)) { exit 1 }'), 3)
+        self.assertNotRegex(script, r'(?m)^\s*Save-Record\s*$')
+        self.assertLess(save.index('Move-Item -LiteralPath $pending'), save.index('return $withinBudget'))
 
     def test_mapper_uses_only_documented_sdk_metadata_and_closes_handles(self):
         mapper = MAPPER.read_text(encoding="utf-8")
