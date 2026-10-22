@@ -35,6 +35,63 @@ class TerminalEvidenceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def cleanup_verified_session(self, proc, child_pid_path: Path, cleanup):
+        self.assertNotEqual(proc.pid, os.getpgrp())
+        self.assertEqual(os.getpgid(proc.pid), proc.pid)
+        self.assertEqual(os.getsid(proc.pid), proc.pid)
+        try:
+            try:
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                # A timeout may precede PID publication, including its file write.
+                pass
+            else:
+                self.assertEqual(os.getpgid(child_pid), proc.pid)
+                self.assertEqual(os.getsid(child_pid), proc.pid)
+        finally:
+            # Parent ownership is proven above; readiness cannot bypass cleanup.
+            result = cleanup(proc)
+        return result
+
+    @unittest.skipIf(os.name == "nt", "POSIX session ownership contract")
+    def test_verified_session_cleanup_survives_readiness_failure(self) -> None:
+        proc = mock.Mock(pid=12345)
+        for failure in (FileNotFoundError(), ValueError(), RuntimeError("readiness failed")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(os, "getpgrp", return_value=999), \
+                    mock.patch.object(os, "getpgid", return_value=proc.pid), \
+                    mock.patch.object(os, "getsid", return_value=proc.pid):
+                path = mock.Mock()
+                path.read_text.side_effect = failure
+                cleanup = mock.Mock(return_value={"root_reaped": True})
+                if isinstance(failure, RuntimeError):
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.cleanup_verified_session(proc, path, cleanup)
+                    self.assertIs(raised.exception, failure)
+                else:
+                    self.assertEqual(self.cleanup_verified_session(proc, path, cleanup),
+                                     {"root_reaped": True})
+                cleanup.assert_called_once_with(proc)
+        with mock.patch.object(os, "getpgrp", return_value=999), \
+                mock.patch.object(os, "getpgid", side_effect=[proc.pid, 456]), \
+                mock.patch.object(os, "getsid", return_value=proc.pid):
+            path = mock.Mock()
+            path.read_text.return_value = "23456"
+            cleanup = mock.Mock()
+            with self.assertRaises(AssertionError):
+                self.cleanup_verified_session(proc, path, cleanup)
+            cleanup.assert_called_once_with(proc)
+        for query in ("getpgid", "getsid"):
+            with self.subTest(unverified=query), \
+                    mock.patch.object(os, "getpgrp", return_value=999), \
+                    mock.patch.object(os, "getpgid", return_value=proc.pid), \
+                    mock.patch.object(os, "getsid", return_value=proc.pid):
+                with mock.patch.object(os, query, return_value=456):
+                    cleanup = mock.Mock()
+                    with self.assertRaises(AssertionError):
+                        self.cleanup_verified_session(proc, mock.Mock(), cleanup)
+                    cleanup.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "fixture executable uses a POSIX shebang")
     def test_cpu_diagnostic_timeout_seals_partial_evidence_and_reaps_child_tree(self) -> None:
         grandchild_pid_path = self.root / "grandchild.pid"
@@ -63,13 +120,7 @@ class TerminalEvidenceTests(unittest.TestCase):
         real_cleanup = terminal.terminate_owned_child
 
         def checked_cleanup(proc):
-            self.assertNotEqual(proc.pid, os.getpgrp())
-            self.assertEqual(os.getpgid(proc.pid), proc.pid)
-            self.assertEqual(os.getsid(proc.pid), proc.pid)
-            child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
-            self.assertEqual(os.getpgid(child_pid), proc.pid)
-            self.assertEqual(os.getsid(child_pid), proc.pid)
-            return real_cleanup(proc)
+            return self.cleanup_verified_session(proc, grandchild_pid_path, real_cleanup)
 
         inventory = {"inventory_sha256": "e" * 64}
         sizes = {"language_weight_bytes": 1, "vision_weight_bytes": 0, "projector_bytes": 0}
@@ -101,8 +152,11 @@ class TerminalEvidenceTests(unittest.TestCase):
         self.assertIn("progress-rss.jsonl", [item["path"] for item in manifest["files"]])
         with self.assertRaisesRegex(ValueError, "did not complete successfully"):
             terminal.validate_receipt(output)
-        self.assertTrue(grandchild_pid_path.is_file())
-        child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        try:
+            child_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            # The verified session was reaped even if its child never published a PID.
+            return
         for _ in range(20):
             state = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(child_pid)], capture_output=True, text=True,
