@@ -76,11 +76,13 @@ fn in_cpu_child(name: &str) -> bool {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
+                "--include-ignored",
                 &format!("ios_pricing::additivity::{name}"),
                 "--nocapture",
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
+            .env("IOS_CAPTURE_IN_CHILD", "1")
             .env(DONE, &marker)
             .status()
             .unwrap();
@@ -918,6 +920,7 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
 /// Literal resident TEXT uses the production warm callback's encoder superset, independent of
 /// img2img. Price each actual header inventory once (packed weights stay packed).
 #[test]
+#[ignore = "expensive fixture ownership capture; run through the selected iOS capture workflow"]
 fn resident_text_keeps_and_prices_the_production_encoder_superset() {
     if !in_cpu_child("resident_text_keeps_and_prices_the_production_encoder_superset") {
         return;
@@ -1014,12 +1017,16 @@ fn resident_text_keeps_and_prices_the_production_encoder_superset() {
             }
         }
     }
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_pricing::additivity::resident_text_keeps_and_prices_the_production_encoder_superset");
+    }
 }
 
 /// Legacy positive additivity regression, still requiring a source-correlated verdict. Logical
 /// counts and the legacy mode inventory do not prove text-anchor inheritance. Preserve the real
 /// positive assertions; Uncertified must not become passing refusal or a capture-family collapse.
 #[test]
+#[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
 fn every_mode_is_derivable_from_the_text_anchor() {
     if !in_cpu_child("every_mode_is_derivable_from_the_text_anchor") {
         return;
@@ -1028,6 +1035,9 @@ fn every_mode_is_derivable_from_the_text_anchor() {
     // No additivity certificate is inferred from the legacy inventory.
     let failures = prove_all(|_, _| {}, TIERS.len());
     assert!(failures.is_empty(), "not additive: {failures:#?}");
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_pricing::additivity::every_mode_is_derivable_from_the_text_anchor");
+    }
 }
 
 /// The proof has teeth: a derivation whose requests forget the sampler state their denoise carries
@@ -1035,6 +1045,7 @@ fn every_mode_is_derivable_from_the_text_anchor() {
 /// model input — the components the anchor's text denoise does not hold, re-added through `C_req`)
 /// goes red for every such mode. Dense tier.
 #[test]
+#[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
 fn dropping_the_carried_sampler_state_breaks_the_proof() {
     if !in_cpu_child("dropping_the_carried_sampler_state_breaks_the_proof") {
         return;
@@ -1065,5 +1076,8 @@ fn dropping_the_carried_sampler_state_breaks_the_proof() {
                 .any(|f| f.starts_with(case) && f.contains("denoise")),
             "{case}: dropping its carried sampler state must break the derivation"
         );
+    }
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_pricing::additivity::dropping_the_carried_sampler_state_breaks_the_proof");
     }
 }

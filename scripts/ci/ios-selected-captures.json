@@ -1,0 +1,350 @@
+[
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "quantum_proofs::every_backbone_quantum_price_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "quantum_proofs::every_text_encoder_quantum_price_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::actual_runtime_metadata_matches_recipe_epochs",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::actual_sampling_epochs_bound_both_solvers_cfg_intervals_and_serial_outputs",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::depth_and_restoration_derive_a_second_size_from_native_certificates",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::the_priced_resident_accounts_for_the_live_set_at_every_check",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "anchor_tests::installed_adapter_derivability_is_measured_at_both_endpoints_per_phase",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "packed_tests::a_packed_backbone_loads_bit_identical_to_the_release_quantized_at_load",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/packed_tests.rs"
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "lib",
+    "fqn": "packed_tests::a_packed_text_tower_loads_bit_identical_to_the_tower_quantized_at_load",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/src/packed_tests.rs"
+  },
+  {
+    "package": "mlx-gen-anima",
+    "target": "lib",
+    "fqn": "quantum_tests::dit_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-anima/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-anima",
+    "target": "lib",
+    "fqn": "quantum_tests::conditioner_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-anima/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-anima",
+    "target": "lib",
+    "fqn": "quantum_tests::text_encoder_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-anima/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::dit_block_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::dit_stage_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::text_encoder_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::control_and_streamed_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::adapter_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::vae_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "quantum_proofs::pipeline_and_vae_head_formulas_track_the_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/quantum_proofs.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "ios_additivity_tests::dropping_the_control_components_breaks_the_proof",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs"
+  },
+  {
+    "package": "mlx-gen-z-image",
+    "target": "lib",
+    "fqn": "ios_additivity_tests::packed_tier_matrix",
+    "source": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_additivity_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sana",
+    "target": "lib",
+    "fqn": "ios_pricing::additivity::every_mode_is_derivable_from_the_text_anchor",
+    "source": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sana",
+    "target": "lib",
+    "fqn": "ios_pricing::additivity::dropping_the_carried_sampler_state_breaks_the_proof",
+    "source": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::mixed_conv_cast_and_layout_are_distinct_live_allocations",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::affine_norm_fallback_tracks_both_compute_widths",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::biased_projection_prices_all_addmm_operand_promotions",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::control_injection_prices_lazy_and_materialized_owned_residuals",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::unet_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::transformer_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::controlnet_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::f16_unet_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::composed_conv_bias_promotion_is_separate_from_weight_layout",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::f16_and_packed_clip_layers_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::encoder_layers_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::vae_quanta_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::sampler_step_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::load_quantize_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::proofs::ip_cfg_tokens_track_their_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::adapters::adapter_installs_track_their_measured_peaks",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::streamed_block_quantum_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::streamed_unet_load_floor_tracks_its_measured_peak",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::staged_ip_denoise_resident_tracks_the_measured_bundle",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::cast_load_floor_and_resident_track_their_measurements",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::every_guard_covers_its_real_request_quantum",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+  },
+  {
+    "package": "mlx-gen-sana",
+    "target": "lib",
+    "fqn": "ios_pricing::additivity::resident_text_keeps_and_prices_the_production_encoder_superset",
+    "source": "crates/media/mlx-gen/mlx-gen-sana/src/ios_pricing/additivity.rs"
+  }
+]

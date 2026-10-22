@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Dispatch-only, exact Rust fixture captures. Phone anchors remain campaign.py's job."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+REGISTRY = tuple(json.loads(Path(__file__).with_name("ios-selected-captures.json").read_text()))
+FAMILIES = ("iris", "anima", "z-image", "sdxl", "sana")
+
+
+def identity(row: dict) -> str:
+    return row["package"] + "/" + row["fqn"]
+
+
+def select(selection: str) -> tuple[dict, ...]:
+    choices = ("all", *FAMILIES, *(identity(row) for row in REGISTRY))
+    if selection not in choices:
+        raise ValueError("selection must name a fixed family or registered package/FQN")
+    rows = tuple(row for row in REGISTRY if selection == "all"
+                 or row["package"] == "mlx-gen-" + selection or identity(row) == selection)
+    if not rows or len({identity(row) for row in rows}) != len(rows):
+        raise ValueError("empty or duplicate capture selection")
+    return rows
+
+
+def require_dispatch(env: dict[str, str]) -> None:
+    for key, expected in (("GITHUB_EVENT_NAME", "workflow_dispatch"),
+                          ("RUNNER_NAME", "nax-macos-2"), ("RUNNER_OS", "macOS"),
+                          ("RUNNER_ARCH", "ARM64")):
+        if env.get(key) != expected:
+            raise ValueError(f"{key} must be {expected}; no local/shared-dev-Mac capture")
+
+
+def command(row: dict, discover: bool) -> list[str]:
+    # No command, target, feature, test pattern or manifest can come from dispatch input.
+    if row not in REGISTRY or row["target"] != "lib":
+        raise ValueError("unregistered capture target")
+    return ["cargo", "test", "--locked", "--no-default-features", "-p", row["package"],
+            "--lib", row["fqn"], "--", "--exact", "--ignored",
+            *( ["--list"] if discover else ["--nocapture", "--test-threads=1"] )]
+
+
+def verify_discovery(row: dict, text: str) -> None:
+    discovered = re.findall(r"^(.+): test$", text, re.M)
+    if discovered != [row["fqn"]]:
+        raise ValueError(f"{identity(row)}: expected exactly one ignored test, got {discovered}")
+    if not re.search(r"^1 test, 0 benchmarks$", text, re.M):
+        raise ValueError("ignored discovery did not report exactly one test")
+
+
+def verify_execution(row: dict, text: str) -> None:
+    results = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
+    # These captures all delegate to an exact CPU child. Both parent and child must execute one.
+    if len(results) != 2 or any(result != ("1", "0", "0") for result in results):
+        raise ValueError(f"{identity(row)}: expected one completed parent AND child: {results}")
+    marker = "IOS_CAPTURE_BODY_COMPLETED " + row["fqn"]
+    if text.splitlines().count(marker) != 1:
+        raise ValueError(f"{identity(row)}: missing/duplicate actual capture-body completion")
+
+
+def run(selection: str) -> int:
+    require_dispatch(os.environ)
+    rows = select(selection)
+    completed = 0
+    output = Path(os.environ["RUNNER_TEMP"]) / "ios-selected-captures"
+    output.mkdir(parents=True, exist_ok=True)
+    receipt = {"selected": len(rows), "completed": 0, "captures": []}
+    try:
+        for index, row in enumerate(rows):
+            for discover in (True, False):
+                proc = subprocess.run(command(row, discover), cwd=ROOT,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                text = proc.stdout
+                log = output / f"{index:03d}-{'discovery' if discover else 'body'}.log"
+                log.write_text(text)
+                print(text, end="", flush=True)
+                if proc.returncode:
+                    return proc.returncode
+                (verify_discovery if discover else verify_execution)(row, text)
+            completed += 1
+            receipt["completed"] = completed
+            receipt["captures"].append(identity(row))
+        if completed != len(rows):
+            raise ValueError("selected/completed capture count mismatch")
+        return 0
+    finally:
+        (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        print(f"IOS_CAPTURE_COUNTS selected={len(rows)} completed={completed}", flush=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--select", required=True,
+                        choices=("all", *FAMILIES, *(identity(row) for row in REGISTRY)))
+    parser.add_argument("--list", action="store_true", help="list fixed bindings without running")
+    args = parser.parse_args()
+    if args.list:
+        print(json.dumps(select(args.select), indent=2))
+        return 0
+    try:
+        return run(args.select)
+    except (ValueError, OSError) as error:
+        print(f"capture prerequisite/validation failure: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

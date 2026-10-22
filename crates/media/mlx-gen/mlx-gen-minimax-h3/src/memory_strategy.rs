@@ -2271,13 +2271,34 @@ mod tests {
     }
 
     /// Write a snapshot tree whose component directories hold **sparse** `.safetensors` files of
-    /// the exact measured sizes. `safetensors_path_bytes` stats rather than parses, so this costs
-    /// no disk and still exercises the real directory-name wiring.
+    /// the exact measured sizes. Valid headers exercise tier detection without materializing the
+    /// sparse payload; stat-based component accounting still sees every original measured byte.
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).expect("component dir");
-            let file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            let mut file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            use std::io::Write;
+            // Header and both payload intervals cover the exact sparse file, including odd
+            // measured lengths. A real BF16 tensor proves dense storage; U8 padding is not a
+            // pretend floating parameter and must not alter stat-derived component charges.
+            let mut padding = 0_u64;
+            let header = loop {
+                let header = format!(
+                    r#"{{"w":{{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}},"padding":{{"dtype":"U8","shape":[{padding:20}],"data_offsets":[2,{:20}]}}}}"#,
+                    padding + 2
+                );
+                let remaining = (*bytes)
+                    .checked_sub(8 + header.len() as u64 + 2)
+                    .expect("fixture fits header");
+                if padding == remaining {
+                    break header;
+                }
+                padding = remaining;
+            };
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .unwrap();
+            file.write_all(header.as_bytes()).unwrap();
             file.set_len(*bytes).expect("sparse shard");
         }
     }

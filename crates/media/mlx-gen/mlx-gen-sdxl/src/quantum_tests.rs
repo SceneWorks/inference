@@ -61,6 +61,7 @@ fn cpu_child(name: &str) -> bool {
             "--include-ignored",
         ])
         .env(CHILD, "1")
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .status()
         .unwrap();
     assert!(status.success(), "CPU child for {name} failed");
@@ -109,9 +110,11 @@ fn completed_cpu_child(name: &str) -> Option<CpuBodyCompletion> {
             "--exact",
             &format!("quantum_tests::{name}"),
             "--nocapture",
+            "--include-ignored",
             "--test-threads=1",
         ])
         .env("SDXL_IOS_QUANTUM_CPU_CHILD", "1")
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .env("SDXL_IOS_QUANTUM_CPU_BODY_DONE", &marker)
         .status()
         .unwrap();
@@ -1647,7 +1650,14 @@ fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
             "{batching:?}: every actual block is priced at its explicit {batch}-row forward geometry");
         assert_eq!(
             checked(&events, UNET_STEM),
-            vec![unet.stem_scratch_for_test(&x, ctx); forwards],
+            vec![
+                predicted
+                    .iter()
+                    .find(|(label, _)| *label == UNET_STEM)
+                    .unwrap()
+                    .1;
+                forwards
+            ],
             "{batching:?}: actual stem input has exactly {batch} latent rows"
         );
     }
@@ -1668,10 +1678,28 @@ fn actual_noised_unet_input_is_cast_at_every_forward() {
     let ctx = ctx.as_dtype(crate::model::DTYPE).unwrap();
     let pooled = pooled.as_dtype(crate::model::DTYPE).unwrap();
     let narrow = pair.as_dtype(crate::model::DTYPE).unwrap();
-    let expected = unet.stem_scratch_for_test(&narrow, &ctx);
+    let full_stem = |input: &Array| {
+        let mut prices = Vec::new();
+        unet.price_forward(
+            input,
+            &ctx,
+            &pooled,
+            None,
+            None,
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+            &mut prices,
+        )
+        .unwrap();
+        prices
+            .into_iter()
+            .find(|(label, _)| *label == UNET_STEM)
+            .unwrap()
+            .1
+    };
+    let expected = full_stem(&narrow);
     assert_ne!(
         expected,
-        unet.stem_scratch_for_test(&pair, &ctx),
+        full_stem(&pair),
         "the fixture must distinguish f32 from compute-dtype stem inputs"
     );
     let euler = crate::sampler::EulerSampler::new_with_dtype(
@@ -2231,6 +2259,7 @@ mod proofs {
     /// The frontend cast of a permuted half weight and CPU GEMM's layout copy coexist.
     /// The pre-promoted control keeps exactly the same layout, but has no pending dtype cast.
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn mixed_conv_cast_and_layout_are_distinct_live_allocations() {
         if !cpu_child("proofs::mixed_conv_cast_and_layout_are_distinct_live_allocations") {
             return;
@@ -2260,9 +2289,14 @@ mod proofs {
             elements(&w) * dtype_bytes(Dtype::Float32),
             "frontend weight cast only"
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::mixed_conv_cast_and_layout_are_distinct_live_allocations");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn affine_norm_fallback_tracks_both_compute_widths() {
         if !cpu_child("proofs::affine_norm_fallback_tracks_both_compute_widths") {
             return;
@@ -2285,9 +2319,14 @@ mod proofs {
                 },
             );
         }
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::affine_norm_fallback_tracks_both_compute_widths");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn biased_projection_prices_all_addmm_operand_promotions() {
         if !cpu_child("proofs::biased_projection_prices_all_addmm_operand_promotions") {
             return;
@@ -2323,9 +2362,14 @@ mod proofs {
             linear_operand_bytes(&ready, ready_x.shape(), ready_x.dtype()),
             0
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::biased_projection_prices_all_addmm_operand_promotions");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn control_injection_prices_lazy_and_materialized_owned_residuals() {
         if !cpu_child("proofs::control_injection_prices_lazy_and_materialized_owned_residuals") {
             return;
@@ -2359,6 +2403,10 @@ mod proofs {
                 );
             }
             assert_eq!(scratch, elements(&x) * (2 + dtype_bytes(dtype)));
+        }
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::control_injection_prices_lazy_and_materialized_owned_residuals");
         }
     }
 
@@ -2423,6 +2471,7 @@ mod proofs {
     // -- U-Net ---------------------------------------------------------------------------------
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn unet_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::unet_quanta_track_their_measured_peaks") {
             return;
@@ -2511,9 +2560,14 @@ mod proofs {
             )?;
             Ok(vec![x, temb])
         });
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::unet_quanta_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn transformer_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::transformer_quanta_track_their_measured_peaks") {
             return;
@@ -2570,9 +2624,14 @@ mod proofs {
         prove(TRANSFORMER_PROJ_OUT, proj_out, || {
             Ok(vec![t.proj_out_body(&hidden, &x)?])
         });
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::transformer_quanta_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn controlnet_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::controlnet_quanta_track_their_measured_peaks") {
             return;
@@ -2627,6 +2686,10 @@ mod proofs {
                 )?])
             },
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::controlnet_quanta_track_their_measured_peaks");
+        }
     }
 
     // -- f16 activations (the device's compute dtype) -------------------------------------------
@@ -2677,6 +2740,7 @@ mod proofs {
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_unet_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_unet_quanta_track_their_measured_peaks") {
             return;
@@ -2798,12 +2862,17 @@ mod proofs {
                 Ok(vec![x, temb])
             },
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_unet_quanta_track_their_measured_peaks");
+        }
     }
 
     /// The packed tier's promotions: a pre-quantized snapshot's `time_emb_proj` (BF16 scales) turns
     /// the f16 resnet's second half f32 (the projected f32 time embedding widens the sum); after it
     /// the U-Net carries f32 activations through f16 convolutions, whose weights MLX casts up.
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn packed_tier_resnet_and_conv_promotions_track_their_measured_peaks() {
         if !cpu_child("proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks") {
             return;
@@ -2896,9 +2965,14 @@ mod proofs {
             call.transient(Backend::Metal) - narrow.transient(Backend::Metal),
             call.weight_elements() * (4 + 4 - 2)
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn composed_conv_bias_promotion_is_separate_from_weight_layout() {
         if !cpu_child("proofs::composed_conv_bias_promotion_is_separate_from_weight_layout") {
             return;
@@ -2928,9 +3002,14 @@ mod proofs {
         prove("composed convolution wider bias", widened, || {
             Ok(vec![mlx_rs::ops::add(&x16, &b32)?])
         });
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::composed_conv_bias_promotion_is_separate_from_weight_layout");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn resnet_affine_bias_and_shortcut_promotions_are_tensor_derived() {
         if !cpu_child("proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived") {
             return;
@@ -2967,11 +3046,16 @@ mod proofs {
                 )?])
             },
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived");
+        }
     }
 
     /// Both CLIP text encoders run f16 on the device; a packed snapshot's BF16 scales make each
     /// layer's projections, and so its residual stream, f32.
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_and_packed_clip_layers_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_and_packed_clip_layers_track_their_measured_peaks") {
             return;
@@ -3040,9 +3124,14 @@ mod proofs {
             scratch,
             || Ok(vec![body()?]),
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_and_packed_clip_layers_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_transformer_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_transformer_quanta_track_their_measured_peaks") {
             return;
@@ -3183,11 +3272,16 @@ mod proofs {
             packed_block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, unbounded.attention),
             || Ok(vec![packed_block.forward_ip(&y, &memory, None, unbounded)?]),
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks");
+        }
     }
 
     // -- Text / vision encoders ------------------------------------------------------------------
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn encoder_layers_track_their_measured_peaks() {
         if !cpu_child("proofs::encoder_layers_track_their_measured_peaks") {
             return;
@@ -3288,11 +3382,16 @@ mod proofs {
         let latents = rand(&[1, 16, 128], 4);
         let (scratch, body) = resampler.layer_quantum_for_test(0, &features, &latents);
         prove(RESAMPLER_LAYER, scratch, || Ok(vec![body()?]));
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::encoder_layers_track_their_measured_peaks");
+        }
     }
 
     // -- VAE -------------------------------------------------------------------------------------
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn vae_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::vae_quanta_track_their_measured_peaks") {
             return;
@@ -3391,9 +3490,14 @@ mod proofs {
             crate::pipeline::decoded_to_image(&decoded)?;
             Ok(vec![])
         });
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::vae_quanta_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn tiled_vae_stages_and_tiles_track_their_measured_peaks() {
         if !cpu_child("proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks") {
             return;
@@ -3493,9 +3597,14 @@ mod proofs {
                 )?])
             },
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks");
+        }
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn sampler_step_tracks_its_measured_peak() {
         if !cpu_child("proofs::sampler_step_tracks_its_measured_peak") {
             return;
@@ -3513,12 +3622,17 @@ mod proofs {
                 mlx_gen::gen_core::guidance::cfg(&mlx_gen::MlxLatentOps, &eps_text, &eps_neg, 7.0)?;
             Ok(vec![schedule.step(&eps, &latents, 3)?])
         });
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::sampler_step_tracks_its_measured_peak");
+        }
     }
 
     /// One projection's load-time pack (epic 16774) over a resident dense f16 `[1280, 2048]`
     /// projection with its bias (an SDXL IP K/V or ControlNet attention projection's width), at
     /// both packed tiers.
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn load_quantize_tracks_its_measured_peak() {
         if !cpu_child("proofs::load_quantize_tracks_its_measured_peak") {
             return;
@@ -3548,11 +3662,16 @@ mod proofs {
                 Ok(out)
             });
         }
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::load_quantize_tracks_its_measured_peak");
+        }
     }
 
     /// The IP tokens' CFG pair (epic 16774), at the production plus Resampler's 16 x 2048 tokens
     /// (f16, and f32 where a packed tier promotes them).
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn ip_cfg_tokens_track_their_measured_peak() {
         if !cpu_child("proofs::ip_cfg_tokens_track_their_measured_peak") {
             return;
@@ -3562,6 +3681,10 @@ mod proofs {
             prove(IP_CFG_TOKENS, ip_cfg_tokens_bytes(&tokens), || {
                 Ok(vec![crate::ip_adapter::cfg_pair(&tokens)?])
             });
+        }
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::ip_cfg_tokens_track_their_measured_peak");
         }
     }
 }
@@ -3966,6 +4089,7 @@ mod adapters {
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn adapter_installs_track_their_measured_peaks() {
         if !cpu_child("adapters::adapter_installs_track_their_measured_peaks") {
             return;
@@ -4113,6 +4237,10 @@ mod adapters {
             AdapterKind::Lora,
             complete,
         );
+
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::adapters::adapter_installs_track_their_measured_peaks");
+        }
     }
 
     /// Every adapter file is checked (header floor) before it is read and every target's install

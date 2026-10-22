@@ -75,8 +75,16 @@ pub(crate) fn in_cpu_child(test: &str, body: fn()) {
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--include-ignored",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .env(DONE, &marker)
         .status()
         .unwrap();

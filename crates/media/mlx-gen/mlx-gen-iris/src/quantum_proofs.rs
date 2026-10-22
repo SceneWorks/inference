@@ -63,8 +63,16 @@ fn in_cpu_child(test: &str, body: fn()) {
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--include-ignored",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .env(DONE, &marker)
         .status()
         .unwrap();
@@ -354,11 +362,16 @@ fn backbone_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_backbone_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_backbone_quantum_price_tracks_its_measured_peak",
         backbone_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_backbone_quantum_price_tracks_its_measured_peak");
+    }
 }
 
 fn text_encoder_body() {
@@ -500,11 +513,16 @@ fn text_encoder_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_text_encoder_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_text_encoder_quantum_price_tracks_its_measured_peak",
         text_encoder_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_text_encoder_quantum_price_tracks_its_measured_peak");
+    }
 }
 
 fn small_steps_body() {
@@ -602,11 +620,16 @@ fn small_steps_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_small_step_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak",
         small_steps_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak");
+    }
 }
 
 /// Copy the complete miniature snapshot into this test's own temporary tree, then rewrite only
@@ -941,9 +964,14 @@ fn streamed_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_streamed_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak",
         streamed_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak");
+    }
 }

@@ -101,10 +101,9 @@ fn backbone(quant: Option<Quant>) -> IrisDiT {
 /// |Δ| 2.5e-2 (cos 0.9984), q4 mean |Δ| 1.56e-1 (cos 0.944). Gated at q8 ≤ 6e-2 / cos ≥ 0.99 and
 /// q4 ≤ 2.5e-1 / cos ≥ 0.90.
 ///
-/// The contract prices norm gains and biases at their stored f32 width while the loader holds the
-/// biases in the compute dtype — a constant over-price no tier changes (the biases are never
-/// packed). Every tier's `priced − resident` must equal the dense tier's, so a packed projection
-/// held at any other width than priced reds in either direction.
+/// Header-role pricing must equal the actual parameter inventory with each allocation rounded
+/// separately. Page slack changes with the tier's allocation sizes/count; it is not one constant
+/// difference from the unrounded resident payload sum.
 ///
 /// *Mutations that red this:* a tier that loads dense (bytes do not shrink); quantizing without
 /// padding the 170-wide projections (q4 resident below the padded pricing); forgetting the input
@@ -133,7 +132,6 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
 
             let mut images = Vec::new();
             let mut bytes = Vec::new();
-            let mut slack = None;
             for quant in TIERS {
                 let dit = backbone(quant);
                 let resident = dit.resident_weight_bytes();
@@ -146,11 +144,23 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
                     resident <= priced,
                     "{quant:?}: {resident} > priced {priced}"
                 );
-                let gap = priced - resident;
+                // Round EACH actual parameter allocation, never the aggregate. Dense and
+                // packed tiers have different page slack and a different number of allocations.
+                let rounded = dit
+                    .arrays()
+                    .iter()
+                    .map(|a| {
+                        let bytes = a.nbytes() as u64;
+                        if bytes > 16 * 1024 {
+                            bytes.div_ceil(16 * 1024) * (16 * 1024)
+                        } else {
+                            bytes
+                        }
+                    })
+                    .sum::<u64>();
                 assert_eq!(
-                    gap,
-                    *slack.get_or_insert(gap),
-                    "{quant:?}: priced − resident differs from the dense tier's"
+                    priced, rounded,
+                    "{quant:?}: header-role price must match actual separately rounded storage"
                 );
                 bytes.push(resident);
                 images.push(
@@ -211,9 +221,9 @@ fn lora_on_an_unaligned_projection(root: &Path) -> PathBuf {
 }
 
 /// An adapted load at the q4 tier is the q4 model: every projection — the adapted ones, and the
-/// 170-wide adapted down projection over its zero-padded input — is packed, so its resident bytes
-/// are the unadapted q4 model's and sit the dense tier's constant below the contract's pricing of
-/// the adapted spec; its image is within the q4 bound of the adapted bf16 image, the residuals
+/// 170-wide adapted down projection over its zero-padded input — is packed. Its complete arrays
+/// include the residual factors, charged separately through overlay_bytes rather than base bytes.
+/// Its image is within the q4 bound of the adapted bf16 image, the residuals
 /// reach it (it differs from the unadapted q4 image), and the residual on the padded projection
 /// is live (it differs from the same stack without that module).
 ///
@@ -291,22 +301,30 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
                 memory_strategy_contract(MODEL_ID, &spec)
                     .unwrap()
                     .asset_facts
-                    .transformer_bytes
             };
-
-            let dense = backbone(None);
-            let slack = priced(&[], None) - dense.resident_weight_bytes();
             let plain_q4 = backbone(Some(Quant::Q4));
             let adapted_bf16 = load(&with_w2, None);
             let adapted_q4 = load(&with_w2, Some(Quant::Q4));
             let resident = adapted_q4.resident_weight_bytes();
-            let adapted_priced = priced(&with_w2, Some(Quant::Q4));
-            eprintln!(
-                "adapted q4: resident {resident} B, priced {adapted_priced} B, slack {slack}"
+            let adapted_facts = priced(&with_w2, Some(Quant::Q4));
+            let adapted_priced = adapted_facts.transformer_bytes + adapted_facts.overlay_bytes;
+            let plain_facts = priced(&[], Some(Quant::Q4));
+            let base_resident = plain_q4.resident_weight_bytes();
+            assert!(
+                resident > base_resident,
+                "arrays must retain the adapter payloads"
             );
-            assert_eq!(resident, plain_q4.resident_weight_bytes());
-            assert_eq!(adapted_priced, priced(&[], Some(Quant::Q4)));
-            assert_eq!(adapted_priced - resident, slack);
+            assert_eq!(
+                adapted_facts.transformer_bytes, plain_facts.transformer_bytes,
+                "adapter factors are not base transformer bytes"
+            );
+            assert_eq!(plain_facts.overlay_bytes, 0);
+            assert!(adapted_facts.overlay_bytes > 0);
+            assert!(
+                resident - base_resident <= adapted_facts.overlay_bytes,
+                "the overlay must cover actual retained adapter storage"
+            );
+            assert!(resident <= adapted_priced);
 
             let image = render(&adapted_q4);
             let (max_abs, _, mean) = errors(&image, &render(&adapted_bf16));
@@ -445,22 +463,50 @@ fn packed_projections_sit_on_their_stored_grid() {
             };
             let (plain, adapted) = (load(&[]), load(&lora));
             let (a, b) = (plain.arrays(), adapted.arrays());
-            assert_eq!(a.len(), b.len());
-            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-                assert_eq!(x.shape(), y.shape(), "array {i}");
-                let same = x
-                    .as_dtype(Dtype::Float32)
-                    .unwrap()
-                    .eq(y.as_dtype(Dtype::Float32).unwrap())
-                    .unwrap()
-                    .all(None)
-                    .unwrap()
-                    .item::<bool>();
+            let file = Array::load_safetensors(&lora[0].path).unwrap();
+            let factors: Vec<_> = file
+                .iter()
+                .filter(|(name, _)| {
+                    name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight")
+                })
+                .map(|(_, array)| array)
+                .collect();
+            assert!(!factors.is_empty());
+            assert_eq!(
+                b.len(),
+                a.len() + factors.len(),
+                "every LoRA factor is owned beside the unchanged base"
+            );
+            let mut next = 0;
+            for (i, x) in a.iter().enumerate() {
+                let mut found = false;
+                while let Some(y) = b.get(next) {
+                    next += 1;
+                    if x.shape() != y.shape() || x.dtype() != y.dtype() {
+                        continue;
+                    }
+                    let same = x
+                        .as_dtype(Dtype::Float32)
+                        .unwrap()
+                        .eq(y.as_dtype(Dtype::Float32).unwrap())
+                        .unwrap()
+                        .all(None)
+                        .unwrap()
+                        .item::<bool>();
+                    if same {
+                        found = true;
+                        break;
+                    }
+                }
                 assert!(
-                    same,
-                    "array {i} of the adapted q8 load differs from the unadapted one"
+                    found,
+                    "base array {i} changed or disappeared from adapted q8 inventory"
                 );
             }
+            let base_bytes: usize = a.iter().map(|x| x.nbytes()).sum();
+            let all_bytes: usize = b.iter().map(|x| x.nbytes()).sum();
+            assert_eq!(all_bytes - base_bytes, factors.iter().map(|x| x.nbytes()).sum::<usize>(),
+                "F32 fixture factors are retained exactly; alpha scaling introduces no extra retained scalar");
         },
     );
 }

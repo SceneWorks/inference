@@ -816,7 +816,7 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
                 height: PX as u32,
                 batch: 1,
                 frames: 1,
-                reference_count: 0,
+                reference_count: generation.conditioning.len() as u32,
             },
             selection: &sel,
             execution: &memory,
@@ -2322,6 +2322,7 @@ fn endpoints_use_literal_resident_and_streamed_load_ownership() {
 /// Complete certified derivation over real text-anchor marks, every declared additive mode,
 /// both literal load endpoints and all served storage tiers. No uncertified fallback is accepted.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_additive_mode_is_derived_from_the_text_anchor() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor",
@@ -2400,11 +2401,16 @@ fn every_additive_mode_is_derived_from_the_text_anchor() {
         }
     }
     completion.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor");
+    }
 }
 
 /// Count two retains the real first latent while executing the second output, not a batch-one
 /// assertion relabeled as batching. Production request reconstruction rejects mismatched geometry.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn serial_count_two_uses_real_geometry_and_complete_native_bounds() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds",
@@ -2522,11 +2528,16 @@ fn serial_count_two_uses_real_geometry_and_complete_native_bounds() {
         "count-two execution cannot be admitted under batch-one geometry"
     );
     completion.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds");
+    }
 }
 
 /// Payload-free source replay resolves the same work as the actual text request, but never
 /// manufactures observations. Actual captured marks are retained unchanged for certification.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn payload_free_text_anchor_replay_preserves_native_certificates() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates",
@@ -2651,6 +2662,10 @@ fn payload_free_text_anchor_replay_preserves_native_certificates() {
     .unwrap();
     assert_certified_native_run(&measured, &derived, "q4 resident payload-free text anchor");
     completion.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates");
+    }
 }
 
 /// Every listed exception is a mode key this crate prices.
@@ -2669,6 +2684,7 @@ fn every_listed_non_additive_mode_is_a_priced_mode() {
 /// Honest Control certifies; deleting its actual resident component from C_req must fail
 /// source-profile validation rather than manufacture a lower certified demand.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dropping_the_controlnet_from_c_req_fails_the_proof() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof",
@@ -2736,6 +2752,10 @@ fn dropping_the_controlnet_from_c_req_fails_the_proof() {
         );
     }
     completion.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2929,6 +2949,7 @@ fn ios_init_cast_preserves_decoded_rgb() {
 /// Real-request coverage of every checked execution quantum, including upstream lazy allocations
 /// it materializes. The stalled isolated proofs remain the stronger bound on individual kernels.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_guard_covers_its_real_request_quantum() {
     if !cpu_child("pricing::additivity::every_guard_covers_its_real_request_quantum") {
         return;
@@ -2997,6 +3018,10 @@ fn every_guard_covers_its_real_request_quantum() {
         under.borrow().is_empty(),
         "under-priced real-request quantum"
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::every_guard_covers_its_real_request_quantum");
+    }
 }
 
 /// Full request output parity, not just cast-array error: init/noise/inpaint and ControlNet residual
@@ -3046,6 +3071,7 @@ fn ios_boundary_casts_preserve_full_request_rgb() {
 /// Recorded IP source facts travel with payload-free catalog anchors. The same real
 /// capture is used on both sides; replay never synthesizes execution observations.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn payload_free_ip_anchor_replay_preserves_native_certificates() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates",
@@ -3164,4 +3190,8 @@ fn payload_free_ip_anchor_replay_preserves_native_certificates() {
     .unwrap();
     assert_certified_native_run(&measured, &derived, "q4 resident recorded-source IP replay");
     completion.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates");
+    }
 }

@@ -575,7 +575,7 @@ fn text_encoder_body() {
             .iter()
             .map(|c| c.0.as_str())
             .collect::<Vec<_>>(),
-        [te_q::LOAD]
+        [te_q::LOAD, crate::stream::LOAD_TARGET_QUANTUM]
     );
     take_refusal();
     let (refused, _) = observed(0, load);
@@ -648,7 +648,11 @@ fn depth_body() {
             .iter()
             .map(|c| c.0.as_str())
             .collect::<Vec<_>>(),
-        [depth_q::LOAD]
+        [
+            depth_q::LOAD,
+            crate::stream::LOAD_TARGET_QUANTUM,
+            crate::stream::EXPORT_TARGET_QUANTUM
+        ]
     );
     take_refusal();
     let (refused, _) = observed(0, || load_depth_export(export().unwrap(), Dtype::Float32));
@@ -715,7 +719,13 @@ fn restoration_body() {
             .iter()
             .map(|c| c.0.as_str())
             .collect::<Vec<_>>(),
-        [restore_q::LOAD, crate::model::BACKBONE_LOAD_QUANTUM]
+        [
+            restore_q::LOAD,
+            crate::stream::LOAD_TARGET_QUANTUM,
+            crate::model::BACKBONE_LOAD_QUANTUM,
+            crate::stream::LOAD_TARGET_QUANTUM,
+            crate::stream::EXPORT_TARGET_QUANTUM
+        ]
     );
     take_refusal();
     let (refused, _) = observed(0, || IrisRestorer::load(&spec));
@@ -803,9 +813,16 @@ fn generation_body() {
     );
     let (loaded, load_events) = observed(AMPLE, || crate::model::load(&spec));
     let generator = loaded.unwrap();
-    let mut loads: Vec<String> = checks(&load_events).into_iter().map(|c| c.0).collect();
-    loads.sort();
-    assert_eq!(loads, [crate::model::BACKBONE_LOAD_QUANTUM, te_q::LOAD]);
+    let loads: Vec<String> = checks(&load_events).into_iter().map(|c| c.0).collect();
+    assert_eq!(
+        loads,
+        [
+            te_q::LOAD,
+            crate::stream::LOAD_TARGET_QUANTUM,
+            crate::model::BACKBONE_LOAD_QUANTUM,
+            crate::stream::LOAD_TARGET_QUANTUM
+        ]
+    );
     take_refusal();
     let (refused, _) = observed(0, || crate::model::load(&spec));
     assert!(refused.is_err());

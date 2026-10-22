@@ -13,8 +13,8 @@ use std::path::PathBuf;
 const LATENT: i32 = 8;
 /// Text tokens per CLIP window of the tiny encoders (their position tables hold 8).
 const TOKENS: i32 = 8;
-/// The tiny VAE's spatial scale (two blocks, one downsample).
-const VAE_SCALE: i32 = 2;
+/// Match the fixed ControlNet embedding: four VAE blocks, three downsamples.
+const VAE_SCALE: i32 = 8;
 /// The tiny ControlNet conditioning embedding's stride (three stride-2 convolutions).
 const CONTROL_SCALE: i32 = 8;
 
@@ -194,7 +194,7 @@ impl Snapshot {
             )
             .unwrap();
         }
-        let (vw, vae) = crate::vae::tests::fixture();
+        let (vw, vae) = crate::vae::tests::fixture_scale_eight();
         save(
             &vw,
             &root.join("vae_fp16_fix/diffusion_pytorch_model.safetensors"),
@@ -1097,6 +1097,7 @@ fn decode_resident_separates_sampler_state_forward_cast_and_compute_alias() {
 /// tracks the stalled measured peak (>= measured, <= 1.5x) at an f32 block (256 wide, a 1024-wide
 /// GEGLU) over 64 tokens, weight-dominated as every production SDXL block is.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn streamed_block_quantum_tracks_its_measured_peak() {
     if !cpu_child("pricing::streamed_block_quantum_tracks_its_measured_peak") {
         return;
@@ -1161,11 +1162,16 @@ fn streamed_block_quantum_tracks_its_measured_peak() {
     .unwrap();
     eprintln!("PROOF {TRANSFORMER_BLOCK} (256 tokens): formula {price} B, measured {measured} B");
     assert!(price >= measured, "{price} < {measured}");
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::streamed_block_quantum_tracks_its_measured_peak");
+    }
 }
 
 /// A streamed U-Net load's floor counts only the tensors the load materializes (the resident
 /// remainder; the blocks are read by their quanta) and tracks the measured peak of that load.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn streamed_unet_load_floor_tracks_its_measured_peak() {
     if !cpu_child("pricing::streamed_unet_load_floor_tracks_its_measured_peak") {
         return;
@@ -1189,6 +1195,10 @@ fn streamed_unet_load_floor_tracks_its_measured_peak() {
         Ok(Vec::new())
     });
     assert!(streamed < whole, "{streamed} vs {whole}");
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::streamed_unet_load_floor_tracks_its_measured_peak");
+    }
 }
 
 /// Parity: holding a cast load's sources changes no value — the fp16-fix VAE loaded on the iOS
@@ -1253,6 +1263,7 @@ fn staged_ip_request_sheds_the_image_encoder_with_identical_tokens() {
 /// shed (>= measured, <= 1.5x) — the tower here is most of the bundle, so pricing it resident (or
 /// not shedding it) fails the bound.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn staged_ip_denoise_resident_tracks_the_measured_bundle() {
     if !cpu_child("pricing::staged_ip_denoise_resident_tracks_the_measured_bundle") {
         return;
@@ -1292,6 +1303,10 @@ fn staged_ip_denoise_resident_tracks_the_measured_bundle() {
     eprintln!("PROOF staged IP denoise resident: priced {resident} B, measured {measured} B");
     assert_tracks_measured("staged IP denoise resident", resident, measured, 1.5);
     drop(bundle);
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::staged_ip_denoise_resident_tracks_the_measured_bundle");
+    }
 }
 
 /// A CAST load (the fp16-fix VAE: f32 on disk, f16 resident): the floor the guard checks tracks the
@@ -1299,6 +1314,7 @@ fn staged_ip_denoise_resident_tracks_the_measured_bundle() {
 /// exactly the copies resident — the sources are held until the load materializes, so no copy is
 /// donated (and keeps) a wider source buffer.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn cast_load_floor_and_resident_track_their_measurements() {
     if !cpu_child("pricing::cast_load_floor_and_resident_track_their_measurements") {
         return;
@@ -1330,6 +1346,10 @@ fn cast_load_floor_and_resident_track_their_measurements() {
         "the load leaves exactly the f16 copies resident"
     );
     drop(vae);
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::cast_load_floor_and_resident_track_their_measurements");
+    }
 }
 
 #[path = "quantum_tests_additivity.rs"]

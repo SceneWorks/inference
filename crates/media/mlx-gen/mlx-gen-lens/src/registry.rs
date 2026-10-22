@@ -1347,11 +1347,22 @@ mod tests {
         for (component, bytes) in [("text_encoder", 13), ("transformer", 11), ("vae", 3)] {
             let dir = root.join(component);
             std::fs::create_dir(&dir).expect("component dir");
-            std::fs::write(dir.join("model.safetensors"), vec![0; bytes]).expect("fixture");
+            let header =
+                format!(r#"{{"w":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#);
+            let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+            shard.extend_from_slice(header.as_bytes());
+            shard.resize(shard.len() + bytes, 0);
+            std::fs::write(dir.join("model.safetensors"), shard).expect("fixture");
         }
         let mut spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
         spec.quantize = quantize;
         (root, spec)
+    }
+
+    fn fixture_disk_bytes(root: &std::path::Path, component: &str) -> u64 {
+        std::fs::metadata(root.join(component).join("model.safetensors"))
+            .unwrap()
+            .len()
     }
 
     fn write_text_encoder_config(root: &std::path::Path, body: &str) {
@@ -1370,8 +1381,8 @@ mod tests {
         let fp = component_footprint(&spec).expect("footprint");
         let gib: f64 = 1024.0 * 1024.0 * 1024.0;
         assert_eq!(fp.text_encoder, (30.07 * gib).ceil() as u64);
-        assert_eq!(fp.dit, 11);
-        assert_eq!(fp.vae, 3);
+        assert_eq!(fp.dit, fixture_disk_bytes(&root, "transformer"));
+        assert_eq!(fp.vae, fixture_disk_bytes(&root, "vae"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1383,9 +1394,9 @@ mod tests {
         assert_eq!(
             component_footprint(&spec).expect("footprint"),
             mlx_gen::PerComponentBytes {
-                text_encoder: 13,
-                dit: 11,
-                vae: 3,
+                text_encoder: fixture_disk_bytes(&root, "text_encoder"),
+                dit: fixture_disk_bytes(&root, "transformer"),
+                vae: fixture_disk_bytes(&root, "vae"),
             },
             "an explicit bf16-on-disk encoder has no MXFP4 materialization delta"
         );
@@ -1520,9 +1531,9 @@ mod tests {
             assert_eq!(
                 component_footprint(&spec).expect("footprint"),
                 mlx_gen::PerComponentBytes {
-                    text_encoder: 13,
-                    dit: 11,
-                    vae: 3,
+                    text_encoder: fixture_disk_bytes(&root, "text_encoder"),
+                    dit: fixture_disk_bytes(&root, "transformer"),
+                    vae: fixture_disk_bytes(&root, "vae"),
                 }
             );
             std::fs::remove_dir_all(root).ok();
@@ -1540,7 +1551,7 @@ mod tests {
         .expect("packed marker");
         assert_eq!(
             component_footprint(&spec).expect("footprint").text_encoder,
-            13
+            fixture_disk_bytes(&root, "text_encoder")
         );
         std::fs::remove_dir_all(root).ok();
     }

@@ -6021,7 +6021,8 @@ mod depth_constructor_output_tests {
         .collect();
         assert_eq!(
             depth_constructor_output_bytes(&headers, Precision::Bf16, false).unwrap(),
-            384 * 2 + 64 * 4 + 3 * 2 + 2
+            // No .scales companion: the U32 matrix is dense and the constructor casts it.
+            384 * 8 * 2 + 384 * 2 + 64 * 4 + 3 * 2 + 2
         );
     }
 

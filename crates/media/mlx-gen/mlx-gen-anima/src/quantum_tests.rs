@@ -43,6 +43,7 @@ fn in_cpu_child(name: &str) -> bool {
                 "--include-ignored",
             ])
             .env(CHILD, "1")
+            .env("IOS_CAPTURE_IN_CHILD", "1")
             .status()
             .unwrap();
         assert!(status.success(), "CPU child for {name} failed");
@@ -1143,6 +1144,7 @@ fn sdpa_scores_follow_the_metal_kernel_support() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dit_formulas_track_the_measured_peak() {
     if !in_cpu_child("dit_formulas_track_the_measured_peak") {
         return;
@@ -1299,6 +1301,12 @@ fn dit_formulas_track_the_measured_peak() {
             measured(|| dit.output(&f32_hidden, &embedded, &temb, (1, 8, 8))),
         );
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!(
+            "\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak"
+        );
+    }
 }
 
 /// Every tensor `AnimaTextConditioner::from_weights(.., "net.llm_adapter", cfg)` reads, at `dtype`.
@@ -1377,6 +1385,7 @@ fn conditioner_weights(cfg: &ConditionerConfig, dtype: Dtype) -> Weights {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn conditioner_formulas_track_the_measured_peak() {
     if !in_cpu_child("conditioner_formulas_track_the_measured_peak") {
         return;
@@ -1452,9 +1461,14 @@ fn conditioner_formulas_track_the_measured_peak() {
             measured(|| cond.output(&out, 1, st, Some(&weights), out.dtype())),
         );
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
+    }
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn text_encoder_formulas_track_the_measured_peak() {
     if !in_cpu_child("text_encoder_formulas_track_the_measured_peak") {
         return;
@@ -1536,6 +1550,10 @@ fn text_encoder_formulas_track_the_measured_peak() {
             te.norm_bytes(1, s, out.item_size() as u64),
             measured(|| te.final_norm(&out)),
         );
+    }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
     }
 }
 

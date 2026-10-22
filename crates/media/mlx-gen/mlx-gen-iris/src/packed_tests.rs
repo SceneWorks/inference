@@ -40,8 +40,16 @@ fn in_cpu_child(test: &str, body: fn()) {
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--include-ignored",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
+        .env("IOS_CAPTURE_IN_CHILD", "1")
         .env(DONE, &marker)
         .status()
         .unwrap();
@@ -205,11 +213,16 @@ fn backbone_parity_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn a_packed_backbone_loads_bit_identical_to_the_release_quantized_at_load() {
     in_cpu_child(
         "packed_tests::a_packed_backbone_loads_bit_identical_to_the_release_quantized_at_load",
         backbone_parity_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED packed_tests::a_packed_backbone_loads_bit_identical_to_the_release_quantized_at_load");
+    }
 }
 
 /// The miniature tower with an aligned MLP (`intermediate_size: 64`; the released miniature's 48
@@ -307,11 +320,16 @@ fn text_encoder_parity_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn a_packed_text_tower_loads_bit_identical_to_the_tower_quantized_at_load() {
     in_cpu_child(
         "packed_tests::a_packed_text_tower_loads_bit_identical_to_the_tower_quantized_at_load",
         text_encoder_parity_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED packed_tests::a_packed_text_tower_loads_bit_identical_to_the_tower_quantized_at_load");
+    }
 }
 
 fn identity_body() {

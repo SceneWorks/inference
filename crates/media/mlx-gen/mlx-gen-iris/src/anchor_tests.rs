@@ -1528,11 +1528,16 @@ fn prompt_batch_body() {
 /// Mutation: price the batch/count as batch 1, or certify it from the batch-1 request; the
 /// pricing context or the single-prompt comparison goes red.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn prompt_batch_derivability_is_measured_at_both_endpoints_per_phase() {
     in_cpu_child(
         "anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase",
         prompt_batch_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase");
+    }
 }
 
 fn metadata_body() {
@@ -1657,11 +1662,16 @@ fn metadata_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn actual_runtime_metadata_matches_recipe_epochs() {
     in_cpu_child(
         "anchor_tests::actual_runtime_metadata_matches_recipe_epochs",
         metadata_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::actual_runtime_metadata_matches_recipe_epochs");
+    }
 }
 
 // ---- actual Iris solver / CFG / serial epochs ---------------------------------------------
@@ -1813,11 +1823,16 @@ fn sampling_body() {
 }
 
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn actual_sampling_epochs_bound_both_solvers_cfg_intervals_and_serial_outputs() {
     in_cpu_child(
         "anchor_tests::actual_sampling_epochs_bound_both_solvers_cfg_intervals_and_serial_outputs",
         sampling_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::actual_sampling_epochs_bound_both_solvers_cfg_intervals_and_serial_outputs");
+    }
 }
 
 // ---- iris_3b_restore / iris_3b_depth: self-consistency across geometry -----------------------
@@ -2180,11 +2195,16 @@ fn downstream_body() {
 /// measured run at a second input size and stays within it, whole run and per phase, in the
 /// native-allocator domain (restoration's host planes are a separately certified domain).
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn depth_and_restoration_derive_a_second_size_from_native_certificates() {
     in_cpu_child(
         "anchor_tests::depth_and_restoration_derive_a_second_size_from_native_certificates",
         downstream_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::depth_and_restoration_derive_a_second_size_from_native_certificates");
+    }
 }
 
 // ---- the priced resident bounds the live set ----------------------------------------------
@@ -2395,11 +2415,16 @@ fn resident_body() {
 /// *Mutation that reds this:* dropping the `pixel_table` term from a denoise or decode resident in
 /// `ios_pricing`.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn the_priced_resident_accounts_for_the_live_set_at_every_check() {
     in_cpu_child(
         "anchor_tests::the_priced_resident_accounts_for_the_live_set_at_every_check",
         resident_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::the_priced_resident_accounts_for_the_live_set_at_every_check");
+    }
 }
 
 // ---- installed generation adapter: native CPU anchor → twice the area -----------------------
@@ -2525,9 +2550,14 @@ fn installed_adapter_anchor_body() {
 /// Mutation: omit installed adapter load/retention/forward terms from the native upper ledger;
 /// the native lower-bound checks or the no-adapter certificate discriminator must fail.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn installed_adapter_derivability_is_measured_at_both_endpoints_per_phase() {
     in_cpu_child(
         "anchor_tests::installed_adapter_derivability_is_measured_at_both_endpoints_per_phase",
         installed_adapter_anchor_body,
     );
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED anchor_tests::installed_adapter_derivability_is_measured_at_both_endpoints_per_phase");
+    }
 }

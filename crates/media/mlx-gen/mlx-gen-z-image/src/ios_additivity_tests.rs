@@ -64,6 +64,7 @@ fn in_cpu_child(name: &str) -> bool {
                 "--include-ignored",
             ])
             .env(CHILD, "1")
+            .env("IOS_CAPTURE_IN_CHILD", "1")
             .env(DONE, &marker)
             .status()
             .unwrap();
@@ -865,6 +866,7 @@ fn failures(verdicts: &[(String, Verdict)]) -> Vec<String> {
 /// [`packed_tier_matrix`].
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_mode_is_derivable_from_the_text_anchor() {
     if !in_cpu_child("every_mode_is_derivable_from_the_text_anchor") {
         return;
@@ -875,6 +877,10 @@ fn every_mode_is_derivable_from_the_text_anchor() {
     for selection in [OPTIMIZED, RUNG_0] {
         let failures = failures(&prove(selection, &["dense"], &cases(), |_, _, _| {}));
         assert!(failures.is_empty(), "not additive: {failures:#?}");
+    }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor");
     }
 }
 
@@ -892,6 +898,10 @@ fn packed_tier_matrix() {
         let failures = failures(&prove(selection, &["q4", "q8"], &cases(), |_, _, _| {}));
         assert!(failures.is_empty(), "not additive: {failures:#?}");
     }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::packed_tier_matrix");
+    }
 }
 
 /// The proof has teeth: a derivation that forgets the control route's extra components in its
@@ -899,6 +909,7 @@ fn packed_tier_matrix() {
 /// priced at the text anchor's denoise residency) goes red at the optimized selection. Dense tier.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dropping_the_control_components_breaks_the_proof() {
     if !in_cpu_child("dropping_the_control_components_breaks_the_proof") {
         return;
@@ -937,6 +948,10 @@ fn dropping_the_control_components_breaks_the_proof() {
                 .any(|f| f.contains(case) && f.contains("phase denoise")),
             "{case}: dropping the control components must break the derivation"
         );
+    }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::dropping_the_control_components_breaks_the_proof");
     }
 }
 
@@ -1836,6 +1851,7 @@ mod original_pre_embed_capacity {
                         "--test-threads=1",
                     ])
                     .env(CHILD, "1")
+                    .env("IOS_CAPTURE_IN_CHILD", "1")
                     .env(DONE, &marker)
                     .status()
                     .unwrap();

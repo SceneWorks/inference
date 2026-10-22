@@ -1718,6 +1718,31 @@ pub(crate) mod tests {
         fixture_with(values)
     }
 
+    /// Same small channel widths, but the production 8x spatial scale. ControlNet's fixed
+    /// three downsampling convolutions and the VAE now agree on request-pixel geometry.
+    pub(crate) fn fixture_scale_eight() -> (Weights, VaeConfig) {
+        let (weights, mut cfg) = fixture();
+        let mut tensors = weights.into_tensors();
+        let originals: Vec<_> = tensors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (key, value) in originals {
+            for prefix in ["decoder.up_blocks", "encoder.down_blocks"] {
+                if let Some(suffix) = key.strip_prefix(&format!("{prefix}.0.")) {
+                    for block in 1..4 {
+                        // Every block has resnets, all but the last have a resampler.
+                        if block < 3 || suffix.starts_with("resnets.") {
+                            tensors.insert(format!("{prefix}.{block}.{suffix}"), value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        cfg.block_out_channels = vec![CHANNELS; 4];
+        (Weights::from_map(tensors), cfg)
+    }
+
     /// [`fixture`] over the [`decorrelated`] generator — the precision tests' fixture.
     fn decorrelated_fixture() -> (Weights, VaeConfig) {
         fixture_with(decorrelated)
