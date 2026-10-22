@@ -46,8 +46,10 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CastPolicy {
     /// The backbone loaders ([`crate::model::load_backbone_quantized`],
-    /// [`crate::depth::load_depth_export`]): every matrix (rank ≥ 2) but the text position table
-    /// and a packed projection's stored parts to the compute dtype; vectors as stored.
+    /// [`crate::depth::load_depth_export`]) at ordinary floating storage: floating matrices
+    /// (rank ≥ 2) but the text position table and packed parts to compute; vectors as stored.
+    /// The existing window policy leaves numeric/F64 matrices stored, unlike root eager reads;
+    /// constructor accounting must therefore use this policy's actual post-read dtype.
     Backbone { compute: Dtype },
     /// The Qwen3-VL tower (`mlx_llm`'s decoder build): every float tensor but a packed projection's
     /// stored parts to bf16.
@@ -119,10 +121,9 @@ pub(crate) fn tensor_read(header: &SafetensorsTensorHeader, policy: CastPolicy) 
         (Some(target), Some(stored))
             if width(target) != stored || mismatched(header.dtype, target) =>
         {
-            let elements = header.shape.iter().map(|&d| d as u64).product::<u64>();
             TensorRead {
-                held: crate::retention::allocated(elements * width(target)),
-                transient: crate::retention::allocated(header.data_bytes),
+                held: target_bytes(header, target).unwrap_or(u64::MAX),
+                transient: source_allocation(header.data_bytes).unwrap_or(u64::MAX),
             }
         }
         _ => TensorRead {
@@ -140,10 +141,8 @@ fn mismatched(stored: Stored, target: Dtype) -> bool {
     )
 }
 
-/// One linear bias the block constructor casts AFTER the read (the backbone's `Loader::linear`
-/// reads a vector bias at the compute dtype; a packed projection's bias at bf16): bytes of the
-/// new buffer, `0` when the stored dtype already is the target. Only the backbone has biases on
-/// its projections; the Qwen3-VL tower has none.
+/// Bias targets after the ACTUAL window read: the shared constructor law distinguishes linear
+/// biases (compute/BF16) from norm/modulation biases (F32), including same-width dtype changes.
 fn bias_cast(
     header: &SafetensorsTensorHeader,
     headers: &[&SafetensorsTensorHeader],
@@ -152,33 +151,19 @@ fn bias_cast(
     let CastPolicy::Backbone { compute } = policy else {
         return 0;
     };
-    let Some(base) = header.name.strip_suffix(".bias") else {
-        return 0;
-    };
-    let weight = format!("{base}.weight");
-    let Some(w) = headers.iter().find(|h| h.name == weight) else {
-        return 0;
-    };
-    if w.shape.len() != 2 {
+    if !header.name.ends_with(".bias") {
         return 0;
     }
-    let packed = headers.iter().any(|h| h.name == format!("{base}.scales"));
-    let target = if packed { Dtype::Bfloat16 } else { compute };
-    match stored_width(header.dtype) {
-        Some(stored) if stored != crate::nn::dtype_bytes(target) => {
-            let elements = header.shape.iter().map(|&d| d as u64).product::<u64>();
-            crate::retention::allocated(elements * crate::nn::dtype_bytes(target))
-        }
-        _ => 0,
-    }
+    let view = headers.iter().map(|h| (h.name.as_str(), *h)).collect();
+    streamed_constructor_cast_bytes(header, &view, compute, policy)
 }
 
 /// The price of one block's read: what the materialized block holds, and the largest source
 /// tensor alive beside its cast while it is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BlockRead {
-    /// Bytes the built block holds (its materialized tensors plus the bias casts its constructor
-    /// makes).
+    /// Bytes the built block holds (its materialized tensors plus every constructor/getter
+    /// target, conservatively retaining completed targets rather than assuming retirement).
     pub held: u64,
     /// The largest single [`TensorRead::transient`] of the block.
     pub transient: u64,
@@ -186,13 +171,20 @@ pub(crate) struct BlockRead {
 
 /// [`BlockRead`] of the tensors `headers` names, under `policy`.
 pub(crate) fn block_read(headers: &[&SafetensorsTensorHeader], policy: CastPolicy) -> BlockRead {
+    let view = headers.iter().map(|h| (h.name.as_str(), *h)).collect();
     let mut read = BlockRead::default();
     for header in headers {
         let t = tensor_read(header, policy);
-        read.held = read
-            .held
-            .saturating_add(t.held)
-            .saturating_add(bias_cast(header, headers, policy));
+        let constructor = match policy {
+            CastPolicy::Backbone { .. } if header.name.ends_with(".bias") => {
+                bias_cast(header, headers, policy)
+            }
+            CastPolicy::Backbone { compute } => {
+                streamed_constructor_cast_bytes(header, &view, compute, policy)
+            }
+            CastPolicy::Tower => tower_constructor_cast_bytes(header, &view),
+        };
+        read.held = read.held.saturating_add(t.held).saturating_add(constructor);
         read.transient = read.transient.max(t.transient);
     }
     read
@@ -378,8 +370,141 @@ fn read_cast(name: &str, header: &SafetensorsTensorHeader) -> bool {
         && !is_packed_part_header(header)
 }
 
-/// The SAME constructor target law used by runtime and pricing. Keys are logical (depth prefix
-/// removed), borrowed from already-held metadata; no key/shape copies or new source reads.
+/// The constructor's target dtype, independent of how its source was read. Root loads and
+/// deferred windows share these constructor sites but deliberately retain their own read policies.
+fn backbone_constructor_target(
+    name: &str,
+    header: &SafetensorsTensorHeader,
+    headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
+    compute: Dtype,
+) -> Option<Dtype> {
+    let linear_base = name.strip_suffix(".bias").filter(|base| {
+        headers.iter().any(|(key, sibling)| {
+            sibling.shape.len() == 2 && key.strip_suffix(".weight") == Some(*base)
+        })
+    });
+    if name.ends_with(crate::packed::IN_FEATURES_SUFFIX) {
+        Some(Dtype::Int32)
+    } else if name == "depth_reducer.weight" || name == "depth_reducer.bias" {
+        Some(compute)
+    } else if let Some(base) = linear_base {
+        let packed = headers
+            .keys()
+            .any(|key| key.strip_suffix(".scales") == Some(base));
+        Some(if packed { Dtype::Bfloat16 } else { compute })
+    } else if name == "y_pos_embedding"
+        || header.shape.len() == 1 && name.ends_with(".weight")
+        || name.ends_with(".bias")
+    {
+        Some(Dtype::Float32)
+    } else if header.shape.len() == 2 && name.ends_with(".weight") {
+        let base = name.strip_suffix(".weight").expect("checked suffix");
+        (!headers
+            .keys()
+            .any(|key| key.strip_suffix(".scales") == Some(base)))
+        .then_some(compute)
+    } else {
+        None
+    }
+}
+
+/// A constructor cast aliases only when its ACTUAL post-read dtype is already the target.
+fn constructor_cast_bytes(
+    header: &SafetensorsTensorHeader,
+    target: Option<Dtype>,
+    post_read: Option<Dtype>,
+) -> Result<u64> {
+    let Some(target) = target else {
+        return Ok(0);
+    };
+    let aliases = post_read.map_or_else(|| same_dtype(header.dtype, target), |read| read == target);
+    if aliases {
+        Ok(0)
+    } else {
+        target_bytes(header, target)
+    }
+}
+
+/// Window inventory keeps its existing saturating upper contract. On arithmetic overflow the
+/// upper is unpayable, never a smaller allowance; root load/pricing helpers return the error.
+fn streamed_constructor_cast_bytes(
+    header: &SafetensorsTensorHeader,
+    headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
+    compute: Dtype,
+    policy: CastPolicy,
+) -> u64 {
+    let post_read = policy.target(
+        &header.name,
+        header.shape.len(),
+        is_packed_part_header(header),
+        is_float(header.dtype),
+    );
+    constructor_cast_bytes(
+        header,
+        backbone_constructor_target(&header.name, header, headers, compute),
+        post_read,
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The seven decoder projection roles share load quantization and stored-affine normalization.
+fn tower_layer_projection(base: &str) -> bool {
+    let Some(layer) = crate::text_encoder::tower_layer_of(base) else {
+        return false;
+    };
+    let stem = format!(
+        "{}layers.{layer}.",
+        crate::text_encoder::LANGUAGE_TOWER_PREFIX
+    );
+    let Some(role) = base.strip_prefix(&stem) else {
+        return false;
+    };
+    matches!(
+        role,
+        "self_attn.q_proj"
+            | "self_attn.k_proj"
+            | "self_attn.v_proj"
+            | "self_attn.o_proj"
+            | "mlp.gate_proj"
+            | "mlp.up_proj"
+            | "mlp.down_proj"
+    )
+}
+
+/// Only owners actually consumed by Qwen3-VL constructors normalize stored packed affines.
+fn tower_packed_owner(base: &str) -> bool {
+    base == "lm_head"
+        || base.strip_prefix(crate::text_encoder::LANGUAGE_TOWER_PREFIX) == Some("embed_tokens")
+        || tower_layer_projection(base)
+}
+
+fn tower_affine_target(
+    header: &SafetensorsTensorHeader,
+    headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
+) -> Option<Dtype> {
+    let base = header
+        .name
+        .strip_suffix(".scales")
+        .or_else(|| header.name.strip_suffix(".biases"))?;
+    (tower_packed_owner(base)
+        && headers
+            .get(format!("{base}.weight").as_str())
+            .is_some_and(|h| h.shape.len() == 2)
+        && headers.contains_key(format!("{base}.scales").as_str()))
+    .then_some(Dtype::Bfloat16)
+}
+
+fn tower_constructor_cast_bytes(
+    header: &SafetensorsTensorHeader,
+    headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
+) -> u64 {
+    // materialize preserves packed parts; from_quantized/from_stored normalize their affine
+    // parameters to BF16. Dense leaves have no additional post-materialize cast in StreamedLayer.
+    constructor_cast_bytes(header, tower_affine_target(header, headers), None).unwrap_or(u64::MAX)
+}
+
+/// The SAME constructor target law used by root runtime and pricing. Keys are logical (depth
+/// prefix removed), borrowed from already-held metadata; no source reopen or tensor read.
 pub(crate) fn constructor_output_bytes(
     headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
     compute: Dtype,
@@ -389,47 +514,13 @@ pub(crate) fn constructor_output_bytes(
         .iter()
         .filter(|(name, _)| keep(name))
         .try_fold(0u64, |sum, (name, header)| {
-            let linear_base = name.strip_suffix(".bias").filter(|base| {
-                headers.iter().any(|(key, sibling)| {
-                    sibling.shape.len() == 2 && key.strip_suffix(".weight") == Some(*base)
-                })
-            });
-            let target = if name.ends_with(crate::packed::IN_FEATURES_SUFFIX) {
-                Some(Dtype::Int32)
-            } else if *name == "depth_reducer.weight" || *name == "depth_reducer.bias" {
-                Some(compute)
-            } else if let Some(base) = linear_base {
-                let packed = headers
-                    .keys()
-                    .any(|key| key.strip_suffix(".scales") == Some(base));
-                Some(if packed { Dtype::Bfloat16 } else { compute })
-            } else if *name == "y_pos_embedding"
-                || header.shape.len() == 1 && name.ends_with(".weight")
-                || name.ends_with(".bias")
-            {
-                Some(Dtype::Float32)
-            } else if header.shape.len() == 2 && name.ends_with(".weight") {
-                let base = name.strip_suffix(".weight").expect("checked suffix");
-                (!headers
-                    .keys()
-                    .any(|key| key.strip_suffix(".scales") == Some(base)))
-                .then_some(compute)
-            } else {
-                None
-            };
-            let Some(target) = target else {
-                return Ok(sum);
-            };
-            let aliases = if read_cast(name, header) {
-                compute == target
-            } else {
-                same_dtype(header.dtype, target)
-            };
-            if aliases {
-                return Ok(sum);
-            }
-            sum.checked_add(target_bytes(header, target)?)
-                .ok_or_else(load_overflow)
+            let post_read = read_cast(name, header).then_some(compute);
+            sum.checked_add(constructor_cast_bytes(
+                header,
+                backbone_constructor_target(name, header, headers, compute),
+                post_read,
+            )?)
+            .ok_or_else(load_overflow)
         })
 }
 
@@ -473,6 +564,7 @@ pub(crate) fn tower_load_output_bytes(
     keep: impl Fn(&str) -> bool,
     rotary_row: u64,
 ) -> Result<(u64, u64)> {
+    let view = headers.iter().map(|h| (h.name.as_str(), h)).collect();
     headers
         .iter()
         .filter(|h| keep(&h.name))
@@ -490,15 +582,15 @@ pub(crate) fn tower_load_output_bytes(
                         .iter()
                         .any(|s| s.name.strip_suffix(".scales") == Some(base))
                 });
-            if packed_code
-                || h.name.ends_with(".scales")
-                || h.name.ends_with(".biases")
-                || h.dtype == Stored::BF16
-            {
-                return Ok((logical, upper));
-            }
+            let target = if h.name.ends_with(".scales") || h.name.ends_with(".biases") {
+                tower_affine_target(h, &view)
+            } else if packed_code {
+                None
+            } else {
+                Some(Dtype::Bfloat16)
+            };
             upper
-                .checked_add(target_bytes(h, Dtype::Bfloat16)?)
+                .checked_add(constructor_cast_bytes(h, target, None)?)
                 .map(|upper| (logical, upper))
                 .ok_or_else(load_overflow)
         })
@@ -661,18 +753,10 @@ pub(crate) fn tower_quantization_bytes(
         .try_fold(0u64, |sum, h| {
             // Only Qwen3-VL LayerPlan decoder projections are load-quantized. Embedding,
             // untied lm_head, norms and any malformed rank-two tensor stay dense BF16.
-            let projection = crate::text_encoder::tower_layer_of(&h.name).is_some()
-                && [
-                    ".self_attn.q_proj.weight",
-                    ".self_attn.k_proj.weight",
-                    ".self_attn.v_proj.weight",
-                    ".self_attn.o_proj.weight",
-                    ".mlp.gate_proj.weight",
-                    ".mlp.up_proj.weight",
-                    ".mlp.down_proj.weight",
-                ]
-                .iter()
-                .any(|suffix| h.name.ends_with(suffix));
+            let projection = h
+                .name
+                .strip_suffix(".weight")
+                .is_some_and(tower_layer_projection);
             if h.shape.len() != 2 || !projection {
                 return Ok(sum);
             }
@@ -771,17 +855,20 @@ impl PendingBackbone {
 pub(crate) fn installed_width_output_bytes(
     headers: &std::collections::HashMap<&str, &SafetensorsTensorHeader>,
     compute: Dtype,
+    keep: impl Fn(&str) -> bool,
 ) -> Result<u64> {
     constructor_output_bytes(headers, compute, |name| {
+        if !keep(name) {
+            return false;
+        }
         let Some(base) = name.strip_suffix(crate::packed::IN_FEATURES_SUFFIX) else {
             return false;
         };
-        headers
-            .iter()
-            .any(|(key, h)| key.strip_suffix(".weight") == Some(base) && h.shape.len() == 2)
-            && headers
-                .iter()
-                .any(|(key, h)| key.strip_suffix(".scales") == Some(base) && h.shape.len() == 2)
+        headers.iter().any(|(key, h)| {
+            keep(key) && key.strip_suffix(".weight") == Some(base) && h.shape.len() == 2
+        }) && headers.iter().any(|(key, h)| {
+            keep(key) && key.strip_suffix(".scales") == Some(base) && h.shape.len() == 2
+        })
     })
 }
 
@@ -799,7 +886,7 @@ pub(crate) fn backbone_pending_plan(
             .iter()
             .map(|h| (h.name.strip_prefix(prefix).unwrap_or(&h.name), h))
             .collect();
-        let width_outputs = installed_width_output_bytes(&view, compute)?;
+        let width_outputs = installed_width_output_bytes(&view, compute, |_| true)?;
         let complete_quant = backbone_quantization_bytes(&view, compute, quant, |_| true)?;
         let eval_quant = backbone_quantization_evaluation_bytes(&view, compute, quant, |_| true)?;
         let evaluation = constructors
@@ -1074,12 +1161,17 @@ mod pending_quantization_tests {
         let headers = [h("p.weight", &[8, 65]), h("p.bias", &[8])];
         let view = headers.iter().map(|h| (h.name.as_str(), h)).collect();
         let quant = crate::nn::BackboneQuant::for_load(Some(Quant::Q4)).unwrap();
-        let complete = backbone_quantization_bytes(&view, Dtype::Float16, quant, |_| true).unwrap();
-        let eval =
+        let padded_complete =
+            backbone_quantization_bytes(&view, Dtype::Float16, quant, |_| true).unwrap();
+        let padded_eval =
             backbone_quantization_evaluation_bytes(&view, Dtype::Float16, quant, |_| true).unwrap();
         let (build, _) = crate::nn::stored_grid_allocation_parts(8, 128, 64, 4).unwrap();
         // Padded projection: the eager Int32 pad zero (4 B) is a BUILD constructor too.
-        assert_eq!(complete - eval, build + 4);
+        assert_eq!(padded_complete - padded_eval, build + 4);
+        assert_eq!(
+            padded_complete - crate::nn::stored_grid_allocation_bytes(8, 128, 64, 4).unwrap(),
+            4 + 2 + 8 * 128 * 2 + 8 * 128 * 2 + 8 * 2
+        );
         let aligned = [h("q.weight", &[8, 64])];
         let aligned = aligned.iter().map(|h| (h.name.as_str(), h)).collect();
         let complete =
@@ -1089,7 +1181,10 @@ mod pending_quantization_tests {
                 .unwrap();
         let (build, _) = crate::nn::stored_grid_allocation_parts(8, 64, 64, 4).unwrap();
         assert_eq!(complete - eval, build, "no pad constructor without padding");
-        assert!(complete > crate::nn::stored_grid_allocation_bytes(8, 128, 64, 4).unwrap());
+        assert_eq!(
+            complete - crate::nn::stored_grid_allocation_bytes(8, 64, 64, 4).unwrap(),
+            8 * 64 * 2
+        );
     }
 }
 
@@ -1101,7 +1196,7 @@ mod disabled_guard_tests {
         assert!(!mlx_gen::ios_quantum::enabled());
         let missing = std::path::PathBuf::from("/definitely/missing/iris/model.safetensors");
         assert_eq!(
-            before_materialized_load("raw", &[missing.clone()], |_| true).unwrap(),
+            before_materialized_load("raw", std::slice::from_ref(&missing), |_| true).unwrap(),
             None
         );
         assert_eq!(
@@ -1282,5 +1377,163 @@ mod completed_width_plan_tests {
         };
         assert!(bad.before_build_targets(true).is_err());
         assert!(bad.after_build_targets().is_err());
+    }
+}
+
+#[cfg(test)]
+mod selected_constructor_plan_tests {
+    use super::*;
+
+    fn h(name: &str, dtype: Stored, shape: &[usize], bytes: u64) -> SafetensorsTensorHeader {
+        SafetensorsTensorHeader {
+            name: name.into(),
+            dtype,
+            shape: shape.to_vec(),
+            data_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn window_constructor_targets_use_actual_read_policy_not_root_matrix_casts() {
+        let policy = CastPolicy::Backbone {
+            compute: Dtype::Bfloat16,
+        };
+        for (dtype, shape, bytes, expected) in [
+            (Stored::I32, vec![1], 4, 0),
+            (Stored::I64, vec![1], 8, 4),
+            (Stored::I32, vec![1, 1], 4, 0),
+            (Stored::F32, vec![1, 1], 4, 4),
+        ] {
+            let header = h("p.in_features", dtype, &shape, bytes);
+            let view = [(header.name.as_str(), &header)].into_iter().collect();
+            let read = tensor_read(&header, policy);
+            let block = block_read(&[&header], policy);
+            assert_eq!(block.held, read.held + expected);
+            assert_eq!(block.transient, read.transient);
+            if dtype == Stored::I32 && shape.len() == 2 {
+                assert_eq!(
+                    constructor_output_bytes(&view, Dtype::Bfloat16, |_| true).unwrap(),
+                    4
+                );
+                assert_eq!(
+                    policy.target(&header.name, 2, false, false),
+                    None,
+                    "integer window reads remain unchanged, unlike eager root reads"
+                );
+            }
+        }
+        let norm = h("norm.weight", Stored::BF16, &[64], 128);
+        assert_eq!(block_read(&[&norm], policy).held, 128 + 256);
+        let codes = h("p.weight", Stored::U32, &[64, 8], 2048);
+        let scales = h("p.scales", Stored::BF16, &[64, 1], 128);
+        let bias = h("p.bias", Stored::F16, &[64], 128);
+        assert_eq!(
+            block_read(&[&codes, &scales, &bias], policy).held,
+            2048 + 128 + 128 + 128,
+            "F16 packed bias to BF16 is a fresh same-width target"
+        );
+        let overflow = h("norm.weight", Stored::BF16, &[usize::MAX], 0);
+        assert_eq!(
+            block_read(&[&overflow], policy).held,
+            u64::MAX,
+            "an overflowing constructor upper cannot become an affordable window"
+        );
+        let overflow_read = h("p.weight", Stored::F32, &[usize::MAX, usize::MAX], 0);
+        assert_eq!(
+            block_read(&[&overflow_read], policy).held,
+            u64::MAX,
+            "read casts retain the same fail-closed overflow contract"
+        );
+    }
+
+    #[test]
+    fn packed_tower_affines_cast_for_real_layer_embedding_and_head_owners() {
+        for base in [
+            "model.language_model.layers.0.self_attn.q_proj",
+            "model.language_model.layers.0.self_attn.k_proj",
+            "model.language_model.layers.0.self_attn.v_proj",
+            "model.language_model.layers.0.self_attn.o_proj",
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.0.mlp.up_proj",
+            "model.language_model.layers.0.mlp.down_proj",
+            "model.language_model.embed_tokens",
+            "lm_head",
+        ] {
+            for dtype in [Stored::F16, Stored::F32, Stored::BF16] {
+                let width = if dtype == Stored::F32 { 4 } else { 2 };
+                let headers = [
+                    h(&format!("{base}.weight"), Stored::U32, &[64, 8], 2048),
+                    h(&format!("{base}.scales"), dtype, &[64, 1], 64 * width),
+                    h(&format!("{base}.biases"), dtype, &[64, 1], 64 * width),
+                ];
+                let fresh = if dtype == Stored::BF16 { 0 } else { 2 * 128 };
+                let (raw, extra) = tower_load_output_bytes(&headers, |_| true, 0).unwrap();
+                assert_eq!(raw, 2048 + 2 * 64 * width);
+                assert_eq!(
+                    extra, fresh,
+                    "{base} {dtype:?}: codes stay raw; each affine normalizes"
+                );
+                let refs: Vec<_> = headers.iter().collect();
+                assert_eq!(block_read(&refs, CastPolicy::Tower).held, raw + fresh);
+                assert_eq!(block_read(&refs, CastPolicy::Tower).transient, 0);
+            }
+        }
+        assert!(!tower_layer_projection(
+            "model.language_model.layers.0.unused.self_attn.q_proj"
+        ));
+        let unrelated = [
+            h(
+                "model.language_model.layers.0.unused.weight",
+                Stored::U32,
+                &[64, 8],
+                2048,
+            ),
+            h(
+                "model.language_model.layers.0.unused.scales",
+                Stored::F32,
+                &[64, 1],
+                256,
+            ),
+            h(
+                "model.language_model.layers.0.unused.biases",
+                Stored::F32,
+                &[64, 1],
+                256,
+            ),
+        ];
+        assert_eq!(
+            tower_load_output_bytes(&unrelated, |_| true, 0).unwrap().1,
+            0,
+            "suffixes alone do not invent an unexecuted packed affine constructor"
+        );
+    }
+
+    #[test]
+    fn width_completion_uses_only_selected_projection_owners() {
+        let headers = [
+            h("blocks.0.attn_proj.weight", Stored::U32, &[64, 8], 2048),
+            h("blocks.0.attn_proj.scales", Stored::BF16, &[64, 1], 128),
+            h("blocks.0.attn_proj.in_features", Stored::I64, &[1], 8),
+            h("norm.weight", Stored::F32, &[64], 256),
+        ];
+        let view = headers.iter().map(|h| (h.name.as_str(), h)).collect();
+        assert_eq!(
+            installed_width_output_bytes(&view, Dtype::Bfloat16, |_| true).unwrap(),
+            4
+        );
+        let skeleton = |name: &str| crate::dit::Stack::of(name).is_none();
+        assert_eq!(
+            installed_width_output_bytes(&view, Dtype::Bfloat16, skeleton).unwrap(),
+            0
+        );
+        let selected: Vec<_> = headers.into_iter().filter(|h| skeleton(&h.name)).collect();
+        let (_, pending) =
+            backbone_pending_plan(&vec![selected], "", Dtype::Bfloat16, None).unwrap();
+        assert_eq!(pending.width_outputs, 0);
+        assert_eq!(
+            pending.after_build_targets().unwrap(),
+            0,
+            "unloaded stack getters cannot be subtracted from a skeleton"
+        );
     }
 }

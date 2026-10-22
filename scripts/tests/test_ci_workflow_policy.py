@@ -1047,6 +1047,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def assert_candle_metal_pins_select_real_modules(self, run: str) -> None:
         command = " ".join(run.split())
         self.assertIn("--features metal --test integration --", command)
+        # The collector's separator is not the test-binary argument separator.
+        command = command.removeprefix("python3 scripts/ci/run_ci_collection.py -- ")
         filters = command.split(" -- ", 1)[1].split()
         self.assertEqual(sorted(filters), sorted(f"{name}::" for name in self.CANDLE_METAL_PINS))
         root = WORKFLOW.parents[2]
@@ -4043,7 +4045,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
         # The device-capture surface is tested and linted on the host lane.
         self.assertTrue(
-            any("cargo test --locked --lib -p runtime-ios --features device-capture" in run for run in metal)
+            any("cargo test --locked --keep-going --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)
         )
         # The capture-gating doctests run both ways (the `--lib` steps never run doctests).
         lines = {
@@ -4053,12 +4055,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in step["run"].splitlines()
         }
         for doc in (
-            "cargo test --locked --doc -p runtime-ios --features device-capture",
-            "cargo test --locked --doc -p runtime-ios",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --doc -p runtime-ios --features device-capture",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --doc -p runtime-ios",
         ):
             self.assertIn(doc, lines)
+        doc_runs = [run for run in metal if "--doc -p runtime-ios" in run]
+        self.assertEqual(len(doc_runs), 2)
+        for run in doc_runs:
+            self.assertTrue(run.startswith(
+                "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast "
+            ))
         self.assertTrue(
-            any("cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
+            any("cargo test --locked --keep-going --no-fail-fast --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
         )
         self.assertTrue(
             any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)

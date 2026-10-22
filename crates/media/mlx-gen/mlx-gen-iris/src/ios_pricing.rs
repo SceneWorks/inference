@@ -2167,8 +2167,11 @@ fn priced_backbone_from_headers(
         load_quant,
         |name| !streamed || Stack::of(name).is_none(),
     )?;
-    let width_outputs =
-        crate::stream::installed_width_output_bytes(&load_view, compute_dtype(precision))?;
+    let width_outputs = crate::stream::installed_width_output_bytes(
+        &load_view,
+        compute_dtype(precision),
+        |name| !streamed || Stack::of(name).is_none(),
+    )?;
     let evaluation_outputs = constructor_outputs
         .checked_add(eval_quantized)
         .ok_or_else(|| Error::Unsupported("Iris pending evaluation byte overflow".into()))?;
@@ -3096,6 +3099,28 @@ fn generation_work(
     Ok(work)
 }
 
+/// Owners already present before adapter reconstruction, and a conservative after-build upper.
+/// Sources and constructor scalars remain counted at both boundaries: finishing reconstruction
+/// does not grant retirement credit. Only allocation sites marked as new retained outputs join
+/// the late upper; retained LoRA views alias sources and must not be counted a second time.
+fn adapter_pending_held_bytes(
+    host_bytes: u64,
+    files: &[crate::adapters::AdapterFileReadFacts],
+    loads: &std::collections::BTreeMap<String, crate::adapters::ProjectionAdapterLoadFacts>,
+) -> Result<(u64, u64)> {
+    let overflow = || Error::Unsupported("Iris pending adapter owner byte overflow".into());
+    let sources = files.iter().try_fold(host_bytes, |sum, file| {
+        sum.checked_add(file.source_bytes)
+            .and_then(|bytes| bytes.checked_add(file.graph_constructor_bytes))
+            .ok_or_else(overflow)
+    })?;
+    let late = loads.values().try_fold(sources, |sum, load| {
+        sum.checked_add(load.new_retained_bytes()?)
+            .ok_or_else(overflow)
+    })?;
+    Ok((sources, late))
+}
+
 fn generation(
     req: &IosPricingRequest<'_>,
     opts: Pricing,
@@ -3158,6 +3183,9 @@ fn generation(
     };
     let adapter_loads = adapter_inventory.projection_loads()?;
     let adapter_files = adapter_inventory.file_read_facts()?;
+    let adapter_host_bytes = crate::adapters::host_constructor_bytes(packed_adapter_hosts)?;
+    let (adapter_build_held, adapter_evaluation_held) =
+        adapter_pending_held_bytes(adapter_host_bytes, &adapter_files, &adapter_loads)?;
     let adapter_resident = adapter_inventory
         .projections
         .values()
@@ -3257,7 +3285,7 @@ fn generation(
                 Error::Unsupported("Iris adapter load ownership sum overflow".into())
             })
         };
-        let host = crate::adapters::host_constructor_bytes(packed_adapter_hosts)?;
+        let host = adapter_host_bytes;
         // Conservative load payload upper: source base inventory and its eventual cast parameters
         // can coexist during build. This is not a coincident physical lower or an anchor credit.
         let base_upper = add(add(load_tower, base_bb_resident)?, bb.floor)?;
@@ -3377,10 +3405,14 @@ fn generation(
             .before_build_targets(!spec.adapters.is_empty())?
             .checked_add(residuals)
             .ok_or_else(|| Error::Unsupported("Iris pending construction byte overflow".into()))?;
-        let held = load_conditioning
+        let model_held = load_conditioning
             .checked_add(bb.read_sources_upper)
-            .and_then(|bytes| bytes.checked_add(adapter_resident))
             .ok_or_else(|| Error::Unsupported("Iris adapted base held byte overflow".into()))?;
+        // File factors, graph scalars and packed-host placeholders already exist at this
+        // boundary. A future retained delta is not a substitute for those input owners.
+        let held = model_held.checked_add(adapter_build_held).ok_or_else(|| {
+            Error::Unsupported("Iris pending adapter source held byte overflow".into())
+        })?;
         // Completed operations may still have live buffers. Keep their source upper outside
         // future-allocation scratch; this is not retirement or common-owner subtraction.
         let pre_completed = if spec.adapters.is_empty() {
@@ -3402,8 +3434,12 @@ fn generation(
             "active source/read inputs and completed installed-width targets; pending build",
             1,
         );
-        let late_held = held
-            .checked_add(stage_plan.completed_before_evaluation()?)
+        // Keep the same source owners conservatively after evaluation, and add only distinct
+        // new retained outputs. File aliases are already in adapter_evaluation_held's sources.
+        let completed = stage_plan.completed_before_evaluation()?;
+        let late_held = model_held
+            .checked_add(adapter_evaluation_held)
+            .and_then(|bytes| bytes.checked_add(completed))
             .ok_or_else(|| Error::Unsupported("Iris completed build held byte overflow".into()))?;
         take_source_at(&mut pricing, IosPhase::Load, load_tower, late_held,
             &[(crate::nn::ADAPTED_BASE_EVAL_QUANTUM, stage_plan.after_build_targets()?)],
@@ -4774,12 +4810,19 @@ fn depth_with_sources(
         "depth::load_depth_export original raw floor then actual joint targets",
         1,
     );
-    let late_targets = bb
-        .constructor_outputs
+    let stage_plan = crate::stream::PendingBackbone {
+        constructors: bb.constructor_outputs,
+        evaluation: bb.evaluation_outputs,
+        width_outputs: bb.width_outputs,
+    };
+    let late_targets = stage_plan
+        .after_build_targets()?
         .checked_add(states)
         .ok_or_else(|| Error::Unsupported("Iris depth final targets byte overflow".into()))?;
+    let completed = stage_plan.completed_before_evaluation()?;
     let late_sources = caller_rgb
         .checked_add(bb.read_sources_upper)
+        .and_then(|bytes| bytes.checked_add(completed))
         .ok_or_else(|| Error::Unsupported("Iris depth final source byte overflow".into()))?;
     take_source_at(
         &mut pricing,
@@ -4789,7 +4832,7 @@ fn depth_with_sources(
         &[(crate::stream::EXPORT_TARGET_QUANTUM, late_targets)],
         basis.clone(),
         "iris.depth.load/final_targets",
-        "explicitly read source buffers retained; pending constructors and F32 upload",
+        "read inputs and completed getters retained; only pending targets plus F32 upload",
         1,
     );
     let input = crate::depth::depth_input_scratch(1, h as i32, w as i32);
@@ -6145,12 +6188,34 @@ mod shared_load_target_tests {
     #[test]
     fn tower_rounding_is_per_source_and_preserved_pack_parts_are_not_cast() {
         let headers = [
-            h("dense.weight", Stored::F32, &[384, 16], 24576),
-            h("packed.weight", Stored::U32, &[64, 16], 4096),
-            h("packed.scales", Stored::F32, &[64, 1], 256),
-            h("packed.biases", Stored::BF16, &[64, 1], 128),
+            h(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                Stored::F32,
+                &[384, 16],
+                24576,
+            ),
+            h(
+                "model.language_model.layers.1.self_attn.k_proj.weight",
+                Stored::U32,
+                &[64, 16],
+                4096,
+            ),
+            h(
+                "model.language_model.layers.1.self_attn.k_proj.scales",
+                Stored::F32,
+                &[64, 1],
+                256,
+            ),
+            h(
+                "model.language_model.layers.1.self_attn.k_proj.biases",
+                Stored::BF16,
+                &[64, 1],
+                128,
+            ),
         ];
-        let expected = (allocated(24576) - 24576) + allocated(12288) + 64;
+        // Codes stay stored; the F32 affine scale gets a distinct BF16 target, while the
+        // already-BF16 affine bias aliases. Round each owning request before adding.
+        let expected = (allocated(24576) - 24576) + allocated(12288) + allocated(128) + 64;
         assert_eq!(
             tower_load_output_bytes(&headers, |_| true, 64).unwrap().1,
             expected
@@ -6178,5 +6243,83 @@ mod shared_load_target_tests {
         assert!(backbone_constructor_output_bytes(&headers, Precision::Bf16, |_| true).is_err());
         let headers = [h("norm.weight", Stored::BF16, &[32], u64::MAX)];
         assert!(tower_load_output_bytes(&headers, |_| true, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_adapter_owner_tests {
+    use super::*;
+    use crate::adapters::{
+        AdapterFileReadFacts, AdapterLoadAllocation, ProjectionAdapterLoadFacts,
+    };
+    use mlx_gen::adapters::facts::{AdapterFacts, TensorFacts};
+
+    fn file(source_bytes: u64) -> AdapterFileReadFacts {
+        AdapterFileReadFacts {
+            path: "metadata-only-unused.safetensors".into(),
+            source_bytes,
+            file_floor_bytes: source_bytes,
+            alpha_read_scratch_bytes: 0,
+            graph_constructor_bytes: 8,
+        }
+    }
+
+    #[test]
+    fn pending_adapter_inputs_are_not_replaced_by_future_delta_owners() {
+        let load = ProjectionAdapterLoadFacts {
+            retained: vec![
+                AdapterFacts::Materialized {
+                    delta: TensorFacts::materialized_matrix(8, 8, mlx_rs::Dtype::Bfloat16),
+                    disabled: false,
+                },
+                AdapterFacts::Lora {
+                    a: TensorFacts::materialized_matrix(8, 4, mlx_rs::Dtype::Bfloat16),
+                    b: TensorFacts::materialized_matrix(4, 8, mlx_rs::Dtype::Bfloat16),
+                    disabled: false,
+                },
+            ],
+            allocations: vec![
+                AdapterLoadAllocation {
+                    operation: "new retained delta",
+                    shape: vec![8, 8],
+                    dtype: mlx_rs::Dtype::Bfloat16,
+                    minimum_bytes: 0,
+                    retained_output: true,
+                },
+                AdapterLoadAllocation {
+                    operation: "temporary reconstruction",
+                    shape: vec![4, 64],
+                    dtype: mlx_rs::Dtype::Bfloat16,
+                    minimum_bytes: 0,
+                    retained_output: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let loads = [("projection".into(), load)].into_iter().collect();
+        let (before, after) = adapter_pending_held_bytes(4, &[file(4096)], &loads).unwrap();
+        // Before build: all raw factors, existing graph scalars and the packed host scalar.
+        // After build: retain those owners without retirement credit; only the new output joins.
+        assert_eq!(before, 4 + 4096 + 8);
+        assert_eq!(after, before + 8 * 8 * 2);
+        assert!(
+            before > 8 * 8 * 2,
+            "a small future delta is not the raw factor inventory"
+        );
+        assert_eq!(
+            after - before,
+            loads["projection"].new_retained_bytes().unwrap()
+        );
+        assert!(
+            loads["projection"].retained_bytes().unwrap() > after - before,
+            "retained LoRA source aliases are not independent new output owners"
+        );
+    }
+
+    #[test]
+    fn pending_adapter_owner_sums_are_checked_and_empty_sources_stay_empty() {
+        let loads = std::collections::BTreeMap::new();
+        assert_eq!(adapter_pending_held_bytes(0, &[], &loads).unwrap(), (0, 0));
+        assert!(adapter_pending_held_bytes(4, &[file(u64::MAX)], &loads).is_err());
     }
 }

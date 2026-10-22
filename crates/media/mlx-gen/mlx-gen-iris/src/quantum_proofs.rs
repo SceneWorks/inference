@@ -609,6 +609,160 @@ fn every_small_step_quantum_price_tracks_its_measured_peak() {
     );
 }
 
+/// Copy the complete miniature snapshot into this test's own temporary tree, then rewrite only
+/// native tensor dtypes/width-marker representations. Metadata and every non-weight file survive.
+fn rewrite_stream_snapshot(
+    root: &std::path::Path,
+    source: &std::path::Path,
+    label: &str,
+    rewrite: impl FnOnce(&mut std::collections::HashMap<String, Array>),
+) -> PathBuf {
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let target = root.join(label);
+    copy_tree(source, &target);
+    let file = source.join("model.safetensors");
+    let mut tensors = Array::load_safetensors(&file).unwrap();
+    // Materialize the source fixture before rewriting its independent temporary copy.
+    for tensor in tensors.values() {
+        mlx_rs::transforms::eval_pending_loads([tensor]).unwrap();
+        eval([tensor]).unwrap();
+    }
+    rewrite(&mut tensors);
+    for tensor in tensors.values() {
+        eval([tensor]).unwrap();
+    }
+    let metadata: std::collections::HashMap<_, _> =
+        mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&file)
+            .unwrap()
+            .into_iter()
+            .collect();
+    let mut entries: Vec<_> = tensors
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    Array::save_safetensors(entries, Some(&metadata), target.join("model.safetensors")).unwrap();
+    target
+}
+
+fn rewrite_backbone_window_dtypes(
+    tensors: &mut std::collections::HashMap<String, Array>,
+    marker_dtype: Option<Dtype>,
+) {
+    let keys: Vec<_> = tensors.keys().cloned().collect();
+    for key in keys {
+        let tensor = &tensors[&key];
+        let target = if tensor.ndim() == 1 && key.ends_with(".weight") {
+            Some(Dtype::Bfloat16)
+        } else if key.ends_with(".bias") {
+            Some(Dtype::Float16)
+        } else {
+            None
+        };
+        if let Some(dtype) = target {
+            let converted = tensor.as_dtype(dtype).unwrap();
+            tensors.insert(key, converted);
+        }
+    }
+    if let Some(dtype) = marker_dtype {
+        let scales: Vec<_> = tensors
+            .keys()
+            .filter_map(|key| key.strip_suffix(".scales").map(str::to_owned))
+            .collect();
+        for base in scales {
+            let key = format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX);
+            let width = tensors.get(&key).map_or_else(
+                || {
+                    tensors[&format!("{base}.scales")].shape()[1]
+                        * crate::nn::QUANT_GROUP_SIZE as i32
+                },
+                |marker| marker.item::<i32>(),
+            );
+            let marker = match dtype {
+                Dtype::Int64 => Array::from_slice(&[i64::from(width)], &[1]),
+                Dtype::Int32 => Array::from_slice(&[width], &[1, 1]),
+                _ => unreachable!("the proof selects scalar I64 or matrix I32 width markers"),
+            };
+            tensors.insert(key, marker);
+        }
+    }
+}
+
+/// These are real root loader calls, not a copied decoder: the old price (without the affine
+/// targets) fits, while the shared joint guard must refuse before any native tower read. A full
+/// ample-headroom load is the positive control; refusal alone is not successful coverage.
+fn packed_tower_affine_root_checks(
+    dir: &std::path::Path,
+    text_config: &mlx_gen::gen_core::iris::TextEncoderConfig,
+    quant: mlx_gen::Quant,
+) {
+    use mlx_gen::ios_quantum::{take_refusal, PROCESS_RESERVE_BYTES};
+    let cfg = mlx_llm::ModelConfig::from_dir(dir).unwrap();
+    let mut headers = Vec::new();
+    for file in crate::text_encoder::weight_shards(dir, !cfg.tie_word_embeddings).unwrap() {
+        headers.extend(
+            crate::stream::headers(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|h| {
+                    crate::text_encoder::is_text_tower_tensor(&h.name, !cfg.tie_word_embeddings)
+                }),
+        );
+    }
+    let (logical, additional) = crate::stream::tower_load_output_bytes(
+        &headers,
+        |_| true,
+        crate::stream::tower_rope_bytes(&cfg).unwrap(),
+    )
+    .unwrap();
+    let affine_targets: u64 = headers
+        .iter()
+        .filter(|h| h.name.ends_with(".scales") || h.name.ends_with(".biases"))
+        .map(|h| {
+            assert_ne!(h.dtype, mlx_gen::gen_core::weightsmeta::Dtype::BF16);
+            crate::retention::allocated(h.shape.iter().product::<usize>() as u64 * 2)
+        })
+        .sum();
+    assert!(affine_targets > 0);
+    let joint = logical + additional;
+    let old_price = joint - affine_targets;
+    take_refusal();
+    let active = mlx_rs::memory::get_active_memory();
+    let denied = with_cpu_diagnostic_headroom(old_price + PROCESS_RESERVE_BYTES, || {
+        crate::text_encoder::IrisTextEncoder::load_quantized(dir, text_config, Some(quant))
+    });
+    assert!(denied.is_err());
+    let refusal = take_refusal().expect("stored affine targets must discriminate the old price");
+    assert_eq!(refusal.label, crate::stream::LOAD_TARGET_QUANTUM);
+    assert_eq!(refusal.scratch_bytes, joint);
+    assert_eq!(
+        refusal.available_bytes,
+        Some(old_price + PROCESS_RESERVE_BYTES)
+    );
+    assert_eq!(
+        mlx_rs::memory::get_active_memory(),
+        active,
+        "affine target refusal precedes all native tower materialization"
+    );
+    drop(
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            crate::text_encoder::IrisTextEncoder::load_quantized(dir, text_config, Some(quant))
+        })
+        .expect("the accepted packed affine fixture must actually load"),
+    );
+}
+
 /// The streamed (rung-4) quanta: a backbone window's read (every block of every stack, dense at
 /// both compute widths and packed at both tiers), the tower's layer read (f32-stored, packed), its
 /// cache-free decoder layer and its embedding + RoPE quantum, and the per-row output concatenation.
@@ -623,6 +777,13 @@ fn streamed_body() {
         (backbone_dir(), Dtype::Float32, None),
         (backbone_dir(), Dtype::Bfloat16, None),
     ];
+    let mixed_dense =
+        rewrite_stream_snapshot(root.path(), &backbone_dir(), "mixed-dense", |tensors| {
+            rewrite_backbone_window_dtypes(tensors, None);
+        });
+    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+        backbones.push((mixed_dense.clone(), dtype, None));
+    }
     for quant in [Quant::Q4, Quant::Q8] {
         let packed = crate::packed_tests::convert(
             ConvertKind::Export { depth: false },
@@ -630,6 +791,17 @@ fn streamed_body() {
             root.path(),
             quant,
         );
+        for marker in [Dtype::Int64, Dtype::Int32] {
+            let mixed = rewrite_stream_snapshot(
+                root.path(),
+                &packed,
+                &format!("mixed-{quant:?}-{marker:?}"),
+                |tensors| {
+                    rewrite_backbone_window_dtypes(tensors, Some(marker));
+                },
+            );
+            backbones.push((mixed, Dtype::Bfloat16, Some(quant)));
+        }
         backbones.push((packed, Dtype::Bfloat16, Some(quant)));
     }
     for (dir, dtype, quant) in backbones {
@@ -644,7 +816,10 @@ fn streamed_body() {
                     Ok(built.arrays().into_iter().cloned().collect())
                 });
                 prove(
-                    &format!("backbone block read {stack:?} {i} {dtype:?} {quant:?}"),
+                    &format!(
+                        "backbone block read {} {stack:?} {i} {dtype:?} {quant:?}",
+                        dir.display()
+                    ),
                     crate::stream::window_read_bytes(&[stream.read(stack, i)]),
                     peak,
                 );
@@ -658,16 +833,46 @@ fn streamed_body() {
     for quant in [Quant::Q4, Quant::Q8] {
         let packed =
             crate::packed_tests::convert(ConvertKind::TextEncoder, &aligned, root.path(), quant);
+        for affine_dtype in [Dtype::Float16, Dtype::Float32] {
+            let mixed = rewrite_stream_snapshot(
+                root.path(),
+                &packed,
+                &format!("tower-{quant:?}-{affine_dtype:?}"),
+                |tensors| {
+                    let affines: Vec<_> = tensors
+                        .keys()
+                        .filter(|key| key.ends_with(".scales") || key.ends_with(".biases"))
+                        .cloned()
+                        .collect();
+                    assert!(!affines.is_empty());
+                    for key in affines {
+                        let converted = tensors[&key].as_dtype(affine_dtype).unwrap();
+                        tensors.insert(key, converted);
+                    }
+                },
+            );
+            packed_tower_affine_root_checks(&mixed, &config.text_encoder, quant);
+            towers.push((mixed, Some(quant)));
+        }
         towers.push((packed, Some(quant)));
     }
     for (dir, quant) in towers {
         let te = IrisTextEncoder::load_streamed(&dir, &config.text_encoder, quant).unwrap();
         let tower = te.streamed().unwrap();
         let cfg = tower.config();
-        for i in [0, 1, cfg.num_layers - 1] {
-            let (peak, _) = measure(|| tower.read_layer(i));
+        for i in [0, 1, cfg.num_layers - 1]
+            .into_iter()
+            .chain(2..cfg.num_layers.saturating_sub(1))
+        {
+            let (peak, arrays) = measure(|| tower.read_layer(i));
+            assert!(
+                arrays
+                    .iter()
+                    .all(|a| matches!(a.dtype(), Dtype::Bfloat16 | Dtype::Uint32)),
+                "the actual streamed constructors must normalize packed affine parameters"
+            );
             prove(
-                &format!("text layer read {i} {quant:?}"),
+                &format!("text layer read {} {i} {quant:?}", dir.display()),
                 crate::stream::window_read_bytes(&[tower.read_price(i)]),
                 peak,
             );

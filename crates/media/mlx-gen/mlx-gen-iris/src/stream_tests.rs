@@ -684,24 +684,250 @@ fn a_streamed_load_holds_its_skeleton_and_releases_every_window() {
 
 // ---- pricing --------------------------------------------------------------------------------
 
-/// Run `body` with every guard enabled (ample headroom) and collect, per quantum label, the
-/// largest scratch any of its checks observed.
+#[derive(Clone, Debug)]
+enum PricingBoundary {
+    Checked(String, u64),
+    Synchronized(String),
+    BackboneWindow(Stack, usize),
+    TowerWindow(usize),
+}
+
+fn raw_load(label: &str) -> bool {
+    matches!(
+        label,
+        crate::model::BACKBONE_LOAD_QUANTUM
+            | crate::text_encoder::quanta::LOAD
+            | crate::depth::quanta::LOAD
+            | crate::restoration::quanta::LOAD
+    )
+}
+
+/// sc-26270 — streamed block constructor targets: check every reached boundary, not merely
+/// the largest check of a label. Existing window-open hooks independently witness each read.
+fn assert_boundary_protocol(events: &[PricingBoundary]) {
+    use crate::text_encoder::quanta as te_q;
+    let checked = |event: Option<&PricingBoundary>, label: &str| matches!(event, Some(PricingBoundary::Checked(found, _)) if found == label);
+    let synchronized = |event: Option<&PricingBoundary>, label: &str| matches!(event, Some(PricingBoundary::Synchronized(found)) if found == label);
+    let mut raw = 0;
+    let mut joint = 0;
+    let mut backbone_raw = 0;
+    let mut export_raw = 0;
+    let mut export_targets = 0;
+    let mut pending = false;
+    let mut construction_count = 0;
+    let mut evaluation_count = 0;
+    let mut backbone_windows = 0;
+    let mut tower_windows = 0;
+    let mut backbone_reads = 0;
+    let mut tower_reads = 0;
+    let mut backbone_finishes = 0;
+    let mut tower_finishes = 0;
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            PricingBoundary::BackboneWindow(stack, first) => {
+                backbone_windows += 1;
+                assert!(
+                    checked(events.get(index + 1), crate::dit::quanta::BLOCK_READ),
+                    "{stack:?} window {first} must check before its read: {events:?}"
+                );
+                assert!(
+                    synchronized(events.get(index + 2), crate::dit::quanta::BLOCK_READ),
+                    "{stack:?} window {first} must finish that read before its blocks run"
+                );
+            }
+            PricingBoundary::TowerWindow(first) => {
+                tower_windows += 1;
+                assert!(
+                    checked(events.get(index + 1), te_q::LAYER_READ),
+                    "tower window {first} must check before its read: {events:?}"
+                );
+                assert!(
+                    synchronized(events.get(index + 2), te_q::LAYER_READ),
+                    "tower window {first} must finish its read before running a layer"
+                );
+            }
+            PricingBoundary::Checked(label, scratch) => {
+                if raw_load(label) {
+                    raw += 1;
+                    backbone_raw += usize::from(label == crate::model::BACKBONE_LOAD_QUANTUM);
+                    export_raw += usize::from(
+                        label == crate::depth::quanta::LOAD
+                            || label == crate::restoration::quanta::LOAD,
+                    );
+                    assert!(
+                        checked(events.get(index + 1), crate::stream::LOAD_TARGET_QUANTUM),
+                        "raw {label} ({scratch}) must be followed by its real joint check"
+                    );
+                } else if label == crate::stream::LOAD_TARGET_QUANTUM {
+                    joint += 1;
+                    assert!(
+                        matches!(index.checked_sub(1).and_then(|i| events.get(i)),
+                        Some(PricingBoundary::Checked(previous, _)) if raw_load(previous)),
+                        "joint check must belong to the immediately preceding raw source"
+                    );
+                } else if label == crate::nn::PENDING_CONSTRUCTION_QUANTUM {
+                    assert!(
+                        !pending,
+                        "a repeated build lost its preceding evaluation check"
+                    );
+                    pending = true;
+                    construction_count += 1;
+                } else if label == crate::nn::ADAPTED_BASE_EVAL_QUANTUM {
+                    assert!(
+                        pending,
+                        "evaluation must follow an actual construction boundary"
+                    );
+                    pending = false;
+                    evaluation_count += 1;
+                } else if label == crate::stream::EXPORT_TARGET_QUANTUM {
+                    export_targets += 1;
+                } else if label == crate::dit::quanta::BLOCK_READ {
+                    backbone_reads += 1;
+                    assert!(
+                        matches!(
+                            index.checked_sub(1).and_then(|i| events.get(i)),
+                            Some(PricingBoundary::BackboneWindow(_, _))
+                        ),
+                        "every backbone read check must identify its actual window"
+                    );
+                } else if label == te_q::LAYER_READ {
+                    tower_reads += 1;
+                    assert!(
+                        matches!(
+                            index.checked_sub(1).and_then(|i| events.get(i)),
+                            Some(PricingBoundary::TowerWindow(_))
+                        ),
+                        "every tower read check must identify its actual window"
+                    );
+                }
+            }
+            PricingBoundary::Synchronized(label) => {
+                if label == crate::dit::quanta::BLOCK_READ {
+                    backbone_finishes += 1;
+                    assert!(checked(
+                        index.checked_sub(1).and_then(|i| events.get(i)),
+                        label
+                    ));
+                } else if label == te_q::LAYER_READ {
+                    tower_finishes += 1;
+                    assert!(checked(
+                        index.checked_sub(1).and_then(|i| events.get(i)),
+                        label
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        raw, joint,
+        "no raw/joint occurrence may be lost in a per-label maximum"
+    );
+    assert_eq!(
+        export_raw, export_targets,
+        "each export owns one late upload boundary"
+    );
+    assert!(
+        !pending,
+        "the last build must also reach its evaluation check"
+    );
+    assert_eq!(construction_count, evaluation_count);
+    if construction_count != 0 {
+        // Each observed body uses one specification, including any staged reloads of it.
+        assert_eq!(
+            construction_count, backbone_raw,
+            "every repeated adapter/dense-quant backbone load must reach both pending checks"
+        );
+    }
+    assert_eq!(
+        (backbone_windows, backbone_windows),
+        (backbone_reads, backbone_finishes)
+    );
+    assert_eq!(
+        (tower_windows, tower_windows),
+        (tower_reads, tower_finishes)
+    );
+}
+
+#[test]
+fn ordered_pricing_protocol_rejects_a_missing_repeated_boundary() {
+    let read = crate::dit::quanta::BLOCK_READ;
+    let valid = vec![
+        PricingBoundary::BackboneWindow(Stack::Trunk, 0),
+        PricingBoundary::Checked(read.into(), 64),
+        PricingBoundary::Synchronized(read.into()),
+        PricingBoundary::BackboneWindow(Stack::Trunk, 1),
+        PricingBoundary::Checked(read.into(), 64),
+        PricingBoundary::Synchronized(read.into()),
+    ];
+    assert_boundary_protocol(&valid);
+    // The per-label maximum remains 64 in both mutations. The independent operation hooks
+    // still demand TWO ordered check/finish pairs, so neither omission can disappear in a map.
+    let mut missing_check = valid.clone();
+    missing_check.remove(4);
+    assert!(std::panic::catch_unwind(|| assert_boundary_protocol(&missing_check)).is_err());
+    let mut missing_pair = valid;
+    missing_pair.truncate(4);
+    assert!(std::panic::catch_unwind(|| assert_boundary_protocol(&missing_pair)).is_err());
+}
+
+struct RestorePricingHooks {
+    backbone: Option<crate::dit::WindowHook>,
+    tower: Option<crate::text_encoder::TowerWindowHook>,
+}
+
+impl Drop for RestorePricingHooks {
+    fn drop(&mut self) {
+        crate::dit::WINDOW_HOOK.with(|hook| *hook.borrow_mut() = self.backbone.take());
+        crate::text_encoder::TOWER_WINDOW_HOOK.with(|hook| *hook.borrow_mut() = self.tower.take());
+    }
+}
+
+/// Collect the original largest-per-label prices AND an independently count-bearing ordered
+/// protocol. Hooks only record scalar window identifiers; they add no native query or evaluation.
 fn observed_phases(body: impl FnOnce() -> mlx_gen::Result<()>) -> BTreeMap<String, u64> {
     let seen: Rc<RefCell<BTreeMap<String, u64>>> = Rc::default();
+    let boundaries: Rc<RefCell<Vec<PricingBoundary>>> = Rc::default();
+    let windows = boundaries.clone();
+    let backbone = crate::dit::WINDOW_HOOK.with(|hook| {
+        hook.borrow_mut().replace(Box::new(move |stack, first| {
+            windows
+                .borrow_mut()
+                .push(PricingBoundary::BackboneWindow(stack, first))
+        }))
+    });
+    let windows = boundaries.clone();
+    let tower = crate::text_encoder::TOWER_WINDOW_HOOK.with(|hook| {
+        hook.borrow_mut().replace(Box::new(move |first| {
+            windows
+                .borrow_mut()
+                .push(PricingBoundary::TowerWindow(first))
+        }))
+    });
+    let _restore = RestorePricingHooks { backbone, tower };
     let sink = seen.clone();
+    let events = boundaries.clone();
     with_cpu_diagnostic_headroom(AMPLE, || {
         with_cpu_diagnostic_observer(
-            move |event| {
-                if let QuantumEvent::Checked { label, scratch } = event {
+            move |event| match event {
+                QuantumEvent::Checked { label, scratch } => {
                     let mut seen = sink.borrow_mut();
                     let entry = seen.entry(label.clone()).or_insert(0);
                     *entry = (*entry).max(*scratch);
+                    events
+                        .borrow_mut()
+                        .push(PricingBoundary::Checked(label.clone(), *scratch));
+                }
+                QuantumEvent::Synchronized { label, .. } => {
+                    events
+                        .borrow_mut()
+                        .push(PricingBoundary::Synchronized(label.clone()));
                 }
             },
             body,
         )
     })
     .unwrap();
+    assert_boundary_protocol(&boundaries.borrow());
     seen.take()
 }
 

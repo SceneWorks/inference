@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T12:54:36.558401+00:00",
-  "rust_proof_closure_sha256": "0b82c432341d18ec1f3b728a35d619d54fb99abaad085710cfbecdf6bbbab3ed",
+  "UTC": "2026-10-22T14:30:11.566008+00:00",
+  "rust_proof_closure_sha256": "27ecd72849166f739bd189e8c58732fea49565b4010838da07e60787d821fc5e",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -20,7 +20,7 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "cfd80507de8ebe53be2708d319a1bdac4fc3bc50e09f0201ee5d4f6e0d61e14e"
+      "sha256": "8770f4feceebaab90248f7dce8b5dcaea99e9ac97ab28fbd2533230a78c13351"
     },
     {
       "path": ".github/workflows/real-weights.yml",
@@ -240,7 +240,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
-      "sha256": "f17af0efab64aea88315a2e86a0ef7c9a736c92d56c8856aa5e96cb992d18f8b"
+      "sha256": "a27ec86f67c99564fda63a034eac759afdd4dc86ae8f3998e1c3c60f8eed0399"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/dit.rs",
@@ -248,7 +248,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "bb7b717f936c7a65aa7618e59f04b333ba595e7432ed4c2bd29c8f2499a1a7e3"
+      "sha256": "dab571402922983c815d67c4c3a6d94100abceb98d8ca572713161990a4deba8"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
@@ -280,11 +280,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_proofs.rs",
-      "sha256": "ad9a0bffae78658025d4769ca207c685291da8e70d488926401004c28f4c1431"
+      "sha256": "34c43d031b4198aaa34e851649f97dbacdc7c2e0214e148d2b95f14b6b1c9441"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_tests.rs",
-      "sha256": "6f38957bbfac9e6b2a8dc8e176b3fa3f95f697e252c6e728f2f05da49ba0c6cd"
+      "sha256": "08be989da80825ee1c52aca04a7640568f3adc363cd492d2a8e96675fee2a051"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/reachable_sizes.rs",
@@ -304,11 +304,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream.rs",
-      "sha256": "7da1c6107284b7366e5b781c1e31d84dba17fe07f9d939650b5bbecf1117eda3"
+      "sha256": "54ca12971d57e024c688ec8285d447a5a9ab46dd621316e2eb903e171a2fc36a"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/stream_tests.rs",
-      "sha256": "ebe518a92b880fef856f78d3d3bfc4a5470cbd419b7708688727fead70d389a7"
+      "sha256": "5a799b01de27dae150c79423cea1782cdf95faacdd0251c1ee8530ed6923e8fe"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs",
@@ -947,6 +947,10 @@
       "sha256": "56bd4b2b2b6c0568dc8985e84e5e6e78d65ad37510d3ca3ba7ec79c5477b6054"
     },
     {
+      "path": "scripts/ci/run_ci_collection.py",
+      "sha256": "debef95a5c87e8d89c44112490b8775e901ca4aa2350be4923666cfeec5df41b"
+    },
+    {
       "path": "scripts/ci/run_clip_regex_certificate_tests.py",
       "sha256": "a8331508e0399b4b8ca97d84a793d4ecb29fa06b853eaf4d5b8bb145625c6f25"
     },
@@ -963,8 +967,20 @@
       "sha256": "2197fbabd8928a82b385f310af210232d596597197310ebb329c948868ce9240"
     },
     {
+      "path": "scripts/tests/test_ci_collection.py",
+      "sha256": "1b76d6e0ba5f9073a4e3312d8b3e3abe6ca5185e0f4f6ca834de0963ca2b78d4"
+    },
+    {
+      "path": "scripts/tests/test_ci_workflow_policy.py",
+      "sha256": "cb89aff0214479baf88cfed62f297037087fbc0699cf1edfdf8fc5be0e575558"
+    },
+    {
       "path": "scripts/tests/test_clip_regex_certificate_runner.py",
       "sha256": "735a3bc048cf1cad0b249509550d2202dda11c986ac88a131b7e324ccf930d2e"
+    },
+    {
+      "path": "scripts/tests/test_dependency_ci_policy.py",
+      "sha256": "209408142bf3df73fe31ab88ccee4492495d24bf2bf2f07abfc948ddc18c69c3"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
@@ -2378,17 +2394,21 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "ac159291ad60e71605eb14b3e89240abcd90a1693a84570a0e893fd20a731943",
-    "classification_sha256": "9c9ff7c7f38f16ffc3a3d06a5b435cd7fc516056eb7572590f52c95f69769d6b",
-    "selected_Rust_FQNs": 263,
-    "HOST_logical": 234,
-    "HOST_expected_PASS_rows": 235,
-    "native_logical": 29,
-    "native_expected_PASS_rows": 58,
-    "Python_exact_tests": 17,
+    "inventory_sha256": "68f109a3aef3185e26ce7471aaa112befe53017ec0f925420918f608de2fc6a0",
+    "classification_sha256": "e1caca7d197e121097575089e079f97f65caacede9257cdc7569cd9b4df7610d",
+    "selected_Rust_FQNs": 272,
+    "HOST_logical": 240,
+    "HOST_expected_PASS_rows": 241,
+    "native_logical": 32,
+    "native_expected_PASS_rows": 64,
+    "Python_exact_tests": 29,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
     "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
     "diagnostic_checkpoint": "Real RAW->EARLYJOINT and source-pending Build/Eval/export guards, raw/Z API unchanged. Single operator visitor retains U semantics and emits fresh-A pending plan. Disabled None skips unused I/O/math. New actual Checked events invoke existing samplers more often; no new sampling API/query site/sync. Two approved exact helper event sequences strengthened.20new tests17HOST/3CPU-child; completed-width and build operations removed from future scratch but retained in held/source upper; runtime outcomes and opaque26662/FS/HOST/physical remain OPEN.",
-    "existing_constructor_caller_compile_repair": "Add actual existing adapter format CPU-child FQN/source binding; no new test, no assertion changes; current native/cache/trace execution remains UNOBSERVED."
+    "existing_constructor_caller_compile_repair": "Add actual existing adapter format CPU-child FQN/source binding; no new test, no assertion changes; current native/cache/trace execution remains UNOBSERVED.",
+    "coherent_batch": "sc-26270 tasks26698/26699/26700 source-fix candidate. Actual role/dtype constructor targets, completed width+selected keep, conservative adapter input owners, ordered/count-bearing protocol; same eager/deferred numeric policy, timing, originalstrict matrices. Standard combined CI gathers errors; compiler/native unobserved, feature/model/physical/FS/opaque/HOST obligations remain OPEN.",
+    "critical_execution_bindings_sha256": "3c6a0cda2948748b3b83eb7fbaaa0d2e43097cff9df582f7d1aeacc0c729ec81",
+    "iris_critical_execution_bindings_sha256": "88d577ec3ae0b39b6b639bbef1be76835761f46aa36be4bbb6893fd3f894a7b3",
+    "execution_bindings_are_eligibility_not_observed_PASS": true
   }
 }

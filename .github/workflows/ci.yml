@@ -577,7 +577,9 @@ jobs:
       CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        id: mlx_checkout
       - name: Toolchain versions
+        id: mlx_versions
         run: |
           sw_vers
           xcodebuild -version
@@ -639,16 +641,19 @@ jobs:
           echo "reclaim running in background (pid $!); log: $RUNNER_TEMP/reclaim-runner-disk.log"
           exit 0
       - name: Ensure Metal compiler
+        id: mlx_metal
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then
             sudo xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun metal --version || true
       - name: Install pinned Rust toolchain
+        id: mlx_rust
         run: |
           rustup show
           rustup component add clippy
       - name: Fetch prebuilt MLX (sc-21382)
+        id: mlx_prebuilt
         # pmetal-mlx-sys's cmake build of libmlx is ≈6 min on this runner on every cache miss
         # (plus a network fetch of MLX). The SceneWorks/mlx-rs fork publishes that build per
         # commit (`prebuilt-<sha12>` releases, cell = target × deployment target × Debug/Release);
@@ -672,6 +677,7 @@ jobs:
             exit "$rc"
           fi
       - name: Cache Cargo and MLX native build
+        id: mlx_setup
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # Save only on `main` — see the note on the `workspace` job's cache step. This lane's
@@ -679,22 +685,40 @@ jobs:
           # is that the others get to survive alongside it.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test dependency-owned CLIP certificate and source hasher
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_clip_regex_certificate_tests.py
+          python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/run_clip_regex_certificate_tests.py
           --output-dir "${{ runner.temp }}/clip-regex-certificate-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Clippy MLX packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo clippy --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
           --all-targets -- -D warnings
       - name: Rustdoc macOS MLX packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         # This is the complete macOS/MLX package set the lane already builds. Keep its public
         # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
         # sets; NAX-specific docs remain on the separate macos-nax feature/platform lane.
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: >-
-          cargo doc --locked --no-deps
+          python3 scripts/ci/run_ci_collection.py -- cargo doc --locked --keep-going --no-deps
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
           -p runtime-macos -p runtime-ios
@@ -729,10 +753,18 @@ jobs:
       # NB the `macos-nax` lane below IS self-hosted, so it does share `$TMPDIR` between jobs; it
       # is safe only because no hardcoded fixture path remains in the crates it runs (mlx-llm,
       # runtime-macos). Keep it that way if that lane's package set ever grows.
+      # Keep the original combined feature graph; compile errors block dependent test binaries.
+      # --no-fail-fast collects later test failures once that combined graph compiles.
       - name: Test MLX packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo test --locked --lib --tests
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --lib --tests
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -746,20 +778,67 @@ jobs:
       # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
       # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-macos -p runtime-ios
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
       # The non-default `device-capture` surface (`media::capture_permit`), which only the device
       # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
       - name: Test runtime-ios device-capture surface
-        run: |
-          cargo clippy --locked -p runtime-ios --features device-capture --all-targets -- -D warnings
-          cargo test --locked --lib -p runtime-ios --features device-capture
-          cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
+          -p runtime-ios --features device-capture --all-targets -- -D warnings
+      - name: Test runtime-ios device-capture unit tests
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          --lib -p runtime-ios --features device-capture
+      - name: Test iOS catalog device-capture unit tests
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          --lib -p mlx-gen-ios-catalog --features device-capture
       # The compile_fail doctests that keep `capture_permit` out of a product build (and the
       # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
       - name: Doctest runtime-ios capture gating
-        run: |
-          cargo test --locked --doc -p runtime-ios
-          cargo test --locked --doc -p runtime-ios --features device-capture
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          --doc -p runtime-ios
+      - name: Doctest runtime-ios enabled capture gating
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast
+          --doc -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()
@@ -773,7 +852,13 @@ jobs:
       # LLM+audio composition (mlx LLM + candle audio lane, no mlx media graph) is a supported
       # profile — and this is the one platform where that combination is cross-backend.
       - name: Test LLM+audio macOS bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-macos
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
       # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
       # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
       # only; never fails the job.
@@ -796,8 +881,14 @@ jobs:
       # test targets no lane had ever compiled. Keep this package set aligned with the CPU and cuda
       # Clippy lanes.
       - name: Clippy Candle Metal packages
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo clippy --locked
+          python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
       # The only Candle tests any lane RUNS on a Metal device. The vendored candle-metal-kernels
@@ -809,8 +900,14 @@ jobs:
       # The filters are pinned to existing integration modules by test_ci_workflow_policy, so a
       # renamed module cannot turn this into a step that runs zero tests.
       - name: Test Candle Metal reduce pins
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          cargo test --locked -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
+          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --keep-going --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
       # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
       # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
@@ -823,18 +920,30 @@ jobs:
       # smoke: GEMMs, softmax, metallib load), is skipped by name; it is the device harness's own
       # host baseline and runs from `scripts/ios/run_smoke.sh`, never on this shared runner.
       - name: Clippy iOS device harness (host)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: >-
-          cargo --config 'profile.dev.package."*".opt-level=3'
-          clippy --locked --manifest-path ios-host/smoke/Cargo.toml
+          python3 scripts/ci/run_ci_collection.py -- cargo --config 'profile.dev.package."*".opt-level=3'
+          clippy --locked --keep-going --manifest-path ios-host/smoke/Cargo.toml
           --features media --all-targets -- -D warnings
       - name: Test iOS device harness (host, weights-free)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: >-
-          cargo --config 'profile.dev.package."*".opt-level=3'
-          test --locked --manifest-path ios-host/smoke/Cargo.toml
+          python3 scripts/ci/run_ci_collection.py -- cargo --config 'profile.dev.package."*".opt-level=3'
+          test --locked --keep-going --no-fail-fast --manifest-path ios-host/smoke/Cargo.toml
           --features media --lib -- --skip smoke_passes_on_the_host
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after iOS device harness

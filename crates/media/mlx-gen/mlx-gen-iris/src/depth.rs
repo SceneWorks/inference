@@ -268,9 +268,15 @@ fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> R
 
     let prompt: EmptyPrompt = export.empty_prompt()?;
     let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
-    // Source reducer buffers were explicitly read/evaluated above; no pending raw reducer
-    // input is assumed. Only remaining constructor targets plus the fresh F32 upload remain.
-    crate::stream::before_export_targets(pending.constructors, prompt.embeddings.len())?;
+    // Reducer/read inputs are already evaluated, and the successful backbone build already
+    // executed its numeric-width getters. Charge only future targets, not completed getters.
+    // Keep unused budget arithmetic off the original disabled path.
+    if mlx_gen::ios_quantum::enabled() {
+        crate::stream::before_export_targets(
+            pending.after_build_targets()?,
+            prompt.embeddings.len(),
+        )?;
+    }
     let embeddings = Array::from_slice(&prompt.embeddings, &shape);
 
     let mut arrays = dit.arrays();

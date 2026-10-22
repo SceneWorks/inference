@@ -1713,8 +1713,8 @@ fn export_denial_body() {
     });
     assert_eq!(
         scratch,
-        plan.constructors + upload,
-        "depth: pending constructors plus F32 upload"
+        plan.after_build_targets().unwrap() + upload,
+        "depth: only post-build pending targets plus F32 upload"
     );
     assert!(plan.constructors > 0);
     assert!(labels
@@ -1735,5 +1735,182 @@ fn adapted_and_dense_quantized_pending_guards_follow_real_intervening_growth() {
     in_cpu_child(
         "quantum_tests::adapted_and_dense_quantized_pending_guards_follow_real_intervening_growth",
         post_adapter_denial_body,
+    );
+}
+
+/// Keep the packed bases and their metadata unchanged; only encode their existing logical widths
+/// in another accepted native numeric representation. Every projection gets an explicit marker,
+/// including skeleton and deferred-stack projections, so selection is independently observable.
+fn numeric_depth_width_markers(dir: &std::path::Path, dtype: Dtype, shape: &[i32]) {
+    let path = dir.join("model.safetensors");
+    let metadata: std::collections::HashMap<_, _> =
+        mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&path)
+            .unwrap()
+            .into_iter()
+            .collect();
+    let mut tensors = Array::load_safetensors(&path).unwrap();
+    let projections: Vec<_> = tensors
+        .keys()
+        .filter_map(|name| {
+            let base = name.strip_suffix(".scales")?;
+            let weight = tensors.get(&format!("{base}.weight"))?;
+            (weight.dtype() == Dtype::Uint32).then(|| base.to_owned())
+        })
+        .collect();
+    assert!(
+        !projections.is_empty(),
+        "the packed fixture must contain real projections"
+    );
+    for base in projections {
+        let marker = format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX);
+        let value = match tensors.get(&marker) {
+            Some(array) => array.try_item::<i32>().unwrap(),
+            None => {
+                tensors[&format!("{base}.scales")].shape()[1] * crate::nn::QUANT_GROUP_SIZE as i32
+            }
+        };
+        // The matrix-marker case intentionally preserves the loader's existing BF16 read
+        // policy. All this fixture's logical widths are representable, so no numeric knob moves.
+        let round_trip = Array::from_slice(&[value], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+            .try_item::<i32>()
+            .unwrap();
+        assert_eq!(
+            round_trip, value,
+            "fixture width must survive the unchanged read policy"
+        );
+        let array = match dtype {
+            Dtype::Int64 => Array::from_slice(&[i64::from(value)], shape),
+            Dtype::Float32 => Array::from_slice(&[value as f32], shape),
+            Dtype::Int32 => Array::from_slice(&[value], shape),
+            _ => unreachable!("the test names its supported numeric marker formats"),
+        };
+        tensors.insert(marker, array);
+    }
+    for array in tensors.values() {
+        array.eval().unwrap();
+    }
+    let mut entries: Vec<_> = tensors
+        .iter()
+        .map(|(name, array)| (name.as_str(), array))
+        .collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    // Do not overwrite a file whose lazy/mapped source arrays are still owned by the writer.
+    let output = dir.join("numeric-width-model.safetensors");
+    Array::save_safetensors(entries, Some(&metadata), &output).unwrap();
+    std::fs::rename(output, path).unwrap();
+}
+
+fn depth_completed_width_body() {
+    use mlx_gen::gen_core::LoadShape;
+    for (dtype, shape) in [
+        (Dtype::Int64, Vec::new()),
+        (Dtype::Float32, vec![1]),
+        (Dtype::Int32, vec![1, 1]),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = fixtures().join("tiny-depth");
+        for quant in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+            let dir = crate::packed_tests::convert(
+                crate::packed::ConvertKind::Export { depth: true },
+                &source,
+                root.path(),
+                quant,
+            );
+            numeric_depth_width_markers(&dir, dtype, &shape);
+            let full_model = crate::stream::headers(&dir.join("model.safetensors")).unwrap();
+            let prompt = crate::stream::headers(&dir.join("empty_prompt.safetensors")).unwrap();
+            let embeddings = prompt
+                .iter()
+                .find(|header| header.name == "embeddings")
+                .unwrap();
+            let elements = embeddings.shape.iter().product::<usize>() as u64;
+            let upload = crate::stream::empty_prompt_upload_bytes(elements).unwrap();
+            let all = crate::stream::backbone_pending_plan(
+                &vec![full_model.clone(), prompt.clone()],
+                "pixel.",
+                Dtype::Bfloat16,
+                None,
+            )
+            .unwrap()
+            .1;
+            for load_shape in [
+                LoadShape::EagerMaterialization,
+                LoadShape::DeferredMaterialization,
+            ] {
+                let selected: Vec<_> = full_model
+                    .iter()
+                    .filter(|header| {
+                        load_shape != LoadShape::DeferredMaterialization
+                            || header
+                                .name
+                                .strip_prefix("pixel.")
+                                .is_none_or(|name| crate::dit::Stack::of(name).is_none())
+                    })
+                    .cloned()
+                    .collect();
+                let plan = crate::stream::backbone_pending_plan(
+                    &vec![selected, prompt.clone()],
+                    "pixel.",
+                    Dtype::Bfloat16,
+                    None,
+                )
+                .unwrap()
+                .1;
+                assert!(
+                    plan.width_outputs > 0,
+                    "the selected skeleton marker conversion must run"
+                );
+                if load_shape == LoadShape::DeferredMaterialization {
+                    assert!(
+                        all.width_outputs > plan.width_outputs,
+                        "unloaded stack marker getters must not grant completion credit"
+                    );
+                }
+                let expected = plan.after_build_targets().unwrap() + upload;
+                assert_eq!(
+                    expected + plan.width_outputs,
+                    plan.constructors + upload,
+                    "exact same getter operations move out of future allocation scratch"
+                );
+                let spec = LoadSpec::new(WeightsSource::Dir(dir.clone()))
+                    .with_quant(quant)
+                    .with_load_shape(load_shape);
+                let (scratch, labels) =
+                    refused_scratch(crate::stream::EXPORT_TARGET_QUANTUM, || {
+                        crate::depth::load_depth(&spec).map(|_| ())
+                    });
+                assert_eq!(scratch, expected, "{dtype:?} {quant:?} {load_shape:?}");
+                assert!(
+                    scratch < plan.constructors + upload,
+                    "completed getter casts must not be allocated a second time"
+                );
+                assert!(labels
+                    .iter()
+                    .any(|label| label == crate::stream::LOAD_TARGET_QUANTUM));
+                let (loaded, events) = observed(AMPLE, || crate::depth::load_depth(&spec));
+                assert!(
+                    loaded.is_ok(),
+                    "accepted marker format must still load: {dtype:?} {quant:?}"
+                );
+                assert_eq!(
+                    checks(&events)
+                        .iter()
+                        .filter(|check| check.0 == crate::stream::EXPORT_TARGET_QUANTUM)
+                        .count(),
+                    1
+                );
+                drop(loaded);
+            }
+        }
+    }
+}
+
+#[test]
+fn depth_late_targets_use_only_completed_selected_numeric_width_operations() {
+    in_cpu_child(
+        "quantum_tests::depth_late_targets_use_only_completed_selected_numeric_width_operations",
+        depth_completed_width_body,
     );
 }
