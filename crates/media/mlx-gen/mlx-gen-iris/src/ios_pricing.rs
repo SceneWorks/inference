@@ -11,9 +11,10 @@
 //! adapter MLX tensors are allocated. Tokenization uses the actual tokenizer when needed.
 //! [`ios_quantum_phase`] attributes every quantum label the crate checks to its phase.
 //!
-//! A phase binds at its largest pointwise resident-plus-quantum price. Dynamic generation pairs
-//! each actual solver evaluation's rows/history/serial carry with that evaluation's forward before
-//! maximizing; independent maxima are not subtracted. `stream_tests::the_pricing_states_the_largest_check_of_
+//! Exact source windows pair each solver evaluation's rows/history/serial carry with its forward.
+//! The compatibility phase summary is a conservative envelope: maximum retained ownership plus
+//! the largest guard scratch (and that scratch's binding), which need not come from one window.
+//! Certificates use the exact windows, never a subtraction of independent summary maxima. `stream_tests::the_pricing_states_the_largest_check_of_
 //! every_phase` checks the guard formulas real runs observe — every quantum
 //! label priced at its largest observed check, no label priced that the run never checks —
 //! for generation (eager rung 0 / rung 3, deferred rung 4 under each scope, text and prompt batch,
@@ -772,6 +773,7 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         te_q::LOAD
         | crate::model::BACKBONE_LOAD_QUANTUM
         | crate::adapters::ADAPTER_LOAD_QUANTUM
+        | mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM
         | crate::adapters::ADAPTER_HOST_QUANTUM
         | crate::adapters::ADAPTER_MATERIALIZE_QUANTUM
         | depth_q::LOAD
@@ -822,6 +824,7 @@ fn quantum_labels_iter() -> impl Iterator<Item = &'static str> {
         crate::model::BACKBONE_LOAD_QUANTUM,
         crate::model::IMAGE_QUANTUM,
         crate::adapters::ADAPTER_LOAD_QUANTUM,
+        mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM,
         crate::adapters::ADAPTER_HOST_QUANTUM,
         crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
         crate::solver::PLAN_QUANTUM,
@@ -1102,6 +1105,27 @@ fn stored(headers: &[Header], keep: impl Fn(&str) -> bool) -> u64 {
         .iter()
         .filter(|h| keep(&h.name))
         .fold(0u64, |a, h| a.saturating_add(h.data_bytes))
+}
+
+/// Model/stream loaders materialize EACH retained safetensors tensor separately. The file's
+/// aggregate payload length is not its allocator charge: each request above PAGE_BYTES rounds
+/// independently (retention::allocated / the native macOS allocator). Apply that same source law
+/// before summing, without saturation. The keep predicate is the actual eager/skeleton selection;
+/// untouched streamed block payloads must not enter the skeleton's load floor.
+fn materialized_load_bytes(headers: &[Header], keep: impl Fn(&str) -> bool) -> Result<u64> {
+    headers
+        .iter()
+        .filter(|header| keep(&header.name))
+        .try_fold(0u64, |total, header| {
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(
+                header.data_bytes,
+                crate::retention::PAGE_BYTES,
+            )
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| {
+                Error::Unsupported("Iris materialized load byte arithmetic overflow".into())
+            })
+        })
 }
 
 /// `(image_and_text_share_parent, text_retains_joined_parent)` after `completed` trunk blocks.
@@ -2101,7 +2125,7 @@ fn priced_backbone_from_headers(
     let keep = |name: &str| !streamed || skeleton(name);
     // The load floor is the file the load reads: the packed export when one is assumed.
     let floor_headers = if opts.assume_packed { &built[..] } else { real };
-    let floor = stored(floor_headers, keep);
+    let floor = materialized_load_bytes(floor_headers, keep)?;
     let quant = if requantized {
         BackboneQuant::for_load(requested)?
     } else {
@@ -2648,6 +2672,8 @@ pub fn input_storage_facts(req: &IosPricingRequest<'_>) -> Result<Option<InputSt
 #[derive(Clone, Debug)]
 pub struct PricingFacts {
     pub pricing: IosPricing,
+    /// Diagnostic area of the compatibility summary's largest scratch check, not the area of
+    /// its independent resident maximum. Exact source-window geometry lives in `pricing.windows`.
     pub phase_areas: std::collections::BTreeMap<IosPhase, u64>,
     pub host_analysis: Option<IrisHostAnalysis>,
     pub metadata: Option<IrisMetadataFacts>,
@@ -2687,10 +2713,10 @@ fn take_source_at(
             "source window has wrong phase: {label}"
         );
         let total = structural.saturating_add(held);
-        let changed = pricing
-            .pricing
-            .phase(phase)
-            .is_none_or(|old| total.saturating_add(scratch) > old.peak_bytes());
+        let previous = pricing.pricing.phase(phase).cloned();
+        let largest_check = previous
+            .as_ref()
+            .is_none_or(|old| scratch > old.scratch_bytes);
         pricing.pricing.take_window(IosWindowPrice {
             phase,
             class: Some(format!("{class}/{label}/operator{operator}")),
@@ -2701,10 +2727,26 @@ fn take_source_at(
             basis: Some(basis.clone()),
             owner_domain: owner.into(),
         });
-        pricing.quanta.push((phase, label, scratch));
-        if changed {
+        // The public phase compatibility view promises the phase's largest guard and enough
+        // retained owners for every check. These independent maxima are a conservative envelope,
+        // NOT a coincident source point. Exact windows above remain the certificate authority;
+        // never subtract this summary or treat it as a native/physical lower bound.
+        let summary = pricing
+            .pricing
+            .phases
+            .iter_mut()
+            .find(|p| p.phase == phase)
+            .expect("the source window created its phase");
+        summary.resident_bytes = total.max(previous.as_ref().map_or(0, |old| old.resident_bytes));
+        if largest_check {
+            summary.scratch_bytes = scratch;
+            summary.binding = label.into();
             pricing.phase_areas.insert(phase, area);
+        } else if let Some(previous) = previous {
+            summary.scratch_bytes = previous.scratch_bytes;
+            summary.binding = previous.binding;
         }
+        pricing.quanta.push((phase, label, scratch));
     }
 }
 
@@ -3063,17 +3105,22 @@ fn generation(
         // Conservative load payload upper: source base inventory and its eventual cast parameters
         // can coexist during build. This is not a coincident physical lower or an anchor credit.
         let base_upper = add(add(load_tower, base_bb_resident)?, bb.floor)?;
-        take_source_at(
-            &mut pricing,
-            IosPhase::Load,
-            base_upper,
-            load_conditioning,
-            &[(crate::adapters::ADAPTER_HOST_QUANTUM, host)],
-            IosWorkBasis::default(),
-            "iris.generation.load/adapter_host",
-            "adapters::install before ProjectionHost constructors",
-            1,
-        );
+        if host != 0 {
+            take_source_at(
+                &mut pricing,
+                IosPhase::Load,
+                base_upper,
+                load_conditioning,
+                &[
+                    (crate::adapters::ADAPTER_HOST_QUANTUM, host), // before lazy width scalar reads
+                    (crate::adapters::ADAPTER_HOST_QUANTUM, host), // before host scalar placeholders
+                ],
+                IosWorkBasis::default(),
+                "iris.generation.load/adapter_host",
+                "adapters::install before ProjectionHost constructors",
+                1,
+            );
+        }
         let mut previous_file_payload = 0u64;
         for read in &adapter_files {
             take_source_at(
@@ -3081,10 +3128,18 @@ fn generation(
                 IosPhase::Load,
                 base_upper,
                 add(add(load_conditioning, host)?, previous_file_payload)?,
-                &[(
-                    crate::adapters::ADAPTER_LOAD_QUANTUM,
-                    read.read_guard_bytes()?,
-                )],
+                &[
+                    (
+                        crate::adapters::ADAPTER_LOAD_QUANTUM,
+                        read.read_guard_bytes()?,
+                    ),
+                    // apply_adapters_strict invokes the shared loader's own pre-file floor.
+                    // It opens the same file before any current-file graph constructor runs.
+                    (
+                        mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM,
+                        read.file_floor_bytes,
+                    ),
+                ],
                 IosWorkBasis::default(),
                 "iris.generation.load/adapter_file",
                 "adapters::install ordered strict file read/graph construction",
@@ -5104,6 +5159,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn phase_compatibility_envelope_keeps_independent_winners_and_exact_windows() {
+        for reverse in [false, true] {
+            let mut priced = Priced::default();
+            let mut points = [
+                (900, 100, dit_q::TRUNK_BLOCK, 100, 4),
+                (200, 200, dit_q::PIXEL_BLOCK, 800, 9),
+            ];
+            if reverse {
+                points.reverse();
+            }
+            for (structural, held, label, scratch, area) in points {
+                take_source_at(
+                    &mut priced,
+                    IosPhase::Denoise,
+                    structural,
+                    held,
+                    &[(label, scratch)],
+                    IosWorkBasis::default(),
+                    "test/source",
+                    "test/owner",
+                    area,
+                );
+            }
+            let phase = priced.pricing.phase(IosPhase::Denoise).unwrap();
+            assert_eq!((phase.resident_bytes, phase.scratch_bytes), (1000, 800));
+            assert_eq!(phase.binding, dit_q::PIXEL_BLOCK);
+            assert_eq!(priced.phase_areas[&IosPhase::Denoise], 9);
+            let mut windows: Vec<_> = priced
+                .pricing
+                .windows
+                .iter()
+                .map(|w| (w.resident_bytes, w.held_bytes, w.scratch_bytes))
+                .collect();
+            windows.sort_unstable();
+            assert_eq!(windows, [(200, 200, 800), (900, 100, 100)]);
+            assert_eq!(
+                priced
+                    .pricing
+                    .windows
+                    .iter()
+                    .map(IosWindowPrice::logical_peak_bytes)
+                    .max(),
+                Some(1200)
+            );
+            assert_eq!(
+                phase.peak_bytes(),
+                1800,
+                "the summary is an envelope, not a source window"
+            );
+        }
+    }
+
     /// Every quantum label the crate checks is attributed to a phase.
     ///
     /// *Mutation that reds this:* dropping any arm of `ios_quantum_phase`.
@@ -5114,6 +5222,11 @@ mod tests {
         for label in labels {
             assert!(ios_quantum_phase(label).is_some(), "{label} has no phase");
         }
+        assert!(quantum_labels().contains(&mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM));
+        assert_eq!(
+            ios_quantum_phase(mlx_gen::adapters::loader::ADAPTER_LOAD_QUANTUM),
+            Some(IosPhase::Load)
+        );
         assert_eq!(ios_quantum_phase("not an Iris quantum"), None);
     }
 }
@@ -5377,5 +5490,64 @@ mod guarded_source_tests {
         assert!(reason.contains("SourceMetadataCapacity"));
         assert!(!reason.contains("this-Iris-source"));
         assert!(reason.len() < 2048);
+    }
+}
+
+#[cfg(test)]
+mod materialized_load_floor_tests {
+    use super::*;
+
+    fn core_codes(name: &str, bits: usize) -> Header {
+        // Exact production packing: 384 output rows, 64 inputs, u32 code words.
+        let words = 64 * bits / 32;
+        Header {
+            name: name.into(),
+            dtype: Stored::U32,
+            shape: vec![384, words],
+            data_bytes: (384 * words * 4) as u64,
+        }
+    }
+
+    #[test]
+    fn q8_core_code_operands_round_separately_before_load_sum() {
+        let headers = [
+            core_codes("modulation_cores.adaln_img.weight", 8),
+            core_codes("modulation_cores.adaln_txt.weight", 8),
+        ];
+        let page = crate::retention::PAGE_BYTES;
+        assert_eq!(headers[0].data_bytes, page + page / 2);
+        assert_eq!(stored(&headers, |_| true), 3 * page);
+        assert_eq!(
+            materialized_load_bytes(&headers, |_| true).unwrap(),
+            4 * page
+        );
+    }
+
+    #[test]
+    fn q4_codes_stay_exact_and_streamed_stack_headers_are_not_loaded() {
+        let headers = [
+            core_codes("modulation_cores.adaln_img.weight", 4),
+            core_codes("modulation_cores.adaln_txt.weight", 4),
+            core_codes("blocks.0.attn.qkv.weight", 8),
+        ];
+        let skeleton = |name: &str| Stack::of(name).is_none();
+        assert_eq!(
+            materialized_load_bytes(&headers, skeleton).unwrap(),
+            stored(&headers, skeleton)
+        );
+        assert!(
+            materialized_load_bytes(&headers, |_| true).unwrap()
+                > materialized_load_bytes(&headers, skeleton).unwrap()
+        );
+    }
+
+    #[test]
+    fn materialized_load_rejects_rounding_and_sum_overflow() {
+        let mut header = core_codes("modulation_cores.adaln_img.weight", 8);
+        header.data_bytes = u64::MAX;
+        assert!(materialized_load_bytes(std::slice::from_ref(&header), |_| true).is_err());
+        header.data_bytes = u64::MAX - (crate::retention::PAGE_BYTES - 1);
+        let headers = [header, core_codes("modulation_cores.adaln_txt.weight", 8)];
+        assert!(materialized_load_bytes(&headers, |_| true).is_err());
     }
 }

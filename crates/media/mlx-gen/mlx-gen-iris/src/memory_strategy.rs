@@ -718,18 +718,37 @@ pub(crate) fn backbone_bytes_from_headers(
             .name
             .strip_suffix(".bias")
             .is_some_and(|base| projections.contains(base));
+        let allocated = crate::retention::allocated;
         let bytes = match header.shape.as_slice() {
-            _ if packed_part => header.data_bytes,
-            [_] if projection_bias => elements * width,
-            [out, input] if header.name.ends_with(".weight") => crate::nn::ProjectionLayout::of(
-                *input, quant,
-            )
-            .weight_bytes(*out as u64, *input as u64, width),
-            shape if shape.len() >= 2 && !position_table => elements * width,
-            _ => header.data_bytes,
+            _ if packed_part => allocated(header.data_bytes),
+            [_] if projection_bias => allocated(elements * width),
+            [out, input] if header.name.ends_with(".weight") => {
+                match crate::nn::ProjectionLayout::of(*input, quant) {
+                    crate::nn::ProjectionLayout::Dense => allocated(elements * width),
+                    crate::nn::ProjectionLayout::Quantized { bits, padded_in } => {
+                        // quantize returns three distinct arrays: uint32 codes, BF16 scales,
+                        // BF16 biases. Each buffer is rounded separately, never their byte sum.
+                        let out = *out as u64;
+                        let padded = padded_in as u64;
+                        let codes = allocated(out * padded * bits as u64 / 8);
+                        let table =
+                            allocated(out * (padded / crate::nn::QUANT_GROUP_SIZE as u64) * 2);
+                        codes
+                            .checked_add(table)
+                            .and_then(|n| n.checked_add(table))
+                            .ok_or_else(|| {
+                                CoreError::Msg(format!(
+                                    "{MODEL_ID}: packed projection byte sum overflow"
+                                ))
+                            })?
+                    }
+                }
+            }
+            shape if shape.len() >= 2 && !position_table => allocated(elements * width),
+            _ => allocated(header.data_bytes),
         };
         total = total
-            .checked_add(crate::retention::allocated(bytes))
+            .checked_add(bytes)
             .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: backbone byte sum overflow")))?;
     }
     Ok(total)
@@ -1363,6 +1382,46 @@ mod tests {
 
     fn elements(header: &SafetensorsTensorHeader) -> u64 {
         header.shape.iter().map(|&d| d as u64).product()
+    }
+
+    /// Independent allocation oracle: the loader owns each tensor/buffer separately. Do not call
+    /// the production retained-byte helpers here, or a missing rounding term would self-validate.
+    fn allocation_oracle(bytes: u64) -> u64 {
+        let page = crate::retention::PAGE_BYTES;
+        if bytes <= page {
+            bytes
+        } else {
+            bytes.div_ceil(page) * page
+        }
+    }
+
+    #[test]
+    fn packed_resident_rounds_the_three_buffers_separately() {
+        for input in [128usize, 192] {
+            let out = 128usize;
+            let header = SafetensorsTensorHeader {
+                name: "projection.weight".into(),
+                dtype: gen_core::weightsmeta::Dtype::F32,
+                shape: vec![out, input],
+                data_bytes: (out * input * 4) as u64,
+            };
+            let codes = (out * input) as u64; // Q8, one byte per input element.
+            let table = (out * (input / 64) * 2) as u64; // independent BF16 scale/bias arrays.
+            let expected = allocation_oracle(codes) + allocation_oracle(table) * 2;
+            let actual = backbone_bytes_from_headers(
+                &[header],
+                Precision::Bf16,
+                crate::nn::BackboneQuant::for_load(Some(Quant::Q8)).unwrap(),
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_ne!(
+                expected,
+                allocation_oracle(codes + table * 2),
+                "a rounded concatenation is not the three allocations returned by quantize"
+            );
+        }
     }
 
     /// The ladder each route publishes, on every surface it witnesses.
@@ -2225,12 +2284,35 @@ mod tests {
             let matrix_elements = sum(&weights, |h| if matrix(h) { elements(h) } else { 0 });
             let stored_rest = sum(&weights, |h| if matrix(h) { 0 } else { h.data_bytes });
             assert!(matrix_elements > 0 && stored_rest > 0);
+            let headers = safetensors_path_tensor_headers(&weights).unwrap();
+            // Loader::linear casts the bias of each matrix projection to its compute dtype;
+            // other vectors and the position table stay stored. Round each resulting allocation.
+            let projection_biases: std::collections::BTreeSet<_> = headers
+                .iter()
+                .filter(|h| h.shape.len() == 2)
+                .filter_map(|h| h.name.strip_suffix(".weight"))
+                .map(|name| format!("{name}.bias"))
+                .collect();
+            let backbone_at = |width| {
+                sum(&weights, |h| {
+                    allocation_oracle(if matrix(h) || projection_biases.contains(&h.name) {
+                        elements(h) * width
+                    } else {
+                        h.data_bytes
+                    })
+                })
+            };
+            assert_ne!(
+                backbone_at(2),
+                matrix_elements * 2 + stored_rest,
+                "this fixture distinguishes raw artifact payload from retained allocations"
+            );
 
             let bf16 = loaded(task, &spec);
             gen_core_testkit::memory_strategy_conformance(&bf16);
             gen_core_testkit::assert_memory_contract_facts_conform(&bf16);
             let facts = bf16.asset_facts;
-            assert_eq!(facts.transformer_bytes, matrix_elements * 2 + stored_rest);
+            assert_eq!(facts.transformer_bytes, backbone_at(2));
             assert_eq!(facts.decoder_bytes, 0, "pixel space");
             assert_eq!(facts.overlay_bytes, 0);
             assert_eq!(
@@ -2241,10 +2323,7 @@ mod tests {
             let mut fp32_spec = spec.clone();
             fp32_spec.precision = Precision::Fp32;
             let fp32 = loaded(task, &fp32_spec);
-            assert_eq!(
-                fp32.asset_facts.transformer_bytes,
-                matrix_elements * 4 + stored_rest
-            );
+            assert_eq!(fp32.asset_facts.transformer_bytes, backbone_at(4));
             // The conditioning never follows the backbone's precision: the text tower is bf16
             // whatever the backbone computes in, and the empty prompt is stored f32.
             assert_eq!(
@@ -2372,17 +2451,32 @@ mod tests {
             out * padded_in * bits / 8 + out * (padded_in / group) * 4
         };
         let backbone = fixtures().join("tiny-snapshot/iris/model.safetensors");
+        let headers = safetensors_path_tensor_headers(&backbone).unwrap();
+        let projection_biases: std::collections::BTreeSet<_> = headers
+            .iter()
+            .filter(|h| h.shape.len() == 2)
+            .filter_map(|h| h.name.strip_suffix(".weight"))
+            .map(|name| format!("{name}.bias"))
+            .collect();
         let backbone_at = |bits: Option<u64>, pad: bool| {
             sum(&backbone, |h| match (h.shape.as_slice(), bits) {
                 ([out, input], Some(bits))
                     if h.name.ends_with(".weight") && *input >= 64 && (input % 64 == 0 || pad) =>
                 {
-                    packed(*out as u64, input.div_ceil(64) as u64 * 64, bits, 64)
+                    let out = *out as u64;
+                    let padded = input.div_ceil(64) as u64 * 64;
+                    let codes = allocation_oracle(out * padded * bits / 8);
+                    let scales = allocation_oracle(out * (padded / 64) * 2);
+                    let biases = allocation_oracle(out * (padded / 64) * 2);
+                    codes + scales + biases
                 }
-                (shape, _) if shape.len() >= 2 && !h.name.ends_with("y_pos_embedding") => {
-                    elements(h) * 2
+                (shape, _)
+                    if (shape.len() >= 2 && !h.name.ends_with("y_pos_embedding"))
+                        || projection_biases.contains(&h.name) =>
+                {
+                    allocation_oracle(elements(h) * 2)
                 }
-                _ => h.data_bytes,
+                _ => allocation_oracle(h.data_bytes),
             })
         };
         let tower_at = |bits: Option<u64>| {

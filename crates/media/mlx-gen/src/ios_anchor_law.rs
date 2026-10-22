@@ -536,6 +536,30 @@ impl MeasuredRun {
     }
 }
 
+/// The existing CPU-fixture sample point, with its original native reads retained as scalars.
+/// `phase` is the interval attribution used by `measure_phases`, NOT a claim that `label` caused
+/// the interval peak. A Checked point is before construction; Synchronized is after completion.
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Copy, Debug)]
+pub struct NativePhaseSample<'a> {
+    pub label: &'a str,
+    pub event: NativePhaseSampleEvent,
+    pub phase: Option<IosPhase>,
+    pub previous_opens: bool,
+    pub baseline: u64,
+    pub interval_peak: u64,
+    pub active: u64,
+    pub growth: u64,
+}
+
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativePhaseSampleEvent {
+    Checked,
+    Synchronized,
+    Tail,
+}
+
 /// Measure a tiny CPU fixture's MLX active-memory intervals for provider proofs.
 /// This existing observer is NOT a kernel-physical capture.
 #[cfg(not(target_os = "ios"))]
@@ -543,20 +567,48 @@ pub fn measure_phases<T>(
     phase_of: crate::ios_pricing::IosQuantumPhase,
     body: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<(T, MeasuredRun)> {
+    measure_phases_inner(phase_of, body, None)
+}
+
+/// CPU-fixture-only diagnostic companion. A sink may retain ALREADY queried scalar values in
+/// fixed storage; it must not perform native work or sample memory again. No new native reads,
+/// synchronization, reset points or phase attribution are introduced by this companion.
+#[cfg(not(target_os = "ios"))]
+pub fn measure_phases_with_samples<T>(
+    phase_of: crate::ios_pricing::IosQuantumPhase,
+    sample: impl for<'a> FnMut(NativePhaseSample<'a>) + 'static,
+    body: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<(T, MeasuredRun)> {
+    measure_phases_inner(phase_of, body, Some(Box::new(sample)))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn measure_phases_inner<T>(
+    phase_of: crate::ios_pricing::IosQuantumPhase,
+    body: impl FnOnce() -> crate::Result<T>,
+    sample: Option<Box<dyn for<'a> FnMut(NativePhaseSample<'a>)>>,
+) -> crate::Result<(T, MeasuredRun)> {
     use crate::ios_quantum::QuantumEvent;
     use std::cell::RefCell;
     use std::rc::Rc;
+    let sample = sample.map(|sink| Rc::new(RefCell::new(sink)));
     crate::residency::drain_allocator_cache();
     let baseline = mlx_rs::memory::get_active_memory() as u64;
     mlx_rs::memory::reset_peak_memory();
     type State = (Option<IosPhase>, bool, BTreeMap<IosPhase, u64>);
     let state: Rc<RefCell<State>> = Rc::new(RefCell::new((None, false, BTreeMap::new())));
     let peak_now = || {
-        (mlx_rs::memory::get_peak_memory() as u64).max(mlx_rs::memory::get_active_memory() as u64)
+        // Exactly the original two reads, in their original order. Keep both values rather than
+        // querying either again for diagnostics.
+        let peak = mlx_rs::memory::get_peak_memory() as u64;
+        let active = mlx_rs::memory::get_active_memory() as u64;
+        (peak.max(active), peak, active)
     };
     let sink = Rc::clone(&state);
+    let sample_sink = sample.clone();
     let record = move |label: &str, opens: bool| {
-        let peak = peak_now().saturating_sub(baseline);
+        let (absolute, interval_peak, active) = peak_now();
+        let peak = absolute.saturating_sub(baseline);
         mlx_rs::memory::reset_peak_memory();
         let mut s = sink.borrow_mut();
         let here = phase_of(label);
@@ -565,8 +617,26 @@ pub fn measure_phases<T>(
             let slot = s.2.entry(phase).or_insert(0);
             *slot = (*slot).max(peak);
         }
+        let previous_opens = s.1;
         s.0 = here;
         s.1 = opens;
+        drop(s);
+        if let Some(sample) = &sample_sink {
+            sample.borrow_mut()(NativePhaseSample {
+                label,
+                event: if opens {
+                    NativePhaseSampleEvent::Checked
+                } else {
+                    NativePhaseSampleEvent::Synchronized
+                },
+                phase: target,
+                previous_opens,
+                baseline,
+                interval_peak,
+                active,
+                growth: peak,
+            });
+        }
     };
     let record = Rc::new(record);
     let observer = {
@@ -577,8 +647,21 @@ pub fn measure_phases<T>(
         }
     };
     let value = crate::ios_quantum::with_cpu_diagnostic_observer(observer, body)?;
-    let tail = peak_now().saturating_sub(baseline);
+    let (absolute, interval_peak, active) = peak_now();
+    let tail = absolute.saturating_sub(baseline);
     let mut s = state.borrow_mut();
+    if let Some(sample) = &sample {
+        sample.borrow_mut()(NativePhaseSample {
+            label: "",
+            event: NativePhaseSampleEvent::Tail,
+            phase: s.0,
+            previous_opens: s.1,
+            baseline,
+            interval_peak,
+            active,
+            growth: tail,
+        });
+    }
     if let Some(phase) = s.0 {
         let slot = s.2.entry(phase).or_insert(0);
         *slot = (*slot).max(tail);

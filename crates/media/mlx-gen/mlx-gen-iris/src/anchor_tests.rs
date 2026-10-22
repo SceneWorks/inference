@@ -133,6 +133,310 @@ fn proved_selections(
 struct Captured {
     run: MeasuredRun,
     observations: Vec<IosAnchorObservation>,
+    diagnostics: Option<[NativeTrace; 3]>,
+}
+
+// Fixed scalar storage only; allocated before the measurement baseline. These are interval
+// sample boundaries, NOT an assertion that a kernel at `label` caused the interval peak.
+#[derive(Clone, Copy)]
+struct NativeTracePoint {
+    event: mlx_gen::ios_anchor_law::NativePhaseSampleEvent,
+    ordinal: usize,
+    label: Option<usize>,
+    previous_label: Option<usize>,
+    check: Option<usize>,
+    previous_check: Option<usize>,
+    previous_opens: bool,
+    baseline: u64,
+    peak: u64,
+    active: u64,
+    growth: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeTrace {
+    points: [Option<NativeTracePoint>; 16],
+    ordinal: usize,
+    checks: usize,
+    previous_label: Option<usize>,
+    previous_check: Option<usize>,
+    denoise_samples: usize,
+    repeat_peak: u64,
+}
+
+impl NativeTrace {
+    fn retain(&mut self, sample: mlx_gen::ios_anchor_law::NativePhaseSample<'_>, labels: &[&str]) {
+        use mlx_gen::ios_anchor_law::NativePhaseSampleEvent;
+        let label = labels.iter().position(|known| *known == sample.label);
+        let check = match sample.event {
+            NativePhaseSampleEvent::Checked => {
+                let n = self.checks;
+                self.checks += 1;
+                Some(n)
+            }
+            NativePhaseSampleEvent::Synchronized => self.previous_check,
+            NativePhaseSampleEvent::Tail => None,
+        };
+        let point = NativeTracePoint {
+            event: sample.event,
+            ordinal: self.ordinal,
+            label,
+            previous_label: self.previous_label,
+            check,
+            previous_check: self.previous_check,
+            previous_opens: sample.previous_opens,
+            baseline: sample.baseline,
+            peak: sample.interval_peak,
+            active: sample.active,
+            growth: sample.growth,
+        };
+        if sample.phase == Some(IosPhase::Denoise) {
+            self.denoise_samples += 1;
+            let slot = self
+                .points
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or_else(|| {
+                    self.points
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, p)| p.unwrap().growth)
+                        .unwrap()
+                        .0
+                });
+            // Strict > preserves the earliest tied samples deterministically. A global maximum
+            // can never be displaced by a smaller sample; no unbounded event buffer is collected.
+            if self.points[slot].is_none_or(|old| point.growth > old.growth) {
+                self.points[slot] = Some(point);
+            }
+        }
+        self.ordinal += 1;
+        self.previous_label = label;
+        if matches!(sample.event, NativePhaseSampleEvent::Checked) {
+            self.previous_check = check;
+        }
+    }
+}
+
+#[test]
+fn native_trace_retention_is_fixed_bounded_and_keeps_peak_and_first_ties() {
+    use mlx_gen::ios_anchor_law::{NativePhaseSample, NativePhaseSampleEvent};
+    let mut trace = NativeTrace::default();
+    for n in 0..40 {
+        trace.retain(
+            NativePhaseSample {
+                label: "known",
+                event: NativePhaseSampleEvent::Checked,
+                phase: Some(IosPhase::Denoise),
+                previous_opens: false,
+                baseline: 100,
+                interval_peak: 100 + n,
+                active: 100,
+                growth: n,
+            },
+            &["known"],
+        );
+    }
+    assert_eq!(trace.points.iter().flatten().count(), 16);
+    assert_eq!(trace.denoise_samples, 40);
+    assert_eq!(
+        trace.points.iter().flatten().map(|p| p.growth).min(),
+        Some(24)
+    );
+    assert_eq!(
+        trace.points.iter().flatten().map(|p| p.growth).max(),
+        Some(39)
+    );
+    let before = trace.points.map(|p| p.unwrap().ordinal);
+    trace.retain(
+        NativePhaseSample {
+            label: "unknown",
+            event: NativePhaseSampleEvent::Tail,
+            phase: Some(IosPhase::Denoise),
+            previous_opens: false,
+            baseline: 100,
+            interval_peak: 124,
+            active: 100,
+            growth: 24,
+        },
+        &["known"],
+    );
+    assert_eq!(
+        trace.points.map(|p| p.unwrap().ordinal),
+        before,
+        "later equal peaks do not displace earlier ties"
+    );
+    assert_eq!(
+        trace
+            .points
+            .iter()
+            .flatten()
+            .find(|p| p.growth == 39)
+            .unwrap()
+            .check,
+        Some(39)
+    );
+}
+
+fn native_trace_enabled() -> bool {
+    matches!(std::env::var("IRIS_STREAM_CPU_CHILD").as_deref(),
+        Ok("anchor_tests::actual_sampling_epochs_bound_both_solvers_cfg_intervals_and_serial_outputs")
+        | Ok("anchor_tests::prompt_batch_derivability_is_measured_at_both_endpoints_per_phase"))
+}
+
+/// Print only after all repeats have finished, and only for the two failing fixture children.
+/// Labels come from the predeclared static inventory, never arbitrary observed strings or paths.
+fn report_native_underprediction(side: &str, captured: &Captured, pricing: &IosPricing) {
+    let Some(traces) = &captured.diagnostics else {
+        return;
+    };
+    let Some(phase) = pricing.phase(IosPhase::Denoise) else {
+        return;
+    };
+    let Some(&measured) = captured.run.phases.get(&IosPhase::Denoise) else {
+        return;
+    };
+    if phase.peak_bytes() >= measured {
+        return;
+    }
+    let labels = crate::ios_pricing::quantum_labels();
+    let static_label =
+        |id: Option<usize>| id.and_then(|n| labels.get(n)).copied().unwrap_or("<none>");
+    let plan = pricing
+        .windows
+        .iter()
+        .filter(|w| w.label == crate::solver::PLAN_QUANTUM)
+        .map(|w| w.scratch_bytes)
+        .max()
+        .unwrap_or(0);
+    eprintln!("IRIS_NATIVE_DIAG side={side} phase=denoise measured={measured} summary_resident={} summary_scratch={} plan_guard={plan} interval_labels_not_kernel_attribution=true",
+        phase.resident_bytes, phase.scratch_bytes);
+    for (repeat, trace) in traces.iter().enumerate() {
+        let retained_peak = trace
+            .points
+            .iter()
+            .flatten()
+            .map(|p| p.growth)
+            .max()
+            .unwrap_or(0);
+        eprintln!("IRIS_NATIVE_REPEAT side={side} repeat={repeat} phase_peak={} retained_peak={retained_peak} phase_winner={} samples={} retained={} omitted={}",
+            trace.repeat_peak, trace.repeat_peak == measured, trace.denoise_samples,
+            trace.points.iter().flatten().count(), trace.denoise_samples.saturating_sub(16));
+        let mut points = trace.points;
+        points.sort_by_key(|p| p.map_or(usize::MAX, |p| p.ordinal));
+        for point in points.into_iter().flatten() {
+            eprintln!("IRIS_NATIVE_INTERVAL side={side} repeat={repeat} ordinal={} event={:?} label={} previous_label={} previous_opens={} check={:?} previous_check={:?} baseline={} interval_peak={} active={} growth={}",
+                point.ordinal, point.event, static_label(point.label), static_label(point.previous_label),
+                point.previous_opens, point.check, point.previous_check, point.baseline,
+                point.peak, point.active, point.growth);
+            let mut last_check = None;
+            for check in [point.previous_check, point.check]
+                .into_iter()
+                .flatten()
+                .take(2)
+            {
+                if last_check == Some(check) {
+                    continue;
+                }
+                last_check = Some(check);
+                let Some(observed) = captured.observations[repeat].checks.get(check) else {
+                    continue;
+                };
+                for &index in observed.context.iter().take(6) {
+                    let Some(meta) = captured.observations[repeat].metadata.get(index as usize)
+                    else {
+                        continue;
+                    };
+                    // Only static kind names and a fixed scalar whitelist; no arbitrary payload.
+                    let kind = match meta.kind.as_str() {
+                        "solver" => "solver",
+                        "dit_block" => "dit_block",
+                        "dit_window" => "dit_window",
+                        "dit_output" => "dit_output",
+                        "solve_complete" => "solve_complete",
+                        "allocation_scope" => "allocation_scope",
+                        _ => "other",
+                    };
+                    let fields = [
+                        "stack",
+                        "index",
+                        "row",
+                        "rows",
+                        "evaluation",
+                        "guided",
+                        "update_order",
+                        "first",
+                        "terminal",
+                        "prior_completed_steps",
+                        "conditioning_rows",
+                        "input_f32",
+                        "evaluations",
+                    ]
+                    .map(|key| (key, meta.fields.get(key).copied()));
+                    eprintln!("IRIS_NATIVE_CONTEXT repeat={repeat} check={check} context={index} kind={kind} fields={fields:?}");
+                }
+            }
+        }
+    }
+    let matching = |w: &mlx_gen::ios_pricing::IosWindowPrice| {
+        w.phase == IosPhase::Denoise
+            && traces
+                .iter()
+                .flat_map(|t| t.points.iter().flatten())
+                .any(|p| {
+                    [p.label, p.previous_label]
+                        .into_iter()
+                        .flatten()
+                        .any(|id| labels[id] == w.label)
+                })
+    };
+    let mut top: [Option<(usize, u64)>; 8] = [None; 8];
+    let mut total = 0usize;
+    for (index, window) in pricing
+        .windows
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| matching(w))
+    {
+        total += 1;
+        let slot = top.iter().position(Option::is_none).unwrap_or_else(|| {
+            top.iter()
+                .enumerate()
+                .min_by_key(|(_, p)| p.unwrap().1)
+                .unwrap()
+                .0
+        });
+        if top[slot].is_none_or(|old| window.logical_peak_bytes() > old.1) {
+            top[slot] = Some((index, window.logical_peak_bytes()));
+        }
+    }
+    eprintln!(
+        "IRIS_NATIVE_WINDOWS matching={total} retained={} omitted={}",
+        total.min(8),
+        total.saturating_sub(8)
+    );
+    for (index, _) in top.into_iter().flatten() {
+        let w = &pricing.windows[index];
+        let class = w.class.as_deref().unwrap_or("");
+        let flag = |prefix: &str| {
+            class
+                .split('/')
+                .find_map(|part| part.strip_prefix(prefix)?.parse::<bool>().ok())
+        };
+        let op = class
+            .split('/')
+            .find_map(|part| part.strip_prefix("op")?.parse::<u64>().ok());
+        eprintln!("IRIS_NATIVE_WINDOW_FLAGS index={index} op={op:?} guided={:?} history={:?} first={:?} terminal={:?} serial={:?}",
+            flag("guided"), flag("history"), flag("first"), flag("terminal"), flag("serial"));
+        eprintln!(
+            "IRIS_NATIVE_WINDOW index={index} label={} resident={} held={} scratch={} basis={:?}",
+            static_label(labels.iter().position(|label| *label == w.label)),
+            w.resident_bytes,
+            w.held_bytes,
+            w.scratch_bytes,
+            w.basis
+        );
+    }
 }
 
 impl std::ops::Deref for Captured {
@@ -245,11 +549,35 @@ fn measure(mut body: impl FnMut() -> mlx_gen::Result<()>) -> Captured {
         phases: BTreeMap::new(),
     };
     let mut observations = Vec::new();
+    let labels = native_trace_enabled().then(|| Rc::new(crate::ios_pricing::quantum_labels()));
+    let mut diagnostics = labels.as_ref().map(|_| [NativeTrace::default(); 3]);
     for repeat in 0..3 {
+        let trace = labels
+            .as_ref()
+            .map(|_| Rc::new(RefCell::new(NativeTrace::default())));
         let (((), run), observation) = observe_marks(|| {
-            with_cpu_diagnostic_headroom(AMPLE, || measure_phases(ios_quantum_phase, &mut body))
-                .unwrap()
+            with_cpu_diagnostic_headroom(AMPLE, || {
+                if let (Some(trace), Some(labels)) = (&trace, &labels) {
+                    let trace = Rc::clone(trace);
+                    let labels = Rc::clone(labels);
+                    mlx_gen::ios_anchor_law::measure_phases_with_samples(
+                        ios_quantum_phase,
+                        move |sample: mlx_gen::ios_anchor_law::NativePhaseSample<'_>| {
+                            trace.borrow_mut().retain(sample, &labels);
+                        },
+                        &mut body,
+                    )
+                } else {
+                    measure_phases(ios_quantum_phase, &mut body)
+                }
+            })
+            .unwrap()
         });
+        if let (Some(trace), Some(diagnostics)) = (trace, &mut diagnostics) {
+            let mut trace = *trace.borrow();
+            trace.repeat_peak = run.phases.get(&IosPhase::Denoise).copied().unwrap_or(0);
+            diagnostics[repeat] = trace;
+        }
         eprintln!("CAPTURE repeat {repeat}: {} {:?}", run.demand, run.phases);
         assert!(
             !observation.checks.is_empty(),
@@ -265,6 +593,7 @@ fn measure(mut body: impl FnMut() -> mlx_gen::Result<()>) -> Captured {
     Captured {
         run: worst,
         observations,
+        diagnostics,
     }
 }
 
@@ -414,6 +743,8 @@ fn check(
         derived: Ok(0),
         over: Vec::new(),
     };
+    report_native_underprediction("anchor", anchor_run, at_anchor);
+    report_native_underprediction("request", measured, priced);
     for (side, run, pricing) in [
         ("anchor", &anchor_run.run, at_anchor),
         ("request", &measured.run, priced),

@@ -305,6 +305,12 @@ impl Weights {
         })
     }
 
+    /// Inspect an array's metadata without consuming its loader key. This borrows the original
+    /// handle: it neither records access, clones a key/array, nor evaluates a lazy tensor.
+    pub fn peek(&self, key: &str) -> Option<&Array> {
+        self.tensors.get(key)
+    }
+
     pub fn get(&self, key: &str) -> Option<&Array> {
         let value = self.tensors.get(key)?;
         self.accessed.borrow_mut().insert(key.to_owned());
@@ -484,6 +490,67 @@ pub fn join(prefix: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_borrows_without_consuming_or_changing_array_identity() {
+        #[cfg(target_os = "macos")]
+        const CHILD: &str = "MLX_WEIGHTS_PEEK_CPU_CHILD";
+        #[cfg(target_os = "macos")]
+        const DONE: &str = "MLX_WEIGHTS_PEEK_CPU_DONE";
+        #[cfg(target_os = "macos")]
+        {
+            const FQN: &str =
+                "weights::tests::peek_borrows_without_consuming_or_changing_array_identity";
+            if std::env::var(CHILD).as_deref() != Ok(FQN) {
+                let dir = tempfile::tempdir().unwrap();
+                let marker = dir.path().join("done");
+                assert!(marker.is_absolute() && !marker.exists());
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, FQN)
+                    .env(DONE, &marker)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "weights peek CPU child failed");
+                assert_eq!(std::fs::read(marker).unwrap().as_slice(), b"ok");
+                return;
+            }
+            let marker = std::path::PathBuf::from(std::env::var(DONE).unwrap());
+            assert!(marker.is_absolute() && !marker.exists());
+            mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+            assert_eq!(
+                mlx_rs::Device::try_default().unwrap(),
+                mlx_rs::Device::cpu()
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
+                0
+            );
+            assert_eq!(
+                mlx_rs::Stream::new().get_index().unwrap(),
+                mlx_rs::Stream::cpu().get_index().unwrap()
+            );
+            assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+            assert!(crate::ios_quantum::quantum_metal_guard::metal_forbidden());
+        }
+        let mut weights = Weights::empty();
+        weights.insert("w", Array::from_slice(&[1i32], &[]));
+        assert!(weights.peek("missing").is_none());
+        let inspected = weights.peek("w").unwrap();
+        assert!(std::ptr::eq(inspected, weights.peek("w").unwrap()));
+        assert_eq!(weights.unused_keys(), ["w"]);
+        assert!(std::ptr::eq(inspected, weights.get("w").unwrap()));
+        assert!(weights.unused_keys().is_empty());
+        assert!(weights.get("missing").is_none());
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
+                0
+            );
+            std::fs::write(std::env::var(DONE).unwrap(), b"ok").unwrap();
+        }
+    }
 
     #[test]
     fn round_trip_file_with_metadata() {

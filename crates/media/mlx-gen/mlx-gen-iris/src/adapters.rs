@@ -178,13 +178,37 @@ fn peek(weights: &mut Weights, key: &str) -> Option<Array> {
 /// Shapes the actual dense install host exposes, including the logical (unpadded) width of an
 /// already-packed artifact. Only the packed width scalar is read; no base cast/placeholder is built.
 fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, [i32; 2]>, u64)> {
+    // Borrow metadata only: get() would mark consumption and clone key strings; neither a
+    // cloned key list nor a tensor/shape allocation belongs ahead of this native check.
+    let mut packed = 0_u64;
+    for key in weights.keys() {
+        let Some(path) = key.strip_suffix(".weight") else {
+            continue;
+        };
+        let Some(weight) = weights.peek(key) else {
+            continue;
+        };
+        if weight.ndim() == 2
+            && weights
+                .keys()
+                .any(|name| name.strip_suffix(".scales") == Some(path))
+        {
+            packed = packed.checked_add(1).ok_or_else(|| {
+                Error::Unsupported("iris: packed adapter-host projection count overflow".into())
+            })?;
+        }
+    }
+    if packed != 0 {
+        // Packed-format width markers are scalar I32 (four bytes); validate that metadata below
+        // before try_item. This guard protects the sum of their native source payloads.
+        mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_constructor_bytes(packed)?)?;
+    }
     let keys: Vec<String> = weights
         .keys()
         .filter(|k| k.ends_with(".weight"))
         .map(str::to_owned)
         .collect();
     let mut shapes = BTreeMap::new();
-    let mut packed = 0_u64;
     for key in keys {
         let Some(weight) = peek(weights, &key) else {
             continue;
@@ -199,9 +223,6 @@ fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, 
                     "iris: {path} has non-matrix packed scales"
                 )));
             }
-            packed = packed.checked_add(1).ok_or_else(|| {
-                Error::Unsupported("iris: packed adapter-host projection count overflow".into())
-            })?;
             let padded = scales.shape()[1]
                 .checked_mul(crate::nn::QUANT_GROUP_SIZE as i32)
                 .ok_or_else(|| {
@@ -211,7 +232,14 @@ fn logical_projection_shapes(weights: &mut Weights) -> Result<(BTreeMap<String, 
                 weights,
                 &format!("{path}{}", crate::packed::IN_FEATURES_SUFFIX),
             ) {
-                Some(width) => width.try_item::<i32>()?,
+                Some(width) => {
+                    if width.dtype() != Dtype::Int32 || !width.shape().is_empty() {
+                        return Err(Error::Unsupported(format!(
+                            "iris: {path} packed width must be a scalar I32"
+                        )));
+                    }
+                    width.try_item::<i32>()?
+                }
                 None => padded,
             }
         } else {
@@ -270,7 +298,12 @@ pub fn install(
     let inventory = header_inventory(specs, &shapes, compute, task, base_model)?;
     let load_facts = inventory.projection_loads()?;
     let file_reads = inventory.file_read_facts()?;
-    mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_constructor_bytes(packed)?)?;
+    let host_bytes = host_constructor_bytes(packed)?;
+    // Only packed projections construct scalar-backed placeholders. A dense install creates no
+    // native host payload here: its first allocating boundary is the file's ADAPTER_LOAD check.
+    if host_bytes != 0 {
+        mlx_gen::ios_quantum::before(ADAPTER_HOST_QUANTUM, host_bytes)?;
+    }
     let mut host = ProjectionHost::from_weights(weights, compute)?;
     let mut reports = Vec::with_capacity(specs.len());
     for (spec, read) in specs.iter().zip(&file_reads) {

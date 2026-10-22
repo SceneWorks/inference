@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-21T23:04:51.745819+00:00",
-  "rust_proof_closure_sha256": "0ebdc64006be5b63527ed70d08320cebc3491eea55e46dce0c8b8303853dc6d9",
+  "UTC": "2026-10-22T01:50:45.944947+00:00",
+  "rust_proof_closure_sha256": "b9c014b35034c977811cef5749bb9bb2765a00d8cb0cd23f9a3b6f1595819926",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -232,11 +232,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/adapters.rs",
-      "sha256": "92e6aefad034325d1d66609e7987c5c4a32386e87b51df2ad832d5a28a8c8dc7"
+      "sha256": "2f46b0b506d63a9d46902cf13f9017ee52b07737bf04caf6f3f1bd5a6dbf26ad"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/anchor_tests.rs",
-      "sha256": "935b6c65c618a9b85fd4660db940e61c3f3b9ea0048b3c6c32a0c44eb9edba09"
+      "sha256": "a74a2523b093e8030bfefb05809ab07f65aabbe9f2999bace44bf2feb1319200"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/depth.rs",
@@ -248,7 +248,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing.rs",
-      "sha256": "c033b63152537683c73d1a030475fec19149c8fbe7eb5c8ff4aba74e41bf5275"
+      "sha256": "2769bb22006218702fb3125a59c55588c8165c8fc5a1686460d111be4c2cb2da"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/ios_pricing/bounder.rs",
@@ -260,7 +260,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/memory_strategy.rs",
-      "sha256": "411b09a00585e299295b627b4720164c42bb423606ec6757c77526ae05c3a44a"
+      "sha256": "bd69239f915050cdf8dc76364d61731430c9e4392bc7fad38f13cc587b1e0c74"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/model.rs",
@@ -284,7 +284,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/quantum_tests.rs",
-      "sha256": "a7cbad08ce48aac8610912443811c26e73c352cf046c52dbd4e146b1c7425c4f"
+      "sha256": "d1ee9754049df8e425ab6519e3845b1f3d866abaf267b1387d07a268e874a93c"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-iris/src/reachable_sizes.rs",
@@ -840,7 +840,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_anchor_law.rs",
-      "sha256": "ec52f13db70590eb691c2e39e5601bf5212a439a140619389a7e1f8b351b4d97"
+      "sha256": "6cb829383d04c47f23de1ee27c13d41ce557c9c7bc976ec50ff662a3dbbfae75"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
@@ -884,7 +884,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/weights.rs",
-      "sha256": "1d00969b2298236a790b53d29771b1dd62e0ccad0e21e67fb1a5dd0bdee68a14"
+      "sha256": "93fd99660c78fba835dd8ee7c20bdfff1232e971a7bbcfefd5cbb4f8be356b69"
     },
     {
       "path": "docs/ios-device-runbook.md",
@@ -2374,15 +2374,16 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "5c35784da71cd77b66d2cb06e81061423fb5d1876403485fcd54a8570e5eef54",
-    "classification_sha256": "d54f7ab40b133e2ac29628e7f7d626472b5220146f38950dd65a68fe152a8e2d",
-    "selected_Rust_FQNs": 217,
-    "HOST_logical": 195,
-    "HOST_expected_PASS_rows": 196,
-    "native_logical": 22,
-    "native_expected_PASS_rows": 44,
+    "inventory_sha256": "cf071a43b37dd30f46fce78eaa998eb527b4345592961d96ee72631e36eee01c",
+    "classification_sha256": "f1dda9bc060f0c6e3578211b913300f5aa582d6cf00c2c745ffb4ee217e82d85",
+    "selected_Rust_FQNs": 225,
+    "HOST_logical": 201,
+    "HOST_expected_PASS_rows": 202,
+    "native_logical": 24,
+    "native_expected_PASS_rows": 48,
     "Python_exact_tests": 17,
     "legacy37_compile_helper_selection_retained_not_expanded_acceptance": true,
-    "all_current_source_UNVALIDATED_no_GREEN_inheritance": true
+    "all_current_source_UNVALIDATED_no_GREEN_inheritance": true,
+    "diagnostic_checkpoint": "Seven source-backed repairs plus bounded diagnostics; two dense native failures explicitly OPEN. Original requests/matrices/strict assertions and native query/reset sites unchanged. Parent corrects three window API names and binds weights identity test to existing strict CPU child."
   }
 }

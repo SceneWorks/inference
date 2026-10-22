@@ -1052,3 +1052,103 @@ fn adapter_files_are_priced_before_they_are_read() {
         adapter_read_body,
     );
 }
+
+fn packed_adapter_host_guard_body() {
+    use mlx_gen::{AdapterKind, AdapterSpec};
+    let mut weights = Weights::from_file(backbone_dir().join("model.safetensors")).unwrap();
+    weights.materialize().unwrap();
+    let key = weights
+        .keys()
+        .find(|name| {
+            name.ends_with(".weight")
+                && weights
+                    .peek(name)
+                    .is_some_and(|a| a.ndim() == 2 && a.shape()[1] >= 64 && a.shape()[1] % 64 == 0)
+        })
+        .unwrap()
+        .to_owned();
+    let shape = weights.peek(&key).unwrap().shape().to_vec();
+    let (out, input) = (shape[0] as usize, shape[1] as usize);
+    let base = key.strip_suffix(".weight").unwrap();
+    let codes = Array::from_slice(
+        &vec![0u32; out * input / 4],
+        &[out as i32, (input / 4) as i32],
+    );
+    let scales = Array::from_slice(
+        &vec![1f32; out * input / 64],
+        &[out as i32, (input / 64) as i32],
+    )
+    .as_dtype(Dtype::Bfloat16)
+    .unwrap();
+    let biases = Array::from_slice(
+        &vec![0f32; out * input / 64],
+        &[out as i32, (input / 64) as i32],
+    )
+    .as_dtype(Dtype::Bfloat16)
+    .unwrap();
+    let left = Array::from_slice(&[input as i32], &[]);
+    let right = Array::from_slice(&[0i32], &[]);
+    for array in [&codes, &scales, &biases, &left, &right] {
+        array.eval().unwrap();
+    }
+    let width = mlx_rs::ops::add(&left, &right).unwrap(); // deliberately unevaluated I32 scalar
+    weights.insert(key.clone(), codes);
+    weights.insert(format!("{base}.scales"), scales);
+    weights.insert(format!("{base}.biases"), biases);
+    weights.insert(
+        format!("{base}{}", crate::packed::IN_FEATURES_SUFFIX),
+        width.clone(),
+    );
+    let specs = [AdapterSpec::new(
+        fixtures().join("iris_lora.safetensors"),
+        0.75,
+        AdapterKind::Lora,
+    )];
+    let baseline = mlx_rs::memory::get_active_memory();
+    take_refusal();
+    let (denied, _) = observed(0, || {
+        crate::adapters::install(
+            &mut weights,
+            Dtype::Float32,
+            &specs,
+            IrisTask::Generation,
+            crate::model::MODEL_ID,
+        )
+    });
+    assert!(denied.is_err());
+    assert_eq!(
+        take_refusal().unwrap().label,
+        crate::adapters::ADAPTER_HOST_QUANTUM
+    );
+    assert_eq!(
+        mlx_rs::memory::get_active_memory(),
+        baseline,
+        "denial must precede width.try_item, not merely the later placeholder constructor"
+    );
+
+    let active = Rc::new(RefCell::new(Vec::new()));
+    let sink = active.clone();
+    let installed = with_cpu_diagnostic_headroom(AMPLE, || with_cpu_diagnostic_observer(
+        move |event| {
+            if matches!(event, QuantumEvent::Checked { label, .. } if label == crate::adapters::ADAPTER_HOST_QUANTUM) {
+                sink.borrow_mut().push(mlx_rs::memory::get_active_memory() - baseline);
+            }
+        },
+        || crate::adapters::install(&mut weights, Dtype::Float32,
+            &specs, IrisTask::Generation, crate::model::MODEL_ID),
+    )).unwrap();
+    assert!(installed.is_some());
+    assert_eq!(
+        &*active.borrow(),
+        &[0, std::mem::size_of::<i32>()],
+        "the first check precedes the lazy width read; the second precedes the host placeholder"
+    );
+}
+
+#[test]
+fn packed_adapter_host_guards_both_width_reads_and_placeholders() {
+    in_cpu_child(
+        "quantum_tests::packed_adapter_host_guards_both_width_reads_and_placeholders",
+        packed_adapter_host_guard_body,
+    );
+}
