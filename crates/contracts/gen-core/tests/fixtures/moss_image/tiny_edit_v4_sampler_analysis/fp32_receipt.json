@@ -1,0 +1,31 @@
+{
+  "status": "PASS_SOURCE_FP32_REPRESENTED_BF16_FULL_SAMPLER",
+  "fixture_sha256": "905bef23f86f6bf08e116c716a03051ebbfa4f886d7b3dd9786e68e0d064cf56",
+  "generator_sha256": "5610fda57b31d8fbcba6867c84e49d0c803f4e4fdb75d4be929d315c8e9f118b",
+  "source_sha256": {
+    "author": "1dac1aca9feb1bfdfc727a401e4b67d61a505d3190706d1b7d2d784f88678b31",
+    "edit": "f0f5d3011c1f689547d290231a8a50a1c4d16f58c561556b53db60a0edbe9885",
+    "lora": "692f9df723323a95cdb24bbf612c7b6d2a98709cefcbee479e2d7dc57aab0705"
+  },
+  "model_values_exactly_parent_bf16": true,
+  "parent_unchanged": true,
+  "cases": [
+    {
+      "reference_count": 1,
+      "controls": {
+        "reference_uses_body_time": 0.8106074333190918,
+        "body_cannot_read_references": 1.7948297262191772
+      },
+      "manual_euler_max_abs": 0.0
+    },
+    {
+      "reference_count": 4,
+      "controls": {
+        "reference_uses_body_time": 1.3132848739624023,
+        "body_cannot_read_references": 1.8267054557800293,
+        "reversed_reference_order": 0.10991740226745605
+      },
+      "manual_euler_max_abs": 0.0
+    }
+  ]
+}

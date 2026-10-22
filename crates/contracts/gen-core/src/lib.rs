@@ -47,6 +47,7 @@ pub mod memory_phases;
 pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
+pub mod moss_image_edit;
 pub mod pth;
 pub mod registry;
 pub mod residency;

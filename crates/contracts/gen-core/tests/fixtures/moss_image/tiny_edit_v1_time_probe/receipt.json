@@ -1,0 +1,49 @@
+{
+  "status": "PASS_CPU_SYNTHETIC_FROZEN_EDIT",
+  "fixture_sha256": "c2af600c1c966ced4f8485081fc469d4b206a91205db49a7f5400e66204c5985",
+  "script_sha256": "e681a34b8c195713b67818659b0465150225e736d7e6c0ba2a4201754827e165",
+  "source_sha256": {
+    "author": "1dac1aca9feb1bfdfc727a401e4b67d61a505d3190706d1b7d2d784f88678b31",
+    "edit": "f0f5d3011c1f689547d290231a8a50a1c4d16f58c561556b53db60a0edbe9885",
+    "lora": "692f9df723323a95cdb24bbf612c7b6d2a98709cefcbee479e2d7dc57aab0705"
+  },
+  "torch_version": "2.9.1",
+  "device": "cpu",
+  "real_weights": false,
+  "config": {
+    "dim": 16,
+    "ffn_dim": 24,
+    "num_heads": 2,
+    "num_layers": 2,
+    "text_dim": 12,
+    "freq_dim": 8,
+    "latent_channels": 4,
+    "rope_base": 10000.0
+  },
+  "rank": 2,
+  "cases": [
+    {
+      "reference_count": 1,
+      "cached_uncached_max_abs": 0.0,
+      "controls": {
+        "reference_uses_body_time": 0.0009765625,
+        "body_cannot_read_references": 0.0009765625
+      }
+    },
+    {
+      "reference_count": 4,
+      "cached_uncached_max_abs": 0.0,
+      "controls": {
+        "reference_uses_body_time": 0.00048828125,
+        "body_cannot_read_references": 0.0009765625,
+        "reversed_reference_order": 0.0009765625
+      }
+    }
+  ],
+  "projection_controls": {
+    "fp32_max_abs_difference": 0.00518345832824707,
+    "merged_max_abs_difference": 0.0078125
+  },
+  "elapsed_seconds": 0.8573717499966733,
+  "bytes": 262257
+}

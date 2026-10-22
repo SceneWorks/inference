@@ -15,6 +15,40 @@ pub fn selected_asset_facts(
     selected_facts(&sources, mode)
 }
 
+/// Cold typed edit admission before loading a generator or constructing MLX tensors.
+/// Validates request semantics and pinned component metadata, then includes ordinary
+/// assets, reference encoding, edit adapter, K/V and request-specific scratch.
+/// Host-side authentication may read source files; this is a structural estimate,
+/// not a measured peak or a credit for previously retained allocations.
+pub fn edit_request_peak(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    request: &GenerationRequest,
+    inputs: moss_image_edit::MossImageEditInputs<'_>,
+) -> Result<u64> {
+    crate::model::MossImage::validate_load_spec(spec).map_err(Error::from)?;
+    inputs.validate()?;
+    let request = moss_image_edit::edit_request(request)?;
+    let (resolved, count) =
+        crate::model::MossImage::validate_request_inputs(variant, spec, &request, inputs.advanced)
+            .map_err(Error::from)?;
+    crate::edit::EditAssets::prepare(spec).map_err(Error::from)?;
+    let assets = selected_asset_facts(variant, spec, resolved.acceleration)?;
+    let workspace = request_workspace_bytes(
+        request.width,
+        request.height,
+        count,
+        resolved.max_sequence_length,
+        1 + u32::from(resolved.guidance != 1.0),
+    )?;
+    let edit = crate::edit::extra_peak(inputs, &request).map_err(Error::from)?;
+    workspace
+        .checked_add(assets.base_bytes)
+        .and_then(|n| n.checked_add(assets.overlay_bytes))
+        .and_then(|n| n.checked_add(edit))
+        .ok_or_else(|| Error::Unsupported("MOSS edit peak overflow".into()))
+}
+
 pub(crate) fn facts(s: &Sources) -> Result<MemoryAssetFacts> {
     selected_facts(s, moss_image::MossImageAcceleration::Off)
 }
@@ -207,9 +241,16 @@ pub(crate) fn safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    if context.geometry.reference_count != 0 || context.use_pid || context.has_phases {
+    if (context.geometry.reference_count != 0
+        && !(context.geometry.reference_count == 1
+            && spec
+                .components
+                .contains_key(mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT)))
+        || context.use_pid
+        || context.has_phases
+    {
         return MemorySafetyDecision::Reject {
-            reason: "MOSS supports text-to-image only".into(),
+            reason: "MOSS supports text generation or one typed edit reference with its exact edit component; PID/phases are unsupported".into(),
         };
     }
     default_registered_memory_strategy_safety_check(spec, contract, context)

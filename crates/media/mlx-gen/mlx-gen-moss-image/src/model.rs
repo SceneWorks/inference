@@ -7,6 +7,7 @@ use crate::{
     transformer::Transformer,
 };
 use gen_core::moss_image::*;
+use gen_core::moss_image_edit::*;
 use mlx_gen::gen_core::{
     self, LoadShape, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality,
     PerComponentBytes, SizeFloor,
@@ -66,6 +67,7 @@ pub struct MossImage {
     vae: Flux2Vae,
     memory: MemoryProviderContract,
     state: Mutex<State>,
+    edit_report: Mutex<Option<MossImageEditExecutionReport>>,
 }
 fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
     ModelDescriptor {
@@ -116,14 +118,18 @@ pub fn load_sft(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(MossImage::load(MossImageVariant::Sft, spec)?))
 }
 impl MossImage {
-    /// Load exact frozen components. Optional DMD policies remain explicit per request.
-    pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
+    pub(crate) fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
         if spec.precision != Precision::Bf16
             || spec.offload_policy != OffloadPolicy::Resident
             || spec.load_shape != LoadShape::EagerMaterialization
         {
             return Err(Error::Unsupported("MOSS supports resident BF16 official loading; select full-FP32 DMD through explicit MOSS controls. Staging/deferred loading is not implemented".into()));
         }
+        Ok(())
+    }
+    /// Load exact frozen components. Optional DMD policies remain explicit per request.
+    pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
+        Self::validate_load_spec(spec)?;
         let sources = Sources::prepare(variant, spec)?;
         let facts = memory_strategy::facts(&sources)?;
         let memory = memory_strategy::contract_with_facts(variant, facts);
@@ -171,6 +177,7 @@ impl MossImage {
             encoder,
             vae,
             memory,
+            edit_report: Mutex::new(None),
             state: Mutex::new(State {
                 renderer: None,
                 report: None,
@@ -185,10 +192,19 @@ impl MossImage {
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
     ) -> Result<(MossImageResolved, usize)> {
-        self.descriptor
+        Self::validate_request_inputs(self.variant, &self.spec, request, inputs)
+    }
+    pub(crate) fn validate_request_inputs(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+    ) -> Result<(MossImageResolved, usize)> {
+        let descriptor = descriptor(variant);
+        descriptor
             .capabilities
-            .validate_request(self.descriptor.id, request)?;
-        let resolved = MossImageResolved::resolve(self.variant, request)?;
+            .validate_request(descriptor.id, request)?;
+        let resolved = MossImageResolved::resolve(variant, request)?;
         let count = inputs.validate(request, &resolved)?;
         if count > 64 {
             return Err(Error::Unsupported("MOSS expanded prompt-batch × image-count exceeds the native 64-output resource limit".into()));
@@ -199,7 +215,7 @@ impl MossImage {
         {
             return Err(Error::Unsupported("MOSS currently implements resident execution; staging, tiling, chunking, windows and alternate execution policies are unavailable".into()));
         }
-        self.selected_sources(resolved.acceleration)?
+        Sources::selected(variant, spec, resolved.acceleration)?
             .mode_assets(resolved.acceleration)?;
         let branches = if matches!(resolved.acceleration, MossImageAcceleration::Off) {
             1 + u32::from(resolved.guidance != 1.0)
@@ -291,19 +307,35 @@ impl MossImage {
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
         progress: &mut dyn FnMut(Progress),
+        edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
         state.begin();
+        let mut edit_report = self
+            .edit_report
+            .lock()
+            .map_err(|_| Error::Msg("MOSS edit receipt lock poisoned".into()))?;
+        *edit_report = None;
         let result = (|| {
             check(&request.cancel)?;
             self.sources.ensure_unchanged()?;
             let (resolved, count) = self.validate_inputs(request, inputs)?;
             let sources = self.selected_sources(resolved.acceleration)?;
             sources.ensure_unchanged()?;
-            let peak = self.estimated_request_peak(request, inputs)?;
+            let peak = self
+                .estimated_request_peak(request, inputs)?
+                .checked_add(
+                    edit.map(|edit| crate::edit::extra_peak(edit, request))
+                        .transpose()?
+                        .unwrap_or(0),
+                )
+                .ok_or_else(|| Error::Unsupported("MOSS edit peak overflow".into()))?;
+            let edit_assets = edit
+                .map(|_| crate::edit::EditAssets::prepare(&self.spec))
+                .transpose()?;
             if let Some(cap) = mlx_gen::memory::recommended_working_set_bytes() {
                 if peak > cap {
                     return Err(Error::Unsupported(format!("MOSS structural resident peak {peak} exceeds admitted MLX working set {cap}; choose a supported geometry/batch or a larger admitted device")));
@@ -313,7 +345,7 @@ impl MossImage {
             if state
                 .renderer
                 .as_ref()
-                .is_some_and(|(mode, _)| *mode != resolved.acceleration)
+                .is_some_and(|(mode, _)| edit.is_some() || *mode != resolved.acceleration)
             {
                 state.renderer = None;
                 mlx_gen::residency::drain_allocator_cache();
@@ -365,10 +397,25 @@ impl MossImage {
                 });
             }
             check(&request.cancel)?;
-            state.select(resolved.acceleration, || {
-                mlx_gen::residency::drain_allocator_cache();
-                sources.transformer(resolved.acceleration, &request.cancel)
-            })?;
+            let mut edit_renderer = None;
+            let mut edit_references = None;
+            if let (Some(edit), Some(assets)) = (edit, edit_assets.as_ref()) {
+                let mut renderer = sources.transformer(resolved.acceleration, &request.cancel)?;
+                assets.install(&mut renderer, &request.cancel)?;
+                edit_references = Some(crate::edit::encode_references(
+                    &sources,
+                    edit,
+                    &request.cancel,
+                )?);
+                edit_renderer = Some(renderer);
+                progress(Progress::ConditioningComplete);
+                check(&request.cancel)?;
+            } else {
+                state.select(resolved.acceleration, || {
+                    mlx_gen::residency::drain_allocator_cache();
+                    sources.transformer(resolved.acceleration, &request.cancel)
+                })?;
+            }
             let shape = [
                 count as i32,
                 128,
@@ -427,21 +474,39 @@ impl MossImage {
             } else {
                 None
             };
-            let renderer = &state
-                .renderer
-                .as_ref()
-                .ok_or_else(|| Error::Msg("MOSS renderer missing".into()))?
-                .1;
-            let latents = Sampling {
-                transformer: renderer,
-                resolved: &resolved,
-                positive: &positive,
-                negative: &negative,
-                dataspace: dataspace
-                    .as_ref()
-                    .map(|(q, codes, _)| (q, codes.as_slice())),
-            }
-            .run(&noise, &request.cancel, progress)?;
+            let renderer = match edit_renderer.as_ref() {
+                Some(renderer) => renderer,
+                None => {
+                    &state
+                        .renderer
+                        .as_ref()
+                        .ok_or_else(|| Error::Msg("MOSS renderer missing".into()))?
+                        .1
+                }
+            };
+            let latents =
+                if let (Some(edit), Some((references, _))) = (edit, edit_references.as_ref()) {
+                    crate::edit::EditSampling {
+                        transformer: renderer,
+                        resolved: &resolved,
+                        positive: &positive,
+                        negative: &negative,
+                        references,
+                        use_cache: edit.use_kv_cache,
+                    }
+                    .run(&noise, &request.cancel, progress)?
+                } else {
+                    Sampling {
+                        transformer: renderer,
+                        resolved: &resolved,
+                        positive: &positive,
+                        negative: &negative,
+                        dataspace: dataspace
+                            .as_ref()
+                            .map(|(q, codes, _)| (q, codes.as_slice())),
+                    }
+                    .run(&noise, &request.cancel, progress)?
+                };
             check(&request.cancel)?;
             mlx_rs::transforms::eval([&latents])?;
             let output = match inputs.output {
@@ -562,11 +627,38 @@ impl MossImage {
                 adapter_reports,
             })?;
             check(&request.cancel)?;
-            state.report = Some(report);
+            if let (Some(edit), Some(assets), Some((_, references))) =
+                (edit, edit_assets.as_ref(), edit_references)
+            {
+                assets.ensure_unchanged()?;
+                check(&request.cancel)?;
+                *edit_report = Some(MossImageEditExecutionReport {
+                    base: report,
+                    adapter_path: assets.path().to_path_buf(),
+                    edit_contract: EDIT_CONTRACT.into(),
+                    adapter_repository: EDIT_REPOSITORY.into(),
+                    adapter_revision: EDIT_REVISION.into(),
+                    adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+                    config_sha256: EDIT_CONFIG_SHA256.into(),
+                    applied_projections: 252,
+                    references,
+                    reference_max_edge: edit.reference_max_edge,
+                    use_kv_cache: edit.use_kv_cache,
+                });
+                edit_report
+                    .as_ref()
+                    .expect("just published edit receipt")
+                    .validate()?;
+            } else {
+                state.report = Some(report);
+            }
             Ok(output)
         })();
         if result.is_err() {
+            *edit_report = None;
             state.failed();
+        }
+        if result.is_err() || edit.is_some() {
             mlx_gen::residency::drain_allocator_cache();
         }
         result
@@ -579,11 +671,46 @@ impl MossImageAdvancedGenerator for MossImage {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
-        self.execute(request, inputs, on_progress)
+        self.execute(request, inputs, on_progress, None)
             .map_err(Into::into)
     }
 }
 impl Generator for MossImage {
+    fn generate_moss_image_edit(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<MossImageAdvancedOutput> {
+        // Clear both receipts even if edit validation rejects before execution starts.
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| gen_core::Error::Unsupported("MOSS lifecycle lock poisoned".into()))?;
+            state.begin();
+            *self.edit_report.lock().map_err(|_| {
+                gen_core::Error::Unsupported("MOSS edit receipt lock poisoned".into())
+            })? = None;
+        }
+        inputs.validate()?;
+        let request = edit_request(request)?;
+        self.execute(&request, inputs.advanced, progress, Some(inputs))
+            .map_err(Into::into)
+    }
+    fn moss_image_edit_request_peak(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+    ) -> gen_core::Result<u64> {
+        memory_strategy::edit_request_peak(self.variant, &self.spec, request, inputs)
+    }
+    fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
+        self.edit_report
+            .lock()
+            .ok()
+            .and_then(|report| report.clone())
+    }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -597,7 +724,12 @@ impl Generator for MossImage {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        match self.execute(request, MossImageAdvancedInputs::default(), on_progress)? {
+        match self.execute(
+            request,
+            MossImageAdvancedInputs::default(),
+            on_progress,
+            None,
+        )? {
             MossImageAdvancedOutput::Images(images) => Ok(GenerationOutput::Images(images)),
             _ => Err(gen_core::Error::Unsupported(
                 "generic MOSS generation requires image output".into(),
@@ -620,8 +752,16 @@ impl Generator for MossImage {
             .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
-        self.moss_image_execution_report()
-            .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
+        if let Some(edit) = self.moss_image_edit_execution_report() {
+            vec![gen_core::AdapterApplyReport {
+                adapter_path: edit.adapter_path,
+                applied: edit.applied_projections,
+                skipped: vec![],
+            }]
+        } else {
+            self.moss_image_execution_report()
+                .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
+        }
     }
 }
 fn footprint(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {

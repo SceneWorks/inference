@@ -30,6 +30,34 @@ pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
 
+    /// Native MOSS edit entry point available through catalog-loaded trait objects.
+    fn generate_moss_image_edit(
+        &self,
+        _request: &GenerationRequest,
+        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
+        _progress: &mut dyn FnMut(Progress),
+    ) -> Result<crate::moss_image::MossImageAdvancedOutput> {
+        Err(Error::Unsupported(
+            "provider has no native MOSS edit path".into(),
+        ))
+    }
+    /// Complete structural edit peak, including reference encoding and request-local K/V.
+    fn moss_image_edit_request_peak(
+        &self,
+        _request: &GenerationRequest,
+        _inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
+    ) -> Result<u64> {
+        Err(Error::Unsupported(
+            "provider has no native MOSS edit admission".into(),
+        ))
+    }
+    /// Last completed edit; cleared on every attempt, including failures and cancellation.
+    fn moss_image_edit_execution_report(
+        &self,
+    ) -> Option<crate::moss_image_edit::MossImageEditExecutionReport> {
+        None
+    }
+
     /// Observed sparse-attention outcome of the most recent request, when adopted.
     fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
         None
