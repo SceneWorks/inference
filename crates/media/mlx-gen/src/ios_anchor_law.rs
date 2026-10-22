@@ -583,10 +583,13 @@ pub fn measure_phases_with_samples<T>(
 }
 
 #[cfg(not(target_os = "ios"))]
+type NativePhaseSampleSink = Box<dyn for<'a> FnMut(NativePhaseSample<'a>)>;
+
+#[cfg(not(target_os = "ios"))]
 fn measure_phases_inner<T>(
     phase_of: crate::ios_pricing::IosQuantumPhase,
     body: impl FnOnce() -> crate::Result<T>,
-    sample: Option<Box<dyn for<'a> FnMut(NativePhaseSample<'a>)>>,
+    sample: Option<NativePhaseSampleSink>,
 ) -> crate::Result<(T, MeasuredRun)> {
     use crate::ios_quantum::QuantumEvent;
     use std::cell::RefCell;

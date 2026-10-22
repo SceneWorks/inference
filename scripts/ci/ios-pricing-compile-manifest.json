@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-22T01:50:45.944947+00:00",
-  "rust_proof_closure_sha256": "b9c014b35034c977811cef5749bb9bb2765a00d8cb0cd23f9a3b6f1595819926",
+  "UTC": "2026-10-22T02:24:09.093341+00:00",
+  "rust_proof_closure_sha256": "18e0ab53e2a9c22b1657e239b35f73e0f3e6d6e5248937a8b6c9f668e6e65506",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -840,7 +840,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_anchor_law.rs",
-      "sha256": "6cb829383d04c47f23de1ee27c13d41ce557c9c7bc976ec50ff662a3dbbfae75"
+      "sha256": "96907a5c3acac78f70cfe6521084e739983195e2085f2bacd8cfbebee00ee97e"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_pricing.rs",
@@ -2374,8 +2374,8 @@
   "no_local_build_or_dispatch_admitted": true,
   "checkpoint_boundary": "Includes currentdualCLIP,SDXL14,PiD7rank,coherentwrapper/provider; excludes futureownsourcejoins/hierarchies. Compilerfeedback checkpoint, notfullstoryacceptance.",
   "connected_source_selection": {
-    "inventory_sha256": "cf071a43b37dd30f46fce78eaa998eb527b4345592961d96ee72631e36eee01c",
-    "classification_sha256": "f1dda9bc060f0c6e3578211b913300f5aa582d6cf00c2c745ffb4ee217e82d85",
+    "inventory_sha256": "9533013f42fddf783527d3efe8377191626cc34099614122b1ca6934f6fc69fa",
+    "classification_sha256": "cd8312f9538bc44408f03b888a2ba63680ba8bd19a479cf8046be431169c318e",
     "selected_Rust_FQNs": 225,
     "HOST_logical": 201,
     "HOST_expected_PASS_rows": 202,
