@@ -71,7 +71,11 @@ class DependencyCiPolicyTests(unittest.TestCase):
         jobs = workflow["jobs"]
         job = jobs["supply-chain"]
         self.assertNotIn("needs", job)
-        self.assertNotIn("if", job)
+        self.assertEqual(
+            job.get("if"),
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
+            "dependency policy stays unconditional for verification events; only metadata dispatch skips",
+        )
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("supply_chain", jobs["changes"]["outputs"])
         self.assertIn("supply-chain", jobs["gate"]["needs"])

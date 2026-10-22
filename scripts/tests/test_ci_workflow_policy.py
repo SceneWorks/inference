@@ -260,12 +260,14 @@ def evaluate_policy(
     event_name: str,
     head_repository: str,
     repository: str = "SceneWorks/inference",
+    dispatch_lanes: str = "all",
 ) -> bool:
     values = {
         "needs.changes.outputs.windows_cuda": str(lanes_include_cuda).lower(),
         "github.event_name": event_name,
         "github.event.pull_request.head.repo.full_name": head_repository,
         "github.repository": repository,
+        "inputs.lanes": dispatch_lanes,
     }
     rendered = expression
     for name in sorted(values, key=len, reverse=True):
@@ -4145,7 +4147,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4260,11 +4262,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             policy_steps[0],
             "event or path gating the policy would let an invalid topology omit its verdict",
         )
-        self.assertNotIn(
-            "if",
-            changes,
-            "the changes job is the always-run trust boundary for feature-epic topology",
+        self.assertEqual(
+            changes.get("if"),
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
+            "topology remains unconditional except the explicit metadata-only dispatch",
         )
+        for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+            for lane in ("all", "windows-cuda", ""):
+                self.assertTrue(evaluate_policy(
+                    changes["if"], lanes_include_cuda=False, event_name=event,
+                    head_repository="foreign/repo", dispatch_lanes=lane,
+                ))
         self.assertIn(
             "changes",
             workflow["jobs"]["gate"]["needs"],
@@ -4309,7 +4317,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `if: always()` is the load-bearing half. The default `success()` would skip the gate
         # precisely when an upstream lane failed, and a skipped job satisfies a required status
         # check -- so the gate would report green on exactly the runs it exists to block.
-        self.assertEqual(gate["if"], "always()")
+        self.assertEqual(
+            gate["if"],
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())",
+        )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
         self.assertEqual(
