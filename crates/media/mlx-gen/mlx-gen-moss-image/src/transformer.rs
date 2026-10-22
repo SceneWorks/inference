@@ -88,6 +88,7 @@ pub(crate) struct Projection {
     bias: Option<Array>,
     adapter: Option<(Array, Array, f32)>,
     edit_adapter: bool,
+    edit_fused_bias: bool,
 }
 impl Projection {
     fn load(w: &Weights, p: &str, input: i32, output: i32, bias: bool) -> Result<Self> {
@@ -100,6 +101,7 @@ impl Projection {
             },
             adapter: None,
             edit_adapter: false,
+            edit_fused_bias: false,
         })
     }
     fn dtype(&self) -> Dtype {
@@ -114,13 +116,31 @@ impl Projection {
                 None => projected,
             }
         } else if let Some(b) = &self.bias {
-            mlx_gen::nn::linear(&cast, &self.weight, b)?
+            if self.edit_fused_bias {
+                // Pinned Metal GEMV addmm casts its dot to BF16 before bias addition.
+                // Upstream nn.Linear rounds once after FP32 accumulation plus bias.
+                add(
+                    linear_fp32(
+                        &cast.as_dtype(Dtype::Float32)?,
+                        &self.weight.as_dtype(Dtype::Float32)?,
+                    )?,
+                    b.as_dtype(Dtype::Float32)?,
+                )?
+                .as_dtype(self.weight.dtype())?
+            } else {
+                mlx_gen::nn::linear(&cast, &self.weight, b)?
+            }
         } else {
             cast.matmul(self.weight.t())?
         };
         if let Some((down, up, scale)) = &self.adapter {
             if self.edit_adapter {
-                let residual = x.as_dtype(down.dtype())?.matmul(down.t())?.matmul(up.t())?;
+                let residual = if down.dtype() == Dtype::Float32 {
+                    // Synthetic FP32 diagnostics must not enter the NAX TF32 GEMM path.
+                    linear_fp32(&linear_fp32(&x.as_dtype(Dtype::Float32)?, down)?, up)?
+                } else {
+                    x.as_dtype(down.dtype())?.matmul(down.t())?.matmul(up.t())?
+                };
                 return Ok(add(
                     &base,
                     self::scale(&residual, *scale)?.as_dtype(base.dtype())?,
@@ -1042,6 +1062,11 @@ impl Block {
         Ok(next)
     }
 }
+fn edit_silu(x: &Array) -> Result<Array> {
+    // nn.SiLU computes the activation in FP32 then rounds once to the input dtype.
+    // The backend's BF16 silu_exact instead preserves eager sigmoid/multiply rounding.
+    Ok(mlx_rs::fast::silu_exact(x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
+}
 fn edit_attention(
     q: &Array,
     k: &Array,
@@ -1059,7 +1084,32 @@ fn edit_attention(
     }
 }
 impl Transformer {
+    fn enable_edit_precision(&mut self) {
+        for projection in [
+            &mut self.time1,
+            &mut self.time2,
+            &mut self.modulation,
+            &mut self.head,
+            &mut self.video,
+            &mut self.text,
+            &mut self.output,
+        ] {
+            projection.edit_fused_bias = true;
+        }
+        for block in &mut self.text_blocks {
+            for projection in [
+                &mut block.qkv,
+                &mut block.proj,
+                &mut block.up,
+                &mut block.gate,
+                &mut block.down,
+            ] {
+                projection.edit_fused_bias = true;
+            }
+        }
+    }
     pub(crate) fn install_edit(&mut self, w: &Weights, rank: i32) -> Result<()> {
+        self.enable_edit_precision();
         for (index, block) in self.blocks.iter_mut().enumerate() {
             for (projection, name) in
                 block
@@ -1110,7 +1160,7 @@ impl Transformer {
         }
         let time = self
             .time2
-            .forward(&mlx_rs::fast::silu_exact(
+            .forward(&edit_silu(
                 &self
                     .time1
                     .forward(&Array::from_slice(&features, &[1, self.g.freq]))?,
@@ -1228,15 +1278,18 @@ impl Transformer {
                     .transpose_axes(&[0, 2, 3, 1])?
                     .reshape(&[1, h * w, g.channels])?,
             )?;
+
         let original = rope(h, w, text_len, g.dim / g.heads)?.as_dtype(video.dtype())?;
         let text_rope = slice_axis(&original, 1, h * w, text_len)?;
         let mut text = self.text.forward(context)?;
+
         for block in &self.text_blocks {
             check(cancel)?;
             text = block.forward(&text, &text_rope, g, cancel)?;
             eval([&text])?;
         }
         let mut body = concatenate_axis(&[&text, &video], 1)?;
+
         let body_rope = concatenate_axis(&[&text_rope, &slice_axis(&original, 1, 0, h * w)?], 1)?;
         let (modulation, head) = self.edit_time(time)?;
         let mut uncached = if cache.is_none() {
@@ -1259,6 +1312,7 @@ impl Transformer {
                 temporary = kv;
                 &temporary
             };
+
             body = block.edit_body(
                 &body,
                 reference,
@@ -1271,9 +1325,11 @@ impl Transformer {
                 cancel,
             )?;
         }
+
         let output = self
             .norm
             .forward(&slice_axis(&body, 1, text_len, h * w)?.as_dtype(self.norm.weight.dtype())?)?;
+
         let output = add(
             multiply(
                 output,
@@ -1281,11 +1337,13 @@ impl Transformer {
             )?,
             slice_axis(&head, 1, 0, 1)?,
         )?;
-        let output = self
-            .output
-            .forward(&output)?
+
+        let output = self.output.forward(&output)?;
+
+        let output = output
             .reshape(&[1, h, w, g.channels])?
             .transpose_axes(&[0, 3, 1, 2])?;
+
         eval([&output])?;
         check(cancel)?;
         Ok(output)
@@ -1363,7 +1421,7 @@ mod edit_fixture_tests {
                 ),
                 (
                     "time exact SiLU",
-                    mlx_rs::fast::silu_exact(array(&probe["silu_input"])).unwrap(),
+                    edit_silu(&array(&probe["silu_input"])).unwrap(),
                     &probe["silu"],
                 ),
                 (
@@ -1388,7 +1446,29 @@ mod edit_fixture_tests {
                     &probe["head_flat"],
                 ),
             ] {
-                compare_bf16(&actual, expected, label);
+                if matches!(label, "time first linear" | "time exact SiLU") {
+                    compare(&actual, expected, 0.0, label);
+                } else {
+                    compare_bf16(&actual, expected, label);
+                }
+            }
+            let split_bias = add(
+                array(&probe["time1_input"])
+                    .matmul(model.time1.weight.t())
+                    .unwrap(),
+                model.time1.bias.as_ref().unwrap(),
+            )
+            .unwrap();
+            let eager_silu = mlx_rs::fast::silu_exact(array(&probe["silu_input"])).unwrap();
+            for (wrong, expected) in [
+                (&split_bias, &probe["time1"]),
+                (&eager_silu, &probe["silu"]),
+            ] {
+                assert_ne!(
+                    logical_f32_readback(wrong).unwrap(),
+                    logical_f32_readback(&array(expected)).unwrap(),
+                    "rounding control must distinguish source-fused arithmetic"
+                );
             }
             let (modulation, head) = model
                 .edit_time(probe["normalized_timestep"].as_f64().unwrap() as f32)
@@ -1438,6 +1518,214 @@ mod edit_fixture_tests {
         );
         mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || run_oracle(false));
     }
+    fn fixture_model(f: &Value, fp32: bool) -> Transformer {
+        let weights = Weights::from_map(
+            f["weights"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| {
+                    let value = array(v);
+                    (
+                        k.clone(),
+                        if fp32 {
+                            value.as_dtype(Dtype::Float32).unwrap()
+                        } else {
+                            value
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut model = Transformer::load(
+            &weights,
+            Geometry {
+                dim: 16,
+                ffn: 24,
+                heads: 2,
+                layers: 2,
+                text: 12,
+                freq: 8,
+                channels: 4,
+            },
+        )
+        .unwrap();
+        let adapter = Weights::from_map(
+            f["adapter"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), array(v)))
+                .collect(),
+        );
+        model.install_edit(&adapter, 2).unwrap();
+        if fp32 {
+            // Diagnostic only: same represented source weights cast to FP32. The
+            // production package validator continues requiring BF16 A/B tensors.
+            for block in &mut model.blocks {
+                for p in &mut block.projections {
+                    if let Some((a, b, scale)) = &p.adapter {
+                        p.adapter = Some((
+                            a.as_dtype(Dtype::Float32).unwrap(),
+                            b.as_dtype(Dtype::Float32).unwrap(),
+                            *scale,
+                        ));
+                    }
+                }
+            }
+        }
+        model
+    }
+    // Separate network error from integration: BF16 predictions are compared at
+    // identical source states; FP32 represented-weight sampling checks the entire graph.
+    // The historical final-only BF16 bound did not compose through CFG and state feedback.
+    fn sampler_precision(f: &Value) {
+        const FP32_BOUND: f32 = 2e-5;
+        let oracle: Value = serde_json::from_str(include_str!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v4_sampler_analysis/fp32_sampler.json")).unwrap();
+        let input = &f["inputs"];
+        for fp32 in [false, true] {
+            let model = fixture_model(f, fp32);
+            for case in f["cases"].as_array().unwrap() {
+                let count = case["reference_count"].as_u64().unwrap() as usize;
+                let refs = input["references"].as_array().unwrap()[..count]
+                    .iter()
+                    .map(array)
+                    .collect::<Vec<_>>();
+                let positive = [masked(&input["positive"], &input["positive_mask"])];
+                let negative = [masked(&input["negative"], &input["negative_mask"])];
+                let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+                    mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+                    &mlx_gen::gen_core::moss_image_edit::edit_request(
+                        &mlx_gen::GenerationRequest {
+                            steps: Some(2),
+                            guidance: Some(4.0),
+                            width: 48,
+                            height: 32,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let sampling = crate::edit::EditSampling {
+                    transformer: &model,
+                    resolved: &resolved,
+                    positive: &positive,
+                    negative: &negative,
+                    references: &refs,
+                    use_cache: true,
+                };
+                crate::edit::SAMPLING_TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+                let output = sampling
+                    .run(
+                        &array(&input["hidden_states"]),
+                        &CancelFlag::new(),
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                let trace = crate::edit::SAMPLING_TRACE.with(|t| t.borrow_mut().take().unwrap());
+                assert_eq!(trace.len(), 2);
+                assert_eq!(output.dtype(), Dtype::Float32);
+                if fp32 {
+                    let expected = oracle["cases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c["reference_count"] == case["reference_count"])
+                        .unwrap();
+                    compare(
+                        &output,
+                        &expected["correct"]["final"],
+                        FP32_BOUND,
+                        "strict FP32 complete sampler",
+                    );
+                    for (actual, step) in trace
+                        .iter()
+                        .zip(expected["correct"]["steps"].as_array().unwrap())
+                    {
+                        for (a, key) in
+                            actual
+                                .iter()
+                                .zip(["input", "conditional", "unconditional", "output"])
+                        {
+                            assert_eq!(a.dtype(), Dtype::Float32);
+                            compare(a, &step[key], FP32_BOUND, "strict FP32 sampler stage");
+                        }
+                    }
+                    for (name, control) in expected["controls"].as_object().unwrap() {
+                        let wrong = array(&control["final"]);
+                        let delta = checked_delta(
+                            &logical_f32_readback(&output).unwrap(),
+                            output.shape(),
+                            &logical_f32_readback(&wrong).unwrap(),
+                            wrong.shape(),
+                        );
+                        eprintln!("full sampler semantic control {name}: delta={delta}, bound={FP32_BOUND}");
+                        assert!(
+                            delta > 100.0 * FP32_BOUND,
+                            "undiscriminated full sampler control {name}: {delta}"
+                        );
+                    }
+                } else {
+                    let cache = model.prepare_edit_cache(&refs, &CancelFlag::new()).unwrap();
+                    for (index, source) in case["sampling"]["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        let sigmas = &case["sampling"]["sigmas"]["values"];
+                        let time = sigmas[index].as_f64().unwrap() as f32;
+                        for (context, key) in [
+                            (&positive[0], "conditional"),
+                            (&negative[0], "unconditional"),
+                        ] {
+                            let prediction = model
+                                .forward_edit(
+                                    &array(&source["input"]),
+                                    time,
+                                    EditConditioning {
+                                        context,
+                                        references: &refs,
+                                        cache: Some(&cache),
+                                    },
+                                    &CancelFlag::new(),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                prediction.dtype(),
+                                Dtype::Bfloat16,
+                                "production edit prediction dtype"
+                            );
+                            compare_bf16(
+                                &prediction,
+                                &source[key],
+                                "BF16 prediction at source step input",
+                            );
+                        }
+                        let values = trace[index]
+                            .iter()
+                            .map(|a| {
+                                assert_eq!(a.dtype(), Dtype::Float32);
+                                logical_f32_readback(a).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let dt = sigmas[index + 1].as_f64().unwrap() as f32 - time;
+                        let mut error = 0.0_f32;
+                        for (i, &current) in values[0].iter().enumerate() {
+                            let guided = values[2][i] + 4.0 * (values[1][i] - values[2][i]);
+                            error = error.max((values[3][i] - (current + dt * guided)).abs());
+                        }
+                        assert!(
+                            error <= 1e-6,
+                            "actual production sampler composition error {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn run_oracle(cpu_only: bool) {
         let f: Value = serde_json::from_str(include_str!(
             "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
@@ -1490,7 +1778,8 @@ mod edit_fixture_tests {
                     .map(|(k, v)| (k.clone(), array(v)))
                     .collect(),
             );
-            let original_model = Transformer::load(&original_weights, model.g.clone()).unwrap();
+            let mut original_model = Transformer::load(&original_weights, model.g.clone()).unwrap();
+            original_model.enable_edit_precision();
             time_probes(&original_model, &original);
             time_probes(&model, &f);
         }
@@ -1617,10 +1906,16 @@ mod edit_fixture_tests {
                 })
                 .unwrap();
             assert_eq!(sampled.dtype(), Dtype::Float32, "sampler accumulator dtype");
-            compare_bf16(
-                &sampled,
-                &case["sampling"]["final"],
-                "complete network sampling (BF16 prediction tolerance)",
+            // Aggregate BF16 drift is diagnostic, not a fictitious final-latent ULP gate.
+            let expected = array(&case["sampling"]["final"]);
+            eprintln!(
+                "BF16 complete sampler aggregate drift: {}",
+                checked_delta(
+                    &logical_f32_readback(&sampled).unwrap(),
+                    sampled.shape(),
+                    &logical_f32_readback(&expected).unwrap(),
+                    expected.shape()
+                )
             );
             assert_eq!(steps, [(1, 2), (2, 2)]);
             let stop = CancelFlag::new();
@@ -1641,6 +1936,9 @@ mod edit_fixture_tests {
                 logical_f32_readback(&sampled).unwrap(),
                 logical_f32_readback(&reentry).unwrap()
             );
+        }
+        if !cpu_only {
+            sampler_precision(&f);
         }
         cancel.cancel();
         assert!(matches!(

@@ -121,3 +121,27 @@ execution because the exact fused activation is Metal-only. They are synthetic; 
 weights are loaded. CPU projection, reference-coordinate, package and byte-exact Pillow
 resize checks run independently. Real-weight quality and product acceptance belong to the
 integrated epic-end campaign.
+
+Before loading a provider, use
+`runtime_macos::providers::moss_image::memory_strategy::edit_request_peak(variant, spec, request, inputs)`
+(or the same path under `mlx_gen_moss_image`). This host-only structural estimate
+validates typed inputs and pinned metadata and includes ordinary residency,
+reference encoder, adapter, reference K/V and geometry-dependent FP32 temporaries.
+It constructs no MLX tensors. The generator's edit estimate uses the same function.
+
+Editing preserves upstream single-rounding biased BF16 projections and SiLU by
+accumulating those operations in FP32 before casting once. FP32 cast weights are
+temporary; the backbone and edit adapter remain BF16. The extra peak derives its
+bound from the largest simultaneously live text-embedding/text-block cast weights
+and request token counts. Reference encoding opts into precise FP32 linear
+accumulation for attention projections and quantization convolution; ordinary
+encoding and decoding retain their existing policy.
+
+The frozen edit numerical gate checks BF16 predictions at every identical source
+sampler input, strict FP32 CFG/Euler (including accumulator-dtype and low-precision
+negative controls), and a complete FP32 represented-weight diagnostic sampler at
+`2e-5` against independently executed source with semantic mutants. FP32 diagnostic
+weights are test-only. A final-latent BF16 ULP bound is not asserted: CFG amplifies
+prediction errors and subsequent network evaluations receive changed states.
+The retained source analysis documents why that former bound did not compose;
+aggregate BF16 drift remains printed rather than treated as identity evidence.

@@ -118,14 +118,18 @@ pub fn load_sft(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Box::new(MossImage::load(MossImageVariant::Sft, spec)?))
 }
 impl MossImage {
-    /// Load exact frozen components. Optional DMD policies remain explicit per request.
-    pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
+    pub(crate) fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
         if spec.precision != Precision::Bf16
             || spec.offload_policy != OffloadPolicy::Resident
             || spec.load_shape != LoadShape::EagerMaterialization
         {
             return Err(Error::Unsupported("MOSS supports resident BF16 official loading; select full-FP32 DMD through explicit MOSS controls. Staging/deferred loading is not implemented".into()));
         }
+        Ok(())
+    }
+    /// Load exact frozen components. Optional DMD policies remain explicit per request.
+    pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
+        Self::validate_load_spec(spec)?;
         let sources = Sources::prepare(variant, spec)?;
         let facts = memory_strategy::facts(&sources)?;
         let memory = memory_strategy::contract_with_facts(variant, facts);
@@ -188,10 +192,19 @@ impl MossImage {
         request: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
     ) -> Result<(MossImageResolved, usize)> {
-        self.descriptor
+        Self::validate_request_inputs(self.variant, &self.spec, request, inputs)
+    }
+    pub(crate) fn validate_request_inputs(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+    ) -> Result<(MossImageResolved, usize)> {
+        let descriptor = descriptor(variant);
+        descriptor
             .capabilities
-            .validate_request(self.descriptor.id, request)?;
-        let resolved = MossImageResolved::resolve(self.variant, request)?;
+            .validate_request(descriptor.id, request)?;
+        let resolved = MossImageResolved::resolve(variant, request)?;
         let count = inputs.validate(request, &resolved)?;
         if count > 64 {
             return Err(Error::Unsupported("MOSS expanded prompt-batch × image-count exceeds the native 64-output resource limit".into()));
@@ -202,7 +215,7 @@ impl MossImage {
         {
             return Err(Error::Unsupported("MOSS currently implements resident execution; staging, tiling, chunking, windows and alternate execution policies are unavailable".into()));
         }
-        self.selected_sources(resolved.acceleration)?
+        Sources::selected(variant, spec, resolved.acceleration)?
             .mode_assets(resolved.acceleration)?;
         let branches = if matches!(resolved.acceleration, MossImageAcceleration::Off) {
             1 + u32::from(resolved.guidance != 1.0)
@@ -690,12 +703,7 @@ impl Generator for MossImage {
         request: &GenerationRequest,
         inputs: MossImageEditInputs<'_>,
     ) -> gen_core::Result<u64> {
-        inputs.validate()?;
-        let request = edit_request(request)?;
-        crate::edit::EditAssets::prepare(&self.spec)?;
-        self.estimated_request_peak(&request, inputs.advanced)?
-            .checked_add(crate::edit::extra_peak(inputs, &request)?)
-            .ok_or_else(|| gen_core::Error::Unsupported("MOSS edit peak overflow".into()))
+        memory_strategy::edit_request_peak(self.variant, &self.spec, request, inputs)
     }
     fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
         self.edit_report

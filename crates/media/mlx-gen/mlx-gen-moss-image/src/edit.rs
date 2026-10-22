@@ -150,9 +150,11 @@ pub(crate) fn extra_peak(
 ) -> Result<u64> {
     let dimensions = inputs.validate()?;
     let mut total = 0u64;
+    let mut largest_reference_tokens = 0u64;
     for ([w, h], original) in dimensions.into_iter().zip(inputs.references) {
         let pixels = w as u64 * h as u64;
         let tokens = pixels / 256;
+        largest_reference_tokens = largest_reference_tokens.max(tokens);
         // All reference K/V plus layer workspaces/attention; full FP32 VAE with source staging.
         let kv = tokens * 3072 * 2 * 2 * 42;
         let body_tokens = (request.width as u64)
@@ -185,8 +187,37 @@ pub(crate) fn extra_peak(
             .and_then(|n| n.checked_add(resize_bytes))
             .ok_or_else(|| Error::Unsupported("MOSS edit bound overflow".into()))?;
     }
+    // Edit-only biased projections cast temporarily, never retaining an FP32 backbone.
+    // Bound the text embedder plus one evaluated text block: text*d + 4*d*d + 3*d*f
+    // weight elements, plus both latent projections (2*latent*d). This exceeds
+    // the complete timestep path (freq*d + 9*d*d).
+    // Scratch counts input, dot and biased output for every projection conservatively;
+    // text blocks evaluate before the next block, so their cast weights do not overlap.
+    const D: u64 = 3072;
+    const F: u64 = 8192;
+    const TEXT: u64 = 4096;
+    const LATENT: u64 = 128;
+    let text_tokens = request
+        .moss_image
+        .as_ref()
+        .map_or(4096, |o| o.max_sequence_length) as u64;
+    let image_tokens =
+        (request.width as u64 * request.height as u64 / 256).max(largest_reference_tokens);
+    let precise_bytes = text_tokens
+        .checked_mul(TEXT + 16 * D + 5 * F)
+        .and_then(|n| {
+            image_tokens
+                .checked_mul(3 * D + 3 * LATENT)
+                .and_then(|m| n.checked_add(m))
+        })
+        .and_then(|n| {
+            n.checked_add(TEXT * D + 4 * D * D + 3 * D * F + 2 * LATENT * D + 256 + 23 * D)
+        })
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| Error::Unsupported("MOSS edit precise projection bound overflow".into()))?;
     total
-        .checked_add(2_000_000_000 + 297_271_296 * 2)
+        .checked_add(precise_bytes)
+        .and_then(|n| n.checked_add(2_000_000_000 + 297_271_296 * 2))
         .ok_or_else(|| Error::Unsupported("MOSS edit bound overflow".into()))
 }
 pub(crate) fn encode_references(
@@ -253,7 +284,7 @@ pub(crate) fn encode_references(
 }
 fn reference_latent(vae: &Flux2Vae, image: &Array, cancel: &CancelFlag) -> Result<Array> {
     check(cancel)?;
-    let mean = vae.encode_mean(image)?;
+    let mean = vae.encode_mean_precise(image)?;
     mlx_rs::transforms::eval([&mean])?;
     check(cancel)?;
     let s = mean.shape();
@@ -289,6 +320,11 @@ fn cfg_euler_step(
         current.as_dtype(Dtype::Float32)?,
         multiply(prediction, scalar(delta_sigma))?,
     )?)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static SAMPLING_TRACE: std::cell::RefCell<Option<Vec<[Array; 4]>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct EditSampling<'a> {
@@ -354,6 +390,17 @@ impl EditSampling<'_> {
                     pair[1] - pair[0],
                 )?;
                 mlx_rs::transforms::eval([&next])?;
+                #[cfg(test)]
+                SAMPLING_TRACE.with(|trace| {
+                    if let Some(trace) = trace.borrow_mut().as_mut() {
+                        trace.push([
+                            current.clone(),
+                            prediction.clone(),
+                            negative.as_ref().unwrap().clone(),
+                            next.clone(),
+                        ]);
+                    }
+                });
                 outputs.push(next);
             }
             latents = concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 0)?;
@@ -476,6 +523,7 @@ mod tests {
         Array::from_slice(&values(&v["values"]), &shape)
     }
     fn compare(actual: &Array, expected: &Value, tolerance: f32) {
+        assert_eq!(actual.dtype(), Dtype::Float32);
         assert_eq!(
             actual.shape(),
             expected["shape"]
@@ -494,10 +542,56 @@ mod tests {
             .zip(&expected)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
+        eprintln!("reference encoder max_abs={error}, bound={tolerance}");
         assert!(
             error <= tolerance,
             "encoder maximum absolute error {error} > {tolerance}"
         );
+    }
+    fn encoder_weights(fixture: &Value) -> Weights {
+        let mut tensors = HashMap::new();
+        for recipe in fixture["weights"].as_array().unwrap() {
+            let shape = recipe["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect::<Vec<_>>();
+            let count = shape.iter().map(|v| *v as usize).product::<usize>();
+            let seed = recipe["seed"].as_u64().unwrap() as u32;
+            let data = (0..count as u32)
+                .map(|index| {
+                    let mut bits = (index + 1) ^ seed;
+                    bits ^= bits << 13;
+                    bits ^= bits >> 17;
+                    bits ^= bits << 5;
+                    let signed = (bits & 65535) as i32 - 32768;
+                    match recipe["kind"].as_str().unwrap() {
+                        "bn_mean" => ((index % 17) as i32 - 8) as f32 / 64.0,
+                        "bn_var" => 1.0 + ((index * 7) % 31) as f32 / 32.0,
+                        "norm" => 1.0 + signed as f32 / 262144.0,
+                        "bias" => signed as f32 / 1048576.0,
+                        "weight" => signed as f32 / 8388608.0,
+                        "pointwise_identity" => {
+                            signed as f32 / 8388608.0
+                                + if index / (shape[1] as u32) == index % (shape[1] as u32) {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                        }
+                        kind => panic!("unknown encoder fixture recipe {kind}"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let name = recipe["name"].as_str().unwrap();
+            assert_eq!(
+                data[..data.len().min(4)],
+                values(&fixture["weight_prefix_probes"][name])
+            );
+            tensors.insert(name.into(), Array::from_slice(&data, &shape));
+        }
+        Weights::from_map(tensors)
     }
     #[test]
     #[ignore = "requires coordinator-admitted Metal ownership; exact VAE activation is Metal-only"]
@@ -511,49 +605,7 @@ mod tests {
                 "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_encode/fixture.json"
             ))
             .unwrap();
-            let mut tensors = HashMap::new();
-            for recipe in fixture["weights"].as_array().unwrap() {
-                let shape = recipe["shape"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_i64().unwrap() as i32)
-                    .collect::<Vec<_>>();
-                let count = shape.iter().map(|v| *v as usize).product::<usize>();
-                let seed = recipe["seed"].as_u64().unwrap() as u32;
-                let data = (0..count as u32)
-                    .map(|index| {
-                        let mut bits = (index + 1) ^ seed;
-                        bits ^= bits << 13;
-                        bits ^= bits >> 17;
-                        bits ^= bits << 5;
-                        let signed = (bits & 65535) as i32 - 32768;
-                        match recipe["kind"].as_str().unwrap() {
-                            "bn_mean" => ((index % 17) as i32 - 8) as f32 / 64.0,
-                            "bn_var" => 1.0 + ((index * 7) % 31) as f32 / 32.0,
-                            "norm" => 1.0 + signed as f32 / 262144.0,
-                            "bias" => signed as f32 / 1048576.0,
-                            "weight" => signed as f32 / 8388608.0,
-                            "pointwise_identity" => {
-                                signed as f32 / 8388608.0
-                                    + if index / (shape[1] as u32) == index % (shape[1] as u32) {
-                                        1.0
-                                    } else {
-                                        0.0
-                                    }
-                            }
-                            kind => panic!("unknown encoder fixture recipe {kind}"),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let name = recipe["name"].as_str().unwrap();
-                assert_eq!(
-                    data[..data.len().min(4)],
-                    values(&fixture["weight_prefix_probes"][name])
-                );
-                tensors.insert(name.into(), Array::from_slice(&data, &shape));
-            }
-            let weights = Weights::from_map(tensors);
+            let weights = encoder_weights(&fixture);
             let vae = Flux2Vae::from_weights_with_decoder_config(
                 &weights,
                 &Flux2VaeDecoderConfig {
@@ -564,13 +616,28 @@ mod tests {
             let pixels = array(&fixture["pixels_nhwc"]);
             let tolerance = fixture["absolute_tolerance"].as_f64().unwrap() as f32;
             compare(
-                &vae.encode_mean(&pixels).unwrap(),
+                &vae.encode_mean_precise(&pixels).unwrap(),
                 &fixture["mean_nhwc"],
                 tolerance,
             );
             let cancel = CancelFlag::new();
             let latent = reference_latent(&vae, &pixels, &cancel).unwrap();
             compare(&latent, &fixture["normalized_packed_nchw"], tolerance);
+            let actual = logical_f32_readback(&latent).unwrap();
+            for (name, mutant) in fixture["mutants"].as_object().unwrap() {
+                let wrong = values(&mutant["values"]);
+                assert_eq!(actual.len(), wrong.len());
+                let delta = actual
+                    .iter()
+                    .zip(wrong)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                eprintln!("reference encoder control {name}: delta={delta}, bound={tolerance}");
+                assert!(
+                    delta > 100.0 * tolerance,
+                    "undiscriminated encoder control {name}"
+                );
+            }
             cancel.cancel();
             assert!(matches!(
                 reference_latent(&vae, &pixels, &cancel),
@@ -578,6 +645,60 @@ mod tests {
             ));
         });
     }
+    #[test]
+    fn edit_peak_cpu_prices_reference_context_and_cold_rejection() {
+        let image = mlx_gen::Image {
+            width: 512,
+            height: 512,
+            pixels: vec![0; 512 * 512 * 3],
+        };
+        let references = [image];
+        let inputs = MossImageEditInputs {
+            references: &references,
+            ..Default::default()
+        };
+        let mut request = mlx_gen::GenerationRequest {
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        let full = extra_peak(inputs, &request).unwrap();
+        let smaller = extra_peak(
+            MossImageEditInputs {
+                reference_max_edge: 256,
+                ..inputs
+            },
+            &request,
+        )
+        .unwrap();
+        assert!(
+            full > smaller + 100_000_000,
+            "reference encoder/KV must affect admission"
+        );
+        request.moss_image = Some(Default::default());
+        request.moss_image.as_mut().unwrap().max_sequence_length = 256;
+        assert!(
+            extra_peak(inputs, &request).unwrap() < full,
+            "precise projection scratch tracks context"
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from(
+            "unused-cold-snapshot",
+        )));
+        request.moss_image.as_mut().unwrap().uncond_skip_layers = Some(vec![22]);
+        let error = crate::memory_strategy::edit_request_peak(
+            mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+            &spec,
+            &request,
+            inputs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("full-layer CFG"),
+            "typed refusal precedes asset access: {error}"
+        );
+    }
+
     #[test]
     fn edit_package_missing_corrupt_and_prepared_identity_reject_before_device() {
         let temp = tempfile::tempdir().unwrap();
