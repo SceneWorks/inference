@@ -18,6 +18,8 @@ jobs:
   moss-transport-selftest:
     runs-on: windows-latest
     timeout-minutes: 5
+    env:
+      RUSTUP_AUTO_INSTALL: '0'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -28,14 +30,16 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Windows PowerShell 5.1 required' }
-          Get-Command rustup,cargo -CommandType Application -ErrorAction Stop|Select-Object Name,Source
-          # Read installed state before invoking a rustup proxy inside the checkout.
-          # Explicitly use the already-installed default, avoiding rust-toolchain.toml.
-          $defaults=@(& rustup default)
-          if ($LASTEXITCODE -ne 0 -or $defaults.Count -ne 1) { throw 'Installed default toolchain required' }
-          $toolchain=($defaults[0] -split '\s+')[0]
-          $installed=@(& rustup toolchain list)
-          if ($LASTEXITCODE -ne 0 -or @($installed|Where-Object { ($_ -split '\s+')[0] -ceq $toolchain }).Count -ne 1) { throw 'Default toolchain is not installed; refusing installation' }
+          # Discover the installed default outside the repo toolchain override.
+          Push-Location $env:RUNNER_TEMP
+          try {
+            Get-Command rustup,cargo -CommandType Application -ErrorAction Stop|Select-Object Name,Source
+            $defaults=@(& rustup default)
+            if ($LASTEXITCODE -ne 0 -or $defaults.Count -ne 1) { throw 'Installed default toolchain required' }
+            $toolchain=($defaults[0] -split '\s+')[0]
+            $installed=@(& rustup toolchain list)
+            if ($LASTEXITCODE -ne 0 -or @($installed|Where-Object { ($_ -split '\s+')[0] -ceq $toolchain }).Count -ne 1) { throw 'Default toolchain is not installed; refusing installation' }
+          } finally { Pop-Location }
           $env:RUSTUP_TOOLCHAIN=$toolchain
           & cargo --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Cargo unavailable' }
@@ -54,7 +58,7 @@ jobs:
             foreach ($code in @(0,7)) {
               $p=$null
               try {
-                $p=Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/c',('exit '+$code)) -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $temp ($code+'.stdout')) -RedirectStandardError (Join-Path $temp ($code+'.stderr'))
+                $p=Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/c',('exit '+$code)) -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $temp ('{0}.stdout' -f $code)) -RedirectStandardError (Join-Path $temp ('{0}.stderr' -f $code))
                 $row=[ordered]@{requested_exit=$code;pid=$p.Id;handle_before_wait=$null;handle_error=$null;waited=$false;has_exited=$null;exit_property=$null;exit_getter=$null;exit_getter_error=$null}
                 try { $row.handle_before_wait=$p.Handle } catch { $row.handle_error=$_.Exception.Message }
                 $row.waited=$p.WaitForExit(5000)
@@ -65,7 +69,7 @@ jobs:
                 }
                 $json=$row|ConvertTo-Json -Compress
                 $json|Write-Output
-                $json|Set-Content -LiteralPath (Join-Path $temp ($code+'.json')) -Encoding UTF8
+                $json|Set-Content -LiteralPath (Join-Path $temp ('{0}.json' -f $code)) -Encoding UTF8
                 if (-not $row.waited) { throw 'Immediate child did not exit within five seconds' }
                 # Diagnostic observations cannot turn missing status into success;
                 # actual success/failure assertions remain in the full self-test below.
