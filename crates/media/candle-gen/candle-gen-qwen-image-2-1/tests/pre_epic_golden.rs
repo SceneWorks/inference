@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use candle_core::Device;
 use candle_gen::gen_core::{
-    LoadSpec, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest, WeightsSource,
+    LoadSpec, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 use candle_gen_qwen_image_2_1::training::QwenImage21Trainer;
 

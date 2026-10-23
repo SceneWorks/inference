@@ -605,7 +605,8 @@ impl ForwardHooks for TrainHooks<'_> {
         image: Tensor,
         text: Option<Tensor>,
     ) -> Result<(Tensor, Option<Tensor>)> {
-        if !self.ac.active() || (!image.track_op() && !text.as_ref().is_some_and(Tensor::track_op)) {
+        if !self.ac.active() || (!image.track_op() && !text.as_ref().is_some_and(Tensor::track_op))
+        {
             return Ok((image, text));
         }
         // The two cores share the timestep SiLU. Traverse them together, after all trunk readers,
@@ -819,7 +820,10 @@ fn backward_segmented(
                     has_txt.then(|| vars[3].as_tensor()),
                 )?;
                 (
-                    vec![(so, take(&mut cot, &outs[0])), (yo, take(&mut cot, &outs[1]))],
+                    vec![
+                        (so, take(&mut cot, &outs[0])),
+                        (yo, take(&mut cot, &outs[1])),
+                    ],
                     Some(vars),
                 )
             }
