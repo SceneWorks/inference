@@ -153,6 +153,7 @@ pub struct RunReceipt {
 pub struct TrainingProbe {
     evaluation: EvaluationManifest,
     receipts: Arc<Mutex<Vec<RunReceipt>>>,
+    generation: Arc<Mutex<Option<serde_json::Value>>>,
     // Output-only diagnostic path supplied by the owned CPU supervisor, never a model/source knob.
     artifact_path: Option<PathBuf>,
 }
@@ -166,6 +167,7 @@ impl TrainingProbe {
         Self {
             evaluation,
             receipts: Arc::new(Mutex::new(Vec::new())),
+            generation: Arc::new(Mutex::new(None)),
             artifact_path: std::env::var_os("MOSS_CPU_RECEIPT_PATH").map(PathBuf::from),
         }
     }
@@ -213,6 +215,7 @@ impl TrainingProbe {
                 "mask_sha256":self.evaluation.mask_digest,
             },
             "receipts":receipts,
+            "generation":&*self.generation.lock().map_err(|_| Error::Msg("generation observation poisoned".into()))?,
             // Hash-observed changes, not an invented numeric norm of the parameter delta.
             "parameter_hash_changed":parameter_delta,
         }))
@@ -251,6 +254,59 @@ impl TrainingProbe {
             owner: self.clone(),
             index,
         })
+    }
+    /// Observations from the existing real FP32 scale-one/zero generator witnesses, not pixels.
+    /// This records diagnostics only; every original acceptance assertion remains in the caller.
+    pub fn generation_observation(
+        &self,
+        request: &gen_core::GenerationRequest,
+        baseline: (&[usize; 4], &[f32]),
+        trained: (&[usize; 4], &[f32]),
+        disabled: (&[usize; 4], &[f32]),
+        adapter_applied: bool,
+    ) -> Result<()> {
+        let compare = |values: &[f32]| {
+            let finite = baseline.1.iter().chain(values).all(|v| v.is_finite());
+            let nonzero = baseline
+                .1
+                .iter()
+                .zip(values)
+                .filter(|(a, b)| a != b)
+                .count();
+            let maximum = if finite && baseline.1.len() == values.len() && !values.is_empty() {
+                Some(
+                    baseline
+                        .1
+                        .iter()
+                        .zip(values)
+                        .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
+                        .fold(0.0_f64, f64::max),
+                )
+            } else {
+                None
+            };
+            serde_json::json!({"elements":values.len(),"finite":finite,
+                "nonzero_elements_in_overlap":nonzero,"max_abs_delta":maximum})
+        };
+        let observation = serde_json::json!({
+            "request":{"prompt":&request.prompt,"width":request.width,"height":request.height,
+                "seed":request.seed,"steps":request.steps,"guidance":request.guidance,
+                "max_sequence_length":request.moss_image.as_ref().map(|m|m.max_sequence_length)},
+            "baseline_shape":baseline.0,"baseline_elements":baseline.1.len(),
+            "trained_shape":trained.0,"zero_strength_shape":disabled.0,
+            "trained":compare(trained.1),"zero_strength":compare(disabled.1),
+            "adapter_applied":adapter_applied,
+        });
+        // Same lock order as update/persist: receipts, then diagnostic generation metadata.
+        let receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| Error::Msg("training probe poisoned".into()))?;
+        *self
+            .generation
+            .lock()
+            .map_err(|_| Error::Msg("generation observation poisoned".into()))? = Some(observation);
+        self.persist(&receipts)
     }
     pub fn receipts(&self) -> Result<Vec<RunReceipt>> {
         Ok(self

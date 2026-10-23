@@ -36,7 +36,9 @@ pub(super) fn factors(set: &LoraSet) -> Result<String> {
 pub(super) fn gradients(probe: &RunProbe, gradients: &GradStore, set: &LoraSet) -> Result<()> {
     let mut finite = true;
     let mut nonzero = false;
-    for (_, var) in set.named_vars() {
+    let named = set.named_vars();
+    let count = named.len() as u64;
+    for (_, var) in named {
         let value = gradients
             .get(var.as_tensor())
             .ok_or_else(|| CandleError::Msg("observed gradient missing".into()))?
@@ -49,7 +51,7 @@ pub(super) fn gradients(probe: &RunProbe, gradients: &GradStore, set: &LoraSet) 
             nonzero |= values.iter().any(|v| *v != 0.);
         }
     }
-    probe.gradients(set.len() as u64, finite, nonzero)?;
+    probe.gradients(count, finite, nonzero)?;
     Ok(())
 }
 pub(super) fn mask(probe: &RunProbe, mask: &Tensor, latent: &Tensor) -> Result<()> {

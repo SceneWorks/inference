@@ -228,7 +228,6 @@ mod tests {
             || fixture.trainer_with_probe(variant, probe.clone()),
             |adapters| fixture.generator(variant, adapters),
         )?;
-        gen_core_testkit::moss_training_probe::assert_complete_case(&probe, case == 3)?;
         let request = generation_request();
         let (before, shape, _) = fixture.generate_latents(variant, Vec::new(), &request)?;
         let kind = if case.is_multiple_of(2) {
@@ -244,6 +243,21 @@ mod tests {
             vec![AdapterSpec::new(saved.clone(), 1., kind)],
             &request,
         )?;
+        let (disabled, disabled_shape, _) = fixture.generate_latents(
+            variant,
+            vec![AdapterSpec::new(saved.clone(), 0., kind)],
+            &request,
+        )?;
+        probe.generation_observation(
+            &request,
+            (&shape, &before),
+            (&after_shape, &after),
+            (&disabled_shape, &disabled),
+            reports
+                .iter()
+                .any(|r| r.adapter_path == saved && r.applied > 0 && r.skipped.is_empty()),
+        )?;
+        gen_core_testkit::moss_training_probe::assert_complete_case(&probe, case == 3)?;
         assert_eq!(shape, after_shape);
         assert_eq!(before.len(), after.len());
         assert!(before.iter().chain(&after).all(|v| v.is_finite()));
@@ -254,8 +268,6 @@ mod tests {
         assert!(reports
             .iter()
             .any(|r| r.adapter_path == saved && r.applied > 0 && r.skipped.is_empty()));
-        let (disabled, disabled_shape, _) =
-            fixture.generate_latents(variant, vec![AdapterSpec::new(saved, 0., kind)], &request)?;
         assert_eq!(shape, disabled_shape);
         assert_eq!(
             before, disabled,

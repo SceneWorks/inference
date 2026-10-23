@@ -26,6 +26,23 @@ CADENCE_TEST = "training::review_admission_tests::resume_accepts_checkpoint_cade
 METADATA_TEST = "training_memory::tests::persistent_metadata_raises_backward_checkpoint_and_admission_boundary"
 ZERO_TEST = "training::review_admission_tests::concrete_trainer_override_refuses_before_missing_model_or_dataset_can_load"
 STAGING_TEST = "test_support::tests::source_sized_request_staging_preserves_public_default_and_refuses_cap"
+# Existing immutable CPU controls, selected from the actual d079 unfiltered listings.
+CAUSAL_TESTS = {
+    "candle": ("tests::training_contract_tests::cpu_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload",),
+    "mlx": (
+        "transformer::training_graph_tests::cpu_native_backward_updates_only_factors_and_reload_changes_generation",
+        "transformer::training_bf16_cpu_tests::production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload",
+        "transformer::review_fix_tests::all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward",
+    ),
+}
+FRACTION_TESTS = tuple("train::memory_budget_tests::" + name for name in (
+    "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
+    "fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback",
+    "fraction_cap_rounds_down_exactly_even_at_u64_max"))
+MASK_TESTS = tuple("train::subject_mask::tests::" + name for name in (
+    "area_average_preserves_nonbinary_constants_and_convex_range",
+    "area_average_partial_crop_matches_independent_integer_overlap_oracle",
+    "area_average_f64_taps_keep_supported_host_scratch_layout"))
 TRAINING = "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs"
 MLX_MEMORY = "crates/media/mlx-gen/mlx-gen-moss-image/src/training_memory.rs"
 
@@ -150,10 +167,7 @@ def compile_binary(backend: str, path: Path) -> tuple[Path, dict]:
 
 def contract_fraction_tests(directory: Path) -> dict:
     package = "sceneworks-gen-core"
-    names = ["train::memory_budget_tests::" + name for name in (
-        "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
-        "fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback",
-        "fraction_cap_rounds_down_exactly_even_at_u64_max")]
+    names = [*FRACTION_TESTS, *MASK_TESTS]
     argv = ["cargo", "test", "--locked", "--lib", "-j", "1", "-p", package,
             "--no-run", "--message-format=json"]
     stamp = fixture.source_stamp()
@@ -169,6 +183,7 @@ def contract_fraction_tests(directory: Path) -> dict:
         if result.returncode != 101:
             raise UnitFailure("fraction compiler did not finish normally; independent readiness unknown")
         return {"passed": False, "compiler_exit": result.returncode, "source": stamp,
+                "groups": {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)},
                 "cargo_json_sha256": fixture.file_digest(cargo_log),
                 "tests": [{"test": name, "status": "blocked_compile"} for name in names]}
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
@@ -179,6 +194,7 @@ def contract_fraction_tests(directory: Path) -> dict:
         raise UnitFailure("contract binary lacks exact fraction tests")
     results = independent_tests(binary, names, directory, "fraction")
     return {"tests": results, "passed": all(r["status"] == "passed" for r in results),
+            "groups": {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)},
             "source": fixture.source_stamp(), "binary_sha256": fixture.file_digest(binary),
             "cargo_json_sha256": fixture.file_digest(cargo_log)}
 
@@ -235,7 +251,8 @@ def run(backend: str, directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     evidence = {"backend": backend, "head": None, "passed": False,
                 "expected_fixture_tests": [fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES],
-                "expected_review_tests": sorted({m["test"] for m in mutations(backend)}), "mutations": []}
+                "expected_review_tests": sorted({m["test"] for m in mutations(backend)} | set(CAUSAL_TESTS[backend])),
+                "causal_controls": list(CAUSAL_TESTS[backend]), "mutations": []}
     baseline = None
     try:
         evidence.update(venue(backend))

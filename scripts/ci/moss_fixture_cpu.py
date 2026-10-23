@@ -333,7 +333,30 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
         expected_delta = (before != after) if before and after else None
         if delta[index] is not expected_delta:
             raise UnitFailure("training observation parameter-hash delta differs")
-    return {"path": str(path), "sha256": file_digest(path), "runs": len(receipts)}
+    generation = value.get("generation")
+    if generation is not None:
+        if not isinstance(generation, dict) or type(generation.get("adapter_applied")) is not bool:
+            raise UnitFailure("generation observation is malformed")
+        request = generation.get("request") or {}
+        if request.get("seed") != receipts[0]["resolved_seed"]:
+            raise UnitFailure("generation witness changed the fixed seed")
+        for key in ("baseline_shape", "trained_shape", "zero_strength_shape"):
+            shape = generation.get(key)
+            if not isinstance(shape, list) or len(shape) != 4 or any(type(n) is not int or n <= 0 for n in shape):
+                raise UnitFailure("generation witness shape missing")
+        elements = generation.get("baseline_elements")
+        if type(elements) is not int or elements <= 0:
+            raise UnitFailure("generation baseline element count missing")
+        for key in ("trained", "zero_strength"):
+            values = generation.get(key) or {}
+            count, nonzero, maximum = values.get("elements"), values.get("nonzero_elements_in_overlap"), values.get("max_abs_delta")
+            if (type(count) is not int or count <= 0 or type(nonzero) is not int
+                    or not 0 <= nonzero <= min(elements, count) or type(values.get("finite")) is not bool
+                    or (values.get("finite") is True and count == elements and maximum is None)
+                    or (maximum is not None and (type(maximum) not in (int, float) or not 0 <= maximum < float("inf")))):
+                raise UnitFailure("generation delta metadata missing or invalid")
+    return {"path": str(path), "sha256": file_digest(path), "runs": len(receipts),
+            "generation_observed": generation is not None}
 
 
 def execute(binary: Path, name: str, log: Path) -> str:
@@ -361,6 +384,8 @@ def execute(binary: Path, name: str, log: Path) -> str:
     if not failed:
         verify(output, name)
     observation = read_observations(log, stamp["head"], name in CASES)
+    if name in CASES and not failed and not observation["generation_observed"]:
+        raise UnitFailure("positive full case lacks actual FP32 generation observations")
     result = {"test": name, "status": "assertion_failed" if failed else "passed",
               "source": stamp, "binary_sha256": digest, "log_sha256": file_digest(log),
               "observations": observation, "observed_elapsed_seconds": time.monotonic() - started,

@@ -321,6 +321,20 @@ class DiagnosticBatchTests(unittest.TestCase):
             path = log.with_suffix(".receipts.json")
             path.write_text(json.dumps(value), encoding="utf-8")
             self.assertEqual(fixture.read_observations(log, head, True)["runs"], 1)
+            with_generation = copy.deepcopy(value)
+            with_generation["generation"] = {
+                "request": {"seed": 173}, "baseline_shape": [1, 1, 2, 2], "baseline_elements": 4,
+                "trained_shape": [1, 1, 2, 2], "zero_strength_shape": [1, 1, 2, 2], "adapter_applied": True,
+                "trained": {"elements": 4, "finite": True, "nonzero_elements_in_overlap": 1, "max_abs_delta": 0.125},
+                "zero_strength": {"elements": 4, "finite": True, "nonzero_elements_in_overlap": 0, "max_abs_delta": 0.0},
+            }
+            path.write_text(json.dumps(with_generation), encoding="utf-8")
+            self.assertTrue(fixture.read_observations(log, head, True)["generation_observed"])
+            bad_generation = copy.deepcopy(with_generation)
+            bad_generation["generation"]["request"]["seed"] = 999
+            path.write_text(json.dumps(bad_generation), encoding="utf-8")
+            with self.assertRaises(UnitFailure):
+                fixture.read_observations(log, head, True)
             mutants = []
             for key, changed in (("source_head", "0" * 40), ("receipts", []), ("parameter_hash_changed", [False]), ("evaluation", {})):
                 mutant = copy.deepcopy(value); mutant[key] = changed; mutants.append(mutant)
@@ -415,6 +429,31 @@ class DiagnosticBatchTests(unittest.TestCase):
                         result = json.loads((root / "baseline.batch.json").read_text(encoding="utf-8"))
                         self.assertIsNotNone(result["fatal_error"])
                         self.assertFalse(result["passed"])
+
+    def test_causal_controls_are_existing_unmodified_explicit_cpu_tests(self):
+        candle = (ROOT / "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs").read_text(encoding="utf-8")
+        mlx = (ROOT / "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer.rs").read_text(encoding="utf-8")
+        for name in profile.CAUSAL_TESTS["candle"]:
+            function = name.split("::")[-1]
+            self.assertIn(f"fn {function}()", candle)
+            body = candle.split(f"fn {function}()", 1)[1].split("\n#[test]", 1)[0]
+            self.assertIn("native_graph_cases(Device::Cpu)", body)
+        for name in profile.CAUSAL_TESTS["mlx"]:
+            function = name.split("::")[-1]
+            self.assertIn(f"fn {function}()", mlx)
+            body = mlx.split(f"fn {function}()", 1)[1].split("\n    #[test]", 1)[0]
+            self.assertIn("let _device = crate::cpu_test_device();", body)
+        for name in profile.MASK_TESTS:
+            self.assertIn("fn " + name.split("::")[-1] + "()", (ROOT / "crates/contracts/gen-core/src/train/subject_mask/tests.rs").read_text(encoding="utf-8"))
+
+    def test_existing_fp32_witnesses_are_observed_before_unchanged_heldout_assertion(self):
+        for backend in ("candle-gen/candle-gen-moss-image", "mlx-gen/mlx-gen-moss-image"):
+            source = (ROOT / f"crates/media/{backend}/src/test_support.rs").read_text(encoding="utf-8")
+            body = source.split("fn run(case: usize)", 1)[1].split("    #[test]", 1)[0]
+            self.assertLess(body.index("probe.generation_observation"), body.index("assert_complete_case"))
+            self.assertLess(body.index("let (disabled, disabled_shape"), body.index("probe.generation_observation"))
+            self.assertIn("actual scale1 generator latents must change", body)
+            self.assertIn("zero-strength adapter must not fake a generation delta", body)
 
     def test_contract_compile_error_is_blocked_not_a_runtime_red(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
