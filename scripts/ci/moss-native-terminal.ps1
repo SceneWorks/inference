@@ -238,7 +238,7 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
                 ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $script:evidence ($name+'.ownership.json')) -Encoding UTF8
         }
         while (-not $p.HasExited) {
-            foreach ($copy in $copies) { if ($copy.IsFaulted) { $copy.GetAwaiter().GetResult() } }
+            foreach ($copy in $copies) { if ($copy.IsFaulted) { $null=$copy.GetAwaiter().GetResult() } }
             Require ($null -ne $root) 'Live root has no authenticated ownership identity'
             $all = @(Get-CimInstance Win32_Process)
             Discover-Owned $all $owned {param($row,$parent) Retain-Child $row $parent}
@@ -282,7 +282,7 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
             # Descendants can inherit the pipes: terminate them before waiting for EOF.
             if ($copies.Count -gt 0) {
                 Require ([Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$copies,5000)) "Owned child output drain timed out: $name"
-                foreach ($copy in $copies) { $copy.GetAwaiter().GetResult() }
+                foreach ($copy in $copies) { $null=$copy.GetAwaiter().GetResult() }
             }
         } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
         finally {
@@ -725,13 +725,16 @@ try { $child.WaitForExit();exit $child.ExitCode } finally {$child.Dispose()}
         Require (-not (Same-Identity $legacy $observed.identity)) 'Legacy root identity unexpectedly passed the alias regression'
         Write-Output ('Owned alias identity: '+($observed|ConvertTo-Json -Compress -Depth 4))
         Remove-Variable fixtureRelease,fixtureChainObserved,fixtureDrainObserved -Scope Script
-        # Root exits after authentication while its child still owns inherited pipes.
-        # Output EOF must be awaited only after the retained child has been stopped.
-        [IO.File]::WriteAllText((Join-Path $temp 'pipe-child-fixture.ps1'),$grand.Replace('release-fixture','never-release-pipe-child'))
+        # Root exits after the exact intended child has an authenticated retained handle.
+        # Output EOF must be awaited only after that pipe-holding child has stopped.
+        [IO.File]::WriteAllText((Join-Path $temp 'pipe-child-fixture.ps1'),$grand.Replace('release-fixture','release-pipe-child'))
         $pipeRoot=@'
 $child=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $PSScriptRoot 'pipe-child-fixture.ps1')+'"')) -NoNewWindow -PassThru
 $null=$child.Handle
 try {
+    $ready=Join-Path $PSScriptRoot 'pipe-child-ready.json'
+    [IO.File]::WriteAllText(($ready+'.tmp'),(@{pid=$child.Id;handle_created_utc=$child.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json))
+    [IO.File]::Move(($ready+'.tmp'),$ready)
     $limit=[DateTime]::UtcNow.AddSeconds(60)
     while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-pipe-root'))) {
         if ([DateTime]::UtcNow -gt $limit) { exit 91 }
@@ -742,22 +745,48 @@ try {
 '@
         [IO.File]::WriteAllText((Join-Path $temp 'pipe-root-fixture.ps1'),$pipeRoot)
         $script:fixturePipeObserved=$false; $script:fixturePipeDrained=$false
+        $script:fixturePipeReady=Join-Path $temp 'pipe-child-ready.json'
         $script:fixturePipeRelease=Join-Path $temp 'release-pipe-root'
+        $script:fixturePipeChildRelease=Join-Path $temp 'release-pipe-child'
+        $script:fixturePipeChild=$null; $script:fixturePipeClock=[Diagnostics.Stopwatch]::StartNew()
         try {
             Owned-Run 'powershell' @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'pipe-root-fixture.ps1')+'"')) 'root-exits-before-pipe-child' 10 {
                 param($ids,$owned)
-                if ($ids.Count -ge 2) {
-                    $script:fixturePipeObserved=$true
-                    [IO.File]::WriteAllText($script:fixturePipeRelease,'release')
+                if (-not $script:fixturePipeObserved -and (Test-Path -LiteralPath $script:fixturePipeReady)) {
+                    $ready=Get-Content -Raw -LiteralPath $script:fixturePipeReady|ConvertFrom-Json
+                    Require (Integer $ready.pid) 'Pipe fixture child PID unavailable'
+                    $id=[int]$ready.pid
+                    if ($owned.ContainsKey($id) -and (Owned-Entry-Live $owned[$id])) {
+                        $entry=$owned[$id]
+                        Require ($entry.identity.name -ieq 'powershell.exe' -and $entry.handle_created_utc -ceq $ready.handle_created_utc) 'Pipe fixture retained the wrong child'
+                        $script:fixturePipeChild=$entry.identity.PSObject.Copy()
+                        $script:fixturePipeObserved=$true
+                        Write-Output ('Pipe fixture retained: '+(@{elapsed_ms=$script:fixturePipeClock.ElapsedMilliseconds;child=$script:fixturePipeChild}|ConvertTo-Json -Compress -Depth 4))
+                        [IO.File]::WriteAllText($script:fixturePipeRelease,'release')
+                    }
                 }
             } {
                 param($owned)
-                Require ($owned.Count -ge 2) 'Pipe child was not retained'
-                foreach ($entry in $owned.Values) { Require ($entry.process.HasExited) 'Pipe child survived owned cleanup' }
-                $script:fixturePipeDrained=$true
+                try {
+                    Require ($null -ne $script:fixturePipeChild -and $owned.ContainsKey($script:fixturePipeChild.pid)) 'Pipe child was not retained'
+                    $entry=$owned[$script:fixturePipeChild.pid]
+                    Require (Same-Identity $entry.identity $script:fixturePipeChild) 'Pipe fixture retained child changed'
+                    Require ($entry.process.HasExited) 'Pipe child survived owned cleanup'
+                    foreach ($member in $owned.Values) { Require ($member.process.HasExited) 'Pipe fixture descendant survived owned cleanup' }
+                    $script:fixturePipeDrained=$true
+                    Write-Output ('Pipe fixture retained child exited: '+$script:fixturePipeClock.ElapsedMilliseconds)
+                } finally {
+                    # Release only this fixture's waiter even when an assertion failed.
+                    [IO.File]::WriteAllText($script:fixturePipeChildRelease,'release')
+                    Write-Output ('Pipe fixture cleanup release: '+$script:fixturePipeClock.ElapsedMilliseconds)
+                }
             }
             Require ($script:fixturePipeObserved -and $script:fixturePipeDrained) 'Root-exit pipe cleanup never ran'
-        } finally { Remove-Variable fixturePipeRelease,fixturePipeObserved,fixturePipeDrained -Scope Script }
+        } finally {
+            [IO.File]::WriteAllText($script:fixturePipeChildRelease,'release')
+            Write-Output ('Pipe fixture returned/finally: '+$script:fixturePipeClock.ElapsedMilliseconds)
+            Remove-Variable fixturePipeReady,fixturePipeRelease,fixturePipeChildRelease,fixturePipeChild,fixturePipeClock,fixturePipeObserved,fixturePipeDrained -Scope Script
+        }
         # Exercise the installed Cargo/rustup launcher without Rust compilation,
         # dependencies, network, or GPU work. Cargo waits for this temporary external
         # subcommand until the supervisor has authenticated the live process chain.
