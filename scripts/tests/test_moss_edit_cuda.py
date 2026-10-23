@@ -206,13 +206,15 @@ class OrchestrationTests(unittest.TestCase):
 
 class OwnershipTests(unittest.TestCase):
     def test_suspended_assignment_cleanup_and_deadline_only_touch_owned_child(self):
-        for mode in ('success', 'timeout', 'assign-failure', 'leftover'):
+        for mode in ('success', 'transient', 'timeout', 'assign-failure', 'leftover', 'short-deadline', 'query-error', 'query-overrun'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                events = []
+                events = []; clock = [0.0]; observations = [0]
                 class Child:
                     pid = 123
                     returncode = 0
-                    def poll(self): return None if mode == 'timeout' else 0
+                    def poll(self):
+                        if mode == 'short-deadline': clock[0] = 0.99
+                        return None if mode == 'timeout' else 0
                     def kill(self): events.append('child-kill')
                     def wait(self, timeout): events.append('child-wait')
                 class Job:
@@ -220,21 +222,47 @@ class OwnershipTests(unittest.TestCase):
                     def assign_and_resume(self, child):
                         events.append('assign')
                         if mode == 'assign-failure': raise RuntimeError('assignment denied')
-                        self.live = mode in ('timeout', 'leftover')
-                    def members(self): return {123} if self.live else set()
+                        self.live = mode in ('transient', 'timeout', 'leftover', 'short-deadline', 'query-error')
+                    def members(self):
+                        observations[0] += 1
+                        if mode == 'query-error' and observations[0] == 1: raise RuntimeError('Job query failed')
+                        if mode == 'transient' and observations[0] >= 3: self.live = False
+                        if mode == 'query-overrun': clock[0] = 1.01
+                        return {456 if mode in ('leftover', 'short-deadline') else 123} if self.live else set()
                     def terminate_and_reap(self, child, grace): events.append('owned-job-terminate'); self.live = False
                     def close(self): events.append('close')
                 def spawn(args, **kwargs):
                     self.assertEqual(kwargs['creationflags'], 0x00000004); events.append('suspended-spawn'); return Child()
-                with patch.object(gate.time, 'monotonic', side_effect=[0, 2]):
-                    if mode == 'success': gate.run_owned(['fixture'], {}, Path(directory), 'case', 1, job_type=Job, popen=spawn)
+                def sleep(seconds): clock[0] += seconds
+                with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.time, 'sleep', side_effect=sleep):
+                    if mode in ('success', 'transient'): gate.run_owned(['fixture'], {}, Path(directory), 'case', 2 if mode == 'query-overrun' else 1, job_type=Job, popen=spawn)
                     else:
-                        with self.assertRaises((ValueError, RuntimeError)): gate.run_owned(['fixture'], {}, Path(directory), 'case', 1, job_type=Job, popen=spawn)
+                        with self.assertRaises((ValueError, RuntimeError)): gate.run_owned(['fixture'], {}, Path(directory), 'case', 2 if mode == 'query-overrun' else 1, job_type=Job, popen=spawn)
                 self.assertEqual(events[:2], ['suspended-spawn', 'assign']); self.assertEqual(events[-1], 'close')
-                self.assertEqual('owned-job-terminate' in events, mode in ('timeout', 'leftover'))
+                self.assertEqual('owned-job-terminate' in events, mode in ('timeout', 'leftover', 'short-deadline', 'query-error'))
                 self.assertEqual('child-kill' in events, mode == 'assign-failure')
                 receipt = json.loads((Path(directory)/'case.owned.json').read_text(encoding='utf-8'))
                 self.assertEqual(receipt['remainingOwnedPids'], [])
+                if mode not in ('timeout', 'assign-failure'):
+                    self.assertEqual(receipt['returncode'], 0)
+                    self.assertIn('rootExitObservedUtc', receipt)
+                    self.assertLessEqual(len(receipt['jobDrainObservations']), 21)
+                if mode == 'transient':
+                    self.assertEqual([r['pids'] for r in receipt['jobDrainObservations']], [[123], [123], []])
+                    self.assertNotIn('error', receipt)
+                if mode in ('leftover', 'short-deadline'):
+                    self.assertEqual(receipt['preCleanupOwnedPids'], [456])
+                    self.assertTrue(all(r['pids'] == [456] for r in receipt['jobDrainObservations']))
+                    self.assertIn('survived root exit drain', receipt['error'])
+                    self.assertLessEqual(clock[0], 1.0)
+                if mode == 'short-deadline':
+                    self.assertEqual(len(receipt['jobDrainObservations']), 2)
+                if mode == 'query-overrun':
+                    self.assertEqual(receipt['error'], 'owned Job drain deadline exceeded')
+                    self.assertEqual(receipt['jobDrainObservations'], [{'elapsedSeconds': 1.01, 'pids': []}])
+                if mode == 'query-error':
+                    self.assertEqual(receipt['error'], 'Job query failed')
+                    self.assertEqual(receipt['jobDrainObservations'], [])
 
 
 class WorkflowTests(unittest.TestCase):

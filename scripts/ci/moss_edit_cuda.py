@@ -240,16 +240,34 @@ def run_owned(args, env, out, label, seconds, *, job_type=WindowsJob, popen=subp
                 require(time.monotonic() - started < seconds, 'owned command deadline exceeded')
                 require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
                 time.sleep(0.05)
-            require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
-            require(not job.members(), 'owned descendants survived root exit')
             receipt['returncode'] = child.returncode
+            receipt['rootExitObservedUtc'] = utc().isoformat()
+            # Root exit alone does not establish that the whole owned Job has drained.
+            # Permit natural completion briefly, without extending the command deadline.
+            drain_started = time.monotonic()
+            drain_deadline = min(started + seconds, drain_started + 1.0)
+            receipt['jobDrainObservations'] = []
+            for attempt in range(21):
+                members = sorted(job.members())
+                observed = time.monotonic()
+                receipt['jobDrainObservations'].append({
+                    'elapsedSeconds': round(observed - started, 6), 'pids': members,
+                })
+                require(observed <= drain_deadline, 'owned Job drain deadline exceeded')
+                if not members:
+                    break
+                require(observed < drain_deadline and attempt < 20, 'owned descendants survived root exit drain')
+                require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
+                time.sleep(min(0.05, drain_deadline - observed))
+            require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
             return child.returncode, paths[0].read_text(encoding='utf-8', errors='replace')
         except BaseException as error:
             receipt['error'] = str(error)
             raise
         finally:
             try:
-                if child is not None and job.members():
+                receipt['preCleanupOwnedPids'] = sorted(job.members())
+                if child is not None and receipt['preCleanupOwnedPids']:
                     job.terminate_and_reap(child, 10)
                 receipt['remainingOwnedPids'] = sorted(job.members())
                 require(not receipt['remainingOwnedPids'], 'owned cleanup incomplete')
