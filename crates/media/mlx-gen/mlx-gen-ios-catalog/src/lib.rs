@@ -55,7 +55,8 @@ mod binding;
 mod source_work;
 pub use mlx_gen_sdxl::sampling::SourceRequestBudget;
 pub use source_work::{
-    record_source_context, serialize_capture_failure, serialize_capture_row, SdxlWorkBinding,
+    record_source_context, serialize_capture_failure, serialize_capture_row,
+    source_context_requested_bytes, SdxlWorkBinding,
 };
 mod bound;
 mod capture_config;

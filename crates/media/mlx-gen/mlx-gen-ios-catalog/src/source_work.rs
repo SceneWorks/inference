@@ -901,8 +901,19 @@ pub(crate) fn parse_table(
     Ok(table)
 }
 
+/// Exact requested metadata layouts for one SDXL source-context capture.
+///
+/// Borrows the actual request without allocating or cloning image/media buffers.
+/// This is the existing controls-Vec plus Arc ownership law, NOT live headroom,
+/// physical/RSS bytes, a model-memory bound, or a capture/execution permit.
+/// Callers must still perform `record_source_context` with the same real
+/// byte-sensitive capacity callback; this query authorizes no allocation itself.
+pub fn source_context_requested_bytes(request: &GenerationRequest) -> Result<u64> {
+    capture_requested_bytes(SamplingSourceView::from_request(request))
+}
+
+/// Shared law for production queries and the existing zero/boundary/allocation tests.
 /// Exact newly owned requested layouts for a one-pass actual capture, not import growth peaks.
-#[cfg(test)]
 pub(crate) fn capture_requested_bytes(view: SamplingSourceView<'_>) -> Result<u64> {
     let vector =
         Layout::array::<mlx_gen_sdxl::sampling::IndexedImageSourceFacts>(view.work().control_count)
@@ -1140,6 +1151,40 @@ mod tests {
     }
 
     #[test]
+    fn public_source_context_query_borrows_every_role_without_allocating() {
+        for case in 0..=4 {
+            for large in [false, true] {
+                let mut actual = request(case);
+                if large {
+                    actual.prompt = "large λ\n\"source\"".repeat(4096);
+                    actual.negative_prompt = Some("negative 雪\n\"escaped\"".repeat(4096));
+                    for role in &mut actual.conditioning {
+                        let image = match role {
+                            Conditioning::Reference { image, .. }
+                            | Conditioning::Mask { image }
+                            | Conditioning::Control { image, .. } => image,
+                            _ => unreachable!(),
+                        };
+                        image.width = 512;
+                        image.height = 512;
+                        image.pixels.resize(512 * 512 * 3, 17);
+                    }
+                }
+                let expected =
+                    capture_requested_bytes(SamplingSourceView::from_request(&actual)).unwrap();
+                let (queried, allocated) = crate::binding::tests::allocations_during(|| {
+                    source_context_requested_bytes(&actual)
+                });
+                assert_eq!(queried.unwrap(), expected);
+                assert_eq!(
+                    allocated, 0,
+                    "metadata query must not clone images or allocate owners"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_roles_roundtrip_and_key_clones_share_verified_facts() {
         for case in 1..=4 {
             let r = request(case);
@@ -1162,7 +1207,7 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             let before = buffers(&r);
-            let requested = capture_requested_bytes(SamplingSourceView::from_request(&r)).unwrap();
+            let requested = source_context_requested_bytes(&r).unwrap();
             let mut capture_budget = SourceRequestBudget::bounded(requested);
             let (owned, allocated) = crate::binding::tests::allocations_during(|| {
                 SdxlWorkBinding::capture(&r, &mut capture_budget)
@@ -1343,7 +1388,7 @@ mod tests {
             assert!(bytes > 0);
             Err(error.take().expect("first request must stop"))
         };
-        let allowance = capture_requested_bytes(SamplingSourceView::from_request(&r)).unwrap();
+        let allowance = source_context_requested_bytes(&r).unwrap();
         let mut live_denied = SourceRequestBudget::with_capacity(allowance, &mut refuse);
         let (refused, allocated) = crate::binding::tests::allocations_during(|| {
             SdxlWorkBinding::capture(&r, &mut live_denied)

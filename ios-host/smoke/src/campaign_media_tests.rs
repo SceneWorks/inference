@@ -476,10 +476,21 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
             "{purpose}"
         );
     }
-    assert!(listed.iter().any(|e| e["case"]
-        .as_str()
+    // Without an actual depth checkpoint there is no source-owned allocation
+    // class. Keep that registered capability visible, not a fabricated anchor.
+    assert!(listing["unserved_sampling"]
+        .as_array()
         .unwrap()
-        .starts_with("iris_3b_depth/iris_3b_depth/bf16/1024/depth/")));
+        .iter()
+        .any(|entry| entry["provider"] == "iris_3b_depth"
+            && entry["tier"] == "bf16"
+            && entry["mode"] == "depth"
+            && entry["memory_class"].is_null()));
+    assert!(discovered
+        .iter()
+        .any(|surface| surface.provider == "iris_3b_depth"
+            && surface.modes.contains(&"depth".into())
+            && surface.serves("bf16")));
     // A tier a route does not serve (the dense-only Iris tasks at q8) is listed as unserved, never
     // silently dropped and never a planned cell.
     assert!(listing["unserved"]
@@ -517,6 +528,65 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
         usize::from(additive_control)
     );
 }
+#[test]
+fn configured_depth_matrix_has_real_bf16_1024_endpoints_and_guarded_source_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-depth");
+    super::admission_tests::copy_tree(&fixture, &root.path().join("iris_3b_depth/bf16"));
+    let catalog = runtime_ios::catalog().unwrap();
+    let discovered = surfaces_with_snapshots(catalog.media(), Some(root.path())).unwrap();
+    let variant_of =
+        |p: &str, _route: &str, mode: &str, tier: &str, recipe: &campaign::CaptureRecipe| {
+            variant(p, mode, tier, recipe.memory_class.as_deref())
+        };
+    let (_, planned) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
+    for purpose in [campaign::Purpose::Resident, campaign::Purpose::Optimized] {
+        let endpoints: Vec<_> = planned
+            .iter()
+            .filter(|entry| {
+                entry.purpose == purpose
+                    && entry.case.provider == "iris_3b_depth"
+                    && entry.case.route == "iris_3b_depth"
+                    && entry.case.tier == "bf16"
+                    && entry.case.edge == 1024
+                    && entry.case.mode == "depth"
+            })
+            .collect();
+        assert!(
+            !endpoints.is_empty(),
+            "actual configured depth is missing {purpose:?}"
+        );
+        for entry in endpoints {
+            assert!(
+                entry.case.recipe.is_some(),
+                "a real source-owned sampling recipe is required"
+            );
+            let mut adapter =
+                super::admission_tests::adapter(catalog.media(), root.path().to_owned());
+            adapter
+                .prepare(&entry.case)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", entry.case.key()));
+            let key = adapter
+                .evidence_key
+                .as_ref()
+                .expect("guarded source capture produced an actual key");
+            assert_eq!(key.mode, "depth");
+            assert!(
+                key.layout_sha256.len() == 64
+                    && key
+                        .layout_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+            );
+            assert!(
+                adapter.permit.is_none(),
+                "metadata/keys do not grant execution or fake evidence"
+            );
+        }
+    }
+}
+
 #[cfg(not(target_os = "ios"))]
 #[test]
 fn campaign_public_report_host_execution_is_failure_before_allocator_or_load() {
@@ -725,6 +795,51 @@ fn copy_tiny_iris_metadata_slot(root: &Path, tier: &str, shift: f64, prediction:
     let slot = root.join("iris_3b").join(tier);
     copy_dir(&fixture.join("iris"), &slot);
     copy_dir(&fixture.join("text_encoder"), &slot.join("text_encoder"));
+    if tier == "q8" {
+        // The dense numerical fixture's MLP width 48 cannot use affine group 32
+        // or 64. Build a coherent synthetic width-64 tower for this q8 metadata
+        // test, changing BOTH config and every affected tensor shape (not merely
+        // declaring a quantization policy over incompatible source geometry).
+        let config = slot.join("text_encoder/config.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(value["text_config"]["intermediate_size"], 48);
+        value["text_config"]["intermediate_size"] = json!(64);
+        std::fs::write(config, serde_json::to_vec(&value).unwrap()).unwrap();
+        let weights = slot.join("text_encoder/model.safetensors");
+        let mut headers =
+            runtime_ios::gen_core::weightsmeta::safetensors_path_tensor_headers(&weights).unwrap();
+        let mut changed = 0;
+        for tensor in &mut headers {
+            if tensor.name.contains(".mlp.") {
+                for dimension in &mut tensor.shape {
+                    if *dimension == 48 {
+                        *dimension = 64;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            changed > 0,
+            "the quantizable fixture must change actual MLP matrices"
+        );
+        let dtypes: Vec<_> = headers
+            .iter()
+            .map(|tensor| format!("{:?}", tensor.dtype))
+            .collect();
+        let tensors: Vec<_> = headers
+            .iter()
+            .zip(&dtypes)
+            .map(|(tensor, dtype)| {
+                (
+                    tensor.name.as_str(),
+                    dtype.as_str(),
+                    tensor.shape.as_slice(),
+                )
+            })
+            .collect();
+        gen_core_testkit::wan_i2v::write_safetensors(&weights, &tensors);
+    }
     let config = slot.join("config.yaml");
     let original = std::fs::read_to_string(&config).unwrap();
     assert_eq!(original.matches("  shift: 4.0").count(), 1);

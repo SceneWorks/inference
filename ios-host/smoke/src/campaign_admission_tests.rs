@@ -18,7 +18,7 @@ pub(super) fn cell(prefix: &str) -> Case {
     }
     c
 }
-fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
+pub(super) fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
     DeviceProvider {
         registry,
         root,
@@ -63,7 +63,7 @@ fn sana(root: &Path) {
     );
     tensor(&root.join("vae/a.safetensors"), "conv.weight");
 }
-fn copy_tree(from: &Path, to: &Path) {
+pub(super) fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
@@ -96,7 +96,7 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
         if kind == "no_evidence" {
             assert!(p.artifact["layout_sha256"]
                 .as_str()
-                .is_some_and(|s| s.len() == 64));
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())));
             assert!(p.evidence_key.is_some(), "the memory key is recorded");
         }
     }

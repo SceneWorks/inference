@@ -1105,6 +1105,7 @@ fn anchor_context<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
     row: &'row AnchorRow,
+    mut next: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<AnchorContext<'row>> {
     let (Some(strategy), Some(parameters)) = (row.selection.strategy(), row.selection.parameters())
     else {
@@ -1129,13 +1130,22 @@ fn anchor_context<'row>(
     } else {
         None
     };
-    let mut spec = candidate.spec.clone();
+    let mut spec = match next.as_mut() {
+        Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
+            candidate.spec.clone_with_capacity(core_next)
+        })?,
+        None => candidate.spec.clone(),
+    };
+    // This override copies only the two load-form enums; it allocates nothing.
     // Re-price the anchor's actual load, not the requesting endpoint's load form.
     row.key.load_form.apply(&mut spec);
     // Retain the actual matched configured graph, including Control+Reference/IP combinations.
     // Family identity carries normalized overlay semantics; mode-name stripping would silently
     // change the load and defeat the provider's real init/IP interpretation.
-    spec.resolved_route = Some(row.key.route.clone());
+    spec.resolved_route = Some(match next.as_mut() {
+        Some(next) => source_string_clone(&row.key.route, Some(&mut **next))?,
+        None => row.key.route.clone(),
+    });
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
         .ok_or_else(|| no_evidence(format!("{provider}: no memory contract")))?;
@@ -1192,9 +1202,12 @@ fn price_anchor_using_source_capacity<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
     row: &'row AnchorRow,
-    next: Option<KeyCapacity<'_>>,
+    mut next: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
-    let context = anchor_context(registry, candidate, row)?;
+    let context = match next.as_mut() {
+        Some(next) => anchor_context(registry, candidate, row, Some(&mut **next))?,
+        None => anchor_context(registry, candidate, row, None)?,
+    };
     let mut pricing = match next {
         Some(next) => with_source_metadata_capacity(next, |next| {
             crate::sampling::price_metadata_with_source_capacity(
@@ -1264,6 +1277,125 @@ fn with_source_inventory_capacity<T>(
         },
         |error| source_metadata_gap_refusal(AdmissionError::Failed(error)),
     )
+}
+
+/// Build exactly the borrowed UTF-8 segments billed BEFORE allocation. Both
+/// iterator passes are source-owned, immutable and allocation-free. No format!
+/// growth heuristic or temporary collected Vec participates in the guarded path.
+fn source_string_parts<'a>(
+    parts: impl Iterator<Item = &'a str> + Clone,
+    next: KeyCapacity<'_>,
+) -> AdmissionResult<String> {
+    let bytes = parts
+        .clone()
+        .try_fold(0usize, |bytes, part| bytes.checked_add(part.len()))
+        .ok_or_else(|| no_evidence("source string requested-layout overflow".into()))?;
+    let requested = u64::try_from(bytes)
+        .map_err(|_| no_evidence("source string requested-layout exceeds u64".into()))?;
+    with_source_metadata_capacity(next, |same_next| {
+        same_next(requested)?;
+        let mut value = String::new();
+        value.try_reserve_exact(bytes).map_err(|_| {
+            mlx_gen::Error::Msg("source string allocation failed after capacity check".into())
+        })?;
+        for part in parts {
+            value.push_str(part);
+        }
+        Ok(value)
+    })
+}
+
+fn source_string_clone(value: &str, next: Option<KeyCapacity<'_>>) -> AdmissionResult<String> {
+    match next {
+        Some(next) => source_string_parts(std::iter::once(value), next),
+        None => Ok(value.to_owned()),
+    }
+}
+
+/// Full concrete context Clone law: only these four string owners allocate.
+/// Exhaustive destructuring/matching forces a source audit if a field/variant is
+/// added; selection, authority, geometry, budget and cache state are Copy data.
+fn source_context_clone(
+    context: &MemoryRunContext,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<MemoryRunContext> {
+    let Some(next) = next else {
+        return Ok(context.clone());
+    };
+    fn require_copy<T: Copy>(_: T) {}
+    require_copy((
+        context.selection,
+        context.optimization_authority,
+        context.calibration_abi,
+        context.load_shape,
+        context.has_reference,
+        context.use_pid,
+        context.has_phases,
+        context.geometry,
+        context.budget,
+        context.predicted_peak_bytes,
+        context.cache_state,
+    ));
+    let MemoryRunContext {
+        selection: _,
+        optimization_authority: _,
+        calibration_abi: _,
+        calibration_fingerprint,
+        load_shape: _,
+        mode,
+        has_reference: _,
+        use_pid: _,
+        has_phases: _,
+        geometry: _,
+        overlay,
+        budget: _,
+        predicted_peak_bytes: _,
+        cache_state: _,
+        evidence_revision,
+    } = context;
+    let mode_bytes = match mode {
+        MemoryMode::TextToImage | MemoryMode::ImageToImage | MemoryMode::Edit => 0,
+        MemoryMode::Other(value) => value.len(),
+    };
+    let bytes = [
+        calibration_fingerprint.len(),
+        mode_bytes,
+        overlay.as_ref().map_or(0, String::len),
+        evidence_revision.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or_else(|| no_evidence("context clone requested-layout overflow".into()))?;
+    let requested = u64::try_from(bytes)
+        .map_err(|_| no_evidence("context clone requested-layout exceeds u64".into()))?;
+    with_source_metadata_capacity(next, |same_next| {
+        same_next(requested)?;
+        Ok(context.clone())
+    })
+}
+
+fn source_evidence_revision(
+    key: &EvidenceKey,
+    premises: &[IosCertificatePremise],
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<String> {
+    let Some(next) = next else {
+        let revision = format!("ios-device-anchor:{}", key.layout_sha256);
+        return Ok(if premises.is_empty() {
+            revision
+        } else {
+            let ids: Vec<_> = premises.iter().map(|premise| premise.id.as_str()).collect();
+            format!("{revision};premises={}", ids.join(","))
+        });
+    };
+    let prefix =
+        std::iter::once("ios-device-anchor:").chain(std::iter::once(key.layout_sha256.as_str()));
+    let premise_prefix = (!premises.is_empty()).then_some(";premises=").into_iter();
+    let ids = premises
+        .iter()
+        .enumerate()
+        .flat_map(|(index, premise)| [if index == 0 { "" } else { "," }, premise.id.as_str()]);
+    source_string_parts(prefix.chain(premise_prefix).chain(ids), next)
 }
 
 fn with_source_capacity_using<T>(
@@ -1829,19 +1961,21 @@ fn admit_one_using_key_capacity(
         let required_bytes = anchor::with_margin(demand_bytes, margin_bytes).map_err(|error| {
             no_evidence(format!("complete admitted envelope arithmetic: {error}"))
         })?;
-        let mut context = candidate.context.clone();
+        let mut context = match next.as_mut() {
+            Some(next) => source_context_clone(&candidate.context, Some(&mut **next))?,
+            None => candidate.context.clone(),
+        };
         if rows.is_some() {
             context.budget = budget;
             // The render's own growth plus the anchor's measured margin; what the process already
             // holds is the budget's committed bytes and is never credited as reusable.
             context.predicted_peak_bytes = required_bytes;
-            context.evidence_revision = format!("ios-device-anchor:{}", key.layout_sha256);
-            if !premises.is_empty() {
-                // The approved premises are part of the admitted evidence identity, not hidden.
-                let ids: Vec<_> = premises.iter().map(|premise| premise.id.as_str()).collect();
-                context.evidence_revision =
-                    format!("{};premises={}", context.evidence_revision, ids.join(","));
-            }
+            // Preserve the exact approved identity without a temporary IDs Vec
+            // or unchecked format/String growth in the guarded path.
+            context.evidence_revision = match next.as_mut() {
+                Some(next) => source_evidence_revision(&key, &premises, Some(&mut **next))?,
+                None => source_evidence_revision(&key, &premises, None)?,
+            };
             if let MemorySafetyDecision::Reject { reason } =
                 (registration.safety_check)(&candidate.spec, &contract, &context)
             {
@@ -1853,22 +1987,38 @@ fn admit_one_using_key_capacity(
                 return Err(AdmissionError::refused(kind, reason));
             }
         } else {
-            context.evidence_revision = "ios-capture-permit:no-evidence-row".into();
+            context.evidence_revision = match next.as_mut() {
+                Some(next) => {
+                    source_string_clone("ios-capture-permit:no-evidence-row", Some(&mut **next))?
+                }
+                None => "ios-capture-permit:no-evidence-row".into(),
+            };
         }
-        // Source/spec/token cloning and binding need their own checked ownership law.
-        // Do not clone first and then pretend a verification check covered that allocation.
-        if let Some(next) = next.as_mut() {
-            with_source_inventory_capacity(&mut **next, |core_next| {
-                guard.preflight_admission_binding_with_capacity(&candidate.spec, core_next)
-            })?;
-        }
-        let mut spec = candidate.spec.clone();
+        // The actual full Clone and inventory binding are behind their own
+        // finite requested-layout laws, not a preflight followed by unchecked
+        // copies. Keep the SAME mutable capacity callback for every owner.
+        let mut spec = match next.as_mut() {
+            Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
+                candidate.spec.clone_with_capacity(core_next)
+            })?,
+            None => candidate.spec.clone(),
+        };
         if spec.source_inventory().is_none() {
-            spec.bind_source_inventory((*guard).clone())?;
+            match next.as_mut() {
+                Some(next) => with_source_inventory_capacity(&mut **next, |core_next| {
+                    let source = guard.clone_with_capacity(core_next)?;
+                    spec.bind_source_inventory_with_capacity(source, core_next)
+                })?,
+                None => spec.bind_source_inventory((*guard).clone())?,
+            }
         }
+        let provider = match next.as_mut() {
+            Some(next) => source_string_clone(&candidate.provider, Some(&mut **next))?,
+            None => candidate.provider.clone(),
+        };
         Ok(Admission {
             index,
-            provider: candidate.provider.clone(),
+            provider,
             demand_bytes,
             margin_bytes,
             basis,
@@ -2314,6 +2464,132 @@ impl Admission {
             Box::new(capacity),
             envelope,
         ))
+    }
+}
+
+#[cfg(test)]
+mod guarded_clone_tests {
+    use super::*;
+    use crate::binding::tests::allocations_during;
+    use std::cell::Cell;
+
+    #[test]
+    fn guarded_string_checks_utf8_requested_bytes_before_its_only_allocation() {
+        let parts = ["route/", "日本語", "/tail"];
+        let bill = Cell::new(0);
+        let mut next = |bytes| {
+            bill.set(bytes);
+            Ok(())
+        };
+        let (result, allocated) =
+            allocations_during(|| source_string_parts(parts.into_iter(), &mut next));
+        let value = result.unwrap();
+        assert_eq!(value, "route/日本語/tail");
+        assert_eq!(bill.get(), value.len() as u64);
+        assert_eq!(
+            allocated as u64,
+            bill.get(),
+            "unbilled temporary/growth allocation"
+        );
+    }
+
+    #[test]
+    fn guarded_string_refusal_precedes_large_owner_creation() {
+        let original = "x".repeat(1 << 20);
+        let calls = Cell::new(0);
+        let mut next = |bytes| {
+            assert_eq!(bytes, original.len() as u64);
+            calls.set(calls.get() + 1);
+            Err(mlx_gen::Error::Canceled)
+        };
+        let (result, allocated) =
+            allocations_during(|| source_string_clone(&original, Some(&mut next)));
+        assert!(
+            matches!(result, Err(AdmissionError::Refused(ref refusal)) if refusal.kind == RefusalKind::Capacity)
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(
+            allocated < original.len(),
+            "copy builder ran after capacity refusal"
+        );
+    }
+
+    #[test]
+    fn guarded_context_clone_bills_all_actual_string_owners() {
+        let registry = crate::provider_registry().unwrap();
+        let root = crate::sdxl::tests::fixture();
+        let mut context = crate::sdxl::tests::candidate(
+            &registry,
+            root.path(),
+            "sdxl",
+            512,
+            None,
+            "text_to_image",
+        )
+        .context;
+        context.calibration_fingerprint = "fingerprint".repeat(8);
+        context.mode = MemoryMode::Other("mode".repeat(9));
+        context.overlay = Some("overlay".repeat(7));
+        context.evidence_revision = "previous".repeat(11);
+        let bill = Cell::new(0);
+        let mut next = |bytes| {
+            bill.set(bytes);
+            Ok(())
+        };
+        let (result, allocated) =
+            allocations_during(|| source_context_clone(&context, Some(&mut next)));
+        assert_eq!(result.unwrap(), context);
+        assert_eq!(allocated as u64, bill.get());
+        assert!(bill.get() > 0);
+    }
+
+    #[test]
+    fn guarded_evidence_revision_preserves_exact_legacy_identity_without_ids_vec() {
+        let registry = crate::provider_registry().unwrap();
+        let root = crate::sdxl::tests::fixture();
+        let candidate = crate::sdxl::tests::candidate(
+            &registry,
+            root.path(),
+            "sdxl",
+            512,
+            None,
+            "text_to_image",
+        );
+        let key = crate::evidence::fixture::capture(
+            &registry,
+            &candidate,
+            crate::evidence::ANCHOR_MARGIN_FLOOR_BYTES,
+        )
+        .key;
+        let premises = [
+            IosCertificatePremise {
+                id: "first".into(),
+                statement: "statement must not be copied".repeat(100),
+            },
+            IosCertificatePremise {
+                id: "日本語".into(),
+                statement: "other".into(),
+            },
+        ];
+        for count in 0..=premises.len() {
+            let expected = source_evidence_revision(&key, &premises[..count], None).unwrap();
+            let bill = Cell::new(0);
+            let mut next = |bytes| {
+                bill.set(bytes);
+                Ok(())
+            };
+            let (result, allocated) = allocations_during(|| {
+                source_evidence_revision(&key, &premises[..count], Some(&mut next))
+            });
+            let value = result.unwrap();
+            assert_eq!(value, expected);
+            assert_eq!(bill.get(), value.len() as u64);
+            assert_eq!(
+                allocated as u64,
+                bill.get(),
+                "temporary IDs or format growth escaped bill"
+            );
+        }
     }
 }
 

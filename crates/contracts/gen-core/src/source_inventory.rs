@@ -2,14 +2,39 @@
 //! file tokens, not a header hash masquerading as immutable tensor bytes. Persistent replacement,
 //! in-place stat changes and directory membership changes fail before/after each guarded read.
 //! Like PinnedWeightsFile, this is not a filesystem transaction against restored-path attacks.
+//! Guarded capacity APIs use an owned, source-proven Apple (macOS/iOS) backend. Other targets
+//! retain explicit source-gap refusals; their ordinary/native inventory APIs are unchanged.
 use crate::{Error, LoadSpec, PinnedWeightsFile, Result};
 use std::path::{Path, PathBuf};
+
+#[cfg(target_vendor = "apple")]
+#[path = "bounded_clone.rs"]
+pub(crate) mod bounded_clone;
+#[cfg(target_vendor = "apple")]
+#[path = "bounded_fs.rs"]
+pub(crate) mod bounded_fs;
 
 #[derive(Clone, Debug)]
 pub struct SourceInventory {
     roots: Vec<PathBuf>,
     entries: Vec<PathBuf>,
     pins: Vec<PinnedWeightsFile>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl bounded_clone::CloneLaw for SourceInventory {
+    fn clone_bytes(&self) -> Result<u64> {
+        let Self {
+            roots,
+            entries,
+            pins,
+        } = self;
+        bounded_clone::sum([
+            roots.clone_bytes(),
+            entries.clone_bytes(),
+            pins.clone_bytes(),
+        ])
+    }
 }
 
 /// Read-only requested-layout facts of the ALREADY retained source inventory. No paths or pins
@@ -54,12 +79,70 @@ fn collect(path: &Path, entries: &mut Vec<PathBuf>, files: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum DirectoryVerificationOperation {
-    Open,
-    Next,
-    OwnedName,
-    FileType,
+#[cfg(target_vendor = "apple")]
+fn collect_with_capacity(
+    roots: &[PathBuf],
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    use bounded_fs as fs;
+    let mut entries = fs::vec(roots.len(), next)?;
+    let mut files = Vec::new();
+    for root in roots {
+        entries.push(fs::copy_path(root, next)?);
+    }
+    // Iterative traversal: directory depth does not consume a recursive native stack.
+    let mut cursor = 0;
+    while cursor < entries.len() {
+        let path = fs::copy_path(&entries[cursor], next)?;
+        cursor += 1;
+        let target = fs::stat(&path, true, next)?;
+        if fs::is_file(&target) {
+            fs::push(&mut files, path, next)?;
+            continue;
+        }
+        let mut directory = fs::Directory::open(&path, next)?;
+        while let Some(name) = directory.next(next)? {
+            let leaf = Path::new(name);
+            if crate::weightsmeta::is_hidden_file(leaf) || crate::weightsmeta::is_hidden_dir(leaf) {
+                continue;
+            }
+            let child = fs::join(&path, name, next)?;
+            let target = fs::stat(&child, true, next)?;
+            if fs::is_dir(&target) && fs::is_link(&fs::stat(&child, false, next)?) {
+                return SourceInventory::metadata_gap(
+                    next,
+                    "source inventory refuses a symlinked subdirectory",
+                );
+            }
+            fs::push(&mut entries, child, next)?;
+        }
+    }
+    entries.sort_unstable();
+    entries.dedup();
+    files.sort_unstable();
+    files.dedup();
+    Ok((entries, files))
+}
+
+#[cfg(target_vendor = "apple")]
+fn roots_with_capacity(
+    spec: &LoadSpec,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut result = Ok(());
+    spec.visit_source_paths(|path, _| {
+        if result.is_ok() {
+            result = (|| {
+                let path = bounded_fs::absolute(path, next)?;
+                bounded_fs::push(&mut roots, path, next)
+            })();
+        }
+    });
+    result?;
+    roots.sort_unstable();
+    roots.dedup();
+    Ok(roots)
 }
 
 impl SourceInventory {
@@ -77,7 +160,7 @@ impl SourceInventory {
         reason: &'static str,
     ) -> Result<T> {
         let layout = std::alloc::Layout::array::<u8>(reason.len())
-            .map_err(|_| Error::Msg("source metadata diagnostic layout overflow".into()))?;
+            .map_err(|_| Error::Io(std::io::ErrorKind::InvalidInput.into()))?;
         next(layout.size() as u64)?;
         Err(Error::Unsupported(reason.into()))
     }
@@ -86,27 +169,49 @@ impl SourceInventory {
         Self::metadata_gap(next, "source inventory changed after admission")
     }
 
-    /// Earliest borrowed directory-source boundary, before snapshot/configuration/contract
-    /// discovery can open any current member. No inventory, PathBuf or request DTO is built.
-    /// Until the exact filesystem wrapper law closes, refuse the named gap BEFORE that work.
+    /// Earliest directory-source discovery boundary. On Apple, walk actual current
+    /// members using caller-owned, prechecked buffers, without acquiring content seals.
+    /// This is discovery, not a retained membership receipt or a static manifest.
     pub fn preflight_directory_with_capacity(
-        _directory: &Path,
+        directory: &Path,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
+        #[cfg(target_vendor = "apple")]
+        {
+            let directory = bounded_fs::absolute(directory, next)?;
+            collect_with_capacity(std::slice::from_ref(&directory), next)?;
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = directory;
+            Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
+        }
     }
 
-    /// Guard receipt source/spec/token ownership BEFORE cloning or binding it. A complete
-    /// checked allocation law is required before this operation can succeed. This narrow
-    /// public operation exposes only the fixed initial-seal/binding gap, not arbitrary reasons.
-    /// The borrowed inputs are available for the future source law; no native fallback or clone
-    /// is performed while its authority remains missing (sc-26270 activity 26647).
+    /// Compatibility preflight for the aggregate owning Clone of this inventory
+    /// and spec. This does not authorize native filesystem operations: callers
+    /// still use bind_source_inventory_with_capacity for verification/binding.
+    /// New code should prefer the per-operation clone_with_capacity methods.
     pub fn preflight_admission_binding_with_capacity(
         &self,
-        _spec: &LoadSpec,
+        spec: &LoadSpec,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        Self::metadata_gap(next, Self::PIN_CAPTURE_METADATA_GAP)
+        #[cfg(target_vendor = "apple")]
+        {
+            use bounded_clone::CloneLaw;
+            self.verify_for_with_capacity(spec, next)?;
+            next(bounded_clone::sum([
+                self.clone_bytes(),
+                spec.clone_bytes(),
+            ])?)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = spec;
+            Self::metadata_gap(next, Self::PIN_CAPTURE_METADATA_GAP)
+        }
     }
 
     /// Initial guarded inventory acquisition. No current-directory Vec or seal acquisition runs
@@ -115,183 +220,188 @@ impl SourceInventory {
         spec: &LoadSpec,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<Self> {
-        let mut directory = false;
-        spec.visit_source_paths(|_, is_directory| directory |= is_directory);
-        Self::metadata_gap(
-            next,
-            if directory {
-                Self::READDIR_METADATA_GAP
-            } else {
-                Self::PIN_CAPTURE_METADATA_GAP
-            },
-        )
+        #[cfg(target_vendor = "apple")]
+        {
+            spec.validate_prepared_file_pins_with_capacity(next)?;
+            if let Some(retained) = spec.source_inventory() {
+                retained.verify_for_with_capacity(spec, next)?;
+            }
+            let roots = roots_with_capacity(spec, next)?;
+            let (entries, files) = collect_with_capacity(&roots, next)?;
+            let mut pins = bounded_fs::vec(files.len(), next)?;
+            for path in files {
+                pins.push(match spec.prepared_file_pins().get(&path) {
+                    Some(pin) => pin.clone_with_capacity(next)?,
+                    None => PinnedWeightsFile::pin_with_capacity(&path, next)?,
+                });
+            }
+            let inventory = Self {
+                roots,
+                entries,
+                pins,
+            };
+            inventory.verify_unchanged_with_capacity(next)?;
+            Ok(inventory)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let mut directory = false;
+            spec.visit_source_paths(|_, is_directory| directory |= is_directory);
+            Self::metadata_gap(
+                next,
+                if directory {
+                    Self::READDIR_METADATA_GAP
+                } else {
+                    Self::PIN_CAPTURE_METADATA_GAP
+                },
+            )
+        }
     }
 
-    /// Borrow the original member token without path cloning. Relative path normalization remains
-    /// an explicit pre-operation source gap rather than calling unbounded `current_dir` first.
+    /// Borrow the original token after guarded lexical normalization. Apple's
+    /// caller-buffer current-directory path supports relative bindings; other
+    /// targets retain their explicit relative-path source gap.
     pub fn member_pin_with_capacity(
         &self,
         loader_path: &Path,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<Option<&PinnedWeightsFile>> {
-        if !loader_path.is_absolute() {
-            return Self::metadata_gap(next, Self::ABSOLUTE_PATH_METADATA_GAP);
+        #[cfg(target_vendor = "apple")]
+        {
+            let loader_path = bounded_fs::absolute(loader_path, next)?;
+            Ok(self
+                .pins
+                .iter()
+                .find(|pin| pin.loader_path() == loader_path))
         }
-        Ok(self
-            .pins
-            .iter()
-            .find(|pin| pin.loader_path() == loader_path))
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            if !loader_path.is_absolute() {
+                return Self::metadata_gap(next, Self::ABSOLUTE_PATH_METADATA_GAP);
+            }
+            Ok(self
+                .pins
+                .iter()
+                .find(|pin| pin.loader_path() == loader_path))
+        }
     }
 
-    /// Check configured root membership without first collecting CURRENT roots into a Vec.
+    /// Normalize configured roots with prechecked ownership, compare the sorted
+    /// lexical binding, then independently verify current membership and pins.
     pub fn verify_for_with_capacity(
         &self,
         spec: &LoadSpec,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        let mut relative = false;
-        let mut mismatch = false;
-        spec.visit_source_paths(|path, _| {
-            relative |= !path.is_absolute();
-            mismatch |= !self.roots.iter().any(|root| root.as_path() == path);
-        });
-        if relative {
-            return Self::metadata_gap(next, Self::ABSOLUTE_PATH_METADATA_GAP);
+        #[cfg(target_vendor = "apple")]
+        {
+            spec.validate_prepared_file_pins_with_capacity(next)?;
+            if roots_with_capacity(spec, next)? != self.roots {
+                return Self::metadata_gap(
+                    next,
+                    "source inventory does not cover the configured sources",
+                );
+            }
+            self.verify_unchanged_with_capacity(next)
         }
-        for expected in &self.roots {
-            let mut present = false;
-            spec.visit_source_paths(|path, _| present |= path == expected.as_path());
-            mismatch |= !present;
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = spec;
+            Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
         }
-        if mismatch {
-            return Self::metadata_gap(
-                next,
-                "source inventory does not cover the configured sources",
-            );
-        }
-        self.verify_unchanged_with_capacity(next)
     }
 
     fn expected_is_file(&self, path: &Path) -> bool {
-        self.pins.iter().any(|pin| pin.loader_path() == path)
+        // Both acquisition paths retain pins in sorted file-path order.
+        self.pins
+            .binary_search_by(|pin| pin.loader_path().cmp(path))
+            .is_ok()
     }
 
     fn expected_child_index(&self, directory: &Path, name: &std::ffi::OsStr) -> Option<usize> {
+        // Compare a BORROWED joined component sequence against the sorted closure.
+        // No joined PathBuf, name allocation or quadratic full-member scan.
         self.entries
-            .iter()
-            .position(|path| path.parent() == Some(directory) && path.file_name() == Some(name))
+            .binary_search_by(|path| {
+                path.components().cmp(
+                    directory
+                        .components()
+                        .chain(std::iter::once(std::path::Component::Normal(name))),
+                )
+            })
+            .ok()
     }
 
-    /// Gate BEFORE std::read_dir, iterator.next or owned entry-name conversion.
-    /// Authenticated std owners are known, but private InnerReadDir ABI, Apple dirent cfg and
-    /// missing helpers/libc183 bytes do NOT yet give a whole requested-layout upper. Never use
-    /// Layout<ReadDir> as the size of its Arc payload, or expected-count as an entry-name limit.
-    fn check_directory_operation(
-        &self,
-        _directory: &Path,
-        _operation: DirectoryVerificationOperation,
-        next: &mut dyn FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
-    }
-
-    /// Streaming expected-member verification. The only owned tracking vector is bounded by the
-    /// SEALED entry count and prechecked; CURRENT entries are never collected into PathBuf Vecs.
-    /// A directory wrapper gap refuses before any ReadDir/private-entry operation. This does NOT
-    /// claim the currently unproved directory capability has been activated.
+    /// Reopen EVERY retained directory, borrowing names from an owned bounded
+    /// syscall buffer. Current cardinality never sizes a vector. An extra entry
+    /// fails before joining/owning its path; missing members are independently
+    /// detected by a sealed-count seen vector. Pins retain all identity checks.
     pub fn verify_unchanged_with_capacity(
         &self,
         next: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        // No native vector based on a mutable directory's current cardinality.
-        let has_directories = self.entries.iter().any(|path| !self.expected_is_file(path));
-        if has_directories {
-            // Resolve the private wrapper obligation BEFORE even allocating bounded seen storage.
-            let first = self
-                .entries
-                .iter()
-                .find(|path| !self.expected_is_file(path))
-                .unwrap();
-            self.check_directory_operation(first, DirectoryVerificationOperation::Open, next)?;
-            let layout = std::alloc::Layout::array::<bool>(self.entries.len())
-                .map_err(|_| Error::Msg("source inventory seen layout overflow".into()))?;
-            next(layout.size() as u64)?;
-            let mut seen = Vec::new();
-            seen.try_reserve_exact(self.entries.len())
-                .map_err(|_| Error::Msg("source inventory seen reservation failed".into()))?;
+        #[cfg(target_vendor = "apple")]
+        {
+            use bounded_fs as fs;
+            let mut seen = fs::vec::<bool>(self.entries.len(), next)?;
             seen.resize(self.entries.len(), false);
-            // Configured roots need not appear as a child of another retained directory.
             for (index, path) in self.entries.iter().enumerate() {
                 if self.roots.contains(path) {
                     seen[index] = true;
                 }
-            }
-            for directory in self
-                .entries
-                .iter()
-                .filter(|path| !self.expected_is_file(path))
-            {
-                self.check_directory_operation(
-                    directory,
-                    DirectoryVerificationOperation::Open,
-                    next,
-                )?;
-                let mut current = std::fs::read_dir(directory)?;
-                loop {
-                    self.check_directory_operation(
-                        directory,
-                        DirectoryVerificationOperation::Next,
+                if self.expected_is_file(path) {
+                    continue;
+                }
+                let target = fs::stat(path, true, next)?;
+                if !fs::is_dir(&target) {
+                    return Self::changed_with_capacity(next);
+                }
+                // Configured root directory symlinks are historically allowed;
+                // a discovered symlinked subdirectory is not.
+                if !self.roots.contains(path) && fs::is_link(&fs::stat(path, false, next)?) {
+                    return Self::metadata_gap(
                         next,
-                    )?;
-                    let Some(entry) = current.next() else {
-                        break;
-                    };
-                    let entry = entry?;
-                    self.check_directory_operation(
-                        directory,
-                        DirectoryVerificationOperation::OwnedName,
-                        next,
-                    )?;
-                    let name = entry.file_name();
-                    let leaf = Path::new(&name);
+                        "source inventory refuses a symlinked subdirectory",
+                    );
+                }
+                let mut current = fs::Directory::open(path, next)?;
+                while let Some(name) = current.next(next)? {
+                    let leaf = Path::new(name);
                     if crate::weightsmeta::is_hidden_file(leaf)
                         || crate::weightsmeta::is_hidden_dir(leaf)
                     {
                         continue;
                     }
-                    let Some(index) = self.expected_child_index(directory, &name) else {
-                        // Stop at FIRST extra/renamed member, before path joining or growing any
-                        // collection. No cap depends on how many unexpected entries now exist.
+                    let Some(child) = self.expected_child_index(path, name) else {
                         return Self::changed_with_capacity(next);
                     };
-                    self.check_directory_operation(
-                        directory,
-                        DirectoryVerificationOperation::FileType,
-                        next,
-                    )?;
-                    let kind = entry.file_type()?;
-                    let expected_file = self.expected_is_file(&self.entries[index]);
-                    if kind.is_symlink() && !expected_file {
+                    let expected = &self.entries[child];
+                    let target = fs::stat(expected, true, next)?;
+                    let expected_file = self.expected_is_file(expected);
+                    if (expected_file && !fs::is_file(&target))
+                        || (!expected_file && !fs::is_dir(&target))
+                    {
+                        return Self::changed_with_capacity(next);
+                    }
+                    if !expected_file && fs::is_link(&fs::stat(expected, false, next)?) {
                         return Self::metadata_gap(
                             next,
                             "source inventory refuses a symlinked subdirectory",
                         );
                     }
-                    if (!expected_file && !kind.is_dir()) || (expected_file && kind.is_dir()) {
-                        return Self::changed_with_capacity(next);
-                    }
-                    seen[index] = true;
+                    seen[child] = true;
                 }
             }
             if seen.iter().any(|seen| !seen) {
                 return Self::changed_with_capacity(next);
             }
+            for pin in &self.pins {
+                pin.verify_unchanged_with_capacity(next)?;
+            }
+            Ok(())
         }
-        // File-only verification also must not hide canonicalize/component snapshot allocation.
-        for pin in &self.pins {
-            pin.verify_unchanged_with_capacity(next)?;
-        }
-        Ok(())
+        #[cfg(not(target_vendor = "apple"))]
+        Self::metadata_gap(next, Self::READDIR_METADATA_GAP)
     }
 
     /// Same source closure and SAME capacity check both before and after the read, including a
@@ -383,6 +493,65 @@ impl SourceInventory {
         };
         guard.verify_unchanged()?;
         Ok(guard)
+    }
+
+    /// Clone only known retained owners, checking each requested layout before
+    /// ownership is acquired. This does not authorize a LoadSpec/DTO clone.
+    pub fn clone_with_capacity(&self, next: &mut dyn FnMut(u64) -> Result<()>) -> Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut roots = bounded_fs::vec(self.roots.len(), next)?;
+            for root in &self.roots {
+                roots.push(bounded_fs::copy_path(root, next)?);
+            }
+            let mut entries = bounded_fs::vec(self.entries.len(), next)?;
+            for entry in &self.entries {
+                entries.push(bounded_fs::copy_path(entry, next)?);
+            }
+            let mut pins = bounded_fs::vec(self.pins.len(), next)?;
+            for pin in &self.pins {
+                pins.push(pin.clone_with_capacity(next)?);
+            }
+            Ok(Self {
+                roots,
+                entries,
+                pins,
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Self::metadata_gap(next, Self::PIN_CAPTURE_METADATA_GAP)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn configured_file_pins_with_capacity(
+        &self,
+        spec: &LoadSpec,
+        next: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Vec<(PathBuf, PinnedWeightsFile)>> {
+        let mut paths = Vec::new();
+        let mut result: Result<()> = Ok(());
+        spec.visit_source_paths(|path, directory| {
+            if !directory && result.is_ok() {
+                result = (|| {
+                    let path = bounded_fs::absolute(path, next)?;
+                    bounded_fs::push(&mut paths, path, next)
+                })();
+            }
+        });
+        result?;
+        paths.sort_unstable();
+        paths.dedup();
+        let mut pins = bounded_fs::vec(paths.len(), next)?;
+        for path in paths {
+            let Some(pin) = self.pins.iter().find(|pin| pin.loader_path() == path) else {
+                return Self::metadata_gap(
+                    next,
+                    "configured File is absent from retained inventory",
+                );
+            };
+            pins.push((path, pin.clone_with_capacity(next)?));
+        }
+        Ok(pins)
     }
 
     pub(crate) fn configured_file_pins(&self, spec: &LoadSpec) -> Result<Vec<PinnedWeightsFile>> {
@@ -597,7 +766,7 @@ mod member_pin_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 mod guarded_source_inventory_tests {
     use super::*;
     use crate::WeightsSource;
@@ -738,7 +907,11 @@ mod guarded_source_inventory_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "source_inventory_guarded_tests.rs"]
+pub(crate) mod guarded_allocation_tests;
+
+#[cfg(all(test, not(target_vendor = "apple")))]
 mod source_prelude_boundary_tests {
     use super::*;
 
@@ -773,7 +946,7 @@ mod source_prelude_boundary_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_vendor = "apple")))]
 mod admission_binding_preflight_tests {
     use super::*;
 

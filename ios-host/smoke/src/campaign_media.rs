@@ -27,6 +27,9 @@ mod primitive;
 #[cfg(test)]
 #[path = "campaign_admission_tests.rs"]
 mod admission_tests;
+#[cfg(all(test, any(not(target_os = "ios"), target_abi = "sim")))]
+#[path = "campaign_host_output_tests.rs"]
+mod host_output_tests;
 #[cfg(test)]
 #[path = "campaign_media_tests.rs"]
 mod tests;
@@ -1271,8 +1274,21 @@ impl DeviceProvider<'_> {
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if c.provider == "sdxl" {
+            #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
             let allowance =
                 runtime_ios::media::source_metadata_allowance().map_err(|e| e.to_string())?;
+            // Injected host/simulator metadata fixtures have no iOS live reading.
+            // Authorize only the source-owned requested layouts of THIS actual
+            // request; still invoke the SAME real capacity hook and capture code.
+            // This is neither fabricated headroom nor a model execution permit.
+            #[cfg(any(not(target_os = "ios"), target_abi = "sim"))]
+            let allowance = match &candidate.work {
+                runtime_ios::media::IosWork::Generate(request) => {
+                    runtime_ios::media::source_context_requested_bytes(request)
+                        .map_err(|e| e.to_string())?
+                }
+                _ => return Err("SDXL source context requires a generation request".into()),
+            };
             let mut next =
                 |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
             let mut budget =
@@ -1620,6 +1636,70 @@ fn phys_footprint() -> Option<(u64, support::PeakReading)> {
     ))
 }
 
+/// Diagnostic output ONLY: count the actual borrowed JSON/key overlay without
+/// cloning a Value, allocating a key string, or manufacturing a live allowance.
+/// Unit errors deliberately require no additional allocation on refusal/overflow.
+#[cfg(any(not(target_os = "ios"), target_abi = "sim"))]
+fn serialize_host_diagnostic_with_capacity(
+    prefix: &str,
+    row: &Value,
+    next: &mut dyn FnMut(u64) -> mlx_gen::Result<()>,
+) -> Result<String, ()> {
+    use std::io::Write;
+    struct Count {
+        bytes: usize,
+        overflow: bool,
+    }
+    impl Count {
+        fn add(&mut self, bytes: usize) {
+            match self.bytes.checked_add(bytes) {
+                Some(total) => self.bytes = total,
+                None => self.overflow = true,
+            }
+        }
+    }
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // An infallible counting sink avoids allocating a serde IO error on
+            // overflow. The checked flag is tested before any output ownership.
+            self.add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let object = row.as_object().ok_or(())?;
+    let mut count = Count {
+        bytes: prefix.len(),
+        overflow: false,
+    };
+    count.add(1); // The serializer's trailing newline.
+    serde_json::to_writer(&mut count, row).map_err(|_| ())?;
+    if let Some(value) = object.get("evidence_key") {
+        let mut old = Count {
+            bytes: 0,
+            overflow: false,
+        };
+        serde_json::to_writer(&mut old, value).map_err(|_| ())?;
+        if old.overflow {
+            return Err(());
+        }
+        count.bytes = count.bytes.checked_sub(old.bytes).ok_or(())?;
+        count.add(b"null".len());
+    } else {
+        count.add(b"\"evidence_key\":null".len());
+        count.add(usize::from(!object.is_empty()));
+    }
+    if count.overflow {
+        return Err(());
+    }
+    std::alloc::Layout::array::<u8>(count.bytes).map_err(|_| ())?;
+    let allowance = u64::try_from(count.bytes).map_err(|_| ())?;
+    let mut budget = runtime_ios::media::SourceRequestBudget::with_capacity(allowance, next);
+    runtime_ios::media::serialize_capture_row(prefix, row, None, &mut budget).map_err(|_| ())
+}
+
 pub fn report(value: &str, diagnostic: bool) -> String {
     let started = Instant::now();
     let model_case =
@@ -1961,6 +2041,17 @@ pub fn report(value: &str, diagnostic: bool) -> String {
     } else {
         "SMOKE: FAIL\nCAMPAIGN_JSON "
     };
+    // A host/simulator can emit an unexecuted diagnostic, but has no iOS live
+    // allowance. Count ONLY that actual output's requested bytes, then use the
+    // same capacity callback/serializer. This is not a source/capture allowance,
+    // not invented headroom, and never authorizes inspecting or loading a model.
+    #[cfg(any(not(target_os = "ios"), target_abi = "sim"))]
+    if source_key.is_none() && row["status"] == "diagnostic_failure" {
+        let mut next =
+            |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
+        return serialize_host_diagnostic_with_capacity(prefix, &row, &mut next)
+            .unwrap_or_default();
+    }
     let serialized = (|| -> Result<String, String> {
         let retained = source_key
             .as_ref()

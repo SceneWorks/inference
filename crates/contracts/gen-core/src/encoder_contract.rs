@@ -14,6 +14,10 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_vendor = "apple")]
+#[path = "encoder_guarded.rs"]
+mod guarded;
+
 use crate::weightsmeta::Dtype;
 use crate::{
     safetensors_path_tensor_headers, Error, PinnedWeightsFile, Result, SafetensorsTensorHeader,
