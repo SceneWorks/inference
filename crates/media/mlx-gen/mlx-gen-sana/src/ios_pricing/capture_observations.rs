@@ -1,6 +1,6 @@
-//! Actual scalar source marks for the isolated CPU endpoint captures. No replay
-//! creates observations, no arrays are retained, and native sampling/reset points
-//! remain those of measure_phases_with_samples.
+//! Actual scalar source marks for isolated CPU endpoint execution. No replay
+//! creates observations and no arrays are retained. The non-measuring recorder
+//! does not query memory counters or invoke the expensive measurement sentinel.
 use super::*;
 use mlx_gen::ios_pricing::{
     IosAnchorObservation, IosMemoryCoordinate, IosMemoryDomain, IosObservedCheck,
@@ -8,15 +8,43 @@ use mlx_gen::ios_pricing::{
 };
 use mlx_gen::ios_quantum::{set_quantum_listener, QuantumMark};
 
+type Stored =
+    std::sync::Arc<std::sync::Mutex<(IosAnchorObservation, BTreeMap<(String, String), u32>)>>;
+
 pub(super) fn measure<T>(
     body: impl FnOnce() -> Result<T>,
 ) -> (Result<(T, MeasuredRun)>, IosAnchorObservation) {
+    collect(|stored| {
+        {
+            let mut state = stored.lock().expect("Sana actual source mark lock");
+            state.0.domain = IosMemoryDomain::NativeAllocatorGrowth;
+            state.0.coordinate = IosMemoryCoordinate::BeforeModelLoad;
+        }
+        let samples = stored.clone();
+        mlx_gen::ios_anchor_law::measure_phases_with_samples(
+            ios_quantum_phase,
+            move |sample| {
+                // Already queried by the original measurement; no new native read.
+                samples
+                    .lock()
+                    .expect("Sana actual sample lock")
+                    .0
+                    .baseline_bytes = sample.baseline;
+            },
+            body,
+        )
+    })
+}
+
+/// Real execution/receipt observations ONLY. No measurement, native byte bound,
+/// process baseline or physical-memory evidence is created by this recorder.
+pub(super) fn record<T>(body: impl FnOnce() -> Result<T>) -> (Result<T>, IosAnchorObservation) {
+    collect(|_| body())
+}
+
+fn collect<T>(body: impl FnOnce(&Stored) -> Result<T>) -> (Result<T>, IosAnchorObservation) {
     let stored = std::sync::Arc::new(std::sync::Mutex::new((
-        IosAnchorObservation {
-            domain: IosMemoryDomain::NativeAllocatorGrowth,
-            coordinate: IosMemoryCoordinate::BeforeModelLoad,
-            ..Default::default()
-        },
+        IosAnchorObservation::default(),
         BTreeMap::<(String, String), u32>::new(),
     )));
     let sink = stored.clone();
@@ -57,30 +85,15 @@ pub(super) fn measure<T>(
         !previous,
         "isolated Sana capture must not replace a foreign listener"
     );
-    let samples = stored.clone();
-    let result = with_cpu_diagnostic_headroom(AMPLE, || {
-        mlx_gen::ios_anchor_law::measure_phases_with_samples(
-            ios_quantum_phase,
-            move |sample| {
-                // Already queried by the original measurement; no new native read.
-                samples
-                    .lock()
-                    .expect("Sana actual sample lock")
-                    .0
-                    .baseline_bytes = sample.baseline;
-            },
-            body,
-        )
-    });
+    let result = with_cpu_diagnostic_headroom(AMPLE, || body(&stored));
     drop(guard);
     let mut observation = stored
         .lock()
         .expect("Sana actual source mark lock")
         .0
         .clone();
-    // This isolated listener stores every actual event (overflow is a hard
-    // failure), and the original measurement must complete successfully.
-    // Native receipt validity is separate; no source marks are synthesized.
+    // Every actual event was retained (overflow is a hard failure), and the
+    // body must complete successfully. Receipt validity is checked separately.
     observation.telemetry_complete = result.is_ok();
     (result, observation)
 }

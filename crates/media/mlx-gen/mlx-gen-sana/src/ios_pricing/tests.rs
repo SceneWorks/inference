@@ -1,5 +1,31 @@
 use super::*;
 
+/// Actual tokenizer/parser path only: no tensor, stream, model or admission.
+/// Fresh paths ensure the successful per-path memo cannot mask source corruption.
+#[test]
+fn gemma_window_preserves_missing_and_malformed_tokenizer_failures() {
+    let valid = tempfile::tempdir().unwrap();
+    let path = valid.path().join("tokenizer.json");
+    std::fs::write(
+        &path,
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../contracts/gen-core/tests/fixtures/tiny_gemma3_tokenizer.json"
+        )),
+    )
+    .unwrap();
+    assert!(gemma_window(&path).unwrap() >= MAX_SEQUENCE_LENGTH as u64 - 2);
+    for missing in [true, false] {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("tokenizer.json");
+        if !missing {
+            std::fs::write(&path, b"not tokenizer json").unwrap();
+        }
+        assert!(matches!(gemma_window(&path), Err(Error::Msg(reason)) if reason.starts_with("tokenizer: ")),
+            "missing={missing}: genuine tokenizer corruption must remain a parser failure, not Unsupported/no-evidence");
+    }
+}
+
 #[test]
 fn retired_projection_selects_real_subwindows_without_erasing_original_feature() {
     let cfg = DcAeConfig::sana_f32c32();

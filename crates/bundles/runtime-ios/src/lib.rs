@@ -1111,7 +1111,8 @@ mod tests {
                 "model.embed_tokens.weight",
             );
             tensor(&sana.join("vae/a.safetensors"), "conv.weight");
-            // Pricing parses Gemma's real tokenizer metadata before evidence lookup.
+            // Real source pricing needs Gemma tokenizer metadata if derivation reaches it;
+            // the no-anchor precheck deliberately leaves the source unopened.
             std::fs::write(
                 sana.join("text_encoder/tokenizer.json"),
                 include_str!(
@@ -1247,8 +1248,10 @@ mod tests {
     }
 
     /// Findings 3/4: every image surface has an admitted facade; each requires the platform limits
-    /// bound (a typed failure, before evidence), then refuses with the typed `no_evidence` kind
-    /// while the reviewed table has no row — before any weight load. A candidate offered to the
+    /// bound (a typed failure, before evidence). iOS then refuses `no_evidence` without a row;
+    /// other platforms fail the actual-footprint boundary first. No synthetic baseline is supplied.
+    /// The metadata-only catalog still refuses an empty reviewed table before source/budget use.
+    /// A candidate offered to the
     /// wrong facade is a typed `mode` refusal, never silently routed elsewhere.
     #[cfg(feature = "media")]
     #[test]
@@ -1281,18 +1284,54 @@ mod tests {
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
         for (id, facade) in facades.iter() {
             let candidate = candidates.iter().find(|c| c.provider == *id).unwrap();
-            assert_eq!(
-                kind(facade(std::slice::from_ref(candidate))),
-                None,
-                "{id}: limits must be bound first"
+            assert!(
+                matches!(
+                    facade(std::slice::from_ref(candidate)),
+                    Err(AdmissionError::Failed(crate::gen_core::Error::Unsupported(reason)))
+                        if reason == "iOS admission requires bound_mlx_to_platform_limits first"
+                ),
+                "{id}: limits must fail before any later boundary/evidence check"
             );
         }
         super::PLATFORM_LIMITS_BOUND.store(true, super::Ordering::Release);
         let by_id = |id: &str| candidates.iter().find(|c| c.provider == id).unwrap();
+        let registry = mlx_gen_ios_catalog::provider_registry().unwrap();
         for (id, facade) in facades.iter() {
             let candidate = by_id(id);
+            #[cfg(target_os = "ios")]
             assert_eq!(
                 kind(facade(std::slice::from_ref(candidate))),
+                Some(RefusalKind::NoEvidence),
+                "{id}"
+            );
+            #[cfg(not(target_os = "ios"))]
+            assert!(
+                matches!(
+                    facade(std::slice::from_ref(candidate)),
+                    Err(AdmissionError::Failed(crate::gen_core::Error::Unsupported(reason)))
+                        if reason == "iOS admission requires an actual BeforeModelLoad process footprint snapshot"
+                ),
+                "{id}: off-iOS must not fabricate a process baseline or reach admission"
+            );
+            // This is the existing metadata-only catalog seam, NOT an SDK admission
+            // with invented footprint/headroom. Empty rows reject source-unopened
+            // before the zero budget could authorize or price any work.
+            assert_eq!(
+                kind(
+                    mlx_gen_ios_catalog::ios_admission::admit_with_rows(
+                        &registry,
+                        std::slice::from_ref(candidate),
+                        "no-reviewed-device",
+                        crate::gen_core::MemoryBudget {
+                            total_bytes: 0,
+                            committed_bytes: 0,
+                            reclaimable_bytes: 0,
+                            reserved_headroom_bytes: 0,
+                        },
+                        &[],
+                    )
+                    .map(|admission| admission.index())
+                ),
                 Some(RefusalKind::NoEvidence),
                 "{id}"
             );
@@ -1307,29 +1346,9 @@ mod tests {
                 other.provider
             );
         }
-        // A malformed source is still a typed failure, not absence of evidence.
-        // Fresh paths prevent Gemma's per-path window memo from hiding mutations.
-        for missing in [true, false] {
-            let source = tempfile::tempdir().unwrap();
-            let candidates = fixtures::candidates(source.path());
-            let tokenizer = source.path().join("sana/text_encoder/tokenizer.json");
-            if missing {
-                std::fs::remove_file(&tokenizer).unwrap();
-            } else {
-                std::fs::write(&tokenizer, b"not tokenizer json").unwrap();
-            }
-            let candidate = candidates
-                .iter()
-                .find(|c| c.provider == "sana_1600m")
-                .unwrap();
-            assert!(
-                matches!(
-                    media::load_sana(std::slice::from_ref(candidate)),
-                    Err(AdmissionError::Failed(_))
-                ),
-                "missing={missing}: invalid tokenizer must fail before evidence lookup"
-            );
-        }
+        // Tokenizer corruption is tested at SANA's actual gemma_window parser.
+        // This facade cannot test it: the platform baseline and source-unopened
+        // no-anchor precheck deliberately precede tokenizer parsing.
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
     }
 

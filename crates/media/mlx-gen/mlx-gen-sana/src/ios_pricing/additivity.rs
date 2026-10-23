@@ -1322,6 +1322,80 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
     failures
 }
 
+/// Ordinary macOS CI walking skeleton: real tiny model execution, NOT a peak
+/// measurement or physical/process certificate. One dense Sprint text request,
+/// same seed/weights/carrier, with exact ordinary-versus-joined output parity.
+#[test]
+fn joined_native_sprint_matches_ordinary_pixels_and_completes_receipts() {
+    if !in_cpu_child("joined_native_sprint_matches_ordinary_pixels_and_completes_receipts") {
+        return;
+    }
+    let _completion = CpuChildCompletion;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sprint-dense");
+    write_snapshot(&root, true);
+    let (_, execution, spec) = selections(crate::SPRINT_MODEL_ID, &root, None)
+        .into_iter()
+        .next()
+        .unwrap();
+    let case = Request {
+        sprint: true,
+        img2img: false,
+        root,
+        execution,
+        spec,
+    };
+    let mut actual = case.actual_generation();
+    actual.steps = Some(1);
+    let ordinary = case.ordinary_pixels(&actual);
+    let (joined, observation) = capture_observations::record(|| case.run(&actual));
+    assert_eq!(
+        joined.expect("real joined tiny SANA execution failed"),
+        ordinary,
+        "retirement boundaries must not change actual RGB bytes"
+    );
+    assert!(observation.telemetry_complete);
+    assert_eq!(
+        observation.domain,
+        mlx_gen::ios_pricing::IosMemoryDomain::Unspecified,
+        "the non-measuring recorder must not declare native allocation evidence"
+    );
+    assert_eq!(observation.baseline_bytes, 0);
+    for label in [
+        labels::SCM_STEP,
+        labels::DECODER_GLU,
+        labels::DECODED_PIXELS,
+    ] {
+        assert!(
+            observation.checks.iter().any(|check| check.label == label),
+            "real source execution did not reach {label}"
+        );
+    }
+    super::native_certificate::validate_retirement_receipts(
+        observation.metadata.len(),
+        |index| {
+            observation.metadata.get(index).map(|mark| {
+                super::native_certificate::RetirementMetadataView {
+                    provider: &mark.provider,
+                    kind: &mark.kind,
+                    fields: &mark.fields,
+                }
+            })
+        },
+        observation
+            .checks
+            .iter()
+            .map(|check| super::native_certificate::RetirementCheckView {
+                phase: check.phase,
+                label: &check.label,
+                context: &check.context,
+                count: 1,
+            }),
+        observation.telemetry_complete,
+    )
+    .expect("real configured invocation must complete every captured-prefix receipt");
+}
+
 /// Literal resident TEXT uses the production warm callback's encoder superset, independent of
 /// img2img. Price each actual header inventory once (packed weights stay packed).
 #[test]
