@@ -1,5 +1,6 @@
 //! One immutable run's dataset identities, header facts and bounded authenticated decode buffers.
-use crate::train::subject_mask::{PreparedSubjectMask, SubjectMask, SubjectMaskLoss};
+use crate::train::subject_mask::{PreparedSubjectMask, SubjectMask};
+use crate::train::SubjectMaskLoss;
 use crate::{Error, PinnedWeightsFile, Result, TrainingRequest};
 use sha2::{Digest, Sha256};
 use std::{

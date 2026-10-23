@@ -1,6 +1,8 @@
 """Source routing and proof protocol only: never invokes Cargo, devices, or model execution."""
 from __future__ import annotations
 import os
+import io
+from contextlib import redirect_stderr
 import json
 from pathlib import Path
 import subprocess
@@ -27,12 +29,42 @@ class HostedCpuRoutingTests(unittest.TestCase):
         return next(step["run"] for step in self.workflow()["jobs"]["changes"]["steps"]
                     if step.get("id") == "select")
 
-    def select(self, script, event, lanes, ref_type="branch"):
+    def fixture_repository(self, path):
+        subprocess.run(["git", "init", "--initial-branch=main", str(path)], check=True, capture_output=True)
+        script = path / "scripts/ci/select_lanes.py"
+        script.parent.mkdir(parents=True)
+        script.write_bytes((ROOT / "scripts/ci/select_lanes.py").read_bytes())
+        subprocess.run(["git", "add", "--", "scripts/ci/select_lanes.py"], cwd=path, check=True, capture_output=True)
+        self.fixture_commit(path, "baseline")
+        return path
+
+    def fixture_commit(self, path, message):
+        subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-m", message], cwd=path, check=True, capture_output=True)
+
+    def change_fixture(self, path):
+        changed = path / "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs"
+        changed.parent.mkdir(parents=True, exist_ok=True)
+        previous = changed.read_text(encoding="utf-8") if changed.exists() else ""
+        changed.write_text(previous + "// owned nonempty route fixture change\n", encoding="utf-8")
+        subprocess.run(["git", "add", "--", str(changed.relative_to(path))], cwd=path, check=True, capture_output=True)
+        self.fixture_commit(path, "nonempty MOSS change")
+
+    def select(self, script, event, lanes, ref_type="branch", repository=None, base=None):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "output"
+            root = Path(directory)
+            output = root / "output"
+            path_selected = event != "workflow_dispatch" and ref_type != "tag"
+            if repository is None:
+                repository = ROOT
+                if path_selected:
+                    repository = self.fixture_repository(root / "repository")
+                    self.change_fixture(repository)
+            if base is None:
+                base = "HEAD^" if path_selected else "HEAD"
             env = dict(os.environ, EVENT_NAME=event, DISPATCH_LANES=lanes, REF_TYPE=ref_type,
-                       GITHUB_OUTPUT=str(output), BASE_SHA="1755167e90fbc09edad644ba065da423d5a8fe41", HEAD_SHA="HEAD")
-            subprocess.run(["bash", "-e", "-c", script], cwd=ROOT, env=env, check=True, capture_output=True)
+                       GITHUB_OUTPUT=str(output), BASE_SHA=base, HEAD_SHA="HEAD")
+            subprocess.run(["bash", "-e", "-c", script], cwd=repository, env=env, check=True, capture_output=True)
             return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
 
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
@@ -79,6 +111,36 @@ class HostedCpuRoutingTests(unittest.TestCase):
                                   ("push", "", "tag"), ("merge_group", "", "branch")):
             with self.subTest(event=event, lanes=lanes, ref=ref):
                 self.assertEqual(self.select(current, event, lanes, ref), self.select(previous, event, lanes, ref))
+
+    def test_path_route_equivalence_works_in_actual_depth_one_detached_checkout(self):
+        # Start at a true depth-one boundary, then create our own available parent/nonempty diff.
+        # No historical repository SHA, network fetch, or broader CI checkout is needed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.fixture_repository(root / "source")
+            self.change_fixture(source)
+            checkout = root / "checkout"
+            subprocess.run(["git", "clone", "--depth=1", source.as_uri(), str(checkout)], check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "--detach", "HEAD"], cwd=checkout, check=True, capture_output=True)
+            self.change_fixture(checkout)
+            shallow = subprocess.check_output(["git", "rev-parse", "--is-shallow-repository"], cwd=checkout, text=True, encoding="utf-8")
+            self.assertEqual(shallow.strip(), "true")
+            self.assertNotEqual(subprocess.run(["git", "rev-parse", "--verify", "HEAD^^"], cwd=checkout, capture_output=True).returncode, 0)
+            delta = subprocess.check_output(["git", "diff", "--name-only", "HEAD^", "HEAD"], cwd=checkout, text=True, encoding="utf-8")
+            self.assertEqual(delta.strip(), "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs")
+            current = self.selector()
+            addition = '\nelif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then\n  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"'
+            previous = current.replace(addition, "")
+            expected = {"workspace", "macos_metal", "real_weights"}
+            for event in ("pull_request", "push", "merge_group"):
+                selected = self.select(current, event, "", repository=checkout)
+                self.assertEqual(selected, self.select(previous, event, "", repository=checkout))
+                self.assertEqual({name for name, value in selected.items() if value == "true"}, expected)
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.select(current, "pull_request", "", repository=checkout, base="HEAD^^")
+            mutant = current.replace('--base "$BASE_SHA" --head "$HEAD_SHA"', '--only workspace')
+            selected = self.select(mutant, "pull_request", "", repository=checkout)
+            self.assertNotEqual({name for name, value in selected.items() if value == "true"}, expected)
 
     def test_requested_matrix_skip_or_failure_cannot_turn_aggregate_green(self):
         job = self.workflow()["jobs"]["gate"]
@@ -136,6 +198,20 @@ class CpuReviewProtocolTests(unittest.TestCase):
                 self.assertNotEqual(mutation["old"], mutation["new"])
                 self.assertTrue(mutation["test"].startswith(("training::", "training_memory::")))
                 self.assertTrue(mutation["panic"])
+
+    def test_compile_errors_are_rendered_and_stage_is_not_misreported_as_mutation(self):
+        message = json.dumps({"reason": "compiler-message", "message": {
+            "level": "error", "rendered": "error[E0603]: exact private import diagnostic"}})
+        output = io.StringIO()
+        with redirect_stderr(output):
+            fixture.render_compile_errors(message)
+        self.assertIn("error[E0603]: exact private import diagnostic", output.getvalue())
+        for stage in ("baseline", "red", "green"):
+            with tempfile.TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
+                path = Path(directory) / f"{stage}.json"
+                with mock.patch.object(profile.subprocess, "run", return_value=mock.Mock(returncode=101)):
+                    with self.assertRaisesRegex(UnitFailure, f"{stage} compile failed; compile errors are NOT assertion RED"):
+                        profile.compile_binary("candle", path)
 
     def test_contract_library_alias_still_requires_exact_package_and_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

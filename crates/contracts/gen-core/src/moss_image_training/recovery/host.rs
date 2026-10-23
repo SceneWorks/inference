@@ -31,6 +31,15 @@ pub fn available_bytes() -> Result<u64> {
     }
     Ok(status.ullAvailPhys)
 }
+// libc 0.2.186 exposes the Mach types and host query, but not this System symbol.
+// Release the send right returned by mach_host_self without adding a device/context API.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 pub fn available_bytes() -> Result<u64> {
@@ -47,7 +56,7 @@ pub fn available_bytes() -> Result<u64> {
             &mut count,
         )
     };
-    unsafe { libc::mach_port_deallocate(libc::mach_task_self(), host) };
+    unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
     if result != libc::KERN_SUCCESS || page_size == 0 || count != libc::HOST_VM_INFO64_COUNT {
         return Err(invalid("host VM page metadata unavailable"));
     }

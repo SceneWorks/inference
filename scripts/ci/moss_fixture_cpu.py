@@ -189,6 +189,19 @@ def compile_argv(backend: str) -> list[str]:
             "--features", "test-support", "--no-run", "--message-format=json"]
 
 
+def render_compile_errors(stdout: str) -> None:
+    """Cargo JSON goes to the sealed artifact; also expose its actual errors in the job log."""
+    for line in stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("reason") == "compiler-message":
+            message = record.get("message") or {}
+            if message.get("level") == "error":
+                print(message.get("rendered") or message.get("message", "compiler error"), file=sys.stderr, flush=True)
+
+
 def select_binary(stdout: str, package: str, target: Path, *, lib_name: str | None = None) -> Path:
     found = []
     for line in stdout.splitlines():
@@ -286,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
             cargo_log = args.binary_file.with_suffix(".cargo.jsonl")
             cargo_log.write_text(result.stdout, encoding="utf-8")
             if result.returncode != 0:
+                render_compile_errors(result.stdout)
                 raise UnitFailure(f"fixture compile exited {result.returncode}")
             binary = select_binary(result.stdout, PACKAGES[args.backend], target)
             if source_stamp() != stamp:

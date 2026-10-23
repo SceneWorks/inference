@@ -128,7 +128,13 @@ def compile_binary(backend: str, path: Path) -> tuple[Path, dict]:
                                  "compile", backend, "--binary-file", str(path)], cwd=ROOT,
                                 stdout=log, stderr=subprocess.STDOUT, timeout=2760)
     if result.returncode:
-        raise UnitFailure("mutation compile failed; compile errors are NOT assertion RED evidence")
+        # Preserve the complete compiler artifact log, and surface a bounded diagnostic tail.
+        with path.with_suffix(".compile.log").open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 64 * 1024))
+            print(log.read().decode("utf-8", "replace"), file=sys.stderr, flush=True)
+        stage = "baseline" if path.stem == "baseline" else f"{path.parent.name}/{path.stem}"
+        raise UnitFailure(f"{stage} compile failed; compile errors are NOT assertion RED evidence")
     record = json.loads(path.read_text(encoding="utf-8"))
     binary = Path(record["binary"])
     if (record["source"] != fixture.source_stamp() or record["binary_sha256"] != fixture.file_digest(binary)
@@ -152,6 +158,7 @@ def contract_fraction_tests(directory: Path) -> dict:
     cargo_log = directory / "contract.cargo.jsonl"
     cargo_log.write_text(result.stdout, encoding="utf-8")
     if result.returncode:
+        fixture.render_compile_errors(result.stdout)
         raise UnitFailure("fraction contract compile failed, not runtime proof")
     if fixture.source_stamp() != stamp:
         raise UnitFailure("contract source changed during compilation")
