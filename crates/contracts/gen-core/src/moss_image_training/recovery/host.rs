@@ -69,3 +69,28 @@ pub fn available_bytes() -> Result<u64> {
         "platform does not expose supported host availability",
     ))
 }
+
+/// Actual Apple unified-memory physical TOTAL, distinct from available pages and Metal's
+/// recommended working set. Used only when the SDK requests a fraction; no allocator/device call.
+#[cfg(target_os = "macos")]
+pub fn total_bytes() -> Result<u64> {
+    let mut total = 0_u64;
+    let mut size = std::mem::size_of::<u64>();
+    let status = unsafe {
+        libc::sysctlbyname(
+            b"hw.memsize\0".as_ptr().cast(),
+            (&mut total as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || size != std::mem::size_of::<u64>() || total == 0 {
+        return Err(invalid("physical unified total unavailable"));
+    }
+    Ok(total)
+}
+#[cfg(not(target_os = "macos"))]
+pub fn total_bytes() -> Result<u64> {
+    Err(invalid("physical unified total is supported only on macOS"))
+}

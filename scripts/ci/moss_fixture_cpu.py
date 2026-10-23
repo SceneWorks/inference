@@ -6,6 +6,7 @@ session, 180-second deadline and 2-GiB RSS cap. No GPU inventory, models, caches
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import ctypes
 import errno
 import signal
@@ -170,12 +171,25 @@ def git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, encoding="utf-8").strip()
 
 
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_stamp() -> dict:
+    delta = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)
+    return {"head": git_head(), "tracked_delta_sha256": hashlib.sha256(delta).hexdigest()}
+
+
 def compile_argv(backend: str) -> list[str]:
     return ["cargo", "test", "--locked", "--lib", "-j", "1", "-p", PACKAGES[backend],
             "--features", "test-support", "--no-run", "--message-format=json"]
 
 
-def select_binary(stdout: str, package: str, target: Path) -> Path:
+def select_binary(stdout: str, package: str, target: Path, *, lib_name: str | None = None) -> Path:
     found = []
     for line in stdout.splitlines():
         if not line.strip():
@@ -188,7 +202,7 @@ def select_binary(stdout: str, package: str, target: Path) -> Path:
             continue
         artifact = message.get("target") or {}
         if (re.search(rf"(?:/|#|^){re.escape(package)}(?:[@#\s]|$)", str(message.get("package_id", "")))
-                and artifact.get("name") == package.replace("-", "_")
+                and artifact.get("name") == (lib_name or package.replace("-", "_"))
                 and artifact.get("kind") == ["lib"]
                 and (message.get("profile") or {}).get("test") is True
                 and message.get("executable")):
@@ -266,12 +280,19 @@ def main(argv: list[str] | None = None) -> int:
             raise UnitFailure("this CPU fixture profile requires its declared POSIX host")
         target = Path(os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")))
         if args.command == "compile":
+            stamp = source_stamp()
             result = subprocess.run(compile_argv(args.backend), cwd=ROOT, stdout=subprocess.PIPE,
                                     text=True, encoding="utf-8", timeout=2700, check=False)
+            cargo_log = args.binary_file.with_suffix(".cargo.jsonl")
+            cargo_log.write_text(result.stdout, encoding="utf-8")
             if result.returncode != 0:
                 raise UnitFailure(f"fixture compile exited {result.returncode}")
             binary = select_binary(result.stdout, PACKAGES[args.backend], target)
+            if source_stamp() != stamp:
+                raise UnitFailure("fixture source changed during compilation")
             args.binary_file.write_text(json.dumps({"backend": args.backend, "head": git_head(),
+                                                   "source": stamp, "binary_sha256": file_digest(binary),
+                                                   "cargo_json_sha256": file_digest(cargo_log),
                                                    "binary": str(binary), "target": str(target.resolve())}), encoding="utf-8")
         else:
             record = json.loads(args.binary_file.read_text(encoding="utf-8"))
@@ -280,6 +301,10 @@ def main(argv: list[str] | None = None) -> int:
             binary = Path(record["binary"])
             if not binary.is_file() or Path(record["target"]) not in binary.resolve().parents:
                 raise UnitFailure("compiled fixture executable missing or outside owned target")
+            if record["source"] != source_stamp() or record["binary_sha256"] != file_digest(binary):
+                raise UnitFailure("compiled fixture source or executable content changed")
+            if record["cargo_json_sha256"] != file_digest(args.binary_file.with_suffix(".cargo.jsonl")):
+                raise UnitFailure("compiled fixture Cargo artifact log changed")
             logs = args.binary_file.parent / f"moss-fixture-{args.backend}-logs"
             logs.mkdir(exist_ok=True)
             listing=supervise([str(binary),"--list"],CpuOwner(),logs/"unfiltered-list.log",deadline=DEADLINE,rss_cap=RSS_CAP)

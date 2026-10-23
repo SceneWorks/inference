@@ -661,6 +661,11 @@ mod tests {
         let mut retry = request.clone();
         retry.config.resume = true;
         retry.config.memory_limit_bytes = Some(173);
+        retry.config.memory_limit_fraction = Some(0.5);
+        assert_eq!(
+            crate::train::resume::training_config_fingerprint(&retry.config),
+            legacy
+        );
         assert_eq!(
             effective_identity(&retry, "fixture-parent-a", &plan).unwrap(),
             baseline

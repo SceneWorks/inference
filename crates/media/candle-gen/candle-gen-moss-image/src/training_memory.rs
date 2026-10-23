@@ -88,7 +88,12 @@ pub(crate) fn resolve_budget(override_bytes: Option<u64>, device_bytes: u64) -> 
 }
 /// Resolve an actual allocator/device budget. CPU numerical oracles must explicitly provide
 /// an override; unknown CUDA memory never disables preallocation admission.
+#[cfg(test)]
 pub(crate) fn device_budget_bytes(device: &candle_gen::candle_core::Device) -> Result<u64> {
+    device_memory_budget(device).map(|(budget, _total)| budget)
+}
+/// Live/safety allowance and physical TOTAL from the SAME already-selected CUDA context.
+pub(crate) fn device_memory_budget(device: &candle_gen::candle_core::Device) -> Result<(u64, u64)> {
     if !device.is_cuda() {
         return Err(invalid(
             "native MOSS training requires CUDA; CPU oracles require an explicit trainer budget",
@@ -99,11 +104,16 @@ pub(crate) fn device_budget_bytes(device: &candle_gen::candle_core::Device) -> R
         // Query the caller's actual context, not nvidia-smi's physical ordinal or a separately
         // created logical device 0. Cudarc binds this exact context before cuMemGetInfo.
         let stream = device.as_cuda_device().map_err(source)?.cuda_stream();
-        let (free,_total)=stream.context().mem_get_info().map_err(|e|invalid(format!("cannot query the admitted CUDA context: {e}; provide an explicit native trainer budget")))?;
-        if free == 0 {
-            return Err(invalid("admitted CUDA device has no free memory"));
+        let (free,total)=stream.context().mem_get_info().map_err(|e|invalid(format!("cannot query the admitted CUDA context: {e}; provide an explicit native trainer budget")))?;
+        if free == 0 || total == 0 || free > total {
+            return Err(invalid(
+                "admitted CUDA device has invalid free/total memory",
+            ));
         }
-        Ok((free as f64 * candle_gen::train::flow_match::TRAIN_SAFE_FRAC) as u64)
+        Ok((
+            (free as f64 * candle_gen::train::flow_match::TRAIN_SAFE_FRAC) as u64,
+            total as u64,
+        ))
     }
     #[cfg(not(feature = "cuda"))]
     Err(invalid(

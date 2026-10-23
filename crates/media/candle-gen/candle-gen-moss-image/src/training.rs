@@ -151,17 +151,26 @@ impl MossImageTrainer {
     fn budget(&self, req: &TrainingRequest) -> Result<u64> {
         // Only the explicitly selected CPU numerical oracle has no CUDA physical discovery.
         // A runtime override is a lower ceiling on a real device, never a VRAM substitute.
-        let physical = match (&self.device, self.memory_budget_override) {
-            (Device::Cpu, Some(bytes)) => admission::resolve_budget(Some(bytes), 0),
+        let (physical, total) = match (&self.device, self.memory_budget_override) {
+            // Explicit CPU numerical-reference domain; this is not physical GPU evidence.
+            (Device::Cpu, Some(bytes)) => (admission::resolve_budget(Some(bytes), 0), bytes),
             _ => {
-                let discovered =
-                    admission::device_budget_bytes(&self.device).map_err(admission_error)?;
-                self.memory_budget_override
-                    .map_or(discovered, |limit| discovered.min(limit))
+                let (discovered, total) =
+                    admission::device_memory_budget(&self.device).map_err(admission_error)?;
+                (
+                    self.memory_budget_override
+                        .map_or(discovered, |limit| discovered.min(limit)),
+                    total,
+                )
             }
         };
-        gen_core::train::effective_memory_budget(physical, req.config.memory_limit_bytes)
-            .map_err(Into::into)
+        gen_core::train::effective_memory_budget_with_fraction(
+            physical,
+            Some(total),
+            req.config.memory_limit_bytes,
+            req.config.memory_limit_fraction,
+        )
+        .map_err(Into::into)
     }
     fn basic(&self, req: &TrainingRequest) -> Result<()> {
         validate_request(&self.descriptor, req)?;

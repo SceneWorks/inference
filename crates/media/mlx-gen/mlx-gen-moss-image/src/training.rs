@@ -164,9 +164,16 @@ impl MossImageTrainer {
     }
     fn prepare(&self, req: &TrainingRequest) -> Result<Preparation> {
         let available = contract::recovery::host::available_bytes()?;
-        let budget = gen_core::train::effective_memory_budget(
+        let total = req
+            .config
+            .memory_limit_fraction
+            .map(|_| self.physical_total())
+            .transpose()?;
+        let budget = gen_core::train::effective_memory_budget_with_fraction(
             self.budget()?.min(available),
+            total,
             req.config.memory_limit_bytes,
+            req.config.memory_limit_fraction,
         )?;
         let minimal = self
             .facts
@@ -225,6 +232,15 @@ impl MossImageTrainer {
             #[cfg(feature = "test-support")]
             evaluation,
         })
+    }
+    fn physical_total(&self) -> Result<u64> {
+        #[cfg(feature = "test-support")]
+        if self.sources.is_fixture() {
+            crate::test_support::ensure_cpu()?;
+            // Explicit CPU reference envelope, not an MLX/Metal physical-memory measurement.
+            return Ok(crate::test_support::HOST_CAP_BYTES);
+        }
+        contract::recovery::host::total_bytes().map_err(Into::into)
     }
     fn budget(&self) -> Result<u64> {
         #[cfg(feature = "test-support")]
