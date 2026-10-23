@@ -25,6 +25,7 @@ PHASE_TEST = "training_memory::tests::every_phase_rejects_one_byte_below_and_acc
 CADENCE_TEST = "training::review_admission_tests::resume_accepts_checkpoint_cadence_inside_accumulation_window"
 METADATA_TEST = "training_memory::tests::persistent_metadata_raises_backward_checkpoint_and_admission_boundary"
 ZERO_TEST = "training::review_admission_tests::concrete_trainer_override_refuses_before_missing_model_or_dataset_can_load"
+STAGING_TEST = "test_support::tests::source_sized_request_staging_preserves_public_default_and_refuses_cap"
 TRAINING = "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs"
 MLX_MEMORY = "crates/media/mlx-gen/mlx-gen-moss-image/src/training_memory.rs"
 
@@ -84,7 +85,7 @@ def venue(backend: str) -> dict:
 def mutations(backend: str) -> list[dict]:
     memory = MLX_MEMORY if backend == "mlx" else "crates/media/candle-gen/candle-gen-moss-image/src/training_memory.rs"
     result = [{"id": "phase-isolation", "path": memory, "old": "            only.checkpoint = 0;\n",
-               "new": "", "test": PHASE_TEST, "panic": "assertion `left == right` failed"}]
+               "new": "", "test": PHASE_TEST, "panic": "isolated phase retains another demand"}]
     if backend == "mlx":
         result.append({"id": "partial-window-cadence", "path": TRAINING,
                        "old": "    if c.sample_every > 0 && !c.sample_prompts.is_empty() && c.sample_steps == 0 {",
@@ -103,7 +104,11 @@ def mutations(backend: str) -> list[dict]:
             for term in ("f.host_metadata_bytes", "r.dataset_metadata_bytes"):
                 result.append({"id": f"{phase}-omit-{term.split('.')[1]}", "path": MLX_MEMORY,
                                "old": old, "new": old.replace(f"                {term},\n", ""),
-                               "test": METADATA_TEST, "panic": "assertion `left == right` failed"})
+                               "test": METADATA_TEST, "panic": f"{phase.capitalize()}, host={str(term.startswith('f.')).lower()}"})
+        result.append({"id": "source-sized-staging", "path": "crates/media/mlx-gen/mlx-gen-moss-image/src/memory_strategy.rs",
+                       "old": ".and_then(|n| n.checked_add(source_staging))",
+                       "new": ".and_then(|n| n.checked_add(5_362_224_248))", "test": STAGING_TEST,
+                       "panic": "private fixture source staging ignored"})
         result.append({"id": "positive-budget-error", "path": "crates/contracts/gen-core/src/train.rs",
                        "old": '"training memory budget must be positive"',
                        "new": '"mutated positive-budget refusal"', "test": ZERO_TEST,
@@ -157,20 +162,24 @@ def contract_fraction_tests(directory: Path) -> dict:
                                 text=True, encoding="utf-8", timeout=2700)
     cargo_log = directory / "contract.cargo.jsonl"
     cargo_log.write_text(result.stdout, encoding="utf-8")
-    if result.returncode:
-        fixture.render_compile_errors(result.stdout)
-        raise UnitFailure("fraction contract compile failed, not runtime proof")
     if fixture.source_stamp() != stamp:
         raise UnitFailure("contract source changed during compilation")
+    if result.returncode:
+        fixture.render_compile_errors(result.stdout)
+        if result.returncode != 101:
+            raise UnitFailure("fraction compiler did not finish normally; independent readiness unknown")
+        return {"passed": False, "compiler_exit": result.returncode, "source": stamp,
+                "cargo_json_sha256": fixture.file_digest(cargo_log),
+                "tests": [{"test": name, "status": "blocked_compile"} for name in names]}
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
     binary = fixture.select_binary(result.stdout, package, target, lib_name="gen_core")
     listing = supervise([str(binary), "--list"], fixture.CpuOwner(), directory / "contract-unfiltered-list.log",
                         deadline=fixture.DEADLINE, rss_cap=fixture.RSS_CAP)
     if not all(name + ": test" in listing.splitlines() for name in names):
         raise UnitFailure("contract binary lacks exact fraction tests")
-    for index, name in enumerate(names):
-        fixture.execute(binary, name, directory / f"fraction-{index}.log")
-    return {"tests": names, "source": fixture.source_stamp(), "binary_sha256": fixture.file_digest(binary),
+    results = independent_tests(binary, names, directory, "fraction")
+    return {"tests": results, "passed": all(r["status"] == "passed" for r in results),
+            "source": fixture.source_stamp(), "binary_sha256": fixture.file_digest(binary),
             "cargo_json_sha256": fixture.file_digest(cargo_log)}
 
 
@@ -195,27 +204,63 @@ def assertion_red(binary: Path, mutation: dict, log: Path) -> dict:
             "configured_rss_cap_bytes": fixture.RSS_CAP, "configured_deadline_seconds": fixture.DEADLINE}
 
 
+def independent_tests(binary: Path, names: list[str], directory: Path, prefix: str) -> list[dict]:
+    results = []
+    for index, name in enumerate(names):
+        log = directory / f"{prefix}-{index}.log"
+        try:
+            fixture.execute(binary, name, log)
+        except fixture.CaseAssertionFailure:
+            pass  # Only exact independently released assertion failures are aggregatable.
+        results.append(json.loads(log.with_suffix(".result.json").read_text(encoding="utf-8")))
+    return results
+
+
+def validate_batch(batch: dict, returncode: int, source: dict) -> None:
+    rows = batch.get("cases")
+    if (returncode not in (0, 1) or batch.get("fatal_error") is not None
+            or batch.get("source") != source or batch.get("final_source") != source
+            or batch.get("source_restored") is not True or batch.get("header_admitted") is not True
+            or not isinstance(rows, list) or [r.get("test") for r in rows] != [fixture.TOKEN_TEST, *fixture.CASES]
+            or any(r.get("status") not in ("passed", "assertion_failed")
+                   or r.get("owned_released") is not True or r.get("source") != source for r in rows)):
+        raise UnitFailure("fixture admission/source/cleanup/protocol incomplete; refusing independent phases")
+    passed = all(r["status"] == "passed" for r in rows)
+    if batch.get("passed") is not passed or returncode != (0 if passed else 1):
+        raise UnitFailure("fixture batch exit/status differs")
+    fixture.validate_demand("MOSS_FIXTURE_DEMAND=" + json.dumps(batch.get("actual_demand")))
+
+
 def run(backend: str, directory: Path) -> dict:
-    evidence = venue(backend)
-    baseline = fixture.source_stamp()
-    evidence.update(passed=False, expected_fixture_tests=[fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES],
-                    expected_review_tests=sorted({m["test"] for m in mutations(backend)}), mutations=[])
     directory.mkdir(parents=True, exist_ok=True)
+    evidence = {"backend": backend, "head": None, "passed": False,
+                "expected_fixture_tests": [fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES],
+                "expected_review_tests": sorted({m["test"] for m in mutations(backend)}), "mutations": []}
+    baseline = None
     try:
+        evidence.update(venue(backend))
+        baseline = fixture.source_stamp()
         # The same reviewed compile/run commands used by ordinary package CI, not a copied trainer.
         binary, evidence["baseline_compiler"] = compile_binary(backend, directory / "baseline.json")
         with (directory / "fixture-run.log").open("w", encoding="utf-8") as log:
             result = subprocess.run([sys.executable, str(ROOT / "scripts/ci/moss_fixture_cpu.py"), "run", backend,
                                      "--binary-file", str(directory / "baseline.json")], cwd=ROOT,
                                     stdout=log, stderr=subprocess.STDOUT, timeout=1500)
-        if result.returncode:
-            raise UnitFailure("actual full-pipeline CPU fixture did not pass")
-        evidence["actual_demand"] = fixture.validate_demand(
-            (directory / f"moss-fixture-{backend}-logs" / "demand.log").read_text(encoding="utf-8"))
+        batch = json.loads((directory / "baseline.batch.json").read_text(encoding="utf-8"))
+        evidence["fixture_batch"] = batch
+        validate_batch(batch, result.returncode, baseline)
+        evidence["actual_demand"] = batch["actual_demand"]
         evidence["fraction_contract"] = contract_fraction_tests(directory)
-        for index, name in enumerate(evidence["expected_review_tests"]):
-            fixture.execute(binary, name, directory / f"review-baseline-{index}.log")
+        evidence["review_baselines"] = independent_tests(binary, evidence["expected_review_tests"], directory, "review-baseline")
+        green_baselines = {r["test"] for r in evidence["review_baselines"] if r["status"] == "passed"}
         for mutation in mutations(backend):
+            if mutation["test"] not in green_baselines:
+                evidence["mutations"].append({"id": mutation["id"], "test": mutation["test"],
+                                               "status": "blocked_baseline_red", "runtime_assertion_red": False,
+                                               "restored_green": False})
+                continue
+            if fixture.source_stamp() != baseline:
+                raise UnitFailure("source changed before independent mutation")
             folder = directory / mutation["id"]
             folder.mkdir()
             path = ROOT / mutation["path"]
@@ -235,19 +280,31 @@ def run(backend: str, directory: Path) -> dict:
             green_binary, green_record = compile_binary(backend, folder / "green.json")
             fixture.execute(green_binary, mutation["test"], folder / "green.log")
             evidence["mutations"].append({"id": mutation["id"], "test": mutation["test"],
-                                           "runtime_assertion_red": True, "restored_green": True,
+                                           "status": "killed_and_restored", "runtime_assertion_red": True, "restored_green": True,
                                            "red_compiler": red_record, "green_compiler": green_record,
                                            "red_resources": red_resources})
-        evidence["passed"] = True
+        evidence["passed"] = (batch["passed"] and evidence["fraction_contract"]["passed"]
+                              and all(r["status"] == "passed" for r in evidence["review_baselines"])
+                              and all(m["status"] == "killed_and_restored" for m in evidence["mutations"]))
+    except BaseException as error:
+        evidence["fatal_error"] = str(error)
+        raise
     finally:
-        evidence["final_source"] = fixture.source_stamp()
-        evidence["source_restored"] = evidence["final_source"] == baseline
+        try:
+            evidence["final_source"] = fixture.source_stamp()
+            evidence["source_restored"] = evidence["final_source"] == baseline if baseline is not None else None
+        except (OSError, subprocess.SubprocessError) as error:
+            evidence["final_source"] = None
+            evidence["source_restored"] = None
+            evidence["source_check_error"] = str(error)
+        if evidence["source_restored"] is not True:
+            evidence["passed"] = False
         evidence["file_sha256"] = {str(p.relative_to(directory)): fixture.file_digest(p)
                                     for p in sorted(directory.rglob("*")) if p.is_file() and p.name != "proof.json"}
         (directory / "proof.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
     if not evidence["source_restored"]:
         raise UnitFailure("profile source was not restored")
-    print(json.dumps({"head": evidence["head"], "backend": backend, "passed": True,
+    print(json.dumps({"head": evidence["head"], "backend": backend, "passed": evidence["passed"],
                       "mutations": len(evidence["mutations"]), "proof_sha256": fixture.file_digest(directory / "proof.json")}))
     return evidence
 
@@ -257,7 +314,10 @@ def main() -> int:
     parser.add_argument("backend", choices=tuple(fixture.PACKAGES))
     args = parser.parse_args()
     try:
-        run(args.backend, Path(os.environ["RUNNER_TEMP"]) / f"moss-cpu-{args.backend}-evidence")
+        evidence = run(args.backend, Path(os.environ["RUNNER_TEMP"]) / f"moss-cpu-{args.backend}-evidence")
+        if not evidence["passed"]:
+            print("moss-cpu-profile: FAIL independent baseline/case/mutation failures remain", file=sys.stderr)
+            return 1
     except (UnitFailure, OSError, subprocess.SubprocessError, KeyError, TypeError, ValueError) as error:
         print(f"moss-cpu-profile: FAIL {error}", file=sys.stderr)
         return 1

@@ -224,6 +224,31 @@ impl Sources {
         mlx_gen::residency::drain_allocator_cache();
         Ok(())
     }
+    pub(crate) fn request_workspace_bytes(
+        &self,
+        width: u32,
+        height: u32,
+        expanded: usize,
+        context: u32,
+        branches: u32,
+    ) -> Result<u64> {
+        #[cfg(feature = "test-support")]
+        if self.is_fixture() {
+            return Ok(
+                crate::memory_strategy::request_workspace_bytes_with_staging(
+                    width,
+                    height,
+                    expanded,
+                    context,
+                    branches,
+                    self.load_staging_bytes()?,
+                )?,
+            );
+        }
+        Ok(crate::memory_strategy::request_workspace_bytes(
+            width, height, expanded, context, branches,
+        )?)
+    }
     pub(crate) fn load_staging_bytes(&self) -> Result<u64> {
         #[cfg(feature = "test-support")]
         if self.is_fixture() {

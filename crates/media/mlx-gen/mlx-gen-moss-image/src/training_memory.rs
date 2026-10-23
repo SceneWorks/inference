@@ -1343,7 +1343,11 @@ pub(crate) mod tests {
                 Phase::Preview,
                 Phase::Checkpoint,
             ] {
-                assert_eq!(only.bytes(isolated), if isolated == phase { n } else { 0 });
+                assert_eq!(
+                    only.bytes(isolated),
+                    if isolated == phase { n } else { 0 },
+                    "isolated phase retains another demand"
+                );
             }
             assert!(only.check_all(n - 1).is_err());
             assert!(only.check_all(n).is_ok());

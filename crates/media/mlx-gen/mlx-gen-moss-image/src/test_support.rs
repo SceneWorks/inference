@@ -281,6 +281,57 @@ mod tests {
         run(3)
     }
     #[test]
+    fn source_sized_request_staging_preserves_public_default_and_refuses_cap(
+    ) -> gen_core::Result<()> {
+        let root = tempfile::tempdir()?;
+        let fixture = Fixture::create(&root.path().join("source"))?;
+        with_cpu(|| {
+            let sources = fixture.sources()?;
+            let staging = sources.load_staging_bytes()?;
+            let released = crate::memory_strategy::request_workspace_bytes(32, 32, 1, 32, 1)?;
+            let seq = 36_u64;
+            let legacy = seq * 4 * (3072 * 12 + 8192 * 4)
+                + seq * seq * 24 * 4
+                + 4 * 128 * 4 * 5
+                + 32 * 4096 * 4
+                + 1024 * 96 * 4 * 6
+                + 5_362_224_248;
+            assert_eq!(released, legacy, "public released-model estimate changed");
+            let actual = sources.request_workspace_bytes(32, 32, 1, 32, 1)?;
+            assert_eq!(
+                actual,
+                released - 5_362_224_248 + staging,
+                "private fixture source staging ignored"
+            );
+            assert_eq!(
+                actual,
+                crate::memory_strategy::request_workspace_bytes_with_staging(
+                    32, 32, 1, 32, 1, staging
+                )?
+            );
+            let assets = crate::memory_strategy::facts(&sources)?;
+            let cap = sources
+                .working_set_budget()?
+                .expect("explicit CPU reference ceiling");
+            assert!(actual + assets.base_bytes + assets.overlay_bytes < cap);
+            assert!(released + assets.base_bytes + assets.overlay_bytes > cap);
+            let mut generator = fixture.generator(MossImageVariant::Base, Vec::new())?;
+            let mut request = generation_request();
+            request.width = 4096;
+            request.height = 4096;
+            let mut events = 0;
+            let refused = generator.generate(&request, &mut |_| events += 1);
+            assert!(
+                matches!(refused, Err(gen_core::Error::Unsupported(message)) if message.contains("structural resident peak"))
+            );
+            assert_eq!(
+                events, 0,
+                "oversized request executed before unchanged admission guard"
+            );
+            Ok(())
+        })
+    }
+    #[test]
     fn header_only_demand_profile() -> gen_core::Result<()> {
         let root = tempfile::tempdir()?;
         let fixture = Fixture::create(&root.path().join("source"))?;

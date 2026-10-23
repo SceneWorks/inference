@@ -188,6 +188,18 @@ pub fn request_workspace_bytes(
     context: u32,
     branches: u32,
 ) -> Result<u64> {
+    request_workspace_bytes_with_staging(width, height, expanded, context, branches, 5_362_224_248)
+}
+/// Internal source-staging adjunction. The public released-model estimate remains byte-for-byte
+/// equivalent; only a verified private fixture supplies its existing header-derived staging bound.
+pub(crate) fn request_workspace_bytes_with_staging(
+    width: u32,
+    height: u32,
+    expanded: usize,
+    context: u32,
+    branches: u32,
+    source_staging: u64,
+) -> Result<u64> {
     if width == 0
         || height == 0
         || !width.is_multiple_of(16)
@@ -234,7 +246,7 @@ pub fn request_workspace_bytes(
         .and_then(|n| n.checked_add(outputs))
         .and_then(|n| n.checked_add(embeddings))
         .and_then(|n| n.checked_add(decode))
-        .and_then(|n| n.checked_add(5_362_224_248))
+        .and_then(|n| n.checked_add(source_staging))
         .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
 }
 pub(crate) fn safety(

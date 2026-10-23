@@ -272,6 +272,14 @@ impl Trainer for MossImageTrainer {
             .map(|p| p.begin(self.device.is_cpu()))
             .transpose()?;
         #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            probe.bind_request(
+                req,
+                &prepared.plan,
+                &self.sources.source_identity(self.variant),
+            )?;
+        }
+        #[cfg(feature = "test-support")]
         let result = self.train_impl(req, progress, prepared, probe.clone());
         #[cfg(not(feature = "test-support"))]
         let result = self.train_impl(req, progress, prepared);

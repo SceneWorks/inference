@@ -1,6 +1,7 @@
 """Source routing and proof protocol only: never invokes Cargo, devices, or model execution."""
 from __future__ import annotations
 import os
+import copy
 import io
 from contextlib import redirect_stderr
 import json
@@ -190,13 +191,13 @@ class CpuReviewProtocolTests(unittest.TestCase):
     def test_mutations_have_unique_exact_live_source_anchors_and_observable_tests(self):
         for backend in fixture.PACKAGES:
             mutations = profile.mutations(backend)
-            self.assertEqual(len(mutations), 7 if backend == "mlx" else 1)
+            self.assertEqual(len(mutations), 8 if backend == "mlx" else 1)
             self.assertEqual(len({item["id"] for item in mutations}), len(mutations))
             for mutation in mutations:
                 source = (ROOT / mutation["path"]).read_text(encoding="utf-8")
                 self.assertEqual(source.count(mutation["old"]), 1, mutation["id"])
                 self.assertNotEqual(mutation["old"], mutation["new"])
-                self.assertTrue(mutation["test"].startswith(("training::", "training_memory::")))
+                self.assertTrue(mutation["test"].startswith(("training::", "training_memory::", "test_support::")))
                 self.assertTrue(mutation["panic"])
 
     def test_compile_errors_are_rendered_and_stage_is_not_misreported_as_mutation(self):
@@ -246,6 +247,225 @@ class CpuReviewProtocolTests(unittest.TestCase):
             original = fixture.file_digest(path)
             path.write_bytes(b"two")
             self.assertNotEqual(fixture.file_digest(path), original)
+
+
+class DiagnosticBatchTests(unittest.TestCase):
+    def source(self):
+        return {"head": "a" * 40, "tracked_delta_sha256": "b" * 64}
+
+    def demand(self):
+        return {"cpu_reference": True, "token_bound_case_host_envelope_bytes": 1024,
+                "cases": [{"tensor_peak_bytes": 173, "host_envelope_bytes": 1024} for _ in fixture.CASES]}
+
+    def batch(self):
+        source = self.source()
+        rows = [{"test": name, "status": "passed", "owned_released": True, "source": source}
+                for name in (fixture.TOKEN_TEST, *fixture.CASES)]
+        return {"source": source, "final_source": source, "source_restored": True,
+                "header_admitted": True, "fatal_error": None, "passed": True,
+                "actual_demand": self.demand(), "cases": rows}
+
+    def red(self, name):
+        return (f"running 1 test\ntest {name} ... \nthread 'test' panicked at source.rs:1:1:\n"
+                "fixed independent heldout objective did not decrease\nFAILED\n"
+                f"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.1s\n")
+
+    def test_only_exact_assertions_aggregate_not_bare_admission_or_protocol_errors(self):
+        output = self.red(profile.PHASE_TEST)
+        fixture.verify_assertion_failure(output, profile.PHASE_TEST)
+        for text in (output.replace("panicked at", "returned an error at"),
+                     output.replace("fixed independent heldout", "Error: Unsupported admission; fixed independent heldout"),
+                     output.replace("running 1 test", "running 0 tests"),
+                     output.replace("0 ignored", "1 ignored"), output + output):
+            with self.subTest(text=text), self.assertRaises(UnitFailure):
+                fixture.verify_assertion_failure(text, profile.PHASE_TEST)
+
+    def test_case_assertion_requires_released_ownership_and_unchanged_source(self):
+        for mode in ("assertion", "ownership", "source", "deadline"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
+                root = Path(directory)
+                binary, log = root / "binary", root / "run.log"
+                binary.write_bytes(b"protocol artifact only")
+                log.write_text(self.red(profile.PHASE_TEST), encoding="utf-8")
+                owner = mock.Mock(peak=173)
+                owner.child.returncode = 101
+                owner.collect.return_value = {123: (1, 1, 173)} if mode == "ownership" else {}
+                stamp = self.source()
+                stamps = [stamp, {**stamp, "head": "c" * 40}] if mode == "source" else [stamp, stamp]
+                failure = "exceeded the execution deadline" if mode == "deadline" else "test process exited with 101"
+                with mock.patch.object(fixture, "CpuOwner", return_value=owner), mock.patch.object(
+                        fixture, "source_stamp", side_effect=stamps), mock.patch.object(
+                        fixture, "supervise", side_effect=UnitFailure(failure)):
+                    if mode == "assertion":
+                        with self.assertRaises(fixture.CaseAssertionFailure) as caught:
+                            fixture.execute(binary, profile.PHASE_TEST, log)
+                        self.assertTrue(caught.exception.result["owned_released"])
+                        self.assertEqual(caught.exception.result["status"], "assertion_failed")
+                    else:
+                        with self.assertRaises(UnitFailure) as caught:
+                            fixture.execute(binary, profile.PHASE_TEST, log)
+                        self.assertNotIsInstance(caught.exception, fixture.CaseAssertionFailure)
+
+    def test_receipts_bind_actual_request_context_and_hash_delta(self):
+        head = self.source()["head"]
+        receipt = {"request_identity": {"source_checkpoint": "synthetic-fixture:source",
+                    "dataset_fingerprint": "d" * 64, "effective_config": json.dumps({"seed": 173, "steps": 6})},
+                   "resolved_seed": 173, "evaluation_manifest": "e" * 64, "cpu_reference": True,
+                   "factor_before": "f" * 64, "factor_after": "c" * 64}
+        value = {"version": "moss-cpu-training-observations-v1", "source_head": head,
+                 "evaluation": {"identity": "e" * 64, "width": 32, "height": 32, "noise_seed": 173,
+                                "sigma": 0.375, "image_sha256": [0] * 32, "mask_sha256": None},
+                 "receipts": [receipt], "parameter_hash_changed": [True]}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"GITHUB_SHA": head}):
+            log = Path(directory) / "run.log"
+            path = log.with_suffix(".receipts.json")
+            path.write_text(json.dumps(value), encoding="utf-8")
+            self.assertEqual(fixture.read_observations(log, head, True)["runs"], 1)
+            mutants = []
+            for key, changed in (("source_head", "0" * 40), ("receipts", []), ("parameter_hash_changed", [False]), ("evaluation", {})):
+                mutant = copy.deepcopy(value); mutant[key] = changed; mutants.append(mutant)
+            for key, changed in (("resolved_seed", False), ("request_identity", None), ("evaluation_manifest", "missing")):
+                mutant = copy.deepcopy(value); mutant["receipts"][0][key] = changed; mutants.append(mutant)
+            mutant = copy.deepcopy(value)
+            mutant["receipts"][0]["request_identity"]["effective_config"] = json.dumps({"seed": 0})
+            mutants.append(mutant)
+            for mutant in mutants:
+                path.write_text(json.dumps(mutant), encoding="utf-8")
+                with self.assertRaises(UnitFailure):
+                    fixture.read_observations(log, head, True)
+            path.unlink()
+            with self.assertRaisesRegex(UnitFailure, "missing"):
+                fixture.read_observations(log, head, True)
+
+    def test_batch_continues_recorded_assertions_but_never_admission_source_or_cleanup_failure(self):
+        batch = self.batch()
+        profile.validate_batch(batch, 0, self.source())
+        batch["cases"][1]["status"] = "assertion_failed"; batch["passed"] = False
+        profile.validate_batch(batch, 1, self.source())
+        mutants = []
+        for key, value in (("fatal_error", "unknown ownership"), ("header_admitted", False),
+                           ("source_restored", False), ("cases", [])):
+            mutant = copy.deepcopy(batch); mutant[key] = value; mutants.append(mutant)
+        mutant = copy.deepcopy(batch); mutant["cases"][0]["owned_released"] = False; mutants.append(mutant)
+        mutant = copy.deepcopy(batch); mutant["cases"][0]["status"] = "skipped"; mutants.append(mutant)
+        for mutant in mutants:
+            with self.assertRaises(UnitFailure):
+                profile.validate_batch(mutant, 1, self.source())
+        with self.assertRaises(UnitFailure):
+            profile.validate_batch(batch, 0, self.source())
+
+    def test_independent_named_tests_continue_only_known_released_assertions(self):
+        for fatal in (False, True):
+            with self.subTest(fatal=fatal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                names = ["first", "second", "third"]
+                def execute(_binary, name, log):
+                    if name == "first":
+                        if fatal:
+                            raise UnitFailure("source readiness unknown")
+                        result = {"test": name, "status": "assertion_failed"}
+                        log.with_suffix(".result.json").write_text(json.dumps(result), encoding="utf-8")
+                        raise fixture.CaseAssertionFailure(result)
+                    log.with_suffix(".result.json").write_text(json.dumps({"test": name, "status": "passed"}), encoding="utf-8")
+                    return "positive protocol"
+                with mock.patch.object(fixture, "execute", side_effect=execute) as run:
+                    if fatal:
+                        with self.assertRaises(UnitFailure):
+                            profile.independent_tests(root / "binary", names, root, "named")
+                        self.assertEqual(run.call_count, 1)
+                    else:
+                        result = profile.independent_tests(root / "binary", names, root, "named")
+                        self.assertEqual([row["status"] for row in result], ["assertion_failed", "passed", "passed"])
+                        self.assertEqual(run.call_count, 3)
+
+    def test_real_case_orchestrator_runs_all_assertion_cases_but_stops_unknown_failures(self):
+        for mode in ("assertion", "fatal", "list_cleanup"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
+                root = Path(directory)
+                binary = root / "binary"; binary.write_bytes(b"source protocol artifact")
+                compiler = {"source": self.source(), "binary_sha256": fixture.file_digest(binary)}
+                names = [fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES]
+                listing = "\n".join(name + ": test" for name in names)
+                owner = mock.Mock()
+                owner.collect.return_value = {123: (1, 1, 1)} if mode == "list_cleanup" else {}
+                def execute(_binary, name, log):
+                    if name == fixture.DEMAND_TEST:
+                        return "MOSS_FIXTURE_DEMAND=" + json.dumps(self.demand())
+                    status = "assertion_failed" if name == fixture.CASES[0] else "passed"
+                    if status == "assertion_failed" and mode == "fatal":
+                        raise UnitFailure("source/ownership readiness unknown")
+                    result = {"test": name, "status": status, "source": self.source(), "owned_released": True}
+                    log.with_suffix(".result.json").write_text(json.dumps(result), encoding="utf-8")
+                    if status == "assertion_failed":
+                        raise fixture.CaseAssertionFailure(result)
+                    return "positive source protocol"
+                with mock.patch.object(fixture, "source_stamp", return_value=self.source()), mock.patch.object(
+                        fixture, "CpuOwner", return_value=owner), mock.patch.object(
+                        fixture, "supervise", return_value=listing), mock.patch.object(fixture, "execute", side_effect=execute) as run:
+                    if mode == "assertion":
+                        result = fixture.run_cases(binary, "candle", root / "baseline.json", compiler)
+                        self.assertFalse(result["passed"])
+                        self.assertTrue(result["header_admitted"])
+                        self.assertEqual([row["test"] for row in result["cases"]], names[1:])
+                        self.assertEqual(run.call_count, len(names))
+                    else:
+                        with self.assertRaises(UnitFailure):
+                            fixture.run_cases(binary, "candle", root / "baseline.json", compiler)
+                        self.assertEqual(run.call_count, 0 if mode == "list_cleanup" else 3)
+                        result = json.loads((root / "baseline.batch.json").read_text(encoding="utf-8"))
+                        self.assertIsNotNone(result["fatal_error"])
+                        self.assertFalse(result["passed"])
+
+    def test_contract_compile_error_is_blocked_not_a_runtime_red(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
+            root = Path(directory)
+            result = mock.Mock(returncode=101, stdout=json.dumps({"reason": "build-finished", "success": False}))
+            with mock.patch.object(fixture, "source_stamp", return_value=self.source()), mock.patch.object(
+                    profile.subprocess, "run", return_value=result), mock.patch.object(fixture, "select_binary") as select:
+                evidence = profile.contract_fraction_tests(root)
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(evidence["compiler_exit"], 101)
+            self.assertTrue(all(row["status"] == "blocked_compile" for row in evidence["tests"]))
+            select.assert_not_called()
+
+    def test_venue_or_source_failure_still_writes_truthful_failure_payload(self):
+        for venue_error in (True, False):
+            with self.subTest(venue_error=venue_error), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with mock.patch.object(profile, "venue", side_effect=UnitFailure("venue refused") if venue_error else None,
+                                       return_value={"head": "a" * 40, "backend": "candle"}), mock.patch.object(
+                        fixture, "source_stamp", return_value=self.source(),
+                        side_effect=None if venue_error else subprocess.CalledProcessError(128, ["git", "diff"])), mock.patch.object(
+                        profile, "compile_binary") as compile_:
+                    with self.assertRaises((UnitFailure, subprocess.SubprocessError)):
+                        profile.run("candle", root)
+                evidence = json.loads((root / "proof.json").read_text(encoding="utf-8"))
+                self.assertFalse(evidence["passed"])
+                self.assertIsNone(evidence["source_restored"])
+                self.assertIn("fatal_error", evidence)
+                compile_.assert_not_called()
+
+    def test_red_named_baseline_blocks_mutation_without_claiming_a_kill(self):
+        source = self.source()
+        batch = self.batch(); batch["cases"][1]["status"] = "assertion_failed"; batch["passed"] = False
+        with tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
+            root = Path(directory)
+            binary = root / "binary"; binary.write_bytes(b"source protocol artifact")
+            (root / "baseline.batch.json").write_text(json.dumps(batch), encoding="utf-8")
+            with mock.patch.object(profile, "venue", return_value={"head": source["head"], "backend": "candle"}), mock.patch.object(
+                    fixture, "source_stamp", return_value=source), mock.patch.object(
+                    profile, "compile_binary", return_value=(binary, {"source": source})) as compile_, mock.patch.object(
+                    profile.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(
+                    profile, "contract_fraction_tests", return_value={"passed": True}), mock.patch.object(
+                    profile, "independent_tests", return_value=[{"test": profile.PHASE_TEST, "status": "assertion_failed"}]), mock.patch.object(
+                    profile, "assertion_red") as red:
+                evidence = profile.run("candle", root)
+            self.assertFalse(evidence["passed"])
+            self.assertEqual(compile_.call_count, 1)
+            red.assert_not_called()
+            self.assertEqual(evidence["mutations"][0]["status"], "blocked_baseline_red")
+            self.assertFalse(evidence["mutations"][0]["runtime_assertion_red"])
+            self.assertTrue(evidence["source_restored"])
 
 
 if __name__ == "__main__":

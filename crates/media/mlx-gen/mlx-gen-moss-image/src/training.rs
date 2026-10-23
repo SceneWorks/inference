@@ -293,6 +293,14 @@ impl Trainer for MossImageTrainer {
             .as_ref()
             .map(|p| p.begin(self.sources.is_fixture()))
             .transpose()?;
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            probe.bind_request(
+                req,
+                &prepared.plan,
+                &self.sources.source_identity(self.variant),
+            )?;
+        }
         let result = (|| {
             crate::pipeline::check(&req.cancel)?;
             let estimate = prepared.estimate.clone();

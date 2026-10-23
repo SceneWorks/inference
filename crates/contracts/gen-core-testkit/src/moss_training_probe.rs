@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    io::Write,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -121,6 +123,14 @@ pub struct FrozenReceipt {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunReceipt {
+    #[serde(default)]
+    pub request_identity: Option<gen_core::moss_image_training::recovery::RunIdentity>,
+    #[serde(default)]
+    pub resolved_seed: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_fraction: Option<f32>,
     pub cpu_reference: bool,
     pub evaluation_manifest: String,
     pub evaluation_before: Option<f32>,
@@ -143,6 +153,8 @@ pub struct RunReceipt {
 pub struct TrainingProbe {
     evaluation: EvaluationManifest,
     receipts: Arc<Mutex<Vec<RunReceipt>>>,
+    // Output-only diagnostic path supplied by the owned CPU supervisor, never a model/source knob.
+    artifact_path: Option<PathBuf>,
 }
 #[derive(Clone, Debug)]
 pub struct RunProbe {
@@ -154,7 +166,72 @@ impl TrainingProbe {
         Self {
             evaluation,
             receipts: Arc::new(Mutex::new(Vec::new())),
+            artifact_path: std::env::var_os("MOSS_CPU_RECEIPT_PATH").map(PathBuf::from),
         }
+    }
+    fn persist(&self, receipts: &[RunReceipt]) -> Result<()> {
+        let Some(path) = &self.artifact_path else {
+            return Ok(());
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Msg("receipt output parent missing".into()))?;
+        if !path.is_absolute() || !std::fs::symlink_metadata(parent)?.is_dir() {
+            return Err(Error::Unsupported(
+                "receipt output must have an owned absolute directory".into(),
+            ));
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(Error::Unsupported(
+                    "receipt output is not a regular file".into(),
+                ))
+            }
+            Ok(_) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        let parameter_delta: Vec<_> = receipts
+            .iter()
+            .map(|r| {
+                if r.factor_before.is_empty() || r.factor_after.is_empty() {
+                    None
+                } else {
+                    Some(r.factor_before != r.factor_after)
+                }
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version":"moss-cpu-training-observations-v1",
+            "source_head":std::env::var("GITHUB_SHA").ok(),
+            "evaluation":{
+                "identity":&self.evaluation.identity,
+                "width":self.evaluation.width,"height":self.evaluation.height,
+                "noise_seed":self.evaluation.noise_seed,"sigma":self.evaluation.sigma,
+                "caption":&self.evaluation.item.caption,
+                "image_sha256":self.evaluation.image_digest,
+                "mask_sha256":self.evaluation.mask_digest,
+            },
+            "receipts":receipts,
+            // Hash-observed changes, not an invented numeric norm of the parameter delta.
+            "parameter_hash_changed":parameter_delta,
+        }))
+        .map_err(|e| Error::Msg(e.to_string()))?;
+        let staging = path.with_extension("receipts.partial");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        let result = (|| -> Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&staging, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(staging);
+        }
+        result
     }
     pub fn begin(&self, cpu_reference: bool) -> Result<RunProbe> {
         self.evaluation.verify()?;
@@ -169,6 +246,7 @@ impl TrainingProbe {
             gradients_finite: true,
             ..Default::default()
         });
+        self.persist(&receipts)?;
         Ok(RunProbe {
             owner: self.clone(),
             index,
@@ -199,7 +277,23 @@ impl RunProbe {
             .get_mut(self.index)
             .ok_or_else(|| Error::Msg("training probe run missing".into()))?;
         write(receipt);
-        Ok(())
+        // Persist before frozen/gradient/heldout assertions can fail or unwind.
+        self.owner.persist(&receipts)
+    }
+    pub fn bind_request(
+        &self,
+        request: &TrainingRequest,
+        plan: &gen_core::moss_image_training::recovery::DataPlan,
+        source: &str,
+    ) -> Result<()> {
+        let identity =
+            gen_core::moss_image_training::recovery::effective_identity(request, source, plan)?;
+        self.update(|r| {
+            r.request_identity = Some(identity);
+            r.resolved_seed = Some(request.config.seed);
+            r.memory_limit_bytes = request.config.memory_limit_bytes;
+            r.memory_limit_fraction = request.config.memory_limit_fraction;
+        })
     }
     pub fn frozen(&self, name: &str, before: &str, after: &str) -> Result<()> {
         self.update(|r| {

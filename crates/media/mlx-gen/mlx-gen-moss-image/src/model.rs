@@ -256,7 +256,7 @@ impl MossImage {
         } else {
             1
         };
-        let _ = memory_strategy::request_workspace_bytes(
+        let _ = self.sources.request_workspace_bytes(
             request.width,
             request.height,
             count,
@@ -287,17 +287,18 @@ impl MossImage {
             &self.selected_sources(r.acceleration)?,
             r.acceleration,
         )?;
-        memory_strategy::request_workspace_bytes(
-            request.width,
-            request.height,
-            count,
-            r.max_sequence_length,
-            branches,
-        )?
-        .checked_add(assets.base_bytes)
-        .and_then(|n| n.checked_add(assets.overlay_bytes))
-        .and_then(|n| n.checked_add(self.custom_adapter_bytes))
-        .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
+        self.sources
+            .request_workspace_bytes(
+                request.width,
+                request.height,
+                count,
+                r.max_sequence_length,
+                branches,
+            )?
+            .checked_add(assets.base_bytes)
+            .and_then(|n| n.checked_add(assets.overlay_bytes))
+            .and_then(|n| n.checked_add(self.custom_adapter_bytes))
+            .ok_or_else(|| Error::Unsupported("MOSS peak overflow".into()))
     }
     /// Incremental live demand above a caller's committed snapshot. Credit is bounded by this
     /// provider's retained materialized buffers and by that snapshot; foreign models earn no credit.

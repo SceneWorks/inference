@@ -52,10 +52,13 @@ class FixtureProtocolTests(unittest.TestCase):
     def test_execution_uses_the_declared_owned_cpu_envelope_and_exact_filter(self):
         owner = mock.Mock(peak=173)
         owner.collect.return_value = {}
-        with tempfile.TemporaryDirectory() as root, mock.patch("builtins.print"), mock.patch.object(fixture, "CpuOwner", return_value=owner), mock.patch.object(fixture, "supervise", return_value=self.output()) as run:
-            fixture.execute(Path(root) / "actual-binary", fixture.CASES[0], Path(root) / "run.log")
+        with tempfile.TemporaryDirectory() as root, mock.patch("builtins.print"), mock.patch.object(fixture, "CpuOwner", return_value=owner), mock.patch.object(fixture, "supervise", return_value=self.output(fixture.TOKEN_TEST)) as run:
+            binary, log = Path(root) / "actual-binary", Path(root) / "run.log"
+            binary.write_bytes(b"artifact protocol only")
+            log.write_text(self.output(fixture.TOKEN_TEST), encoding="utf-8")
+            fixture.execute(binary, fixture.TOKEN_TEST, log)
         argv = run.call_args.args[0]
-        self.assertEqual(argv[1], fixture.CASES[0])
+        self.assertEqual(argv[1], fixture.TOKEN_TEST)
         self.assertIn("--exact", argv)
         self.assertIn("--test-threads=1", argv)
         self.assertIs(run.call_args.args[1], owner)
