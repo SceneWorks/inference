@@ -621,8 +621,8 @@ fn forward_eps(
     ip: Option<(&Array, f32)>,
     plan: crate::plan::SdxlForwardPlan<'_>,
 ) -> Result<Array> {
-    // The noised/scaled init may have promoted back to f32 after its VAE boundary. Bound the
-    // actual input to every U-Net/ControlNet forward too; sampler state itself retains its dtype.
+    // Preserve the sampler's actual dtype, including promoted F32 img2img/noise state.
+    // Header pricing follows this same operand; bounded execution must not change arithmetic.
     let x_cast = ios_unet_input(x_unet)?;
     mlx_gen::sampler::diagnostic_sampling_tensor(
         "sdxl",
@@ -1413,14 +1413,11 @@ pub fn encode_init_latents_tiled(
     ios_unet_input(&latent)
 }
 
-/// iOS boundary precision: init latents and ControlNet residuals enter the U-Net at its compute
-/// dtype. Off-device this is exactly the historical value (including the Mac golden path).
+/// Preserve the historical init/sampler/ControlNet arithmetic on every platform. A boundary
+/// must not narrow a promoted F32 owner: latent rounding is amplified by the nonlinear decode.
+/// Curated samplers still perform their original pre-CFG compute cast at their own call sites.
 pub(crate) fn ios_unet_input(value: &Array) -> Result<Array> {
-    if cfg!(target_os = "ios") || mlx_gen::ios_quantum::enabled() {
-        Ok(value.as_dtype(crate::model::DTYPE)?)
-    } else {
-        Ok(value.clone())
-    }
+    Ok(value.clone())
 }
 
 /// Convert a VAE-decoded NHWC tensor `[1, H, W, 3]` (≈`[-1, 1]`) to an RGB8 [`Image`]:

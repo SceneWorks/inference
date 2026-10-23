@@ -1012,6 +1012,14 @@ mod tests {
                 "model.embed_tokens.weight",
             );
             tensor(&sana.join("vae/a.safetensors"), "conv.weight");
+            // Pricing parses Gemma's real tokenizer metadata before evidence lookup.
+            std::fs::write(
+                sana.join("text_encoder/tokenizer.json"),
+                include_str!(
+                    "../../../contracts/gen-core/tests/fixtures/tiny_gemma3_tokenizer.json"
+                ),
+            )
+            .unwrap();
             let sdxl = root.join("sdxl");
             for c in ["unet", "vae", "text_encoder", "text_encoder_2"] {
                 tensor(&sdxl.join(c).join("model.safetensors"), "x");
@@ -1198,6 +1206,29 @@ mod tests {
                 Some(RefusalKind::Mode),
                 "{id} accepted a {} candidate",
                 other.provider
+            );
+        }
+        // A malformed source is still a typed failure, not absence of evidence.
+        // Fresh paths prevent Gemma's per-path window memo from hiding mutations.
+        for missing in [true, false] {
+            let source = tempfile::tempdir().unwrap();
+            let candidates = fixtures::candidates(source.path());
+            let tokenizer = source.path().join("sana/text_encoder/tokenizer.json");
+            if missing {
+                std::fs::remove_file(&tokenizer).unwrap();
+            } else {
+                std::fs::write(&tokenizer, b"not tokenizer json").unwrap();
+            }
+            let candidate = candidates
+                .iter()
+                .find(|c| c.provider == "sana_1600m")
+                .unwrap();
+            assert!(
+                matches!(
+                    media::load_sana(std::slice::from_ref(candidate)),
+                    Err(AdmissionError::Failed(_))
+                ),
+                "missing={missing}: invalid tokenizer must fail before evidence lookup"
             );
         }
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);

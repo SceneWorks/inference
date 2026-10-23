@@ -292,7 +292,8 @@ fn metadata_roles_follow_actual_configured_ip_and_control_factory() {
                     height: 80,
                     batch: 1,
                     frames: 1,
-                    reference_count: work.reference_count as u32,
+                    reference_count: (work.reference_count + work.mask_count + work.control_count)
+                        as u32,
                 },
                 selection: &selection,
                 execution: &execution,
@@ -307,8 +308,14 @@ fn metadata_roles_follow_actual_configured_ip_and_control_factory() {
     };
     let mut configured = LoadSpec::new(WeightsSource::Dir("unused-actual-role-headers".into()));
     configured.ip_adapter = Some(WeightsSource::Dir("unused-configured-ip".into()));
+    let source = mlx_gen::media::Image {
+        width: 73,
+        height: 91,
+        pixels: vec![0; 73 * 91 * 3],
+    };
     let reference = SamplingWorkFacts {
         reference_count: 1,
+        reference_image: Some(ReferenceImageFacts::from_image(&source)),
         ..Default::default()
     };
     assert_eq!(
@@ -321,7 +328,7 @@ fn metadata_roles_follow_actual_configured_ip_and_control_factory() {
     let controlled = SamplingWorkFacts {
         reference_count: 1,
         control_count: 1,
-        ..Default::default()
+        ..reference
     };
     let both = resolve(&configured, MemoryMode::Other("control".into()), controlled).unwrap();
     assert_eq!((both.route, both.has_init), (Route::Control, true));

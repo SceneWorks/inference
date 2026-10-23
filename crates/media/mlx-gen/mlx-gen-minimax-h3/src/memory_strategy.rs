@@ -3260,6 +3260,20 @@ mod tests {
                 ("transformer_ref", DIT_BF16_BYTES),
             ],
         );
+        // Audio VAE loads EVERY tensor as F32, including the fixture's U8 padding. Derive
+        // its resident charge from actual header elements, not the sparse file's stat size.
+        let audio_headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+            root.path().join("audio_vae"),
+        )
+        .expect("valid audio fixture headers");
+        let audio_f32: u64 = audio_headers
+            .iter()
+            .map(|h| h.shape.iter().map(|&d| d as u64).product::<u64>() * 4)
+            .sum();
+        assert!(
+            audio_f32 > AUDIO_VAE_BYTES,
+            "U8 padding must materialize wider"
+        );
         let contract =
             contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
         let facts = contract.asset_facts;
@@ -3267,13 +3281,13 @@ mod tests {
         assert_eq!(facts.transformer_bytes, DIT_BF16_BYTES);
         assert_eq!(
             facts.decoder_bytes,
-            VIDEO_VAE_BYTES + AUDIO_VAE_BYTES,
+            VIDEO_VAE_BYTES + audio_f32,
             "both decoders are charged, and only the decoders"
         );
         assert_eq!(facts.overlay_bytes, 0);
         assert_eq!(
             facts.base_bytes,
-            TEXT_ENCODER_BYTES + DIT_BF16_BYTES + VIDEO_VAE_BYTES + AUDIO_VAE_BYTES
+            TEXT_ENCODER_BYTES + DIT_BF16_BYTES + VIDEO_VAE_BYTES + audio_f32
         );
         assert!(contract.conformance_errors().is_empty());
     }

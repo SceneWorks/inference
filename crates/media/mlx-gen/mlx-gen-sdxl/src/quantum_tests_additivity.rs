@@ -2036,7 +2036,7 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
             } else {
                 assert_eq!(
                     trace.init,
-                    Some((crate::model::DTYPE, (LATENT * LATENT * 4) as u64 * 2))
+                    Some((Dtype::Float32, (LATENT * LATENT * 4) as u64 * 4))
                 );
             }
             for (i, state, scaled) in &trace.inputs {
@@ -2111,9 +2111,22 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
                         .collect::<Vec<_>>()
                 };
                 for step in 0..steps {
-                    let base_step = step.min(base.inputs.len() - 1);
-                    assert_eq!(signature(&trace, step), signature(base, base_step),
-                        "{tier} {route:?}: match actual model quantum shapes/dtypes/bindings at first/steady epoch {step}");
+                    let input_dtype = trace.inputs[step].1;
+                    if let Some((base_step, _, _)) = base
+                        .inputs
+                        .iter()
+                        .find(|(_, dtype, _)| *dtype == input_dtype)
+                    {
+                        assert_eq!(signature(&trace, step), signature(base, *base_step),
+                            "{tier} {route:?}: same actual operand dtype must have the same model quantum bindings at epoch {step}");
+                    } else {
+                        assert_eq!(
+                            tier, "bf16",
+                            "every packed request body needs an actual same-dtype anchor epoch"
+                        );
+                        assert_ne!(signature(&trace, step), signature(base, 0),
+                            "different dense forward precision must not claim the old common-body certificate");
+                    }
                 }
                 let flows = |trace: &StepOwnershipTrace| {
                     trace
@@ -2930,7 +2943,12 @@ fn ios_init_cast_preserves_decoded_rgb() {
             .unwrap();
     let cast = with_cpu_diagnostic_headroom(PLENTY, || crate::pipeline::ios_unet_input(&original))
         .unwrap();
-    assert_eq!(cast.dtype(), crate::model::DTYPE);
+    assert_eq!(cast.dtype(), original.dtype());
+    assert_eq!(
+        bits(&cast),
+        bits(&original),
+        "boundary preserves actual init values, not just RGB tolerance"
+    );
     let decode =
         |z: &Array| crate::pipeline::decode_image_tiled(&vae, z, None, None, None).unwrap();
     let (a, b) = (decode(&original), decode(&cast));
@@ -3024,10 +3042,45 @@ fn every_guard_covers_its_real_request_quantum() {
     }
 }
 
+/// The exact native CI regression: bf16 / optimized / img2img. Keep this single production
+/// lifecycle comparison ordinary even though the full 48-lifecycle matrix is selected-only.
+/// It exercises real init encode, sampler, U-Net forward and RGB decode, not a cast-array proxy.
+#[test]
+fn optimized_bf16_img2img_preserves_full_request_rgb() {
+    if !cpu_child("pricing::additivity::optimized_bf16_img2img_preserves_full_request_rgb") {
+        return;
+    }
+    let snap = Snapshot::new(2);
+    let sp = spec(&snap, Route::Reference, Selection::Optimized);
+    let (sel, memory) = selection(&sp, Selection::Optimized);
+    let r = regime(&sp, &MemoryMode::ImageToImage, &sel, &memory);
+    let files = Files::of(&snap);
+    let host = run_image(&files, &r, &memory).unwrap();
+    let ios = with_cpu_diagnostic_headroom(PLENTY, || run_image(&files, &r, &memory)).unwrap();
+    assert_eq!(
+        (host.width, host.height, host.pixels.len()),
+        (ios.width, ios.height, ios.pixels.len())
+    );
+    assert!(!host.pixels.is_empty());
+    let diffs: Vec<f64> = host
+        .pixels
+        .iter()
+        .zip(&ios.pixels)
+        .map(|(a, b)| a.abs_diff(*b) as f64 / 255.0)
+        .collect();
+    let max = diffs.iter().copied().fold(0.0, f64::max);
+    let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
+    assert!(
+        max <= 3.0 / 255.0 && mean <= 0.25 / 255.0,
+        "bf16 Optimized image_to_image: max {max}, mean {mean}"
+    );
+}
+
 /// Full request output parity, not just cast-array error: init/noise/inpaint and ControlNet residual
 /// casts must keep the decoded RGB image within max 3/255 and mean .25/255 of the unchanged host
 /// path. The nonlinear VAE has no universal latent-error equivalent of an RGB error bound.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn ios_boundary_casts_preserve_full_request_rgb() {
     if !cpu_child("pricing::additivity::ios_boundary_casts_preserve_full_request_rgb") {
         return;
@@ -3065,6 +3118,10 @@ fn ios_boundary_casts_preserve_full_request_rgb() {
                 );
             }
         }
+    }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::ios_boundary_casts_preserve_full_request_rgb");
     }
 }
 

@@ -1064,6 +1064,74 @@ fn pipeline_quanta_refuse_before_construction() {
 /// Streamed (rung-4) blocks and layers are priced with what they read inside their quantum: a
 /// windowed forward's block checks carry the stored bytes of exactly the tensors each block reads
 /// on top of the resident price.
+fn expected_streamed_read_capacity(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    prefix: &str,
+) -> u64 {
+    headers
+        .iter()
+        .filter(|h| h.name.starts_with(prefix))
+        .map(|h| mlx_gen::ios_quantum::allocated_bytes(h.data_bytes))
+        .sum()
+}
+
+/// Read costs are per-tensor allocator capacities, not aggregate raw bytes. Distinguish dtypes
+/// and a page crossing independently so using either raw data or one rounded sum cannot pass.
+#[test]
+fn streamed_read_capacity_distinguishes_dtype_and_each_page_boundary() {
+    let page = mlx_gen::ios_quantum::PAGE_BYTES;
+    let allocated = mlx_gen::ios_quantum::allocated_bytes;
+    let elements = page / 2 + 1;
+    use mlx_gen::gen_core::weightsmeta::{Dtype as Stored, SafetensorsTensorHeader as Header};
+    let headers = [
+        Header {
+            name: "block.bf16".into(),
+            dtype: Stored::BF16,
+            shape: vec![elements as usize],
+            data_bytes: elements * 2,
+        },
+        Header {
+            name: "block.f32".into(),
+            dtype: Stored::F32,
+            shape: vec![elements as usize],
+            data_bytes: elements * 4,
+        },
+        Header {
+            name: "other".into(),
+            dtype: Stored::U8,
+            shape: vec![1],
+            data_bytes: 1,
+        },
+    ];
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block.bf16"),
+        page * 2
+    );
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block.f32"),
+        page * 3
+    );
+    assert_eq!(
+        expected_streamed_read_capacity(&headers, "block."),
+        page * 5
+    );
+    assert_eq!(allocated(elements * 2), page * 2, "BF16 crosses one page");
+    assert_eq!(allocated(elements * 4), page * 3, "F32 crosses two pages");
+    let requests = [page + 2, page + 4];
+    let individual: u64 = requests.into_iter().map(allocated).sum();
+    assert_eq!(individual, page * 4);
+    assert_ne!(
+        individual,
+        requests.into_iter().sum::<u64>(),
+        "not raw header sum"
+    );
+    assert_ne!(
+        individual,
+        allocated(requests.into_iter().sum()),
+        "not one rounded sum"
+    );
+}
+
 #[test]
 fn streamed_quanta_are_priced_with_the_bytes_they_read() {
     if !in_cpu_child("streamed_quanta_are_priced_with_the_bytes_they_read") {
@@ -1098,11 +1166,7 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
         mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(fixture("denoise_loop"))
             .unwrap();
     for (i, n) in [(1usize, 0), (2, 1)] {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("w.layers.{n}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 = expected_streamed_read_capacity(&headers, &format!("w.layers.{n}."));
         assert!(read > 0);
         assert_eq!(wn[i], r[i] + read, "main block {n}");
     }
@@ -1148,11 +1212,7 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
         .collect();
     assert_eq!(resident_layers.len(), 3);
     for (i, (streamed, resident)) in layers.iter().zip(&resident_layers).enumerate() {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("model.layers.{i}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 = expected_streamed_read_capacity(&headers, &format!("model.layers.{i}."));
         assert!(read > 0);
         assert_eq!(*streamed, resident + read, "layer {i}");
     }
@@ -1234,11 +1294,8 @@ fn control_quanta_are_priced_with_their_hints_and_reads() {
     ))
     .unwrap();
     for i in 0..15 {
-        let read: u64 = headers
-            .iter()
-            .filter(|h| h.name.starts_with(&format!("w.control_layers.{i}.")))
-            .map(|h| h.data_bytes)
-            .sum();
+        let read: u64 =
+            expected_streamed_read_capacity(&headers, &format!("w.control_layers.{i}."));
         // The refiner's 2 blocks run first (resident in both); then the 15 main control blocks.
         assert_eq!(s[2 + i], r[2 + i] + read, "control block {i}");
     }

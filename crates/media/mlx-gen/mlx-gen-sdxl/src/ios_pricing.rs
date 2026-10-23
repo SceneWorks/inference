@@ -757,10 +757,9 @@ fn proven_only_bounds(
     })
 }
 
-/// The body cancellation is source-specific: forward_eps supplies the SAME F16 input shape to
-/// the SAME packed U-Net operations at the SAME first/steady epoch and CFG half. The separately
-/// owned state/cast/init inputs are backed by the native lifetime proof, not by guard-upper
-/// subtraction. Class strings locate those already-proved points; equality is not proof authority.
+/// Body cancellation requires the SAME actual input dtype/shape and CFG-half/quantum.
+/// A promoted first request can match an anchor's promoted steady epoch, never its F16 body.
+/// Separately owned state/init use native lifetime proof, not guard-upper subtraction.
 pub(crate) fn bound_ancestral_forward_windows(
     anchor: &Regime,
     anchor_pricing: &IosPricing,
@@ -794,10 +793,18 @@ pub(crate) fn bound_ancestral_forward_windows(
             continue;
         };
         let mut candidates = Vec::new();
-        for at_anchor in anchor_pricing.windows.iter().filter(|window| {
-            window.owner_domain == "sdxl/ancestral/forward-input-native-v1"
-                && window.profile_class() == Some(class)
-        }) {
+        let requested_body = ancestral_body_coordinate(class, states[1])?;
+        for at_anchor in anchor_pricing
+            .windows
+            .iter()
+            .filter(|window| window.owner_domain == "sdxl/ancestral/forward-input-native-v1")
+        {
+            if ancestral_body_coordinate(at_anchor, states[0])? != requested_body {
+                continue;
+            }
+            let anchor_class = at_anchor
+                .profile_class()
+                .expect("validated body coordinate");
             // This checks that the generated ledger still describes the identical common body.
             // It does NOT turn either scratch upper into a physical anchor lower bound.
             if requested.label != at_anchor.label
@@ -848,7 +855,7 @@ pub(crate) fn bound_ancestral_forward_windows(
                     q::metal_reuse_upper_bytes,
                 )?;
                 candidates.push(IosAnchorCandidate {
-                    anchor_class: class.into(),
+                    anchor_class: anchor_class.into(),
                     delta_growth_upper: i128::from(request_owned) - i128::from(anchor_owned),
                     physical_anchor_lower_bound: None,
                     witnesses: vec![witness],
@@ -865,6 +872,57 @@ pub(crate) fn bound_ancestral_forward_windows(
         }
     }
     Ok(bounds)
+}
+
+/// Native body identity. On the ancestral route state dtype IS forward dtype.
+fn ancestral_body_coordinate(
+    class: &str,
+    (first, steady): (Dtype, Dtype),
+) -> Result<(&str, &str, &str, Dtype)> {
+    let invalid = || Error::Unsupported("sdxl malformed source forward body coordinate".into());
+    let mut parts = class.rsplitn(4, ':');
+    let quantum = parts
+        .next()
+        .filter(|s| s.starts_with('q'))
+        .ok_or_else(invalid)?;
+    let half = parts
+        .next()
+        .filter(|s| s.starts_with("cfg"))
+        .ok_or_else(invalid)?;
+    let dtype = match parts.next() {
+        Some("first") => first,
+        Some("steady") => steady,
+        _ => return Err(invalid()),
+    };
+    let recipe = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    Ok((recipe, half, quantum, dtype))
+}
+
+#[test]
+fn ancestral_body_matching_preserves_precision_and_cfg_coordinates() {
+    let mixed = (Dtype::Float16, Dtype::Float32);
+    let promoted = (Dtype::Float32, Dtype::Float32);
+    let first = "recipe:ancestral:first:cfg0:q3";
+    let steady = "recipe:ancestral:steady:cfg0:q3";
+    let request = ancestral_body_coordinate(first, promoted).unwrap();
+    assert_eq!(
+        request,
+        ancestral_body_coordinate(steady, mixed).unwrap(),
+        "promoted first body matches actual promoted steady anchor"
+    );
+    assert_ne!(
+        request,
+        ancestral_body_coordinate(first, mixed).unwrap(),
+        "F16 and F32 bodies cannot cancel even at the same named epoch"
+    );
+    for other in [
+        "recipe:ancestral:steady:cfg1:q3",
+        "recipe:ancestral:steady:cfg0:q4",
+        "other:ancestral:steady:cfg0:q3",
+    ] {
+        assert_ne!(request, ancestral_body_coordinate(other, mixed).unwrap());
+    }
+    assert!(ancestral_body_coordinate("recipe:unknown:cfg0:q3", mixed).is_err());
 }
 
 fn witnessed_cache_zero_page(pricing: &IosPricing, witness: &IosAnchorWitness) -> Result<u64> {
@@ -950,7 +1008,7 @@ fn ancestral_forward_owners(
     };
     if regime.has_init {
         add(elements
-            .checked_mul(q::dtype_bytes(crate::model::DTYPE))
+            .checked_mul(q::dtype_bytes(Dtype::Float32))
             .ok_or_else(invalid)?)?;
     }
     if regime.route == Route::Mask {
@@ -1060,8 +1118,7 @@ fn ancestral_forward_witnesses(
             if current_ordinal != ordinal
                 || barrier_index <= half_index
                 || barrier_index <= cast_index
-                || ready.get("dtype")
-                    != Some(&mlx_gen::sampler::sampling_dtype_code(crate::model::DTYPE))
+                || ready.get("dtype") != Some(&mlx_gen::sampler::sampling_dtype_code(state))
                 || ready.get("rows") != Some(&(regime.model_rows() as u64))
                 || ready.get("elements") != Some(&expected_elements)
                 || cast.get("elements") != Some(&expected_elements)
@@ -1072,8 +1129,7 @@ fn ancestral_forward_witnesses(
                 || cfg_half.get("half") != Some(&expected_half)
                 || input.get("dtype") != Some(&mlx_gen::sampler::sampling_dtype_code(state))
                 || input.get("evaluation") != Some(&evaluation)
-                || cast.get("dtype")
-                    != Some(&mlx_gen::sampler::sampling_dtype_code(crate::model::DTYPE))
+                || cast.get("dtype") != Some(&mlx_gen::sampler::sampling_dtype_code(state))
                 || cast.get("dim0") != Some(&(regime.model_rows() as u64))
                 || cast.get("dim1") != Some(&((regime.height / latent_scale) as u64))
                 || cast.get("dim2") != Some(&((regime.width / latent_scale) as u64))
@@ -1398,7 +1454,7 @@ impl Regime {
 
     pub(crate) fn initial_fixed_inputs(&self, latent_elements: u64) -> u64 {
         let init = if self.has_init {
-            latent_elements.saturating_mul(q::dtype_bytes(crate::model::DTYPE))
+            latent_elements.saturating_mul(q::dtype_bytes(Dtype::Float32))
         } else {
             0
         };
@@ -2812,7 +2868,8 @@ impl Priced {
         // Denoise: one guided step (two sequential batch-1 halves, or one batched pair), the
         // ControlNet branches beside the U-Net, the IP tokens in the cross-attention.
         // add_noise(_with) uses f32 noise; Euler retains that promoted sampler state.
-        // The per-forward cast in price_step is a different tensor, not a state conversion.
+        // Ancestral forwards preserve that promoted dtype; curated callbacks retain their
+        // historical pre-CFG compute cast independently of sampler state.
         let latent = regime.initial_state_dtype();
         let sequential = regime.sampling.guidance() > 1.0 && !regime.cfg_batching.is_batched();
         let batch = regime.model_rows();
@@ -2938,7 +2995,15 @@ impl Priced {
                         // guards price their local activation, while forward_eps still borrows
                         // the caller's original input. Do not count that input twice at the stem.
                         let overlap = if label == q::UNET_STEM || label == q::CONTROL_STEM {
-                            elements * q::dtype_bytes(crate::model::DTYPE) * batch as u64
+                            elements
+                                * q::dtype_bytes(
+                                    if regime.sampling.route() == SamplingRoute::Ancestral {
+                                        step_dtype
+                                    } else {
+                                        crate::model::DTYPE
+                                    },
+                                )
+                                * batch as u64
                         } else {
                             0
                         };
@@ -3224,7 +3289,7 @@ impl Priced {
         }
         let shed_ip =
             crate::model::sheds_ip_image_encoder(staged) && regime.route == Route::IpAdapter;
-        // A real init owner is F16, independently of the F32 noised sampler state. The mask
+        // A real init owner is the VAE's F32 mean, independently of the noised sampler state. The mask
         // path additionally retains its F32 noise/mask. ControlNet+reference also owns that init;
         // an IP image prompt does not. These are owners, not a fitted phase correction.
         let elements = (lh as u64) * (lw as u64) * 4;
@@ -3408,7 +3473,14 @@ impl Priced {
         owners: &mut Vec<u64>,
     ) -> Result<Dtype> {
         let first_quantum = quanta.len();
-        let x = price_tensor(x.shape(), crate::model::DTYPE)?;
+        // Curated/acceleration callbacks keep their historical explicit pre-forward cast;
+        // ancestral callbacks pass their actual (possibly promoted F32) sampler operand.
+        let input_dtype = if regime.sampling.route() == SamplingRoute::Ancestral {
+            x.dtype()
+        } else {
+            crate::model::DTYPE
+        };
+        let x = price_tensor(x.shape(), input_dtype)?;
         let batch = x.shape()[0];
         let mut control: Option<(Vec<PriceTensor>, PriceTensor)> = None;
         let mut pending_control = q::ControlMergeWork::default();
@@ -3477,16 +3549,11 @@ impl Priced {
                 });
             }
         }
-        // `pipeline::forward_eps` casts the combined residuals at the iOS U-Net boundary.
-        if let Some((down, mid)) = &mut control {
-            for residual in down {
-                *residual = price_tensor(residual.shape(), crate::model::DTYPE)?;
-            }
-            *mid = price_tensor(mid.shape(), crate::model::DTYPE)?;
-        }
-        let (cast_down, cast_mid) = control.as_ref().map_or((0, 0), |(down, mid)| {
-            (down.iter().map(price_bytes).sum::<u64>(), price_bytes(mid))
-        });
+        // Combined ControlNet residuals retain their native promoted dtype, exactly as on host.
+        let (merged_down_bytes, merged_mid_bytes) =
+            control.as_ref().map_or((0, 0), |(down, mid)| {
+                (down.iter().map(price_bytes).sum::<u64>(), price_bytes(mid))
+            });
         let unet_first = quanta.len();
         let effects = self
             .unet_effects
@@ -3509,12 +3576,20 @@ impl Priced {
         let (mut down_complete, mut mid_complete) = (false, false);
         for (label, _) in &quanta[unet_first..] {
             // Only the ACTUAL existing injection finish may replace raw source parents with the
-            // materialized cast's logical owner. This remains unclassified, not backing equality:
+            // materialized sum's logical owner. This remains unclassified, not backing equality:
             // inherited storage/cache oversizing and native/process domains are not inferred.
             owners.push(
                 selected_rows
-                    + if down_complete { cast_down } else { raw_down }
-                    + if mid_complete { cast_mid } else { raw_mid },
+                    + if down_complete {
+                        merged_down_bytes
+                    } else {
+                        raw_down
+                    }
+                    + if mid_complete {
+                        merged_mid_bytes
+                    } else {
+                        raw_mid
+                    },
             );
             if *label == q::CONTROL_DOWN_INJECTION {
                 down_complete = true;

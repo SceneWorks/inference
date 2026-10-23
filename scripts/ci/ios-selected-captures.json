@@ -418,5 +418,23 @@
     "target": "lib",
     "fqn": "sampler::tests::curated_solver_steps_are_guarded_quanta",
     "source": "crates/media/mlx-gen/src/sampler.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::correlated_rank_worlds_restore_effects_and_native_prefixes",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs"
+  },
+  {
+    "package": "mlx-gen-sdxl",
+    "target": "lib",
+    "fqn": "quantum_tests::pricing::additivity::ios_boundary_casts_preserve_full_request_rgb",
+    "source": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
   }
 ]

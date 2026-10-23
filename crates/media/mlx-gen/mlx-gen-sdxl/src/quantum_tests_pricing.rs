@@ -30,6 +30,9 @@ fn label_constants() -> Vec<(String, String)> {
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("pub(crate) const ")?;
             let (name, value) = rest.split_once(": &str = \"")?;
+            if name == "NATIVE_SHAPE_CHECK" {
+                return None;
+            }
             Some((name.to_owned(), value.strip_suffix("\";")?.to_owned()))
         })
         .collect()
@@ -63,6 +66,11 @@ fn every_quantum_label_maps_to_its_phase() {
         assert_eq!(ios_quantum_phase(label), Some(phase), "{label}");
     }
     assert_eq!(ios_quantum_phase(TILED_CORE), None);
+    assert_eq!(
+        ios_quantum_phase(NATIVE_SHAPE_CHECK),
+        None,
+        "metadata errors are not guarded execution phases"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -977,6 +985,7 @@ fn packed_pricing_is_the_guards_formulas() {
 
 /// Exercise the actual text/IP final-quantum call sites, not just the shared norm helper.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn final_norm_guards_cover_norm_pool_and_projection() {
     if !cpu_child("pricing::final_norm_guards_cover_norm_pool_and_projection") {
         return;
@@ -1037,6 +1046,10 @@ fn final_norm_guards_cover_norm_pool_and_projection() {
             Some(&1),
             "IP projection/norm executed"
         );
+    }
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection");
     }
 }
 
@@ -2141,6 +2154,7 @@ fn packed_residual_host_add_uses_native_broadcast_extent() {
 /// ranks refuse at the real dense merge after the earlier K install. Native arrays, not another
 /// header replay, supply installed geometry, values, packed operands and ordered guard facts.
 #[test]
+#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
     let Some(mut completed) =
         completed_cpu_child("pricing::correlated_rank_worlds_restore_effects_and_native_prefixes")
@@ -2599,7 +2613,10 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
             .iter()
             .map(|p| (p.before_resident, p.scratch))
             .collect();
-        let before_q = describe(&priced.unet_effects.as_ref().unwrap().0[q].weights);
+        let before_q = priced
+            .unet_effects
+            .as_ref()
+            .map(|effects| describe(&effects.0[q].weights));
         let mut observed = [0usize; 4];
         let mut native_merge_max = 0;
         let pricing = priced.price_configured_observing(&spec, &inputs.unet, inputs.quant_bits, &regime(Route::Text),
@@ -2649,7 +2666,10 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
             "final whole-world envelope must not select the smaller native merge candidate"
         );
         assert_eq!(
-            describe(&priced.unet_effects.as_ref().unwrap().0[q].weights),
+            priced
+                .unet_effects
+                .as_ref()
+                .map(|effects| describe(&effects.0[q].weights)),
             before_q,
             "selected effects restored after all worlds"
         );
@@ -2682,7 +2702,10 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
             matches!(failed_consumer, Err(ref e) if e.to_string().contains("fixture selected-consumer failure"))
         );
         assert_eq!(
-            describe(&priced.unet_effects.as_ref().unwrap().0[q].weights),
+            priced
+                .unet_effects
+                .as_ref()
+                .map(|effects| describe(&effects.0[q].weights)),
             before_q,
             "consumer error must restore actual selected effects before propagating"
         );
@@ -2797,6 +2820,10 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
         );
     }
     completed.body_completed = true;
+
+    if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+        eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::correlated_rank_worlds_restore_effects_and_native_prefixes");
+    }
 }
 
 /// Native PEFT constructor order, not a shared header formula as its own oracle. Every row starts

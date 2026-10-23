@@ -4423,8 +4423,7 @@ impl NativeLedger {
         if r.has_init {
             let image = GraphTensor::new(&[1, r.height as u64, r.width as u64, 3], Dtype::Float32)?;
             self.array(4, image.elements()?)?;
-            let latent = self.vae_encode_graph(&p.vae, image, tile)?;
-            self.cg_cast(&latent, crate::model::DTYPE)?;
+            self.vae_encode_graph(&p.vae, image, tile)?;
         }
         if r.route == Route::Mask {
             // preprocess_mask stores [1,H/8,W/8,1] F32 after HOST luma/resize/normalization.
@@ -4478,19 +4477,22 @@ impl NativeLedger {
         }
         Ok(())
     }
-    fn forward_request(&mut self, c: &ForwardContext<'_>, r: &Regime) -> Result<GraphTensor> {
+    fn forward_request(
+        &mut self,
+        c: &ForwardContext<'_>,
+        r: &Regime,
+        input_dtype: Dtype,
+    ) -> Result<GraphTensor> {
         let h = r.height as u64 / c.inputs.arch.latent_scale as u64;
         let w = r.width as u64 / c.inputs.arch.latent_scale as u64;
         let cfg = r.sampling.guidance() > 1.0;
         let sequential = cfg && !r.cfg_batching.is_batched();
         let rows = if cfg && !sequential { 2 } else { 1 };
-        let input = GraphTensor::new(&[rows, h, w, 4], crate::model::DTYPE)?;
+        let input = GraphTensor::new(&[rows, h, w, 4], input_dtype)?;
         if cfg && !sequential {
-            self.concat(2, input.elements()?, 2)?;
+            self.concat(input.width(), input.elements()?, 2)?;
         }
-        // forward_eps always performs the iOS model-input cast. For discrete ancestry the
-        // source state can be F32; retaining this possible output also covers off-device tests.
-        self.array(2, input.elements()?)?;
+        // Preserve the real sampler dtype; caller-owned historical casts are counted there.
         let halves = if sequential { 2 } else { 1 };
         let mut output = None;
         for _ in 0..halves {
@@ -4532,12 +4534,6 @@ impl NativeLedger {
                     None => branch,
                     Some(prev) => self.control_merge_graph(prev, branch)?,
                 });
-            }
-            if let Some(held) = &mut residual {
-                for tensor in &mut held.down {
-                    *tensor = self.cg_cast(tensor, crate::model::DTYPE)?;
-                }
-                held.mid = self.cg_cast(&held.mid, crate::model::DTYPE)?;
             }
             let effects = c
                 .priced
@@ -4790,7 +4786,6 @@ impl NativeLedger {
                     self.sigma_interpolation(false)?;
                     self.repeated(4, 1, 4)?; // square, one, add, rsqrt
                     self.repeated(4, n, 3)?; // noise*s, init+..., renorm
-                    self.cast(n, 2, 4)?; // ios init input was cast to compute precision
                     Ok(SymbolicLatent { n, width: 4 })
                 } else {
                     self.scalar(4)?;
@@ -4805,7 +4800,6 @@ impl NativeLedger {
                 self.scalar(4)?;
                 self.op(4, n)?;
                 if r.has_init {
-                    self.cast(n, 2, 4)?;
                     self.op(4, n)?;
                 }
                 Ok(SymbolicLatent { n, width: 4 })
@@ -4890,7 +4884,7 @@ impl NativeLedger {
                             let mut l = ops.ledger.borrow_mut();
                             l.preview_graph(input.n, input.width, true)?;
                             l.cast(n, input.width, 2)?;
-                            let eps = l.forward_request(c, r)?;
+                            let eps = l.forward_request(c, r, crate::model::DTYPE)?;
                             Ok(SymbolicLatent {
                                 n,
                                 width: q::dtype_bytes(eps.dtype),
@@ -4940,7 +4934,7 @@ impl NativeLedger {
                 let mut state = initial;
                 for _ in 0..steps {
                     self.preview_graph(n, state.width, false)?;
-                    let eps = self.forward_request(c, r)?;
+                    let eps = self.forward_request(c, r, native_dtype(state.width)?)?;
                     state.width =
                         self.ancestral_update(n, state.width, q::dtype_bytes(eps.dtype))?;
                     if r.route == Route::Mask {
@@ -4958,7 +4952,7 @@ impl NativeLedger {
                     }
                     self.cast(n, state.width, 2)?;
                     self.preview_graph(n, 2, false)?;
-                    let eps = self.forward_request(c, r)?;
+                    let eps = self.forward_request(c, r, crate::model::DTYPE)?;
                     self.cast(n, state.width, 4)?;
                     self.cast(n, q::dtype_bytes(eps.dtype), 4)?;
                     if coeff.uses_unity_noiseless_update() {

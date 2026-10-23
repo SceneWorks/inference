@@ -126,6 +126,34 @@ fn completed_cpu_child(name: &str) -> Option<CpuBodyCompletion> {
     None
 }
 
+/// Cheap precision discriminator retained in ordinary CI after the full RGB matrix becomes
+/// selected-only. Values deliberately distinguish F32 from a round-trip through F16.
+#[test]
+fn ios_boundary_preserves_actual_operand_dtype_and_values() {
+    if !cpu_child("ios_boundary_preserves_actual_operand_dtype_and_values") {
+        return;
+    }
+    for dtype in [Dtype::Float16, Dtype::Float32] {
+        let source = Array::from_slice(&[0.1234567_f32, -0.9876543, 1.000123], &[1, 1, 1, 3])
+            .as_dtype(dtype)
+            .unwrap();
+        let host = crate::pipeline::ios_unet_input(&source).unwrap();
+        let bounded =
+            with_cpu_diagnostic_headroom(PLENTY, || crate::pipeline::ios_unet_input(&source))
+                .unwrap();
+        assert_eq!(bounded.dtype(), dtype);
+        assert_eq!(bits(&bounded), bits(&source));
+        assert_eq!(bits(&host), bits(&source));
+        if dtype == Dtype::Float32 {
+            assert_ne!(
+                bits(&source),
+                bits(&source.as_dtype(Dtype::Float16).unwrap()),
+                "fixture detects narrowing"
+            );
+        }
+    }
+}
+
 /// Header-only target topology must equal the ACTUAL constructor's target surfaces, including
 /// optional time projections/shortcuts. This is a native CPU construction test, not backing proof.
 #[test]
@@ -2098,7 +2126,7 @@ mod proofs {
                         mlx_gen::ios_quantum::finish("retained forward input unit", &[&scaled, &pre_cfg, &pair, &forward])?;
                         let retained = (mlx_rs::memory::get_active_memory() as u64).saturating_sub(before);
                         assert_eq!(retained, owned - bytes(&state), "{flow:?} CFGrows={cfg_rows}: distinct native owners only");
-                        assert_eq!(forward.dtype(), crate::model::DTYPE);
+                        assert_eq!(forward.dtype(), if flow.cast_before_cfg { crate::model::DTYPE } else { flow.scaled.unwrap_or(state_dtype) });
                         assert_eq!(forward.shape()[0] as u64, cfg_rows);
                         eprintln!("FORWARD OWNERS {flow:?} rows={cfg_rows}: caller={} native_extra={retained} priced_total={owned}", bytes(&state));
                         drop((scaled, pre_cfg, pair, forward));
@@ -2186,7 +2214,14 @@ mod proofs {
                 .expect("held caller/coefficient cannot disappear");
             assert_eq!(retained, predicted.checked_sub(parent).unwrap(),
                 "{flow:?} shape={:?} rows={rows} page={page} parent_elements={parent_elements}: unique physical backings", state.shape());
-            assert_eq!(input.dtype(), crate::model::DTYPE);
+            assert_eq!(
+                input.dtype(),
+                if flow.cast_before_cfg {
+                    crate::model::DTYPE
+                } else {
+                    flow.scaled.unwrap_or(state.dtype())
+                }
+            );
             eprintln!("NATIVE UNIQUE INPUT {flow:?} shape={:?} rows={rows} parent={parent} total={predicted} extra={retained} page={page}", state.shape());
             // Keep caller state, coefficient and the actual scope alive THROUGH the assertion.
             drop((scaled, pre, pair, input));

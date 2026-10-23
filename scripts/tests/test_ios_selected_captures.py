@@ -169,6 +169,12 @@ class SelectedCaptures(unittest.TestCase):
         rows = [("mlx-gen-iris/src/quantum_proofs.rs", "proof_policy_cannot_be_disabled_by_print_only"),
                 ("mlx-gen-iris/src/anchor_tests.rs", "missing_phase_is_not_a_zero_or_a_skipped_assertion"),
                 ("mlx-gen-sdxl/src/quantum_tests.rs", "measured_lower_bound_is_hard_and_overpricing_is_report_only"),
+                ("mlx-gen-sdxl/src/quantum_tests.rs", "ios_boundary_preserves_actual_operand_dtype_and_values"),
+                ("mlx-gen-sdxl/src/quantum_tests_additivity.rs", "optimized_bf16_img2img_preserves_full_request_rgb"),
+                ("mlx-gen-sdxl/src/text_encoder.rs", "final_pool_prices_live_eos_and_native_fallback_scalar_operands"),
+                ("mlx-gen-sdxl/src/ios_pricing.rs", "ancestral_body_matching_preserves_precision_and_cfg_coordinates"),
+                ("mlx-gen-z-image/src/quantum_tests.rs", "streamed_read_capacity_distinguishes_dtype_and_each_page_boundary"),
+                ("mlx-gen-lens/src/registry.rs", "sparse_footprint_growth_rewrites_the_exact_payload_extent"),
                 ("mlx-gen-anima/src/quantum_tests.rs", "sdpa_scores_follow_the_metal_kernel_support")]
         for rel, name in rows:
             text = (ROOT / 'crates/media/mlx-gen' / rel).read_text(encoding='utf-8').split('fn ' + name + '()')[0]

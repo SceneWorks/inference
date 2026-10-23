@@ -482,8 +482,18 @@ fn clip_final_scratch(
                 &[b as u64, p.output_width()],
             )
     });
-    let pool = row * n as u64 + row + b as u64 * 4 + projection;
-    q::final_norm_bytes_from_metadata(&[b, n, dim], input, weight, bias).max(pool)
+    let pool = row * n as u64 + row + projection;
+    // Array::from_slice eagerly allocates b i32 EOS indices BEFORE the lazy norm evaluates.
+    // That source buffer overlaps BOTH norm and pooling, so it belongs outside their max.
+    // macOS's shared Metal allocator (also for CPU streams) rounds only above a page;
+    // there is no invented 16-byte CPU alignment law.
+    let gather = mlx_gen::ios_quantum::allocated_bytes(mlx_gen::ios_quantum::tensor_bytes(
+        q::dtype_bytes(Dtype::Int32),
+        &[b as u64],
+    ));
+    gather.saturating_add(
+        q::final_norm_bytes_from_metadata(&[b, n, dim], input, weight, bias).max(pool),
+    )
 }
 
 impl ClipPrice {
@@ -1278,6 +1288,32 @@ fn first_argmax(ids: &[i32]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No native arrays: independently enumerate the F16 CPU fallback live graph and the
+    /// eager EOS owner. This cheap discriminator remains ordinary when native captures move out.
+    #[test]
+    fn final_pool_prices_live_eos_and_native_fallback_scalar_operands() {
+        let affine = mlx_gen::adapters::facts::TensorFacts {
+            shape: vec![32],
+            dtype: Dtype::Float16,
+            strides: vec![],
+        };
+        crate::quantum::with_backend(crate::quantum::Backend::Cpu, || {
+            for batch in [1, 2, 5] {
+                let elements = batch as u64 * 8 * 32;
+                // Three half-width epilogue outputs plus three F32 fallback operands;
+                // three per-row F32 statistics; two mean normalizers plus epsilon; EOS i32.
+                let expected = elements * (3 * 2 + 3 * 4)
+                    + 3 * (batch as u64 * 8) * 4
+                    + (2 + 1) * 4
+                    + batch as u64 * 4;
+                assert_eq!(
+                    clip_final_scratch(batch, 8, 32, Dtype::Float16, &affine, &affine, None),
+                    expected
+                );
+            }
+        });
+    }
 
     #[test]
     fn first_argmax_picks_first_max_on_ties() {

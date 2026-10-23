@@ -937,7 +937,12 @@ pub(crate) fn final_norm_bytes_from_metadata(
             let input_width = dtype_bytes(input);
             let centered = count * (2 * 4 + u64::from(input_width < 4) * 4);
             let normalized = count * (3 * width + u64::from(input_width < 4) * 3 * 4);
-            centered.max(normalized) + 3 * (count / channels) * 4 + affine
+            // MLX v0.32.0 fast.cpp fallback constructs two mean normalizers (ops.cpp
+            // number_of_elements) and epsilon as eager F32 scalar Arrays before evaluating
+            // the lazy norm graph. Count all three source owners, not a measured byte gap.
+            // Some can retire before the peak; retaining all is a source-derived upper.
+            let scalars = tensor_bytes(dtype_bytes(Dtype::Float32), &[3]);
+            centered.max(normalized) + 3 * (count / channels) * 4 + affine + scalars
         }
     }
 }
@@ -1003,7 +1008,7 @@ pub(crate) fn diagnostic_owned_tensors<'a>(
 
 /// Owned inputs live DURING a model forward, excluding construction-only temporaries. `None`
 /// scaled dtype is an alias of caller state; `Some` is a separately owned scaled input. Curated
-/// paths cast before CFG, whereas ancestral paths concatenate first and cast in forward_eps.
+/// paths cast before CFG, whereas ancestral paths preserve the sampler dtype through forward_eps.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ForwardInputOwnership {
     pub state: Dtype,
@@ -1045,9 +1050,8 @@ impl ForwardInputOwnership {
         if cfg_rows > 1 {
             owned[3] = tensor(input, cfg_rows);
         }
-        if input != compute {
-            owned[4] = tensor(compute, cfg_rows);
-        }
+        // forward_eps preserves this input. Only the historical pre-CFG curated cast above
+        // creates a compute-dtype owner; ancestral F32 state/CFG is never narrowed on iOS.
         owned
     }
 
