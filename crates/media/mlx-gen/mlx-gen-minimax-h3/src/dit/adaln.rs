@@ -106,6 +106,7 @@ use std::collections::HashMap;
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
+use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 use mlx_gen::{Error, Result};
 
 use crate::dit::block::{AdaLnModulation, DitBlock};
@@ -438,6 +439,10 @@ pub struct AdaLnCache {
     schedule: TimestepSchedule,
     layers: Vec<AdaLnModulation>,
     bytes: usize,
+    /// `Some` when the modulation was projected from a pruned coordinate-table topology — the
+    /// content identity of its table + reduced projections + folded biases. The schedule-only
+    /// [`Self::is_current_for`] refuses such a cache: it cannot see the basis.
+    pruning: Option<PruningIdentity>,
 }
 
 impl AdaLnCache {
@@ -506,6 +511,25 @@ impl AdaLnCache {
     /// across the stack in one Metal submission. The windowed caller enforces the same bound
     /// before releasing each window; by the time it reaches here its windows are already released.
     pub fn from_layers(schedule: TimestepSchedule, layers: Vec<AdaLnModulation>) -> Result<Self> {
+        Self::from_layers_marked(schedule, layers, None)
+    }
+
+    /// [`Self::from_layers`] for a **pruned** stack, binding the cache to the pruning content
+    /// identity so the schedule-only [`Self::is_current_for`] refuses it and only
+    /// [`Self::is_current_for_pruned`] can re-admit it on the exact same basis.
+    pub fn from_layers_pruned(
+        schedule: TimestepSchedule,
+        layers: Vec<AdaLnModulation>,
+        identity: PruningIdentity,
+    ) -> Result<Self> {
+        Self::from_layers_marked(schedule, layers, Some(identity))
+    }
+
+    fn from_layers_marked(
+        schedule: TimestepSchedule,
+        layers: Vec<AdaLnModulation>,
+        pruning: Option<PruningIdentity>,
+    ) -> Result<Self> {
         if layers.is_empty() {
             return Err(Error::Msg(
                 "minimax-h3 adaln cache: no modulation layers were projected".into(),
@@ -523,6 +547,7 @@ impl AdaLnCache {
             schedule,
             layers,
             bytes,
+            pruning,
         })
     }
 
@@ -613,8 +638,23 @@ impl AdaLnCache {
     /// Whether this cache can serve `schedule`, i.e. whether the schedule is bitwise the one it was
     /// built from. A changed step count, a changed sigma shift or a changed solver all produce a
     /// different [`ScheduleKey`] and therefore a `false` here.
+    ///
+    /// A **pruned** cache returns `false` unconditionally: the schedule cannot see the pruning
+    /// basis, so a caller that predicates reuse on this alone must never re-admit a pruned cache.
+    /// Pruned callers use [`Self::is_current_for_pruned`].
     pub fn is_current_for(&self, schedule: &TimestepSchedule) -> bool {
-        self.schedule.key() == schedule.key()
+        self.pruning.is_none() && self.schedule.key() == schedule.key()
+    }
+
+    /// Whether this pruned cache can serve `schedule` on exactly `identity`'s basis. A full cache
+    /// (`None` here) is `false`: it has no pruning identity to compare.
+    pub fn is_current_for_pruned(&self, schedule: &TimestepSchedule, identity: &PruningIdentity) -> bool {
+        self.pruning == Some(*identity) && self.schedule.key() == schedule.key()
+    }
+
+    /// The pruning content identity this cache is bound to, or `None` for a full MLP cache.
+    pub fn pruning_identity(&self) -> Option<PruningIdentity> {
+        self.pruning
     }
 }
 

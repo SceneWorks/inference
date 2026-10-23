@@ -41,15 +41,13 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
     let schedule = adaln_schedule(&joint).unwrap();
     assert_eq!(schedule.num_distinct_timesteps(), 9);
     let cache = AdaLnCache::precompute(dit.blocks(), schedule.clone(), |ts| {
-        dit.projections().time_embedder.forward(ts)
+        dit.embed_timesteps(ts)
     })
     .expect("cold AdaLN precompute must complete without a Metal timeout");
     assert_eq!(cache.num_layers(), 50);
     assert!(cache.is_current_for(&schedule));
     let temb = dit
-        .projections()
-        .time_embedder
-        .forward(schedule.distinct_timesteps())
+        .embed_timesteps(schedule.distinct_timesteps())
         .unwrap();
     let mut checked = 0;
     for (index, block) in dit.blocks().iter().enumerate() {

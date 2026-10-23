@@ -76,6 +76,8 @@ mod joint_denoise;
 #[path = "pipeline.rs"]
 mod pipeline;
 
+#[path = "pruned_adaln.rs"]
+mod pruned_adaln;
 #[path = "quant_policy.rs"]
 mod quant_policy;
 
