@@ -99,6 +99,10 @@ fn assert_close(got: &[f32], want: &[f32], tol: f64, what: &str) {
         got.len(),
         want.len()
     );
+    assert!(
+        got.iter().chain(want).all(|v| v.is_finite()),
+        "{what}: nonfinite numeric result"
+    );
     let peak = got
         .iter()
         .zip(want)
@@ -302,36 +306,22 @@ fn the_reduced_projections_match_the_pinned_modulation_without_silu() {
     let device = dev();
     let c = curve(&f, &device);
     for (i, case) in f["cases"].as_array().unwrap().iter().enumerate() {
-        let coords = c
-            .coordinates(&floats(&case["timesteps"]), &device)
-            .unwrap();
-        for (layer, want) in case["block_modulations"].as_array().unwrap().iter().enumerate() {
-            let got = c
+        let coords = c.coordinates(&floats(&case["timesteps"]), &device).unwrap();
+        for (layer, want) in case["block_modulations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let flat = c
                 .block_projection(layer)
                 .unwrap()
-                .modulation(&coords)
+                .forward(&coords)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
                 .unwrap();
-            let flat: Vec<f32> = [
-                &got.shift_msa,
-                &got.scale_msa,
-                &got.gate_msa,
-                &got.shift_mlp,
-                &got.scale_mlp,
-                &got.gate_mlp,
-            ]
-            .into_iter()
-            .map(|t| {
-                t.to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
             assert_close(
                 &flat,
                 &floats(want),
@@ -343,13 +333,8 @@ fn the_reduced_projections_match_the_pinned_modulation_without_silu() {
         // the projection moves the modulation far beyond the tolerance, so a port that kept the
         // stock MLP's SiLU cannot pass this gate by tolerance luck.
         let activated = candle_gen_minimax_h3::nn::silu(&coords).unwrap();
-        let silu_first = c
-            .block_projection(0)
-            .unwrap()
-            .modulation(&activated)
-            .unwrap();
+        let silu_first = c.block_projection(0).unwrap().forward(&activated).unwrap();
         let peak = silu_first
-            .shift_msa
             .to_dtype(DType::F32)
             .unwrap()
             .flatten_all()
@@ -379,27 +364,14 @@ fn norm_out_modulation_matches_and_is_shift_first() {
     let device = dev();
     let c = curve(&f, &device);
     for (i, case) in f["cases"].as_array().unwrap().iter().enumerate() {
-        let coords = c
-            .coordinates(&floats(&case["timesteps"]), &device)
-            .unwrap();
+        let coords = c.coordinates(&floats(&case["timesteps"]), &device).unwrap();
         let m = c.norm_out_modulation(&coords).unwrap();
-        let mut flat: Vec<f32> = m
-            .shift
-            .to_dtype(DType::F32)
+        let flat = Tensor::cat(&[&m.shift, &m.scale], 1)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
-        flat.extend(
-            m.scale
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap(),
-        );
         assert_close(
             &flat,
             &floats(&case["norm_modulation"]),
@@ -439,8 +411,8 @@ fn native(f: &Value, device: &Device) -> Native {
         })
         .collect();
     let norm_out = AdaLayerNormOut::from_weights_curve(&w, "norm_out", &cfg).unwrap();
-    let proj_out = LinearBias::from_weights(&w, "proj_out", cfg.hidden_size, cfg.video_patch_dim())
-        .unwrap();
+    let proj_out =
+        LinearBias::from_weights(&w, "proj_out", cfg.hidden_size, cfg.video_patch_dim()).unwrap();
     let audio_proj_out =
         LinearBias::from_weights(&w, "audio_proj_out", cfg.hidden_size, cfg.audio_in_channels)
             .unwrap();
@@ -467,12 +439,8 @@ fn native_blocks_and_final_outputs_match_the_pinned_reference() {
     let cfg = config();
     let c = curve(&f, &device);
     let n = native(&f, &device);
-    let hidden = Tensor::from_vec(
-        floats(&f["input_hidden"]),
-        (1, 5, cfg.hidden_size),
-        &device,
-    )
-    .unwrap();
+    let hidden =
+        Tensor::from_vec(floats(&f["input_hidden"]), (1, 5, cfg.hidden_size), &device).unwrap();
     let adaln_indices = Tensor::from_vec(
         floats(&f["adaln_indices"])
             .into_iter()
@@ -499,9 +467,7 @@ fn native_blocks_and_final_outputs_match_the_pinned_reference() {
         .unwrap();
 
     for (i, case) in f["cases"].as_array().unwrap().iter().enumerate() {
-        let coords = c
-            .coordinates(&floats(&case["timesteps"]), &device)
-            .unwrap();
+        let coords = c.coordinates(&floats(&case["timesteps"]), &device).unwrap();
         let norm_out = c.norm_out_modulation(&coords).unwrap();
         let mut x = hidden.clone();
         for (layer, block) in n.blocks.iter().enumerate() {
@@ -521,15 +487,9 @@ fn native_blocks_and_final_outputs_match_the_pinned_reference() {
                 &format!("case {i} block {layer} output"),
             );
         }
-        let x = n
-            .norm_out
-            .apply(&x, &norm_out, &timestep_indices)
-            .unwrap();
+        let x = n.norm_out.apply(&x, &norm_out, &timestep_indices).unwrap();
         // The final head picks the target video row (4) and target audio row (3).
-        let video = n
-            .proj_out
-            .forward(&x.narrow(1, 4, 1).unwrap())
-            .unwrap();
+        let video = n.proj_out.forward(&x.narrow(1, 4, 1).unwrap()).unwrap();
         let audio = n
             .audio_proj_out
             .forward(&x.narrow(1, 3, 1).unwrap())
@@ -589,9 +549,18 @@ fn a_same_shaped_different_basis_never_matches() {
         let mut map = weight_map(&f, &device);
         let t = map.get_mut(name).unwrap();
         let dtype = t.dtype();
-        let mut v = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut v = t
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         v[element] += 0.25;
-        let t = Tensor::from_vec(v, t.dims().to_vec(), &device).unwrap().to_dtype(dtype).unwrap();
+        let t = Tensor::from_vec(v, t.dims().to_vec(), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
         map.insert(name.to_string(), t);
         let w = Weights::from_map(map);
         let topology = CurveAdaLn::inspect(&w, &cfg).unwrap().unwrap();
@@ -655,7 +624,9 @@ fn an_incomplete_identity_is_refused() {
     // Out-of-order and duplicate operand feeds are refused too.
     let mut builder = topology.identity_builder();
     let second = &topology.operands()[1].name;
-    assert!(builder.operand_values(second, std::iter::empty::<f32>()).is_err());
+    assert!(builder
+        .operand_values(second, std::iter::empty::<f32>())
+        .is_err());
 }
 
 // -------------------------------------------------------------------------------------------
@@ -669,7 +640,7 @@ fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
     let cfg = config();
     let c = curve(&f, &device);
     let map = weight_map(&f, &device);
-    let w = Weights::from_map(map);
+    let w = Weights::from_map(map.clone());
     let blocks = (0..cfg.num_layers)
         .map(|i| {
             DitBlock::from_weights_curve(
@@ -700,8 +671,11 @@ fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
     // A different basis with the SAME schedule is refused, with a reason that names the mismatch.
     let mutated = {
         let mut map2 = map.clone();
-        let t = map2.get_mut("transformer_blocks.0.adaln_proj.linear.weight").unwrap();
+        let t = map2
+            .get("transformer_blocks.0.adaln_proj.linear.weight")
+            .unwrap();
         let dtype = t.dtype();
+        let shape = t.dims().to_vec();
         let mut v = t
             .to_dtype(DType::F32)
             .unwrap()
@@ -712,7 +686,7 @@ fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
         v[0] += 0.5;
         map2.insert(
             "transformer_blocks.0.adaln_proj.linear.weight".to_string(),
-            Tensor::from_vec(v, t.dims().to_vec(), &device)
+            Tensor::from_vec(v, shape, &device)
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap(),
@@ -755,9 +729,10 @@ fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
     // Basis B: same shapes, one reduced block weight moved.
     let mut map = weight_map(&f, &device);
     let t = map
-        .get_mut("transformer_blocks.0.adaln_proj.linear.weight")
+        .get("transformer_blocks.0.adaln_proj.linear.weight")
         .unwrap();
     let dtype = t.dtype();
+    let shape = t.dims().to_vec();
     let mut v = t
         .to_dtype(DType::F32)
         .unwrap()
@@ -768,7 +743,7 @@ fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
     v[1] += 0.5;
     map.insert(
         "transformer_blocks.0.adaln_proj.linear.weight".to_string(),
-        Tensor::from_vec(v, t.dims().to_vec(), &device)
+        Tensor::from_vec(v, shape, &device)
             .unwrap()
             .to_dtype(dtype)
             .unwrap(),
@@ -814,42 +789,8 @@ fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
 // -------------------------------------------------------------------------------------------
 
 #[test]
-fn the_pruned_model_refuses_the_stock_embedding_and_exposes_the_identity() {
-    let f = fixture();
-    let device = dev();
-    let cfg = config();
-    let map = weight_map(&f, &device);
-    let w = Weights::from_map(map);
-    let model = candle_gen_minimax_h3::dit::MiniMaxH3Dit::from_weights(&w, &cfg, &device, DType::F32)
-        .expect("a complete pruned checkpoint loads");
-    assert!(
-        !model.holds_adaln(),
-        "a pruned checkpoint has no full-width adaln_proj to hold"
-    );
-    assert!(
-        model.pruning_identity().is_some(),
-        "the pruned model exposes its pruning identity"
-    );
-    let err = model.embed_timesteps(&[0.5]).unwrap_err().to_string();
-    assert!(
-        err.contains("modulation-pruned") && err.contains("curve_coordinates"),
-        "the stock embedding must be refused with the way out: {err}"
-    );
-    let err = model.curve_coordinates(&[0.5]).is_ok();
-    assert!(err, "the curve coordinates are available on the pruned model");
-    let err = model.curve_coordinates(&[f32::NAN]).unwrap_err().to_string();
-    assert!(
-        err.contains("finite"),
-        "a non-finite timestep must be refused: {err}"
-    );
-}
-
-#[test]
 fn the_stock_path_is_untouched_and_refuses_curve_coordinates() {
-    mod common {
-        include!("common/mod.rs");
-    }
-    use common::{dit_fixture_config, weights, DIT_FIXTURE, Golden};
+    use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
     let device = dev();
     // A stock checkpoint — full timestep MLP, full-width projections, no table — must load exactly
     // as before the curve work existed, and refuse the curve accessors: the two embedding sources
@@ -857,13 +798,9 @@ fn the_stock_path_is_untouched_and_refuses_curve_coordinates() {
     let golden = Golden::load(DIT_FIXTURE);
     let cfg = dit_fixture_config();
     let w = weights(golden.model_map(&["src.", "in.", "out.", "layout."]));
-    let model = candle_gen_minimax_h3::dit::MiniMaxH3Dit::from_weights(
-        &w,
-        &cfg,
-        &device,
-        DType::BF16,
-    )
-    .expect("the stock checkpoint still loads");
+    let model =
+        candle_gen_minimax_h3::dit::MiniMaxH3Dit::from_weights(&w, &cfg, &device, DType::BF16)
+            .expect("the stock checkpoint still loads");
     assert!(
         model.holds_adaln(),
         "the stock checkpoint still holds its full-width projections"
@@ -933,10 +870,11 @@ fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision()
         tensors.insert(name.clone(), (dtype, shape, bytes));
     }
     // The omitted top-level inputs: deterministic fillers at the published shapes.
-    let filler = |n: usize| -> Vec<u8> {
-        (0..n)
-            .map(|i| ((i % 7) as i8 - 3) as u8)
-            .collect::<Vec<_>>()
+    let filler = |bytes: usize| -> Vec<u8> {
+        assert!(bytes.is_multiple_of(4));
+        (0..bytes / 4)
+            .flat_map(|i| (((i % 7) as f32 - 3.0) / 32.0).to_le_bytes())
+            .collect()
     };
     let (patch, hidden, text) = (cfg.video_patch_dim(), cfg.hidden_size, cfg.text_dim);
     let mut push = |name: String, dtype: safetensors::Dtype, shape: Vec<usize>, data: Vec<u8>| {
@@ -1045,11 +983,86 @@ fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision()
     let identity = model
         .pruning_identity()
         .expect("the pruned model exposes its identity");
+    model.ensure_pruning_identity(&identity).unwrap();
+    let mut other = identity;
+    other.0[0] ^= 1;
+    assert!(model.ensure_pruning_identity(&other).is_err());
     assert_eq!(
         identity,
         curve(&f, &Device::Cpu).identity(),
         "the identity binds the loaded bytes"
     );
+    let mlp_error = model.embed_timesteps(&[0.5]).unwrap_err().to_string();
+    assert!(
+        mlp_error.contains("modulation-pruned") && mlp_error.contains("curve_coordinates"),
+        "{mlp_error}"
+    );
+    assert!(model.curve_coordinates(&[0.5]).is_ok());
+    assert!(model
+        .curve_coordinates(&[f32::NAN])
+        .unwrap_err()
+        .to_string()
+        .contains("finite"));
+
+    use candle_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
+    let device = Device::Cpu;
+    let loaded_curve = model.curve().unwrap();
+    let times = floats(&f["cases"][4]["timesteps"]);
+    let coords = loaded_curve.coordinates(&times, &device).unwrap();
+    let norm = loaded_curve.norm_out_modulation(&coords).unwrap();
+    let schedule = TimestepSchedule::new(vec![times]).unwrap();
+    let own_blocks = native(&f, &device);
+    let (cache, _) = loaded_curve
+        .precompute(&own_blocks.blocks, &schedule)
+        .unwrap();
+    let video = Tensor::from_vec(vec![0.1f32; 8], (1, 2, 4), &device).unwrap();
+    let audio = Tensor::from_vec(vec![0.2f32; 8], (1, 2, 4), &device).unwrap();
+    let text = Tensor::from_vec(vec![0.3f32; 8], (1, 1, 8), &device).unwrap();
+    let adaln = Tensor::from_vec(vec![1u32, 3, 11, 8, 0], (5,), &device).unwrap();
+    let ts = Tensor::from_vec(vec![0u32, 1, 3, 2, 0], (5,), &device).unwrap();
+    let positions = Tensor::zeros((5, 3), DType::F32, &device).unwrap();
+    let tables = own_blocks.rope.tables(&positions).unwrap();
+    let packed = PackedForward {
+        video_rows: &video,
+        audio_rows: &audio,
+        text_rows: &text,
+        adaln_indices: &adaln,
+        timestep_indices: &ts,
+        tables: &tables,
+        text_indices: &[0],
+        video_indices: &[1, 4],
+        audio_indices: &[2, 3],
+    };
+    let cached = model
+        .forward_packed(&packed, BlockModulation::Cached(&cache), &norm)
+        .unwrap();
+    let resident = model
+        .forward_packed(&packed, BlockModulation::CurveCoords(&coords), &norm)
+        .unwrap();
+    for (got, want) in [(&resident.0, &cached.0), (&resident.1, &cached.1)] {
+        assert_close(
+            &got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            &want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            BLOCK_ABS,
+            "loaded source resident/cache equivalence",
+        );
+    }
+    let mut other_fixture = f.clone();
+    let value = other_fixture["tensors"][TABLE_KEY]["data"][3]
+        .as_f64()
+        .unwrap();
+    other_fixture["tensors"][TABLE_KEY]["data"][3] = (value + 0.5).into();
+    let other_curve = curve(&other_fixture, &device);
+    let other_blocks = native(&other_fixture, &device);
+    let (foreign, _) = other_curve
+        .precompute(&other_blocks.blocks, &schedule)
+        .unwrap();
+    let error = model
+        .forward_packed(&packed, BlockModulation::Cached(&foreign), &norm)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pruning identity"), "{error}");
+    println!("S5 source-preserving synthetic partition load + resident/cache forward: native CPU video/audio outputs match; foreign basis refused");
     assert!(
         !model.holds_adaln(),
         "no full-width projection exists on the pruned path"
@@ -1094,13 +1107,45 @@ fn native_pruned_adaln_matches_pinned_reference() {
         .rope
         .tables(&Tensor::from_vec(vec![0.0f32; 15], (5, 3), &device).unwrap())
         .unwrap();
+    let flatten = |tensor: &Tensor| {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    assert_eq!(
+        f["cases"].as_array().unwrap().len(),
+        10,
+        "native proof must execute every pinned sweep case"
+    );
     for (i, case) in f["cases"].as_array().unwrap().iter().enumerate() {
-        let coords = c
-            .coordinates(&floats(&case["timesteps"]), &device)
-            .unwrap();
+        let coords = c.coordinates(&floats(&case["timesteps"]), &device).unwrap();
+        assert_close(
+            &flatten(&coords),
+            &floats(&case["coordinates"]),
+            COORDS_ABS,
+            &format!("CUDA case {i} coordinates"),
+        );
+        let final_projected = c.norm_out_projection().unwrap().forward(&coords).unwrap();
+        assert_close(
+            &flatten(&final_projected),
+            &floats(&case["norm_modulation"]),
+            PROJECTION_ABS,
+            &format!("CUDA case {i} final reduced projection"),
+        );
         let norm_out = c.norm_out_modulation(&coords).unwrap();
         let mut x = hidden.clone();
         for (layer, block) in n.blocks.iter().enumerate() {
+            let projected = c.block_projection(layer).unwrap().forward(&coords).unwrap();
+            assert_close(
+                &flatten(&projected),
+                &floats(&case["block_modulations"][layer]),
+                PROJECTION_ABS,
+                &format!("CUDA case {i} block {layer} reduced projection"),
+            );
             let modulation = block.curve_modulation(&coords).unwrap();
             x = block
                 .forward(&x, &modulation, &adaln_indices, &n.rope, &tables)
@@ -1117,12 +1162,12 @@ fn native_pruned_adaln_matches_pinned_reference() {
                 &format!("case {i} block {layer} output"),
             );
         }
-        let x = n
-            .norm_out
-            .apply(&x, &norm_out, &timestep_indices)
-            .unwrap();
+        let x = n.norm_out.apply(&x, &norm_out, &timestep_indices).unwrap();
         let video = n.proj_out.forward(&x.narrow(1, 4, 1).unwrap()).unwrap();
-        let audio = n.audio_proj_out.forward(&x.narrow(1, 3, 1).unwrap()).unwrap();
+        let audio = n
+            .audio_proj_out
+            .forward(&x.narrow(1, 3, 1).unwrap())
+            .unwrap();
         assert_close(
             &video
                 .to_dtype(DType::F32)

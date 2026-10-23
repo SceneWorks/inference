@@ -257,7 +257,10 @@ fn the_seventeen_load_at_the_published_geometry() {
     let tiny = dit_fixture_config();
     let p = DitProjections::from_weights(&model_weights(&f), &tiny).unwrap();
     assert_eq!(
-        p.time_embedder.time_embed_dim(),
+        p.time_embedder
+            .as_ref()
+            .expect("stock checkpoint timestep MLP")
+            .time_embed_dim(),
         tiny.time_embed_dim,
         "the AdaLN projections consume this width"
     );

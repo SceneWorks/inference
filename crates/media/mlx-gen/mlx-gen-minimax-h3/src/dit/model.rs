@@ -37,13 +37,13 @@ use std::path::Path;
 
 use mlx_rs::{Array, Dtype};
 
+use crate::block_stream::DitBlockStream;
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
+use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
-use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
-use crate::block_stream::DitBlockStream;
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
@@ -498,6 +498,13 @@ impl MiniMaxH3Dit {
         window: Option<(&BlockPlan, &CancelFlag)>,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<(Array, Array)> {
+        if let BlockModulation::Cached(cache) = blocks {
+            if cache.pruning_identity() != self.pruning_identity() {
+                return Err(Error::Msg(
+                    "minimax-h3: cached modulation pruning identity mismatch".into(),
+                ));
+            }
+        }
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -580,7 +587,11 @@ impl MiniMaxH3Dit {
                 veda.map(|(v, step)| (v, layer, step)),
             ),
             BlockModulation::Temb(temb) => {
-                let modulation = block.modulation(temb)?;
+                let modulation = if let Some(pruned) = &self.pruned {
+                    pruned.block_modulation(layer, temb)?
+                } else {
+                    block.modulation(temb)?
+                };
                 block.forward_bounded_veda(
                     &x,
                     &modulation,
@@ -723,7 +734,7 @@ pub struct PackedForward<'a> {
 pub enum BlockModulation<'a> {
     /// The precomputed table sc-17145's eviction leaves behind.
     Cached(&'a AdaLnCache),
-    /// A live timestep embedding, projected per block — the resident path.
+    /// A live timestep embedding or pruned coordinates, projected per block — the resident path.
     Temb(&'a Array),
 }
 
@@ -896,19 +907,27 @@ impl JointDit {
         // Both residencies consume `adaln_proj` next: the precompute reads all of it at once, the
         // resident sampler reads it per step. Verify it here, once, before either.
         dit.verify_adaln_sources()?;
-        let pruned = dit.pruned.clone();
         let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes, unverified) =
-            if let Some(pruned) = pruned.as_ref() {
-                // A pruned topology always precomputes: the reduced projections are a few tens of
-                // MB (vs the full 26 GB), so residency is a memory non-choice and every sampler's
-                // schedule — grid or midpoint — projects from the same table coordinates.
+            if let Some(pruned) = dit
+                .pruned
+                .as_ref()
+                .filter(|_| residency == AdaLnResidency::PrecomputeAndEvict)
+            {
+                // Preserve the requested residency: state-dependent samplers still use the
+                // Resident arm below and interpolate their actual per-evaluation timesteps.
                 let unverified = dit.unverified_source_counts()[1];
                 let coords = pruned.coords(schedule.distinct_timesteps())?;
                 let norm_out = pruned.final_projection().modulation(&coords)?;
                 // Force it before the first step; the same lazy-eval discipline as the full path.
                 mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
                 let cache = pruned.precompute(schedule, dit.num_layers())?;
-                (Modulation::Cached(Box::new(cache)), Some(norm_out), None, 0, unverified)
+                (
+                    Modulation::Cached(Box::new(cache)),
+                    Some(norm_out),
+                    None,
+                    0,
+                    unverified,
+                )
             } else {
                 match residency {
                     AdaLnResidency::PrecomputeAndEvict => {
@@ -978,8 +997,7 @@ impl JointDit {
                         (Modulation::Resident, None, Some(local), 0, unverified)
                     }
                 }
-            }
-            ;
+            };
         // After the eviction: the bodies are now exactly what step 1 will hold, so forcing and
         // verifying them here is peak-neutral and takes the cold reads out of the step-1 graph.
         dit.verify_body_sources()?;
@@ -1058,6 +1076,9 @@ impl JointDit {
             )));
         }
         let tables = dit.rope.tables(layout.position_ids())?;
+        if dit.pruned.is_some() {
+            dit.verify_adaln_sources()?;
+        }
 
         // One modulation + norm_out per run. The full path captures a single `temb` for both; the
         // pruned path projects its (eager) reduced weights from one coordinate table.
@@ -1248,7 +1269,13 @@ impl JointVelocity for JointDit {
         // `norm_out`'s table is per-timestep, so under the resident residency it moves every step
         // and is rebuilt from that step's own four row-class timesteps.
         let norm_out = match (&resident_temb, &self.norm_out_modulation) {
-            (Some(temb), _) => self.dit.projections.norm_out.modulation(temb)?,
+            (Some(temb), _) => {
+                if let Some(pruned) = &self.dit.pruned {
+                    pruned.final_projection().modulation(temb)?
+                } else {
+                    self.dit.projections.norm_out.modulation(temb)?
+                }
+            }
             (None, Some(cached)) => cached.clone(),
             (None, None) => {
                 return Err(Error::Msg(

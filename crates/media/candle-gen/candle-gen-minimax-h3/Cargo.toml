@@ -37,11 +37,6 @@ rand = { workspace = true }
 # 3-D partial rotary, the DAC-lineage BigVGAN audio decoder and the Kaiser-sinc alias-free
 # resamplers are all written here on candle-core/candle-nn.
 # Parses `vae/config.json` and the audio VAE's `config.json` + `config.yaml` + `metadata.json`
-# The pruned (sc-26684) DiT loader scans the safetensors headers of the shards to validate the
-# reduced-curve topology before any tensor is materialized, and reads the curve operands' stored
-# dtypes from those headers; the same crate is already a dev-dependency for the fixture writers.
-safetensors = { workspace = true }
-
 # source triple (the three documents the Apache-2.0 reference's `from_pretrained` reads).
 serde_json = { workspace = true }
 
@@ -57,9 +52,12 @@ tempfile = { workspace = true }
 # The turbo-LoRA fixtures (sc-18728) must carry a top-level `__metadata__["alpha"]`, which is the
 # thing under test — candle's own `safetensors::save` writes no metadata at all, so the fixture
 # writer serializes through the `safetensors` crate directly.
+safetensors = { workspace = true }
 # The fixtures are written **bf16**, the dtype every published turbo file carries; with f32 fixtures
 # the install's dtype-preserving fold is unobservable (sc-18724 review). Reading a bf16 tensor's
 # bytes back needs the `WithDType` impl on `half::bf16`.
+half = "2"
+# Shared test-support helpers (`candle_gen::testkit`).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # The shared weights-free memory-contract conformance checks (sc-18659). This is the same
 # `check_memory_strategy_contract` the registry path calls, so this crate's contract is held to the

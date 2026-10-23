@@ -647,9 +647,7 @@ impl AdaLnCache {
     }
 
     /// The pruning identity this cache's basis carries, `None` on the stock path.
-    pub fn pruning_identity(
-        &self,
-    ) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
         self.identity
     }
 
@@ -666,7 +664,7 @@ impl AdaLnCache {
         schedule: &TimestepSchedule,
         expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
     ) -> bool {
-        self.is_current_for(schedule) && self.identity == Some(expected)
+        self.schedule.key() == schedule.key() && self.identity == Some(expected)
     }
 
     /// The reuse refusal as a typed error, for callers that must state *why* a held cache was not
@@ -676,7 +674,7 @@ impl AdaLnCache {
         schedule: &TimestepSchedule,
         expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
     ) -> Result<()> {
-        if !self.is_current_for(schedule) {
+        if self.schedule.key() != schedule.key() {
             return Err(CandleError::Msg(
                 "minimax-h3 adaln cache: the held cache was built for a different schedule; \
                  rebuilding is required"

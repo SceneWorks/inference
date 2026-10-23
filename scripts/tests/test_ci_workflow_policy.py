@@ -5222,5 +5222,45 @@ class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
                 self.assertTrue(self.ceiling_errors(mutant))
 
 
+class H3PrunedAdaLnProofTests(unittest.TestCase):
+    def test_both_native_lanes_execute_the_named_fixture_with_private_caches(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        target = "pruned_adaln::native_pruned_adaln_matches_pinned_reference"
+        for lane, backend in [("macos-metal", "mlx-gen"), ("windows-cuda", "candle-gen")]:
+            with self.subTest(lane=lane):
+                job = workflow["jobs"][lane]
+                steps = [s for s in job["steps"] if target in s.get("run", "")]
+                self.assertEqual(len(steps), 1)
+                step = steps[0]
+                self.assertFalse(step.get("continue-on-error", False))
+                self.assertNotIn("if", step)
+                command = step["run"]
+                self.assertIn(f"-p {backend}-minimax-h3", command)
+                self.assertIn("--test integration", command)
+                self.assertIn("-- --ignored --exact --nocapture", command)
+                if lane == "windows-cuda":
+                    self.assertIn("--features cuda", command)
+                env = {**job.get("env", {}), **step.get("env", {})}
+                if lane == "windows-cuda":
+                    setup = next(s for s in job["steps"] if s.get("name") == "Isolate persistent-runner HF caches")
+                    self.assertLess(job["steps"].index(setup), job["steps"].index(step))
+                    self.assertNotIn("if", setup)
+                    self.assertFalse(setup.get("continue-on-error", False))
+                    for value in ("$env:RUNNER_TEMP", "$env:GITHUB_RUN_ID", "$env:GITHUB_RUN_ATTEMPT"):
+                        self.assertIn(value, setup["run"])
+                    for name in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+                        self.assertIn(f'"{name}=$(Join-Path $outer', setup["run"])
+                    self.assertIn(">> $env:GITHUB_ENV", setup["run"])
+                else:
+                    for name in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+                        self.assertIn("${{ runner.temp }}", env[name])
+                        self.assertIn("${{ github.run_id }}", env[name])
+                        self.assertIn("${{ github.run_attempt }}", env[name])
+                self.assertEqual(env["HF_HUB_OFFLINE"], "1")
+                tests = WORKFLOW.parents[2] / "crates" / "media" / backend / f"{backend}-minimax-h3" / "tests"
+                self.assertRegex((tests / "pruned_adaln.rs").read_text(), r"fn native_pruned_adaln_matches_pinned_reference\s*\(")
+                self.assertRegex((tests / "main.rs").read_text(), r"mod pruned_adaln;")
+
+
 if __name__ == "__main__":
     unittest.main()

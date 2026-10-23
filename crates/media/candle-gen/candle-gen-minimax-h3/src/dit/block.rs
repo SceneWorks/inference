@@ -369,12 +369,13 @@ impl DitBlock {
             .modulation(coords)
     }
 
-
     /// The pruning identity of the checkpoint this block's reduced curve projection came from, or
     /// `None` on the stock path — the check [`crate::dit::curve::CurveAdaLn::precompute`] runs
     /// before projecting any block, so a projection from a different basis cannot be labelled with
     /// this curve's identity.
-    pub fn curve_pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn curve_pruning_identity(
+        &self,
+    ) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
         self.curve.as_ref().map(|p| p.pruning_identity())
     }
     /// This block's AdaLN projection, or `None` once it has been evicted.

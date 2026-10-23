@@ -648,7 +648,11 @@ impl AdaLnCache {
 
     /// Whether this pruned cache can serve `schedule` on exactly `identity`'s basis. A full cache
     /// (`None` here) is `false`: it has no pruning identity to compare.
-    pub fn is_current_for_pruned(&self, schedule: &TimestepSchedule, identity: &PruningIdentity) -> bool {
+    pub fn is_current_for_pruned(
+        &self,
+        schedule: &TimestepSchedule,
+        identity: &PruningIdentity,
+    ) -> bool {
         self.pruning == Some(*identity) && self.schedule.key() == schedule.key()
     }
 

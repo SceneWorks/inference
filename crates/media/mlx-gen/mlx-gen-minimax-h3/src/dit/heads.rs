@@ -563,7 +563,10 @@ impl DitProjections {
         self.proj_in.nbytes()
             + self.audio_proj_in.nbytes()
             + self.context_embedder.nbytes()
-            + self.time_embedder.as_ref().map_or(0, TimestepEmbedder::nbytes)
+            + self
+                .time_embedder
+                .as_ref()
+                .map_or(0, TimestepEmbedder::nbytes)
             + self.norm_out.nbytes()
             + self.proj_out.nbytes()
             + self.audio_proj_out.nbytes()

@@ -47,12 +47,9 @@
 
 use std::collections::HashMap;
 
-use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::pruned_adaln::{
-    self, PrunedAdaLn, PruningIdentity, TABLE_KEY,
-};
-use candle_gen::gen_core::weightsmeta::Dtype as MetaDtype;
+use candle_gen::gen_core::pruned_adaln::{self, PrunedAdaLn, PruningIdentity, TABLE_KEY};
+use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype as MetaDtype};
 use candle_gen::{CandleError, Result, Weights};
 
 use crate::dit::adaln::{AdaLnCache, TimestepSchedule};
@@ -145,10 +142,10 @@ impl CurveProjection {
         }
         let weight = self.weight.to_dtype(DType::F32)?;
         let bias = self.bias.to_dtype(DType::F32)?;
-        coords
+        Ok(coords
             .to_dtype(DType::F32)?
             .matmul(&weight.t()?)?
-            .broadcast_add(&bias)
+            .broadcast_add(&bias)?)
     }
 
     /// [`Self::forward`] reshaped into the six modulation tables, exactly as
@@ -226,7 +223,8 @@ impl CurveAdaLn {
         let lookup = |name: &str| -> Option<(MetaDtype, Vec<usize>)> {
             if name.ends_with(".weight") {
                 let base = name.trim_end_matches(".weight");
-                if w.contains(&format!("{base}.scales")) || w.contains(&format!("{base}.comfy_quant"))
+                if w.contains(&format!("{base}.scales"))
+                    || w.contains(&format!("{base}.comfy_quant"))
                 {
                     return None;
                 }
@@ -270,14 +268,13 @@ impl CurveAdaLn {
                     operand.name
                 ))
             })?;
-            let got = meta_dtype(tensor.dtype())
-                .ok_or_else(|| {
-                    CandleError::Msg(format!(
-                        "minimax-h3 dit curve: {} is {:?}, not a float curve operand",
-                        operand.name,
-                        tensor.dtype()
-                    ))
-                })?;
+            let got = meta_dtype(tensor.dtype()).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 dit curve: {} is {:?}, not a float curve operand",
+                    operand.name,
+                    tensor.dtype()
+                ))
+            })?;
             if got != operand.dtype || tensor.dims() != operand.shape.as_slice() {
                 return Err(CandleError::Msg(format!(
                     "minimax-h3 dit curve: {} is {:?} {:?}, inspected as {:?} {:?}",
@@ -301,7 +298,9 @@ impl CurveAdaLn {
         let table = operands
             .get(TABLE_KEY)
             .ok_or_else(|| {
-                CandleError::Msg("minimax-h3 dit curve: the validated topology lost its table".into())
+                CandleError::Msg(
+                    "minimax-h3 dit curve: the validated topology lost its table".into(),
+                )
             })?
             .clone();
         Ok(Self {
@@ -385,10 +384,9 @@ impl CurveAdaLn {
     }
 
     fn operand(&self, name: &str) -> Result<Tensor> {
-        self.operands
-            .get(name)
-            .cloned()
-            .ok_or_else(|| CandleError::Msg(format!("minimax-h3 dit curve: missing operand {name}")))
+        self.operands.get(name).cloned().ok_or_else(|| {
+            CandleError::Msg(format!("minimax-h3 dit curve: missing operand {name}"))
+        })
     }
 
     /// Interpolate the table at `timesteps` — `[num_timesteps, rank]` F32.
@@ -422,7 +420,7 @@ impl CurveAdaLn {
         let weight = Tensor::from_vec(fraction, (timesteps.len(), 1), device)?;
         let start = self.table.index_select(&lower, 0)?;
         let end = self.table.index_select(&upper, 0)?;
-        start.broadcast_add(&weight.broadcast_mul(&end.broadcast_sub(&start)?)?)
+        Ok(start.broadcast_add(&weight.broadcast_mul(&end.broadcast_sub(&start)?)?)?)
     }
 
     /// The final `norm_out` modulation from the reduced projection: `shift` is the FIRST half,
@@ -522,7 +520,7 @@ pub fn meta_dtype(dtype: DType) -> Option<MetaDtype> {
 /// validates a 20 GB checkpoint's topology from kilobytes of headers, exactly what
 /// [`PrunedAdaLn::inspect`]'s "validation allocates headers only" contract asks of a backend.
 pub struct CurveScan {
-    headers: HashMap<String, (safetensors::Dtype, Vec<usize>)>,
+    headers: HashMap<String, (MetaDtype, Vec<usize>)>,
 }
 
 impl CurveScan {
@@ -531,12 +529,12 @@ impl CurveScan {
     pub fn read(files: &[impl AsRef<std::path::Path>]) -> Result<Self> {
         let mut headers = HashMap::new();
         for path in files {
-            // SAFETY: read-only, process-owned checkpoint, mapped for header metadata only — the
-            // standard candle weight-loading invariant.
-            let st = unsafe { MmapedSafetensors::new(path.as_ref())? };
-            for (key, view) in st.tensors() {
+            for header in safetensors_path_tensor_headers(path.as_ref())
+                .map_err(|error| CandleError::Msg(error.to_string()))?
+            {
+                let key = header.name;
                 if headers
-                    .insert(key.to_string(), (view.dtype(), view.shape().to_vec()))
+                    .insert(key.clone(), (header.dtype, header.shape))
                     .is_some()
                 {
                     return Err(CandleError::Msg(format!(
@@ -557,14 +555,9 @@ impl CurveScan {
     /// The canonical lookup [`PrunedAdaLn::inspect`] consumes, over the scanned headers.
     pub fn lookup(&self, name: &str) -> Option<(MetaDtype, Vec<usize>)> {
         let (dtype, shape) = self.headers.get(name)?;
-        let dtype = match dtype {
-            safetensors::Dtype::F16 => MetaDtype::F16,
-            safetensors::Dtype::BF16 => MetaDtype::BF16,
-            safetensors::Dtype::F32 => MetaDtype::F32,
-            _ => return None,
-        };
-        Some((dtype, shape.clone()))
+        if !matches!(dtype, MetaDtype::F16 | MetaDtype::BF16 | MetaDtype::F32) {
+            return None;
+        }
+        Some((*dtype, shape.clone()))
     }
-
 }
-

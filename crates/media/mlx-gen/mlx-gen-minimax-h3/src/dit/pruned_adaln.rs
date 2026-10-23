@@ -188,7 +188,7 @@ impl PrunedTable {
         let lo = self.table.take_axis(&lower_idx, 0)?;
         let hi = self.table.take_axis(&upper_idx, 0)?;
         let delta = subtract(&hi, &lo)?;
-        add(&lo, &multiply(&delta, &fraction)?)
+        Ok(add(&lo, &multiply(&delta, &fraction)?)?)
     }
 
     /// [`Self::coordinates`] under the name the timestep-embedding seam expects.
@@ -210,7 +210,12 @@ pub struct PrunedReducedLinear {
 
 impl PrunedReducedLinear {
     /// Load `{prefix}.weight` (BF16) and `{prefix}.bias` (F16) at their stored dtypes.
-    pub fn from_weights(w: &Weights, prefix: &str, out_features: usize, rank: usize) -> Result<Self> {
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        out_features: usize,
+        rank: usize,
+    ) -> Result<Self> {
         let weight = w.require(&format!("{prefix}.weight"))?.clone();
         let bias = w.require(&format!("{prefix}.bias"))?.clone();
         let want = vec![out_features as i32, rank as i32];
@@ -226,9 +231,13 @@ impl PrunedReducedLinear {
                 bias.shape()
             )));
         }
-        if !matches!(weight.dtype(), Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
-            || !matches!(bias.dtype(), Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
-        {
+        if !matches!(
+            weight.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+        ) || !matches!(
+            bias.dtype(),
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+        ) {
             return Err(Error::Msg(format!(
                 "minimax-h3 pruned adaln: {prefix} must be dense F16/BF16/F32, got {:?}/{:?}",
                 weight.dtype(),
@@ -320,8 +329,7 @@ impl PrunedAdaLnProjection {
         let steps = s[0];
         let rows = steps * MODALITY_NUM;
         let table = projected.reshape(&[rows, MODULATION_PARAMS * self.hidden_size])?;
-        let part =
-            |i: i32| slice_axis(&table, 1, i * self.hidden_size, (i + 1) * self.hidden_size);
+        let part = |i: i32| slice_axis(&table, 1, i * self.hidden_size, (i + 1) * self.hidden_size);
         Ok(AdaLnModulation {
             shift_msa: part(0)?,
             scale_msa: part(1)?,
@@ -341,7 +349,12 @@ pub struct PrunedFinalProjection {
 }
 
 impl PrunedFinalProjection {
-    pub fn from_weights(w: &Weights, prefix: &str, hidden_size: usize, rank: usize) -> Result<Self> {
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        hidden_size: usize,
+        rank: usize,
+    ) -> Result<Self> {
         Ok(Self {
             linear: PrunedReducedLinear::from_weights(w, prefix, 2 * hidden_size, rank)?,
             hidden_size: hidden_size as i32,
@@ -413,11 +426,7 @@ impl PrunedAdaLnRuntime {
     /// `num_blocks` must equal the reduced projection count exactly; the modulation is projected
     /// **only** from this runtime's own `block_projections` — never from caller-passed block bodies,
     /// whose identity belongs to the source binding, not the pruning identity.
-    pub fn precompute(
-        &self,
-        schedule: TimestepSchedule,
-        num_blocks: usize,
-    ) -> Result<AdaLnCache> {
+    pub fn precompute(&self, schedule: TimestepSchedule, num_blocks: usize) -> Result<AdaLnCache> {
         if num_blocks != self.block_projections.len() {
             return Err(Error::Msg(format!(
                 "minimax-h3 pruned adaln: projected {} blocks but the stack has {num_blocks}",

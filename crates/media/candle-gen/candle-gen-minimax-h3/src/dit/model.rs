@@ -43,8 +43,8 @@
 //! not go anywhere. [`crate::dit::adaln`] documents that trap; `load` closes it by construction, by
 //! owning the map and dropping it before returning.
 
-use std::path::Path;
 use std::collections::HashMap;
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::{CandleError, Result, Weights};
@@ -105,7 +105,7 @@ impl MiniMaxH3Dit {
             let operands = topology
                 .operands()
                 .iter()
-                .map(|o| (o.name.clone(), w.require(&o.name)?))
+                .map(|o| Ok((o.name.clone(), w.require(&o.name)?)))
                 .collect::<Result<HashMap<String, Tensor>>>()?;
             let curve = CurveAdaLn::assemble(topology, operands, cfg, device)?;
             let projections = DitProjections::from_weights_curve(w, cfg)?;
@@ -298,6 +298,19 @@ impl MiniMaxH3Dit {
         self.curve.as_ref().map(CurveAdaLn::identity)
     }
 
+    /// Refuse an unpruned model or a different table/basis before serving an expected source.
+    pub fn ensure_pruning_identity(
+        &self,
+        expected: &candle_gen::gen_core::pruned_adaln::PruningIdentity,
+    ) -> Result<()> {
+        match self.pruning_identity() {
+            Some(identity) if &identity == expected => Ok(()),
+            actual => Err(CandleError::Msg(format!(
+                "minimax-h3 pruning identity mismatch: expected {expected:?}, got {actual:?}"
+            ))),
+        }
+    }
+
     /// **The adapter addressing seam** (sc-18728) — resolve a dotted module path, pre-split into
     /// segments, to the projection a LoRA residual attaches to.
     ///
@@ -426,6 +439,13 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<(Tensor, Tensor)> {
+        if let BlockModulation::Cached(cache) = blocks {
+            if cache.pruning_identity() != self.pruning_identity() {
+                return Err(CandleError::Msg(
+                    "minimax-h3: cached modulation pruning identity mismatch".into(),
+                ));
+            }
+        }
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -544,10 +564,7 @@ pub struct PackedForward<'a> {
 /// The resident path's per-row AdaLN index (`row_class · MODALITY_NUM + token_tag`) and its
 /// per-row bare row-class index (`norm_out` gathers with), both constant across steps because
 /// neither the class nor the tag of a row ever moves.
-fn resident_local_indices(
-    layout: &PackedLayout,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
+fn resident_local_indices(layout: &PackedLayout, device: &Device) -> Result<(Tensor, Tensor)> {
     let local: Vec<u32> = layout
         .row_classes()
         .iter()
@@ -700,12 +717,11 @@ impl JointDit {
         let device = dit.device.clone();
 
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
-            if dit.curve.is_some() {
+            if let Some(curve) = &dit.curve {
                 // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
                 // are ~90 MB resident — so PrecomputeAndEvict reports zero released bytes and
                 // Resident simply re-interpolates the table per step; both residencies are
                 // legal, and neither touches a timestep MLP (there is none to call).
-                let curve = dit.curve.as_ref().expect("checked above");
                 match residency {
                     AdaLnResidency::PrecomputeAndEvict => {
                         let (cache, norm_out) = curve.precompute(&dit.blocks, &schedule)?;
@@ -719,13 +735,7 @@ impl JointDit {
                     }
                     AdaLnResidency::Resident => {
                         let local = resident_local_indices(&layout, &device)?;
-                        (
-                            Modulation::Resident,
-                            None,
-                            Some(local.0),
-                            Some(local.1),
-                            0,
-                        )
+                        (Modulation::Resident, None, Some(local.0), Some(local.1), 0)
                     }
                 }
             } else {
@@ -822,7 +832,6 @@ impl JointDit {
         self.released_bytes
     }
 
-
     /// The loaded checkpoint's pruning identity, `None` on the stock path — the compatibility key
     /// a consumer checks a held [`AdaLnCache`] against ([`AdaLnCache::is_current_for_pruning`]).
     pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
@@ -872,13 +881,11 @@ impl JointVelocity for JointDit {
                 (
                     local.clone(),
                     classes.clone(),
-                    Some(
-                        if self.dit.curve.is_some() {
-                            self.dit.curve_coordinates(&step.row_timesteps)?
-                        } else {
-                            self.dit.embed_timesteps(&step.row_timesteps)?
-                        },
-                    ),
+                    Some(if self.dit.curve.is_some() {
+                        self.dit.curve_coordinates(&step.row_timesteps)?
+                    } else {
+                        self.dit.embed_timesteps(&step.row_timesteps)?
+                    }),
                 )
             }
         };
@@ -887,12 +894,8 @@ impl JointVelocity for JointDit {
         // and is rebuilt from that step's own four row-class timesteps.
         let norm_out = match (&resident_temb, &self.norm_out_modulation) {
             (Some(temb), _) => {
-                if self.dit.curve.is_some() {
-                    self.dit
-                        .curve
-                        .as_ref()
-                        .expect("curve checked above")
-                        .norm_out_modulation(temb)?
+                if let Some(curve) = &self.dit.curve {
+                    curve.norm_out_modulation(temb)?
                 } else {
                     self.dit.projections.norm_out.modulation(temb)?
                 }

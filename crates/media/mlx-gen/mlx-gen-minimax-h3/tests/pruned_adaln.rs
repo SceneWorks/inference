@@ -59,8 +59,11 @@ fn tiny_cfg() -> MiniMaxH3DitConfig {
     cfg
 }
 
-fn f32s(values: &[f64]) -> Vec<f32> {
-    values.iter().map(|&v| v as f32).collect()
+fn f32s(values: &[serde_json::Value]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|value| value.as_f64().expect("numeric oracle value") as f32)
+        .collect()
 }
 
 /// Build an MLX array from a JSON `{shape, dtype, data}` tensor. The data are f32 in the fixture;
@@ -68,7 +71,8 @@ fn f32s(values: &[f64]) -> Vec<f32> {
 /// at the stored width).
 fn array_from_json(shape: &[i64], dtype: &str, data: &[f64]) -> Array {
     let shape: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
-    let base = Array::from_slice(&f32s(data), &shape);
+    let values: Vec<f32> = data.iter().map(|&value| value as f32).collect();
+    let base = Array::from_slice(&values, &shape);
     match dtype {
         "F32" => base,
         "BF16" => base.as_dtype(Dtype::Bfloat16).unwrap(),
@@ -100,8 +104,14 @@ fn finite_max_abs_diff(got: &Array, want: &[f32]) -> f32 {
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
-    assert!(got.iter().all(|v| v.is_finite()), "native output contains a non-finite value");
-    assert!(want.iter().all(|v| v.is_finite()), "oracle contains a non-finite value");
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "native output contains a non-finite value"
+    );
+    assert!(
+        want.iter().all(|v| v.is_finite()),
+        "oracle contains a non-finite value"
+    );
     got.iter()
         .zip(want)
         .map(|(a, b)| (a - b).abs())
@@ -110,7 +120,12 @@ fn finite_max_abs_diff(got: &Array, want: &[f32]) -> f32 {
 
 fn assert_abs(got: &Array, want: &[f32], tol: f32, what: &str) {
     let count = got.shape().iter().product::<i32>() as usize;
-    assert_eq!(count, want.len(), "{what}: element count {count} vs {}", want.len());
+    assert_eq!(
+        count,
+        want.len(),
+        "{what}: element count {count} vs {}",
+        want.len()
+    );
     let diff = finite_max_abs_diff(got, want);
     assert!(
         diff < tol && diff.is_finite(),
@@ -142,8 +157,15 @@ fn run_case(
     case: &serde_json::Value,
     tol: (f32, f32, f32),
 ) {
-    let coords = table.coordinates(&f32s(case["timesteps"].as_array().unwrap())).unwrap();
-    assert_abs(&coords, &f32s(case["coordinates"].as_array().unwrap()), tol.0, "coordinates");
+    let coords = table
+        .coordinates(&f32s(case["timesteps"].as_array().unwrap()))
+        .unwrap();
+    assert_abs(
+        &coords,
+        &f32s(case["coordinates"].as_array().unwrap()),
+        tol.0,
+        "coordinates",
+    );
 
     let mut x = input_hidden.clone();
     let block_modulations = case["block_modulations"].as_array().unwrap();
@@ -159,7 +181,9 @@ fn run_case(
             &format!("block {i} modulation"),
         );
         let modulation = projections[i].forward(&coords).unwrap();
-        x = block.forward(&x, &modulation, adaln_indices, rope, tables).unwrap();
+        x = block
+            .forward(&x, &modulation, adaln_indices, rope, tables)
+            .unwrap();
         assert_abs(
             &x,
             &f32s(block_outputs[i].as_array().unwrap()),
@@ -169,14 +193,29 @@ fn run_case(
     }
 
     let raw_norm = final_projection.projected(&coords).unwrap();
-    assert_abs(&raw_norm, &f32s(case["norm_modulation"].as_array().unwrap()), tol.1, "norm_out projection");
+    assert_abs(
+        &raw_norm,
+        &f32s(case["norm_modulation"].as_array().unwrap()),
+        tol.1,
+        "norm_out projection",
+    );
     let norm_mod = final_projection.modulation(&coords).unwrap();
 
     let x = norm_out.apply(&x, &norm_mod, timestep_indices).unwrap();
     let video = proj_out.forward(&gather(&x, &[4])).unwrap();
     let audio = audio_proj_out.forward(&gather(&x, &[3])).unwrap();
-    assert_abs(&video, &f32s(case["video_output"].as_array().unwrap()), tol.2, "video output");
-    assert_abs(&audio, &f32s(case["audio_output"].as_array().unwrap()), tol.2, "audio output");
+    assert_abs(
+        &video,
+        &f32s(case["video_output"].as_array().unwrap()),
+        tol.2,
+        "video output",
+    );
+    assert_abs(
+        &audio,
+        &f32s(case["audio_output"].as_array().unwrap()),
+        tol.2,
+        "audio output",
+    );
 }
 
 /// Rebuild the fixture operands and drive the whole pruned forward for every case, comparing
@@ -210,15 +249,20 @@ fn native_pruned_adaln_matches_pinned_reference() {
                     .iter()
                     .map(|v| v.as_f64().unwrap())
                     .collect();
-                (name.clone(), array_from_json(&shape, tensor["dtype"].as_str().unwrap(), &data))
+                (
+                    name.clone(),
+                    array_from_json(&shape, tensor["dtype"].as_str().unwrap(), &data),
+                )
             })
             .collect(),
     );
 
-    let runtime = detect(&w, &cfg).expect("detection succeeds").expect("a complete pruned topology");
+    let runtime = detect(&w, &cfg)
+        .expect("detection succeeds")
+        .expect("a complete pruned topology");
 
     let table = runtime.table().clone();
-    let projections: Vec<_> = (0..cfg.num_layers)
+    let projections: Vec<_> = (0..cfg.num_layers as usize)
         .map(|i| runtime.block_projection(i).unwrap().clone())
         .collect();
     let final_projection = runtime.final_projection().clone();
@@ -234,9 +278,16 @@ fn native_pruned_adaln_matches_pinned_reference() {
         })
         .collect();
     let norm_out = AdaLayerNormOut::from_weights_norm_only(&mut w, "norm_out", &cfg).unwrap();
-    let proj_out = LinearBias::from_weights(&mut w, "proj_out", cfg.hidden_size, cfg.video_patch_dim()).unwrap();
-    let audio_proj_out =
-        LinearBias::from_weights(&mut w, "audio_proj_out", cfg.hidden_size, cfg.audio_in_channels).unwrap();
+    let proj_out =
+        LinearBias::from_weights(&mut w, "proj_out", cfg.hidden_size, cfg.video_patch_dim())
+            .unwrap();
+    let audio_proj_out = LinearBias::from_weights(
+        &mut w,
+        "audio_proj_out",
+        cfg.hidden_size,
+        cfg.audio_in_channels,
+    )
+    .unwrap();
 
     // Identity rotary: every position is 0, so cos=1/sin=0 and the rotation is the oracle's
     // `rope=None` exactly.
@@ -244,7 +295,8 @@ fn native_pruned_adaln_matches_pinned_reference() {
     let positions = Array::from_slice(&[0.0f32; 15], &[5, 3]);
     let tables = rope.tables(&positions).unwrap();
 
-    let input_hidden = Array::from_slice(&f32s(json["input_hidden"].as_array().unwrap()), &[1, 5, 8]);
+    let input_hidden =
+        Array::from_slice(&f32s(json["input_hidden"].as_array().unwrap()), &[1, 5, 8]);
     let adaln_indices = index_array(&json, "adaln_indices");
     let timestep_indices = index_array(&json, "timestep_indices");
 
@@ -256,11 +308,26 @@ fn native_pruned_adaln_matches_pinned_reference() {
     );
 
     let cases = json["cases"].as_array().unwrap();
-    assert!(cases.len() >= 10, "the sweep covers off-grid and conditioning endpoints");
+    assert!(
+        cases.len() >= 10,
+        "the sweep covers off-grid and conditioning endpoints"
+    );
     for case in cases {
         run_case(
-            &table, &projections, &blocks, &norm_out, &final_projection, &proj_out, &audio_proj_out,
-            &rope, &tables, &input_hidden, &adaln_indices, &timestep_indices, case, tol,
+            &table,
+            &projections,
+            &blocks,
+            &norm_out,
+            &final_projection,
+            &proj_out,
+            &audio_proj_out,
+            &rope,
+            &tables,
+            &input_hidden,
+            &adaln_indices,
+            &timestep_indices,
+            case,
+            tol,
         );
     }
 }
@@ -269,7 +336,10 @@ fn native_pruned_adaln_matches_pinned_reference() {
 /// with deterministic non-degenerate values so a mutation is observable.
 fn tiny_pruned_headers() -> HashMap<String, (String, Vec<i64>, Vec<f64>)> {
     let mut m = HashMap::new();
-    m.insert("adaln_t_table".to_string(), ("F32".into(), vec![4, 2], vec![0.25; 8]));
+    m.insert(
+        "adaln_t_table".to_string(),
+        ("F32".into(), vec![4, 2], vec![0.25; 8]),
+    );
     m.insert(
         "transformer_blocks.0.adaln_proj.linear.weight".into(),
         ("BF16".into(), vec![36, 2], vec![0.5; 72]),
@@ -278,8 +348,14 @@ fn tiny_pruned_headers() -> HashMap<String, (String, Vec<i64>, Vec<f64>)> {
         "transformer_blocks.0.adaln_proj.linear.bias".into(),
         ("F16".into(), vec![36], vec![0.25; 36]),
     );
-    m.insert("norm_out.linear.weight".into(), ("BF16".into(), vec![4, 2], vec![0.5; 8]));
-    m.insert("norm_out.linear.bias".into(), ("F16".into(), vec![4], vec![0.25; 4]));
+    m.insert(
+        "norm_out.linear.weight".into(),
+        ("BF16".into(), vec![4, 2], vec![0.5; 8]),
+    );
+    m.insert(
+        "norm_out.linear.bias".into(),
+        ("F16".into(), vec![4], vec![0.25; 4]),
+    );
     m
 }
 
@@ -287,9 +363,7 @@ fn tiny_weights(headers: &HashMap<String, (String, Vec<i64>, Vec<f64>)>) -> Weig
     Weights::from_map(
         headers
             .iter()
-            .map(|(name, (dtype, shape, data))| {
-                (name.clone(), array_from_json(shape, dtype, data))
-            })
+            .map(|(name, (dtype, shape, data))| (name.clone(), array_from_json(shape, dtype, data)))
             .collect(),
     )
 }
@@ -301,7 +375,9 @@ fn detects_pruned_topology_and_binds_every_operand() {
     let cfg = tiny_cfg();
     let headers = tiny_pruned_headers();
     let w = tiny_weights(&headers);
-    let runtime = detect(&w, &cfg).expect("detection").expect("complete pruned topology");
+    let runtime = detect(&w, &cfg)
+        .expect("detection")
+        .expect("complete pruned topology");
     let identity = runtime.identity();
     assert_eq!(identity, runtime.identity(), "identity is deterministic");
 
@@ -309,8 +385,14 @@ fn detects_pruned_topology_and_binds_every_operand() {
     let mut corrupted = headers.clone();
     corrupted.get_mut("adaln_t_table").unwrap().2[3] = 0.75;
     let w2 = tiny_weights(&corrupted);
-    let runtime2 = detect(&w2, &cfg).expect("detection").expect("still a complete pruned topology");
-    assert_ne!(runtime2.identity(), identity, "same-shape different basis must identify differently");
+    let runtime2 = detect(&w2, &cfg)
+        .expect("detection")
+        .expect("still a complete pruned topology");
+    assert_ne!(
+        runtime2.identity(),
+        identity,
+        "same-shape different basis must identify differently"
+    );
 }
 
 /// Removing the table or a folded bias, and widening a reduced projection against the table rank,
@@ -327,7 +409,10 @@ fn refuses_missing_and_inconsistent_pruned_topologies() {
     }
 
     let mut headers = tiny_pruned_headers();
-    headers.get_mut("transformer_blocks.0.adaln_proj.linear.weight").unwrap().1 = vec![36, 3];
+    headers
+        .get_mut("transformer_blocks.0.adaln_proj.linear.weight")
+        .unwrap()
+        .1 = vec![36, 3];
     let w = tiny_weights(&headers);
     assert!(
         detect(&w, &cfg).is_err(),
@@ -336,16 +421,21 @@ fn refuses_missing_and_inconsistent_pruned_topologies() {
 
     // The full timestep MLP alongside the table is a conflict, not a fallback.
     let mut headers = tiny_pruned_headers();
-    headers.insert("time_embedder.linear_1.weight".into(), ("F32".into(), vec![16, 8], vec![0.0; 128]));
+    headers.insert(
+        "time_embedder.linear_1.weight".into(),
+        ("F32".into(), vec![16, 8], vec![0.0; 128]),
+    );
     let w = tiny_weights(&headers);
-    assert!(detect(&w, &cfg).is_err(), "a table plus a full timestep MLP must refuse");
+    assert!(
+        detect(&w, &cfg).is_err(),
+        "a table plus a full timestep MLP must refuse"
+    );
 }
 
 /// The reduced operands are retained at their stored dtypes — BF16 weight, F16 folded bias, F32
 /// table — and interpolation clamps off-grid timesteps to the pinned endpoints.
 #[test]
 fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
-    let cfg = tiny_cfg();
     let headers = tiny_pruned_headers();
     let w = tiny_weights(&headers);
 
@@ -356,8 +446,16 @@ fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
         2,
     )
     .unwrap();
-    assert_eq!(block.weight().dtype(), Dtype::Bfloat16, "reduced weight stays BF16");
-    assert_eq!(block.bias().dtype(), Dtype::Float16, "folded bias stays F16");
+    assert_eq!(
+        block.weight().dtype(),
+        Dtype::Bfloat16,
+        "reduced weight stays BF16"
+    );
+    assert_eq!(
+        block.bias().dtype(),
+        Dtype::Float16,
+        "folded bias stays F16"
+    );
 
     let table = mlx_gen_minimax_h3::PrunedTable::from_weights(&w, 4, 2).unwrap();
     let coords = table.coordinates(&[-1.0, 0.0, 1.0, 2.0]).unwrap();
@@ -371,7 +469,11 @@ fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
     // A non-degenerate table proves the lerp + clamp (`[0,0],[1,1],[2,2],[3,3]` along rank 0).
     let map = HashMap::from([(
         "adaln_t_table".to_string(),
-        ("F32".to_string(), vec![4, 2], vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]),
+        (
+            "F32".to_string(),
+            vec![4, 2],
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+        ),
     )]);
     let w2 = Weights::from_map(
         map.iter()
@@ -384,7 +486,10 @@ fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
     let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
     assert!(close(rows[0], 0.0), "t=-1 clamps to the first row");
     assert!(close(rows[2], 1.5), "t=0.5 lerps to the midpoint");
-    assert!(close(rows[4], 3.0), "t=1 addresses the last interval at fraction 1");
+    assert!(
+        close(rows[4], 3.0),
+        "t=1 addresses the last interval at fraction 1"
+    );
     assert!(close(rows[6], 3.0), "t=2 clamps to the last row");
 }
 
@@ -430,7 +535,10 @@ fn full_pruned_map(json: &serde_json::Value, table_perturb: f64) -> HashMap<Stri
         if name == "adaln_t_table" && data.len() > 3 {
             data[3] += table_perturb;
         }
-        map.insert(name.clone(), array_from_json(&shape, tensor["dtype"].as_str().unwrap(), &data));
+        map.insert(
+            name.clone(),
+            array_from_json(&shape, tensor["dtype"].as_str().unwrap(), &data),
+        );
     }
     let heads: [(&str, Vec<i64>); 6] = [
         ("proj_in.weight", vec![8, 4]),
@@ -471,8 +579,11 @@ fn full_model_detects_pruned_and_checks_pruning_identity() {
     let dit = MiniMaxH3Dit::from_weights(&mut w, &cfg, Dtype::Float32)
         .expect("a complete pruned checkpoint loads the full DiT");
 
-    let identity = dit.pruning_identity().expect("a pruned DiT carries an identity");
-    dit.ensure_pruning_identity(&identity).expect("identity matches itself");
+    let identity = dit
+        .pruning_identity()
+        .expect("a pruned DiT carries an identity");
+    dit.ensure_pruning_identity(&identity)
+        .expect("identity matches itself");
 
     let mut other = identity;
     other.0[0] ^= 0xff;
@@ -486,10 +597,75 @@ fn full_model_detects_pruned_and_checks_pruning_identity() {
     let mut w2 = Weights::from_map(full_pruned_map(&json, 0.5));
     let dit2 = MiniMaxH3Dit::from_weights(&mut w2, &cfg, Dtype::Float32)
         .expect("the perturbed checkpoint is still a complete pruned topology");
-    let identity2 = dit2.pruning_identity().expect("the perturbed DiT still carries an identity");
-    assert_ne!(identity2, identity, "same-shape different basis must identify differently");
+    let identity2 = dit2
+        .pruning_identity()
+        .expect("the perturbed DiT still carries an identity");
+    assert_ne!(
+        identity2, identity,
+        "same-shape different basis must identify differently"
+    );
     assert!(
         dit2.ensure_pruning_identity(&identity).is_err(),
         "the perturbed model must refuse the original basis"
     );
+}
+
+#[test]
+fn full_model_live_coordinates_match_cache_and_refuse_foreign_basis() {
+    use mlx_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
+    use mlx_gen_minimax_h3::TimestepSchedule;
+
+    let json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    let cfg = oracle_cfg();
+    let mut weights = Weights::from_map(full_pruned_map(&json, 0.0));
+    let runtime = detect(&weights, &cfg).unwrap().unwrap();
+    let model = MiniMaxH3Dit::from_weights(&mut weights, &cfg, Dtype::Float32).unwrap();
+    let times = f32s(json["cases"][4]["timesteps"].as_array().unwrap());
+    let schedule = TimestepSchedule::new(vec![times.clone()]).unwrap();
+    let coords = runtime.coords(&times).unwrap();
+    let norm = runtime.final_projection().modulation(&coords).unwrap();
+    let cache = runtime.precompute(schedule.clone(), 2).unwrap();
+    let video = Array::from_slice(&[0.1f32; 8], &[1, 2, 4]);
+    let audio = Array::from_slice(&[0.2f32; 8], &[1, 2, 4]);
+    let text = Array::from_slice(&[0.3f32; 8], &[1, 1, 8]);
+    let indices = index_array(&json, "adaln_indices");
+    let timesteps = index_array(&json, "timestep_indices");
+    let rope = MmRope::new(cfg.rope_freq_dim, cfg.rope_theta).unwrap();
+    let positions = Array::from_slice(&[0.0f32; 15], &[5, 3]);
+    let tables = rope.tables(&positions).unwrap();
+    let packed = PackedForward {
+        video_rows: &video,
+        audio_rows: &audio,
+        text_rows: &text,
+        adaln_indices: &indices,
+        timestep_indices: &timesteps,
+        tables: &tables,
+        text_indices: &[0],
+        video_indices: &[1, 4],
+        audio_indices: &[2, 3],
+    };
+    let cached = model
+        .forward_packed(&packed, BlockModulation::Cached(&cache), &norm)
+        .unwrap();
+    let resident = model
+        .forward_packed(&packed, BlockModulation::Temb(&coords), &norm)
+        .unwrap();
+    for (got, want) in [(&resident.0, &cached.0), (&resident.1, &cached.1)] {
+        let want = want.as_dtype(Dtype::Float32).unwrap();
+        want.eval().unwrap();
+        assert_abs(
+            got,
+            want.as_slice::<f32>(),
+            2e-5,
+            "resident/cached source equivalence",
+        );
+    }
+    let other_weights = Weights::from_map(full_pruned_map(&json, 0.5));
+    let other = detect(&other_weights, &cfg).unwrap().unwrap();
+    let foreign = other.precompute(schedule, 2).unwrap();
+    let error = model
+        .forward_packed(&packed, BlockModulation::Cached(&foreign), &norm)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pruning identity"), "{error}");
 }
