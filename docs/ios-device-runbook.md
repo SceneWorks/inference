@@ -27,6 +27,43 @@ bounded capture of a Z-Image campaign case (`IOS_SMOKE_ZIMAGE_CASE`, default
 `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit`) through the same capture permit — there is
 no unadmitted Z-Image loader.
 
+## Explicit CPU fixture captures (not phone anchors)
+
+The `real-weights.yml` **`ios-selected-captures` profile** runs only registered
+ignored fixture proofs on `nax-macos-2`; it never joins a scheduled or `all`
+profile. This is not the phone campaign below. Obtain the host-time authorization
+before dispatching. These are examples, not a record of captures executed.
+
+GitHub permits at most 25 dispatch inputs, so the existing JSON input is
+profile-specific: **only this capture profile** reads its `selection` key. An
+omitted/blank binding or absent selection key selects `iris`; a provided selection
+must name `all`, a fixed family, or an exact `package/FQN` from
+`scripts/ci/ios-selected-captures.json`. Empty, null and unknown provided selections
+fail rather than selecting another family. Binding JSON travels through an
+environment variable and quoted argv, then the existing runner decodes/validates
+it before any capture—not a GitHub `fromJSON('')` startup expression or shell
+code. Discovery, parent/CPU-child completion and exact selected counts remain
+mandatory.
+
+```sh
+# Default iris selection; choose the approved source ref explicitly.
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures
+# One family (use {"selection":"all"} for every registered capture).
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures -f ios_pricing_compile_binding='{"selection":"sdxl"}'
+# One exact registered proof.
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref "$SOURCE_REF" \
+  -f profile=ios-selected-captures \
+  -f ios_pricing_compile_binding='{"selection":"mlx-gen-sdxl/quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection"}'
+```
+
+The **`ios-pricing-compile-only` profile is unchanged**: its original default JSON,
+required `source_sha`/`manifest_sha256`/`host` fields, phase handling and strict
+unknown-key validation still apply. Do **not** add `selection` to a compile
+binding. The former standalone `ios_capture_selection` input is replaced only for
+the capture profile by the JSON selection above.
+
 ## Campaign protocol and command matrix (sc-26270)
 
 **Mechanism only; no new device measurements are recorded here.** No full-model

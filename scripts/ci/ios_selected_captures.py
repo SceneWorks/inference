@@ -32,6 +32,17 @@ def select(selection: str) -> tuple[dict, ...]:
     return rows
 
 
+def selection_from_binding(binding: str) -> str:
+    value = json.loads(binding.strip() or "{}")
+    if not isinstance(value, dict):
+        raise ValueError("capture binding must be a JSON object")
+    selection = value.get("selection", "iris")
+    if not isinstance(selection, str):
+        raise ValueError("provided capture selection must be a string")
+    select(selection)
+    return selection
+
+
 def require_dispatch(env: dict[str, str]) -> None:
     for key, expected in (("GITHUB_EVENT_NAME", "workflow_dispatch"),
                           ("RUNNER_NAME", "nax-macos-2"), ("RUNNER_OS", "macOS"),
@@ -100,15 +111,17 @@ def run(selection: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--select", required=True,
-                        choices=("all", *FAMILIES, *(identity(row) for row in REGISTRY)))
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--select", choices=("all", *FAMILIES, *(identity(row) for row in REGISTRY)))
+    source.add_argument("--binding", help="capture-profile JSON; omitted selection defaults to iris")
     parser.add_argument("--list", action="store_true", help="list fixed bindings without running")
     args = parser.parse_args()
-    if args.list:
-        print(json.dumps(select(args.select), indent=2))
-        return 0
     try:
-        return run(args.select)
+        selection = args.select if args.select is not None else selection_from_binding(args.binding)
+        if args.list:
+            print(json.dumps(select(selection), indent=2))
+            return 0
+        return run(selection)
     except (ValueError, OSError) as error:
         print(f"capture prerequisite/validation failure: {error}", file=sys.stderr)
         return 1

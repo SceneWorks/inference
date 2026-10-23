@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import yaml
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -180,13 +181,63 @@ class SelectedCaptures(unittest.TestCase):
             text = (ROOT / 'crates/media/mlx-gen' / rel).read_text(encoding='utf-8').split('fn ' + name + '()')[0]
             self.assertNotIn('#[ignore', text[text.rfind('#[test]'):])
 
+    def test_profile_specific_selection_preserves_the_legacy_compile_binding(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8'))
+        inputs = workflow[True]['workflow_dispatch']['inputs']
+        self.assertNotIn('ios_capture_selection', inputs)
+        # Frozen protocol default, not a corpus assertion: capture's profile-specific key
+        # must not enter the compile profile's default payload or strict unknown-key contract.
+        default = inputs['ios_pricing_compile_binding']['default']
+        self.assertEqual(default, '{"source_sha":"","manifest_sha256":"","host":"second-mac"}')
+        self.assertNotIn('selection', json.loads(default))
+        capture = workflow['jobs']['ios-selected-captures']
+        self.assertEqual(capture['env']['IOS_CAPTURE_BINDING'], '${{ inputs.ios_pricing_compile_binding }}')
+        self.assertIn('--binding "$IOS_CAPTURE_BINDING"', capture['steps'][2]['run'])
+        self.assertNotIn('fromJSON(', json.dumps(capture))
+        compile_env = workflow['jobs']['ios-pricing-compile-only']['env']
+        for key, value in {'SOURCE_SHA': 'source_sha', 'SOURCE_MANIFEST_SHA256': 'manifest_sha256',
+                           'COMPILE_HOST': 'host'}.items():
+            self.assertEqual(compile_env[key], '${{ fromJSON(inputs.ios_pricing_compile_binding).' + value + ' }}')
+        self.assertEqual(compile_env['COMPILE_PHASE'],
+                         "${{ fromJSON(inputs.ios_pricing_compile_binding).phase || 'compile-only' }}")
+        self.assertEqual(runner.selection_from_binding(default), 'iris')
+
+    def test_json_selection_preserves_all_families_and_every_exact_registered_binding(self):
+        for choice in ('all', *runner.FAMILIES, *(runner.identity(row) for row in runner.REGISTRY)):
+            with self.subTest(selection=choice):
+                supplied = json.dumps({'selection': choice})
+                projected = runner.selection_from_binding(supplied)
+                self.assertEqual(runner.select(projected), runner.select(choice))
+
+    def test_blank_binding_and_absent_key_default_but_invalid_present_selection_refuses(self):
+        for supplied in ('', '  ', '{}', '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'):
+            self.assertEqual(runner.selection_from_binding(supplied), 'iris')
+        for supplied in ('not-json', '[]', 'null', '{"selection":""}', '{"selection":null}',
+                         '{"selection":false}', '{"selection":[]}', '{"selection":"unknown"}',
+                         '{"selection":"sdxl; echo bad"}'):
+            with self.subTest(binding=supplied), self.assertRaises(ValueError):
+                runner.selection_from_binding(supplied)
+
+    def test_actual_binding_entrypoint_lists_defaults_and_explicit_selections_without_execution(self):
+        for supplied, selection in (('', 'iris'), ('{}', 'iris'), ('{"selection":"sdxl"}', 'sdxl'),
+                                    ('{"selection":"all"}', 'all')):
+            result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'),
+                                     '--binding', supplied, '--list'], capture_output=True, text=True, encoding='utf-8')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), list(runner.select(selection)))
+        for supplied in ('{"selection":""}', '{"selection":"unknown"}'):
+            result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/ci/ios_selected_captures.py'),
+                                     '--binding', supplied, '--list'], capture_output=True, text=True, encoding='utf-8')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('capture prerequisite/validation failure', result.stderr)
+
     def test_workflow_is_dispatch_only_and_host_enforced(self):
         text = (ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8')
         job = text.split('  ios-selected-captures:\n')[1].split('  ios-pricing-compile-only:\n')[0]
         self.assertIn("github.event_name == 'workflow_dispatch'", job)
         self.assertIn('runs-on: [self-hosted, macOS, ARM64, rw-llm]', job)
         self.assertIn('[[ "$RUNNER_NAME" == nax-macos-2 ]]', job)
-        self.assertIn('--select "$IOS_CAPTURE_SELECTION"', job)
+        self.assertIn('--binding "$IOS_CAPTURE_BINDING"', job)
         self.assertNotIn('campaign.py', job)
 
 

@@ -149,13 +149,8 @@ on:
         required: false
         default: full
         options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
-      ios_capture_selection:
-        description: 'Fixed fixture-capture family or exact package/FQN from scripts/ci/ios-selected-captures.json; validated, never evaluated as shell'
-        type: string
-        required: false
-        default: iris
       ios_pricing_compile_binding:
-        description: 'Owner-bound JSON: exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe'
+        description: 'ios-selected-captures: JSON selection (all/family/exact package/FQN), omitted defaults iris. ios-pricing-compile-only: owner-bound JSON exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe'
         type: string
         required: false
         default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
@@ -405,7 +400,7 @@ jobs:
       group: ios-selected-captures-nax-macos-2
       cancel-in-progress: false
     env:
-      IOS_CAPTURE_SELECTION: ${{ inputs.ios_capture_selection }}
+      IOS_CAPTURE_BINDING: ${{ inputs.ios_pricing_compile_binding }}
       CARGO_BUILD_JOBS: '4'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -426,7 +421,7 @@ jobs:
         shell: bash
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ios-selected-target-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3.12 -I scripts/ci/ios_selected_captures.py --select "$IOS_CAPTURE_SELECTION"
+        run: python3.12 -I scripts/ci/ios_selected_captures.py --binding "$IOS_CAPTURE_BINDING"
       - name: Upload discovery, completed bodies and exact selected counts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

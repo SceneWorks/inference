@@ -5033,6 +5033,17 @@ class WindowsBashSelectionTests(unittest.TestCase):
         self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
 
 
+def workflow_dispatch_input_errors(workflow: dict) -> list[str]:
+    events = workflow.get("on", workflow.get(True, {}))
+    if not isinstance(events, dict):
+        return []
+    dispatch = events.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if len(inputs) > 25:
+        return ["workflow_dispatch exceeds GitHub's maximum of 25 inputs"]
+    return []
+
+
 class WorkflowFileSizeTests(unittest.TestCase):
     # GitHub refuses any workflow file over 512,000 bytes and every run of it then startup-fails
     # ("Workflow file exceeds the maximum allowed size of 500 KB"). real-weights.yml reached
@@ -5040,6 +5051,20 @@ class WorkflowFileSizeTests(unittest.TestCase):
     # leaves room for more lanes before the next extraction is due, instead of finding out from a
     # run that never starts.
     MAXIMUM_WORKFLOW_BYTES = 450_000
+
+    def test_every_workflow_dispatch_obeys_github_input_limit(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertEqual(workflow_dispatch_input_errors(workflow), [])
+
+    def test_dispatch_input_platform_limit_accepts_25_and_rejects_26(self) -> None:
+        workflow = {"on": {"workflow_dispatch": {"inputs": {
+            f"input_{index}": {"type": "string"} for index in range(25)
+        }}}}
+        self.assertEqual(workflow_dispatch_input_errors(workflow), [])
+        workflow["on"]["workflow_dispatch"]["inputs"]["overflow"] = {"type": "string"}
+        self.assertEqual(len(workflow_dispatch_input_errors(workflow)), 1)
 
     def test_every_workflow_file_stays_well_under_the_github_size_limit(self) -> None:
         for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
