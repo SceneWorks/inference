@@ -638,7 +638,7 @@ pub fn clip_and_noise_grads(
     // HashMap iteration is not a recovery-stable reduction order. Preserve the existing
     // FP32 norm/clipping convention, but sum named factors in canonical order on every run.
     let mut ordered: Vec<_> = avg_grads.iter().collect();
-    ordered.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    ordered.sort_unstable_by_key(|(a, _)| *a);
     let mut squared = Array::from_f32(0.0);
     for (_, grad) in &ordered {
         squared = squared.add(grad.square()?.sum(None)?)?;

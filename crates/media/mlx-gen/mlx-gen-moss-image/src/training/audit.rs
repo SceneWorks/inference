@@ -25,7 +25,7 @@ pub(super) fn digest(arrays: impl IntoIterator<Item = Array>) -> Result<String> 
 }
 pub(super) fn factors(params: &LoraParams) -> Result<String> {
     let mut ordered = params.iter().collect::<Vec<_>>();
-    ordered.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    ordered.sort_unstable_by_key(|(a, _)| *a);
     digest(ordered.into_iter().map(|(_, v)| v.clone()))
 }
 pub(super) fn gradients(probe: &RunProbe, grads: &LoraParams) -> Result<()> {

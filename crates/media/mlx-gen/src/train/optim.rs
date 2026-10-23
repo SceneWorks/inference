@@ -413,7 +413,7 @@ impl Prodigy {
         let mut d_denom = c(0.0);
         // Coupled sums must not depend on a fresh HashMap seed after checkpoint restore.
         let mut ordered: Vec<_> = grads.iter().collect();
-        ordered.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        ordered.sort_unstable_by_key(|(a, _)| *a);
         for (k, g) in ordered {
             let Some(p) = params.get(k) else { continue };
             // `Array::zeros` is fallible, so build the initial state with `?` rather than `.unwrap()`
