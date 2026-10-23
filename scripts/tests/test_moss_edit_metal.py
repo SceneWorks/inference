@@ -707,3 +707,106 @@ class ScratchFreshnessTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CapacityRootFirstTests(unittest.TestCase):
+    def model(self, out, mode):
+        fixture = PreparationCapacityTests('test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts')
+        self.addCleanup(fixture.doCleanups)
+        env, clock, launches, signals, processes = fixture.context(out, [30, 30, 30, 29, 30, 30, 30])
+        child = [True]; pending = [None]; observations = []; armed = [False]
+        original_launch = gate.subprocess.Popen.side_effect
+        original_capacity = gate.capacity.side_effect
+        def launch(*args, **kwargs):
+            process = original_launch(*args, **kwargs)
+            if len(launches) == 1:
+                def poll():
+                    if pending[0] is not None and clock[0] >= pending[0][0]:
+                        process.code = pending[0][1]; pending[0] = None
+                    return process.code
+                process.poll = poll
+                if mode == 'compiler': process.code = 101
+            return process
+        def capacity(*args, **kwargs):
+            try: return original_capacity(*args, **kwargs)
+            except gate.CapacityUnavailable:
+                armed[0] = True
+                if mode == 'external': processes[0].code = -gate.signal.SIGTERM
+                raise
+        def rows(*_args):
+            current = []
+            if processes:
+                root = processes[0]; root.poll()
+                if child[0]: current.append((100, root.pid if root.code is None else 1, root.pid, 'child-birth', '/make'))
+                if root.code is None:
+                    birth = 'reused-birth' if armed[0] and mode == 'reused' else 'owned-birth'
+                    current.append((root.pid, 1, root.pid, birth, '/cargo'))
+            return current + [(777, 1, 777, 'foreign-birth', '/foreign')]
+        def kill(pid, sig):
+            root = processes[0]; observations.append((pid, sig, root.poll(), clock[0]))
+            self.assertNotEqual(pid, 777)
+            if pid == root.pid:
+                if mode == 'lookup':
+                    root.code = -gate.signal.SIGTERM
+                    raise ProcessLookupError('inert root vanished before signal')
+                self.assertNotEqual(mode, 'reused', 'reused root must never be signalled')
+                signals.append((pid, sig))
+                if mode == 'ignored' or (mode == 'kill-needed' and sig == gate.signal.SIGTERM): return
+                pending[0] = (clock[0] + .2, 101 if mode == 'positive' else -sig)
+            elif pid == 100:
+                signals.append((pid, sig))
+                if mode != 'child-stuck': child[0] = False
+                # Model the real race: an interrupted child makes still-running Cargo fail.
+                if root.poll() is None: root.code = 101; pending[0] = None
+            else: self.fail('unowned signal')
+        self.enterContext(patch.object(gate.subprocess, 'Popen', side_effect=launch))
+        self.enterContext(patch.object(gate, 'capacity', side_effect=capacity))
+        self.enterContext(patch.object(gate, 'rows', side_effect=rows))
+        self.enterContext(patch.object(gate.os, 'kill', side_effect=kill))
+        return env, clock, launches, signals, processes, observations
+
+    def test_low_pid_child_high_pid_root_waits_for_asynchronous_negative_exit_before_drain(self):
+        for mode in ('term', 'kill-needed'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); env, clock, launches, signals, processes, observations = self.model(out, mode)
+                self.assertEqual(gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200), 'attempt 2')
+                self.assertEqual(len(launches), 2)
+                self.assertEqual(observations[0][:3], (900, gate.signal.SIGTERM, None))
+                child_signals = [row for row in observations if row[0] == 100]
+                self.assertEqual(len(child_signals), 1)
+                expected = -gate.signal.SIGKILL if mode == 'kill-needed' else -gate.signal.SIGTERM
+                self.assertEqual(child_signals[0][2], expected)
+                self.assertGreaterEqual(child_signals[0][3] - observations[0][3], .2)
+                receipt = gate.read(out / 'compile-001-process.json')
+                self.assertTrue(receipt['capacityRootExit']['confirmed'])
+                self.assertEqual(receipt['exitCode'], expected); self.assertEqual(receipt['remaining'], [])
+                self.assertTrue((out / 'compile-001-scratch-quarantine.json').is_file())
+
+    def test_positive_external_reused_unsignalled_and_incomplete_cleanup_never_retry(self):
+        for mode in ('compiler', 'external', 'reused', 'lookup', 'positive', 'ignored', 'child-stuck'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); env, clock, launches, signals, processes, observations = self.model(out, mode)
+                with self.assertRaises(ValueError):
+                    gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+                self.assertEqual(len(launches), 1)
+                self.assertFalse((out / 'compile-001-scratch-quarantine.json').exists())
+                receipt = gate.read(out / 'compile-001-process.json')
+                if mode not in ('compiler', 'child-stuck'):
+                    self.assertFalse(receipt.get('capacityRootExit', {}).get('confirmed', False))
+                if mode in ('reused', 'external', 'compiler'):
+                    self.assertFalse(any(pid == 900 for pid, sig in signals))
+
+    def test_root_and_descendant_drain_share_unchanged_absolute_cleanup_reserve(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes, observations = self.model(out, 'child-stuck')
+            def monitor(_owned):
+                clock[0] = 90
+                raise gate.CapacityUnavailable('memory', {})
+            with self.assertRaisesRegex(ValueError, 'owned cleanup incomplete'):
+                gate.run_owned(['inert'], env, out, 'bounded', 90, monitor=monitor, absolute_deadline=100)
+            self.assertLessEqual(clock[0], 100)
+            self.assertEqual(observations[0][0], 900)
+            receipt = gate.read(out / 'bounded-process.json')
+            self.assertTrue(receipt['capacityRootExit']['confirmed'])
+            self.assertEqual(receipt['workDeadline'], 90)
+            self.assertEqual(receipt['remaining'], [[100, 'child-birth']])

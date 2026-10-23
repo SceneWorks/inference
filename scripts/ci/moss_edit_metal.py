@@ -220,11 +220,13 @@ def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None, a
         receipt['pid'] = process.pid; receipt['launched'] = True
         def observe(limit=None):
             current = rows(limit) if limit is not None else rows()
-            owned = {process.pid} if process.poll() is None else set()
+            root_birth = observed.get(str(process.pid), {}).get('birth')
+            root_matches = root_birth is None or any(pid == process.pid and birth == root_birth for pid, parent, group, birth, comm in current)
+            owned = {process.pid} if process.poll() is None and root_matches else set()
             for pid, parent, group, birth, comm in current:
                 if observed.get(str(pid), {}).get('birth') == birth: owned.add(pid)
             while True:
-                children = {pid for pid, parent, group, birth, comm in current if parent in owned or (owned and group == process.pid)}
+                children = {pid for pid, parent, group, birth, comm in current if (parent in owned or (owned and group == process.pid)) and (str(pid) not in observed or observed[str(pid)]['birth'] == birth)}
                 if children <= owned: break
                 owned |= children
             living = []
@@ -233,6 +235,30 @@ def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None, a
                     observed[str(pid)] = {'birth': birth, 'comm': comm, 'pgid': group}; living.append((pid, birth))
             return living
         def cleanup():
+            if receipt.get('capacityInterrupted'):
+                # Killing a low-PID make/clang child first can make Cargo exit101
+                # before its TERM arrives. Confirm the root's signal exit before
+                # descendants; three seconds plus their six fit the ten-second reserve.
+                root_birth = observed.get(str(process.pid), {}).get('birth')
+                root_signal = None
+                for sig, seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
+                    observe(absolute_deadline)  # retain descendants before the root exits
+                    current = rows(absolute_deadline) if absolute_deadline is not None else rows()
+                    if process.poll() is not None: break
+                    if root_birth is None or not any(pid == process.pid and birth == root_birth for pid, parent, group, birth, comm in current): break
+                    if absolute_deadline is not None: operation_timeout(1, absolute_deadline)
+                    try: os.kill(process.pid, sig)
+                    except ProcessLookupError: break
+                    else:
+                        root_signal = sig
+                        receipt['sentSignals'].append({'pid': process.pid, 'birth': root_birth, 'signal': int(sig)})
+                    until = time.monotonic() + seconds
+                    if absolute_deadline is not None: until = min(until, absolute_deadline)
+                    while process.poll() is None and time.monotonic() < until:
+                        observe(absolute_deadline)
+                        time.sleep(max(0, min(.1, until - time.monotonic())))
+                root_exit = process.poll()
+                receipt['capacityRootExit'] = {'birth': root_birth, 'signal': int(root_signal) if root_signal is not None else None, 'exitCode': root_exit, 'confirmed': root_exit in (-signal.SIGTERM, -signal.SIGKILL) and any(row['pid'] == process.pid and row['birth'] == root_birth and row['signal'] == -root_exit for row in receipt['sentSignals'])}
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 living = observe(absolute_deadline)
                 if not living: return
@@ -542,7 +568,7 @@ def prepare_compile(out, env, source, runtime, deadline):
             receipt = read(out / (label + '-process.json'))
             require(receipt.get('capacityUnavailable') and receipt['remaining'] == [], 'capacity interruption lacks complete owned cleanup')
             sent_root_signal = any(row['pid'] == receipt.get('pid') and row['birth'] == receipt.get('observed', {}).get(str(receipt.get('pid')), {}).get('birth') and row['signal'] == -receipt.get('exitCode', 0) for row in receipt.get('sentSignals', []))
-            require((receipt.get('launched') is False and receipt['exitCode'] is None) or (receipt.get('capacityInterrupted') is True and sent_root_signal and receipt['exitCode'] in (-signal.SIGTERM, -signal.SIGKILL)), 'not a controller-initiated capacity interruption')
+            require((receipt.get('launched') is False and receipt['exitCode'] is None) or (receipt.get('capacityInterrupted') is True and receipt.get('capacityRootExit', {}).get('confirmed') is True and sent_root_signal and receipt['exitCode'] in (-signal.SIGTERM, -signal.SIGKILL)), 'not a controller-initiated capacity interruption')
             state('owned-drained', attempt=attempt, receipt=label + '-process.json')
             if receipt.get('launched') is not False:
                 revalidate()
