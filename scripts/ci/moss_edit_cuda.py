@@ -358,8 +358,8 @@ def main():
     require(len(raw.encode('utf-8')) <= 48 * 1024, 'reservation JSON exceeded bound')
     lease = json.loads(raw, object_pairs_hook=unique_fields)
     validate_reservation(lease, env, utc())
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip() == lease['source'], 'checkout mismatch')
-    require(not subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True).strip(), 'dirty source')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, encoding='utf-8').strip() == lease['source'], 'checkout mismatch')
+    require(not subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True, encoding='utf-8').strip(), 'dirty source')
     out = Path(env['RUNNER_TEMP']).resolve() / f"moss-edit-{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
     out.mkdir(exist_ok=False)
     receipt = {'source': lease['source'], 'reservation': lease, 'completed': False, 'passed': False}

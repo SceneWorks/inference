@@ -73,8 +73,8 @@ class DependencyCiPolicyTests(unittest.TestCase):
         self.assertNotIn("needs", job)
         self.assertEqual(
             job.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
-            "dependency policy stays unconditional for verification events; only metadata dispatch skips",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')",
+            "dependency policy stays unconditional for verification events; only explicitly isolated manual dispatches skip",
         )
         self.assertNotIn("continue-on-error", job)
         self.assertNotIn("supply_chain", jobs["changes"]["outputs"])

@@ -152,7 +152,7 @@ class OrchestrationTests(unittest.TestCase):
             record = evidence(self.spec)
             if self.bad_admission: record['errors'] = ['query failed']
             if label.endswith('-refresh'): record = final_record(record)
-            (directory / 'evidence.json').write_text(json.dumps(record))
+            (directory / 'evidence.json').write_text(json.dumps(record), encoding='utf-8')
             if self.mutate_arm and label == self.mutate_arm + '-refresh':
                 (self.target / (gate.MOSS + '.exe')).write_bytes(b'tampered')
             return 0, ''
@@ -193,7 +193,7 @@ class OrchestrationTests(unittest.TestCase):
         self.fail_arm = 'edit-tests'
         with self.assertRaisesRegex(ValueError, 'numerical arms failed'): self.run_gate()
         self.assertEqual(len([x for x, _, _ in self.calls if x.endswith('-tests')]), 3)
-        self.assertFalse(json.loads((self.out / 'results.json').read_text())[0]['passed'])
+        self.assertFalse(json.loads((self.out / 'results.json').read_text(encoding='utf-8'))[0]['passed'])
         self.assertFalse(gate.successful_cases(0, 'test result: ok. 0 passed; 0 failed; 0 ignored;', {'expected'}))
         self.assertFalse(gate.successful_cases(0, 'test result: ok. 1 passed; 0 failed; 1 ignored;', {'expected'}))
 
@@ -233,13 +233,13 @@ class OwnershipTests(unittest.TestCase):
                 self.assertEqual(events[:2], ['suspended-spawn', 'assign']); self.assertEqual(events[-1], 'close')
                 self.assertEqual('owned-job-terminate' in events, mode in ('timeout', 'leftover'))
                 self.assertEqual('child-kill' in events, mode == 'assign-failure')
-                receipt = json.loads((Path(directory)/'case.owned.json').read_text())
+                receipt = json.loads((Path(directory)/'case.owned.json').read_text(encoding='utf-8'))
                 self.assertEqual(receipt['remainingOwnedPids'], [])
 
 
 class WorkflowTests(unittest.TestCase):
     def test_dedicated_manual_graph_and_owned_target_preserve_device_boundary(self):
-        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text())
+        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
         job = workflow['jobs']['moss-edit-cuda']
         self.assertIn("github.event_name == 'workflow_dispatch'", job['if'])
         self.assertIn("inputs.lanes == 'moss-edit-cuda'", job['if'])
@@ -258,7 +258,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_new_selector_isolates_job_with_explicit_sibling_guards(self):
         from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
-        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text())
+        workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
         for selected in (True, False):
             for fork in (True, False):
                 for tag in (True, False):
@@ -277,7 +277,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('moss-edit-cuda', selected_jobs(mutant, 'workflow_dispatch', 'windows-gpu-diagnostic'))
 
     def test_final_snapshot_is_not_full_telemetry_and_uses_existing_queries(self):
-        script = (gate.ROOT/'scripts/ci/windows-gpu1-diagnostic.ps1').read_text()
+        script = (gate.ROOT/'scripts/ci/windows-gpu1-diagnostic.ps1').read_text(encoding='utf-8')
         branch = script.split('if ($PreviousEvidencePath) {', 1)[1].split("try {\n    $identity = Identity", 1)[0]
         for token in ("'identity-census-only'", 'Identity \'1\'', 'Census $identity.uuid.Trim()', 'Process-Identity $ids', "'finalSnapshotComplete'", '$previous.telemetryComplete', '$previous.samples.Count -ne 3'):
             self.assertIn(token, branch)
