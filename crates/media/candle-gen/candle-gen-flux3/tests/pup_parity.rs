@@ -1,4 +1,4 @@
-//! The same four frozen upstream prompt-upsampler fixtures through the real native Candle VLM.
+//! Frozen Torch CPU/F32 numerical parity and separate build-selected native PUP behavior.
 
 use candle_gen::gen_core::core_llm::{self, Channel, StreamEvent};
 use candle_gen::gen_core::flux3::pup::{self, PromptUpsampler, UpsampleOptions, UpsamplePlan};
@@ -87,7 +87,24 @@ fn content_projection(up: &Flux3PromptUpsampler, raw: &[i32], margins: &[f32]) -
     visible
 }
 
-fn native_case(case: &str) {
+fn native_cpu_f32_case(case: &str) {
+    // The frozen decoder IDs/margins were computed in Torch F32 on CPU. The native loader
+    // normally selects BF16 on CUDA/Metal; those margins cannot certify its argmax. Use the
+    // existing device override in a child process, never mutate process-global env around a
+    // load. The separate default-backend test below still executes all four native modes.
+    if std::env::var("CANDLE_LLM_DEVICE").as_deref() != Ok("cpu") {
+        let name = std::thread::current().name().unwrap().to_owned();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("CANDLE_LLM_DEVICE", "cpu")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{case}: native Torch CPU/F32 oracle parity"
+        );
+        return;
+    }
     let up = Flux3PromptUpsampler::load(&fixtures().join("tiny-pup-snapshot")).unwrap();
     let golden = fixture("flux3_pup_golden.safetensors");
     assert_eq!(golden.meta("pup_revision"), pup::UPSAMPLER_REVISION);
@@ -121,8 +138,8 @@ fn native_case(case: &str) {
     );
     let expected = host_i32(golden.require(&format!("generated_{case}")));
     let margins = host_f32(golden.require(&format!("margins_{case}")));
-    // Identical oracle policy to the MLX twin: never accept a wide-margin argmax mismatch,
-    // and never call a wholly divergent trajectory parity. No tolerance widened for Candle.
+    // Keep the frozen F32 oracle's existing margin and minimum-prefix requirements. This is
+    // numerical evidence for the CPU/F32 loader only, not for the build's GPU arithmetic.
     let mut matched = 0;
     let visible = content_projection(&up, &expected, &margins);
     for (i, &(want, margin)) in visible.iter().enumerate() {
@@ -207,18 +224,96 @@ fn projection_keeps_ordinary_caption_and_locked_box_tokens() {
 }
 
 #[test]
-fn native_text_matches_the_shared_oracle() {
-    native_case("t2i");
+fn native_cpu_f32_text_matches_the_shared_oracle() {
+    native_cpu_f32_case("t2i");
 }
 #[test]
-fn native_text_with_boxes_matches_the_shared_oracle() {
-    native_case("t2i_bbox");
+fn native_cpu_f32_text_with_boxes_matches_the_shared_oracle() {
+    native_cpu_f32_case("t2i_bbox");
 }
 #[test]
-fn native_edit_matches_the_shared_oracle() {
-    native_case("i2i");
+fn native_cpu_f32_edit_matches_the_shared_oracle() {
+    native_cpu_f32_case("i2i");
 }
 #[test]
-fn native_edit_with_boxes_matches_the_shared_oracle() {
-    native_case("i2i_bbox");
+fn native_cpu_f32_edit_with_boxes_matches_the_shared_oracle() {
+    native_cpu_f32_case("i2i_bbox");
+}
+
+#[test]
+fn default_backend_executes_all_modes_with_ordered_references_and_locked_boxes() {
+    // Intentionally no CPU override here: a CUDA build runs the real BF16 native VLM. Its
+    // behavior is checked without treating a different backend's token margins as a golden.
+    let up = Flux3PromptUpsampler::load(&fixtures().join("tiny-pup-snapshot")).unwrap();
+    let golden = fixture("flux3_pup_golden.safetensors");
+    for case in ["t2i", "t2i_bbox", "i2i", "i2i_bbox"] {
+        let plan = plan_for(&up, &golden, case);
+        assert_eq!(
+            up.package().render(&plan).unwrap(),
+            golden.meta(&format!("chat_text_{case}"))
+        );
+        let request = plan.request(&UpsampleOptions::default(), core_llm::CancelFlag::new());
+        for (content, expected) in request.messages[1].content.iter().zip(&plan.references) {
+            match content {
+                core_llm::Content::Image(image) => assert_eq!(image, expected, "{case}: ref order"),
+                other => panic!("{case}: reference replaced by {other:?}"),
+            }
+        }
+        assert_eq!(request.messages[1].content.len(), plan.references.len() + 1);
+        let output = up.engine().generate(&request, &mut |_| {}).unwrap();
+        assert_eq!(
+            output.usage.prompt_tokens as usize,
+            host_i32(golden.require(&format!("ids_{case}"))).len(),
+            "{case}: native prompt/reference tokenization"
+        );
+        assert!(
+            output.usage.generated_tokens > 0,
+            "{case}: native decode ran"
+        );
+        assert!(output.usage.generated_tokens <= plan.max_new_tokens);
+        assert!(matches!(
+            output.finish_reason,
+            Some(core_llm::FinishReason::Stop | core_llm::FinishReason::Length)
+        ));
+        let mut progress = Vec::new();
+        let raw = up
+            .generate(
+                &plan,
+                &UpsampleOptions::default(),
+                &candle_gen::gen_core::CancelFlag::new(),
+                &mut |event| match event {
+                    candle_gen::gen_core::Progress::Upsampling { tokens, max_tokens } => {
+                        assert_eq!(max_tokens, plan.max_new_tokens);
+                        progress.push(tokens);
+                    }
+                    other => panic!("{case}: unexpected progress {other:?}"),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            raw, output.text,
+            "{case}: deterministic greedy adapter decode"
+        );
+        assert!(
+            progress.len() > 1,
+            "{case}: content tokens reached the adapter"
+        );
+        assert!(progress.iter().copied().eq(0..progress.len() as u32));
+        let finished = plan.finish(&raw).unwrap();
+        assert!(!finished.caption.trim().is_empty());
+        assert_eq!(finished.report.original_prompt, plan.original_prompt);
+        assert_eq!(finished.report.effective_prompt, finished.caption);
+        if let Some(locked) = &plan.locked {
+            let (_, recovered) = pup::detect(&finished.caption).expect("locked boxes survive");
+            assert_eq!(&recovered, locked, "{case}: exact locked rows and order");
+        }
+        let canceled = candle_gen::gen_core::CancelFlag::new();
+        canceled.cancel();
+        assert!(matches!(
+            up.generate(&plan, &UpsampleOptions::default(), &canceled, &mut |_| {
+                panic!("{case}: pre-canceled adapter must not decode")
+            }),
+            Err(candle_gen::gen_core::Error::Canceled)
+        ));
+    }
 }
