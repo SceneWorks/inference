@@ -1,5 +1,5 @@
 # Evidence collection only. No idle verdict, process signals, CUDA or D3D device creation.
-param([Parameter(Mandatory = $true)][string]$OutputDirectory)
+param([Parameter(Mandatory = $true)][string]$OutputDirectory, [string]$PreviousEvidencePath)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = [IO.Path]::GetFullPath($OutputDirectory)
@@ -169,6 +169,32 @@ function Read-Mapped-Counters([string]$Luid, [int]$Count, [bool]$ValidateValues)
         } catch { $issues.Add("Mapped counter incomplete: $counter; $($_.Exception.Message)") }
     }
     return $result
+}
+# Runtime launcher only: fresh device/census/CIM check after a complete collector run.
+# This is explicitly not another complete counter observation or an admission verdict.
+if ($PreviousEvidencePath) {
+    $record['snapshotKind'] = 'identity-census-only'
+    $record['finalSnapshotComplete'] = $false
+    try {
+        $previousPath = [IO.Path]::GetFullPath($PreviousEvidencePath)
+        if (-not $previousPath.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or (Get-Item -LiteralPath $previousPath).Length -gt 4MB) { throw 'Previous evidence path or bound invalid' }
+        $previous = [IO.File]::ReadAllText($previousPath) | ConvertFrom-Json
+        if (-not $previous.completed -or -not $previous.collectionComplete -or -not $previous.telemetryComplete -or $previous.evidenceTruncated -or $previous.samples.Count -ne 3 -or $previous.source -ne $env:GITHUB_SHA -or $previous.host -ne [Environment]::MachineName) { throw 'Previous full evidence incomplete or foreign' }
+        $identity = Identity '1'
+        $record['identity'] = $identity
+        if ($identity.uuid.Trim() -ne $previous.identity.uuid.Trim() -or $identity.pci.Trim() -ne $previous.identity.pci.Trim()) { throw 'GPU1 identity changed after collection' }
+        $census = @(Census $identity.uuid.Trim())
+        $record['processes'] = $census
+        $ids = @(@($census | ForEach-Object { $_.pid }) + @($previous.samples[-1].identitiesAfter | ForEach-Object { $_.pid }) | Sort-Object -Unique)
+        if ($ids.Count -gt 256) { throw 'Final identity cohort exceeded bound' }
+        $record['identities'] = @(Process-Identity $ids)
+        $record['finalSnapshotComplete'] = ($issues.Count -eq 0)
+    } catch { $issues.Add('Final identity snapshot incomplete'); $record['error'] = $_.Exception.Message }
+    $record.completed = $true
+    $record['completedUtc'] = [DateTime]::UtcNow.ToString('o')
+    if (-not (Save-Record)) { exit 1 }
+    if ($issues.Count -ne 0) { exit 1 }
+    exit 0
 }
 if (-not (Save-Record)) { exit 1 }
 try {

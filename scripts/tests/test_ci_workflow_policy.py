@@ -4147,7 +4147,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4264,8 +4264,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             changes.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
-            "topology remains unconditional except the explicit metadata-only dispatch",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')",
+            "topology remains unconditional except explicitly isolated manual dispatches",
         )
         for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
             for lane in ("all", "windows-cuda", ""):
@@ -4319,7 +4319,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # check -- so the gate would report green on exactly the runs it exists to block.
         self.assertEqual(
             gate["if"],
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (always())",
         )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))

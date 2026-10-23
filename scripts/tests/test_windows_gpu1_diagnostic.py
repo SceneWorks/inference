@@ -29,6 +29,7 @@ def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False
         'github.event.pull_request.head.repo.full_name': 'foreign/repo' if fork else 'SceneWorks/inference',
         'github.repository': 'SceneWorks/inference',
         'github.event_name': event,
+        'github.run_attempt': 1,
         'github.ref': 'refs/tags/runtime-test' if tag else 'refs/heads/story/test',
         'inputs.lanes': lane,
     }
@@ -190,7 +191,7 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
     def test_isolation_detects_each_missing_sibling_guard(self):
         guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')"
         for name, job in self.workflow['jobs'].items():
-            if name == LANE:
+            if name in (LANE, 'moss-edit-cuda'):
                 continue
             with self.subTest(job=name):
                 self.assertTrue(job['if'].startswith(guard))
@@ -423,7 +424,7 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertIn('Move-Item -LiteralPath $pending', save)
         self.assertNotIn('throw', save)
         self.assertNotIn('Set-Content', save)
-        self.assertEqual(script.count('if (-not (Save-Record)) { exit 1 }'), 3)
+        self.assertEqual(script.count('if (-not (Save-Record)) { exit 1 }'), 4)
         self.assertNotRegex(script, r'(?m)^\s*Save-Record\s*$')
         self.assertLess(save.index('Move-Item -LiteralPath $pending'), save.index('return $withinBudget'))
 
