@@ -85,7 +85,7 @@ pub(super) fn load_complete(
             "MOSS pending gradient population differs".into(),
         ));
     }
-    let mut gradients = GradStore::new();
+    let mut gradients = GradStore::default();
     for (name, var) in &named {
         if state.accumulated_tokens > 0 {
             let value = pending

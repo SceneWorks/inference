@@ -188,7 +188,20 @@ fn transformer() -> Result<Tensors> {
     }
     Ok(map)
 }
-fn write_tensors(path: &Path, tensors: Tensors) -> Result<u64> {
+fn bf16_bytes(value: f32) -> Result<[u8; 2]> {
+    if !value.is_finite() {
+        return Err(Error::Msg("nonfinite synthetic BF16 source".into()));
+    }
+    // IEEE round-to-nearest, ties-to-even. The ordinary source ABI is BF16 even when
+    // the selected trainer later casts the frozen backbone to FP32 compute.
+    let bits = value.to_bits();
+    let rounded = (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+    if rounded & 0x7f80 == 0x7f80 {
+        return Err(Error::Msg("synthetic BF16 source overflow".into()));
+    }
+    Ok(rounded.to_le_bytes())
+}
+fn write_tensors(path: &Path, tensors: Tensors, transformer: bool) -> Result<u64> {
     let mut header = BTreeMap::<String, Value>::new();
     let mut bytes = Vec::new();
     header.insert("__metadata__".into(),json!({"fixture_identity":"sceneworks-synthetic-moss-full-pipeline-v1","not_published_weights":"true"}));
@@ -202,12 +215,17 @@ fn write_tensors(path: &Path, tensors: Tensors) -> Result<u64> {
             return Err(Error::Msg("invalid fixture shape/value population".into()));
         }
         let start = bytes.len();
+        let bf16 = transformer && name != "rope.bands";
         for value in &tensor.values {
-            bytes.extend(value.to_le_bytes());
+            if bf16 {
+                bytes.extend(bf16_bytes(*value)?);
+            } else {
+                bytes.extend(value.to_le_bytes());
+            }
         }
         header.insert(
             name.clone(),
-            json!({"dtype":"F32","shape":tensor.shape,"data_offsets":[start,bytes.len()]}),
+            json!({"dtype":if bf16 { "BF16" } else { "F32" },"shape":tensor.shape,"data_offsets":[start,bytes.len()]}),
         );
     }
     let mut json = serde_json::to_vec(&header).map_err(|e| Error::Msg(e.to_string()))?;
@@ -225,15 +243,102 @@ fn write_tensors(path: &Path, tensors: Tensors) -> Result<u64> {
     fs::write(path, &file)?;
     let actual = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
     if actual.len() != tensors.len()
-        || actual
-            .iter()
-            .any(|h| tensors.get(&h.name).is_none_or(|t| h.shape != t.shape))
+        || actual.iter().any(|h| {
+            let expected_dtype = if transformer && h.name != "rope.bands" {
+                gen_core::weightsmeta::Dtype::BF16
+            } else {
+                gen_core::weightsmeta::Dtype::F32
+            };
+            tensors.get(&h.name).is_none_or(|t| h.shape != t.shape) || h.dtype != expected_dtype
+        })
     {
         return Err(Error::Msg(
             "written fixture header differs from generated tensor schema".into(),
         ));
     }
     Ok(file.len() as u64)
+}
+
+/// Executed by every real fixture constructor, including the hosted header-demand test.
+/// Expected bit patterns are literal IEEE cases, independent of the converter under test.
+fn validate_source_serialization(root: &Path) -> Result<()> {
+    let cases: [(u32, u16); 13] = [
+        (0x0000_0000, 0x0000),
+        (0x8000_0000, 0x8000),
+        (0x3f80_0000, 0x3f80),
+        (0x3f80_8000, 0x3f80),
+        (0x3f81_8000, 0x3f82),
+        (0xbf80_8000, 0xbf80),
+        (0x0001_0000, 0x0001),
+        (0x0000_0001, 0x0000),
+        (0x8000_0001, 0x8000),
+        (0x0000_8000, 0x0000),
+        (0x0000_8001, 0x0001),
+        (0x0080_0000, 0x0080),
+        (0x7f7f_0000, 0x7f7f),
+    ];
+    for (bits, expected) in cases {
+        assert_eq!(bf16_bytes(f32::from_bits(bits))?, expected.to_le_bytes());
+    }
+    for bits in [
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_0000,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x7f7f_8000,
+    ] {
+        assert!(
+            bf16_bytes(f32::from_bits(bits)).is_err(),
+            "nonfinite/finite overflow must refuse"
+        );
+    }
+    let path = root.join("source-abi-probe.safetensors");
+    let tensors = BTreeMap::from([
+        (
+            "fixture.weight".into(),
+            HostTensor {
+                shape: vec![cases.len()],
+                values: cases
+                    .iter()
+                    .map(|&(bits, _)| f32::from_bits(bits))
+                    .collect(),
+            },
+        ),
+        (
+            "rope.bands".into(),
+            HostTensor {
+                shape: vec![1],
+                values: vec![f32::from_bits(0x3f80_8000)],
+            },
+        ),
+    ]);
+    write_tensors(&path, tensors, true)?;
+    let raw = fs::read(&path)?;
+    let length = u64::from_le_bytes(raw[..8].try_into().expect("generated header length")) as usize;
+    let header: Value =
+        serde_json::from_slice(&raw[8..8 + length]).map_err(|e| Error::Msg(e.to_string()))?;
+    assert_eq!(header["fixture.weight"]["dtype"], "BF16");
+    assert_eq!(header["fixture.weight"]["shape"], json!([cases.len()]));
+    assert_eq!(
+        header["fixture.weight"]["data_offsets"],
+        json!([0, cases.len() * 2])
+    );
+    assert_eq!(header["rope.bands"]["dtype"], "F32");
+    assert_eq!(header["rope.bands"]["shape"], json!([1]));
+    assert_eq!(
+        header["rope.bands"]["data_offsets"],
+        json!([cases.len() * 2, cases.len() * 2 + 4])
+    );
+    let expected: Vec<u8> = cases
+        .iter()
+        .flat_map(|&(_, bits)| bits.to_le_bytes())
+        .collect();
+    let payload = &raw[8 + length..];
+    assert_eq!(&payload[..expected.len()], expected.as_slice());
+    assert_eq!(&payload[expected.len()..], &0x3f80_8000_u32.to_le_bytes());
+    fs::remove_file(path)?; // Only this constructor-owned probe in its newly created scratch root.
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +354,7 @@ impl Fixture {
     /// The caller supplies a new path inside its own scratch/TempDir. Existing data is never removed.
     pub fn create(root: &Path) -> Result<Self> {
         fs::create_dir(root)?;
+        validate_source_serialization(root)?;
         let config = gen_core::moss_image::MossImageConfig {
             dim: 16,
             ffn_dim: 24,
@@ -264,7 +370,8 @@ impl Fixture {
             ("text_encoder/model.safetensors", text()),
             ("vae/diffusion_pytorch_model.safetensors", vae()),
         ] {
-            tensor_file_bytes += write_tensors(&root.join(name), tensors)?;
+            tensor_file_bytes +=
+                write_tensors(&root.join(name), tensors, name.starts_with("transformer/"))?;
         }
         let qwen = json!({"text_config":{"model_type":"qwen3_5_text","hidden_size":32,"num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,"vocab_size":32,"rms_norm_eps":1e-6,"rope_theta":10000000.,"partial_rotary_factor":0.5,"max_position_embeddings":4096,"tie_word_embeddings":false,"full_attention_interval":1,"linear_num_value_heads":4,"linear_num_key_heads":2,"linear_key_head_dim":4,"linear_value_head_dim":4,"linear_conv_kernel_dim":4},"vision_config":{"model_type":"qwen3_5"}});
         fs::write(
@@ -810,4 +917,57 @@ pub fn assert_ragged_token_bounds(
         "public right-truncation limit remains 4096"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod source_abi_tests {
+    use super::*;
+    #[test]
+    fn bf16_source_rounding_is_finite_and_ties_to_even() {
+        for (value, bits) in [
+            (0.0, 0x0000_u16),
+            (-0.0, 0x8000),
+            (1.0, 0x3f80),
+            (1.00390625, 0x3f80),
+            (1.01171875, 0x3f82),
+            (-1.00390625, 0xbf80),
+        ] {
+            assert_eq!(bf16_bytes(value).unwrap(), bits.to_le_bytes());
+        }
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            -f32::MAX,
+        ] {
+            assert!(bf16_bytes(value).is_err());
+        }
+    }
+    #[test]
+    fn ordinary_transformer_source_is_bf16_except_rope_and_other_towers_stay_f32() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::create(&temp.path().join("fixture")).unwrap();
+        for relative in [
+            "transformer/model.safetensors",
+            "text_encoder/model.safetensors",
+            "vae/diffusion_pytorch_model.safetensors",
+        ] {
+            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(
+                &fixture.root.join(relative),
+            )
+            .unwrap();
+            assert!(!headers.is_empty());
+            for header in headers {
+                let expected =
+                    if relative.starts_with("transformer/") && header.name != "rope.bands" {
+                        gen_core::weightsmeta::Dtype::BF16
+                    } else {
+                        gen_core::weightsmeta::Dtype::F32
+                    };
+                assert_eq!(header.dtype, expected, "{relative}:{}", header.name);
+            }
+        }
+        fixture.verify().unwrap();
+    }
 }

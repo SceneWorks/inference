@@ -302,7 +302,7 @@ fn mask_and_cancellation_refuse_before_blocks() {
 pub(crate) fn synthetic_sources() -> Sources {
     Sources{variant:MossImageVariant::Sft,adapter_pins:vec![],selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
         text_config:candle_llm::models::qwen35::Qwen35Config::from_json(&serde_json::json!({"hidden_size":4096,"num_hidden_layers":2,"intermediate_size":24,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":32,"linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":8,"linear_value_head_dim":8})).unwrap(),
-        tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
+        tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{#[cfg(feature="test-support")] fixture_digest:None,pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
         spec:LoadSpec::new(WeightsSource::Dir("synthetic-unloaded-only".into()))}
 }
 fn synthetic_generator() -> MossImageGenerator {
