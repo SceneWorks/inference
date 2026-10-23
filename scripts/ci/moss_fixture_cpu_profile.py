@@ -35,6 +35,7 @@ CAUSAL_TESTS = {
         "transformer::review_fix_tests::all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward",
     ),
 }
+DIAGNOSTIC_BASELINES = ("training_memory::tests::audit_workspace_is_charged_in_checkpoint_and_host_domains",)
 FRACTION_TESTS = tuple("train::memory_budget_tests::" + name for name in (
     "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
     "fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback",
@@ -43,6 +44,10 @@ MASK_TESTS = tuple("train::subject_mask::tests::" + name for name in (
     "area_average_preserves_nonbinary_constants_and_convex_range",
     "area_average_partial_crop_matches_independent_integer_overlap_oracle",
     "area_average_f64_taps_keep_supported_host_scratch_layout"))
+SNAPSHOT_TESTS = (
+    "moss_training_probe::snapshot::tests::streamed_factor_deltas_match_independent_known_values_and_saved_scalars",
+    "moss_training_probe::snapshot::tests::streamed_reader_rejects_other_parent_layout_alpha_and_unadmitted_buffers",
+)
 TRAINING = "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs"
 MLX_MEMORY = "crates/media/mlx-gen/mlx-gen-moss-image/src/training_memory.rs"
 
@@ -165,16 +170,14 @@ def compile_binary(backend: str, path: Path) -> tuple[Path, dict]:
     return binary, record
 
 
-def contract_fraction_tests(directory: Path) -> dict:
-    package = "sceneworks-gen-core"
-    names = [*FRACTION_TESTS, *MASK_TESTS]
+def compiled_core_controls(directory: Path, package: str, lib_name: str, names: list[str], prefix: str, groups: dict) -> dict:
     argv = ["cargo", "test", "--locked", "--lib", "-j", "1", "-p", package,
             "--no-run", "--message-format=json"]
     stamp = fixture.source_stamp()
-    with (directory / "contract-compile.log").open("w", encoding="utf-8") as log:
+    with (directory / f"{prefix}-compile.log").open("w", encoding="utf-8") as log:
         result = subprocess.run(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=log,
                                 text=True, encoding="utf-8", timeout=2700)
-    cargo_log = directory / "contract.cargo.jsonl"
+    cargo_log = directory / f"{prefix}.cargo.jsonl"
     cargo_log.write_text(result.stdout, encoding="utf-8")
     if fixture.source_stamp() != stamp:
         raise UnitFailure("contract source changed during compilation")
@@ -183,20 +186,30 @@ def contract_fraction_tests(directory: Path) -> dict:
         if result.returncode != 101:
             raise UnitFailure("fraction compiler did not finish normally; independent readiness unknown")
         return {"passed": False, "compiler_exit": result.returncode, "source": stamp,
-                "groups": {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)},
+                "groups": groups,
                 "cargo_json_sha256": fixture.file_digest(cargo_log),
                 "tests": [{"test": name, "status": "blocked_compile"} for name in names]}
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
-    binary = fixture.select_binary(result.stdout, package, target, lib_name="gen_core")
-    listing = supervise([str(binary), "--list"], fixture.CpuOwner(), directory / "contract-unfiltered-list.log",
+    binary = fixture.select_binary(result.stdout, package, target, lib_name=lib_name)
+    listing = supervise([str(binary), "--list"], fixture.CpuOwner(), directory / f"{prefix}-unfiltered-list.log",
                         deadline=fixture.DEADLINE, rss_cap=fixture.RSS_CAP)
     if not all(name + ": test" in listing.splitlines() for name in names):
         raise UnitFailure("contract binary lacks exact fraction tests")
-    results = independent_tests(binary, names, directory, "fraction")
+    results = independent_tests(binary, names, directory, prefix)
     return {"tests": results, "passed": all(r["status"] == "passed" for r in results),
-            "groups": {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)},
+            "groups": groups,
             "source": fixture.source_stamp(), "binary_sha256": fixture.file_digest(binary),
             "cargo_json_sha256": fixture.file_digest(cargo_log)}
+
+
+def contract_fraction_tests(directory: Path) -> dict:
+    return compiled_core_controls(directory, "sceneworks-gen-core", "gen_core", [*FRACTION_TESTS, *MASK_TESTS],
+                                  "contract", {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)})
+
+
+def snapshot_reader_tests(directory: Path) -> dict:
+    return compiled_core_controls(directory, "sceneworks-gen-core-testkit", "gen_core_testkit", list(SNAPSHOT_TESTS),
+                                  "snapshot", {"streamed_reader_only": list(SNAPSHOT_TESTS)})
 
 
 def assertion_red(binary: Path, mutation: dict, log: Path) -> dict:
@@ -251,8 +264,8 @@ def run(backend: str, directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     evidence = {"backend": backend, "head": None, "passed": False,
                 "expected_fixture_tests": [fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES],
-                "expected_review_tests": sorted({m["test"] for m in mutations(backend)} | set(CAUSAL_TESTS[backend])),
-                "causal_controls": list(CAUSAL_TESTS[backend]), "mutations": []}
+                "expected_review_tests": sorted({m["test"] for m in mutations(backend)} | set(CAUSAL_TESTS[backend]) | set(DIAGNOSTIC_BASELINES)),
+                "causal_controls": list(CAUSAL_TESTS[backend]), "diagnostic_admission_controls":list(DIAGNOSTIC_BASELINES), "mutations": []}
     baseline = None
     try:
         evidence.update(venue(backend))
@@ -268,6 +281,7 @@ def run(backend: str, directory: Path) -> dict:
         validate_batch(batch, result.returncode, baseline)
         evidence["actual_demand"] = batch["actual_demand"]
         evidence["fraction_contract"] = contract_fraction_tests(directory)
+        evidence["snapshot_reader_controls"] = snapshot_reader_tests(directory)
         evidence["review_baselines"] = independent_tests(binary, evidence["expected_review_tests"], directory, "review-baseline")
         green_baselines = {r["test"] for r in evidence["review_baselines"] if r["status"] == "passed"}
         for mutation in mutations(backend):
@@ -301,6 +315,7 @@ def run(backend: str, directory: Path) -> dict:
                                            "red_compiler": red_record, "green_compiler": green_record,
                                            "red_resources": red_resources})
         evidence["passed"] = (batch["passed"] and evidence["fraction_contract"]["passed"]
+                              and evidence["snapshot_reader_controls"]["passed"]
                               and all(r["status"] == "passed" for r in evidence["review_baselines"])
                               and all(m["status"] == "killed_and_restored" for m in evidence["mutations"]))
     except BaseException as error:

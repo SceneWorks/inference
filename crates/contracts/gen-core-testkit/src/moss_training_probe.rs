@@ -1,11 +1,14 @@
 //! Small explicit native-training acceptance probe. No device/tensor dependency, global hooks,
 //! production request options, optimizer access, or training random-stream mutation.
+mod snapshot;
+pub use snapshot::{AdapterSnapshot, CheckpointObservation, FactorDelta};
+/// Existing admitted audit allowance, shared with native preparation and bounded file readers.
+pub const AUDIT_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 use gen_core::{Error, Result, TrainingItem, TrainingRequest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::Write,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -131,6 +134,16 @@ pub struct RunReceipt {
     pub memory_limit_bytes: Option<u64>,
     #[serde(default)]
     pub memory_limit_fraction: Option<f32>,
+    #[serde(default)]
+    pub run_start_adapter: Option<AdapterSnapshot>,
+    #[serde(default)]
+    pub final_adapter_path: Option<PathBuf>,
+    #[serde(default)]
+    pub final_native_path: Option<PathBuf>,
+    #[serde(default)]
+    pub final_parameter_delta: Option<FactorDelta>,
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointObservation>,
     pub cpu_reference: bool,
     pub evaluation_manifest: String,
     pub evaluation_before: Option<f32>,
@@ -161,6 +174,33 @@ pub struct TrainingProbe {
 pub struct RunProbe {
     owner: TrainingProbe,
     index: usize,
+}
+#[derive(Serialize)]
+struct EvaluationArtifact<'a> {
+    identity: &'a str,
+    width: u32,
+    height: u32,
+    noise_seed: u64,
+    sigma: f32,
+    caption: &'a str,
+    image_sha256: &'a [u8; 32],
+    mask_sha256: Option<&'a [u8; 32]>,
+}
+#[derive(Serialize)]
+struct ObservationArtifact<'a> {
+    version: &'static str,
+    source_head: Option<String>,
+    admitted_audit_workspace_bytes: u64,
+    evaluation: EvaluationArtifact<'a>,
+    receipts: &'a [RunReceipt],
+    generation: &'a Option<serde_json::Value>,
+    parameter_hash_changed: Vec<Option<bool>>,
+}
+#[derive(Serialize)]
+struct CheckpointArtifact<'a> {
+    source_head: Option<String>,
+    run_index: usize,
+    checkpoint: &'a CheckpointObservation,
 }
 impl TrainingProbe {
     pub fn new(evaluation: EvaluationManifest) -> Self {
@@ -203,30 +243,35 @@ impl TrainingProbe {
                 }
             })
             .collect();
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "version":"moss-cpu-training-observations-v1",
-            "source_head":std::env::var("GITHUB_SHA").ok(),
-            "evaluation":{
-                "identity":&self.evaluation.identity,
-                "width":self.evaluation.width,"height":self.evaluation.height,
-                "noise_seed":self.evaluation.noise_seed,"sigma":self.evaluation.sigma,
-                "caption":&self.evaluation.item.caption,
-                "image_sha256":self.evaluation.image_digest,
-                "mask_sha256":self.evaluation.mask_digest,
+        let generation = self
+            .generation
+            .lock()
+            .map_err(|_| Error::Msg("generation observation poisoned".into()))?;
+        let artifact = ObservationArtifact {
+            version: "moss-cpu-training-observations-v1",
+            source_head: std::env::var("GITHUB_SHA").ok(),
+            admitted_audit_workspace_bytes: AUDIT_WORKSPACE_BYTES,
+            evaluation: EvaluationArtifact {
+                identity: &self.evaluation.identity,
+                width: self.evaluation.width,
+                height: self.evaluation.height,
+                noise_seed: self.evaluation.noise_seed,
+                sigma: self.evaluation.sigma,
+                caption: &self.evaluation.item.caption,
+                image_sha256: &self.evaluation.image_digest,
+                mask_sha256: self.evaluation.mask_digest.as_ref(),
             },
-            "receipts":receipts,
-            "generation":&*self.generation.lock().map_err(|_| Error::Msg("generation observation poisoned".into()))?,
-            // Hash-observed changes, not an invented numeric norm of the parameter delta.
-            "parameter_hash_changed":parameter_delta,
-        }))
-        .map_err(|e| Error::Msg(e.to_string()))?;
+            receipts,
+            generation: &generation,
+            parameter_hash_changed: parameter_delta,
+        };
         let staging = path.with_extension("receipts.partial");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging)?;
         let result = (|| -> Result<()> {
-            file.write_all(&bytes)?;
+            serde_json::to_writer(&mut file, &artifact).map_err(|e| Error::Msg(e.to_string()))?;
             file.sync_all()?;
             std::fs::rename(&staging, path)?;
             Ok(())
@@ -255,7 +300,32 @@ impl TrainingProbe {
             index,
         })
     }
-    /// Observations from the existing real FP32 scale-one/zero generator witnesses, not pixels.
+    /// The actual native step-zero export of the completed uninterrupted run, never TrainingOutput.
+    pub fn initial_untrained_adapter(&self) -> Result<Option<AdapterSnapshot>> {
+        let receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| Error::Msg("training probe poisoned".into()))?;
+        let initial = receipts
+            .iter()
+            .find(|r| {
+                r.complete
+                    && r.microsteps.first() == Some(&1)
+                    && r.run_start_adapter
+                        .as_ref()
+                        .is_some_and(|s| s.start_step == 0)
+            })
+            .and_then(|r| r.run_start_adapter.clone());
+        if let Some(initial) = &initial {
+            if snapshot::hash_file(&initial.path)? != initial.sha256 {
+                return Err(Error::Unsupported(
+                    "initial diagnostic adapter changed".into(),
+                ));
+            }
+        }
+        Ok(initial)
+    }
+    /// Observations from real FP32 route-matched controls; presence/zero controls alone are not learning proof.
     /// This records diagnostics only; every original acceptance assertion remains in the caller.
     pub fn generation_observation(
         &self,
@@ -263,20 +333,15 @@ impl TrainingProbe {
         baseline: (&[usize; 4], &[f32]),
         trained: (&[usize; 4], &[f32]),
         disabled: (&[usize; 4], &[f32]),
-        adapter_applied: bool,
+        initial: Option<(&[usize; 4], &[f32], bool)>,
+        trained_adapter: (&std::path::Path, bool),
     ) -> Result<()> {
-        let compare = |values: &[f32]| {
-            let finite = baseline.1.iter().chain(values).all(|v| v.is_finite());
-            let nonzero = baseline
-                .1
-                .iter()
-                .zip(values)
-                .filter(|(a, b)| a != b)
-                .count();
-            let maximum = if finite && baseline.1.len() == values.len() && !values.is_empty() {
+        let compare = |reference: &[f32], values: &[f32]| {
+            let finite = reference.iter().chain(values).all(|v| v.is_finite());
+            let nonzero = reference.iter().zip(values).filter(|(a, b)| a != b).count();
+            let maximum = if finite && reference.len() == values.len() && !values.is_empty() {
                 Some(
-                    baseline
-                        .1
+                    reference
                         .iter()
                         .zip(values)
                         .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
@@ -288,14 +353,65 @@ impl TrainingProbe {
             serde_json::json!({"elements":values.len(),"finite":finite,
                 "nonzero_elements_in_overlap":nonzero,"max_abs_delta":maximum})
         };
+        let initial_export = self.initial_untrained_adapter()?;
+        let matched_binding = if self.artifact_path.is_some() {
+            let actual_sha = snapshot::hash_file(trained_adapter.0)?;
+            let all = self
+                .receipts
+                .lock()
+                .map_err(|_| Error::Msg("training probe poisoned".into()))?;
+            let (index, trained_run) = all
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.final_native_path.as_deref() == Some(trained_adapter.0))
+                .ok_or_else(|| {
+                    Error::Unsupported(
+                        "generation adapter is not an observed native TrainingOutput".into(),
+                    )
+                })?;
+            let start = trained_run
+                .run_start_adapter
+                .as_ref()
+                .ok_or_else(|| Error::Unsupported("trained adapter start export missing".into()))?;
+            let initial = initial_export
+                .as_ref()
+                .ok_or_else(|| Error::Unsupported("real untrained control missing".into()))?;
+            if initial.start_step != 0
+                || initial.layout_sha256 != start.layout_sha256
+                || initial.export_identity != start.export_identity
+                || trained_run.final_parameter_delta.as_ref().is_none_or(|d| {
+                    d.final_sha256 != actual_sha || d.layout_sha256 != initial.layout_sha256
+                })
+            {
+                return Err(Error::Unsupported(
+                    "generation control parent/source/layout/final export differs".into(),
+                ));
+            }
+            Some(
+                serde_json::json!({"trained_native_path":trained_adapter.0,"trained_export_sha256":actual_sha,
+                "matched_run_index":index,"matched_run_start_step":start.start_step,
+                "initial_factor_state_sha256":all.iter().find(|r|r.run_start_adapter.as_ref().is_some_and(|s|s.path==initial.path)).map(|r|&r.factor_before),
+                "trained_factor_state_sha256":&trained_run.factor_after,
+                "layout_sha256":&initial.layout_sha256,"export_identity":&initial.export_identity}),
+            )
+        } else {
+            None
+        };
         let observation = serde_json::json!({
             "request":{"prompt":&request.prompt,"width":request.width,"height":request.height,
                 "seed":request.seed,"steps":request.steps,"guidance":request.guidance,
                 "max_sequence_length":request.moss_image.as_ref().map(|m|m.max_sequence_length)},
             "baseline_shape":baseline.0,"baseline_elements":baseline.1.len(),
             "trained_shape":trained.0,"zero_strength_shape":disabled.0,
-            "trained":compare(trained.1),"zero_strength":compare(disabled.1),
-            "adapter_applied":adapter_applied,
+            "trained":compare(baseline.1,trained.1),"zero_strength":compare(baseline.1,disabled.1),
+            "route_matched_initial":initial.map(|(shape,values,applied)| serde_json::json!({
+                "shape":shape,"adapter_applied":applied,
+                "initial_vs_no_adapter":compare(baseline.1,values),
+                "trained_vs_initial":compare(values,trained.1),
+            })),
+            "initial_native_export":initial_export,
+            "native_export_binding":matched_binding,
+            "adapter_applied":trained_adapter.1,
         });
         // Same lock order as update/persist: receipts, then diagnostic generation metadata.
         let receipts = self
@@ -320,6 +436,156 @@ impl TrainingProbe {
     }
 }
 impl RunProbe {
+    fn artifact_target(&self, label: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = &self.owner.artifact_path else {
+            return Ok(None);
+        };
+        let stem = path
+            .file_stem()
+            .ok_or_else(|| Error::Msg("diagnostic artifact stem missing".into()))?
+            .to_string_lossy();
+        let target = path.with_file_name(format!("{stem}.run{}.{}.safetensors", self.index, label));
+        match std::fs::symlink_metadata(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(target)),
+            Err(e) => Err(e.into()),
+            Ok(_) => Err(Error::Unsupported(
+                "diagnostic target already exists; no overwrite".into(),
+            )),
+        }
+    }
+    pub fn run_start_export_target(&self) -> Result<Option<PathBuf>> {
+        self.artifact_target("native-start")
+    }
+    pub fn record_run_start_export(
+        &self,
+        path: &std::path::Path,
+        step: u32,
+        update: u32,
+        variant: gen_core::moss_image::MossImageVariant,
+    ) -> Result<()> {
+        let info = snapshot::inspect(path, step, update, AUDIT_WORKSPACE_BYTES)?;
+        let metadata: BTreeMap<_, _> = info.export_identity.iter().cloned().collect();
+        gen_core::moss_image_training::validate_metadata(variant, &metadata)?;
+        let request = self
+            .owner
+            .receipts
+            .lock()
+            .map_err(|_| Error::Msg("training probe poisoned".into()))?
+            .get(self.index)
+            .and_then(|r| r.request_identity.clone())
+            .ok_or_else(|| Error::Unsupported("native export request binding missing".into()))?;
+        if metadata.get("source_checkpoint_identity") != Some(&request.source_checkpoint)
+            || metadata.get("dataset_fingerprint") != Some(&request.dataset_fingerprint)
+            || metadata.get("effective_training_controls") != Some(&request.effective_config)
+        {
+            return Err(Error::Unsupported(
+                "native export does not match actual request source/config/dataset".into(),
+            ));
+        }
+        self.update(|r| r.run_start_adapter = Some(info))
+    }
+    fn start_snapshot(&self) -> Result<Option<AdapterSnapshot>> {
+        Ok(self
+            .owner
+            .receipts
+            .lock()
+            .map_err(|_| Error::Msg("training probe poisoned".into()))?
+            .get(self.index)
+            .and_then(|r| r.run_start_adapter.clone()))
+    }
+    pub fn record_checkpoint(
+        &self,
+        bundle: &std::path::Path,
+        adapter: &std::path::Path,
+    ) -> Result<()> {
+        if self.owner.artifact_path.is_none() {
+            return Ok(());
+        }
+        let initial = self
+            .start_snapshot()?
+            .ok_or_else(|| Error::Unsupported("run-start diagnostic export missing".into()))?;
+        let state_bytes = std::fs::metadata(bundle.join("run.json"))?.len();
+        let state_workspace = state_bytes
+            .checked_mul(6)
+            .and_then(|n| n.checked_add(128 * 1024))
+            .ok_or_else(|| {
+                Error::Unsupported("checkpoint observation workspace overflow".into())
+            })?;
+        if state_workspace > AUDIT_WORKSPACE_BYTES {
+            return Err(Error::Unsupported(
+                "checkpoint observations exceed admitted audit workspace".into(),
+            ));
+        }
+        let state = gen_core::moss_image_training::recovery::bundle::read(bundle)?;
+        let reader_budget = AUDIT_WORKSPACE_BYTES
+            .checked_sub(state_workspace)
+            .ok_or_else(|| {
+                Error::Unsupported("checkpoint observation workspace exceeds admission".into())
+            })?;
+        let factor_delta = snapshot::delta(&initial.path, adapter, reader_budget)?;
+        if factor_delta.initial_sha256 != initial.sha256 {
+            return Err(Error::Unsupported("run-start export changed".into()));
+        }
+        let (optimizer_scalars_as_stored, scalar_workspace) =
+            snapshot::optimizer_scalars(&bundle.join("optimizer.safetensors"), reader_budget)?;
+        let workspace_bytes = state_workspace + factor_delta.workspace_bytes.max(scalar_workspace);
+        let observation = CheckpointObservation {
+            state,
+            factor_delta,
+            optimizer_scalars_as_stored,
+            workspace_bytes,
+        };
+        let path = self
+            .artifact_target(&format!("checkpoint-{:06}", observation.state.step))?
+            .ok_or_else(|| Error::Unsupported("checkpoint artifact target missing".into()))?
+            .with_extension("json");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        serde_json::to_writer(
+            &mut file,
+            &CheckpointArtifact {
+                source_head: std::env::var("GITHUB_SHA").ok(),
+                run_index: self.index,
+                checkpoint: &observation,
+            },
+        )
+        .map_err(|e| Error::Msg(e.to_string()))?;
+        file.sync_all()?;
+        // Durable per-checkpoint files hold the timeline; retain only the first/latest anchors.
+        self.update(|r| {
+            if r.checkpoints.len() < 2 {
+                r.checkpoints.push(observation);
+            } else {
+                r.checkpoints[1] = observation;
+            }
+        })
+    }
+    pub fn record_final_export(&self, path: &std::path::Path) -> Result<()> {
+        let Some(target) = self.artifact_target("native-final-copy")? else {
+            return Ok(());
+        };
+        let initial = self
+            .start_snapshot()?
+            .ok_or_else(|| Error::Unsupported("run-start diagnostic export missing".into()))?;
+        let before = snapshot::hash_file(path)?;
+        snapshot::copy_export(path, &target)?;
+        let delta = snapshot::delta(&initial.path, &target, AUDIT_WORKSPACE_BYTES)?;
+        if delta.initial_sha256 != initial.sha256
+            || delta.final_sha256 != before
+            || snapshot::hash_file(path)? != before
+        {
+            return Err(Error::Unsupported(
+                "native export changed during diagnostic capture".into(),
+            ));
+        }
+        self.update(|r| {
+            r.final_adapter_path = Some(target);
+            r.final_native_path = Some(path.to_path_buf());
+            r.final_parameter_delta = Some(delta);
+        })
+    }
     pub fn evaluation(&self) -> &EvaluationManifest {
         self.owner.evaluation()
     }

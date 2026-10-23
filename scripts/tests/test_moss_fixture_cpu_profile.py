@@ -319,6 +319,14 @@ class DiagnosticBatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"GITHUB_SHA": head}):
             log = Path(directory) / "run.log"
             path = log.with_suffix(".receipts.json")
+            initial_file=Path(directory)/"native-initial.safetensors"
+            initial_file.write_bytes(b"protocol-only file identity, not a model")
+            receipt["run_start_adapter"]={"path":str(initial_file),"sha256":fixture.file_digest(initial_file),
+                "start_step":0,"start_update":0,"factor_tensors":1,"workspace_bytes":1024,"layout_sha256":"1"*64,
+                "export_identity":[["source_checkpoint_identity",receipt["request_identity"]["source_checkpoint"]],
+                    ["dataset_fingerprint",receipt["request_identity"]["dataset_fingerprint"]],
+                    ["effective_training_controls",receipt["request_identity"]["effective_config"]]]}
+            value["admitted_audit_workspace_bytes"]=64*1024*1024
             path.write_text(json.dumps(value), encoding="utf-8")
             self.assertEqual(fixture.read_observations(log, head, True)["runs"], 1)
             with_generation = copy.deepcopy(value)
@@ -327,6 +335,13 @@ class DiagnosticBatchTests(unittest.TestCase):
                 "trained_shape": [1, 1, 2, 2], "zero_strength_shape": [1, 1, 2, 2], "adapter_applied": True,
                 "trained": {"elements": 4, "finite": True, "nonzero_elements_in_overlap": 1, "max_abs_delta": 0.125},
                 "zero_strength": {"elements": 4, "finite": True, "nonzero_elements_in_overlap": 0, "max_abs_delta": 0.0},
+                "initial_native_export":copy.deepcopy(receipt["run_start_adapter"]),
+                "native_export_binding":{"layout_sha256":"1"*64,
+                    "export_identity":copy.deepcopy(receipt["run_start_adapter"]["export_identity"]),
+                    "initial_factor_state_sha256":"f"*64,"trained_factor_state_sha256":"c"*64},
+                "route_matched_initial":{"shape":[1,1,2,2],"adapter_applied":True,
+                    "initial_vs_no_adapter":{"elements":4,"finite":True,"nonzero_elements_in_overlap":1,"max_abs_delta":.125},
+                    "trained_vs_initial":{"elements":4,"finite":True,"nonzero_elements_in_overlap":1,"max_abs_delta":.0625}},
             }
             path.write_text(json.dumps(with_generation), encoding="utf-8")
             self.assertTrue(fixture.read_observations(log, head, True)["generation_observed"])
@@ -455,6 +470,20 @@ class DiagnosticBatchTests(unittest.TestCase):
             self.assertIn("actual scale1 generator latents must change", body)
             self.assertIn("zero-strength adapter must not fake a generation delta", body)
 
+    def test_real_run_start_export_and_streamed_controls_are_wired_without_fake_outputs(self):
+        for backend in ("candle-gen/candle-gen-moss-image", "mlx-gen/mlx-gen-moss-image"):
+            source=(ROOT/f"crates/media/{backend}/src/training.rs").read_text(encoding="utf-8")
+            capture=source.split("if let Some(target) = probe.run_start_export_target()?",1)[1].split("let factors = audit::factors",1)[0]
+            self.assertIn("Checkpoint",capture)
+            self.assertIn("save_with_source(",capture)
+            self.assertIn("probe.record_run_start_export",capture)
+            self.assertLess(capture.index("save_with_source("),capture.index("record_run_start_export"))
+            self.assertIn("probe.record_final_export(&path)",source)
+        reader=(ROOT/"crates/contracts/gen-core-testkit/src/moss_training_probe/snapshot.rs").read_text(encoding="utf-8")
+        for name in profile.SNAPSHOT_TESTS:
+            self.assertIn("fn "+name.split("::")[-1]+"()",reader)
+        self.assertIn("snapshot_reader_controls",profile.run.__code__.co_consts)
+
     def test_contract_compile_error_is_blocked_not_a_runtime_red(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch("builtins.print"):
             root = Path(directory)
@@ -496,6 +525,7 @@ class DiagnosticBatchTests(unittest.TestCase):
                     profile, "compile_binary", return_value=(binary, {"source": source})) as compile_, mock.patch.object(
                     profile.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(
                     profile, "contract_fraction_tests", return_value={"passed": True}), mock.patch.object(
+                    profile, "snapshot_reader_tests", return_value={"passed": True}), mock.patch.object(
                     profile, "independent_tests", return_value=[{"test": profile.PHASE_TEST, "status": "assertion_failed"}]), mock.patch.object(
                     profile, "assertion_red") as red:
                 evidence = profile.run("candle", root)

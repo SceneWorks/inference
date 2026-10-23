@@ -228,14 +228,40 @@ mod tests {
             vec![AdapterSpec::new(saved.clone(), 0., kind)],
             &request,
         )?;
+        // This is the real pre-update native export, not manufactured zero factors/output.
+        let initial = probe.initial_untrained_adapter()?;
+        let initial_generated = initial
+            .as_ref()
+            .map(|snapshot| {
+                fixture.generate_latents(
+                    variant,
+                    vec![AdapterSpec::new(snapshot.path.clone(), 1., kind)],
+                    &request,
+                )
+            })
+            .transpose()?;
+        let initial_witness = initial_generated.as_ref().map(|(values, shape, reports)| {
+            let path = &initial.as_ref().expect("initial export").path;
+            (
+                shape,
+                values.as_slice(),
+                reports
+                    .iter()
+                    .any(|r| r.adapter_path == *path && r.applied > 0 && r.skipped.is_empty()),
+            )
+        });
         probe.generation_observation(
             &request,
             (&shape, &before),
             (&after_shape, &after),
             (&disabled_shape, &disabled),
-            reports
-                .iter()
-                .any(|r| r.adapter_path == saved && r.applied > 0 && r.skipped.is_empty()),
+            initial_witness,
+            (
+                &saved,
+                reports
+                    .iter()
+                    .any(|r| r.adapter_path == saved && r.applied > 0 && r.skipped.is_empty()),
+            ),
         )?;
         gen_core_testkit::moss_training_probe::assert_complete_case(&probe, case == 3)?;
         assert_eq!(shape, after_shape);

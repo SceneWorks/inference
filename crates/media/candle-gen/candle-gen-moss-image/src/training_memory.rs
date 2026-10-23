@@ -1441,6 +1441,24 @@ pub(crate) mod tests {
         (f, r)
     }
     #[test]
+    fn audit_workspace_is_charged_in_checkpoint_and_host_domains() {
+        let (facts, mut request) = tiny();
+        let base = estimate(&facts, &request).unwrap();
+        let reserved = 64 * 1024 * 1024;
+        request.audit_workspace_bytes = reserved;
+        let priced = estimate(&facts, &request).unwrap();
+        assert_eq!(priced.host_peak_bytes - base.host_peak_bytes, reserved);
+        assert_eq!(
+            priced.checkpoint - base.checkpoint,
+            16 * 1024 * 1024,
+            "device readback scratch is distinct from the 64MiB HOST audit allowance"
+        );
+        assert!(priced
+            .check_host(priced.host_peak_bytes - 1, false)
+            .is_err());
+        assert!(priced.check_host(priced.host_peak_bytes, false).is_ok());
+    }
+    #[test]
     fn every_phase_rejects_one_byte_below_and_accepts_boundary() {
         // Mutation TM01: replace `required > budget` by false (or >=), or omit a phase in check_all.
         let (f, r) = tiny();

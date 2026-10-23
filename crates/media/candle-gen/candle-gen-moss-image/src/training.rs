@@ -218,7 +218,8 @@ impl MossImageTrainer {
             shape.context_tokens = shape.context_tokens.max(tokens);
             shape.evaluation_context_tokens = tokens;
             shape.evaluation_canvas = Some((u64::from(geometry.width), u64::from(geometry.height)));
-            shape.audit_workspace_bytes = 64 * 1024 * 1024;
+            shape.audit_workspace_bytes =
+                gen_core_testkit::moss_training_probe::AUDIT_WORKSPACE_BYTES;
             shape.decode_bytes = shape
                 .decode_bytes
                 .max(evaluation.plan.decode_buffer_bound()?);
@@ -896,6 +897,23 @@ impl MossImageTrainer {
 
         #[cfg(feature = "test-support")]
         if let Some(probe) = &probe {
+            if let Some(target) = probe.run_start_export_target()? {
+                estimate
+                    .check(admission::Phase::Checkpoint, budget)
+                    .map_err(admission_error)?;
+                estimate
+                    .check_host(host_budget, self.device.is_cpu())
+                    .map_err(admission_error)?;
+                save_with_source(
+                    &transformer,
+                    &set,
+                    self.variant,
+                    req,
+                    &target,
+                    Some(&fingerprint),
+                )?;
+                probe.record_run_start_export(&target, start, update, self.variant)?;
+            }
             let factors = audit::factors(&set)?;
             let loss =
                 evaluation
@@ -1026,6 +1044,18 @@ impl MossImageTrainer {
                     final_loss,
                 )?;
                 recovery::save_complete(req, stem, &state, &opt, &set, &window)?;
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = &probe {
+                    probe.record_checkpoint(
+                        &contract::recovery::resume_bundle_path(
+                            &req.output_dir,
+                            &req.file_name,
+                            step,
+                        )?,
+                        &req.output_dir
+                            .join(checkpoint::checkpoint_filename(stem, step)),
+                    )?;
+                }
                 progress(TrainingProgress::Checkpoint { step });
             }
             if c.sample_every > 0 && step % c.sample_every == 0 && !previews.is_empty() {
@@ -1162,6 +1192,21 @@ impl MossImageTrainer {
                 final_loss,
             )?;
             recovery::save_complete(req, stem, &state, &opt, &set, &window)?;
+            #[cfg(feature = "test-support")]
+            if let Some(probe) = &probe {
+                probe.record_checkpoint(
+                    &contract::recovery::resume_bundle_path(
+                        &req.output_dir,
+                        &req.file_name,
+                        c.steps,
+                    )?,
+                    &path,
+                )?;
+            }
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(probe) = &probe {
+            probe.record_final_export(&path)?;
         }
         Ok(TrainingOutput {
             adapter_path: path,

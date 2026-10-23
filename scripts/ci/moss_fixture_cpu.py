@@ -317,6 +317,23 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
     delta = value.get("parameter_hash_changed")
     if not isinstance(receipts, list) or not receipts or not isinstance(delta, list) or len(delta) != len(receipts):
         raise UnitFailure("training observations lack actual runs")
+    workspace = value.get("admitted_audit_workspace_bytes")
+    if type(workspace) is not int or workspace <= 0:
+        raise UnitFailure("diagnostic workspace admission missing")
+    def diagnostic_file(path, digest):
+        path = Path(path)
+        if (path.resolve().parent != log.parent.resolve() or path.is_symlink() or not path.is_file()
+                or file_digest(path) != digest):
+            raise UnitFailure("diagnostic native export path/content differs")
+    def factor_delta(delta, initial_sha, layout):
+        if (not isinstance(delta, dict) or delta.get("initial_sha256") != initial_sha or delta.get("layout_sha256") != layout
+                or not re.fullmatch(r"[0-9a-f]{64}", delta.get("final_sha256", ""))
+                or type(delta.get("elements")) is not int or delta["elements"] <= 0
+                or type(delta.get("changed_elements")) is not int or not 0 <= delta["changed_elements"] <= delta["elements"]
+                or type(delta.get("workspace_bytes")) is not int or not 0 < delta["workspace_bytes"] <= workspace
+                or any(type(delta.get(key)) not in (int, float) or not 0 <= delta[key] < float("inf")
+                       for key in ("max_abs_delta", "squared_l2_delta"))):
+            raise UnitFailure("streamed actual factor delta is missing or malformed")
     for index, receipt in enumerate(receipts):
         identity = receipt.get("request_identity") or {}
         seed = receipt.get("resolved_seed")
@@ -326,6 +343,34 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
                 or receipt.get("evaluation_manifest") != evaluation["identity"]
                 or receipt.get("cpu_reference") is not True):
             raise UnitFailure("training observations lack actual request/source/seed/dataset/evaluation identity")
+        initial = receipt.get("run_start_adapter") or {}
+        if (type(initial.get("start_step")) is not int or initial["start_step"] < 0
+                or type(initial.get("start_update")) is not int or initial["start_update"] < 0
+                or type(initial.get("factor_tensors")) is not int or initial["factor_tensors"] <= 0
+                or type(initial.get("workspace_bytes")) is not int or not 0 < initial["workspace_bytes"] <= workspace):
+            raise UnitFailure("real native run-start diagnostic export missing")
+        diagnostic_file(initial.get("path", ""), initial.get("sha256"))
+        exported_identity = dict(initial.get("export_identity", []))
+        if (not re.fullmatch(r"[0-9a-f]{64}", initial.get("layout_sha256", ""))
+                or exported_identity.get("source_checkpoint_identity") != identity.get("source_checkpoint")
+                or exported_identity.get("dataset_fingerprint") != identity.get("dataset_fingerprint")
+                or exported_identity.get("effective_training_controls") != identity.get("effective_config")):
+            raise UnitFailure("native start export parent/source/config/layout binding differs")
+        if receipt.get("final_parameter_delta") is not None:
+            exported = receipt["final_parameter_delta"]
+            factor_delta(exported, initial["sha256"], initial["layout_sha256"])
+            diagnostic_file(receipt.get("final_adapter_path", ""), exported["final_sha256"])
+        if receipt.get("complete") is True and receipt.get("final_parameter_delta") is None:
+            raise UnitFailure("completed run lacks streamed real final parameter delta")
+        if len(receipt.get("checkpoints", [])) > 2:
+            raise UnitFailure("unbounded retained checkpoint diagnostics")
+        for checkpoint in receipt.get("checkpoints", []):
+            if (checkpoint.get("state", {}).get("effective_identity") != identity
+                    or type(checkpoint.get("workspace_bytes")) is not int or not 0 < checkpoint["workspace_bytes"] <= workspace
+                    or any(type(n) not in (int, float) or not -float("inf") < n < float("inf")
+                           for n in checkpoint.get("optimizer_scalars_as_stored", {}).values())):
+                raise UnitFailure("checkpoint diagnostic identity/scalars differ")
+            factor_delta(checkpoint.get("factor_delta"), initial["sha256"], initial["layout_sha256"])
         controls = json.loads(identity.get("effective_config", "null"))
         if not isinstance(controls, dict) or type(controls.get("seed")) is not int or controls.get("seed") != seed:
             raise UnitFailure("training observation effective seed/config differs")
@@ -347,8 +392,22 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
         elements = generation.get("baseline_elements")
         if type(elements) is not int or elements <= 0:
             raise UnitFailure("generation baseline element count missing")
-        for key in ("trained", "zero_strength"):
-            values = generation.get(key) or {}
+        control = generation.get("initial_native_export") or {}
+        route = generation.get("route_matched_initial")
+        binding = generation.get("native_export_binding") or {}
+        if (not control or control.get("start_step") != 0
+                or binding.get("layout_sha256") != control.get("layout_sha256")
+                or binding.get("export_identity") != control.get("export_identity")
+                or not binding.get("initial_factor_state_sha256") or not binding.get("trained_factor_state_sha256")):
+            raise UnitFailure("generation lacks the real same-parent/source/layout untrained native export")
+        diagnostic_file(control.get("path", ""), control.get("sha256"))
+        comparisons = [generation.get("trained"), generation.get("zero_strength")]
+        if route is not None:
+            if not isinstance(route, dict) or type(route.get("adapter_applied")) is not bool:
+                raise UnitFailure("route-matched initial control malformed")
+            comparisons += [route.get("initial_vs_no_adapter"), route.get("trained_vs_initial")]
+        for values in comparisons:
+            values = values or {}
             count, nonzero, maximum = values.get("elements"), values.get("nonzero_elements_in_overlap"), values.get("max_abs_delta")
             if (type(count) is not int or count <= 0 or type(nonzero) is not int
                     or not 0 <= nonzero <= min(elements, count) or type(values.get("finite")) is not bool
@@ -356,7 +415,9 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
                     or (maximum is not None and (type(maximum) not in (int, float) or not 0 <= maximum < float("inf")))):
                 raise UnitFailure("generation delta metadata missing or invalid")
     return {"path": str(path), "sha256": file_digest(path), "runs": len(receipts),
-            "generation_observed": generation is not None}
+            "generation_observed": generation is not None,
+            "route_matched_observed": generation is not None and generation.get("route_matched_initial") is not None
+                and generation["route_matched_initial"].get("adapter_applied") is True}
 
 
 def execute(binary: Path, name: str, log: Path) -> str:
@@ -384,8 +445,8 @@ def execute(binary: Path, name: str, log: Path) -> str:
     if not failed:
         verify(output, name)
     observation = read_observations(log, stamp["head"], name in CASES)
-    if name in CASES and not failed and not observation["generation_observed"]:
-        raise UnitFailure("positive full case lacks actual FP32 generation observations")
+    if name in CASES and not failed and not observation["route_matched_observed"]:
+        raise UnitFailure("positive full case lacks actual route-matched FP32 generation observations")
     result = {"test": name, "status": "assertion_failed" if failed else "passed",
               "source": stamp, "binary_sha256": digest, "log_sha256": file_digest(log),
               "observations": observation, "observed_elapsed_seconds": time.monotonic() - started,
