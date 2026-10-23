@@ -178,6 +178,25 @@ class OrchestrationTests(unittest.TestCase):
             if label.endswith('-tests'): self.assertEqual(labels[index-1], label.replace('-tests', '-refresh'))
         self.assertEqual([len(arm[3]) for arm in gate.ARMS], [2, 1, 1])
 
+    def test_compilation_disables_ambient_and_config_wrappers_only_in_child_environment(self):
+        self.env.update(RUSTC_WRAPPER='ambient-sccache.exe', RUSTC_WORKSPACE_WRAPPER='ambient-workspace.exe',
+                        CARGO_BUILD_RUSTC_WRAPPER='configured-sccache.exe',
+                        CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER='configured-workspace.exe')
+        original = self.env.copy()
+        self.run_gate()
+        self.assertEqual(self.env, original)
+        label, command, child_env = self.calls[0]
+        self.assertEqual(label, 'compile')
+        self.assertEqual(command, ['cargo', 'test', '--locked', '--lib', '-p', gate.MOSS, '-p', gate.FLUX,
+                                   '--features', 'cuda', '--no-run', '--message-format=json'])
+        for _, args, child_env in self.calls:
+            self.assertEqual(child_env['RUSTC_WRAPPER'], '')
+            self.assertEqual(child_env['RUSTC_WORKSPACE_WRAPPER'], '')
+            self.assertFalse(any('sccache' in arg for arg in args))
+            # Empty direct overrides supersede config without changing caller/global configuration.
+            self.assertEqual(child_env['CARGO_BUILD_RUSTC_WRAPPER'], original['CARGO_BUILD_RUSTC_WRAPPER'])
+            self.assertEqual(child_env['CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'], original['CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'])
+
     def test_no_gpu_execution_on_missing_cases_or_failed_admission(self):
         for mode in ('bad_list', 'bad_admission'):
             with self.subTest(mode=mode):

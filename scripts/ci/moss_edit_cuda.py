@@ -329,6 +329,8 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
     validate_reservation(lease, env, now())
     env = env.copy()
     env.pop('MOSS_CUDA_ADMISSION', None)
+    # Cargo's empty overrides disable config wrappers too; do not share a compiler service across owned Jobs.
+    env.update(RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='')
     for name in ('hf', 'hub', 'tmp'):
         (out / name).mkdir()
     env.update(CUDA_VISIBLE_DEVICES='-1', CUDA_COMPUTE_CAP='120', HF_HOME=str(out / 'hf'),
