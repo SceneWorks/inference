@@ -798,6 +798,48 @@ pub(crate) const SFT_MEMORY: gen_core::MemoryRegistration = gen_core::MemoryRegi
 };
 
 #[cfg(test)]
+pub(crate) fn verify_numerical_renderer_transitions(
+    mut build: impl FnMut(MossImageAcceleration) -> Transformer,
+    mut predict: impl FnMut(&Transformer) -> Vec<f32>,
+    mut edit: impl FnMut() -> Vec<f32>,
+) {
+    let mut state: AttemptState<Transformer, ()> = AttemptState {
+        renderer: None,
+        report: None,
+    };
+    let expected_edit = edit();
+    // The same release/select boundary used by generate_inner: ordinary -> edit ->
+    // full-F32 DMD -> edit -> ordinary, using real numerical tiny transformers.
+    let mut ordinary = None;
+    for mode in [
+        MossImageAcceleration::Off,
+        MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
+        MossImageAcceleration::Off,
+    ] {
+        state.begin();
+        state.release_for_request(mode, false);
+        let actual = predict(state.select(mode, || Ok(build(mode))).unwrap());
+        assert_eq!(actual, predict(&build(mode)));
+        if mode == MossImageAcceleration::Off {
+            if let Some(baseline) = &ordinary {
+                assert_eq!(&actual, baseline);
+            } else {
+                ordinary = Some(actual);
+            }
+        } else {
+            assert_ne!(&actual, ordinary.as_ref().unwrap());
+        }
+        assert!(state.release_for_request(MossImageAcceleration::Off, true));
+        assert!(state.renderer.is_none());
+        assert_eq!(edit(), expected_edit);
+        assert!(
+            state.renderer.is_none(),
+            "request-local edit must not become ordinary residency"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cpu_tests {
     use super::*;
     #[test]
@@ -888,48 +930,6 @@ mod cpu_tests {
                 .unwrap()
                 .acceleration,
             MossImageAcceleration::Off
-        );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn verify_numerical_renderer_transitions(
-    mut build: impl FnMut(MossImageAcceleration) -> Transformer,
-    mut predict: impl FnMut(&Transformer) -> Vec<f32>,
-    mut edit: impl FnMut() -> Vec<f32>,
-) {
-    let mut state: AttemptState<Transformer, ()> = AttemptState {
-        renderer: None,
-        report: None,
-    };
-    let expected_edit = edit();
-    // The same release/select boundary used by generate_inner: ordinary -> edit ->
-    // full-F32 DMD -> edit -> ordinary, using real numerical tiny transformers.
-    let mut ordinary = None;
-    for mode in [
-        MossImageAcceleration::Off,
-        MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
-        MossImageAcceleration::Off,
-    ] {
-        state.begin();
-        state.release_for_request(mode, false);
-        let actual = predict(state.select(mode, || Ok(build(mode))).unwrap());
-        assert_eq!(actual, predict(&build(mode)));
-        if mode == MossImageAcceleration::Off {
-            if let Some(baseline) = &ordinary {
-                assert_eq!(&actual, baseline);
-            } else {
-                ordinary = Some(actual);
-            }
-        } else {
-            assert_ne!(&actual, ordinary.as_ref().unwrap());
-        }
-        assert!(state.release_for_request(MossImageAcceleration::Off, true));
-        assert!(state.renderer.is_none());
-        assert_eq!(edit(), expected_edit);
-        assert!(
-            state.renderer.is_none(),
-            "request-local edit must not become ordinary residency"
         );
     }
 }

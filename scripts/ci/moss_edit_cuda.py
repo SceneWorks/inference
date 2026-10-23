@@ -326,8 +326,68 @@ def successful_cases(code, text, expected):
     return code == 0 and summaries == [('ok', str(len(expected)), '0', '0')]
 
 
-def execute(lease, env, out, *, runner=run_owned, now=utc):
+def source_snapshot(env):
+    def git(*args):
+        return subprocess.check_output(['git', *args], cwd=ROOT, text=True, encoding='utf-8', timeout=30)
+    require(git('rev-parse', 'HEAD').strip() == env['GITHUB_SHA'], 'source revision changed')
+    require(not git('status', '--porcelain').strip(), 'source checkout changed')
+    return {name: digest(ROOT / name) for name in git('ls-files', '-z').split('\0') if name}
+
+
+def await_arm_admission(label, entry, target, lease, env, out, runner, now, sleep, source_check, source_before):
+    collector = str(ROOT / 'scripts/ci/windows-gpu1-diagnostic.ps1')
+    remaining = lambda: (timestamp(lease['expiresUtc']) - now()).total_seconds()
+    for attempt in range(1, 33):
+        # Refusal/cleanup/source corruption are distinct: only collector output
+        # or ownership validation can queue. Runner cleanup exceptions propagate.
+        validate_reservation(lease, env, now())
+        require(remaining() >= lease['testTimeoutSeconds'] + 360, 'reservation cannot cover complete admission and invocation budget')
+        require(source_check() == source_before, 'source changed while queued')
+        checked_binary(entry, target)
+        directory = out / f'{label}-admission-{attempt:03d}'
+        directory.mkdir(exist_ok=False)
+        full_dir, final_dir = directory / 'full', directory / 'final'
+        row = {'arm': label, 'attempt': attempt, 'startedUtc': now().isoformat(), 'admitted': False}
+        (directory / 'admission.json').write_text(json.dumps(row, indent=2), encoding='utf-8')
+        reason = None
+        phase_start = now()
+        args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(full_dir)]
+        code, _ = runner(args, env, out, f'{label}-admission-{attempt:03d}-collector', min(300, remaining()))
+        require(source_check() == source_before, 'source changed during collector')
+        checked_binary(entry, target)
+        try:
+            require(code == 0, 'fresh collector failed')
+            evidence = read_json(full_dir / 'evidence.json')
+            validate_evidence(evidence, lease, env, phase_start, now())
+        except (ValueError, OSError) as error:
+            reason = str(error)
+        if reason is None:
+            args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(final_dir), '-PreviousEvidencePath', str(full_dir / 'evidence.json')]
+            code, _ = runner(args, env, out, f'{label}-admission-{attempt:03d}-refresh', min(60, remaining()))
+            # Source was fully rehashed BEFORE this final identity refresh. Do
+            # not insert another whole-tree scan between final census and arm.
+            checked_binary(entry, target)
+            try:
+                require(code == 0, 'final identity refresh failed')
+                final = read_json(final_dir / 'evidence.json')
+                validate_final(final, evidence, lease, env, now())
+            except (ValueError, OSError) as error:
+                reason = str(error)
+        row.update(finishedUtc=now().isoformat(), refusal=reason, admitted=reason is None)
+        (directory / 'admission.json').write_text(json.dumps(row, indent=2), encoding='utf-8')
+        if reason is None:
+            require(remaining() >= lease['testTimeoutSeconds'], 'reservation does not cover invocation budget')
+            return full_dir, final_dir
+        require(attempt < 32 and remaining() >= lease['testTimeoutSeconds'] + 390, 'bounded admission queue exhausted or reservation expiring')
+        sleep(30)
+    raise ValueError('bounded admission queue exhausted')
+
+
+def execute(lease, env, out, *, runner=run_owned, now=utc, sleep=time.sleep, source_check=None):
     validate_reservation(lease, env, now())
+    source_check = source_check or (lambda: source_snapshot(env))
+    source_before = source_check()
+    (out / 'source.json').write_text(json.dumps(source_before, indent=2), encoding='utf-8')
     env = env.copy()
     env.pop('MOSS_CUDA_ADMISSION', None)
     # Cargo's empty overrides disable config wrappers too; do not share a compiler service across owned Jobs.
@@ -353,24 +413,8 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
             code, output = runner(args, env, out, label + ('-ignored' if ignored else '-list'), remaining())
             require(code == 0 and listed_tests(output) == (expected_ignored if ignored else expected), 'missing/extra/ignored numerical cases')
     results = []
-    collector = str(ROOT / 'scripts/ci/windows-gpu1-diagnostic.ps1')
     for label, package, filters, expected, expected_ignored in ARMS:
-        validate_reservation(lease, env, now())
-        binary = checked_binary(binaries[package], target)
-        phase_start = now()
-        evidence_dir, final_dir = out / (label + '-evidence'), out / (label + '-final')
-        args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(evidence_dir)]
-        code, _ = runner(args, env, out, label + '-collector', min(300, remaining()))
-        require(code == 0, 'fresh collector failed')
-        evidence = read_json(evidence_dir / 'evidence.json')
-        validate_evidence(evidence, lease, env, phase_start, now())
-        # Verify binaries before the final refresh; no compiler or test listing follows it.
-        binary = checked_binary(binaries[package], target)
-        args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(final_dir), '-PreviousEvidencePath', str(evidence_dir / 'evidence.json')]
-        code, _ = runner(args, env, out, label + '-refresh', min(60, remaining()))
-        require(code == 0, 'final identity refresh failed')
-        final = read_json(final_dir / 'evidence.json')
-        validate_final(final, evidence, lease, env, now())
+        evidence_dir, final_dir = await_arm_admission(label, binaries[package], target, lease, env, out, runner, now, sleep, source_check, source_before)
         binary = checked_binary(binaries[package], target)
         seconds = lease['testTimeoutSeconds']
         require(remaining() >= seconds, 'reservation does not cover invocation budget')
@@ -381,6 +425,8 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
                         'returncode': code, 'passed': successful_cases(code, output, expected),
                         'collectorSha256': digest(evidence_dir / 'evidence.json'), 'finalSnapshotSha256': digest(final_dir / 'evidence.json')})
         (out / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
+        require(source_check() == source_before, 'source changed during numerical invocation')
+        require(results[-1]['passed'], 'numerical arm failed')
     require(all(row['passed'] for row in results), 'one or more numerical arms failed')
     return results
 

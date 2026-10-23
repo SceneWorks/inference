@@ -157,7 +157,7 @@ class OrchestrationTests(unittest.TestCase):
             if self.bad_admission: record['errors'] = ['query failed']
             if label.endswith('-refresh'): record = final_record(record)
             (directory / 'evidence.json').write_text(json.dumps(record), encoding='utf-8')
-            if self.mutate_arm and label == self.mutate_arm + '-refresh':
+            if self.mutate_arm and label.startswith(self.mutate_arm + '-admission-') and label.endswith('-refresh'):
                 (self.target / (gate.MOSS + '.exe')).write_bytes(b'tampered')
             return 0, ''
         self.assertTrue(label.endswith('-tests'))
@@ -171,7 +171,7 @@ class OrchestrationTests(unittest.TestCase):
         return 0, f'test result: ok. {len(arm[3])} passed; 0 failed; 0 ignored;'
 
     def run_gate(self):
-        return gate.execute(self.spec, self.env, self.out, runner=self.runner, now=lambda: NOW)
+        return gate.execute(self.spec, self.env, self.out, runner=self.runner, now=lambda: NOW, sleep=lambda _: None, source_check=lambda: {'fixed': 'source'})
 
     def test_two_binaries_all_compilation_before_three_exact_invocations(self):
         result = self.run_gate(); self.assertEqual(len(result), 3)
@@ -179,7 +179,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(labels[0], 'compile'); self.assertEqual(labels.count('compile'), 1)
         self.assertEqual([x for x in labels if x.endswith('-tests')], ['edit-tests', 'layout-tests', 'encoder-tests'])
         for index, label in enumerate(labels):
-            if label.endswith('-tests'): self.assertEqual(labels[index-1], label.replace('-tests', '-refresh'))
+            if label.endswith('-tests'): self.assertEqual(labels[index-1], label.replace('-tests', '-admission-001-refresh'))
         self.assertEqual([len(arm[3]) for arm in gate.ARMS], [2, 1, 1])
         self.assertEqual([arm[4] for arm in gate.ARMS], [set(), {
             'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}, set()])
@@ -229,9 +229,9 @@ class OrchestrationTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.out = self.root / mode; self.out.mkdir(); self.calls = []
                 setattr(self, mode, 'layout-tests')
-                with self.assertRaisesRegex(ValueError, 'numerical arms failed'): self.run_gate()
+                with self.assertRaisesRegex(ValueError, 'numerical arm failed'): self.run_gate()
                 results = json.loads((self.out/'results.json').read_text(encoding='utf-8'))
-                self.assertEqual([row['passed'] for row in results], [True, False, True])
+                self.assertEqual([row['passed'] for row in results], [True, False])
                 setattr(self, mode, None)
 
     def test_tampered_binary_after_final_refresh_is_not_launched(self):
@@ -244,10 +244,10 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'test compilation failed'): self.run_gate()
         self.assertEqual([label for label, _, _ in self.calls], ['compile'])
 
-    def test_nonzero_test_exit_is_aggregated_without_masking_failure(self):
+    def test_nonzero_test_exit_is_terminal_without_retry_or_later_arms(self):
         self.fail_arm = 'edit-tests'
-        with self.assertRaisesRegex(ValueError, 'numerical arms failed'): self.run_gate()
-        self.assertEqual(len([x for x, _, _ in self.calls if x.endswith('-tests')]), 3)
+        with self.assertRaisesRegex(ValueError, 'numerical arm failed'): self.run_gate()
+        self.assertEqual(len([x for x, _, _ in self.calls if x.endswith('-tests')]), 1)
         self.assertFalse(json.loads((self.out / 'results.json').read_text(encoding='utf-8'))[0]['passed'])
         self.assertFalse(gate.successful_cases(0, 'test result: ok. 0 passed; 0 failed; 0 ignored;', {'expected'}))
         self.assertFalse(gate.successful_cases(0, 'test result: ok. 1 passed; 0 failed; 1 ignored;', {'expected'}))
@@ -257,6 +257,58 @@ class OrchestrationTests(unittest.TestCase):
         path = self.root / 'foreign.exe'; path.write_bytes(b'x')
         with self.assertRaises(ValueError): gate.checked_binary(dict(path=str(path), sha256=gate.digest(path)), self.target)
         with self.assertRaises(FileNotFoundError): gate.checked_binary(dict(path=str(self.target/'missing.exe'), sha256='0'*64), self.target)
+
+
+    def test_busy_and_incomplete_attempts_remain_queued_then_each_arm_executes_once(self):
+        sleeps = []
+        def runner(*args, **kwargs):
+            code, output = self.runner(*args, **kwargs)
+            command, env, out, label, seconds = args
+            if label in ('edit-admission-001-collector', 'edit-admission-002-collector'):
+                path = Path(command[command.index('-OutputDirectory') + 1]) / 'evidence.json'
+                record = json.loads(path.read_text(encoding='utf-8'))
+                record['telemetryComplete'] = False
+                record['errors'] = ['changing foreign process census']
+                path.write_text(json.dumps(record), encoding='utf-8')
+                return (1 if '001' in label else 0), output
+            return code, output
+        results = gate.execute(self.spec, self.env, self.out, runner=runner, now=lambda: NOW,
+                               sleep=sleeps.append, source_check=lambda: {'fixed': 'source'})
+        self.assertEqual(sleeps, [30, 30]); self.assertEqual(len(results), 3)
+        self.assertEqual([name for name, _, _ in self.calls if name.endswith('-tests')], ['edit-tests', 'layout-tests', 'encoder-tests'])
+        attempts = sorted(self.out.glob('edit-admission-*/admission.json'))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual([json.loads(p.read_text(encoding='utf-8'))['admitted'] for p in attempts], [False, False, True])
+        self.assertTrue(all((p.parent / 'full/evidence.json').is_file() for p in attempts))
+        self.assertFalse((attempts[0].parent / 'final').exists())
+        self.assertTrue((attempts[-1].parent / 'final/evidence.json').is_file())
+
+    def test_cleanup_source_and_expiry_failures_do_not_retry_or_launch(self):
+        for failure in ('cleanup', 'source', 'expiry'):
+            with self.subTest(failure=failure):
+                self.out = self.root / failure; self.out.mkdir(); self.calls = []
+                source = {'fixed': 'source'}; clock = [NOW]; sleeps = []
+                def runner(*args, **kwargs):
+                    result = self.runner(*args, **kwargs)
+                    if args[3].endswith('-collector'):
+                        if failure == 'cleanup': raise ValueError('owned cleanup incomplete')
+                        if failure == 'source': source['fixed'] = 'corrupt'
+                        if failure == 'expiry': return 1, ''
+                    return result
+                def sleep(seconds):
+                    sleeps.append(seconds); clock[0] = NOW + dt.timedelta(hours=2)
+                with self.assertRaises(ValueError):
+                    gate.execute(self.spec, self.env, self.out, runner=runner, now=lambda: clock[0], sleep=sleep, source_check=lambda: source.copy())
+                self.assertEqual(len([label for label, _, _ in self.calls if label.endswith('-collector')]), 1)
+                self.assertFalse(any(label.endswith('-tests') for label, _, _ in self.calls))
+                self.assertEqual(sleeps, [30] if failure == 'expiry' else [])
+                self.assertEqual(len(list(self.out.glob('edit-admission-*/admission.json'))), 1)
+
+    def test_expiring_lease_refuses_before_starting_incomplete_arm_budget(self):
+        clock = NOW + dt.timedelta(minutes=55)
+        with self.assertRaisesRegex(ValueError, 'complete admission and invocation budget'):
+            gate.execute(self.spec, self.env, self.out, runner=self.runner, now=lambda: clock, sleep=lambda _: self.fail('unexpected retry'), source_check=lambda: {})
+        self.assertFalse(any(label.endswith(('-collector', '-tests')) for label, _, _ in self.calls))
 
 
 class OwnershipTests(unittest.TestCase):

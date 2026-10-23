@@ -1768,7 +1768,7 @@ mod edit_fixture_tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|v| array(v))
+                .map(array)
                 .collect();
             let hidden = array(&input["hidden_states"]);
             let positive = masked(&input["positive"], &input["positive_mask"]);
