@@ -49,6 +49,7 @@ pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
 pub mod pth;
+pub mod pruned_adaln;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
