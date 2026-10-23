@@ -4,6 +4,7 @@ Preparation and queueing allocate no Metal device. Root classification travels
 through authenticated Actions artifacts; it is never inferred from an idle port.
 """
 from __future__ import annotations
+from contextlib import ExitStack
 import datetime as dt
 import hashlib
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import platform
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -193,7 +195,7 @@ def paths(create=False):
 
 def child_env(out):
     env = {key: value for key, value in os.environ.items() if not any(word in key.upper() for word in ('TOKEN', 'API_KEY', 'SECRET', 'PASSWORD'))}
-    env.update(CARGO_TARGET_DIR=str(out / 'target'), CARGO_BUILD_JOBS='4', CMAKE_BUILD_PARALLEL_LEVEL='4', RUSTUP_TOOLCHAIN='1.96.0', RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='', CARGO_NET_OFFLINE='true', CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_PROFILE_DEV_STRIP='none', CARGO_PROFILE_TEST_STRIP='none', RUSTFLAGS='-C strip=none', RUST_TEST_THREADS='1', RAYON_NUM_THREADS='1', OMP_NUM_THREADS='1', HF_HOME=str(out / 'hf'), HF_HUB_CACHE=str(out / 'hub'), HUGGINGFACE_HUB_CACHE=str(out / 'hub-legacy'), HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_DATASETS_OFFLINE='1', SCENEWORKS_WHISPER_SMOKE_CACHE=str(out / 'whisper'), SCENEWORKS_WHISPER_SMOKE_FRESH='0', TMPDIR=str(out / 'tmp'), TMP=str(out / 'tmp'), TEMP=str(out / 'tmp'), SCENEWORKS_API_URL='http://127.0.0.1:1', SCENEWORKS_ACCESS_TOKEN='source-fixture-deny', RUSTUP_AUTO_INSTALL='0', PYTHONDONTWRITEBYTECODE='1', VECLIB_MAXIMUM_THREADS='1', CUDA_VISIBLE_DEVICES='', MACOSX_DEPLOYMENT_TARGET='26.2')
+    env.update(CARGO_TARGET_DIR=str(out / 'target'), CARGO_BUILD_JOBS='2', CMAKE_BUILD_PARALLEL_LEVEL='2', RUSTUP_TOOLCHAIN='1.96.0', RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='', CARGO_NET_OFFLINE='true', CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_PROFILE_DEV_STRIP='none', CARGO_PROFILE_TEST_STRIP='none', RUSTFLAGS='-C strip=none', RUST_TEST_THREADS='1', RAYON_NUM_THREADS='1', OMP_NUM_THREADS='1', HF_HOME=str(out / 'hf'), HF_HUB_CACHE=str(out / 'hub'), HUGGINGFACE_HUB_CACHE=str(out / 'hub-legacy'), HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_DATASETS_OFFLINE='1', SCENEWORKS_WHISPER_SMOKE_CACHE=str(out / 'whisper'), SCENEWORKS_WHISPER_SMOKE_FRESH='0', TMPDIR=str(out / 'tmp'), TMP=str(out / 'tmp'), TEMP=str(out / 'tmp'), SCENEWORKS_API_URL='http://127.0.0.1:1', SCENEWORKS_ACCESS_TOKEN='source-fixture-deny', RUSTUP_AUTO_INSTALL='0', PYTHONDONTWRITEBYTECODE='1', VECLIB_MAXIMUM_THREADS='1', CUDA_VISIBLE_DEVICES='', MACOSX_DEPLOYMENT_TARGET='26.2')
     return env
 
 def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None, absolute_deadline=None):
@@ -333,6 +335,154 @@ def validate_lease(lease):
         require(job['repository'] in ('SceneWorks/inference', 'SceneWorks/SceneWorks') and type(job['runId']) is int and type(job['attempt']) is int, 'unreviewed compute repository or run')
 
 
+def quarantine_interrupted_pmetal_out(out, target_identity, attempt, deadline):
+    """Retain only this run's generated pmetal OUT_DIR after owned work drained.
+
+    Descriptor-relative traversal/rename never follows generated-tree contents.
+    Rust artifacts and shared Cargo sources are outside this operation.
+    """
+    record = {'attempt': attempt, 'startedUtc': utc().isoformat(), 'moves': []}
+    identity = lambda info: (info.st_dev, info.st_ino)
+    with ExitStack() as handles:
+        anchors = []
+        invalidated = []
+        def budget(): operation_timeout(30, deadline)
+        def directory(name, parent=None, expected=None):
+            budget()
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            require(stat.S_ISDIR(before.st_mode) and before.st_uid == os.getuid(), 'scratch directory is symlink, non-directory or foreign-owned')
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            handles.callback(os.close, fd)
+            actual = os.fstat(fd)
+            require(identity(actual) == identity(before) and (expected is None or identity(actual) == expected), 'scratch directory identity changed')
+            anchors.append((parent, name, fd, identity(actual)))
+            return fd
+        def recheck():
+            budget()
+            for parent, name, fd, expected in anchors:
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.getuid() and identity(current) == expected == identity(os.fstat(fd)), 'scratch directory identity changed')
+            budget()
+        def absent(parent, name):
+            try: os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError: return
+            raise ValueError('fingerprint path unexpectedly exists')
+        def regular(parent, name, limit):
+            budget()
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and before.st_nlink == 1 and before.st_size <= limit, 'invalid build fingerprint file')
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            handles.callback(os.close, fd)
+            signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            require(signature(os.fstat(fd)) == signature(before), 'build fingerprint identity changed')
+            content = os.pread(fd, limit + 1, 0)
+            require(len(content) == before.st_size, 'build fingerprint read changed')
+            def verify():
+                budget()
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                require(stat.S_ISREG(current.st_mode) and current.st_uid == os.getuid() and current.st_nlink == 1 and signature(current) == signature(os.fstat(fd)) == signature(before), 'build fingerprint identity changed')
+                require(os.pread(fd, limit + 1, 0) == content, 'build fingerprint content changed')
+            verify()
+            return content, identity(before), verify
+        def invalidate_build_fingerprint(debug, name, destination, attempt_name, move):
+            # Cargo 1.96 treats a missing run-build fingerprint as dirty. Keep
+            # diagnostic JSON and all compiled Rust unit metadata untouched.
+            fingerprint_name = 'run-build-script-build-script-build'
+            detail = {'status': 'already-dirty'}
+            move['buildFingerprint'] = detail
+            try:
+                fingerprints = directory('.fingerprint', debug)
+                unit = directory(name, fingerprints)
+                os.stat(fingerprint_name, dir_fd=unit, follow_symlinks=False)
+            except FileNotFoundError: return
+            value, file_identity, verify_hash = regular(unit, fingerprint_name, 16)
+            require(re.fullmatch(b'[0-9a-f]{16}', value), 'malformed build fingerprint hash')
+            data, _, verify_json = regular(unit, fingerprint_name + '.json', MAX_LOG)
+            metadata = json.loads(data.decode('utf-8'), object_pairs_hook=unique_fields)
+            outputs = {entry['RerunIfChanged']['output'] for entry in metadata['local'] if 'RerunIfChanged' in entry}
+            require(outputs == {f'debug/build/{name}/output'}, 'build fingerprint belongs to another output')
+            saved_name = name + '.run-build-fingerprint'
+            detail.update(source=f'target/debug/.fingerprint/{name}/{fingerprint_name}',
+                          destination=f'scratch-quarantine/{attempt_name}/{saved_name}',
+                          device=file_identity[0], inode=file_identity[1], sha256=hashlib.sha256(value).hexdigest(), status='validated')
+            recheck(); verify_json(); verify_hash(); absent(destination, saved_name); budget()
+            os.rename(fingerprint_name, saved_name, src_dir_fd=unit, dst_dir_fd=destination)
+            detail['status'] = 'renamed'
+            retained, retained_identity, verify_retained = regular(destination, saved_name, 16)
+            require(retained_identity == file_identity and retained == value, 'retained build fingerprint changed')
+            verify_retained(); absent(unit, fingerprint_name)
+            invalidated.append((unit, fingerprint_name))
+            detail['status'] = 'invalidated'
+
+        root = directory(out)
+        require(os.fstat(root).st_mode & 0o077 == 0, 'preparation root is not private')
+        receipt_name = f'compile-{attempt:03d}-scratch-quarantine.json'
+        receipt_fd = os.open(receipt_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root)
+        with os.fdopen(receipt_fd, 'w', encoding='utf-8') as receipt_file:
+            try:
+                target = directory('target', root, target_identity)
+                try:
+                    debug = directory('debug', target)
+                    build = directory('build', debug)
+                except FileNotFoundError:
+                    recheck()
+                    record['status'] = 'no-pmetal-output'
+                    return record
+                names = os.listdir(build)
+                require(len(names) <= 4096, 'private build directory entry bound exceeded')
+                candidates = sorted(name for name in names if re.fullmatch(r'pmetal-mlx-sys-[0-9a-f]{16}', name))
+                require(len(candidates) <= 32, 'private pmetal output count bound exceeded')
+                quarantine = destination = None
+                for name in candidates:
+                    budget()
+                    package = directory(name, build)
+                    try: generated = directory('out', package)
+                    except FileNotFoundError: continue
+                    old_identity = identity(os.fstat(generated))
+                    if quarantine is None:
+                        try: os.mkdir('scratch-quarantine', 0o700, dir_fd=root)
+                        except FileExistsError: pass
+                        quarantine = directory('scratch-quarantine', root)
+                        require(os.fstat(quarantine).st_mode & 0o077 == 0, 'quarantine is not private')
+                        attempt_name = f'compile-{attempt:03d}'
+                        os.mkdir(attempt_name, 0o700, dir_fd=quarantine)
+                        destination = directory(attempt_name, quarantine)
+                        require(os.fstat(destination).st_dev == old_identity[0], 'quarantine crosses filesystem')
+                    recheck()
+                    try: os.stat(name, dir_fd=destination, follow_symlinks=False)
+                    except FileNotFoundError: pass
+                    else: raise ValueError('quarantine destination already exists')
+                    move = {'source': f'target/debug/build/{name}/out', 'destination': f'scratch-quarantine/{attempt_name}/{name}',
+                            'device': old_identity[0], 'inode': old_identity[1], 'renamed': False, 'recreated': False}
+                    record['moves'].append(move)
+                    invalidate_build_fingerprint(debug, name, destination, attempt_name, move)
+                    recheck()
+                    budget()
+                    os.rename('out', name, src_dir_fd=package, dst_dir_fd=destination)
+                    move['renamed'] = True
+                    moved = os.stat(name, dir_fd=destination, follow_symlinks=False)
+                    require(stat.S_ISDIR(moved.st_mode) and identity(moved) == old_identity, 'quarantined output identity changed')
+                    # The old out name is intentionally replaced; its retained fd still
+                    # points to quarantine and all other directory anchors stay fixed.
+                    anchors[:] = [entry for entry in anchors if entry[2] != generated]
+                    recheck()
+                    os.mkdir('out', 0o700, dir_fd=package)
+                    fresh = directory('out', package)
+                    require(identity(os.fstat(fresh)) != old_identity, 'generated output was not replaced')
+                    move['recreated'] = True
+                recheck()
+                for unit, filename in invalidated: absent(unit, filename)
+                record['status'] = 'quarantined' if record['moves'] else 'no-pmetal-output'
+                return record
+            except BaseException as error:
+                record['error'] = str(error)
+                raise
+            finally:
+                record['finishedUtc'] = utc().isoformat()
+                json.dump(record, receipt_file, indent=2)
+                receipt_file.write('\n')
+
+
 def prepare_compile(out, env, source, runtime, deadline):
     """Wait only for measured capacity; retain each interrupted private build."""
     target = out / 'target'
@@ -394,6 +544,14 @@ def prepare_compile(out, env, source, runtime, deadline):
             sent_root_signal = any(row['pid'] == receipt.get('pid') and row['birth'] == receipt.get('observed', {}).get(str(receipt.get('pid')), {}).get('birth') and row['signal'] == -receipt.get('exitCode', 0) for row in receipt.get('sentSignals', []))
             require((receipt.get('launched') is False and receipt['exitCode'] is None) or (receipt.get('capacityInterrupted') is True and sent_root_signal and receipt['exitCode'] in (-signal.SIGTERM, -signal.SIGKILL)), 'not a controller-initiated capacity interruption')
             state('owned-drained', attempt=attempt, receipt=label + '-process.json')
+            if receipt.get('launched') is not False:
+                revalidate()
+                current = rows(deadline - 70)
+                require(not any((receipt.get('observed', {}).get(str(pid), {}).get('birth') == birth or group == receipt.get('pid')) for pid, parent, group, birth, comm in current), 'owned process reappeared before scratch quarantine')
+                budget(70)
+                rotated = quarantine_interrupted_pmetal_out(out, target_identity, attempt, deadline - 70)
+                state('scratch-quarantined', attempt=attempt, receipt=label + '-scratch-quarantine.json', outputs=len(rotated['moves']))
+                revalidate()
             cooldown()
             continue
         revalidate()

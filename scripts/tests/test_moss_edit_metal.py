@@ -459,5 +459,251 @@ class PreparationCapacityTests(unittest.TestCase):
             self.assertEqual(gate.read(out / 'slow-observe-process.json')['remaining'], [])
 
 
+class ScratchQuarantineTests(unittest.TestCase):
+    name = 'pmetal-mlx-sys-0123456789abcdef'
+
+    def fixture(self, out):
+        target = out / 'target'; target.mkdir()
+        generated = target / 'debug/build' / self.name / 'out'
+        generated.mkdir(parents=True)
+        (generated / 'stale-patch').write_bytes(b'preserved patch state')
+        (target / 'rust-sentinel').write_bytes(b'unrelated Rust cache')
+        return target, generated, (target.stat().st_dev, target.stat().st_ino)
+
+    def test_rotation_retains_inode_bytes_and_rust_cache_across_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); target, generated, identity = self.fixture(out)
+            old_inode = generated.stat().st_ino
+            first = gate.quarantine_interrupted_pmetal_out(out, identity, 1, gate.time.monotonic() + 60)
+            retained = out / first['moves'][0]['destination']
+            self.assertEqual(retained.stat().st_ino, old_inode)
+            self.assertEqual((retained / 'stale-patch').read_bytes(), b'preserved patch state')
+            self.assertEqual(list(generated.iterdir()), [])
+            self.assertEqual((target / 'rust-sentinel').read_bytes(), b'unrelated Rust cache')
+            (generated / 'second').write_bytes(b'second interruption')
+            second = gate.quarantine_interrupted_pmetal_out(out, identity, 2, gate.time.monotonic() + 60)
+            self.assertNotEqual(first['moves'][0]['destination'], second['moves'][0]['destination'])
+            self.assertEqual((out / second['moves'][0]['destination'] / 'second').read_bytes(), b'second interruption')
+            self.assertEqual((target.stat().st_dev, target.stat().st_ino), identity)
+            self.assertTrue(gate.read(out / 'compile-001-scratch-quarantine.json')['moves'][0]['recreated'])
+
+    def test_actual_capacity_retry_rotates_after_drain_before_second_launch(self):
+        fixture = PreparationCapacityTests('test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts')
+        self.addCleanup(fixture.doCleanups)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            env, clock, launches, signals, processes = fixture.context(out, [30, 30, 30, 29, 30, 30, 30])
+            generated = out / 'target/debug/build' / self.name / 'out'
+            original = gate.subprocess.Popen.side_effect
+            def popen(*args, **kwargs):
+                if not launches:
+                    generated.mkdir(parents=True); (generated / 'stale-patch').write_bytes(b'interrupted')
+                else:
+                    self.assertEqual(processes[0].code, -gate.signal.SIGTERM)
+                    self.assertEqual(list(generated.iterdir()), [])
+                    self.assertEqual((out / 'scratch-quarantine/compile-001' / self.name / 'stale-patch').read_bytes(), b'interrupted')
+                return original(*args, **kwargs)
+            with patch.object(gate.subprocess, 'Popen', side_effect=popen):
+                self.assertEqual(gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200), 'attempt 2')
+            self.assertEqual(len(launches), 2)
+            self.assertEqual(signals, [(900, gate.signal.SIGTERM)])
+            states = [r['status'] for r in gate.read(out / 'preparation-queue.json')['events']]
+            self.assertLess(states.index('owned-drained'), states.index('scratch-quarantined'))
+            self.assertLess(states.index('scratch-quarantined'), states.index('retrying'))
+            for n in (1, 2): self.assertTrue((out / f'compile-{n:03d}.log').exists())
+
+    def test_missing_outputs_are_recorded_noop_and_prelaunch_never_rotates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); target = out / 'target'; target.mkdir()
+            result = gate.quarantine_interrupted_pmetal_out(out, (target.stat().st_dev, target.stat().st_ino), 1, gate.time.monotonic() + 60)
+            self.assertEqual(result['status'], 'no-pmetal-output')
+            self.assertFalse((out / 'scratch-quarantine').exists())
+        fixture = PreparationCapacityTests('test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts')
+        self.addCleanup(fixture.doCleanups)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, *_ = fixture.context(out, [30] * 20)
+            calls = []
+            def run(*args, **kwargs):
+                calls.append(args[3])
+                if len(calls) == 1:
+                    gate.write(out / (args[3] + '-process.json'), {'launched': False, 'exitCode': None, 'remaining': [], 'capacityUnavailable': {'predicate': 'memory'}})
+                    raise gate.CapacityUnavailable('memory', {})
+                return 'success'
+            with patch.object(gate, 'run_owned', side_effect=run), patch.object(gate, 'quarantine_interrupted_pmetal_out', side_effect=AssertionError('prelaunch rotation forbidden')):
+                self.assertEqual(gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200), 'success')
+            self.assertEqual(len(calls), 2)
+
+    def test_symlink_components_substitution_and_existing_destination_refuse(self):
+        for mode in ('target', 'debug', 'build', 'package', 'out', 'quarantine', 'identity', 'existing', 'foreign-owner'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as external:
+                out = Path(temp); target, generated, identity = self.fixture(out)
+                foreign = Path(external); (foreign / 'sentinel').write_bytes(b'untouched')
+                components = {'target': target, 'debug': target/'debug', 'build': target/'debug/build', 'package': generated.parent, 'out': generated}
+                if mode in components:
+                    component = components[mode]; component.rename(component.with_name(component.name + '-original')); component.symlink_to(foreign, target_is_directory=True)
+                if mode == 'quarantine': (out/'scratch-quarantine').symlink_to(foreign, target_is_directory=True)
+                if mode == 'identity': identity = (identity[0], identity[1] + 1)
+                if mode == 'existing': (out/'scratch-quarantine/compile-001').mkdir(parents=True, mode=0o700)
+                from contextlib import nullcontext
+                owner = patch.object(gate.os, 'getuid', return_value=out.stat().st_uid + 1) if mode == 'foreign-owner' else nullcontext()
+                with owner, self.assertRaises((ValueError, OSError)):
+                    gate.quarantine_interrupted_pmetal_out(out, identity, 1, gate.time.monotonic() + 60)
+                self.assertEqual((foreign / 'sentinel').read_bytes(), b'untouched')
+                self.assertEqual(list(foreign.iterdir()), [foreign/'sentinel'])
+
+    def test_changed_inode_rename_failure_and_deadline_preserve_failure_receipts(self):
+        for mode in ('changed-inode', 'rename-failed', 'deadline'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); target, generated, identity = self.fixture(out)
+                original_stat = gate.os.stat; original_rename = gate.os.rename; changed = [False]
+                def inspect(name, *args, **kwargs):
+                    if mode == 'changed-inode' and name == 'out' and kwargs.get('dir_fd') is not None and not changed[0]:
+                        # Open captures this original identity; substitute just before recheck.
+                        result = original_stat(name, *args, **kwargs)
+                        changed[0] = True
+                        return result
+                    if mode == 'changed-inode' and name == 'out' and changed[0] is True:
+                        generated.rename(generated.with_name('out-original')); generated.mkdir(); changed[0] = 'replaced'
+                    return original_stat(name, *args, **kwargs)
+                def rename(*args, **kwargs): raise OSError('inert rename failure')
+                clock = [0]
+                def now():
+                    clock[0] += 1
+                    return clock[0] if mode == 'deadline' else 0
+                with patch.object(gate.os, 'stat', side_effect=inspect), patch.object(gate.os, 'rename', side_effect=rename if mode == 'rename-failed' else original_rename), patch.object(gate.time, 'monotonic', side_effect=now):
+                    with self.assertRaises((ValueError, OSError)):
+                        gate.quarantine_interrupted_pmetal_out(out, identity, 1, 8 if mode == 'deadline' else 60)
+                self.assertIn('error', gate.read(out / 'compile-001-scratch-quarantine.json'))
+                self.assertFalse((out/'scratch-quarantine/compile-001'/self.name).exists())
+
+    def test_parallelism_is_two_without_weakening_thresholds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = gate.child_env(Path(temp))
+            self.assertEqual(env['CARGO_BUILD_JOBS'], '2')
+            self.assertEqual(env['CMAKE_BUILD_PARALLEL_LEVEL'], '2')
+            self.assertEqual(env['CARGO_NET_OFFLINE'], 'true')
+            self.assertEqual(env['CUDA_VISIBLE_DEVICES'], '')
+
+
+class ScratchFreshnessTests(unittest.TestCase):
+    name = ScratchQuarantineTests.name
+    fingerprint = 'run-build-script-build-script-build'
+
+    def completed(self, out):
+        generated = out / 'target/debug/build' / self.name / 'out'
+        generated.mkdir(parents=True, exist_ok=True)
+        (generated/'bindings.rs').write_bytes(b'complete bindings')
+        (generated/'native.a').write_bytes(b'complete native archive')
+        (generated.parent/'output').write_bytes(b'cargo native search path')
+        unit = out/'target/debug/.fingerprint'/self.name
+        unit.mkdir(parents=True)
+        fingerprint = unit/self.fingerprint
+        fingerprint.write_bytes(b'0123456789abcdef')
+        gate.write(unit/(self.fingerprint+'.json'), {'local': [{'RerunIfChanged': {'output': f'debug/build/{self.name}/output'}}]})
+        (unit/'unrelated-rust-unit').write_bytes(b'leave unchanged')
+        return generated, fingerprint
+
+    def test_completed_pmetal_downstream_interruption_invalidates_only_affected_freshness(self):
+        fixture = PreparationCapacityTests('test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts')
+        self.addCleanup(fixture.doCleanups)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes = fixture.context(out, [30, 30, 30, 29, 30, 30, 30])
+            original = gate.subprocess.Popen.side_effect; saved = {}; regenerated = []
+            def popen(*args, **kwargs):
+                if not launches:
+                    generated, fingerprint = self.completed(out)
+                    saved.update(generated=generated, fingerprint=fingerprint,
+                                 metadata=fingerprint.with_name(self.fingerprint+'.json').read_bytes())
+                else:
+                    generated, fingerprint = saved['generated'], saved['fingerprint']
+                    # Cargo1.96's source-backed rule: an absent fingerprint dirties
+                    # the build-script unit. This is an inert model, not Cargo.
+                    fresh = fingerprint.exists()
+                    self.assertFalse(fresh)
+                    self.assertEqual(list(generated.iterdir()), [])
+                    self.assertEqual(fingerprint.with_name(self.fingerprint+'.json').read_bytes(), saved['metadata'])
+                    self.assertEqual((fingerprint.parent/'unrelated-rust-unit').read_bytes(), b'leave unchanged')
+                    self.assertEqual((generated.parent/'output').read_bytes(), b'cargo native search path')
+                    retained = out/'scratch-quarantine/compile-001'/self.name
+                    self.assertEqual((retained/'bindings.rs').read_bytes(), b'complete bindings')
+                    self.assertEqual((retained/'native.a').read_bytes(), b'complete native archive')
+                    if not fresh:
+                        (generated/'bindings.rs').write_bytes(b'regenerated bindings')
+                        (generated/'native.a').write_bytes(b'regenerated native archive')
+                        fingerprint.write_bytes(b'fedcba9876543210'); regenerated.append(True)
+                return original(*args, **kwargs)
+            with patch.object(gate.subprocess, 'Popen', side_effect=popen):
+                self.assertEqual(gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200), 'attempt 2')
+            self.assertEqual(regenerated, [True]); self.assertEqual(len(launches), 2)
+            receipt = gate.read(out/'compile-001-scratch-quarantine.json')
+            detail = receipt['moves'][0]['buildFingerprint']
+            self.assertEqual(detail['status'], 'invalidated')
+            self.assertEqual((out/detail['destination']).read_bytes(), b'0123456789abcdef')
+            self.assertEqual((saved['generated']/'bindings.rs').read_bytes(), b'regenerated bindings')
+
+    def test_invalid_fingerprint_or_mapping_refuses_before_output_rotation(self):
+        for mode in ('symlink', 'nonregular', 'foreign-owner', 'malformed', 'missing-json', 'wrong-json', 'oversized-json', 'substituted', 'destination', 'rename-failure', 'deadline'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as foreign:
+                out = Path(temp); (out/'target').mkdir(); generated, fingerprint = self.completed(out)
+                target = out/'target'; identity = (target.stat().st_dev, target.stat().st_ino); old_inode = generated.stat().st_ino
+                external = Path(foreign)/'sentinel'; external.write_bytes(b'external unchanged')
+                metadata = fingerprint.with_name(self.fingerprint+'.json')
+                if mode == 'symlink': fingerprint.unlink(); fingerprint.symlink_to(external)
+                if mode == 'nonregular': fingerprint.unlink(); fingerprint.mkdir()
+                if mode == 'malformed': fingerprint.write_bytes(b'not-a-valid-hash!')
+                if mode == 'missing-json': metadata.unlink()
+                if mode == 'wrong-json': gate.write(metadata, {'local': [{'RerunIfChanged': {'output': 'debug/build/other/output'}}]})
+                if mode == 'oversized-json': metadata.write_bytes(b'x'*(gate.MAX_LOG+1))
+                original_stat, original_rename = gate.os.stat, gate.os.rename
+                observations = [0]; clock = [0]
+                def inspect(name, *args, **kwargs):
+                    if name == self.fingerprint and kwargs.get('dir_fd') is not None:
+                        observations[0] += 1
+                        if mode == 'substituted' and observations[0] == 3:
+                            fingerprint.rename(fingerprint.with_name('retained-original')); fingerprint.write_bytes(b'1111111111111111')
+                        if mode == 'foreign-owner':
+                            fields = list(original_stat(name, *args, **kwargs)); fields[4] += 1
+                            return gate.os.stat_result(fields)
+                        if mode == 'deadline': clock[0] = 60
+                    if mode == 'destination' and name == self.name+'.run-build-fingerprint':
+                        fd = gate.os.open(name, gate.os.O_WRONLY | gate.os.O_CREAT | gate.os.O_EXCL, 0o600, dir_fd=kwargs['dir_fd'])
+                        gate.os.close(fd)
+                    return original_stat(name, *args, **kwargs)
+                def rename(source, *args, **kwargs):
+                    if mode == 'rename-failure' and source == self.fingerprint: raise OSError('inert fingerprint rename failure')
+                    return original_rename(source, *args, **kwargs)
+                with patch.object(gate.os, 'stat', side_effect=inspect), patch.object(gate.os, 'rename', side_effect=rename), patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]):
+                    with self.assertRaises((ValueError, OSError)):
+                        gate.quarantine_interrupted_pmetal_out(out, identity, 1, 60)
+                self.assertEqual(generated.stat().st_ino, old_inode)
+                self.assertEqual((generated/'bindings.rs').read_bytes(), b'complete bindings')
+                self.assertEqual(external.read_bytes(), b'external unchanged')
+                self.assertIn('error', gate.read(out/'compile-001-scratch-quarantine.json'))
+
+    def test_output_rotation_failure_after_invalidation_is_terminal_and_retains_proof(self):
+        fixture = PreparationCapacityTests('test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts')
+        self.addCleanup(fixture.doCleanups)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes = fixture.context(out, [30, 30, 30, 29, 30])
+            original_popen, original_rename = gate.subprocess.Popen.side_effect, gate.os.rename
+            saved = {}
+            def popen(*args, **kwargs):
+                saved['generated'], saved['fingerprint'] = self.completed(out)
+                return original_popen(*args, **kwargs)
+            def rename(source, *args, **kwargs):
+                if source == 'out': raise OSError('inert output rotation failure')
+                return original_rename(source, *args, **kwargs)
+            with patch.object(gate.subprocess, 'Popen', side_effect=popen), patch.object(gate.os, 'rename', side_effect=rename):
+                with self.assertRaisesRegex(OSError, 'output rotation failure'):
+                    gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+            self.assertEqual(len(launches), 1)
+            self.assertFalse(saved['fingerprint'].exists())
+            self.assertEqual((saved['generated']/'bindings.rs').read_bytes(), b'complete bindings')
+            record = gate.read(out/'compile-001-scratch-quarantine.json')
+            self.assertEqual(record['moves'][0]['buildFingerprint']['status'], 'invalidated')
+            self.assertFalse(record['moves'][0]['renamed'])
+            self.assertEqual((out/record['moves'][0]['buildFingerprint']['destination']).read_bytes(), b'0123456789abcdef')
+
+
 if __name__ == '__main__':
     unittest.main()
