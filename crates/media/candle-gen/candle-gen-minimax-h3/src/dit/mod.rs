@@ -58,6 +58,7 @@
 
 pub mod adaln;
 pub mod block;
+pub mod curve;
 pub mod config;
 pub mod heads;
 pub mod layers;
@@ -75,6 +76,7 @@ pub use heads::{
     TimestepEmbedder,
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
+pub use curve::{CurveAdaLn, CurveProjection};
 pub use model::{BlockModulation, JointDit, MiniMaxH3Dit, PackedForward, PUBLISHED_DIT_TENSORS};
 pub use positions::{
     audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids,

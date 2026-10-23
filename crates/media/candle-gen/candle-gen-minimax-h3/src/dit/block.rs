@@ -294,6 +294,8 @@ pub struct DitBlock {
     /// that the post-eviction state is a **typed** one: every path that needs the projection
     /// reports its absence instead of reading a stale or fabricated table.
     adaln_proj: Option<AdaLnProjection>,
+    /// The reduced curve projection of a pruned (sc-26684) checkpoint; `None` on the stock path.
+    curve: Option<crate::dit::curve::CurveProjection>,
 }
 
 impl DitBlock {
@@ -316,7 +318,55 @@ impl DitBlock {
                 cfg,
                 dtype,
             )?),
+            curve: None,
         })
+    }
+
+    /// Load block `prefix` for a **pruned** (sc-26684) checkpoint: the body loads exactly as
+    /// [`Self::from_weights`] does, but there is no full-width `adaln_proj` to load — the reduced
+    /// curve projection `curve` ([`crate::dit::curve::CurveProjection`], at its stored precision)
+    /// replaces it.
+    ///
+    /// [`PrunedAdaLn::inspect`](candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect) must have
+    /// validated the whole reduced topology before this runs; a block constructed here against a
+    /// checkpoint the inspector refused would be exactly the plausible-garbage load the contract
+    /// forbids.
+    pub fn from_weights_curve(
+        w: &Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        dtype: DType,
+        curve: crate::dit::curve::CurveProjection,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        Ok(Self {
+            norm1: RmsNorm::from_weights(w, &format!("{prefix}.norm1"), cfg.norm_eps, dtype)?,
+            attn: DitAttention::from_weights(w, &format!("{prefix}.attn"), cfg, dtype)?,
+            norm2: RmsNorm::from_weights(w, &format!("{prefix}.norm2"), cfg.norm_eps, dtype)?,
+            ff: DitFeedForward::from_weights(w, &format!("{prefix}.ff"), dtype)?,
+            adaln_proj: None,
+            curve: Some(curve),
+        })
+    }
+
+    /// Project interpolated curve coordinates into this block's modulation tables — the pruned
+    /// (sc-26684) counterpart of [`Self::modulation`].
+    ///
+    /// The reduced projection runs in F32 (the pinned `_lock_dtype` widening) with **no SiLU** —
+    /// the table already stores the timestep MLP's post-activation output. Errors if this block
+    /// was loaded on the stock path, mirroring the typed post-eviction state.
+    pub fn curve_modulation(&self, coords: &Tensor) -> Result<AdaLnModulation> {
+        self.curve
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3 dit block: this block has no reduced curve projection; it was \
+                     loaded from an unpruned checkpoint, whose modulation comes from the timestep \
+                     MLP via `modulation`/`AdaLnCache`"
+                        .into(),
+                )
+            })?
+            .modulation(coords)
     }
 
     /// This block's AdaLN projection, or `None` once it has been evicted.

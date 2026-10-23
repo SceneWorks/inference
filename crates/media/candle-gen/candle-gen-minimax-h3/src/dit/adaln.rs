@@ -454,6 +454,10 @@ pub struct AdaLnCache {
     schedule: TimestepSchedule,
     layers: Vec<AdaLnModulation>,
     bytes: usize,
+    /// The pruning identity this cache's basis carries — `Some` for a sc-26684 direct-curve
+    /// checkpoint, `None` for the stock timestep-MLP path. A held cache may only be reused for a
+    /// request whose basis is the one it was built from; see [`Self::is_current_for_pruning`].
+    identity: Option<candle_gen::gen_core::pruned_adaln::PruningIdentity>,
 }
 
 impl AdaLnCache {
@@ -510,6 +514,32 @@ impl AdaLnCache {
             schedule,
             layers,
             bytes,
+            identity: None,
+        })
+    }
+
+    /// Assemble a cache from already-projected modulation tables — the direct-curve
+    /// (sc-26684) path, where the projection runs from interpolated table coordinates rather than
+    /// from a timestep MLP. `identity` is the checkpoint's
+    /// [`PruningIdentity`](candle_gen::gen_core::pruned_adaln::PruningIdentity), hashed at load
+    /// over every stored operand; a caller that cannot state it must pass `None` and forgo the
+    /// basis-matched reuse check.
+    pub fn assemble(
+        schedule: TimestepSchedule,
+        layers: Vec<AdaLnModulation>,
+        identity: Option<candle_gen::gen_core::pruned_adaln::PruningIdentity>,
+    ) -> Result<Self> {
+        if layers.is_empty() {
+            return Err(CandleError::Msg(
+                "minimax-h3 adaln cache: the block stack is empty".into(),
+            ));
+        }
+        let bytes = layers.iter().map(AdaLnModulation::nbytes).sum();
+        Ok(Self {
+            schedule,
+            layers,
+            bytes,
+            identity,
         })
     }
 
@@ -614,6 +644,54 @@ impl AdaLnCache {
     /// `false`. It is the check a cross-request cache-reuse seam must run before serving.
     pub fn is_current_for(&self, schedule: &TimestepSchedule) -> bool {
         self.schedule.key() == schedule.key()
+    }
+
+    /// The pruning identity this cache's basis carries, `None` on the stock path.
+    pub fn pruning_identity(
+        &self,
+    ) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+        self.identity
+    }
+
+    /// The full reuse predicate for a held cache: the schedule must be bitwise the one the cache
+    /// was built from **and** the pruning basis must be the one it was projected with.
+    ///
+    /// `expected` is the identity the caller wants served — the loaded checkpoint's
+    /// [`PruningIdentity`](candle_gen::gen_core::pruned_adaln::PruningIdentity). A cache from a
+    /// different checkpoint (same shapes, different table or any reduced weight or folded bias)
+    /// answers `false`; so does a stock cache (`identity: None`) against any curve identity. This
+    /// is the compatibility gate a consumer must pass before serving a held cache.
+    pub fn is_current_for_pruning(
+        &self,
+        schedule: &TimestepSchedule,
+        expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
+    ) -> bool {
+        self.is_current_for(schedule) && self.identity == Some(expected)
+    }
+
+    /// The reuse refusal as a typed error, for callers that must state *why* a held cache was not
+    /// served ([`Self::is_current_for_pruning`] carries the boolean form).
+    pub fn check_current_for_pruning(
+        &self,
+        schedule: &TimestepSchedule,
+        expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
+    ) -> Result<()> {
+        if !self.is_current_for(schedule) {
+            return Err(CandleError::Msg(
+                "minimax-h3 adaln cache: the held cache was built for a different schedule; \
+                 rebuilding is required"
+                    .into(),
+            ));
+        }
+        if self.identity != Some(expected) {
+            return Err(CandleError::Msg(
+                "minimax-h3 adaln cache: the held cache was projected from a different pruning \
+                 basis — the table, a reduced projection or a folded bias differs (content \
+                 identity mismatch, shapes may agree). Rebuilding is required"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The dtype the cached tables carry.
