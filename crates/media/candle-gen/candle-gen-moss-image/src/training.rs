@@ -173,11 +173,7 @@ impl MossImageTrainer {
         .map_err(Into::into)
     }
     fn basic(&self, req: &TrainingRequest) -> Result<()> {
-        validate_request(&self.descriptor, req)?;
-        contract::target_paths(
-            self.sources.config.num_layers,
-            &req.config.lora_target_modules,
-        )?;
+        validate_request(&self.descriptor, req, self.sources.config.num_layers)?;
         self.sources.ensure_unchanged()?;
         check_cancel(&req.cancel)
     }
@@ -297,7 +293,11 @@ impl Trainer for MossImageTrainer {
         result.map_err(Into::into)
     }
 }
-fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+fn validate_request(
+    d: &TrainerDescriptor,
+    req: &TrainingRequest,
+    layers: usize,
+) -> gen_core::Result<()> {
     gen_core::train::validate_control_request(d, req)?;
     gen_core::train::validate_full_finetune_request(d, req)?;
     gen_core::train::validate_training_techniques(d, req)?;
@@ -396,6 +396,7 @@ fn validate_request(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::R
     {
         return Err(refuse("adapter filename must be a single filename"));
     }
+    contract::target_paths(layers, &c.lora_target_modules)?;
     Ok(())
 }
 fn compute_dtype(c: &TrainingConfig) -> gen_core::Result<DType> {
@@ -1261,11 +1262,12 @@ mod control_tests {
     #[test]
     fn controls_are_preserved_or_actionably_refused_not_defaulted() {
         let mut req = request();
+        let layers = MossImageConfig::default().num_layers;
         for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
             let descriptor = descriptor(variant);
             for dtype in ["f32", "fp32", "float32", "bf16", "bfloat16"] {
                 req.config.train_dtype = dtype.into();
-                validate_request(&descriptor, &req).unwrap();
+                validate_request(&descriptor, &req, layers).unwrap();
                 assert_eq!(
                     compute_dtype(&req.config).unwrap(),
                     if dtype.starts_with('b') {
@@ -1283,38 +1285,57 @@ mod control_tests {
                 "weighted",
             ] {
                 req.config.timestep_type = policy.into();
-                validate_request(&descriptor, &req).unwrap();
+                validate_request(&descriptor, &req, layers).unwrap();
                 let a = sigma(&req.config, 73).unwrap();
                 assert_eq!(a, sigma(&req.config, 73).unwrap());
                 assert!(a.is_finite() && (0.0..=1.0).contains(&a));
             }
             req.config.train_dtype = "fp16".into();
-            assert!(validate_request(&descriptor, &req).is_err());
+            assert!(validate_request(&descriptor, &req, layers).is_err());
             req.config.train_dtype = "f32".into();
             req.config.lora_target_modules = vec!["q".into(), "typo".into()];
-            assert!(validate_request(&descriptor, &req).is_err());
+            assert!(validate_request(&descriptor, &req, layers).is_err());
             req.config.lora_target_modules.clear();
             req.config
                 .model_options
                 .insert("unrecognized".into(), serde_json::json!(true));
-            assert!(validate_request(&descriptor, &req).is_err());
+            assert!(validate_request(&descriptor, &req, layers).is_err());
             req.config.model_options.clear();
             req.config.model_options.insert(
                 "vae_posterior".into(),
                 serde_json::json!(contract::POSTERIOR),
             );
-            validate_request(&descriptor, &req).unwrap();
+            validate_request(&descriptor, &req, layers).unwrap();
             for value in [0., f32::NAN, f32::INFINITY] {
                 req.config.alpha = value;
-                assert!(validate_request(&descriptor, &req).is_err());
+                assert!(validate_request(&descriptor, &req, layers).is_err());
             }
             req.config.alpha = 0.375;
             req.config.optimizer = "unknown".into();
-            assert!(validate_request(&descriptor, &req).is_err());
+            assert!(validate_request(&descriptor, &req, layers).is_err());
             req.config.optimizer = "adamw".into();
             req.config.timestep_type = "wrong".into();
-            assert!(validate_request(&descriptor, &req).is_err());
+            assert!(validate_request(&descriptor, &req, layers).is_err());
             req.config.timestep_type = contract::SAMPLER.into();
+        }
+    }
+    #[test]
+    fn target_validation_uses_selected_layer_geometry_without_loading() {
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let descriptor = descriptor(variant);
+            for layers in [1, MossImageConfig::default().num_layers] {
+                let mut req = request();
+                req.config.lora_target_modules = vec![format!("layers.{}.proj.q", layers - 1)];
+                validate_request(&descriptor, &req, layers).unwrap();
+                for invalid in ["typo".into(), format!("layers.{layers}.proj.q")] {
+                    req.config.lora_target_modules = vec!["q".into(), invalid];
+                    assert!(matches!(
+                        validate_request(&descriptor, &req, layers),
+                        Err(gen_core::Error::Unsupported(message))
+                            if message.contains("matches no transformer projection")
+                    ));
+                }
+            }
         }
     }
     #[test]
