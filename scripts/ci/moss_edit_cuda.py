@@ -23,11 +23,12 @@ FLUX = 'candle-gen-flux2'
 ARMS = (
     ('edit', MOSS, ['transformer::edit::tests::frozen_edit_', '--skip', '_cpu'], {
         'transformer::edit::tests::frozen_edit_oracle_cuda',
-        'transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda'}),
+        'transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda'}, set()),
     ('layout', MOSS, ['transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts', '--exact'], {
+        'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}, {
         'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}),
     ('encoder', FLUX, ['vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda', '--exact'], {
-        'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}),
+        'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}, set()),
 )
 COUNTERS = {'GPU Engine(*)\\Utilization Percentage', 'GPU Process Memory(*)\\Dedicated Usage',
             'GPU Process Memory(*)\\Shared Usage', 'GPU Adapter Memory(*)\\Dedicated Usage'}
@@ -344,16 +345,16 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
     binaries = prepared_binaries(output, target)
     (out / 'prepared.json').write_text(json.dumps(binaries, indent=2), encoding='utf-8')
     # These libtest listings execute no test and keep CUDA hidden. Coverage cannot silently shrink.
-    for label, package, filters, expected in ARMS:
+    for label, package, filters, expected, expected_ignored in ARMS:
         binary = checked_binary(binaries[package], target)
         for ignored in (False, True):
             args = [binary, *filters, '--list'] + (['--ignored'] if ignored else [])
             args[0] = checked_binary(binaries[package], target)
             code, output = runner(args, env, out, label + ('-ignored' if ignored else '-list'), remaining())
-            require(code == 0 and listed_tests(output) == (set() if ignored else expected), 'missing/extra/ignored numerical cases')
+            require(code == 0 and listed_tests(output) == (expected_ignored if ignored else expected), 'missing/extra/ignored numerical cases')
     results = []
     collector = str(ROOT / 'scripts/ci/windows-gpu1-diagnostic.ps1')
-    for label, package, filters, expected in ARMS:
+    for label, package, filters, expected, expected_ignored in ARMS:
         validate_reservation(lease, env, now())
         binary = checked_binary(binaries[package], target)
         phase_start = now()
@@ -374,8 +375,9 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
         seconds = lease['testTimeoutSeconds']
         require(remaining() >= seconds, 'reservation does not cover invocation budget')
         gpu_env = dict(env, CUDA_VISIBLE_DEVICES=lease['uuid'], CUDA_DEVICE_ORDER='PCI_BUS_ID', SCENEWORKS_GPU_ID='1', REQUIRE_SM120='1', CARGO_NET_OFFLINE='true')
-        code, output = runner([binary, *filters, '--test-threads', '1', '--nocapture'], gpu_env, out, label + '-tests', seconds)
-        results.append({'arm': label, 'binarySha256': binaries[package]['sha256'], 'expectedTests': sorted(expected),
+        execution_flags = ['--include-ignored'] if expected_ignored else []
+        code, output = runner([binary, *filters, *execution_flags, '--test-threads', '1', '--nocapture'], gpu_env, out, label + '-tests', seconds)
+        results.append({'arm': label, 'binarySha256': binaries[package]['sha256'], 'expectedTests': sorted(expected), 'declaredIgnoredTests': sorted(expected_ignored),
                         'returncode': code, 'passed': successful_cases(code, output, expected),
                         'collectorSha256': digest(evidence_dir / 'evidence.json'), 'finalSnapshotSha256': digest(final_dir / 'evidence.json')})
         (out / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')

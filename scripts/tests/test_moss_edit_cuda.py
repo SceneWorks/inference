@@ -130,7 +130,7 @@ class OrchestrationTests(unittest.TestCase):
         self.root = Path(self.temp.name); self.out = self.root / 'run'; self.out.mkdir()
         self.target = self.root / 'target'; self.target.mkdir()
         self.spec = lease(); self.env = dict(ENV, CARGO_TARGET_DIR=str(self.target))
-        self.calls = []; self.fail_arm = None; self.mutate_arm = None; self.bad_list = False; self.bad_admission = False
+        self.calls = []; self.fail_arm = None; self.mutate_arm = None; self.bad_list = False; self.bad_admission = False; self.ignored_mutation = None; self.skipped_arm = None; self.zero_arm = None
 
     def runner(self, args, env, out, label, seconds, **policy):
         self.calls.append((label, args, env.copy()))
@@ -146,8 +146,10 @@ class OrchestrationTests(unittest.TestCase):
             return 0, '\n'.join(map(json.dumps, rows))
         if label.endswith(('-list', '-ignored')):
             self.assertEqual(env['CUDA_VISIBLE_DEVICES'], '-1')
-            names = next(arm[3] for arm in gate.ARMS if label.startswith(arm[0]))
-            return 0, '' if label.endswith('-ignored') or self.bad_list else '\n'.join(name + ': test' for name in sorted(names))
+            arm = next(arm for arm in gate.ARMS if label.startswith(arm[0]))
+            names = arm[4] if label.endswith('-ignored') else arm[3]
+            if self.ignored_mutation and label == self.ignored_mutation[0]: names = self.ignored_mutation[1]
+            return 0, '' if self.bad_list else '\n'.join(name + ': test' for name in sorted(names))
         if label.endswith(('-collector', '-refresh')):
             self.assertEqual(env['CUDA_VISIBLE_DEVICES'], '-1')
             directory = Path(args[args.index('-OutputDirectory') + 1]); directory.mkdir()
@@ -162,7 +164,9 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(env['CUDA_VISIBLE_DEVICES'], self.spec['uuid']); self.assertEqual(env['SCENEWORKS_GPU_ID'], '1')
         self.assertIn('--test-threads', args); self.assertNotIn('--ignored', args)
         arm = next(arm for arm in gate.ARMS if label == arm[0] + '-tests')
-        self.assertEqual(args[1:-3], arm[2])
+        self.assertEqual(args[1:-3], arm[2] + (['--include-ignored'] if arm[4] else []))
+        if label == self.skipped_arm: return 0, 'test result: ok. 0 passed; 0 failed; 1 ignored;'
+        if label == self.zero_arm: return 0, 'test result: ok. 0 passed; 0 failed; 0 ignored;'
         if label == self.fail_arm: return 1, 'test result: FAILED. 0 passed; 1 failed; 0 ignored;'
         return 0, f'test result: ok. {len(arm[3])} passed; 0 failed; 0 ignored;'
 
@@ -177,6 +181,9 @@ class OrchestrationTests(unittest.TestCase):
         for index, label in enumerate(labels):
             if label.endswith('-tests'): self.assertEqual(labels[index-1], label.replace('-tests', '-refresh'))
         self.assertEqual([len(arm[3]) for arm in gate.ARMS], [2, 1, 1])
+        self.assertEqual([arm[4] for arm in gate.ARMS], [set(), {
+            'transformer::attention_layout_tests::production_attention_cuda_accepts_ordinary_and_dmd_layouts'}, set()])
+        self.assertEqual(sum(len(row['expectedTests']) for row in result), 4)
 
     def test_compilation_disables_ambient_and_config_wrappers_only_in_child_environment(self):
         self.env.update(RUSTC_WRAPPER='ambient-sccache.exe', RUSTC_WORKSPACE_WRAPPER='ambient-workspace.exe',
@@ -204,6 +211,28 @@ class OrchestrationTests(unittest.TestCase):
                 self.out = self.root / mode; self.out.mkdir(); self.calls = []; setattr(self, mode, True)
                 with self.assertRaises(ValueError): self.run_gate()
                 self.assertFalse(any(label.endswith('-tests') for label, _, _ in self.calls)); setattr(self, mode, False)
+
+    def test_ignored_inventory_drift_refuses_before_any_gpu_execution(self):
+        cases = [('edit-ignored', {'transformer::edit::tests::frozen_edit_oracle_cuda'}),
+                 ('layout-ignored', set()),
+                 ('layout-ignored', gate.ARMS[1][4] | {'unexpected_cuda_test'}),
+                 ('encoder-ignored', {'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'})]
+        for index, mutation in enumerate(cases):
+            with self.subTest(mutation=mutation):
+                self.out = self.root / f'ignored-{index}'; self.out.mkdir(); self.calls = []
+                self.ignored_mutation = mutation
+                with self.assertRaisesRegex(ValueError, 'missing/extra/ignored'): self.run_gate()
+                self.assertFalse(any(label.endswith('-tests') for label, _, _ in self.calls))
+
+    def test_skipped_or_zero_executed_layout_cannot_pass(self):
+        for mode in ('skipped_arm', 'zero_arm'):
+            with self.subTest(mode=mode):
+                self.out = self.root / mode; self.out.mkdir(); self.calls = []
+                setattr(self, mode, 'layout-tests')
+                with self.assertRaisesRegex(ValueError, 'numerical arms failed'): self.run_gate()
+                results = json.loads((self.out/'results.json').read_text(encoding='utf-8'))
+                self.assertEqual([row['passed'] for row in results], [True, False, True])
+                setattr(self, mode, None)
 
     def test_tampered_binary_after_final_refresh_is_not_launched(self):
         self.mutate_arm = 'edit'
