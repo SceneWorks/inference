@@ -1581,7 +1581,12 @@ mod edit_fixture_tests {
     // The historical final-only BF16 bound did not compose through CFG and state feedback.
     fn sampler_precision(f: &Value) {
         const FP32_BOUND: f32 = 2e-5;
-        let oracle: Value = serde_json::from_str(include_str!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v4_sampler_analysis/fp32_sampler.json")).unwrap();
+        let mut oracle: Value = serde_json::from_str(include_str!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v4_sampler_analysis/fp32_sampler.json")).unwrap();
+        let extra: Value = serde_json::from_str(include_str!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_multi/fp32_sampler.json")).unwrap();
+        oracle["cases"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra["cases"].as_array().unwrap().iter().cloned());
         let input = &f["inputs"];
         for fp32 in [false, true] {
             let model = fixture_model(f, fp32);
@@ -1726,11 +1731,246 @@ mod edit_fixture_tests {
         }
     }
 
+    fn lifecycle_values(a: &Array) -> Vec<f32> {
+        logical_f32_readback(a).unwrap()
+    }
+    fn lifecycle_delta(a: &Array, b: &Array) -> f32 {
+        checked_delta(
+            &lifecycle_values(a),
+            a.shape(),
+            &lifecycle_values(b),
+            b.shape(),
+        )
+    }
+    // Successive request discriminators execute actual tiny Transformer/LoRA and sampler math.
+    // Fresh model + uncached sampling is an independent lifetime baseline, not a new golden.
+    fn request_local_lifecycle(f: &Value) {
+        let mut changed_backbone = f.clone();
+        let mut changed_adapter = f.clone();
+        for value in changed_backbone["weights"]["final_linear_video.weight"]["values"]
+            .as_array_mut()
+            .unwrap()
+        {
+            *value = serde_json::json!(-value.as_f64().unwrap());
+        }
+        for (name, tensor) in changed_adapter["adapter"].as_object_mut().unwrap() {
+            if name.ends_with("lora_B") {
+                for value in tensor["values"].as_array_mut().unwrap() {
+                    *value = serde_json::json!(-value.as_f64().unwrap());
+                }
+            }
+        }
+        for fp32 in [false, true] {
+            let definitions = [f, &changed_backbone, &changed_adapter];
+            let models: Vec<_> = definitions.iter().map(|f| fixture_model(f, fp32)).collect();
+            let input = &f["inputs"];
+            let refs: Vec<_> = input["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| array(v))
+                .collect();
+            let hidden = array(&input["hidden_states"]);
+            let positive = masked(&input["positive"], &input["positive_mask"]);
+            let negative = masked(&input["negative"], &input["negative_mask"]);
+            let mut baseline = None;
+            // Return to A after each changed count/order/content/duplicate/model/adapter/context,
+            // geometry/noise/CFG request. Both BF16 production boundaries and represented F32.
+            for case in [
+                0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0,
+            ] {
+                let model_index = match case {
+                    6 => 1,
+                    7 => 2,
+                    _ => 0,
+                };
+                let mut references = refs.clone();
+                match case {
+                    1 => references.truncate(1),
+                    2 => references.truncate(2),
+                    3 => references.truncate(3),
+                    4 => references.reverse(),
+                    5 => references[2] = references[0].clone(),
+                    8 => {
+                        references[1] =
+                            multiply(&references[1], Array::from_slice(&[-1.0_f32], &[1])).unwrap()
+                    }
+                    _ => (),
+                }
+                let noise = if case == 9 {
+                    slice_axis(&hidden, 3, 0, 2).unwrap()
+                } else if case == 10 {
+                    add(&hidden, Array::from_slice(&[0.25_f32], &[1])).unwrap()
+                } else {
+                    hidden.clone()
+                };
+                let positive = [if case == 11 {
+                    negative.clone()
+                } else {
+                    positive.clone()
+                }];
+                let negative = [if case == 11 {
+                    array(&input["negative"])
+                } else {
+                    negative.clone()
+                }];
+                let mut resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+                    mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+                    &mlx_gen::gen_core::moss_image_edit::edit_request(
+                        &mlx_gen::GenerationRequest {
+                            width: 48,
+                            height: 32,
+                            steps: Some(2),
+                            guidance: Some(4.),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if case == 12 {
+                    resolved.guidance = 1.;
+                }
+                let fresh = fixture_model(definitions[model_index], fp32);
+                let sample =
+                    |transformer,
+                     use_cache,
+                     cancel: &CancelFlag,
+                     progress: &mut dyn FnMut(mlx_gen::Progress)| {
+                        crate::edit::EditSampling {
+                            transformer,
+                            resolved: &resolved,
+                            positive: &positive,
+                            negative: &negative,
+                            references: &references,
+                            use_cache,
+                        }
+                        .run(&noise, cancel, progress)
+                    };
+                let actual =
+                    sample(&models[model_index], true, &CancelFlag::new(), &mut |_| {}).unwrap();
+                let expected = sample(&fresh, false, &CancelFlag::new(), &mut |_| {}).unwrap();
+                assert_eq!(
+                    lifecycle_values(&actual),
+                    lifecycle_values(&expected),
+                    "fresh uncached baseline case={case} fp32={fp32}"
+                );
+                if case == 0 {
+                    if let Some(original) = &baseline {
+                        assert_eq!(lifecycle_values(&actual), lifecycle_values(original));
+                    } else {
+                        baseline = Some(actual.clone());
+                    }
+                } else if case != 9 {
+                    assert!(lifecycle_delta(&actual, baseline.as_ref().unwrap()) > 2e-3,
+                        "changed request must change real numerical output: case={case} fp32={fp32}");
+                }
+                let cancel = CancelFlag::new();
+                assert!(matches!(
+                    sample(&models[model_index], true, &cancel, &mut |p| {
+                        if matches!(p, mlx_gen::Progress::Step { .. }) {
+                            cancel.cancel();
+                        }
+                    }),
+                    Err(Error::Canceled)
+                ));
+                // Fail inside the actual network after preparing K/V, then enter another run.
+                let bad_context = [slice_axis(&positive[0], 2, 0, 11).unwrap()];
+                assert!(crate::edit::EditSampling {
+                    transformer: &models[model_index],
+                    resolved: &resolved,
+                    positive: &bad_context,
+                    negative: &negative,
+                    references: &references,
+                    use_cache: true,
+                }
+                .run(&noise, &CancelFlag::new(), &mut |_| {})
+                .is_err());
+                let recovered =
+                    sample(&models[model_index], true, &CancelFlag::new(), &mut |_| {}).unwrap();
+                assert_eq!(
+                    lifecycle_values(&recovered),
+                    lifecycle_values(&expected),
+                    "cancel/error reentry case={case}"
+                );
+            }
+            eprintln!("request-local lifecycle fp32={fp32}: 25 changed/reentry requests, each cached/fresh-uncached/cancel/network-error/recovered; 4 reference counts");
+            let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
+                mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
+                &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                    width: 48,
+                    height: 32,
+                    steps: Some(2),
+                    guidance: Some(4.),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let positive_batch = [positive.clone()];
+            let negative_batch = [negative.clone()];
+            crate::model::verify_numerical_renderer_transitions(
+                |mode| {
+                    let ordinary =
+                        mode == mlx_gen::gen_core::moss_image::MossImageAcceleration::Off;
+                    let definition = if ordinary { f } else { &changed_backbone };
+                    let dtype = if ordinary {
+                        Dtype::Bfloat16
+                    } else {
+                        Dtype::Float32
+                    };
+                    let weights = Weights::from_map(
+                        definition["weights"]
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(name, value)| {
+                                (name.clone(), array(value).as_dtype(dtype).unwrap())
+                            })
+                            .collect(),
+                    );
+                    Transformer::load(&weights, models[0].g.clone()).unwrap()
+                },
+                |model| {
+                    lifecycle_values(
+                        &model
+                            .forward(&hidden, &[0.73], &positive_batch, &[], &CancelFlag::new())
+                            .unwrap(),
+                    )
+                },
+                || {
+                    lifecycle_values(
+                        &crate::edit::EditSampling {
+                            transformer: &models[0],
+                            resolved: &resolved,
+                            positive: &positive_batch,
+                            negative: &negative_batch,
+                            references: &refs,
+                            use_cache: true,
+                        }
+                        .run(&hidden, &CancelFlag::new(), &mut |_| {})
+                        .unwrap(),
+                    )
+                },
+            );
+        }
+    }
+
     fn run_oracle(cpu_only: bool) {
-        let f: Value = serde_json::from_str(include_str!(
+        let mut f: Value = serde_json::from_str(include_str!(
             "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_v2/fixture.json"
         ))
         .unwrap();
+        let extra: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_multi/fixture.json"
+        ))
+        .unwrap();
+        assert_eq!(f["weights"], extra["weights"]);
+        assert_eq!(f["adapter"], extra["adapter"]);
+        f["cases"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra["cases"].as_array().unwrap().iter().cloned());
         let weights = Weights::from_map(
             f["weights"]
                 .as_object()
@@ -1847,6 +2087,36 @@ mod edit_fixture_tests {
             compare_bf16(&cached, &case["cached"], "cached prediction");
             compare_bf16(&uncached, &case["uncached"], "uncached prediction");
             for (name, control) in case["controls"].as_object().unwrap() {
+                if refs.len() == 2 && name == "reversed_reference_order" {
+                    // Two-reference source BF16 reversal cannot meet the unchanged 3x
+                    // margin. Exact ordinal RoPE + strict F32 trajectory/mutant gates
+                    // establish order; this still runs the actual reversed BF16 graph.
+                    let reversed: Vec<_> = refs.iter().rev().cloned().collect();
+                    let output = model
+                        .forward_edit(
+                            &hidden,
+                            time,
+                            EditConditioning {
+                                context: &positive,
+                                references: &reversed,
+                                cache: None,
+                            },
+                            &cancel,
+                        )
+                        .unwrap();
+                    compare_bf16(
+                        &output,
+                        &control["output"],
+                        "two-reference reversed BF16 prediction",
+                    );
+                    let difference = lifecycle_delta(&cached, &output);
+                    eprintln!(
+                        "two-reference BF16 order diagnostic: native={difference}, source={}",
+                        control["max_abs_difference"]
+                    );
+                    assert!(difference > 0., "actual BF16 graph must retain order");
+                    continue;
+                }
                 let delta = checked_delta(
                     &logical_f32_readback(&cached).unwrap(),
                     cached.shape(),
@@ -1939,6 +2209,7 @@ mod edit_fixture_tests {
         }
         if !cpu_only {
             sampler_precision(&f);
+            request_local_lifecycle(&f);
         }
         cancel.cancel();
         assert!(matches!(

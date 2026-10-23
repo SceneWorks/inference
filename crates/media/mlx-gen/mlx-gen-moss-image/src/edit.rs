@@ -148,45 +148,12 @@ pub(crate) fn extra_peak(
     inputs: MossImageEditInputs<'_>,
     request: &mlx_gen::GenerationRequest,
 ) -> Result<u64> {
-    let dimensions = inputs.validate()?;
-    let mut total = 0u64;
-    let mut largest_reference_tokens = 0u64;
-    for ([w, h], original) in dimensions.into_iter().zip(inputs.references) {
-        let pixels = w as u64 * h as u64;
-        let tokens = pixels / 256;
-        largest_reference_tokens = largest_reference_tokens.max(tokens);
-        // All reference K/V plus layer workspaces/attention; full FP32 VAE with source staging.
-        let kv = tokens * 3072 * 2 * 2 * 42;
-        let body_tokens = (request.width as u64)
-            .checked_mul(request.height as u64)
-            .map(|n| n / 256)
-            .and_then(|n| {
-                n.checked_add(
-                    request
-                        .moss_image
-                        .as_ref()
-                        .map_or(4096, |o| o.max_sequence_length) as u64,
-                )
-            })
-            .ok_or_else(|| Error::Unsupported("MOSS edit body bound overflow".into()))?;
-        let attention = tokens
-            .checked_mul(
-                tokens
-                    .checked_add(body_tokens)
-                    .ok_or_else(|| Error::Unsupported("MOSS edit sequence overflow".into()))?,
-            )
-            .and_then(|n| n.checked_mul(24 * 4))
-            .ok_or_else(|| Error::Unsupported("MOSS edit attention bound overflow".into()))?;
-        let resize_bytes = (w as u64)
-            .checked_mul(original.height as u64)
-            .and_then(|n| n.checked_mul(3))
-            .and_then(|n| n.checked_add(original.pixels.len() as u64))
-            .ok_or_else(|| Error::Unsupported("MOSS edit resize bound overflow".into()))?;
-        total = total
-            .checked_add(kv + attention + pixels * 384 * 4 * 12)
-            .and_then(|n| n.checked_add(resize_bytes))
-            .ok_or_else(|| Error::Unsupported("MOSS edit bound overflow".into()))?;
-    }
+    let references = MossEditReferenceMemory::checked(inputs)?;
+    let reference_tokens = references.tokens;
+    let total = references
+        .persistent_bytes
+        .checked_add(references.encoder_bytes)
+        .ok_or_else(|| Error::Unsupported("MOSS edit reference bound overflow".into()))?;
     // Edit-only biased projections cast temporarily, never retaining an FP32 backbone.
     // Bound the text embedder plus one evaluated text block: text*d + 4*d*d + 3*d*f
     // weight elements, plus both latent projections (2*latent*d). This exceeds
@@ -201,8 +168,7 @@ pub(crate) fn extra_peak(
         .moss_image
         .as_ref()
         .map_or(4096, |o| o.max_sequence_length) as u64;
-    let image_tokens =
-        (request.width as u64 * request.height as u64 / 256).max(largest_reference_tokens);
+    let image_tokens = (request.width as u64 * request.height as u64 / 256).max(reference_tokens);
     let precise_bytes = text_tokens
         .checked_mul(TEXT + 16 * D + 5 * F)
         .and_then(|n| {
@@ -215,8 +181,31 @@ pub(crate) fn extra_peak(
         })
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| Error::Unsupported("MOSS edit precise projection bound overflow".into()))?;
+    // The ordinary workspace reserves one full F32 B*B matrix. Extend it to
+    // the concatenated reference/body geometry, including all cross-reference terms.
+    // Production BF16 uses fused SDPA; this full matrix also bounds its workspace.
+    let body_tokens = text_tokens
+        .checked_add(request.width as u64 * request.height as u64 / 256)
+        .ok_or_else(|| Error::Unsupported("MOSS edit body scratch overflow".into()))?;
+    // Ordinary scratch scales with body tokens. Reference blocks run on the whole
+    // prefix; reserve the excess linear/FFN activations when R exceeds B.
+    let reference_work = reference_tokens
+        .saturating_sub(body_tokens)
+        .checked_mul(4 * (12 * D + 4 * F))
+        .ok_or_else(|| Error::Unsupported("MOSS edit reference scratch overflow".into()))?;
+    let attention_bytes = references
+        .attention_elements(body_tokens)?
+        .checked_sub(
+            body_tokens
+                .checked_mul(body_tokens)
+                .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?,
+        )
+        .and_then(|n| n.checked_mul(24 * 4))
+        .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?;
     total
         .checked_add(precise_bytes)
+        .and_then(|n| n.checked_add(reference_work))
+        .and_then(|n| n.checked_add(attention_bytes))
         .and_then(|n| n.checked_add(2_000_000_000 + 297_271_296 * 2))
         .ok_or_else(|| Error::Unsupported("MOSS edit bound overflow".into()))
 }

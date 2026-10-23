@@ -1,0 +1,26 @@
+{
+  "python_executable": "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "python_version": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "torch_version": "2.9.1",
+  "diffusers_version": "0.36.0",
+  "scheduler_sha256": "c2f47ed75801a7bd11f43aa793671986b7d382461b8d6e9d60786ca77fa61bca",
+  "frozen_artifacts_sha256": {
+    "tiny_edit/fixture.json": "4a326adbd707bf11ce45f0e0d62d315690e295e067bac12f3c486e932f51475f",
+    "tiny_edit_v1_time_probe/fixture.json": "c2af600c1c966ced4f8485081fc469d4b206a91205db49a7f5400e66204c5985",
+    "tiny_edit_v2/fixture.json": "398b6b2260c15b670655700ed552d4ee935d493af5c9f2a72c85570cd7d121f1",
+    "tiny_edit_v4_sampler_analysis/fp32_sampler.json": "905bef23f86f6bf08e116c716a03051ebbfa4f886d7b3dd9786e68e0d064cf56",
+    "tiny_edit_v4_sampler_analysis/analysis.json": "1e89a8c037569b988a89703c86894c6907da8c9097c92176d94b461663dcf6da"
+  },
+  "original_bf16_and_f32_replay": "exact 1/4 reference trajectories",
+  "generator_sha256": "50a42a2c3f61336d3e76c3a1ed1f78d4b27e08636af1487b62d0970cb4cfa2f3",
+  "parent_unchanged": true,
+  "native_data": false,
+  "real_weights": false,
+  "fixture_sha256": "c346d3af4bf1a977a883c6bcb16f112e416e748a57e164a44989e2c571fd7675",
+  "fp32_sampler_sha256": "c45cdf11bed353e7f5c73fe1a8567be07eb3bafce6b4bd1049d7ffe171f078eb",
+  "source_sha256": {
+    "author": "1dac1aca9feb1bfdfc727a401e4b67d61a505d3190706d1b7d2d784f88678b31",
+    "edit": "f0f5d3011c1f689547d290231a8a50a1c4d16f58c561556b53db60a0edbe9885",
+    "lora": "692f9df723323a95cdb24bbf612c7b6d2a98709cefcbee479e2d7dc57aab0705"
+  }
+}

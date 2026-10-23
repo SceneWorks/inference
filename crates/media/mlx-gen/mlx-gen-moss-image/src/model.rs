@@ -36,6 +36,16 @@ impl<R, P> AttemptState<R, P> {
         self.report = None;
         self.renderer = None;
     }
+    fn release_for_request(&mut self, mode: MossImageAcceleration, edit: bool) -> bool {
+        let release = self
+            .renderer
+            .as_ref()
+            .is_some_and(|(current, _)| edit || *current != mode);
+        if release {
+            self.renderer = None;
+        }
+        release
+    }
     fn select(
         &mut self,
         mode: MossImageAcceleration,
@@ -342,12 +352,7 @@ impl MossImage {
                 }
             }
             // Only the selected immutable renderer may overlap conditioning activations.
-            if state
-                .renderer
-                .as_ref()
-                .is_some_and(|(mode, _)| edit.is_some() || *mode != resolved.acceleration)
-            {
-                state.renderer = None;
+            if state.release_for_request(resolved.acceleration, edit.is_some()) {
                 mlx_gen::residency::drain_allocator_cache();
             }
             let batch = inputs
@@ -883,6 +888,48 @@ mod cpu_tests {
                 .unwrap()
                 .acceleration,
             MossImageAcceleration::Off
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn verify_numerical_renderer_transitions(
+    mut build: impl FnMut(MossImageAcceleration) -> Transformer,
+    mut predict: impl FnMut(&Transformer) -> Vec<f32>,
+    mut edit: impl FnMut() -> Vec<f32>,
+) {
+    let mut state: AttemptState<Transformer, ()> = AttemptState {
+        renderer: None,
+        report: None,
+    };
+    let expected_edit = edit();
+    // The same release/select boundary used by generate_inner: ordinary -> edit ->
+    // full-F32 DMD -> edit -> ordinary, using real numerical tiny transformers.
+    let mut ordinary = None;
+    for mode in [
+        MossImageAcceleration::Off,
+        MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
+        MossImageAcceleration::Off,
+    ] {
+        state.begin();
+        state.release_for_request(mode, false);
+        let actual = predict(state.select(mode, || Ok(build(mode))).unwrap());
+        assert_eq!(actual, predict(&build(mode)));
+        if mode == MossImageAcceleration::Off {
+            if let Some(baseline) = &ordinary {
+                assert_eq!(&actual, baseline);
+            } else {
+                ordinary = Some(actual);
+            }
+        } else {
+            assert_ne!(&actual, ordinary.as_ref().unwrap());
+        }
+        assert!(state.release_for_request(MossImageAcceleration::Off, true));
+        assert!(state.renderer.is_none());
+        assert_eq!(edit(), expected_edit);
+        assert!(
+            state.renderer.is_none(),
+            "request-local edit must not become ordinary residency"
         );
     }
 }

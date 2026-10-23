@@ -10,6 +10,17 @@ fn fixture(name: &str) -> Value {
         .join(name);
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
+fn multi_fixture() -> Value {
+    let mut f = fixture("tiny_edit_v2/fixture.json");
+    let extra = fixture("tiny_edit_multi/fixture.json");
+    assert_eq!(f["weights"], extra["weights"]);
+    assert_eq!(f["adapter"], extra["adapter"]);
+    f["cases"]
+        .as_array_mut()
+        .unwrap()
+        .extend(extra["cases"].as_array().unwrap().iter().cloned());
+    f
+}
 fn array(v: &Value, device: &Device) -> Tensor {
     let shape: Vec<usize> = serde_json::from_value(v["shape"].clone()).unwrap();
     let values: Vec<f32> = serde_json::from_value(v["values"].clone()).unwrap();
@@ -220,7 +231,14 @@ fn time_probes(model: &Transformer, f: &Value, device: &Device) {
 }
 fn sampler_precision(f: &Value, device: &Device, fp32: bool) {
     const F32_BOUND: f32 = 2e-5;
-    let oracle = fixture("tiny_edit_v4_sampler_analysis/fp32_sampler.json");
+    let mut oracle = fixture("tiny_edit_v4_sampler_analysis/fp32_sampler.json");
+    oracle["cases"].as_array_mut().unwrap().extend(
+        fixture("tiny_edit_multi/fp32_sampler.json")["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
     let input = &f["inputs"];
     let model = model(f, device, fp32);
     for case in f["cases"].as_array().unwrap() {
@@ -340,8 +358,209 @@ fn sampler_precision(f: &Value, device: &Device, fp32: bool) {
         }
     }
 }
+// Successive request discriminators execute actual tiny Transformer/LoRA and sampler math.
+// Fresh model + uncached sampling is an independent lifetime baseline, not a new golden.
+fn request_local_lifecycle(f: &Value, device: &Device) {
+    let mut changed_backbone = f.clone();
+    let mut changed_adapter = f.clone();
+    for value in changed_backbone["weights"]["final_linear_video.weight"]["values"]
+        .as_array_mut()
+        .unwrap()
+    {
+        *value = serde_json::json!(-value.as_f64().unwrap());
+    }
+    for (name, tensor) in changed_adapter["adapter"].as_object_mut().unwrap() {
+        if name.ends_with("lora_B") {
+            for value in tensor["values"].as_array_mut().unwrap() {
+                *value = serde_json::json!(-value.as_f64().unwrap());
+            }
+        }
+    }
+    for fp32 in [false, true] {
+        let definitions = [f, &changed_backbone, &changed_adapter];
+        let models: Vec<_> = definitions.iter().map(|f| model(f, device, fp32)).collect();
+        let input = &f["inputs"];
+        let refs: Vec<_> = input["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| array(v, device))
+            .collect();
+        let hidden = array(&input["hidden_states"], device);
+        let positive = masked(&input["positive"], &input["positive_mask"], device);
+        let negative = masked(&input["negative"], &input["negative_mask"], device);
+        let mut baseline = None;
+        // Return to A after each changed count/order/content/duplicate/model/adapter/context,
+        // geometry/noise/CFG request. Both BF16 production boundaries and represented F32.
+        for case in [
+            0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0,
+        ] {
+            let model_index = match case {
+                6 => 1,
+                7 => 2,
+                _ => 0,
+            };
+            let mut references = refs.clone();
+            match case {
+                1 => references.truncate(1),
+                2 => references.truncate(2),
+                3 => references.truncate(3),
+                4 => references.reverse(),
+                5 => references[2] = references[0].clone(),
+                8 => references[1] = (&references[1] * -1.).unwrap(),
+                _ => (),
+            }
+            let noise = if case == 9 {
+                hidden.narrow(3, 0, 2).unwrap()
+            } else if case == 10 {
+                (&hidden + 0.25).unwrap()
+            } else {
+                hidden.clone()
+            };
+            let positive = [if case == 11 {
+                negative.clone()
+            } else {
+                positive.clone()
+            }];
+            let negative = [if case == 11 {
+                array(&input["negative"], device)
+            } else {
+                negative.clone()
+            }];
+            let mut resolved = resolved();
+            if case == 12 {
+                resolved.guidance = 1.;
+            }
+            let fresh = model(definitions[model_index], device, fp32);
+            let sample = |transformer,
+                          use_cache,
+                          cancel: &CancelFlag,
+                          progress: &mut dyn FnMut(Progress)| {
+                crate::edit::EditSampling {
+                    transformer,
+                    resolved: &resolved,
+                    positive: &positive,
+                    negative: &negative,
+                    references: &references,
+                    use_cache,
+                    images_per_prompt: 1,
+                }
+                .run(&noise, cancel, progress)
+            };
+            let actual =
+                sample(&models[model_index], true, &CancelFlag::new(), &mut |_| {}).unwrap();
+            let expected = sample(&fresh, false, &CancelFlag::new(), &mut |_| {}).unwrap();
+            assert_eq!(
+                values(&actual),
+                values(&expected),
+                "fresh uncached baseline case={case} fp32={fp32}"
+            );
+            if case == 0 {
+                if let Some(original) = &baseline {
+                    assert_eq!(values(&actual), values(original));
+                } else {
+                    baseline = Some(actual.clone());
+                }
+            } else if case != 9 {
+                assert!(
+                    delta(&actual, baseline.as_ref().unwrap()) > 2e-3,
+                    "changed request must change real numerical output: case={case} fp32={fp32}"
+                );
+            }
+            let cancel = CancelFlag::new();
+            assert!(matches!(
+                sample(&models[model_index], true, &cancel, &mut |p| {
+                    if matches!(p, Progress::Step { .. }) {
+                        cancel.cancel();
+                    }
+                }),
+                Err(CandleError::Canceled)
+            ));
+            // Fail inside the actual network after preparing K/V, then enter another run.
+            let bad_context = [positive[0].narrow(2, 0, 11).unwrap()];
+            assert!(crate::edit::EditSampling {
+                transformer: &models[model_index],
+                resolved: &resolved,
+                positive: &bad_context,
+                negative: &negative,
+                references: &references,
+                use_cache: true,
+                images_per_prompt: 1,
+            }
+            .run(&noise, &CancelFlag::new(), &mut |_| {})
+            .is_err());
+            let recovered =
+                sample(&models[model_index], true, &CancelFlag::new(), &mut |_| {}).unwrap();
+            assert_eq!(
+                values(&recovered),
+                values(&expected),
+                "cancel/error reentry case={case}"
+            );
+        }
+        eprintln!("request-local lifecycle fp32={fp32}: 25 changed/reentry requests, each cached/fresh-uncached/cancel/network-error/recovered; 4 reference counts");
+        let resolved = resolved();
+        let positive_batch = [positive.clone()];
+        let negative_batch = [negative.clone()];
+        crate::verify_numerical_renderer_transitions(
+            device,
+            |mode| {
+                let definition = if mode == MossImageAcceleration::Off {
+                    f
+                } else {
+                    &changed_backbone
+                };
+                let dtype = if mode == MossImageAcceleration::Off {
+                    DType::BF16
+                } else {
+                    DType::F32
+                };
+                let weights = Weights::from_map(
+                    definition["weights"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, value)| {
+                            (name.clone(), array(value, device).to_dtype(dtype).unwrap())
+                        })
+                        .collect(),
+                );
+                Transformer::load(&weights, models[0].g, None).unwrap()
+            },
+            |model| {
+                values(
+                    &model
+                        .forward(
+                            &hidden,
+                            0.73,
+                            &positive,
+                            &vec![1; positive.dim(1).unwrap()],
+                            &[],
+                            &CancelFlag::new(),
+                        )
+                        .unwrap(),
+                )
+            },
+            || {
+                values(
+                    &crate::edit::EditSampling {
+                        transformer: &models[0],
+                        resolved: &resolved,
+                        positive: &positive_batch,
+                        negative: &negative_batch,
+                        references: &refs,
+                        use_cache: true,
+                        images_per_prompt: 1,
+                    }
+                    .run(&hidden, &CancelFlag::new(), &mut |_| {})
+                    .unwrap(),
+                )
+            },
+        );
+    }
+}
+
 fn run(device: &Device) {
-    let f = fixture("tiny_edit_v2/fixture.json");
+    let f = multi_fixture();
     let model = model(&f, device, false);
     let probe = &f["projection_probe"];
     let projection = model.layers[0]
@@ -433,6 +652,36 @@ fn run(device: &Device) {
             "negative context",
         );
         for (name, control) in case["controls"].as_object().unwrap() {
+            if refs.len() == 2 && name == "reversed_reference_order" {
+                // Source itself has only .0923 separation at a .1948 three-bound margin.
+                // Preserve the BF16 bound; order is gated by exact RoPE + strict F32
+                // trajectory/mutant checks. Also execute and retain real BF16 reversal.
+                let reversed: Vec<_> = refs.iter().rev().cloned().collect();
+                let output = model
+                    .forward_edit(
+                        &hidden,
+                        time,
+                        EditConditioning {
+                            context: &positive,
+                            references: &reversed,
+                            cache: None,
+                        },
+                        &cancel,
+                    )
+                    .unwrap();
+                compare_bf16(
+                    &output,
+                    &control["output"],
+                    "two-reference reversed BF16 prediction",
+                );
+                let difference = delta(&cached, &output);
+                eprintln!(
+                    "two-reference BF16 order diagnostic: native={difference}, source={}",
+                    control["max_abs_difference"]
+                );
+                assert!(difference > 0., "actual BF16 graph must retain order");
+                continue;
+            }
             assert!(
                 delta(&cached, &array(&control["output"], device))
                     > 3. * bf16_bound(&case["cached"]),
@@ -477,6 +726,7 @@ fn run(device: &Device) {
         assert_eq!(values(&sampled), values(&reentry));
     }
     sampler_precision(&f, device, false);
+    request_local_lifecycle(&f, device);
     cancel.cancel();
     assert!(matches!(
         model.prepare_edit_cache(&references, &cancel),
@@ -498,7 +748,7 @@ fn frozen_edit_oracle_cuda() {
 
 #[test]
 fn frozen_edit_strict_f32_sampler_cpu() {
-    sampler_precision(&fixture("tiny_edit_v2/fixture.json"), &Device::Cpu, true);
+    sampler_precision(&multi_fixture(), &Device::Cpu, true);
 }
 #[cfg(feature = "cuda")]
 #[test]
@@ -506,7 +756,7 @@ fn frozen_edit_strict_f32_sampler_cuda() {
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32());
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_bf16());
     sampler_precision(
-        &fixture("tiny_edit_v2/fixture.json"),
+        &multi_fixture(),
         &Device::new_cuda(0).expect("admitted CUDA lane logical device 0"),
         true,
     );

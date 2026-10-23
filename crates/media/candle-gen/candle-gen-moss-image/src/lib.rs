@@ -27,6 +27,22 @@ struct State {
     edit_report: Option<MossImageEditExecutionReport>,
 }
 impl State {
+    fn release_for_request(
+        &mut self,
+        mode: MossImageAcceleration,
+        edit: bool,
+        synchronize: impl FnOnce() -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<bool> {
+        let release = self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| edit || renderer.mode != mode);
+        if release {
+            synchronize()?;
+            self.renderer = None;
+        }
+        Ok(release)
+    }
     fn select_renderer(
         &mut self,
         mode: MossImageAcceleration,
@@ -255,16 +271,11 @@ impl MossImageGenerator {
         }
         // Release a differently keyed renderer before conditioning, so its old residency cannot
         // overlap the new route's conditioning workspace after warm-budget credit is applied.
-        if state
-            .renderer
-            .as_ref()
-            .is_some_and(|renderer| edit.is_some() || renderer.mode != r.acceleration)
-        {
+        state.release_for_request(r.acceleration, edit.is_some(), || {
             self.device
                 .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
-        }
+                .map_err(candle_gen::CandleError::from)
+        })?;
         if staged {
             self.device
                 .synchronize()
@@ -771,3 +782,56 @@ fn witness_sft(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn verify_numerical_renderer_transitions(
+    device: &Device,
+    mut build: impl FnMut(MossImageAcceleration) -> transformer::Transformer,
+    mut predict: impl FnMut(&transformer::Transformer) -> Vec<f32>,
+    mut edit: impl FnMut() -> Vec<f32>,
+) {
+    let mut state = State::default();
+    let expected_edit = edit();
+    let mut ordinary = None;
+    for mode in [
+        MossImageAcceleration::Off,
+        MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
+        MossImageAcceleration::Off,
+    ] {
+        state
+            .release_for_request(mode, false, || Ok(device.synchronize()?))
+            .unwrap();
+        state
+            .select_renderer(mode, || {
+                Ok(pipeline::Renderer {
+                    mode,
+                    transformer: build(mode),
+                    dataspace: None,
+                    adapter_reports: vec![],
+                })
+            })
+            .unwrap();
+        let actual = predict(&state.renderer.as_ref().unwrap().transformer);
+        assert_eq!(actual, predict(&build(mode)));
+        if mode == MossImageAcceleration::Off {
+            if let Some(baseline) = &ordinary {
+                assert_eq!(&actual, baseline);
+            } else {
+                ordinary = Some(actual);
+            }
+        } else {
+            assert_ne!(&actual, ordinary.as_ref().unwrap());
+        }
+        assert!(state
+            .release_for_request(MossImageAcceleration::Off, true, || Ok(
+                device.synchronize()?
+            ))
+            .unwrap());
+        assert!(state.renderer.is_none());
+        assert_eq!(edit(), expected_edit);
+        assert!(
+            state.renderer.is_none(),
+            "request-local edit must not become ordinary residency"
+        );
+    }
+}
