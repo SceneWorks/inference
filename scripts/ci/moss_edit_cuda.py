@@ -269,7 +269,6 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
                 time.sleep(min(0.05, drain_deadline - observed))
             require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound')
-            return child.returncode, paths[0].read_text(encoding='utf-8', errors='replace')
         except BaseException as error:
             receipt['error'] = str(error)
             raise
@@ -281,6 +280,7 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 receipt['remainingOwnedPids'] = sorted(job.members())
                 require(not receipt['remainingOwnedPids'], 'owned cleanup incomplete')
                 receipt['cleanupCompletedUtc'] = utc().isoformat()
+                require(all(path.stat().st_size <= MAX_LOG for path in paths), 'owned output exceeded bound after cleanup')
             except BaseException as error:
                 receipt['cleanupError'] = str(error)
                 raise
@@ -288,6 +288,8 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 job.close()
                 receipt['finishedUtc'] = utc().isoformat()
                 (out / (label + '.owned.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+    # No retained descendant can append to the accepted compiler output snapshot.
+    return child.returncode, paths[0].read_text(encoding='utf-8', errors='replace')
 
 
 def prepared_binaries(output, target):

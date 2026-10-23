@@ -273,7 +273,7 @@ class OwnershipTests(unittest.TestCase):
 
 
     def test_compile_finalization_requires_completed_owned_cleanup(self):
-        for mode in ('success', 'nonzero', 'cleanup-error', 'cleanup-survivor', 'timeout', 'query-error', 'deadline'):
+        for mode in ('success', 'nonzero', 'cleanup-error', 'cleanup-survivor', 'timeout', 'query-error', 'deadline', 'final-output', 'output-overflow'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 clock = [0.0]; events = []; queried = [False]
                 class Child:
@@ -291,6 +291,8 @@ class OwnershipTests(unittest.TestCase):
                         events.append('owned-job-finalize')
                         if mode == 'cleanup-error': raise RuntimeError('cleanup failed')
                         if mode != 'cleanup-survivor': self.live = False
+                        if mode in ('final-output', 'output-overflow'):
+                            (Path(directory)/'compile.stdout.log').write_text('final output', encoding='utf-8')
                     def close(self): events.append('closed')
                 def sleep(seconds): clock[0] += seconds
                 def invoke():
@@ -298,20 +300,24 @@ class OwnershipTests(unittest.TestCase):
                                           1 if mode == 'deadline' else 2,
                                           finalize_compile_descendants=True, job_type=Job,
                                           popen=lambda *args, **kwargs: Child())
-                with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.time, 'sleep', side_effect=sleep):
-                    if mode in ('success', 'nonzero'):
-                        code, _ = invoke(); events.append('returned')
+                with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.time, 'sleep', side_effect=sleep), patch.object(gate, 'MAX_LOG', 3 if mode == 'output-overflow' else gate.MAX_LOG):
+                    if mode in ('success', 'nonzero', 'final-output'):
+                        code, output = invoke(); events.append('returned')
+                        self.assertEqual(output, 'final output' if mode == 'final-output' else '')
                         self.assertEqual(code, 7 if mode == 'nonzero' else 0)
                         self.assertEqual(events, ['assigned', 'owned-job-finalize', 'closed', 'returned'])
                     else:
                         with self.assertRaises((ValueError, RuntimeError)): invoke()
                 receipt = json.loads((Path(directory)/'compile.owned.json').read_text(encoding='utf-8'))
                 self.assertTrue(receipt['finalizeCompileDescendants'])
-                if mode in ('success', 'nonzero'):
+                if mode in ('success', 'nonzero', 'final-output'):
                     self.assertEqual(receipt['preCleanupOwnedPids'], [456])
                     self.assertEqual(receipt['remainingOwnedPids'], [])
                     self.assertIn('cleanupCompletedUtc', receipt)
                     self.assertNotIn('error', receipt)
+                if mode == 'output-overflow':
+                    self.assertEqual(receipt['cleanupError'], 'owned output exceeded bound after cleanup')
+                    self.assertEqual(receipt['remainingOwnedPids'], [])
                 if mode.startswith('cleanup-'):
                     self.assertIn('cleanupError', receipt)
                     self.assertNotIn('cleanupCompletedUtc', receipt)
