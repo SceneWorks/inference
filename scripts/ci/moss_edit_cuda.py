@@ -218,13 +218,15 @@ def validate_final(record, previous, lease, env, now):
             require(row['path'].casefold() == prior[pid]['path'].casefold(), 'known path changed after counters')
 
 
-def run_owned(args, env, out, label, seconds, *, job_type=WindowsJob, popen=subprocess.Popen):
+def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=False, job_type=WindowsJob, popen=subprocess.Popen):
     """Spawn suspended; only the retained Job/child handles may be terminated."""
     require(seconds > 0, 'execution deadline expired')
+    require(not finalize_compile_descendants or label == 'compile', 'descendant finalization is compile-only')
     paths = [out / (label + suffix) for suffix in ('.stdout.log', '.stderr.log')]
     with paths[0].open('wb') as stdout, paths[1].open('wb') as stderr:
         job, child = job_type(), None
-        receipt = {'argv': args, 'startedUtc': utc().isoformat(), 'assigned': False}
+        receipt = {'argv': args, 'startedUtc': utc().isoformat(), 'assigned': False,
+                   'finalizeCompileDescendants': finalize_compile_descendants}
         started = time.monotonic()
         try:
             child = popen(args, cwd=ROOT, env=env, stdout=stdout, stderr=stderr, creationflags=0x00000004)
@@ -253,6 +255,13 @@ def run_owned(args, env, out, label, seconds, *, job_type=WindowsJob, popen=subp
                 receipt['jobDrainObservations'].append({
                     'elapsedSeconds': round(observed - started, 6), 'pids': members,
                 })
+                # Cargo may leave owned descendants after a completed build. Only this
+                # compile policy may finalize them through the retained Job in finally;
+                # that cleanup must succeed before Python can return the result.
+                if finalize_compile_descendants:
+                    require(observed < started + seconds, 'owned command deadline exceeded during compile drain')
+                    if observed >= drain_deadline or attempt == 20:
+                        break
                 require(observed <= drain_deadline, 'owned Job drain deadline exceeded')
                 if not members:
                     break
@@ -271,6 +280,7 @@ def run_owned(args, env, out, label, seconds, *, job_type=WindowsJob, popen=subp
                     job.terminate_and_reap(child, 10)
                 receipt['remainingOwnedPids'] = sorted(job.members())
                 require(not receipt['remainingOwnedPids'], 'owned cleanup incomplete')
+                receipt['cleanupCompletedUtc'] = utc().isoformat()
             except BaseException as error:
                 receipt['cleanupError'] = str(error)
                 raise
@@ -325,7 +335,7 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
     target = Path(env['CARGO_TARGET_DIR'])
     remaining = lambda: (timestamp(lease['expiresUtc']) - now()).total_seconds()
     command = ['cargo', 'test', '--locked', '--lib', '-p', MOSS, '-p', FLUX, '--features', 'cuda', '--no-run', '--message-format=json']
-    code, output = runner(command, env, out, 'compile', remaining())
+    code, output = runner(command, env, out, 'compile', remaining(), finalize_compile_descendants=True)
     require(code == 0, 'test compilation failed')
     binaries = prepared_binaries(output, target)
     (out / 'prepared.json').write_text(json.dumps(binaries, indent=2), encoding='utf-8')

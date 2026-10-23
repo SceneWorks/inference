@@ -132,10 +132,12 @@ class OrchestrationTests(unittest.TestCase):
         self.spec = lease(); self.env = dict(ENV, CARGO_TARGET_DIR=str(self.target))
         self.calls = []; self.fail_arm = None; self.mutate_arm = None; self.bad_list = False; self.bad_admission = False
 
-    def runner(self, args, env, out, label, seconds):
+    def runner(self, args, env, out, label, seconds, **policy):
         self.calls.append((label, args, env.copy()))
         self.assertGreater(seconds, 0)
+        self.assertEqual(policy, {'finalize_compile_descendants': True} if label == 'compile' else {})
         if label == 'compile':
+            if self.fail_arm == 'compile': return 1, ''
             self.assertEqual(env['CUDA_VISIBLE_DEVICES'], '-1'); self.assertIn('--no-run', args)
             rows = []
             for package in (gate.MOSS, gate.FLUX):
@@ -188,6 +190,11 @@ class OrchestrationTests(unittest.TestCase):
         self.mutate_arm = 'edit'
         with self.assertRaisesRegex(ValueError, 'binary changed'): self.run_gate()
         self.assertFalse(any(label.endswith('-tests') for label, _, _ in self.calls))
+
+    def test_nonzero_compile_stops_before_listing_or_gpu(self):
+        self.fail_arm = 'compile'
+        with self.assertRaisesRegex(ValueError, 'test compilation failed'): self.run_gate()
+        self.assertEqual([label for label, _, _ in self.calls], ['compile'])
 
     def test_nonzero_test_exit_is_aggregated_without_masking_failure(self):
         self.fail_arm = 'edit-tests'
@@ -263,6 +270,53 @@ class OwnershipTests(unittest.TestCase):
                 if mode == 'query-error':
                     self.assertEqual(receipt['error'], 'Job query failed')
                     self.assertEqual(receipt['jobDrainObservations'], [])
+
+
+    def test_compile_finalization_requires_completed_owned_cleanup(self):
+        for mode in ('success', 'nonzero', 'cleanup-error', 'cleanup-survivor', 'timeout', 'query-error', 'deadline'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                clock = [0.0]; events = []; queried = [False]
+                class Child:
+                    pid = 123
+                    returncode = 7 if mode == 'nonzero' else 0
+                    def poll(self): return None if mode == 'timeout' else self.returncode
+                class Job:
+                    def __init__(self): self.live = True
+                    def assign_and_resume(self, child): events.append('assigned')
+                    def members(self):
+                        if mode == 'query-error' and not queried[0]:
+                            queried[0] = True; raise RuntimeError('query failed')
+                        return {456} if self.live else set()
+                    def terminate_and_reap(self, child, grace):
+                        events.append('owned-job-finalize')
+                        if mode == 'cleanup-error': raise RuntimeError('cleanup failed')
+                        if mode != 'cleanup-survivor': self.live = False
+                    def close(self): events.append('closed')
+                def sleep(seconds): clock[0] += seconds
+                def invoke():
+                    return gate.run_owned(['cargo', 'test'], {}, Path(directory), 'compile',
+                                          1 if mode == 'deadline' else 2,
+                                          finalize_compile_descendants=True, job_type=Job,
+                                          popen=lambda *args, **kwargs: Child())
+                with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.time, 'sleep', side_effect=sleep):
+                    if mode in ('success', 'nonzero'):
+                        code, _ = invoke(); events.append('returned')
+                        self.assertEqual(code, 7 if mode == 'nonzero' else 0)
+                        self.assertEqual(events, ['assigned', 'owned-job-finalize', 'closed', 'returned'])
+                    else:
+                        with self.assertRaises((ValueError, RuntimeError)): invoke()
+                receipt = json.loads((Path(directory)/'compile.owned.json').read_text(encoding='utf-8'))
+                self.assertTrue(receipt['finalizeCompileDescendants'])
+                if mode in ('success', 'nonzero'):
+                    self.assertEqual(receipt['preCleanupOwnedPids'], [456])
+                    self.assertEqual(receipt['remainingOwnedPids'], [])
+                    self.assertIn('cleanupCompletedUtc', receipt)
+                    self.assertNotIn('error', receipt)
+                if mode.startswith('cleanup-'):
+                    self.assertIn('cleanupError', receipt)
+                    self.assertNotIn('cleanupCompletedUtc', receipt)
+        with self.assertRaisesRegex(ValueError, 'compile-only'):
+            gate.run_owned(['test'], {}, Path('.'), 'edit-tests', 1, finalize_compile_descendants=True)
 
 
 class WorkflowTests(unittest.TestCase):
