@@ -16,7 +16,6 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::subtract;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
@@ -88,22 +87,35 @@ fn index_array(json: &serde_json::Value, key: &str) -> Array {
     Array::from_slice(&vals, &[vals.len() as i32])
 }
 
-/// Absolute max difference between an MLX array (flattened) and a host f32 slice.
-fn max_abs_diff(got: &Array, want: &[f32]) -> f32 {
-    let got = got
+/// Read the flattened f32 values of `got` and their absolute difference against `want`, rejecting
+/// any non-finite value on either side. A bare `max`-fold would silently ignore NaNs (`f32::max`
+/// returns the other argument), so finiteness is checked first and the max runs only over finite
+/// elements.
+fn finite_max_abs_diff(got: &Array, want: &[f32]) -> f32 {
+    let count = got.shape().iter().product::<i32>() as usize;
+    let got: Vec<f32> = got
         .as_dtype(Dtype::Float32)
         .unwrap()
-        .reshape(&[got.shape().iter().product::<i32>()])
-        .unwrap();
-    let want = Array::from_slice(want, &[want.len() as i32]);
-    subtract(&got, &want).unwrap().abs().unwrap().max(None).unwrap().item()
+        .reshape(&[count as i32])
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    assert!(got.iter().all(|v| v.is_finite()), "native output contains a non-finite value");
+    assert!(want.iter().all(|v| v.is_finite()), "oracle contains a non-finite value");
+    got.iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn assert_abs(got: &Array, want: &[f32], tol: f32, what: &str) {
     let count = got.shape().iter().product::<i32>() as usize;
     assert_eq!(count, want.len(), "{what}: element count {count} vs {}", want.len());
-    let diff = max_abs_diff(got, want);
-    assert!(diff < tol, "{what}: abs max diff {diff:.3e} exceeds {tol:.1e}");
+    let diff = finite_max_abs_diff(got, want);
+    assert!(
+        diff < tol && diff.is_finite(),
+        "{what}: abs max diff {diff:.3e} exceeds {tol:.1e}"
+    );
 }
 
 fn gather(x: &Array, rows: &[i32]) -> Array {
