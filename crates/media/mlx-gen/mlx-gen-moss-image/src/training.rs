@@ -812,7 +812,7 @@ impl LoadedTrainer {
         let fingerprint = contract::recovery::effective_identity(
             req,
             &self.sources.source_identity(self.variant),
-            &plan,
+            plan,
         )?;
         self.sources.ensure_unchanged()?;
         self.admit(req, Phase::Cast)?;
@@ -1011,7 +1011,7 @@ impl LoadedTrainer {
         if c.resume {
             self.admit(req, Phase::Checkpoint)?;
             let (state, loaded, pending) =
-                recovery::load_complete(req, stem, &plan, &fingerprint, &mut opt, &params)?;
+                recovery::load_complete(req, stem, plan, &fingerprint, &mut opt, &params)?;
             params = loaded;
             accumulated = pending;
             accumulated_tokens = state.accumulated_tokens;
@@ -1167,7 +1167,7 @@ impl LoadedTrainer {
                 )?;
                 let state = contract::recovery::RunState::after_step(
                     req,
-                    &plan,
+                    plan,
                     &fingerprint,
                     step,
                     update,
@@ -1262,7 +1262,7 @@ impl LoadedTrainer {
         if c.save_every > 0 || c.resume {
             let state = contract::recovery::RunState::after_step(
                 req,
-                &plan,
+                plan,
                 &fingerprint,
                 c.steps,
                 update,
