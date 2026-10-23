@@ -709,7 +709,7 @@ impl SanaBlock {
             budget,
             hidden.dtype(),
         ));
-        mlx_gen::ios_quantum::run("SANA block", scratch, || {
+        mlx_gen::ios_quantum::run(crate::quantum::labels::BLOCK, scratch, || {
             // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
             let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
             let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
@@ -996,6 +996,18 @@ impl SanaTransformer {
         self.blocks.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_block_stream(&self) -> bool {
+        self.block_stream.is_some()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        std::iter::once(&self.caption_norm)
+            .chain(self.blocks.iter().map(|b| &b.scale_shift_table))
+            .collect()
+    }
+
     /// Forward one denoise step.
     ///
     /// * `latent_nchw` — `[B, in_channels, H, W]` (channels-first, diffusers-native).
@@ -1060,10 +1072,40 @@ impl SanaTransformer {
         let p = cfg.patch_size;
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-trunk",
+            &[
+                ("schema", 1),
+                ("batch", b as u64),
+                ("height", height as u64),
+                ("width", width as u64),
+                ("channels", lsh[1] as u64),
+                ("caption_tokens", caption.shape()[1] as u64),
+                ("caption_width", caption.shape()[2] as u64),
+                ("layers", self.blocks.len() as u64),
+                ("dim", cfg.inner_dim() as u64),
+                ("patch", p as u64),
+                ("qk_norm", u64::from(cfg.qk_norm)),
+                ("guidance_embeds", u64::from(cfg.guidance_embeds)),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(dt)),
+                ("caption_mask", u64::from(caption_mask.is_some())),
+                ("streamed", u64::from(plan.window.is_some())),
+                (
+                    "query_rows",
+                    plan.attention.query_block(
+                        b,
+                        cfg.num_cross_attention_heads,
+                        ph * pw,
+                        caption.shape()[1],
+                    ) as u64,
+                ),
+            ],
+        );
         // The previous step's CFG combine + sampler update is lazy and materializes here.
         mlx_gen::ios_quantum::before(
-            "SANA patch/caption/timestep",
+            crate::quantum::labels::ENTRY,
             crate::quantum::entry_bytes(self.entry_quantum(
                 latent_nchw.shape(),
                 caption.shape(),
@@ -1077,7 +1119,7 @@ impl SanaTransformer {
         let (mut hidden, caption, temb, emb) =
             self.entry(latent_nchw, caption, timestep, guidance)?;
         mlx_gen::ios_quantum::finish(
-            "SANA patch/caption/timestep",
+            crate::quantum::labels::ENTRY,
             &[&hidden, &caption, &temb, &emb],
         )?;
 
@@ -1120,11 +1162,11 @@ impl SanaTransformer {
             return Err(Error::Canceled);
         }
         mlx_gen::ios_quantum::before(
-            "SANA output projection",
+            crate::quantum::labels::OUTPUT,
             crate::quantum::output_bytes(self.output_quantum(b, ph * pw, hidden.dtype())),
         )?;
         let out = self.output(&hidden, &emb, b, ph, pw)?;
-        mlx_gen::ios_quantum::finish("SANA output projection", &[&out])?;
+        mlx_gen::ios_quantum::finish(crate::quantum::labels::OUTPUT, &[&out])?;
         Ok(out)
     }
 
@@ -1653,6 +1695,7 @@ pub(crate) mod quantum_proofs {
     }
 
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn trunk_quanta_track_their_measured_peaks() {
         const CHILD: &str = "SANA_TRUNK_QUANTUM_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1660,9 +1703,12 @@ pub(crate) mod quantum_proofs {
                 .args([
                     "--exact",
                     "transformer::quantum_proofs::trunk_quanta_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -1895,6 +1941,9 @@ pub(crate) mod quantum_proofs {
                 "{label}: the largest-copy-only pricing ({single} B) must under-price the \
                  measured peak ({measured} B), or this shape cannot tell the models apart"
             );
+        }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED transformer::quantum_proofs::trunk_quanta_track_their_measured_peaks");
         }
     }
 }

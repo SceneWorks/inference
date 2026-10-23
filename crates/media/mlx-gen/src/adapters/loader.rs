@@ -25,6 +25,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+// Specialized unfused source-prefix facts; existing public facts/enums/JSON remain separate.
+pub mod source_facts;
+
 use mlx_rs::memory::{get_active_memory, get_memory_limit};
 use mlx_rs::ops::add;
 use mlx_rs::ops::indexing::TryIndexOp;
@@ -153,6 +156,111 @@ pub fn parse_lokr(w: &Weights) -> Result<LokrFile> {
         alpha,
         rank,
         groups,
+    })
+}
+
+/// Bounded alpha CONTROL read for header-only configured iOS graph normalization. This is the sole
+/// payload exception: read the required native scalar (at most eight bytes), never a factor/model
+/// tensor, Array or eval. Hash only the normalized zero/active branch, not this value or file path.
+/// Matches the served shared scalar_alpha first-element semantics, including multi-element alpha
+/// controls. No speculative SDXL reshape mode is exposed: its graph does not need this read.
+pub fn read_control_scalar_f32(path: &std::path::Path, key: &str) -> Result<f32> {
+    if key != "alpha" && !key.ends_with(".alpha") {
+        return Err(Error::Unsupported(
+            "bounded adapter control reader only accepts alpha keys".into(),
+        ));
+    }
+    let layout = wmeta::safetensors_file_tensor_locations(path).map_err(Error::from)?;
+    let location = layout
+        .tensors
+        .iter()
+        .find(|location| location.header.name == key)
+        .ok_or_else(|| Error::Msg(format!("missing adapter alpha control {key}")))?;
+    let mut file = std::fs::File::open(path)?;
+    read_control_scalar_f32_at(&mut file, location, layout.file_len)
+}
+
+fn read_control_scalar_f32_at(
+    file: &mut std::fs::File,
+    location: &gen_core::weightsmeta::SafetensorsTensorLocation,
+    file_len: u64,
+) -> Result<f32> {
+    use gen_core::weightsmeta::Dtype as S;
+    use std::io::{Read, Seek, SeekFrom};
+    let key = &location.header.name;
+    if key != "alpha" && !key.ends_with(".alpha") {
+        return Err(Error::Unsupported(
+            "bounded adapter control reader only accepts alpha keys".into(),
+        ));
+    }
+    let count = location.header.element_count().map_err(Error::from)?;
+    if count == 0 {
+        return Err(Error::Msg(format!(
+            "adapter alpha control {key} has {count} elements; scalar shape refused"
+        )));
+    }
+    let width = match location.header.dtype {
+        S::BOOL | S::U8 | S::I8 | S::F8_E4M3 | S::F8_E8M0 => 1usize,
+        S::U16 | S::I16 | S::F16 | S::BF16 => 2,
+        S::U32 | S::I32 | S::F32 => 4,
+        S::U64 | S::I64 => 8,
+        // Match the actual native safetensors reader, not a new tier conversion.
+        S::F64 | S::F8_E5M2 => {
+            return Err(Error::Unsupported(
+                "native MLX cannot load this alpha control dtype".into(),
+            ))
+        }
+    };
+    let expected = count
+        .checked_mul(width as u64)
+        .ok_or_else(|| Error::Msg("adapter alpha control byte count overflow".into()))?;
+    let end = location
+        .file_offset
+        .checked_add(width as u64)
+        .ok_or_else(|| Error::Msg("adapter alpha control file offset overflow".into()))?;
+    if expected != location.header.data_bytes
+        || width as u64 > location.header.data_bytes
+        || end > file_len
+    {
+        return Err(Error::Msg(
+            "adapter alpha control shape/offset/length mismatch".into(),
+        ));
+    }
+    let mut bytes = [0u8; 8];
+    file.seek(SeekFrom::Start(location.file_offset))?;
+    file.read_exact(&mut bytes[..width])?;
+    let u16_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let u32_bits = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(match location.header.dtype {
+        S::BOOL => u8::from(bytes[0] != 0) as f32,
+        S::U8 | S::F8_E4M3 | S::F8_E8M0 => bytes[0] as f32,
+        S::I8 => (bytes[0] as i8) as f32,
+        S::U16 => u16_bits as f32,
+        S::I16 => (u16_bits as i16) as f32,
+        S::U32 => u32_bits as f32,
+        S::I32 => (u32_bits as i32) as f32,
+        S::U64 => u64::from_le_bytes(bytes) as f32,
+        S::I64 => i64::from_le_bytes(bytes) as f32,
+        S::F32 => f32::from_bits(u32_bits),
+        S::BF16 => f32::from_bits(u32::from(u16_bits) << 16),
+        S::F16 => {
+            let sign = u32::from(u16_bits & 0x8000) << 16;
+            let exponent = (u16_bits >> 10) & 31;
+            let fraction = u32::from(u16_bits & 1023);
+            if exponent == 0 {
+                let magnitude = fraction as f32 * 2.0_f32.powi(-24);
+                if sign != 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            } else if exponent == 31 {
+                f32::from_bits(sign | 0x7f80_0000 | (fraction << 13))
+            } else {
+                f32::from_bits(sign | ((u32::from(exponent) + 112) << 23) | (fraction << 13))
+            }
+        }
+        S::F64 | S::F8_E5M2 => unreachable!("unsupported native dtype rejected before read"),
     })
 }
 
@@ -496,6 +604,49 @@ pub struct ThirdPartyLokr {
     alpha: Option<f32>,
 }
 
+/// Exact third-party rank/shape gate, shared by live tensors and pre-load header normalization.
+/// The historical diagnostic says "2-D", but the actual accepted condition is AT LEAST two axes;
+/// do not turn this into an exact-matrix restriction on otherwise legal batched factors.
+pub fn thirdparty_lokr_rank(
+    w1_a: Option<&[i32]>,
+    t2: Option<&[i32]>,
+    w2_a: Option<&[i32]>,
+) -> Result<Option<f32>> {
+    let selected = if let Some(shape) = w1_a {
+        Some((shape, 1, "lokr_w1_a"))
+    } else if let Some(shape) = t2 {
+        Some((shape, 0, "lokr_t2"))
+    } else {
+        w2_a.map(|shape| (shape, 1, "lokr_w2_a"))
+    };
+    let Some((shape, axis, what)) = selected else {
+        return Ok(None);
+    };
+    if shape.len() < 2 {
+        return Err(Error::Msg(format!(
+            "lokr adapter: {what} factor must be 2-D, got {}-D shape {:?}",
+            shape.len(),
+            shape
+        )));
+    }
+    let rank = shape[axis] as f32;
+    if rank <= 0.0 {
+        return Err(Error::Msg(format!(
+            "lokr adapter: {what} factor has zero rank (zero leading dim)"
+        )));
+    }
+    Ok(Some(rank))
+}
+
+/// Exact shared third-party alpha/rank normalization, including the rank-free full-factor case.
+/// Header-only configured-graph facts use the same branch as the executable loader.
+pub fn thirdparty_lokr_scale(rank: Option<f32>, alpha: Option<f32>) -> f32 {
+    match rank {
+        None => 1.0,
+        Some(rank) => alpha.unwrap_or(rank) / rank,
+    }
+}
+
 impl ThirdPartyLokr {
     /// The factorization rank (`lora_dim`). lycoris lays the factors out inconsistently, so derive in
     /// a fixed order from whichever decomposed factor is present: `lokr_w1_a` is `[shape0, dim]`
@@ -508,42 +659,17 @@ impl ThirdPartyLokr {
     /// silently installed). `Result` so both are rejected with a typed error instead; mirrors the
     /// F-002 LoRA rank-0 guard.
     fn rank(&self) -> Result<Option<f32>> {
-        fn leading_dim(a: &Array, axis: usize, what: &str) -> Result<f32> {
-            let shp = a.shape();
-            if shp.len() < 2 {
-                return Err(Error::Msg(format!(
-                    "lokr adapter: {what} factor must be 2-D, got {}-D shape {:?}",
-                    shp.len(),
-                    shp
-                )));
-            }
-            let r = shp[axis] as f32;
-            if r <= 0.0 {
-                return Err(Error::Msg(format!(
-                    "lokr adapter: {what} factor has zero rank (zero leading dim)"
-                )));
-            }
-            Ok(r)
-        }
-        if let Some(a) = &self.w1_a {
-            return Ok(Some(leading_dim(a, 1, "lokr_w1_a")?));
-        }
-        if let Some(t) = &self.t2 {
-            return Ok(Some(leading_dim(t, 0, "lokr_t2")?));
-        }
-        self.w2_a
-            .as_ref()
-            .map(|a| leading_dim(a, 1, "lokr_w2_a"))
-            .transpose()
+        thirdparty_lokr_rank(
+            self.w1_a.as_ref().map(Array::shape),
+            self.t2.as_ref().map(Array::shape),
+            self.w2_a.as_ref().map(Array::shape),
+        )
     }
 
     /// LyCORIS `scale`: `alpha / lora_dim` (alpha defaulting to `lora_dim`), EXCEPT both-full forces
     /// scale 1 (mirrors `LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
     fn scale(&self) -> Result<f32> {
-        match self.rank()? {
-            None => Ok(1.0),
-            Some(r) => Ok(self.alpha.unwrap_or(r) / r),
-        }
+        Ok(thirdparty_lokr_scale(self.rank()?, self.alpha))
     }
 
     /// Reconstruct this module's `ΔW` (lycoris per-module scale baked in) at `out_dtype`. `pub` so the
@@ -639,7 +765,7 @@ pub fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
 /// ai-toolkit's Krea-2 LoKr (`diffusion_model.blocks.N.attn.wq…`, sc-8395) matches no target even
 /// though the Krea host already aliases `blocks`/`txtfusion`/`wq…`/`mlp` (sc-8185). Returns the key
 /// unchanged when it carries no such prefix.
-fn strip_common_lora_prefix(raw: &str) -> &str {
+pub fn strip_common_lora_prefix(raw: &str) -> &str {
     for prefix in COMMON_LORA_PREFIXES {
         if let Some(rest) = raw.strip_prefix(prefix) {
             return rest;
@@ -703,6 +829,28 @@ pub struct ThirdPartyLoha {
     alpha: Option<f32>,
 }
 
+/// Exact selected third-party LoHa rank gate, shared by runtime and header facts. Other factors
+/// are validated by the actual reconstruction operation; this gate must not restrict them anew.
+pub fn thirdparty_loha_rank(w1_b: Option<&[i32]>) -> Result<Option<f32>> {
+    let Some(shape) = w1_b else {
+        return Ok(None);
+    };
+    if shape.len() < 2 {
+        return Err(Error::Msg(format!(
+            "loha adapter: hada_w1_b must be 2-D, got {}-D shape {:?}",
+            shape.len(),
+            shape
+        )));
+    }
+    let rank = shape[0] as f32;
+    if rank <= 0.0 {
+        return Err(Error::Msg(
+            "loha adapter: hada_w1_b has zero rank (zero leading dim)".into(),
+        ));
+    }
+    Ok(Some(rank))
+}
+
 impl ThirdPartyLoha {
     /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]` in
     /// both the tucker and non-tucker layouts).
@@ -710,26 +858,7 @@ impl ThirdPartyLoha {
     /// F-010: a 1-D/0-D factor panics on the shape index; a zero leading dim → `scale = alpha/0` =
     /// inf/NaN baked into the reconstructed delta. `Result` so both are rejected (F-002 LoRA twin).
     fn rank(&self) -> Result<Option<f32>> {
-        Ok(match &self.w1_b {
-            None => None,
-            Some(b) => {
-                let shp = b.shape();
-                if shp.len() < 2 {
-                    return Err(Error::Msg(format!(
-                        "loha adapter: hada_w1_b must be 2-D, got {}-D shape {:?}",
-                        shp.len(),
-                        shp
-                    )));
-                }
-                let r = shp[0] as f32;
-                if r <= 0.0 {
-                    return Err(Error::Msg(
-                        "loha adapter: hada_w1_b has zero rank (zero leading dim)".into(),
-                    ));
-                }
-                Some(r)
-            }
-        })
+        thirdparty_loha_rank(self.w1_b.as_ref().map(Array::shape))
     }
 
     /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`). LoHa is always decomposed
@@ -852,46 +981,21 @@ pub fn apply_lora_peft(
 ) -> Result<ApplyReport> {
     let prefix = strip_prefix.unwrap_or("");
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
+    let mut claimed = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
         // The down/up factors always carry the file's namespace prefix. `lora_A`/`lora_B` (PEFT) and
         // `lora_down`/`lora_up` (diffusers/ComfyUI) are interchangeable spellings of the same role,
         // and a PEFT export that kept its adapter name writes `lora_A.default` (sc-24158 — the
         // candle `install_dotted_adapters` and the kohya loader below already accept it).
-        if let Some(rest) = key.strip_prefix(prefix) {
-            if let Some(path) = rest
-                .strip_suffix(".lora_A.weight")
-                .or_else(|| rest.strip_suffix(".lora_A.default.weight"))
-                .or_else(|| rest.strip_suffix(".lora_down.weight"))
-            {
-                let slot = &mut groups.entry(path.to_string()).or_default().a;
-                if slot.is_some() {
-                    // Two spellings of one factor (`lora_A` beside `lora_A.default` / `lora_down`):
-                    // refuse rather than keep whichever key sorts last (sc-24158).
-                    return Err(format!(
-                        "LoRA down/A factor for `{path}` is spelled twice (second: `{key}`); \
-                         refusing an ambiguous apply"
-                    )
-                    .into());
-                }
-                *slot = Some(w.require(&key)?.clone());
-                continue;
-            }
-            if let Some(path) = rest
-                .strip_suffix(".lora_B.weight")
-                .or_else(|| rest.strip_suffix(".lora_B.default.weight"))
-                .or_else(|| rest.strip_suffix(".lora_up.weight"))
-            {
-                let slot = &mut groups.entry(path.to_string()).or_default().b;
-                if slot.is_some() {
-                    return Err(format!(
-                        "LoRA up/B factor for `{path}` is spelled twice (second: `{key}`); \
-                         refusing an ambiguous apply"
-                    )
-                    .into());
-                }
-                *slot = Some(w.require(&key)?.clone());
-                continue;
-            }
+        if let Some((path, role)) = peft_lora_factor(&key, prefix) {
+            claim_lora_factor(&mut claimed, path, role, &key)?;
+            let parts = groups.entry(path.to_string()).or_default();
+            let slot = match role {
+                LoraFactorRole::Down => &mut parts.a,
+                LoraFactorRole::Up => &mut parts.b,
+            };
+            *slot = Some(w.require(&key)?.clone());
+            continue;
         }
         // `alpha` may be prefixed (`<prefix><path>.alpha`) OR bare (`<path>.alpha`): some trainers
         // pair prefixed `lora_A/B` with a bare `alpha` — notably the fork's `QwenLoRAMapping`, whose
@@ -953,13 +1057,7 @@ fn install_lora_groups(
                 let mut b = b_raw.t(); // [out, r] -> [r, out]
                                        // A Linear LoRA's factors are 2-D; a malformed 1-D/scalar factor would panic on the
                                        // `a.shape()[1]` rank read below. Reject it with a typed error up front (F-034).
-                if a.shape().len() != 2 || b.shape().len() != 2 {
-                    return Err(Error::Msg(format!(
-                        "lora adapter at '{path}' has non-2-D factors (down {:?}, up {:?})",
-                        a_raw.shape(),
-                        b_raw.shape()
-                    )));
-                }
+                validate_lora_shapes(&path, a_raw.shape(), b_raw.shape())?;
                 // Effective scaling. Precedence: per-target `.alpha` tensor (kohya / SceneWorks
                 // trainer / BFL) → the PEFT/diffusers `lora_adapter_metadata` blob's
                 // `alpha_pattern`/`lora_alpha` (sc-5513 — that format ships NO `.alpha` tensor) → no
@@ -969,14 +1067,7 @@ fn install_lora_groups(
                 let (cfg_alpha, cfg_rank) = meta.map_or((None, None), |m| m.effective(&path));
                 if let Some(alpha) = parts.alpha.or(cfg_alpha) {
                     let factor_rank = a.shape()[1] as f32; // r
-                    if factor_rank == 0.0 {
-                        // Zero rank (empty/malformed factor) → non-finite alpha/rank → a NaN residual
-                        // folded into the linear, silently corrupting inference. Reject the adapter
-                        // instead of installing it (sc-5252/F-002).
-                        return Err(Error::Msg(format!(
-                            "lora adapter at '{path}' has zero rank (empty down/up factor)"
-                        )));
-                    }
+                    validate_lora_alpha_rank(&path, a.shape()[1])?;
                     let rank = cfg_rank.unwrap_or(factor_rank);
                     b = b.multiply(Array::from_slice(&[alpha / rank], &[1]))?;
                 }
@@ -1009,11 +1100,19 @@ const KOHYA_SUFFIXES: [(&str, KohyaRole); 5] = [
     (".alpha", KohyaRole::Alpha),
 ];
 
-#[derive(Clone, Copy)]
-enum KohyaRole {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KohyaRole {
     Down,
     Up,
     Alpha,
+}
+
+/// The exact kohya suffix normalization used by the loader (including `.default`).
+pub fn kohya_factor_key(key: &str) -> Option<(&str, KohyaRole)> {
+    let rem = key.strip_prefix(KOHYA_PREFIX)?;
+    KOHYA_SUFFIXES
+        .iter()
+        .find_map(|(suffix, role)| rem.strip_suffix(suffix).map(|stem| (stem, *role)))
 }
 
 /// `true` if `w` is a kohya-format LoRA — any key carries the `lora_unet_` prefix. (kohya files are
@@ -1051,21 +1150,21 @@ pub fn apply_lora_kohya(
     table: &BTreeMap<String, String>,
 ) -> Result<ApplyReport> {
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
+    let mut claimed = BTreeMap::new();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
-        let Some(rem) = key.strip_prefix(KOHYA_PREFIX) else {
-            continue; // not a denoiser kohya key (e.g. text-encoder `lora_te_…`) — ignore.
-        };
-        let Some((stem, role)) = KOHYA_SUFFIXES
-            .iter()
-            .find_map(|(suf, role)| rem.strip_suffix(suf).map(|s| (s, *role)))
-        else {
-            continue; // a `lora_unet_` key with an unrecognized suffix — ignore.
+        let Some((stem, role)) = kohya_factor_key(&key) else {
+            continue; // not a recognized denoiser kohya factor (e.g. text-encoder keys).
         };
         let Some(path) = table.get(stem) else {
             unresolved.insert(stem.to_string());
             continue;
         };
+        match role {
+            KohyaRole::Down => claim_lora_factor(&mut claimed, path, LoraFactorRole::Down, &key)?,
+            KohyaRole::Up => claim_lora_factor(&mut claimed, path, LoraFactorRole::Up, &key)?,
+            KohyaRole::Alpha => {}
+        }
         let parts = groups.entry(path.clone()).or_default();
         match role {
             KohyaRole::Down => parts.a = Some(w.require(&key)?.clone()),
@@ -1735,6 +1834,616 @@ enum AdapterFormat {
     LoraKindMismatch,
 }
 
+/// The file routes available to an unfused projection host (no BFL fused-to-split mappings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnfusedAdapterFormat {
+    ThirdpartyLokr,
+    ThirdpartyLoha,
+    KohyaLora,
+    PeftLokr,
+    PeftLora,
+    LoraKindMismatch,
+}
+
+/// Header-only counterpart of the actual loader dispatch for an unfused host. No tensor read or
+/// model construction is needed; callers must still validate their provider's identity stamps.
+pub fn classify_unfused_adapter_format<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_type: Option<&str>,
+    kind: AdapterKind,
+) -> UnfusedAdapterFormat {
+    let keys: Vec<&str> = keys.into_iter().collect();
+    let stamped = wmeta::is_lokr_network_type(network_type);
+    if !stamped && wmeta::keys_contain_lokr(keys.iter().copied()) {
+        UnfusedAdapterFormat::ThirdpartyLokr
+    } else if wmeta::keys_contain_loha(keys.iter().copied()) {
+        UnfusedAdapterFormat::ThirdpartyLoha
+    } else if !stamped && wmeta::keys_are_kohya(keys.iter().copied()) {
+        UnfusedAdapterFormat::KohyaLora
+    } else {
+        match kind {
+            AdapterKind::Lokr => UnfusedAdapterFormat::PeftLokr,
+            AdapterKind::Lora if stamped => UnfusedAdapterFormat::LoraKindMismatch,
+            AdapterKind::Lora => UnfusedAdapterFormat::PeftLora,
+        }
+    }
+}
+
+/// A dotted LoRA factor role, shared by the real PEFT loader and header inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LoraFactorRole {
+    Down,
+    Up,
+}
+
+/// The actual unfused residual LoRA install's matrix gate (not the separate convolution merge
+/// format). Shared with header normalization so rejected factors cannot become admitted facts.
+pub fn validate_lora_shapes(path: &str, down: &[i32], up: &[i32]) -> Result<()> {
+    if down.len() != 2 || up.len() != 2 {
+        return Err(Error::Msg(format!(
+            "lora adapter at '{path}' has non-2-D factors (down {:?}, up {:?})",
+            down, up
+        )));
+    }
+    Ok(())
+}
+
+/// Called ONLY when an alpha fold occurs. A zero stored rank without a fold is not newly refused.
+pub fn validate_lora_alpha_rank(path: &str, rank: i32) -> Result<()> {
+    if rank == 0 {
+        return Err(Error::Msg(format!(
+            "lora adapter at '{path}' has zero rank (empty down/up factor)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject ambiguous same-role aliases identically before runtime tensors or header facts are
+/// installed. Report keys in lexical order, independent of the source HashMap's iteration order.
+/// Separate files are separate stacks and intentionally do not share this claim map.
+pub fn claim_lora_factor(
+    claimed: &mut BTreeMap<(String, LoraFactorRole), String>,
+    path: &str,
+    role: LoraFactorRole,
+    key: &str,
+) -> Result<()> {
+    if let Some(previous) = claimed.insert((path.to_owned(), role), key.to_owned()) {
+        let (first, second) = if previous.as_str() < key {
+            (previous.as_str(), key)
+        } else {
+            (key, previous.as_str())
+        };
+        let label = if role == LoraFactorRole::Down {
+            "down/A"
+        } else {
+            "up/B"
+        };
+        return Err(Error::Msg(format!(
+            "LoRA {label} factor for `{path}` is spelled twice (`{first}` and `{second}`); refusing an ambiguous apply"
+        )));
+    }
+    Ok(())
+}
+
+pub fn peft_lora_factor<'a>(key: &'a str, prefix: &str) -> Option<(&'a str, LoraFactorRole)> {
+    let rest = key.strip_prefix(prefix)?;
+    for (suffix, role) in [
+        (".lora_A.weight", LoraFactorRole::Down),
+        (".lora_A.default.weight", LoraFactorRole::Down),
+        (".lora_down.weight", LoraFactorRole::Down),
+        (".lora_B.weight", LoraFactorRole::Up),
+        (".lora_B.default.weight", LoraFactorRole::Up),
+        (".lora_up.weight", LoraFactorRole::Up),
+    ] {
+        if let Some(path) = rest.strip_suffix(suffix) {
+            return Some((path, role));
+        }
+    }
+    None
+}
+
+/// Header-only semantic graph of the SAME unfused adapter loader used by Anima/Z-Image.
+/// The provider supplies its actual pure target namespace/packing facts. No tensor/model/media is
+/// built. The only payload access is a bounded alpha CONTROL scalar when a packed LoKr probe's
+/// actual scale/disable branch needs it; values/paths never enter the returned semantic identity.
+/// This describes configured mechanisms, not physical liveness, a certificate or proof by digest.
+pub fn configured_adapter_semantic_facts(
+    specs: &[AdapterSpec],
+    kohya_paths: &[String],
+    lycoris_dtype: Dtype,
+    projection: impl FnMut(&str) -> Result<Option<(String, super::LinearFacts)>>,
+) -> Result<serde_json::Value> {
+    Ok(configured_adapter_facts(specs, kohya_paths, lycoris_dtype, projection)?.0)
+}
+
+/// The same configured normalization plus typed retained residual facts for source pricing.
+/// The typed payloads describe logical owners only; no view/backing or allocator proof is implied.
+pub fn configured_adapter_facts(
+    specs: &[AdapterSpec],
+    kohya_paths: &[String],
+    lycoris_dtype: Dtype,
+    mut projection: impl FnMut(&str) -> Result<Option<(String, super::LinearFacts)>>,
+) -> Result<(serde_json::Value, Vec<(String, super::facts::AdapterFacts)>)> {
+    use super::facts::{dtype_name, native_header_dtype, AdapterFacts, TensorFacts};
+    let mut retained = Vec::new();
+    let mut batch_applied = 0usize;
+    use serde_json::json;
+    let table = wmeta::kohya_table(kohya_paths);
+    let mut files = Vec::new();
+    for spec in specs {
+        // Same neutral-header gate as the always-enabled real-iOS before_load hook. In particular,
+        // C64 is not privately aliased into another dtype merely because native MLX can load it.
+        let layout = wmeta::safetensors_file_tensor_locations(&spec.path).map_err(Error::from)?;
+        let headers: BTreeMap<String, gen_core::weightsmeta::SafetensorsTensorHeader> = layout
+            .tensors
+            .iter()
+            .map(|location| (location.header.name.clone(), location.header.clone()))
+            .collect();
+        let locations = layout
+            .tensors
+            .iter()
+            .map(|location| (location.header.name.as_str(), location))
+            .collect::<BTreeMap<_, _>>();
+        let mut control_file = None;
+        let mut alpha_control = |key: &str| -> Result<f32> {
+            if control_file.is_none() {
+                control_file = Some(std::fs::File::open(&spec.path)?);
+            }
+            let location = locations
+                .get(key)
+                .ok_or_else(|| Error::Msg("missing alpha control location".into()))?;
+            read_control_scalar_f32_at(
+                control_file.as_mut().expect("opened alpha control file"),
+                location,
+                layout.file_len,
+            )
+        };
+        let metadata = wmeta::safetensors_file_metadata(&spec.path).map_err(Error::from)?;
+        let mut sources = Vec::new();
+        for header in headers.values() {
+            sources.push(json!({"shape": semantic_header_shape(header)?,
+                "dtype": dtype_name(native_header_dtype(header.dtype)?)}));
+        }
+        // Original key spellings and file paths are not graph identities; preserve only the
+        // multiset of actually loaded source shapes/native dtypes, including inactive inputs.
+        sources.sort_by_key(serde_json::Value::to_string);
+        let format = classify_unfused_adapter_format(
+            headers.keys().map(String::as_str),
+            metadata.get("networkType").map(String::as_str),
+            spec.kind,
+        );
+        let format_name = match format {
+            UnfusedAdapterFormat::PeftLora => "peft_lora",
+            UnfusedAdapterFormat::KohyaLora => "kohya_lora",
+            UnfusedAdapterFormat::PeftLokr => "peft_lokr",
+            UnfusedAdapterFormat::ThirdpartyLokr => "thirdparty_lokr",
+            UnfusedAdapterFormat::ThirdpartyLoha => "thirdparty_loha",
+            UnfusedAdapterFormat::LoraKindMismatch => {
+                return Err(Error::Msg(
+                    "adapter declared LoRA but native file dispatch selects stamped LoKr".into(),
+                ))
+            }
+        };
+        let mut installed = Vec::new();
+        if matches!(
+            format,
+            UnfusedAdapterFormat::PeftLora | UnfusedAdapterFormat::KohyaLora
+        ) {
+            let prefix =
+                wmeta::detect_lora_prefix(headers.keys().map(String::as_str)).unwrap_or("");
+            let meta = if format == UnfusedAdapterFormat::PeftLora {
+                wmeta::LoraAdapterMeta::from_metadata(
+                    metadata
+                        .get(wmeta::LORA_ADAPTER_METADATA_KEY)
+                        .map(String::as_str),
+                )
+            } else {
+                None
+            };
+            let mut groups: BTreeMap<String, (Option<String>, Option<String>, bool)> =
+                BTreeMap::new();
+            let mut claimed = BTreeMap::new();
+            for key in headers.keys() {
+                let parsed = if format == UnfusedAdapterFormat::KohyaLora {
+                    if let Some((stem, role)) = kohya_factor_key(key) {
+                        let path = table.get(stem).ok_or_else(|| {
+                            Error::Msg(format!("unmatched kohya adapter target {stem}"))
+                        })?;
+                        Some((
+                            path.as_str(),
+                            match role {
+                                KohyaRole::Down => Some(LoraFactorRole::Down),
+                                KohyaRole::Up => Some(LoraFactorRole::Up),
+                                KohyaRole::Alpha => None,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                } else if let Some((path, role)) = peft_lora_factor(key, prefix) {
+                    Some((path, Some(role)))
+                } else {
+                    key.strip_prefix(prefix)
+                        .and_then(|key| key.strip_suffix(".alpha"))
+                        .or_else(|| key.strip_suffix(".alpha"))
+                        .map(|path| (path, None))
+                };
+                let Some((path, role)) = parsed else { continue };
+                let group = groups.entry(path.to_owned()).or_default();
+                if let Some(role) = role {
+                    claim_lora_factor(&mut claimed, path, role, key)?;
+                    *if role == LoraFactorRole::Down {
+                        &mut group.0
+                    } else {
+                        &mut group.1
+                    } = Some(key.clone());
+                } else {
+                    semantic_nonempty_alpha(&headers[key])?;
+                    group.2 = true;
+                }
+            }
+            for (path, (down, up, tensor_alpha)) in groups {
+                let (Some(down), Some(up)) = (down, up) else {
+                    continue;
+                }; // same partial-group skip
+                let (canonical, base) = projection(&path)?
+                    .ok_or_else(|| Error::Msg(format!("unmatched adapter target {path}")))?;
+                let a = semantic_header_shape(&headers[&down])?;
+                let b = semantic_header_shape(&headers[&up])?;
+                validate_lora_shapes(&path, &a, &b)?;
+                let fold = tensor_alpha
+                    || meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.effective(&path).0.is_some());
+                if fold {
+                    validate_lora_alpha_rank(&path, a[0])?;
+                }
+                let a_dtype = native_header_dtype(headers[&down].dtype)?;
+                let b_dtype = native_header_dtype(headers[&up].dtype)?;
+                let b_dtype = if fold {
+                    Dtype::from_promoting_types(b_dtype, Dtype::Float32)
+                } else {
+                    b_dtype
+                };
+                batch_applied += 1; // Native successful push count, not per-file strictness.
+                retained.push((
+                    canonical.clone(),
+                    AdapterFacts::Lora {
+                        a: TensorFacts::materialized_matrix(a[1], a[0], a_dtype),
+                        b: TensorFacts::materialized_matrix(b[1], b[0], b_dtype),
+                        disabled: spec.scale == 0.0,
+                    },
+                ));
+                installed.push(
+                    json!({"projection":canonical,"base_logical_shape":base.base_shape,
+                    "kind":"lora","a_shape":[a[1],a[0]],"a_dtype":dtype_name(a_dtype),
+                    "b_shape":[b[1],b[0]],"b_dtype":dtype_name(b_dtype),"alpha_fold":fold,
+                    "disabled":spec.scale==0.0}),
+                );
+            }
+        } else {
+            let loha = format == UnfusedAdapterFormat::ThirdpartyLoha;
+            let peft = format == UnfusedAdapterFormat::PeftLokr;
+            let suffixes = if loha {
+                &wmeta::LOHA_TP_SUFFIXES[..]
+            } else if peft {
+                &wmeta::LOKR_SUFFIXES[..]
+            } else {
+                &wmeta::LOKR_TP_SUFFIXES[..]
+            };
+            let mut groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+            for key in headers.keys() {
+                if !peft {
+                    if let Some(raw) = key.strip_suffix(".alpha") {
+                        semantic_nonempty_alpha(&headers[key])?;
+                        groups
+                            .entry(raw.into())
+                            .or_default()
+                            .insert("alpha".into(), key.clone());
+                        continue;
+                    }
+                }
+                if let Some((raw, role)) = wmeta::split_factor_key(key, suffixes) {
+                    groups
+                        .entry(raw.into())
+                        .or_default()
+                        .insert(role.into(), key.clone());
+                }
+            }
+            let mut claimed = BTreeMap::new();
+            for (raw, factors) in groups {
+                let dotted = if peft {
+                    raw.clone()
+                } else {
+                    wmeta::resolve_lokr_path(&raw, &table)
+                        .unwrap_or_else(|| strip_common_lora_prefix(&raw))
+                        .to_owned()
+                };
+                if claimed.insert(dotted.clone(), raw).is_some() {
+                    return Err(Error::Msg(
+                        "LyCORIS aliases resolve to the same target twice".into(),
+                    ));
+                }
+                let (canonical, base) = projection(&dotted)?
+                    .ok_or_else(|| Error::Msg(format!("unmatched adapter target {dotted}")))?;
+                let shape = |role: &str| -> Result<Option<Vec<i32>>> {
+                    factors
+                        .get(role)
+                        .map(|key| semantic_header_shape(&headers[key]))
+                        .transpose()
+                };
+                let required = |role: &str| -> Result<Vec<i32>> {
+                    shape(role)?.ok_or_else(|| Error::Msg(format!("missing adapter factor {role}")))
+                };
+                let mut factor_facts = BTreeMap::new();
+                for (role, key) in &factors {
+                    factor_facts.insert(
+                        role.clone(),
+                        json!({"shape":semantic_header_shape(&headers[key])?,
+                        "dtype":dtype_name(native_header_dtype(headers[key].dtype)?)}),
+                    );
+                }
+                let mut structured_shapes = None;
+                let (kind, disabled, branches) = if loha {
+                    let a1 = required("hada_w1_a")?;
+                    let b1 = required("hada_w1_b")?;
+                    let a2 = required("hada_w2_a")?;
+                    let b2 = required("hada_w2_b")?;
+                    thirdparty_loha_rank(Some(&b1))?;
+                    let t1 = shape("hada_t1")?;
+                    let t2 = shape("hada_t2")?;
+                    let tucker = t1.is_some() && t2.is_some();
+                    let (m1, m2) = if let (Some(t1), Some(t2)) = (&t1, &t2) {
+                        (
+                            semantic_tucker_shape(t1, &a1, &b1)?,
+                            semantic_tucker_shape(t2, &a2, &b2)?,
+                        )
+                    } else {
+                        (
+                            semantic_matmul_shape(&a1, &b1)?,
+                            semantic_matmul_shape(&a2, &b2)?,
+                        )
+                    };
+                    let product = semantic_broadcast_shape(&m1, &m2)?;
+                    semantic_reshape_matches(&product, &base.base_shape)?;
+                    (
+                        "materialized_delta",
+                        spec.scale == 0.0,
+                        json!({"tucker":tucker}),
+                    )
+                } else {
+                    let w1a = shape("lokr_w1_a")?;
+                    let w1b = shape("lokr_w1_b")?;
+                    let w2a = shape("lokr_w2_a")?;
+                    let w2b = shape("lokr_w2_b")?;
+                    let t2 = shape("lokr_t2")?;
+                    let rank = if peft {
+                        None
+                    } else {
+                        thirdparty_lokr_rank(w1a.as_deref(), t2.as_deref(), w2a.as_deref())?
+                    };
+                    let w1 = shape("lokr_w1")?;
+                    let f1 = if let Some(full) = &w1 {
+                        full.clone()
+                    } else {
+                        semantic_matmul_shape(
+                            w1a.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w1 missing".into()))?,
+                            w1b.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w1_b missing".into()))?,
+                        )?
+                    };
+                    let w2 = shape("lokr_w2")?;
+                    let f2 = if let Some(full) = &w2 {
+                        full.clone()
+                    } else if let Some(t2) = &t2 {
+                        semantic_tucker_shape(
+                            t2,
+                            w2a.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w2_a missing".into()))?,
+                            w2b.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w2_b missing".into()))?,
+                        )?
+                    } else {
+                        semantic_matmul_shape(
+                            w2a.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w2 missing".into()))?,
+                            w2b.as_deref()
+                                .ok_or_else(|| Error::Msg("LoKr w2_b missing".into()))?,
+                        )?
+                    };
+                    // Actual packed probe rejects ANY t2 before choosing full w2. Dense delta
+                    // reconstruction instead chooses full w2 first; keep these branches distinct.
+                    let structured = base.is_quantized
+                        && super::lokr_structured_layout(&base.base_shape, &f1, &f2, t2.is_some())
+                            .is_some();
+                    if structured {
+                        structured_shapes = Some((f1.clone(), f2.clone()));
+                    }
+                    let (meta_rank, meta_alpha) = wmeta::parse_rank_alpha(
+                        metadata.get("rank").map(String::as_str),
+                        metadata.get("alpha").map(String::as_str),
+                    );
+                    let coefficient = if base.is_quantized {
+                        let normalized = if peft {
+                            meta_alpha / meta_rank
+                        } else {
+                            let alpha = if rank.is_some() {
+                                factors
+                                    .get("alpha")
+                                    .map(|key| alpha_control(key))
+                                    .transpose()?
+                            } else {
+                                None
+                            };
+                            thirdparty_lokr_scale(rank, alpha)
+                        };
+                        let coefficient = normalized * spec.scale;
+                        if !coefficient.is_finite() {
+                            return Err(Error::Msg("LoKr: non-finite packed scale".into()));
+                        }
+                        coefficient
+                    } else {
+                        spec.scale
+                    };
+                    if peft && !structured {
+                        super::validate_lokr_metadata_scale(meta_alpha, meta_rank)?;
+                    }
+                    let count1 = semantic_elements(&f1)?;
+                    let count2 = semantic_elements(&f2)?;
+                    let count = count1
+                        .checked_mul(count2)
+                        .ok_or_else(|| Error::Msg("LoKr shape product overflow".into()))?;
+                    if count != semantic_elements(&base.base_shape)? {
+                        return Err(Error::Msg(
+                            "LoKr reconstruction cannot reshape to its actual target".into(),
+                        ));
+                    }
+                    (
+                        if structured {
+                            "structured_lokr"
+                        } else {
+                            "materialized_delta"
+                        },
+                        if structured {
+                            coefficient == 0.0
+                        } else {
+                            spec.scale == 0.0
+                        },
+                        json!({"full_w1":w1.is_some(),"full_w2":w2.is_some(),
+                            "dense_tucker_active":w2.is_none() && t2.is_some(),
+                            "packed_t2_probe_rejected":base.is_quantized && t2.is_some()}),
+                    )
+                };
+                let payload = if let Some((w1, w2)) = structured_shapes {
+                    AdapterFacts::Structured {
+                        w1: TensorFacts::materialized_matrix(w1[0], w1[1], lycoris_dtype),
+                        w2: TensorFacts::materialized_matrix(w2[0], w2[1], lycoris_dtype),
+                        disabled,
+                    }
+                } else {
+                    AdapterFacts::Materialized {
+                        delta: TensorFacts {
+                            shape: base.base_shape.clone(),
+                            dtype: lycoris_dtype,
+                            strides: Vec::new(),
+                        },
+                        disabled,
+                    }
+                };
+                batch_applied += 1;
+                retained.push((canonical.clone(), payload));
+                installed.push(
+                    json!({"projection":canonical,"base_logical_shape":base.base_shape,
+                    "kind":kind,"retained_dtype":dtype_name(lycoris_dtype),"disabled":disabled,
+                    "factors":factor_facts,"branches":branches}),
+                );
+            }
+        }
+        // Strict NON-diff autoprefix checks aggregate successful pushes, not each file.
+        // Keep orphan/raw sources; all existing unknown-target/kind/shape/scale errors above stay.
+        files.push(json!({"format":format_name,"loaded_sources":sources,"installed":installed}));
+    }
+    if !specs.is_empty() && batch_applied == 0 {
+        return Err(Error::Msg(
+            "adapter batch matched no actual projection".into(),
+        ));
+    }
+    Ok((
+        json!({"schema":"unfused_adapter_semantic_graph_v1","files":files}),
+        retained,
+    ))
+}
+
+fn semantic_header_shape(
+    header: &gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> Result<Vec<i32>> {
+    header
+        .shape
+        .iter()
+        .map(|&dim| {
+            i32::try_from(dim).map_err(|_| {
+                Error::Unsupported("adapter dimension exceeds native i32 shape".into())
+            })
+        })
+        .collect()
+}
+fn semantic_nonempty_alpha(header: &gen_core::weightsmeta::SafetensorsTensorHeader) -> Result<()> {
+    if header.element_count().map_err(Error::from)? == 0 {
+        return Err(Error::Msg(
+            "scalar_alpha: alpha tensor present but empty".into(),
+        ));
+    }
+    Ok(())
+}
+fn semantic_elements(shape: &[i32]) -> Result<u64> {
+    shape.iter().try_fold(1u64, |count, &dim| {
+        count
+            .checked_mul(dim as u64)
+            .ok_or_else(|| Error::Msg("adapter element count overflow".into()))
+    })
+}
+fn semantic_reshape_matches(from: &[i32], to: &[i32]) -> Result<()> {
+    if semantic_elements(from)? != semantic_elements(to)? {
+        return Err(Error::Msg(
+            "adapter reconstruction cannot reshape to its actual target".into(),
+        ));
+    }
+    Ok(())
+}
+fn semantic_broadcast_shape(a: &[i32], b: &[i32]) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for index in 0..a.len().max(b.len()) {
+        let x = a.len().checked_sub(index + 1).map_or(1, |i| a[i]);
+        let y = b.len().checked_sub(index + 1).map_or(1, |i| b[i]);
+        if x != y && x != 1 && y != 1 {
+            return Err(Error::Msg("adapter broadcast dimensions disagree".into()));
+        }
+        out.push(if x == 1 { y } else { x });
+    }
+    out.reverse();
+    Ok(out)
+}
+fn semantic_matmul_shape(a: &[i32], b: &[i32]) -> Result<Vec<i32>> {
+    if a.is_empty() || b.is_empty() {
+        return Err(Error::Msg("adapter matmul cannot use a scalar".into()));
+    }
+    let (m, k) = if a.len() == 1 {
+        (1, a[0])
+    } else {
+        (a[a.len() - 2], a[a.len() - 1])
+    };
+    let (kb, n) = if b.len() == 1 {
+        (b[0], 1)
+    } else {
+        (b[b.len() - 2], b[b.len() - 1])
+    };
+    if k != kb {
+        return Err(Error::Msg(
+            "adapter matmul contraction dimensions disagree".into(),
+        ));
+    }
+    let mut out = semantic_broadcast_shape(
+        &a[..a.len().saturating_sub(2)],
+        &b[..b.len().saturating_sub(2)],
+    )?;
+    if a.len() != 1 {
+        out.push(m);
+    }
+    if b.len() != 1 {
+        out.push(n);
+    }
+    Ok(out)
+}
+fn semantic_tucker_shape(t: &[i32], a: &[i32], b: &[i32]) -> Result<Vec<i32>> {
+    if t.len() != 4 || a.len() != 2 || b.len() != 2 || t[0] != a[0] || t[1] != b[0] {
+        return Err(Error::Msg(
+            "adapter Tucker dimensions disagree with native contraction".into(),
+        ));
+    }
+    Ok(vec![a[1], b[1], t[2], t[3]])
+}
+
 /// Classify one adapter file for the autoprefix dispatch (F-069). A pure function of the file's
 /// keys/metadata, the declared `kind`, and the host's kohya/BFL surface; `tables` caches the
 /// host-tree walks across specs. See [`AdapterFormat`] for the precedence rationale.
@@ -1744,6 +2453,18 @@ fn classify_adapter_format(
     host: &impl AdaptableHost,
     tables: &mut HostTables,
 ) -> AdapterFormat {
+    // Unfused hosts (including Iris) share this exact header-only classifier with their pre-load
+    // inventory. Fused-to-split BFL hosts retain their existing host-specific classification below.
+    if tables.bfl(host).is_empty() {
+        return match classify_unfused_adapter_format(w.keys(), w.metadata("networkType"), kind) {
+            UnfusedAdapterFormat::ThirdpartyLokr => AdapterFormat::ThirdpartyLokr,
+            UnfusedAdapterFormat::ThirdpartyLoha => AdapterFormat::ThirdpartyLoha,
+            UnfusedAdapterFormat::KohyaLora => AdapterFormat::KohyaLora,
+            UnfusedAdapterFormat::PeftLokr => AdapterFormat::PeftLokr,
+            UnfusedAdapterFormat::PeftLora => AdapterFormat::PeftLora,
+            UnfusedAdapterFormat::LoraKindMismatch => AdapterFormat::LoraKindMismatch,
+        };
+    }
     // The `networkType=lokr` stamp gates `lokr_*` keys: a stamped (peft) file routes by its stamp
     // (global metadata alpha/rank), a keys-only file by the third-party per-module derivation.
     let is_lokr_meta = is_lokr(w);
@@ -2357,6 +3078,323 @@ fn apply_adapters_strict_inner(
         .into());
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod configured_header_tests {
+    use super::*;
+    use crate::adapters::facts::AdapterFacts;
+    fn fixture(
+        root: &std::path::Path,
+        entries: &[(&str, &[usize], f32)],
+        metadata: serde_json::Value,
+    ) -> std::path::PathBuf {
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".into(), metadata);
+        let mut data = Vec::new();
+        for (name, shape, value) in entries {
+            let start = data.len();
+            let count: usize = shape.iter().product();
+            for _ in 0..count {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            header.insert(
+                (*name).into(),
+                serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[start,data.len()]}),
+            );
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(data);
+        let path = root.join("tiny.safetensors");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+    fn spec(path: std::path::PathBuf, kind: AdapterKind, scale: f32) -> AdapterSpec {
+        AdapterSpec {
+            path,
+            kind,
+            scale,
+            pass_scales: None,
+            moe_expert: None,
+        }
+    }
+    fn facts(
+        specs: &[AdapterSpec],
+        packed: bool,
+    ) -> Result<(serde_json::Value, Vec<(String, AdapterFacts)>)> {
+        configured_adapter_facts(specs, &["layer.proj".into()], Dtype::Bfloat16, |path| {
+            Ok((path == "layer.proj").then(|| {
+                (
+                    path.into(),
+                    super::super::LinearFacts {
+                        base_shape: vec![4, 4],
+                        is_quantized: packed,
+                        has_live_adapters: false,
+                        adapter_count: 0,
+                        bias_shape: None,
+                    },
+                )
+            }))
+        })
+    }
+    #[test]
+    fn configured_lora_normalizes_aliases_partial_groups_and_continuous_scales() {
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lora_A.weight", &[1, 4], 1.0),
+                ("layer.proj.lora_B.weight", &[4, 1], 2.0),
+                ("ignored.lora_A.weight", &[1, 4], 3.0),
+            ],
+            serde_json::json!({}),
+        );
+        let a = spec(path.clone(), AdapterKind::Lora, 0.5);
+        let b = spec(path.clone(), AdapterKind::Lora, 2.0);
+        let result = facts(&[a], false);
+        assert!(
+            result.is_ok(),
+            "valid LoRA plus skipped partial group must normalize"
+        );
+        let (identity, retained) = result.unwrap();
+        assert_eq!(identity, facts(&[b], false).unwrap().0);
+        assert_eq!(retained.len(), 1);
+        assert!(
+            matches!(&retained[0].1, AdapterFacts::Lora { a,b,disabled:false } if a.shape == [4,1] && b.shape == [1,4])
+        );
+        assert!(!identity.to_string().contains(path.to_str().unwrap()));
+        let disabled = facts(&[spec(path, AdapterKind::Lora, 0.0)], false).unwrap();
+        assert!(disabled.1[0].1.disabled());
+        assert_ne!(identity, disabled.0);
+        let duplicate = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lora_A.weight", &[1, 4], 1.0),
+                ("layer.proj.lora_down.weight", &[1, 4], 1.0),
+                ("layer.proj.lora_B.weight", &[4, 1], 1.0),
+            ],
+            serde_json::json!({}),
+        );
+        assert!(facts(&[spec(duplicate, AdapterKind::Lora, 1.0)], false).is_err());
+    }
+    #[test]
+    fn configured_packed_lokr_uses_alpha_zero_and_actual_t2_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lokr_w1_a", &[2, 1], 1.0),
+                ("layer.proj.lokr_w1_b", &[1, 2], 1.0),
+                ("layer.proj.lokr_w2", &[2, 2], 1.0),
+                ("layer.proj.alpha", &[3], 0.0),
+            ],
+            serde_json::json!({}),
+        );
+        let s = spec(path, AdapterKind::Lokr, 1.0);
+        let (_, packed) = facts(std::slice::from_ref(&s), true).unwrap();
+        assert!(matches!(
+            &packed[0].1,
+            AdapterFacts::Structured { disabled: true, .. }
+        ));
+        let (_, dense) = facts(&[s], false).unwrap();
+        assert!(matches!(
+            &dense[0].1,
+            AdapterFacts::Materialized {
+                disabled: false,
+                ..
+            }
+        ));
+        let path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lokr_w1", &[2, 2], 1.0),
+                ("layer.proj.lokr_w2", &[2, 2], 1.0),
+                ("layer.proj.lokr_t2", &[1, 1, 1, 1], 1.0),
+            ],
+            serde_json::json!({}),
+        );
+        let (_, fallback) = facts(&[spec(path, AdapterKind::Lokr, 1.0)], true).unwrap();
+        assert!(
+            matches!(&fallback[0].1, AdapterFacts::Materialized { disabled:false,delta } if delta.shape == [4,4])
+        );
+    }
+    #[test]
+    fn configured_peft_rank_gate_depends_on_actual_install_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lokr_w1", &[2, 2], 1.0),
+                ("layer.proj.lokr_w2", &[2, 2], 1.0),
+            ],
+            serde_json::json!({"networkType":"lokr","rank":"-1","alpha":"1"}),
+        );
+        let s = spec(path, AdapterKind::Lokr, 1.0);
+        assert!(matches!(
+            &facts(std::slice::from_ref(&s), true).unwrap().1[0].1,
+            AdapterFacts::Structured {
+                disabled: false,
+                ..
+            }
+        ));
+        let negative_result = facts(std::slice::from_ref(&s), false);
+        assert!(
+            negative_result.is_ok(),
+            "actual rank<=0 parser normalization must precede the dense gate"
+        );
+        let negative_dense = negative_result.unwrap();
+        assert!(matches!(
+            &negative_dense.1[0].1,
+            AdapterFacts::Materialized {
+                disabled: false,
+                ..
+            }
+        ));
+        let default_path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lokr_w1", &[2, 2], 1.0),
+                ("layer.proj.lokr_w2", &[2, 2], 1.0),
+            ],
+            serde_json::json!({"networkType":"lokr","rank":"1","alpha":"1"}),
+        );
+        let default_spec = spec(default_path, AdapterKind::Lokr, 1.0);
+        assert_eq!(negative_dense.0, facts(&[default_spec], false).unwrap().0);
+        let infinite_path = fixture(
+            root.path(),
+            &[
+                ("layer.proj.lokr_w1", &[2, 2], 1.0),
+                ("layer.proj.lokr_w2", &[2, 2], 1.0),
+            ],
+            serde_json::json!({"networkType":"lokr","rank":"inf","alpha":"1"}),
+        );
+        let infinite = spec(infinite_path, AdapterKind::Lokr, 1.0);
+        let infinite_packed = facts(std::slice::from_ref(&infinite), true);
+        assert!(
+            infinite_packed.is_ok(),
+            "finite packed coefficient zero must remain accepted"
+        );
+        assert!(matches!(
+            &infinite_packed.unwrap().1[0].1,
+            AdapterFacts::Structured { disabled: true, .. }
+        ));
+        assert!(facts(&[infinite], false).is_err());
+        assert!(facts(
+            &[AdapterSpec {
+                kind: AdapterKind::Lora,
+                ..s
+            }],
+            true
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod alpha_control_tests {
+    use super::read_control_scalar_f32;
+    fn tensor(
+        key: &str,
+        root: &std::path::Path,
+        dtype: &str,
+        shape: &[usize],
+        bytes: &[u8],
+    ) -> std::path::PathBuf {
+        let path = root.join("alpha.safetensors");
+        let mut entries = serde_json::Map::new();
+        entries.insert(
+            key.into(),
+            serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[0,bytes.len()]}),
+        );
+        let mut header = serde_json::to_vec(&entries).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend_from_slice(bytes);
+        std::fs::write(&path, file).unwrap();
+        path
+    }
+    fn control(
+        root: &std::path::Path,
+        dtype: &str,
+        shape: &[usize],
+        bytes: &[u8],
+    ) -> std::path::PathBuf {
+        tensor("module.alpha", root, dtype, shape, bytes)
+    }
+    #[test]
+    fn alpha_control_reader_matches_native_f32_zero_and_nonzero_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        for (dtype, bytes, expected) in [
+            ("F32", 0.0f32.to_le_bytes().to_vec(), 0.0f32),
+            ("F32", 1.5f32.to_le_bytes().to_vec(), 1.5f32),
+            ("BF16", 0x3fc0u16.to_le_bytes().to_vec(), 1.5),
+            ("F16", 1u16.to_le_bytes().to_vec(), 2.0_f32.powi(-24)),
+            ("F16", 0x3e00u16.to_le_bytes().to_vec(), 1.5),
+            ("BOOL", vec![1], 1.0),
+            ("I8", (-3i8).to_le_bytes().to_vec(), -3.0),
+            ("U8", vec![4], 4.0),
+            ("I16", (-123i16).to_le_bytes().to_vec(), -123.0),
+            ("U16", 321u16.to_le_bytes().to_vec(), 321.0),
+            ("I32", (-12345i32).to_le_bytes().to_vec(), -12345.0),
+            ("U32", 123456u32.to_le_bytes().to_vec(), 123456.0),
+            ("I64", (-3i64).to_le_bytes().to_vec(), -3.0),
+            ("U64", 1234567u64.to_le_bytes().to_vec(), 1234567.0),
+            // Native load maps these to U8; it does NOT opt into floating-point fp8 decoding.
+            ("F8_E4M3", vec![128], 128.0),
+            ("F8_E8M0", vec![0], 0.0),
+        ] {
+            let path = control(root.path(), dtype, &[1], &bytes);
+            assert_eq!(
+                read_control_scalar_f32(&path, "module.alpha")
+                    .unwrap()
+                    .to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
+    #[test]
+    fn alpha_control_reader_preserves_core_first_element_and_alpha_only_selector() {
+        let root = tempfile::tempdir().unwrap();
+        let mut values = 0.5f32.to_le_bytes().to_vec();
+        values.extend_from_slice(&2.0f32.to_le_bytes());
+        values.extend_from_slice(&3.0f32.to_le_bytes());
+        let path = control(root.path(), "F32", &[3], &values);
+        assert!(
+            matches!(read_control_scalar_f32(&path, "module.alpha"), Ok(value) if value == 0.5)
+        );
+        let forbidden = tensor(
+            "module.weight",
+            root.path(),
+            "F32",
+            &[1],
+            &1.5f32.to_le_bytes(),
+        );
+        assert!(read_control_scalar_f32(&forbidden, "module.weight").is_err());
+    }
+    #[test]
+    fn alpha_control_reader_rejects_empty_unsupported_and_truncated_controls() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = control(root.path(), "F32", &[0], &[]);
+        assert!(read_control_scalar_f32(&empty, "module.alpha").is_err());
+        for (dtype, bytes) in [
+            ("F64", 1.0f64.to_le_bytes().to_vec()),
+            ("F8_E5M2", vec![1]),
+            ("C64", vec![0; 8]),
+        ] {
+            let unsupported = control(root.path(), dtype, &[1], &bytes);
+            assert!(read_control_scalar_f32(&unsupported, "module.alpha").is_err());
+        }
+        let truncated = control(root.path(), "F32", &[1], &[0u8; 3]);
+        assert!(read_control_scalar_f32(&truncated, "module.alpha").is_err());
+    }
 }
 
 #[cfg(test)]

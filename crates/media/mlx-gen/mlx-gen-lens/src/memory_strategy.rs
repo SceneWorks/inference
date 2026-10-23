@@ -779,7 +779,11 @@ mod tests {
         for component in ["text_encoder", "transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("model.safetensors"), [0_u8; 8]).unwrap();
+            let header = br#"{"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[0, 0]);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
         }
         for component in ["text_encoder", "transformer"] {
             let config = match bits {

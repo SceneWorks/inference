@@ -16,10 +16,10 @@
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
-//! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise → **drop the U-Net, control branches and IP encoder** (sc-26268) → decode |
+//! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → encode the IP image prompt → **drop the IP image encoder + Resampler** (epic 16774) → denoise → **drop the U-Net, control branches and IP K/V** (sc-26268) → decode |
 //! | 2 Bounded decode | **Implemented** over [`DECODE_TILE_EDGES`] (sc-26268); sealed route/geometry rows still override ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) — layer-wise halo tiling with SC-19753 full-image GroupNorm statistics, exact up to float reassociation at every edge |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
-//! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
+//! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks. A streamable load streams on EVERY request (an unselected window is one window per sub-stack), so its U-Net is resident as its non-block remainder and each block is read inside its own priced iOS quantum (epic 16774, `crate::ios_pricing`) |
 //!
 //! The rung-2 row is the route-blind legacy default. A caller may now replace it for one exact
 //! catalog route, tier, mode, overlay and output geometry by packaging a sealed production-latent
@@ -632,13 +632,19 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// longer carries a resident U-Net (`StagedWeightSchedule::ThreeStage`), rung 2 is published
 /// ([`DECODE_SUPPORT`]), and a packed snapshot's dense leaves now load at the compute dtype instead
 /// of their stored one. Every v3 row described a different decode-phase peak.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v4";
+///
+/// `v5` (epic 16774) because two executions changed: a staged IP-Adapter request now releases the
+/// image encoder and Resampler once its image prompt is encoded (`model::sheds_ip_image_encoder`),
+/// so its denoise no longer holds them; and on the iOS path a cast load holds its sources until it
+/// materializes (`loader::hold_cast_sources`), so no cast copy stays resident at its source's wider
+/// width. Every v4 staged IP row and every iOS cast-load row described a different peak.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v5";
 
 /// The calibration fingerprint of a load that runs the staged **fp16-fix VAE**
 /// ([`crate::loader::VAE_FP16_FIX_COMPONENT`], sc-26268). A different decoder at a different
 /// activation width is a different execution: its decode-phase evidence must never be reused for
 /// the f32 in-snapshot VAE or the other way round.
-pub const MEMORY_CALIBRATION_FINGERPRINT_VAE_FP16: &str = "sdxl-mlx-unet-shared-ladder-v4-vae-fp16";
+pub const MEMORY_CALIBRATION_FINGERPRINT_VAE_FP16: &str = "sdxl-mlx-unet-shared-ladder-v5-vae-fp16";
 
 /// Whether this load runs the staged fp16-fix VAE.
 pub fn uses_fp16_vae(spec: &LoadSpec) -> bool {
@@ -841,31 +847,11 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
     // the 1-D norms are not packed, so they keep the fp16 compute cast. Erring large would have
     // been E3-safe, but a Q4 branch is ~4x smaller than its dense pricing, which is enough to
     // refuse a fit that would have succeeded.
-    let control_group_size = crate::quant::GROUP_SIZE as usize;
     let control_bits = spec.quantize.map(mlx_gen::Quant::bits);
-    let control_projection =
-        move |tensor: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| match control_bits {
-            Some(bits)
-                if tensor.name.ends_with(".weight")
-                    && matches!(
-                        tensor.shape.as_slice(),
-                        [_, input] if *input >= control_group_size
-                            && *input % control_group_size == 0
-                    ) =>
-            {
-                ResidentProjection::GroupQuantized {
-                    bits,
-                    group_size: control_group_size,
-                }
-            }
-            _ => ResidentProjection::Bfloat16,
-        };
-
     let mut control_bytes = 0_u64;
     for source in spec.control.iter().chain(&spec.extra_controls) {
         let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
-        control_bytes =
-            control_bytes.saturating_add(projected_safetensors_bytes(path, control_projection)?);
+        control_bytes = control_bytes.saturating_add(control_resident_bytes(path, control_bits)?);
     }
     push_overlay(
         &mut components,
@@ -945,6 +931,30 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
     );
 
     Ok(components)
+}
+
+/// One ControlNet branch's resident bytes after `load_sdxl`'s load-time cast and tier quantization
+/// at `bits`: `quantize_map`'s eligibility verbatim (its `is_unet_target` predicate is `true`,
+/// leaving the rank-two `.weight` shape guard as the whole scope — `ControlNet::quantize`'s
+/// Linear-only reach); the 4-D convs and the 1-D norms keep the fp16 compute cast. Header-only.
+pub(crate) fn control_resident_bytes(path: &std::path::Path, bits: Option<i32>) -> CoreResult<u64> {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+    let group_size = crate::quant::GROUP_SIZE as usize;
+    projected_safetensors_bytes(
+        path,
+        move |tensor: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| match bits {
+            Some(bits)
+                if tensor.name.ends_with(".weight")
+                    && matches!(
+                        tensor.shape.as_slice(),
+                        [_, input] if *input >= group_size && *input % group_size == 0
+                    ) =>
+            {
+                ResidentProjection::GroupQuantized { bits, group_size }
+            }
+            _ => ResidentProjection::Bfloat16,
+        },
+    )
 }
 
 /// Record one overlay, skipping a zero. The shared validator refuses a declared component with zero
@@ -1245,7 +1255,7 @@ fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
 /// native route has a default: the PiD student honours a selected tile only when it is named
 /// (`mlx_gen_pid::engine::selected_decode_tiling`), so an unnamed PiD geometry stays unnamed and
 /// `DecodeRoutes::validate` refuses it rather than admitting a tile the student would not run.
-fn resolve_decode_geometry(
+pub(crate) fn resolve_decode_geometry(
     use_pid: bool,
     edge: Option<u32>,
     overlap: Option<u32>,

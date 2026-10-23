@@ -61,7 +61,9 @@ pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
     let config_path = component_dir.join("config.json");
     let bytes = match std::fs::read(&config_path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return packed_bits_from_headers(component_dir)
+        }
         Err(err) => {
             return Err(crate::Error::Msg(format!(
                 "packed quant: read {}: {err}",
@@ -76,7 +78,10 @@ pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
         ))
     })?;
     let Some(marker) = config.get("quantization") else {
-        return Ok(None);
+        // No config marker: the packing is read from the safetensors HEADERS (a packed snapshot
+        // published without the marker — e.g. older SceneWorks SDXL-family q8 revisions — is still
+        // packed, and must never be mistaken for dense weights and load-time quantized).
+        return packed_bits_from_headers(component_dir);
     };
     let marker = marker.as_object().ok_or_else(|| {
         crate::Error::Msg(format!(
@@ -108,6 +113,72 @@ pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
     Ok(Some(bits))
 }
 
+/// The group size of a packed component that carries no config marker: the SceneWorks converters
+/// pack at 64 (`quantize_map`), and [`packed_bits_from_headers`] only accepts a pack whose shapes
+/// are exactly a Q4 or Q8 pack at that group size.
+pub const HEADER_PACKED_GROUP_SIZE: i32 = 64;
+
+/// The packed bit-width of a component read from its safetensors HEADERS alone (no payload): every
+/// `X.weight` with a sibling `X.scales` must be a 2-D u32 code tensor `[out, in·bits/32]` beside
+/// `[out, in/64]` scales, with one bit-width (4 or 8) across the component. `None` when no tensor is
+/// packed (dense; a non-u32 `.weight` beside a `.scales` is not a pack). Any inconsistent or
+/// non-Q4/Q8 u32 pack is an error, never "dense".
+pub fn packed_bits_from_headers(component_dir: &Path) -> Result<Option<i32>> {
+    let Ok(entries) = std::fs::read_dir(component_dir) else {
+        return Ok(None);
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+        .collect();
+    files.sort();
+    let mut headers = std::collections::BTreeMap::new();
+    for file in files {
+        for h in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(&file)
+            .map_err(|e| crate::Error::Msg(format!("packed quant: {}: {e}", file.display())))?
+        {
+            headers.insert(h.name.clone(), h);
+        }
+    }
+    let mut bits: Option<i32> = None;
+    for (name, scales) in &headers {
+        let Some(base) = name.strip_suffix(".scales") else {
+            continue;
+        };
+        let Some(weight) = headers.get(&format!("{base}.weight")) else {
+            continue;
+        };
+        let bad = || {
+            crate::Error::Msg(format!(
+                "packed quant: {} {base}: weight {:?} {:?} / scales {:?} is not a Q4/Q8 pack at group \
+                 size {HEADER_PACKED_GROUP_SIZE}",
+                component_dir.display(),
+                weight.dtype.as_str(),
+                weight.shape,
+                scales.shape
+            ))
+        };
+        // Only u32 codes are a pack; a dense tensor that happens to have a `.scales` sibling is not.
+        if weight.dtype.as_str() != "U32" {
+            continue;
+        }
+        if weight.shape.len() != 2 || scales.shape.len() != 2 {
+            return Err(bad());
+        }
+        let input = (scales.shape[1] as u64) * HEADER_PACKED_GROUP_SIZE as u64;
+        let packed_bits = (weight.shape[1] as u64) * 32;
+        if input == 0 || weight.shape[0] != scales.shape[0] || !packed_bits.is_multiple_of(input) {
+            return Err(bad());
+        }
+        let b = i32::try_from(packed_bits / input).map_err(|_| bad())?;
+        if !matches!(b, 4 | 8) || bits.is_some_and(|seen| seen != b) {
+            return Err(bad());
+        }
+        bits = Some(b);
+    }
+    Ok(bits)
+}
+
 /// Read the affine quantization group size declared by a packed component's `config.json`.
 ///
 /// Dense components return `None`. A packed marker must declare one of the group sizes implemented
@@ -132,7 +203,8 @@ pub fn packed_quant_group_size_at(component_dir: &Path) -> Result<Option<i32>> {
         ))
     })?;
     let Some(marker) = config.get("quantization") else {
-        return Ok(None);
+        // Packed per the headers but unmarked: the converter's group size.
+        return Ok(packed_bits_from_headers(component_dir)?.map(|_| HEADER_PACKED_GROUP_SIZE));
     };
     let marker = marker.as_object().ok_or_else(|| {
         crate::Error::Msg(format!(
@@ -202,27 +274,44 @@ pub fn needs_load_time_quant(
 /// Q4/Q8 width. The shared load seam for every Group-B packed snapshot feeds straight off external
 /// `.safetensors`, so these tensors are untrusted.
 pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
-    let sshape = scales.shape();
-    let wshape = wq.shape();
+    packed_bits_from_metadata(
+        wq.shape(),
+        wq.dtype(),
+        scales.shape(),
+        scales.dtype(),
+        group_size,
+    )
+}
+
+/// The exact packed-load geometry validator without constructing or reading a tensor. Both the
+/// executable loader and provider-owned header normalization use this seam; metadata supplies no
+/// allocator/backing authority. Accepted layouts and refusals are those of [`packed_bits`].
+pub fn packed_bits_from_metadata(
+    wshape: &[i32],
+    weight_dtype: Dtype,
+    sshape: &[i32],
+    scales_dtype: Dtype,
+    group_size: i32,
+) -> Result<i32> {
     if sshape.len() != 2 || wshape.len() != 2 {
         return Err(crate::Error::Msg(format!(
             "packed quant: scales and weight must be 2-D, got scales {:?} / weight {:?}",
             sshape, wshape
         )));
     }
-    if wq.dtype() != Dtype::Uint32 {
+    if weight_dtype != Dtype::Uint32 {
         return Err(crate::Error::Msg(format!(
             "packed quant: weight codes must be u32, got {:?}",
-            wq.dtype()
+            weight_dtype
         )));
     }
     if !matches!(
-        scales.dtype(),
+        scales_dtype,
         Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
     ) {
         return Err(crate::Error::Msg(format!(
             "packed quant: scales must be floating point, got {:?}",
-            scales.dtype()
+            scales_dtype
         )));
     }
     if sshape[0] != wshape[0] {
@@ -543,6 +632,91 @@ mod tests {
         }
     }
 
+    /// An UNMARKED packed component (an older published q8 revision with no `quantization` block)
+    /// is read as packed from its headers — never as dense — and an inconsistent pack is an error.
+    #[test]
+    fn an_unmarked_packed_component_is_detected_from_its_headers() {
+        fn write(dir: &Path, tensors: &[(&str, &str, &[usize])]) {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut header = serde_json::Map::new();
+            let mut offset = 0usize;
+            for (name, dtype, shape) in tensors {
+                let width = if *dtype == "F32" || *dtype == "U32" {
+                    4
+                } else {
+                    2
+                };
+                let bytes = shape.iter().product::<usize>() * width;
+                header.insert(
+                    (*name).into(),
+                    serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}),
+                );
+                offset += bytes;
+            }
+            let text = serde_json::Value::Object(header).to_string();
+            let mut data = (text.len() as u64).to_le_bytes().to_vec();
+            data.extend(text.as_bytes());
+            data.resize(data.len() + offset, 0);
+            std::fs::write(dir.join("diffusion_pytorch_model.safetensors"), data).unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // in = 128: Q8 codes are [out, 128·8/32 = 32], scales [out, 128/64 = 2].
+        let q8 = tmp.path().join("q8/unet");
+        write(
+            &q8,
+            &[
+                ("a.weight", "U32", &[4, 32]),
+                ("a.scales", "BF16", &[4, 2]),
+                ("a.biases", "BF16", &[4, 2]),
+                ("norm.weight", "BF16", &[4]),
+            ],
+        );
+        std::fs::write(q8.join("config.json"), r#"{"sample_size": 128}"#).unwrap();
+        assert_eq!(
+            packed_quant_bits(&tmp.path().join("q8"), "unet").unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            packed_quant_group_size_at(&q8).unwrap(),
+            Some(HEADER_PACKED_GROUP_SIZE)
+        );
+        assert!(!needs_load_time_quant(&tmp.path().join("q8"), "unet", 8, "sdxl").unwrap());
+        assert!(needs_load_time_quant(&tmp.path().join("q8"), "unet", 4, "sdxl").is_err());
+        let q4 = tmp.path().join("q4/unet");
+        write(
+            &q4,
+            &[("a.weight", "U32", &[4, 16]), ("a.scales", "BF16", &[4, 2])],
+        );
+        assert_eq!(
+            packed_quant_bits(&tmp.path().join("q4"), "unet").unwrap(),
+            Some(4)
+        );
+        // Dense stays dense; a mixed or non-Q4/Q8 pack is an error, never "dense".
+        let dense = tmp.path().join("dense/unet");
+        write(&dense, &[("a.weight", "F16", &[4, 128])]);
+        assert_eq!(
+            packed_quant_bits(&tmp.path().join("dense"), "unet").unwrap(),
+            None
+        );
+        let mixed = tmp.path().join("mixed/unet");
+        write(
+            &mixed,
+            &[
+                ("a.weight", "U32", &[4, 32]),
+                ("a.scales", "BF16", &[4, 2]),
+                ("b.weight", "U32", &[4, 16]),
+                ("b.scales", "BF16", &[4, 2]),
+            ],
+        );
+        assert!(packed_quant_bits(&tmp.path().join("mixed"), "unet").is_err());
+        let odd = tmp.path().join("odd/unet");
+        write(
+            &odd,
+            &[("a.weight", "U32", &[4, 24]), ("a.scales", "BF16", &[4, 2])],
+        );
+        assert!(packed_quant_bits(&tmp.path().join("odd"), "unet").is_err());
+    }
+
     #[test]
     fn quant_tier_match_skips_and_mismatch_names_context() {
         let tmp = tempfile::tempdir().unwrap();
@@ -683,6 +857,29 @@ mod tests {
         }
         assert!(needs_load_time_quant(&root, "vae", 3, "model").is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Pure production validator coverage: no native device/stream/tensor is constructed.
+    #[test]
+    fn packed_metadata_preserves_exact_load_geometry_refusals() {
+        let check = |w: &[i32], wd, s: &[i32], sd, g| packed_bits_from_metadata(w, wd, s, sd, g);
+        assert_eq!(
+            check(&[128, 32], Dtype::Uint32, &[128, 4], Dtype::Float32, 64).unwrap(),
+            4
+        );
+        assert_eq!(
+            check(&[64, 32], Dtype::Uint32, &[64, 2], Dtype::Float16, 64).unwrap(),
+            8
+        );
+        assert!(check(&[2, 33], Dtype::Uint32, &[2, 2], Dtype::Bfloat16, 64).is_err());
+        assert!(check(&[3, 32], Dtype::Uint32, &[2, 2], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Float32, &[2, 2], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, 2], Dtype::Uint32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, 0], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 24], Dtype::Uint32, &[2, 4], Dtype::Float32, 64).is_err());
+        assert!(check(&[2], Dtype::Uint32, &[2, 4], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, 32], Dtype::Uint32, &[2, i32::MAX], Dtype::Float32, 64).is_err());
+        assert!(check(&[2, i32::MAX], Dtype::Uint32, &[2, 2], Dtype::Float32, 64).is_err());
     }
 
     /// F-011: a Q4 pack at group_size 64 derives bits == 4 from the standard shapes.

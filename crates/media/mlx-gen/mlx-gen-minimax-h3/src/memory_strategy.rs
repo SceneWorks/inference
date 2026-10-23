@@ -2271,13 +2271,34 @@ mod tests {
     }
 
     /// Write a snapshot tree whose component directories hold **sparse** `.safetensors` files of
-    /// the exact measured sizes. `safetensors_path_bytes` stats rather than parses, so this costs
-    /// no disk and still exercises the real directory-name wiring.
+    /// the exact measured sizes. Valid headers exercise tier detection without materializing the
+    /// sparse payload; stat-based component accounting still sees every original measured byte.
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).expect("component dir");
-            let file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            let mut file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
+            use std::io::Write;
+            // Header and both payload intervals cover the exact sparse file, including odd
+            // measured lengths. A real BF16 tensor proves dense storage; U8 padding is not a
+            // pretend floating parameter and must not alter stat-derived component charges.
+            let mut padding = 0_u64;
+            let header = loop {
+                let header = format!(
+                    r#"{{"w":{{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}},"padding":{{"dtype":"U8","shape":[{padding:20}],"data_offsets":[2,{:20}]}}}}"#,
+                    padding + 2
+                );
+                let remaining = (*bytes)
+                    .checked_sub(8 + header.len() as u64 + 2)
+                    .expect("fixture fits header");
+                if padding == remaining {
+                    break header;
+                }
+                padding = remaining;
+            };
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .unwrap();
+            file.write_all(header.as_bytes()).unwrap();
             file.set_len(*bytes).expect("sparse shard");
         }
     }
@@ -3239,6 +3260,20 @@ mod tests {
                 ("transformer_ref", DIT_BF16_BYTES),
             ],
         );
+        // Audio VAE loads EVERY tensor as F32, including the fixture's U8 padding. Derive
+        // its resident charge from actual header elements, not the sparse file's stat size.
+        let audio_headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+            root.path().join("audio_vae"),
+        )
+        .expect("valid audio fixture headers");
+        let audio_f32: u64 = audio_headers
+            .iter()
+            .map(|h| h.shape.iter().map(|&d| d as u64).product::<u64>() * 4)
+            .sum();
+        assert!(
+            audio_f32 > AUDIO_VAE_BYTES,
+            "U8 padding must materialize wider"
+        );
         let contract =
             contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
         let facts = contract.asset_facts;
@@ -3246,13 +3281,13 @@ mod tests {
         assert_eq!(facts.transformer_bytes, DIT_BF16_BYTES);
         assert_eq!(
             facts.decoder_bytes,
-            VIDEO_VAE_BYTES + AUDIO_VAE_BYTES,
+            VIDEO_VAE_BYTES + audio_f32,
             "both decoders are charged, and only the decoders"
         );
         assert_eq!(facts.overlay_bytes, 0);
         assert_eq!(
             facts.base_bytes,
-            TEXT_ENCODER_BYTES + DIT_BF16_BYTES + VIDEO_VAE_BYTES + AUDIO_VAE_BYTES
+            TEXT_ENCODER_BYTES + DIT_BF16_BYTES + VIDEO_VAE_BYTES + audio_f32
         );
         assert!(contract.conformance_errors().is_empty());
     }

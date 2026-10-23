@@ -1080,10 +1080,12 @@ mod tests {
         // sc-25900's `qwen_image_2_1_turbo` publishes the same full surface as `qwen_image_2_1`,
         // so it joins the 12-apiece group — 52 -> 53.
         //
-        // sc-26266 gives `iris_3b` the q8 / q4 tiers it now quantizes at load: three tiers, still
-        // eager only, under both policies — 6, while the encoder-free `iris_3b_depth` and
-        // `iris_3b_restore` keep their one dense tier — 2 apiece.
-        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 6 + 2 * 2);
+        // sc-26266 gives `iris_3b` the q8 / q4 tiers it now quantizes at load: three tiers under
+        // both policies, while the encoder-free `iris_3b_depth` and `iris_3b_restore` keep their
+        // one dense tier. Epic 16774's Iris rung 4 (streamed blocks) adds the deferred load shape
+        // to all three routes: `iris_3b` 3 tiers x 2 policies x 2 shapes — 12, depth and restore
+        // 1 x 2 x 2 — 4 apiece.
+        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4);
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
         let composed: std::collections::BTreeSet<_> = surfaces

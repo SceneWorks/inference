@@ -18,15 +18,15 @@ use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
-    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
+    require_control, Capabilities, ConditioningKind, ControlBranch, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
+    Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
 use std::path::Path;
 
 use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
-use crate::model::{validate_request, ZImageDecodeView, DEFAULT_STEPS, SCHEDULE_SHIFT};
+use crate::model::{validate_request, ZImageDecodeView, DEFAULT_STEPS};
 use crate::pipeline::{
     self, denoise_control_with_progress_and_preview, encode_control_context, encode_init_latents,
     init_time_step,
@@ -296,7 +296,7 @@ fn build_control_residency_with_source(
 
 /// The per-id precision-override rejection message for the turbo control variant, shared by
 /// [`load_control_residency`]'s eager guard and its `Sequential` per-phase loaders.
-const PRECISION_ERROR: &str =
+pub(crate) const PRECISION_ERROR: &str =
     "z_image_turbo_control: only dense bf16 is wired (the text encoder runs \
      f32 internally); drop the precision override";
 
@@ -344,6 +344,18 @@ impl ZImageTurboControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            MODEL_ID,
+            "request",
+            &[
+                ("schema", 1),
+                ("serial_count", req.count as u64),
+                ("forward_rows", 1),
+                ("requested_width", req.width as u64),
+                ("requested_height", req.height as u64),
+                ("requested_steps", req.steps.unwrap_or(DEFAULT_STEPS) as u64),
+            ],
+        );
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
@@ -426,13 +438,8 @@ impl ZImageTurboControl {
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over the shift.
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
-                    req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
-                    steps,
-                    &native.sigmas,
-                ))?;
+                let sampling = crate::sampling::resolve_full(req)?;
+                let scheduler = FlowMatchEuler::from_sigmas(sampling.sigmas().to_vec())?;
 
                 // The 33ch control context is constant across steps + the batch — build once. It stays
                 // **f32** (the fork feeds it f32, which promotes the whole control branch to f32).
@@ -449,7 +456,7 @@ impl ZImageTurboControl {
                     None
                 };
 
-                let sampler_name = req.sampler.as_deref();
+                let sampler_name = Some(sampling.solver().name());
                 let latents = pipeline::denoise_batch(
                     &scheduler,
                     clean.as_ref(),

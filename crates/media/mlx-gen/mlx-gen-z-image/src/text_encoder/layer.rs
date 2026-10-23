@@ -19,6 +19,11 @@ pub struct EncoderLayer {
 }
 
 impl EncoderLayer {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witness(&self) -> &Array {
+        &self.input_ln
+    }
+
     pub fn from_weights(
         w: &Weights,
         prefix: &str,

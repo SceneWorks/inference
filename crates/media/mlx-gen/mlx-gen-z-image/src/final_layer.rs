@@ -64,15 +64,24 @@ impl FinalLayer {
     }
 }
 
+pub(crate) const ADAPTER_TARGET_PATHS: &[&str] = &["linear", "adaLN_modulation.1"];
+pub(crate) fn adapter_header_path(path: &[&str]) -> Option<&'static str> {
+    match path {
+        ["linear"] => Some("linear"),
+        ["adaLN_modulation", "1"] => Some("adaLN_modulation.0"),
+        _ => None,
+    }
+}
+
 impl AdaptableHost for FinalLayer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         // Trained-file naming (fork mapping): `all_final_layer.{p}-{pf}.linear` and, for the adaLN
         // modulation, Sequential index **1** (SiLU at 0) — unlike the transformer blocks whose
         // adaLN file key is index 0. The base checkpoint stores this Linear at `adaLN_modulation.0`,
         // hence the Rust field name, but the adapter file addresses it as `.1`.
-        match path {
-            ["linear"] => Some(&mut self.linear),
-            ["adaLN_modulation", "1"] => Some(&mut self.ada),
+        match adapter_header_path(path)? {
+            "linear" => Some(&mut self.linear),
+            "adaLN_modulation.0" => Some(&mut self.ada),
             _ => None,
         }
     }

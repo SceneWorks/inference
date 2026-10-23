@@ -40,6 +40,8 @@ mlx-gen-z-image = { path = "../mlx-gen-z-image", default-features = false }
 device-capture = []
 
 [dev-dependencies]
+# CPU-native stream pinning before the Metal-trapped admission fixtures.
+mlx-sys = { workspace = true }
 tempfile = { workspace = true }
 # The shared weights-free memory-strategy oracle, run over this catalog's exact registrations.
 sceneworks-gen-core-testkit = { workspace = true }

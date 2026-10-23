@@ -31,6 +31,8 @@ image = { workspace = true, optional = true }
 # Read/annotate per-component `config.json` with the `quantization` block in the offline
 # pre-quantization converter (`convert.rs`, sc-8670) — matches mlx-gen-flux2.
 serde_json = { workspace = true }
+# Stable correspondence digest for complete source histories; same existing locked binding.
+sha2 = { workspace = true }
 
 [features]
 # The LoRA trainer (`training`) and its training-only deps (depth/perceptual aux losses, dataset
@@ -40,12 +42,13 @@ default = ["training"]
 training = ["dep:image", "dep:mlx-gen-depth", "dep:mlx-gen-perceptual"]
 
 [dev-dependencies]
+# Pin CPU-native stream before any weights-free fixture allocation; trap Metal submissions.
+mlx-sys = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.
 tempfile = { workspace = true }
 safetensors = { workspace = true }
-sha2 = { workspace = true }
 # Backend-neutral contract conformance suite (sc-4481): the macos-mlx lane runs z_image_turbo
 # through it as the "one real family" the testkit AC requires. Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }

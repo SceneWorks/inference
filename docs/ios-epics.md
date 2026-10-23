@@ -36,10 +36,13 @@ Mac Iris fidelity/resident-byte tests and final SDXL VAE parity have passed;
 they do not close the phone campaign or establish target fit. The runbook records
 their exact source provenance and the older full-pipeline measurement's limits.
 
-The terminal campaign covers SANA, Anima Turbo, Iris 3B, the complete SDXL family
-and Supra2-IMG across tiers and modes: 512²/768²/1024², with Supra2 at 256².
-Record the largest completed size and next-size pre-load refusal, elapsed time,
-MLX peak, kernel footprint and minimum headroom with artifact/device identity.
+The terminal campaign covers SANA, Anima Turbo, Iris 3B, Z-Image Turbo, the
+complete SDXL family and Supra2-IMG across served tiers and modes as ANCHORS (the
+recorded memory-anchor rule): per family the fully resident and the fully
+optimized configuration at 1024² (Supra2: 256²), the optimized one three times,
+every other rung and size derived (runbook: *Anchors and derivation*). Record
+elapsed time, MLX peak, kernel footprint per phase and minimum headroom with
+artifact/device identity.
 Do not substitute old active+cache observations or launch readings for that
 campaign. Keep missing cells visibly outstanding rather than inventing results.
 

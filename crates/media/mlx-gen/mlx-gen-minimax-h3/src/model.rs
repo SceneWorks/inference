@@ -2187,9 +2187,9 @@ pub(crate) mod tests {
     /// Write the structurally complete **weights-free** snapshot [`load`] probes for.
     ///
     /// Every path here is stat'd or parsed as JSON by the loader; not one tensor is read. The
-    /// shards are **sparse** files of the measured component sizes — `safetensors_path_bytes`
-    /// stats rather than parses — so the contract resolved off this tree carries the family's real
-    /// asset facts at no disk cost. That is what lets the assertions below distinguish the
+    /// shards are **sparse** files of the measured component sizes with valid dense headers, so
+    /// tier detection parses real tensor facts while stat accounting preserves the family's asset
+    /// facts without materializing the sparse payload. That is what lets the assertions below distinguish the
     /// production contract from the zero-footprint weights-free one.
     fn weightless_snapshot(root: &Path) {
         for (dir, probe) in [
@@ -2213,8 +2213,30 @@ pub(crate) mod tests {
             ("vae", crate::memory_strategy::VIDEO_VAE_BYTES),
             ("audio_vae", crate::memory_strategy::AUDIO_VAE_BYTES),
         ] {
-            let shard = std::fs::File::create(root.join(component).join("model.safetensors"))
+            let mut shard = std::fs::File::create(root.join(component).join("model.safetensors"))
                 .expect("shard");
+            use std::io::Write;
+            // Header and both payload intervals cover the exact sparse file, including odd
+            // measured lengths. A real BF16 tensor proves dense storage; U8 padding is not a
+            // pretend floating parameter and must not alter stat-derived component charges.
+            let mut padding = 0_u64;
+            let header = loop {
+                let header = format!(
+                    r#"{{"w":{{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}},"padding":{{"dtype":"U8","shape":[{padding:20}],"data_offsets":[2,{:20}]}}}}"#,
+                    padding + 2
+                );
+                let remaining = (bytes)
+                    .checked_sub(8 + header.len() as u64 + 2)
+                    .expect("fixture fits header");
+                if padding == remaining {
+                    break header;
+                }
+                padding = remaining;
+            };
+            shard
+                .write_all(&(header.len() as u64).to_le_bytes())
+                .unwrap();
+            shard.write_all(header.as_bytes()).unwrap();
             shard.set_len(bytes).expect("sparse shard");
         }
     }

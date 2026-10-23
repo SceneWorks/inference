@@ -23,6 +23,7 @@ mlx-llm = { workspace = true }
 # text encoder's shard index (only the language tower's shards are opened) and the packed-tier
 # converter's config (inference, so not optional).
 serde_json = { workspace = true }
+serde = { workspace = true }
 # MLX's distributed layer (`mlx::core::distributed`: ring / jaccl / mpi) for data-parallel
 # training (sc-25689) — the C bindings mlx-rs does not wrap. Same pin as mlx-rs (workspace).
 mlx-sys = { workspace = true, optional = true }
@@ -43,6 +44,8 @@ training = ["dep:cc", "dep:image", "dep:mlx-sys"]
 cc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Pin CPU native streams in inference-only test builds too (training's binding is optional).
+mlx-sys = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 # The weights-free memory-contract fixtures write a safetensors header (`memory_strategy` tests).
 serde_json = { workspace = true }

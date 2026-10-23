@@ -55,12 +55,14 @@ pub(crate) mod golden_fixture {
 }
 pub mod convert;
 pub mod dc_ae;
+pub mod ios_pricing;
 pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod preview;
 pub(crate) mod quant;
 pub mod quantum;
+pub mod sampling;
 pub mod scm;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]

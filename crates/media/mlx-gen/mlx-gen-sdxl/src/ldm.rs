@@ -1,5 +1,7 @@
 //! In-memory fused SDXL LDM/A1111 checkpoint component split and remap.
 
+pub(crate) mod pricing;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -32,18 +34,30 @@ fn component_map<'a>(
     }
 }
 
-fn squeeze_linear(value: Array) -> Result<Array> {
-    let dims: Vec<i32> = value
-        .shape()
+fn squeezed_dimensions<T: Copy + PartialEq + From<u8>>(shape: &[T]) -> Vec<T> {
+    shape
         .iter()
         .copied()
-        .filter(|&dim| dim != 1)
-        .collect();
+        .filter(|dim| *dim != T::from(1))
+        .collect()
+}
+
+fn squeeze_linear(value: Array) -> Result<Array> {
+    let dims = squeezed_dimensions(value.shape());
     if dims.len() == value.shape().len() {
         Ok(value)
     } else {
         Ok(value.reshape(&dims)?)
     }
+}
+
+/// Normalize a fused file through the SAME key-remap producer as the actual load, keeping every
+/// order-dependent alias group (each realizable native winner) beside the assignment-0 world.
+/// Transpose/squeeze/split are shape-only here; no source payload or Array is constructed.
+pub(crate) fn component_header_source(path: &Path) -> Result<pricing::FusedHeaderSource> {
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|error| Error::Msg(error.to_string()))?;
+    pricing::FusedHeaderSource::from_headers(headers)
 }
 
 pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
@@ -121,10 +135,22 @@ pub(crate) fn before_component_load(
     path: &Path,
     components: &[SdxlComponent],
 ) -> Result<()> {
-    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+    let floor = component_load_floor_from_headers(&headers, components)?;
+    mlx_gen::ios_quantum::before(label, floor)
+}
+
+/// Exact source-raw guard floor over every mapped source header in the selected actual component
+/// set, including overwritten aliases and full QKV sources. No model/Array/world enumeration.
+pub(crate) fn component_load_floor_from_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    components: &[SdxlComponent],
+) -> Result<u64> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     let compute = match crate::model::DTYPE {
         mlx_rs::Dtype::Float32 => (Stored::F32, 4u64),
         mlx_rs::Dtype::Bfloat16 => (Stored::BF16, 2),
@@ -132,9 +158,7 @@ pub(crate) fn before_component_load(
     };
     let mut total = 0u64;
     let mut largest = 0u64;
-    for header in mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
-        .map_err(|e| Error::Msg(e.to_string()))?
-    {
+    for header in headers {
         let component = match remap_sdxl_ldm_key(&header.name) {
             Some(
                 TensorRemap::Rename(component, _)
@@ -164,7 +188,7 @@ pub(crate) fn before_component_load(
             largest = largest.max(cast.saturating_add(header.data_bytes));
         }
     }
-    mlx_gen::ios_quantum::before(label, total.saturating_add(largest))
+    Ok(total.saturating_add(largest))
 }
 
 #[cfg(test)]

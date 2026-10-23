@@ -3857,6 +3857,15 @@ pub trait MemoryRequestScope {
     /// Translate the selected strategy into the provider's existing request controls. This is the
     /// executable bridge for providers that predate the shared contract.
     fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()>;
+    /// Configure an ALREADY canonical, admission-bound immutable request. No
+    /// media/prompt clone and no fabricated metadata carrier is permitted.
+    /// Existing providers keep the old mutable contract unless they explicitly
+    /// implement this source-backed path; unsupported stops before generation.
+    fn configure_admitted_request(&mut self, _request: &GenerationRequest) -> Result<()> {
+        Err(Error::Unsupported(
+            "provider lifecycle does not support immutable admitted configuration".into(),
+        ))
+    }
     fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()>;
     fn configure_decode(

@@ -200,7 +200,7 @@ pub fn tiny_unet_weights_for(cfg: &UNetConfig, seed: u64) -> Result<Weights> {
     let boc = cfg.block_out_channels.clone();
     let n = boc.len();
     let temb = cfg.time_embed_dim();
-    let ctx = TINY_CONTEXT_DIM;
+    let ctx = cfg.cross_attention_dim[0];
     let mut g = Gen {
         w: Weights::empty(),
         seed,

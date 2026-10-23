@@ -89,15 +89,41 @@ impl<L: LatentOps> Sampler<L> for Euler {
     ) -> Result<L::Latent> {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
+            ops.observe_solver(super::solvers::SolverObservation::callback(
+                super::Solver::Euler,
+                i,
+                sigma,
+                sigmas[i + 1],
+                super::solvers::SolverEvaluation::Primary,
+                &x,
+            ));
             let x0 = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 // Degenerate leading 0 (no real schedule starts here): land on x0, no division.
                 x = x0;
+                ops.observe_solver(super::solvers::SolverObservation::update(
+                    super::Solver::Euler,
+                    i,
+                    sigma,
+                    sigmas[i + 1],
+                    &x,
+                    true,
+                    false,
+                ));
                 continue;
             }
             let dt = sigmas[i + 1] - sigma;
             let d = to_d(ops, &x, sigma, &x0)?;
             x = ops.axpy(1.0, &x, dt, &d)?;
+            ops.observe_solver(super::solvers::SolverObservation::update(
+                super::Solver::Euler,
+                i,
+                sigma,
+                sigmas[i + 1],
+                &x,
+                false,
+                false,
+            ));
         }
         Ok(x)
     }

@@ -187,13 +187,55 @@ pub(crate) fn denoise_cfg_with_memory(
     preview: &PreviewSink,
     plan: crate::transformer::SanaForwardPlan,
 ) -> Result<Array> {
+    let mut forwards = 0u64;
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        forwards += 1;
+        let rows = x.shape().first().copied().unwrap_or(0) as u64;
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::MODEL_ID,
+            "forward_argument",
+            forwards,
+            rows,
+            x,
+        );
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::MODEL_ID,
+            "forward",
+            &[
+                ("evaluation", forwards),
+                ("rows", rows),
+                ("conditioned", 1),
+                (
+                    "guided",
+                    u64::from(uncond.is_some() && guidance_scale > 1.0),
+                ),
+            ],
+        );
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
         let pred_cond =
             transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
+                forwards += 1;
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    crate::model::MODEL_ID,
+                    "forward",
+                    &[
+                        ("evaluation", forwards),
+                        ("rows", rows),
+                        ("conditioned", 0),
+                        ("guided", 1),
+                        (
+                            "held_cond_prediction_dtype",
+                            mlx_gen::sampler::sampling_dtype_code(pred_cond.dtype()),
+                        ),
+                        (
+                            "held_cond_prediction_logical_bytes",
+                            mlx_gen::ios_quantum::bytes(&pred_cond),
+                        ),
+                    ],
+                );
                 let pred_uncond =
                     transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?;
                 // pred = uncond + scale·(cond − uncond).
@@ -238,7 +280,7 @@ pub fn decode_to_image(
     decode_to_image_with_tiling(decoder, cfg, latents, cancel, None)
 }
 
-fn decode_to_image_with_tiling(
+pub(crate) fn decode_to_image_with_tiling(
     decoder: &DcAeDecoder,
     cfg: &DcAeConfig,
     latents: &Array,
@@ -252,7 +294,48 @@ fn decode_to_image_with_tiling(
         None => decoder.decode(&unscaled, cancel)?,
     }; // [1, H, W, 3] NHWC, f32
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
-    decoded_to_image(&decoded_nchw)
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+    let shape = decoded_nchw.shape();
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-pixels",
+        &[
+            ("schema", 1),
+            ("batch", shape[0] as u64),
+            ("channels", shape[1] as u64),
+            ("height", shape[2] as u64),
+            ("width", shape[3] as u64),
+            (
+                "dtype",
+                mlx_gen::sampler::sampling_dtype_code(decoded_nchw.dtype()),
+            ),
+            // Transpose is a native view: these handles share ONE decoded input owner.
+            ("nchw_view_of_decoder", 1),
+            ("held_unscaled_elements", unscaled.size() as u64),
+        ],
+    );
+    convert_decoded_pixels_with(
+        decoded_nchw.size() as u64,
+        |scratch| mlx_gen::ios_quantum::before(crate::quantum::labels::DECODED_PIXELS, scratch),
+        || decoded_to_image(&decoded_nchw),
+        || mlx_gen::ios_quantum::finish(crate::quantum::labels::DECODED_PIXELS, &[]),
+    )
+}
+
+// The actual conversion is a lazy builder: rejection cannot construct/execute
+// scale/clamp/round/readback work, and a failed final barrier remains a failure.
+fn convert_decoded_pixels_with<T>(
+    elements: u64,
+    before: impl FnOnce(u64) -> Result<()>,
+    convert: impl FnOnce() -> Result<T>,
+    finish: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    before(mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(
+        elements,
+    ))?;
+    let image = convert()?;
+    finish()?;
+    Ok(image)
 }
 
 /// Measured production DC-AE tile domain. All edges use one fixed 48-pixel overlap; edges below
@@ -346,6 +429,12 @@ pub fn resolved_decode_plan(
 /// (at the request's edge, else [`DECODE_TILE_EDGE`]). Nothing else does — in particular a Mac
 /// request with no memory selection (Resident or Sequential) keeps the whole-image encode.
 pub fn resolved_encode_tile(memory: Option<GenerationMemory>) -> Option<i32> {
+    resolved_encode_tile_on(memory, mlx_gen::ios_quantum::enabled())
+}
+
+/// [`resolved_encode_tile`] with the iOS quantum scope's state given explicitly (`ios`): what a
+/// request resolves to on a device, priced off it by [`crate::ios_pricing`].
+pub fn resolved_encode_tile_on(memory: Option<GenerationMemory>, ios: bool) -> Option<i32> {
     let requested = memory
         .filter(|memory| memory.tile_vae_decode)
         .map(|memory| {
@@ -353,7 +442,7 @@ pub fn resolved_encode_tile(memory: Option<GenerationMemory>) -> Option<i32> {
                 .decode_tile_edge
                 .map_or(DECODE_TILE_EDGE, |edge| edge as i32)
         });
-    requested.or_else(|| mlx_gen::ios_quantum::enabled().then_some(DECODE_TILE_EDGE))
+    requested.or_else(|| ios.then_some(DECODE_TILE_EDGE))
 }
 
 pub fn resolve_decode_tiling(
@@ -453,7 +542,7 @@ fn decode_tiled(
     }
     let plan = tiling.plan(vae, 1, height, width);
     let lifted = head.reshape(&[1, 1, height, width, channels])?;
-    let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
     let (out_h, out_w) = (
         (height as u64).saturating_mul(decoder.tail_scale() as u64),
         (width as u64).saturating_mul(decoder.tail_scale() as u64),
@@ -469,7 +558,7 @@ fn decode_tiled(
             let decoded = decoder.decode_tail_cancellable(&tile, cancel)?;
             let shape = decoded.shape();
             mlx_gen::ios_quantum::before(
-                "DC-AE tile fold",
+                crate::quantum::labels::TILE_FOLD,
                 crate::quantum::tile_fold_bytes(
                     shape[1] as u64,
                     shape[2] as u64,
@@ -482,7 +571,7 @@ fn decode_tiled(
         },
         |accumulators| {
             if mlx_gen::ios_quantum::enabled() {
-                mlx_gen::ios_quantum::finish("DC-AE tile fold", accumulators)
+                mlx_gen::ios_quantum::finish(crate::quantum::labels::TILE_FOLD, accumulators)
             } else {
                 for accumulator in accumulators {
                     accumulator.eval()?;
@@ -497,12 +586,12 @@ fn decode_tiled(
         },
         |_| {
             mlx_gen::ios_quantum::before(
-                "DC-AE final normalize",
+                crate::quantum::labels::TILE_FINALIZE,
                 crate::quantum::tile_finalize_bytes(out_h, out_w),
             )
         },
     )?;
-    mlx_gen::ios_quantum::finish("DC-AE final normalize", &[&out])?;
+    mlx_gen::ios_quantum::finish(crate::quantum::labels::TILE_FINALIZE, &[&out])?;
     let shape = out.shape();
     Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }
@@ -695,6 +784,8 @@ pub(crate) fn denoise_sprint_from_with_memory(
     let preview_schedule = &scheduler.timesteps[start..];
     let previews = mlx_gen::preview::PreviewCounter::new(preview_schedule);
     let mut denoised = latents.clone();
+    let mut completed_steps = 0u64;
+    let mut previous_renoise = false;
     // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
     // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
     let step_key = |step: usize| -> Result<Array> {
@@ -710,10 +801,32 @@ pub(crate) fn denoise_sprint_from_with_memory(
         // responsive rather than deferred to decode. The prior step's SCM update (or the seeded
         // prior on the first step) materializes here, inside its own guarded quantum.
         materialize_latents(
-            "SANA SCM step",
+            crate::quantum::labels::SCM_STEP,
             &[&latents],
             crate::quantum::scm_step_bytes(latents.size() as u64),
         )?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::SPRINT_MODEL_ID,
+            "scm_callback_evaluated",
+            &[
+                ("schema", 1),
+                ("step", i as u64),
+                ("start", start as u64),
+                ("declared_steps", n as u64),
+                ("completed_steps", completed_steps),
+                ("history_present", u64::from(completed_steps > 0)),
+                ("previous_renoise", u64::from(previous_renoise)),
+                (
+                    "state_dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                ),
+                ("state_logical_bytes", mlx_gen::ios_quantum::bytes(&latents)),
+                (
+                    "denoised_owner_logical_bytes",
+                    mlx_gen::ios_quantum::bytes(&denoised),
+                ),
+            ],
+        );
         on_progress(Progress::Step {
             current: (i - start) as u32 + 1,
             total,
@@ -735,6 +848,13 @@ pub(crate) fn denoise_sprint_from_with_memory(
         // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
         let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
         let scm_t_arr = arr1(scm_t);
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::SPRINT_MODEL_ID,
+            "forward_argument",
+            completed_steps + 1,
+            lat_in.shape().first().copied().unwrap_or(0) as u64,
+            &lat_in,
+        );
         let raw = transformer.forward_with_memory(
             &lat_in,
             cond,
@@ -744,6 +864,14 @@ pub(crate) fn denoise_sprint_from_with_memory(
             plan,
             cancel,
         )?;
+
+        mlx_gen::sampler::diagnostic_sampling_tensor(
+            crate::model::SPRINT_MODEL_ID,
+            "forward_return",
+            completed_steps + 1,
+            raw.shape().first().copied().unwrap_or(0) as u64,
+            &raw,
+        );
 
         // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
         // `if len(self.timesteps) > 1`). On the last step `t_next == 0` ⇒ `cos(0)=1`, `sin(0)=0`, so the
@@ -770,18 +898,50 @@ pub(crate) fn denoise_sprint_from_with_memory(
         )?;
         denoised = pred_x0;
         latents = next;
+        completed_steps += 1;
+        previous_renoise = renoise_key.is_some();
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            crate::model::SPRINT_MODEL_ID,
+            "scm_update",
+            &[
+                ("schema", 1),
+                ("step", i as u64),
+                ("completed_steps", completed_steps),
+                ("noise", u64::from(previous_renoise)),
+                ("terminal_alias", u64::from(renoise_key.is_none())),
+                ("next_angle_bits", t_next.to_bits() as u64),
+                (
+                    "state_dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latents.dtype()),
+                ),
+            ],
+        );
     }
 
     // diffusers: latents = denoised / sigma_data (the decode input). The last step's update is
     // still lazy here and materializes with the division.
     let out = divide(&denoised, arr1(sd))?;
     materialize_latents(
-        "SANA SCM final",
+        crate::quantum::labels::SCM_FINAL,
         &[&out],
         crate::quantum::scm_step_bytes(out.size() as u64).saturating_add(
             mlx_gen::ios_quantum::elementwise_bytes(out.size() as u64, 1),
         ),
     )?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        crate::model::SPRINT_MODEL_ID,
+        "solve_complete",
+        &[
+            ("schema", 1),
+            ("evaluations", completed_steps),
+            ("steps", completed_steps),
+            (
+                "final_dtype",
+                mlx_gen::sampler::sampling_dtype_code(out.dtype()),
+            ),
+            ("final_scaling", 1),
+        ],
+    );
     Ok(out)
 }
 
@@ -875,6 +1035,76 @@ pub struct SanaConditioning {
     pub uncond: Option<(Array, Array)>,
 }
 
+/// Real selected-output boundary for the joined program. Ordinary callers retain
+/// the historical lazy/residency cadence. This executes before text can be shed.
+pub(crate) fn materialize_conditioning_if_retired(conditioning: &SanaConditioning) -> Result<()> {
+    if !crate::quantum::retired_lifecycle()? {
+        return Ok(());
+    }
+    let captions = conditioning.cond.size() as u64
+        + conditioning
+            .uncond
+            .as_ref()
+            .map_or(0, |(u, _)| u.size() as u64);
+    let masks = conditioning.cond_mask.size() as u64
+        + conditioning
+            .uncond
+            .as_ref()
+            .map_or(0, |(_, m)| m.size() as u64);
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-selected",
+        &[
+            ("schema", 1),
+            ("branches", 1 + u64::from(conditioning.uncond.is_some())),
+            ("caption_elements", captions),
+            ("mask_elements", masks),
+        ],
+    );
+    mlx_gen::ios_quantum::before(
+        crate::quantum::labels::TEXT_SELECTED,
+        crate::quantum::selected_caption_bytes(captions, masks),
+    )?;
+    match &conditioning.uncond {
+        Some((u, m)) => mlx_gen::ios_quantum::finish(
+            crate::quantum::labels::TEXT_SELECTED,
+            &[&conditioning.cond, &conditioning.cond_mask, u, m],
+        ),
+        None => mlx_gen::ios_quantum::finish(
+            crate::quantum::labels::TEXT_SELECTED,
+            &[&conditioning.cond, &conditioning.cond_mask],
+        ),
+    }
+}
+
+/// Close queued load/encode captures while the UNIQUE staged reference encoder
+/// is still owned by its caller. The caller drops it immediately after this
+/// return; the receipt itself grants no external-alias/cache/process credit.
+/// Required even when strength zero skips encode and only the load ran.
+pub(crate) fn retire_staged_reference_encoder() -> Result<()> {
+    if !crate::quantum::retired_lifecycle()? {
+        return Ok(());
+    }
+    mlx_gen::ios_quantum::drain_native_retirement()?;
+    let epoch = mlx_gen::ios_quantum::native_retirement_epoch()?
+        .ok_or_else(|| Error::Unsupported("SANA reference phase lost native invocation".into()))?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-owned-phase-retired",
+        &[
+            ("schema", 1),
+            ("invocation", epoch.invocation),
+            ("after_epoch", epoch.epoch),
+            ("component", 1),
+            ("prefix_complete", 1),
+            ("rust_drop_pending", 1),
+            ("external_alias_release_credit", 0),
+            ("host_reserve_declared", 0),
+        ],
+    );
+    Ok(())
+}
+
 /// Encode the prompt (and, for base SANA with CFG active, the negative prompt) into [`SanaConditioning`]
 /// — the phase-A step of the shared residency seam. Encodes WITH the caption pad mask (SANA's `attn2`
 /// masks PAD keys; dropping it lets padding swamp short-prompt conditioning). `sprint` and the resolved
@@ -896,11 +1126,13 @@ pub fn encode_conditioning(
     } else {
         None
     };
-    Ok(SanaConditioning {
+    let conditioning = SanaConditioning {
         cond,
         cond_mask,
         uncond,
-    })
+    };
+    materialize_conditioning_if_retired(&conditioning)?;
+    Ok(conditioning)
 }
 
 /// The heavy render-phase components (everything but the Gemma text encoder): the Linear-DiT trunk, the
@@ -1058,7 +1290,7 @@ pub fn prepare_reference_latent(
     // The scaling multiply is the only pending work over the encoder output: one latent-sized
     // f32 output plus its f32 scale operand.
     materialize_latents(
-        "SANA reference latent",
+        crate::quantum::labels::REFERENCE_LATENT,
         &[&latent],
         mlx_gen::ios_quantum::elementwise_bytes(latent.size() as u64 + 1, 1),
     )?;
@@ -1066,6 +1298,21 @@ pub fn prepare_reference_latent(
 }
 
 impl SanaHeavy {
+    /// Inspect actual endpoint ownership, not the requested selection name.
+    #[cfg(test)]
+    pub(crate) fn endpoint_inventory(&self) -> (usize, bool, bool) {
+        (
+            self.transformer.n_blocks(),
+            self.encoder.is_some(),
+            self.transformer.has_block_stream(),
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn endpoint_storage_witnesses(&self) -> Vec<&Array> {
+        self.transformer.endpoint_storage_witnesses()
+    }
+
     /// Compose the **base SANA-1.6B** heavy bundle (true-CFG flow-match) from its render-phase
     /// components plus the DC-AE config (used for the latent `scaling_factor`).
     pub fn new(
@@ -1247,7 +1494,7 @@ impl SanaHeavy {
             crate::transformer::SanaForwardPlan::RESIDENT,
         )?;
         materialize_latents(
-            "SANA latent",
+            crate::quantum::labels::LATENT,
             &[&latents],
             crate::quantum::scm_step_bytes(latents.size() as u64),
         )?;
@@ -1341,13 +1588,24 @@ impl SanaHeavy {
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build once. An
         // unset scheduler keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(mlx_gen::resolve_flow_schedule(
-            req.scheduler,
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        ))?;
+        let sampling_request = mlx_gen::GenerationRequest {
+            // Low-level pipeline parity hooks retain legacy unknown/default fallbacks. Actual
+            // generation requests crossed the descriptor floor before reaching this projection.
+            sampler: Some(
+                mlx_gen::sampler::canonical_solver(req.sampler, mlx_gen::Solver::Euler)
+                    .name()
+                    .into(),
+            ),
+            scheduler: req
+                .scheduler
+                .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
+                .map(str::to_owned),
+            steps: Some(steps.max(1) as u32),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let sampling = crate::sampling::resolve_base_full(&sampling_request)?;
+        let scheduler = FlowMatchEuler::from_sigmas(sampling.sigmas().to_vec())?;
 
         // img2img (sc-10190): a reference image + positive strength starts the denoise at
         // `sigmas[start_step]` over the DC-AE-encoded init latent blended with noise; else start 0
@@ -1377,7 +1635,7 @@ impl SanaHeavy {
         let latents = denoise_cfg_with_memory(
             &self.transformer,
             &scheduler,
-            req.sampler,
+            Some(sampling.solver().name()),
             start_step,
             seed,
             latents,
@@ -1418,7 +1676,7 @@ impl SanaHeavy {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let seed = req.seed.unwrap_or(0);
 
-        let scheduler = ScmScheduler::new(steps);
+        let scheduler = crate::sampling::sprint_scheduler(steps);
         let n = scheduler.num_steps();
         let sd = scheduler.sigma_data;
 
@@ -1973,6 +2231,48 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_tests {
     use super::*;
+
+    #[test]
+    fn decoded_pixels_refusal_precedes_builder_and_finish_errors_propagate() {
+        let built = std::cell::Cell::new(false);
+        let result = convert_decoded_pixels_with(
+            3 * 4 * 8,
+            |scratch| {
+                assert_eq!(
+                    scratch,
+                    mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(3 * 4 * 8)
+                );
+                Err(Error::Unsupported("pixel conversion refused".into()))
+            },
+            || {
+                built.set(true);
+                Ok(7u8)
+            },
+            || panic!("a refused pixel builder cannot reach its completion barrier"),
+        );
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == "pixel conversion refused")
+        );
+        assert!(!built.get(), "rejection must precede all conversion work");
+        let result = convert_decoded_pixels_with(
+            3 * 4 * 8,
+            |_| Ok(()),
+            || {
+                built.set(true);
+                Ok(7u8)
+            },
+            || Err(Error::Unsupported("pixel completion failed".into())),
+        );
+        assert!(built.get());
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == "pixel completion failed")
+        );
+        assert_eq!(
+            convert_decoded_pixels_with(3 * 4 * 8, |_| Ok(()), || Ok(7u8), || Ok(())).unwrap(),
+            7
+        );
+    }
+
     use crate::config::BlockType;
     use mlx_gen::ios_quantum::{
         with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
@@ -2085,6 +2385,7 @@ mod quantum_tests {
     /// tile's materialization to the fold's) against [`crate::quantum::tile_fold_bytes`] at that
     /// tile, and the final normalization against [`crate::quantum::tile_finalize_bytes`].
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn tile_fold_and_finalize_track_their_measured_peaks() {
         const CHILD: &str = "SANA_TILE_FOLD_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2092,9 +2393,12 @@ mod quantum_tests {
                 .args([
                     "--exact",
                     "pipeline::quantum_tests::tile_fold_and_finalize_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -2193,11 +2497,15 @@ mod quantum_tests {
             finalize,
             crate::quantum::MAX_RATIO,
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::tile_fold_and_finalize_track_their_measured_peaks");
+        }
     }
 
     /// One SCM step (the Sprint sampler update the per-step latent quantum materializes) against
     /// [`crate::quantum::scm_step_bytes`], with and without the renoise draw.
     #[test]
+    #[ignore = "expensive fixture capture; run through the selected iOS capture workflow"]
     fn scm_step_tracks_its_measured_peak() {
         const CHILD: &str = "SANA_SCM_STEP_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2205,9 +2513,12 @@ mod quantum_tests {
                 .args([
                     "--exact",
                     "pipeline::quantum_tests::scm_step_tracks_its_measured_peak",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -2247,6 +2558,9 @@ mod quantum_tests {
                 // The terminal step is a subset of the priced update.
                 assert!(formula >= measured);
             }
+        }
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::scm_step_tracks_its_measured_peak");
         }
     }
 
@@ -2396,6 +2710,33 @@ mod quantum_tests {
             label: "SANA reference latent".into(),
             scratch: mlx_gen::ios_quantum::elementwise_bytes(latent_elements + 1, 1),
         }));
+        // The stalled scaling allocation measurement is selected independently below.
+    }
+
+    #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
+    fn reference_latent_scale_tracks_its_measured_peak() {
+        const CHILD: &str = "SANA_REFERENCE_SCALE_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::reference_latent_scale_tracks_its_measured_peak",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        assert!(crate::test_metal_guard::metal_forbidden());
+        let cfg = crate::dc_ae::quantum_proofs::config();
         let raw = rand(&[1, 4, 256, 256], 3);
         raw.eval().unwrap();
         let measured = mlx_gen::ios_quantum::measured_peak_bytes(|| {
@@ -2413,6 +2754,9 @@ mod quantum_tests {
             measured,
             crate::quantum::MAX_RATIO,
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED pipeline::quantum_tests::reference_latent_scale_tracks_its_measured_peak");
+        }
     }
 
     /// The base-rev goldens: outputs of `91ffb4a81`'s default paths (`SanaHeavy::render_one`'s image

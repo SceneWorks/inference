@@ -13,6 +13,8 @@ use mlx_gen::Result;
 
 use super::join;
 
+pub(crate) const QUANTIZATION_LINEAR_PATHS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+
 pub struct TextMlp {
     gate: AdaptableLinear,
     up: AdaptableLinear,
@@ -23,11 +25,13 @@ impl TextMlp {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8670): the three SwiGLU projections load packed from a pre-quantized
         // snapshot or dense otherwise. No biases.
-        let lin = |name: &str| crate::quant::lin(w, &join(prefix, name), false);
+        let lin = |name: &str| {
+            crate::quant::lin(w, &join(prefix, name), crate::quant::TEXT_LINEAR_HAS_BIAS)
+        };
         Ok(Self {
-            gate: lin("gate_proj")?,
-            up: lin("up_proj")?,
-            down: lin("down_proj")?,
+            gate: lin(QUANTIZATION_LINEAR_PATHS[0])?,
+            up: lin(QUANTIZATION_LINEAR_PATHS[1])?,
+            down: lin(QUANTIZATION_LINEAR_PATHS[2])?,
         })
     }
 

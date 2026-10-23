@@ -49,25 +49,49 @@
 //! [`zimage`] states the load defaults and the stored-tier artifact policy.
 
 mod admission;
+pub mod anchor;
 pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
+mod binding;
+mod source_work;
+pub use mlx_gen_sdxl::sampling::SourceRequestBudget;
+pub use source_work::{
+    record_source_context, serialize_capture_failure, serialize_capture_row,
+    source_context_requested_bytes, SdxlWorkBinding,
+};
 mod bound;
+mod capture_config;
+pub use capture_config::capture_adapters;
 pub mod evidence;
 pub mod ios_admission;
 mod layout;
+pub mod pricing;
 mod refusal;
-pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
+pub mod sampling;
+pub use bound::{BoundDepth, BoundGenerator, BoundTransform, GeneratorAdmissionInfo};
+pub use ios_admission::{
+    admit, admit_with_baseline, admit_with_boundary, admit_with_boundary_and_key_capacity,
+    admit_with_sana_lifecycle_fallback, bind_sana_retirement_key, build_candidate, capacity_budget,
+    capture_evidence_key, capture_evidence_key_with_key_capacity, configured_endpoint,
+    configured_load_form, evidence_key, evidence_key_with_key_capacity, execution_for,
+    execution_key, sana_capture_observation_plan, tier_label, token_window, validate_actual,
+    work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork, PremisePolicy,
+    SelectedAdmissionView, SourceCapacityBoundary, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+};
 /// The labelled bounded device-capture permit; compiled only for the device harness.
 #[cfg(feature = "device-capture")]
-pub use ios_admission::capture_permit;
-pub use ios_admission::{
-    admit, build_candidate, capacity_budget, evidence_key, execution_key, tier_label, token_window,
-    validate_actual, work_binding, work_mode, Admission, IosCandidate, IosWork, IRIS_DEPTH_ID,
-    IRIS_RESTORE_ID,
+pub use ios_admission::{capture_permit, capture_permit_with_key_capacity};
+pub use layout::{
+    architecture_digest, artifact_layout_digest, capture_artifact_stem, configured_variant_digest,
+    hex,
 };
-pub use layout::{artifact_layout_digest, hex};
+pub use mlx_gen::ios_pricing::{
+    IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosMemoryBaseline, IosMemoryCoordinate,
+    IosMemoryDomain, IosNativeRetirementExecution,
+};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads
 /// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
 pub use mlx_gen::ios_quantum;
+pub use mlx_gen_sana::ios_pricing::CaptureObservationPlan as SanaCaptureObservationPlan;
 pub use refusal::{AdmissionError, AdmissionResult, Refusal, RefusalKind};
 
 use mlx_gen::gen_core::{

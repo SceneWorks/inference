@@ -16,6 +16,10 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(target_vendor = "apple")]
+#[path = "runtime_clone.rs"]
+mod bounded_clone_laws;
+
 #[cfg(test)]
 #[derive(Debug)]
 struct SealHashWork(AtomicUsize);
@@ -295,6 +299,105 @@ fn path_component_fingerprints(path: &Path) -> std::io::Result<Vec<PathComponent
         .collect()
 }
 
+// These helpers are private to the Apple guarded seal path. The native cross-platform
+// algorithms above remain unchanged, including their metadata/error ordering.
+#[cfg(target_vendor = "apple")]
+fn bounded_stat_fingerprint(
+    path: &Path,
+    follow: bool,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<FileStatFingerprint> {
+    use crate::source_inventory::bounded_fs as fs;
+    let stat = fs::stat(path, follow, next)?;
+    let is_symlink = !follow && fs::is_link(&stat);
+    let seconds = stat.st_mtime;
+    let modified = if seconds >= 0 {
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds as u64))
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(seconds.unsigned_abs()))
+    }
+    .and_then(|time| time.checked_add(std::time::Duration::from_nanos(stat.st_mtime_nsec as u64)));
+    Ok(FileStatFingerprint {
+        size: stat.st_size as u64,
+        modified,
+        is_symlink,
+        symlink_target: if is_symlink {
+            Some(fs::read_link(path, next)?)
+        } else {
+            None
+        },
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        changed_seconds: stat.st_ctime,
+        changed_nanoseconds: stat.st_ctime_nsec,
+    })
+}
+#[cfg(target_vendor = "apple")]
+fn bounded_clone_stat(
+    source: &FileStatFingerprint,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<FileStatFingerprint> {
+    use crate::source_inventory::bounded_fs as fs;
+    Ok(FileStatFingerprint {
+        size: source.size,
+        modified: source.modified,
+        is_symlink: source.is_symlink,
+        symlink_target: source
+            .symlink_target
+            .as_deref()
+            .map(|p| fs::copy_path(p, next))
+            .transpose()?,
+        device: source.device,
+        inode: source.inode,
+        changed_seconds: source.changed_seconds,
+        changed_nanoseconds: source.changed_nanoseconds,
+    })
+}
+#[cfg(target_vendor = "apple")]
+fn bounded_path_components(
+    path: &Path,
+    next: &mut dyn FnMut(u64) -> crate::Result<()>,
+) -> crate::Result<Vec<PathComponentFingerprint>> {
+    use crate::source_inventory::bounded_fs as fs;
+    let count = path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+        .count();
+    let mut result = fs::vec(count, next)?;
+    for parent in path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        let metadata = fs::stat(parent, false, next)?;
+        let is_symlink = fs::is_link(&metadata);
+        result.push(PathComponentFingerprint {
+            path: fs::copy_path(parent, next)?,
+            is_symlink,
+            symlink_target: if is_symlink {
+                Some(fs::read_link(parent, next)?)
+            } else {
+                None
+            },
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        });
+    }
+    result.reverse();
+    Ok(result)
+}
+
+/// ArcInner is repr(C) { strong: AtomicUsize, weak: AtomicUsize, data: T }
+/// (alloc/src/sync.rs). This is its actual payload layout, NOT Layout<Arc<T>>.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn bounded_arc_layout<T>() -> crate::Result<u64> {
+    std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+        .extend(std::alloc::Layout::new::<T>())
+        .map(|(layout, _)| layout.pad_to_align().size() as u64)
+        .map_err(|_| crate::source_inventory::bounded_fs::overflow())
+}
+
 /// A re-openable single-file weights source pinned without canonicalizing its loader path.
 ///
 /// The retained path is absolute but otherwise lexical: an extension-bearing snapshot symlink stays
@@ -336,7 +439,9 @@ pub type PinnedWeightsFile = ArtifactSeal;
 pub struct PreparedFilePins {
     prepared: bool,
     finalized: bool,
-    pins: BTreeMap<PathBuf, PinnedWeightsFile>,
+    // Sorted unique lexical keys. A Vec makes the requested payload layout public
+    // and finite for guarded binding; no private std BTree node ABI is assumed.
+    pins: Vec<(PathBuf, PinnedWeightsFile)>,
 }
 
 impl PreparedFilePins {
@@ -359,15 +464,18 @@ impl PreparedFilePins {
     }
 
     pub fn get(&self, path: &Path) -> Option<&PinnedWeightsFile> {
-        self.pins.get(path)
+        self.pins
+            .binary_search_by(|(key, _)| key.as_path().cmp(path))
+            .ok()
+            .map(|index| &self.pins[index].1)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &PinnedWeightsFile)> {
-        self.pins.iter()
+        self.pins.iter().map(|(path, pin)| (path, pin))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
-        self.pins.keys()
+        self.pins.iter().map(|(path, _)| path)
     }
 }
 
@@ -556,12 +664,134 @@ impl ArtifactSeal {
         Ok(())
     }
 
-    /// Confirm this seal without re-reading stable artifact content.
-    ///
-    /// Metadata and no-follow identity pins are cheap to check on each reopen. If either pin
-    /// changes, this deliberately performs one full-content audit before rejecting the source;
-    /// callers therefore never continue after a same-size replacement, including one that preserves
-    /// an ordinary mtime. The error grammar is shared by Candle and MLX consumers.
+    /// Verify the complete replacement-sensitive identity through caller-owned Darwin
+    /// metadata buffers. This never hashes the payload on a deferred read, including a
+    /// mismatch (which is unconditionally rejected). Native compatibility APIs retain
+    /// their historical audit behavior. See source_inventory::bounded_fs for authority.
+    pub fn verify_unchanged_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_fs as fs;
+            if bounded_path_components(&self.loader_path, next)? != self.path_component_fingerprints
+                || bounded_stat_fingerprint(&self.loader_path, false, next)?
+                    != self.entry_fingerprint
+                || fs::canonical(&self.loader_path, next)? != self.canonical_target_path
+                || bounded_stat_fingerprint(&self.loader_path, true, next)?
+                    != self.target_fingerprint
+            {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "artifact seal mismatch after load",
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_VERIFY_METADATA_GAP)
+    }
+
+    /// Fresh acquisition with the same lexical binding, component/entry/target identity
+    /// and full-content SHA-256 as pin(). The bounded path intentionally does not insert
+    /// into the process-global digest memo: that would allocate private HashMap buckets.
+    /// Already prepared tokens are reused by SourceInventory instead of reacquired.
+    pub fn pin_with_capacity(
+        path: &Path,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_fs as fs;
+            let loader_path = fs::absolute(path, next)?;
+            let canonical_target_path = fs::canonical(&loader_path, next)?;
+            let path_component_fingerprints = bounded_path_components(&loader_path, next)?;
+            let entry_fingerprint = bounded_stat_fingerprint(&loader_path, false, next)?;
+            let target_fingerprint = bounded_stat_fingerprint(&loader_path, true, next)?;
+            if !fs::is_file(&fs::stat(&loader_path, true, next)?) {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "weights source is not a regular file",
+                );
+            }
+            #[cfg(test)]
+            next(bounded_arc_layout::<SealHashWork>()?)?;
+            let mut pinned = Self {
+                loader_path,
+                canonical_target_path,
+                path_component_fingerprints,
+                entry_fingerprint,
+                target_fingerprint,
+                sha256: [0; 32],
+                #[cfg(test)]
+                hash_work: Arc::new(SealHashWork(AtomicUsize::new(0))),
+            };
+            pinned.verify_unchanged_with_capacity(next)?;
+            #[cfg(test)]
+            {
+                pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
+                record_full_hash_work();
+            }
+            pinned.sha256 = fs::hash(&pinned.loader_path, next)?;
+            pinned.verify_unchanged_with_capacity(next)?;
+            Ok(pinned)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = path;
+            crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            )
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn clone_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        use crate::source_inventory::bounded_fs as fs;
+        let mut components = fs::vec(self.path_component_fingerprints.len(), next)?;
+        for component in &self.path_component_fingerprints {
+            components.push(PathComponentFingerprint {
+                path: fs::copy_path(&component.path, next)?,
+                is_symlink: component.is_symlink,
+                symlink_target: component
+                    .symlink_target
+                    .as_deref()
+                    .map(|p| fs::copy_path(p, next))
+                    .transpose()?,
+                device: component.device,
+                inode: component.inode,
+            });
+        }
+        Ok(Self {
+            loader_path: fs::copy_path(&self.loader_path, next)?,
+            canonical_target_path: fs::copy_path(&self.canonical_target_path, next)?,
+            path_component_fingerprints: components,
+            entry_fingerprint: bounded_clone_stat(&self.entry_fingerprint, next)?,
+            target_fingerprint: bounded_clone_stat(&self.target_fingerprint, next)?,
+            sha256: self.sha256,
+            #[cfg(test)]
+            hash_work: self.hash_work.clone(),
+        })
+    }
+
+    /// Same explicit check before and after a pinned read, including failed reads. The existing
+    /// native read_unchanged/verify_unchanged APIs remain unchanged for compatibility.
+    pub fn read_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&Path, &mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        let result = read(&self.loader_path, next);
+        self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        result
+    }
+
     pub fn verify_unchanged(&self) -> crate::Result<()> {
         if self.ensure_unchanged().is_ok() {
             return Ok(());
@@ -988,6 +1218,26 @@ pub struct IdentityWeights {
 }
 
 impl LoadSpec {
+    /// Full borrowed-spec ownership, guarded BEFORE the existing Clone executes.
+    /// The exhaustive owned-field/container law covers every field, including
+    /// nested quality policies, prepared receipts and split/deep component maps.
+    /// SourceInventory Arcs remain shared; no image payload carrier is cloned.
+    /// This owning law is Apple-qualified; other targets retain the explicit
+    /// source-gap refusal, never an unbounded owning-Clone fallback.
+    pub fn clone_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use crate::source_inventory::bounded_clone::CloneLaw;
+            next(self.clone_bytes()?)?;
+            Ok(self.clone())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        crate::SourceInventory::metadata_gap(next, crate::SourceInventory::PIN_CAPTURE_METADATA_GAP)
+    }
+
     /// Dense bf16 load from the given source.
     pub fn new(weights: WeightsSource) -> Self {
         Self {
@@ -1205,7 +1455,7 @@ impl LoadSpec {
         let candidate = PreparedFilePins {
             prepared: true,
             finalized: true,
-            pins,
+            pins: pins.into_iter().collect(),
         };
         if !self.prepared_receipt_paths.is_empty() || self.prepared_encoder_receipt.is_some() {
             return Err(crate::Error::Unsupported(
@@ -1248,7 +1498,7 @@ impl LoadSpec {
         let candidate = PreparedFilePins {
             prepared: true,
             finalized: true,
-            pins,
+            pins: pins.into_iter().collect(),
         };
         let previous_receipt_paths =
             std::mem::replace(&mut self.prepared_receipt_paths, receipt_paths);
@@ -1271,6 +1521,46 @@ impl LoadSpec {
         }
         self.prepared_file_pins = candidate;
         Ok(())
+    }
+
+    pub(crate) fn visit_source_paths<'a>(&'a self, mut visit: impl FnMut(&'a Path, bool)) {
+        fn source<'a>(value: &'a WeightsSource, visit: &mut impl FnMut(&'a Path, bool)) {
+            match value {
+                WeightsSource::File(path) => visit(path, false),
+                WeightsSource::Dir(path) => visit(path, true),
+            }
+        }
+        source(&self.weights, &mut visit);
+        if let Some(value) = &self.control {
+            source(value, &mut visit);
+        }
+        for value in &self.extra_controls {
+            source(value, &mut visit);
+        }
+        if let Some(value) = &self.ip_adapter {
+            source(value, &mut visit);
+        }
+        for adapter in &self.adapters {
+            visit(&adapter.path, false);
+        }
+        if let Some(pid) = &self.pid {
+            source(&pid.checkpoint, &mut visit);
+            source(&pid.gemma, &mut visit);
+        }
+        if let Some(identity) = &self.identity {
+            for value in [&identity.encoder, &identity.eva, &identity.face_dir]
+                .into_iter()
+                .flatten()
+            {
+                source(value, &mut visit);
+            }
+        }
+        if let Some(value) = &self.text_encoder {
+            source(value, &mut visit);
+        }
+        for value in self.components.values() {
+            source(value, &mut visit);
+        }
     }
 
     /// Every File path configured anywhere on this load spec, in deterministic field order.
@@ -1409,7 +1699,14 @@ impl LoadSpec {
             )));
         }
         self.prepared_file_pins.prepared = true;
-        self.prepared_file_pins.pins.insert(expected, prepared);
+        let index = self
+            .prepared_file_pins
+            .pins
+            .binary_search_by(|(path, _)| path.cmp(&expected))
+            .unwrap_or_else(|index| index);
+        self.prepared_file_pins
+            .pins
+            .insert(index, (expected, prepared));
         Ok(())
     }
 
@@ -1694,6 +1991,138 @@ impl LoadSpec {
     /// during the callback fails closed.
     /// As with [`PinnedWeightsFile::read_unchanged`], a fully restored original pathname object is
     /// outside this path-token guarantee.
+    /// Explicit guarded counterpart for metadata readers. Do not enter the legacy directory
+    /// verification/canonicalization path after a one-time retained-count check.
+    pub fn read_prepared_files_unchanged_with_capacity<T, E: From<crate::Error>>(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+        read: impl FnOnce(&mut dyn FnMut(u64) -> crate::Result<()>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let Some(inventory) = self.source_inventory() else {
+            return crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::MISSING_INVENTORY_METADATA_GAP,
+            )
+            .map_err(E::from);
+        };
+        inventory
+            .verify_for_with_capacity(self, next)
+            .map_err(E::from)?;
+        let result = inventory.read_unchanged_with_capacity(next, read);
+        #[cfg(target_vendor = "apple")]
+        self.validate_prepared_file_pins_with_capacity(next)
+            .map_err(E::from)?;
+        result
+    }
+
+    /// Validate the existing prepared set and encoder/tokenizer receipt using only
+    /// bounded metadata operations. Every original missing/orphan/identity predicate
+    /// is retained; no current-directory cardinality authorizes an allocation.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn validate_prepared_file_pins_with_capacity(
+        &self,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        use crate::source_inventory::bounded_fs as fs;
+        if let Some(receipt) = &self.prepared_encoder_receipt {
+            receipt.ensure_unchanged_for_with_capacity(self.text_encoder.as_ref(), next)?;
+        }
+        if !self.prepared_file_pins.is_prepared() {
+            return Ok(());
+        }
+        if !self.prepared_file_pins.is_finalized() {
+            return crate::SourceInventory::metadata_gap(
+                next,
+                "LoadSpec File identity preparation has not been finalized",
+            );
+        }
+        let mut configured = Vec::new();
+        let mut result: crate::Result<()> = Ok(());
+        self.visit_source_paths(|path, directory| {
+            if result.is_ok() {
+                result = (|| {
+                    let path = fs::absolute(path, next)?;
+                    fs::push(&mut configured, (path, directory), next)
+                })();
+            }
+        });
+        result?;
+        for (path, directory) in &configured {
+            if !directory && self.prepared_file_pins.get(path).is_none() {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set is missing configured source",
+                );
+            }
+        }
+        for path in &self.prepared_receipt_paths {
+            if self.prepared_file_pins.get(path).is_none() {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set is missing receipt source",
+                );
+            }
+        }
+        for (path, pin) in self.prepared_file_pins.iter() {
+            let configured = configured.iter().any(|(root, directory)| {
+                if *directory {
+                    path != root && path.starts_with(root)
+                } else {
+                    path == root
+                }
+            });
+            if pin.loader_path() != path
+                || (!configured && !self.prepared_receipt_paths.contains(path))
+            {
+                return crate::SourceInventory::metadata_gap(
+                    next,
+                    "prepared file-token set does not match the LoadSpec sources",
+                );
+            }
+            pin.verify_unchanged_with_capacity(next)?;
+        }
+        Ok(())
+    }
+
+    /// Bind a source closure with exact Vec ownership and actual ArcInner payload
+    /// layouts checked BEFORE allocating. Native APIs keep their existing behavior.
+    pub fn bind_source_inventory_with_capacity(
+        &mut self,
+        inventory: crate::SourceInventory,
+        next: &mut dyn FnMut(u64) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            inventory.verify_for_with_capacity(self, next)?;
+            self.validate_prepared_file_pins_with_capacity(next)?;
+            let prepared = if self.prepared_file_pins.is_prepared() {
+                None
+            } else {
+                Some(PreparedFilePins {
+                    prepared: true,
+                    finalized: true,
+                    pins: inventory.configured_file_pins_with_capacity(self, next)?,
+                })
+            };
+            next(bounded_arc_layout::<crate::SourceInventory>()?)?;
+            let inventory = Arc::new(inventory);
+            // Only commit after every fallible check/allocation preflight succeeds.
+            if let Some(prepared) = prepared {
+                self.prepared_file_pins = prepared;
+            }
+            self.source_inventory = Some(inventory);
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = inventory;
+            crate::SourceInventory::metadata_gap(
+                next,
+                crate::SourceInventory::PIN_CAPTURE_METADATA_GAP,
+            )
+        }
+    }
+
     pub fn read_prepared_files_unchanged<T, E>(
         &self,
         read: impl FnOnce() -> std::result::Result<T, E>,

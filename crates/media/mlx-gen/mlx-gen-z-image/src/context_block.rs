@@ -8,7 +8,7 @@ use mlx_rs::Array;
 
 use super::attention::ZImageAttention;
 use super::feed_forward::FeedForward;
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -143,6 +143,21 @@ impl ZImageContextBlock {
     }
 }
 
+pub(crate) fn adapter_target_paths() -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(
+        crate::attention::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("attention.{path}")),
+    );
+    out.extend(
+        crate::feed_forward::ADAPTER_TARGET_PATHS
+            .iter()
+            .map(|path| format!("feed_forward.{path}")),
+    );
+    out
+}
+
 impl AdaptableHost for ZImageContextBlock {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         // Context blocks carry no timestep, so there is no `adaLN_modulation` target (the fork's
@@ -156,9 +171,6 @@ impl AdaptableHost for ZImageContextBlock {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        // No `adaLN_modulation` (see above) — only the attention + feed-forward leaves.
-        let mut out = prefixed_paths("attention", &self.attention);
-        out.extend(prefixed_paths("feed_forward", &self.feed_forward));
-        out
+        adapter_target_paths()
     }
 }

@@ -272,6 +272,59 @@ pub fn resize_bilinear_u8(
     resize_u8(src, in_h, in_w, out_h, out_w, 3, 1.0, &triangle)
 }
 
+/// Counted host-payload bound of `resize_lanczos_u8` before allocation. Horizontal samples and
+/// coefficient tables follow `resize_u8`; quantizing a table temporarily owns both f64/i64 weights.
+/// Two endpoint slots cover the floor rounding of the support window, clipped to the source axis.
+/// This counts payload, not allocator/driver overhead or measured physical footprint.
+pub fn resize_lanczos_u8_host_bytes(
+    in_h: u32,
+    in_w: u32,
+    out_h: u32,
+    out_w: u32,
+) -> crate::Result<u64> {
+    let overflow = || Error::Msg("Lanczos host-payload accounting overflow".into());
+    if [in_h, in_w, out_h, out_w].contains(&0) {
+        return Err(Error::Msg(
+            "Lanczos host-payload dimensions must be positive".into(),
+        ));
+    }
+    let axis = |input: u32, output: u32| -> crate::Result<u64> {
+        let support = 3.0 * (f64::from(input) / f64::from(output)).max(1.0);
+        let taps = ((2.0 * support).ceil() as u64)
+            .checked_add(2)
+            .ok_or_else(overflow)?
+            .min(u64::from(input));
+        let row = taps
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .and_then(|weights| {
+                weights.checked_add(std::mem::size_of::<(usize, Vec<f64>)>() as u64)
+            })
+            .ok_or_else(overflow)?;
+        row.checked_mul(u64::from(output)).ok_or_else(overflow)
+    };
+    let hc = axis(in_w, out_w)?;
+    let vc = axis(in_h, out_h)?;
+    let plane = |height: u32, width: u32| {
+        u64::from(height)
+            .checked_mul(u64::from(width))
+            .and_then(|pixels| pixels.checked_mul(3 * std::mem::size_of::<f32>() as u64))
+            .ok_or_else(overflow)
+    };
+    let horizontal = plane(in_h, out_w)?;
+    let output = plane(out_h, out_w)?;
+    let first = hc.checked_mul(2).ok_or_else(overflow)?;
+    let vertical = horizontal
+        .checked_add(hc)
+        .and_then(|sum| sum.checked_add(vc.checked_mul(2)?))
+        .ok_or_else(overflow)?;
+    let result = horizontal
+        .checked_add(hc)
+        .and_then(|sum| sum.checked_add(vc))
+        .and_then(|sum| sum.checked_add(output))
+        .ok_or_else(overflow)?;
+    Ok(first.max(vertical).max(result))
+}
+
 /// PIL `Image.LANCZOS` resize of a uint8 RGB HWC image (the fork's `scale_to_dimensions`). Returns
 /// f32 HWC, integer-valued `[0,255]`.
 pub fn resize_lanczos_u8(

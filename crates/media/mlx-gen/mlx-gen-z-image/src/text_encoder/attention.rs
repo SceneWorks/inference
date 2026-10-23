@@ -11,6 +11,8 @@ use mlx_gen::Result;
 
 use super::{join, QK_NORM_EPS};
 
+pub(crate) const QUANTIZATION_LINEAR_PATHS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
+
 pub struct TextAttention {
     q_proj: AdaptableLinear,
     k_proj: AdaptableLinear,
@@ -34,12 +36,14 @@ impl TextAttention {
     ) -> Result<Self> {
         // Packed-detect (sc-8670): the GQA projections load packed from a pre-quantized snapshot or
         // dense otherwise. Qwen3 attention has no biases.
-        let lin = |name: &str| crate::quant::lin(w, &join(prefix, name), false);
+        let lin = |name: &str| {
+            crate::quant::lin(w, &join(prefix, name), crate::quant::TEXT_LINEAR_HAS_BIAS)
+        };
         Ok(Self {
-            q_proj: lin("q_proj")?,
-            k_proj: lin("k_proj")?,
-            v_proj: lin("v_proj")?,
-            o_proj: lin("o_proj")?,
+            q_proj: lin(QUANTIZATION_LINEAR_PATHS[0])?,
+            k_proj: lin(QUANTIZATION_LINEAR_PATHS[1])?,
+            v_proj: lin(QUANTIZATION_LINEAR_PATHS[2])?,
+            o_proj: lin(QUANTIZATION_LINEAR_PATHS[3])?,
             q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
             num_heads,

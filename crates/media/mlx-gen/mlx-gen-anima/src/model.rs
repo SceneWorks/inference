@@ -109,13 +109,18 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, Variant::Turbo)
 }
 
-fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>> {
-    let id = variant.id();
+pub(crate) fn validate_load_precision(spec: &LoadSpec, id: &str) -> Result<()> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense bf16 precision is wired (drop the precision override)"
         )));
     }
+    Ok(())
+}
+
+fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>> {
+    let id = variant.id();
+    validate_load_precision(spec, id)?;
     // Q4/Q8 tiers (sc-10517) are NOT quantized at load. Anima is convert-at-install: the SceneWorks
     // worker packs the Cosmos DiT on-device (`convert::quantize_anima_dit`, conditioner + Qwen3 TE +
     // VAE kept dense bf16), and the DiT's `AdaptableLinear`s packed-detect the tier off the on-disk
@@ -245,9 +250,18 @@ impl Anima {
         validate_request(&self.descriptor, req)?;
         // iOS: one cache-limit scope for the whole request (loads, encode, denoise, decode); inert
         // on every other target.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            self.descriptor.id,
+            "request",
+            &[
+                ("schema", 1),
+                ("serial_count", req.count as u64),
+                ("requested_steps", steps as u64),
+            ],
+        );
         let variant = self.variant;
         let guidance = if variant.uses_cfg() {
             req.guidance.unwrap_or(variant.default_guidance())
@@ -329,6 +343,17 @@ impl Anima {
                 };
                 let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        self.descriptor.id,
+                        "serial",
+                        &[
+                            ("schema", 1),
+                            ("serial", n as u64),
+                            ("completed_batches", latents.len() as u64),
+                            ("forward_rows", 1),
+                            ("cfg_present", u64::from(uncond_enc.is_some())),
+                        ],
+                    );
                     // Release the MLX cache between images so a batch doesn't accumulate to a SIGKILL
                     // (sc-5567).
                     if n > 0 {
@@ -351,6 +376,15 @@ impl Anima {
                         attention,
                         window,
                     )?);
+                    mlx_gen::ios_quantum::diagnostic_metadata(
+                        self.descriptor.id,
+                        "serial_complete",
+                        &[
+                            ("schema", 1),
+                            ("serial", n as u64),
+                            ("completed_batches", latents.len() as u64),
+                        ],
+                    );
                 }
                 Ok(latents)
             },

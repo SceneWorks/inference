@@ -65,5 +65,20 @@ POLL_TRIES=1
                 self.assertEqual(result.returncode, expected, result.stderr)
 
 
+class IosSmokeFeatureBoundaryTests(unittest.TestCase):
+    def test_optional_media_sampler_keeps_its_original_feature_boundary(self):
+        import tomllib
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "ios-host/smoke/src/lib.rs").read_text(encoding="utf-8")
+        manifest = tomllib.loads((root / "ios-host/smoke/Cargo.toml").read_text(encoding="utf-8"))
+        cfg = '#[cfg(any(feature = "media", feature = "zimage"))]\n'
+        for item in ["struct MemorySampler {", "impl MemorySampler {", "impl Drop for MemorySampler {"]:
+            self.assertIn(cfg + item, source, item)
+        self.assertIn('#[cfg(feature = "media")]\nfn sampler_progress_callback_host()', source)
+        self.assertTrue(manifest["dependencies"]["mlx-gen"]["optional"])
+        self.assertIn("dep:mlx-gen", manifest["features"]["media"])
+        self.assertIn("media", manifest["features"]["zimage"])
+
+
 if __name__ == "__main__":
     unittest.main()

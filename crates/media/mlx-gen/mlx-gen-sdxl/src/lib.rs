@@ -22,6 +22,7 @@ pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
+pub mod ios_pricing;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;
@@ -45,6 +46,8 @@ mod quantum_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod default_path_golden;
 pub mod sampler;
+/// Shared host-only SDXL sampling resolution, replay and logical lifetime facts.
+pub mod sampling;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
 pub(crate) mod test_metal_guard;
@@ -98,9 +101,9 @@ pub use loader::{
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    conditioning_window_count, descriptor, load, load_concrete, load_from_ldm_file,
-    snapshot_component_footprint, DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID,
-    PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, conditioning_window_count_with_source_capacity, descriptor, load,
+    load_concrete, load_from_ldm_file, snapshot_component_footprint, DecodeQualitySample, Sdxl,
+    LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,

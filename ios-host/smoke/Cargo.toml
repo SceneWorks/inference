@@ -34,7 +34,7 @@ media = ["runtime-ios/media", "runtime-ios/device-capture", "dep:image", "dep:ml
 zimage = ["media"]
 
 [dependencies]
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "fe22998bf73e5e785d7659beb2f24d624b785bda" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "355e2ae4e81c13032233a4244e956bc3547f49e4" }
 # Deliberately the BUNDLE, not mlx-llm directly: the point of an on-device test is to exercise the
 # composition a product actually consumes (registry, capability descriptor, provider selection),
 # not just the engine underneath it.
@@ -63,3 +63,9 @@ mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
 tempfile = "3"
 # The production Qwen3-4B encoder contract fixture a Z-Image Turbo campaign case validates.
 sceneworks-gen-core-testkit = { path = "../../crates/contracts/gen-core-testkit" }
+
+# This harness is a separate workspace: root patches are not inherited.
+[patch.crates-io]
+regex = { path = "../../vendor/clip-regex/regex" }
+regex-automata = { path = "../../vendor/clip-regex/regex-automata" }
+regex-syntax = { path = "../../vendor/clip-regex/regex-syntax" }

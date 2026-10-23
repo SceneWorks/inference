@@ -38,6 +38,9 @@ exclude = [
     "crates/media/candle-gen/vendor/candle-core",
     "crates/media/candle-gen/vendor/candle-kernels",
     "crates/media/candle-gen/vendor/candle-metal-kernels",
+    "vendor/clip-regex/regex",
+    "vendor/clip-regex/regex-automata",
+    "vendor/clip-regex/regex-syntax",
 ]
 
 # Internal packages are paths so a checkout has one contract package, one
@@ -84,8 +87,8 @@ candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "fe22998bf73e5e785d7659beb2f24d624b785bda" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "fe22998bf73e5e785d7659beb2f24d624b785bda" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "355e2ae4e81c13032233a4244e956bc3547f49e4" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "355e2ae4e81c13032233a4244e956bc3547f49e4" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).
@@ -142,3 +145,9 @@ opt-level = 3
 candle-core = { path = "crates/media/candle-gen/vendor/candle-core" }
 candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }
 candle-metal-kernels = { path = "crates/media/candle-gen/vendor/candle-metal-kernels" }
+
+# Source-bound CLIP allocation facts, same matcher versions and default behavior.
+[patch.crates-io]
+regex = { path = "vendor/clip-regex/regex" }
+regex-automata = { path = "vendor/clip-regex/regex-automata" }
+regex-syntax = { path = "vendor/clip-regex/regex-syntax" }

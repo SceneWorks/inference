@@ -84,7 +84,14 @@ pub fn validate_depth_request(req: &DepthRequest) -> Result<()> {
             img.width, img.height
         )));
     }
-    let need = img.width as usize * img.height as usize * Image::CHANNELS;
+    let need = (img.width as usize)
+        .checked_mul(img.height as usize)
+        .and_then(|pixels| pixels.checked_mul(Image::CHANNELS))
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "{DEPTH_MODEL_ID}: source image byte count overflow"
+            ))
+        })?;
     if img.pixels.len() != need {
         return Err(Error::Msg(format!(
             "{DEPTH_MODEL_ID}: the source pixel buffer holds {} bytes; a {}x{} RGB8 image needs \

@@ -7,8 +7,6 @@ use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype};
 use mlx_gen::gen_core::{Error, LoadSpec, Precision, Result, WeightsSource};
 use sha2::{Digest, Sha256};
 
-use crate::IOS_OFFLOAD_POLICY;
-
 /// Header-only memory-layout identity, independent of directory/file names and weight values.
 /// All tensor keys, shapes, storage dtypes and component membership are hashed, not just the
 /// embedding or the caller's requested quant tier. This is not a weight-content quality claim.
@@ -27,20 +25,21 @@ pub fn sana_snapshot_profile(spec: &LoadSpec) -> Result<SanaSnapshotProfile> {
             "iOS SANA evidence requires a snapshot directory".into(),
         ));
     };
-    if spec.offload_policy != IOS_OFFLOAD_POLICY
-        || spec.precision != Precision::Bf16
+    if spec.precision != Precision::Bf16
         || !spec.components.is_empty()
         || !spec.adapters.is_empty()
         || spec.control.is_some()
         || spec.ip_adapter.is_some()
     {
         return Err(Error::Unsupported(
-            "iOS SANA evidence requires native stored precision, Sequential, and no load overrides"
-                .into(),
+            "iOS SANA evidence requires native stored precision and no load overrides".into(),
         ));
     }
     let mut digest = Sha256::new();
-    digest.update(b"sana-ios-memory-layout-v1");
+    digest.update(b"sana-ios-memory-layout-v2");
+    // The served loader supports both policies: Resident eagerly retains the encoder and heavy
+    // bundle; Sequential owns one phase at a time. Never alias their evidence/load identities.
+    digest.update(format!("{:?}|{:?}", spec.offload_policy, spec.load_shape).as_bytes());
     let mut component_bytes = [0u64; 3];
     let mut embedding = None;
     for (i, component) in ["transformer", "text_encoder", "vae"].iter().enumerate() {
@@ -231,7 +230,26 @@ mod tests {
         );
         let mut spec = fixture.spec();
         spec.offload_policy = mlx_gen::gen_core::OffloadPolicy::Resident;
+        spec.load_shape = mlx_gen::gen_core::LoadShape::EagerMaterialization;
+        let resident = sana_snapshot_profile(&spec).unwrap();
+        assert_ne!(resident.layout_sha256, profile.layout_sha256);
+        assert_eq!(resident.component_bytes, profile.component_bytes);
+        spec.load_shape = mlx_gen::gen_core::LoadShape::DeferredMaterialization;
+        assert_ne!(
+            sana_snapshot_profile(&spec).unwrap().layout_sha256,
+            resident.layout_sha256
+        );
+        spec.precision = Precision::Fp32;
         assert!(sana_snapshot_profile(&spec).is_err());
+        spec = fixture.spec();
+        spec.components.insert(
+            "vae_fp16_fix".into(),
+            WeightsSource::File(fixture.0.path().join("transformer/renamed.safetensors")),
+        );
+        assert!(
+            sana_snapshot_profile(&spec).is_err(),
+            "resident support never grants load overrides"
+        );
         spec = fixture.spec();
         spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
         // SANA's quantize knob is advisory; the loader auto-detects actual on-disk storage.

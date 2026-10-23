@@ -724,6 +724,7 @@ dependencies = [
  "pmetal-mlx-sys",
  "safetensors",
  "sceneworks-gen-core",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -739,6 +740,7 @@ dependencies = [
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]
@@ -763,6 +765,7 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "serde",
  "serde_json",
 ]
 
@@ -793,6 +796,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "serde",
 ]
 
 [[package]]
@@ -803,6 +807,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
+ "serde",
  "serde_json",
 ]
 
@@ -824,12 +829,13 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -857,7 +863,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -1026,7 +1032,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "dyn-clone",
  "half",
@@ -1049,7 +1055,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
 dependencies = [
  "bindgen",
  "cc",
@@ -1238,8 +1244,6 @@ dependencies = [
 [[package]]
 name = "regex"
 version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1250,8 +1254,6 @@ dependencies = [
 [[package]]
 name = "regex-automata"
 version = "0.4.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f388202e4b80542a0921078cc23b6333bcf1409c1e3f86404cae4766a6131db"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1261,8 +1263,6 @@ dependencies = [
 [[package]]
 name = "regex-syntax"
 version = "0.8.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runtime-catalog"

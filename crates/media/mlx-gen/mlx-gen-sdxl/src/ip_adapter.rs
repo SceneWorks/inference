@@ -10,6 +10,8 @@
 //!    injected into the SDXL UNet cross-attn — built generic so the token source is pluggable
 //!    (ViT-H→Resampler here; an ArcFace Resampler for InstantID, sc-3113).
 
+pub(crate) mod pricing;
+
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, split};
 use mlx_rs::{Array, Dtype};
@@ -38,24 +40,9 @@ pub fn preprocess_clip_image(image: &Image) -> Result<Array> {
 pub fn preprocess_clip_image_sized(image: &Image, size: usize) -> Result<Array> {
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
     const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
-    let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len()
-        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
-    {
-        return Err(Error::Msg(format!(
-            "ip-adapter image buffer {} != {iw}x{ih}x3",
-            image.pixels.len()
-        )));
-    }
-    if iw == 0 || ih == 0 {
-        return Err(Error::Msg(format!(
-            "ip-adapter reference image has a zero dimension ({iw}x{ih})"
-        )));
-    }
-    // Resize shortest side to `size` (bicubic), preserving aspect.
-    let scale = size as f64 / iw.min(ih) as f64;
-    let rw = ((iw as f64 * scale).round() as usize).max(size);
-    let rh = ((ih as f64 * scale).round() as usize).max(size);
+    let geometry = preprocess_geometry(image.width, image.height, image.pixels.len() as u64, size)?;
+    let (iw, ih) = (geometry.source_width, geometry.source_height);
+    let (rw, rh) = (geometry.resized_width, geometry.resized_height);
     let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw)?; // HWC f32 [0,255]
                                                                      // Center-crop size×size + normalize.
     let top = (rh - size) / 2;
@@ -119,26 +106,37 @@ impl IpImageEncoder {
     }
 }
 
+/// The CFG pair of image-prompt `tokens` `[1, T, D]`: the tokens over a zeros uncond row of the
+/// same shape and dtype (what [`IpImageEncoder::zeros_like_tokens`] builds), `[2, T, D]`.
+pub(crate) fn cfg_pair(tokens: &Array) -> Result<Array> {
+    let zeros = mlx_rs::ops::zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
+    Ok(mlx_rs::ops::concatenate_axis(&[tokens, &zeros], 0)?)
+}
+
 /// Load the decoupled cross-attention **K/V projection pairs** from an IP-Adapter checkpoint
 /// (`ip_adapter.{n}.to_k_ip/to_v_ip.weight`, bias-free `[hidden, cross_attention_dim]`), returned in
 /// the diffusers `ip_adapter.{1,3,…}` **numeric order** — which is the UNet cross-attention walk
 /// order ([`crate::unet::UNet2DConditionModel::install_ip_adapter`]). 70 pairs for SDXL.
-pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
-    let mut idxs: Vec<u32> = w
-        .keys()
-        .filter_map(|k| {
-            k.strip_prefix("ip_adapter.")
+pub(crate) fn ip_kv_indices<'a>(keys: impl Iterator<Item = &'a str>) -> Result<Vec<u32>> {
+    let mut indices: Vec<u32> = keys
+        .filter_map(|key| {
+            key.strip_prefix("ip_adapter.")
                 .and_then(|r| r.strip_suffix(".to_k_ip.weight"))
                 .and_then(|n| n.parse::<u32>().ok())
         })
         .collect();
-    idxs.sort_unstable();
-    if idxs.is_empty() {
+    indices.sort_unstable();
+    if indices.is_empty() {
         return Err(Error::Msg(
             "ip_adapter: no ip_adapter.{n}.to_k_ip.weight keys found".into(),
         ));
     }
-    idxs.into_iter()
+    Ok(indices)
+}
+
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
+    ip_kv_indices(w.keys())?
+        .into_iter()
         .map(|n| {
             let k = w
                 .require(&format!("ip_adapter.{n}.to_k_ip.weight"))?
@@ -378,26 +376,18 @@ impl Resampler {
     /// `[B, num_queries, output_dim]`.
     pub fn forward(&self, image_features: &Array) -> Result<Array> {
         let b = image_features.shape()[0];
-        if self.latents.shape() != [1, self.num_queries, self.dim] {
-            return Err(Error::Msg(format!(
-                "resampler latents shape {:?} != [1, {}, {}]",
-                self.latents.shape(),
-                self.num_queries,
-                self.dim
-            )));
-        }
+        pricing::validate_latents(self.latents.shape(), self.num_queries, self.dim)?;
         // sc-26270: proj_in, each perceiver layer, and proj_out + norm are guarded iOS quanta
         // (pass-throughs off device), each counted from its own ops: proj_in's output (+ its
         // bias add); each layer per `layer_scratch`; proj_out's output, its bias add and the
         // LayerNorm output.
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let nx = image_features.shape()[1];
         let act = crate::quantum::element_bytes(&self.latents);
-        let rows = |n: i32, width: u64| {
-            mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, width])
-        };
+
         let mut latents = broadcast_to(&self.latents, &[b, self.num_queries, self.dim])?;
-        let proj_in_scratch = 2 * rows(nx, crate::quantum::linear_out(&self.proj_in));
+        let proj_in_scratch =
+            pricing::resampler_in_scratch(b, nx, act, crate::quantum::linear_out(&self.proj_in));
         let x =
             mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_IN, proj_in_scratch, || {
                 self.proj_in.forward(image_features)
@@ -409,8 +399,7 @@ impl Resampler {
                 || Self::layer_body(attn, ff, &x, &latents),
             )?;
         }
-        let proj_out_scratch =
-            3 * rows(self.num_queries, crate::quantum::linear_out(&self.proj_out));
+        let proj_out_scratch = self.proj_out_scratch(b, latents.dtype());
         mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_OUT, proj_out_scratch, || {
             let out = self.proj_out.forward(&latents)?;
             Ok(layer_norm(
@@ -420,6 +409,18 @@ impl Resampler {
                 LN_EPS,
             )?)
         })
+    }
+
+    fn proj_out_scratch(&self, b: i32, input: Dtype) -> u64 {
+        pricing::resampler_out_scratch(
+            b,
+            self.num_queries,
+            self.dim,
+            input,
+            &crate::quantum::LinearWork::of(&self.proj_out),
+            &crate::quantum::activation_facts(&self.norm_out_w),
+            &crate::quantum::activation_facts(&self.norm_out_b),
+        )
     }
 
     /// One perceiver layer: attention over `[x, latents]` + residual, then the FFN + residual.
@@ -465,39 +466,277 @@ impl Resampler {
         b: i32,
         nx: i32,
     ) -> u64 {
-        let act = crate::quantum::element_bytes(&self.latents);
-        let (b, nq) = (b as u64, self.num_queries as u64);
-        let s = nx as u64 + nq;
-        let width = (self.dim as u64).max(crate::quantum::linear_out(&attn.to_q));
-        let ffw = crate::quantum::linear_out(&ff.fc1);
-        let scores = crate::quantum::scores(
-            crate::quantum::Backend::current(),
-            attn.dim_head,
+        pricing::resampler_layer_scratch(
+            crate::quantum::element_bytes(&self.latents),
             self.num_queries,
-            act,
+            self.dim,
+            crate::quantum::linear_out(&attn.to_q),
+            crate::quantum::linear_out(&ff.fc1),
+            attn.heads,
+            attn.dim_head,
+            b,
+            nx,
+        )
+    }
+}
+
+/// Actual shortest-side geometry and HOST requested/logical extents. This is not MLX allocation
+/// identity, RSS/physical demand or an allocator-capacity certificate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClipPreprocessGeometry {
+    pub source_width: usize,
+    pub source_height: usize,
+    pub source_buffer_bytes: u64,
+    pub resized_width: usize,
+    pub resized_height: usize,
+    pub crop_size: usize,
+}
+pub(crate) fn preprocess_geometry(
+    width: u32,
+    height: u32,
+    buffer_bytes: u64,
+    size: usize,
+) -> Result<ClipPreprocessGeometry> {
+    let (iw, ih) = (width as usize, height as usize);
+    if buffer_bytes
+        != mlx_gen::gen_core::imageops::checked_image_buffer_len(iw, ih, 3).unwrap_or(usize::MAX)
+            as u64
+    {
+        return Err(Error::Msg(format!(
+            "ip-adapter image buffer {} != {iw}x{ih}x3",
+            buffer_bytes
+        )));
+    }
+    if iw == 0 || ih == 0 {
+        return Err(Error::Msg(format!(
+            "ip-adapter reference image has a zero dimension ({iw}x{ih})"
+        )));
+    }
+    // SAME native calculation/rounding/max, not output geometry or a square/crop substitution.
+    let scale = size as f64 / iw.min(ih) as f64;
+    let rw = ((iw as f64 * scale).round() as usize).max(size);
+    let rh = ((ih as f64 * scale).round() as usize).max(size);
+    Ok(ClipPreprocessGeometry {
+        source_width: iw,
+        source_height: ih,
+        source_buffer_bytes: buffer_bytes,
+        resized_width: rw,
+        resized_height: rh,
+        crop_size: size,
+    })
+}
+/// Four actual host allocation stages in resize_u8 followed by CLIP normalization. Fixed-size
+/// metadata only; no per-output coefficient plan or pixel buffer is built for pricing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipHostStage {
+    HorizontalCoefficients,
+    VerticalCoefficients,
+    ResizeOutput,
+    Normalize,
+}
+
+/// Requested/logical buffer lengths, NOT Vec capacity, allocator extent, native data_size or
+/// process growth. The borrowed source span and native crop output are separate existing owner
+/// terms at the served IP window; no physical transfer certificate is exposed by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClipHostRequestedWork {
+    stages: [(ClipHostStage, u64); 4],
+}
+impl ClipHostRequestedWork {
+    pub(crate) fn peak_requested(&self) -> u64 {
+        self.stages
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Window-length upper from the actual precompute_coeffs producer, for an axis that passed the
+/// producer's zero checks. ClipPreprocessGeometry's source edges originate as u32, so they are
+/// exactly representable in f64. If in/out>=1, floating division cannot cross ceil(in/out): its
+/// relative rounding times out is less than in*2^-52 <1. For upsampling filterscale is exactly1.
+/// Thus support <=2*ceil(in/out). The two rounded floor endpoints add at most two integer taps;
+/// clipping bounds the result by in. This is a discrete endpoint bound, never a fitted offset.
+/// F64 coefficient generation and I64 quantization have separate row-record size terms.
+fn clip_axis_coeff_requested(input: usize, output: usize) -> Result<(u64, u64)> {
+    let overflow = || Error::Msg("sdxl IP host preprocessing extent overflow".into());
+    if input == 0 || output == 0 {
+        return Err(Error::Msg("sdxl IP host coefficient axis is zero".into()));
+    }
+    let input = input as u64;
+    let output = output as u64;
+    let scale_ceiling = input.div_ceil(output).max(1);
+    let taps = scale_ceiling
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(overflow)?
+        .min(input);
+    let coefficients = output.checked_mul(taps).ok_or_else(overflow)?;
+    let floating = coefficients
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .and_then(|n| {
+            output
+                .checked_mul(std::mem::size_of::<(usize, Vec<f64>)>() as u64)
+                .and_then(|rows| n.checked_add(rows))
+        })
+        .ok_or_else(overflow)?;
+    let fixed = coefficients
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .and_then(|n| {
+            output
+                .checked_mul(std::mem::size_of::<(usize, Vec<i64>)>() as u64)
+                .and_then(|rows| n.checked_add(rows))
+        })
+        .ok_or_else(overflow)?;
+    Ok((floating, fixed))
+}
+
+impl ClipPreprocessGeometry {
+    pub(crate) fn host_requested_work(&self) -> Result<ClipHostRequestedWork> {
+        if self.resized_height == 0 || self.resized_width == 0 {
+            return Err(Error::Msg(format!(
+                "resize_u8: zero dimension — {}×{} → {}×{} (all edges must be > 0)",
+                self.source_width, self.source_height, self.resized_width, self.resized_height
+            )));
+        }
+        let overflow = || Error::Msg("sdxl IP host preprocessing extent overflow".into());
+        let product = |values: &[u64]| {
+            values
+                .iter()
+                .try_fold(1u64, |n, &v| n.checked_mul(v))
+                .ok_or_else(overflow)
+        };
+        let sum = |values: &[u64]| {
+            values
+                .iter()
+                .try_fold(0u64, |n, &v| n.checked_add(v))
+                .ok_or_else(overflow)
+        };
+        let (hf, hi) = clip_axis_coeff_requested(self.source_width, self.resized_width)?;
+        let (vf, vi) = clip_axis_coeff_requested(self.source_height, self.resized_height)?;
+        let horizontal = product(&[self.source_height as u64, self.resized_width as u64, 3, 4])?;
+        let resized = product(&[self.resized_height as u64, self.resized_width as u64, 3, 4])?;
+        let crop = product(&[self.crop_size as u64, self.crop_size as u64, 3, 4])?;
+        Ok(ClipHostRequestedWork {
+            stages: [
+                // quantize_coeffs borrows the temporary precompute F64 table: BOTH coexist.
+                (ClipHostStage::HorizontalCoefficients, sum(&[hf, hi])?),
+                // Horizontal fixed coefficients and image stay live during vertical setup.
+                (
+                    ClipHostStage::VerticalCoefficients,
+                    sum(&[hi, horizontal, vf, vi])?,
+                ),
+                (
+                    ClipHostStage::ResizeOutput,
+                    sum(&[hi, horizontal, vi, resized])?,
+                ),
+                // resize_u8's tables/horizontal leave their Rust scopes; resized and crop coexist.
+                // This is Rust requested-object lifetime only, not allocator/RSS retirement credit.
+                (ClipHostStage::Normalize, sum(&[resized, crop])?),
+            ],
+        })
+    }
+
+    /// Constant-time requested/logical host upper at the existing served IP consumer. There is
+    /// no output-sized schedule allocation, tensor factory, device/stream call or physical law.
+    pub(crate) fn host_requested_upper(&self) -> Result<u64> {
+        Ok(self.host_requested_work()?.peak_requested())
+    }
+}
+
+#[cfg(test)]
+mod clip_host_requested_tests {
+    use super::*;
+
+    #[test]
+    fn clip_host_work_stages_cover_both_coefficient_types_and_images_host() {
+        let geometry = preprocess_geometry(8, 4, 96, 4).unwrap();
+        assert_eq!((geometry.resized_width, geometry.resized_height), (8, 4));
+        let rf = std::mem::size_of::<(usize, Vec<f64>)>() as u64;
+        let ri = std::mem::size_of::<(usize, Vec<i64>)>() as u64;
+        // Independent literals: h8outputs*6taps*8=384; v4*4*8=128;
+        // horizontal4*8*3*4=384, resized384, crop4*4*3*4=192.
+        let work = geometry.host_requested_work().unwrap();
+        assert_eq!(
+            work.stages,
+            [
+                (ClipHostStage::HorizontalCoefficients, 768 + 8 * rf + 8 * ri),
+                (ClipHostStage::VerticalCoefficients, 1024 + 4 * rf + 12 * ri),
+                (ClipHostStage::ResizeOutput, 1280 + 12 * ri),
+                (ClipHostStage::Normalize, 576),
+            ]
         );
-        let fallback = u64::from(matches!(
-            scores,
-            mlx_gen::ios_quantum::Scores::Materialized { .. }
-        ));
-        let ln = crate::quantum::layer_norm_buffers(crate::quantum::Backend::current());
-        // The key side's LayerNorm counts its output only: the concatenation consumes it before
-        // `to_kv`'s output exists, so a CPU fallback's centred/squared temporaries are already
-        // released (measured); on Metal the fused LayerNorm writes only its output anyway.
-        let key_units = 6 + 2 * fallback;
-        let query_units = 5 + 3 * ln + fallback;
-        mlx_gen::ios_quantum::tensor_bytes(act, &[key_units, b, s, width])
-            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
-                act,
-                &[b, nq, query_units * width + 2 * ffw],
-            ))
-            .saturating_add(crate::quantum::page_slack(key_units + query_units + 4))
-            .saturating_add(mlx_gen::ios_quantum::scores_bytes(
-                scores,
-                b,
-                attn.heads as u64,
-                nq,
-                s,
-            ))
+        assert_eq!(
+            geometry.host_requested_upper().unwrap(),
+            (768 + 8 * rf + 8 * ri)
+                .max(1024 + 4 * rf + 12 * ri)
+                .max(1280 + 12 * ri)
+                .max(576)
+        );
+        assert_eq!(
+            geometry.source_buffer_bytes, 96,
+            "actual borrowed source span is not fabricated crop bytes"
+        );
+    }
+
+    #[test]
+    fn clip_host_work_orientation_changes_live_setup_without_aspect_family_split_host() {
+        let landscape = preprocess_geometry(8, 4, 96, 4)
+            .unwrap()
+            .host_requested_work()
+            .unwrap();
+        let portrait = preprocess_geometry(4, 8, 96, 4)
+            .unwrap()
+            .host_requested_work()
+            .unwrap();
+        let rf = std::mem::size_of::<(usize, Vec<f64>)>() as u64;
+        let ri = std::mem::size_of::<(usize, Vec<i64>)>() as u64;
+        assert_eq!(
+            portrait.stages,
+            [
+                (ClipHostStage::HorizontalCoefficients, 256 + 4 * rf + 4 * ri),
+                (ClipHostStage::VerticalCoefficients, 1280 + 8 * rf + 12 * ri),
+                (ClipHostStage::ResizeOutput, 1280 + 12 * ri),
+                (ClipHostStage::Normalize, 576),
+            ]
+        );
+        assert!(
+            portrait.peak_requested() > landscape.peak_requested(),
+            "same source span/crop/resize area is not the same ordered coefficient work"
+        );
+        // No per-aspect measurement/anchor family or hardware probe is used or introduced.
+    }
+
+    #[test]
+    fn clip_axis_requested_integer_bounds_and_validation_order_host() {
+        let rf = std::mem::size_of::<(usize, Vec<f64>)>() as u64;
+        let ri = std::mem::size_of::<(usize, Vec<i64>)>() as u64;
+        for (input, output, taps) in [
+            (8, 8, 6),
+            (4, 4, 4),
+            (16, 8, 10),
+            (20, 18, 10),
+            (3, 16, 3),
+            (65535, 1, 65535),
+        ] {
+            let (floating, fixed) = clip_axis_coeff_requested(input, output).unwrap();
+            assert_eq!(floating, output as u64 * (taps * 8 + rf));
+            assert_eq!(fixed, output as u64 * (taps * 8 + ri));
+        }
+        assert!(preprocess_geometry(0, 8, 1, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("image buffer"));
+        assert!(preprocess_geometry(0, 8, 0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("zero dimension"));
+        assert!(preprocess_geometry(8, 4, 96, 0)
+            .unwrap()
+            .host_requested_work()
+            .unwrap_err()
+            .to_string()
+            .contains("resize_u8: zero dimension"));
     }
 }

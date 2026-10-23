@@ -20,6 +20,7 @@
 //! `sample_dpmpp_2m_cfg_pp`. `heun` / `uni_pc` / `lcm` / `dpmpp_sde` / `euler_ancestral` have no
 //! paper-validated CFG++ form and are gated off ([`base_supports_cfgpp`]).
 
+use super::solvers::{SolverEvaluation, SolverObservation};
 use super::unified::{is_terminal, to_d};
 use super::{LatentOps, Solver};
 use crate::Result;
@@ -81,14 +82,41 @@ impl<L: LatentOps> CfgPpSampler<L> for EulerCfgPp {
     ) -> Result<L::Latent> {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::Euler,
+                    i,
+                    sigma,
+                    sigmas[i + 1],
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .cfg_pp(),
+            );
             let (guided, uncond) = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 x = guided;
+                ops.observe_solver(
+                    SolverObservation::update(
+                        Solver::Euler,
+                        i,
+                        sigma,
+                        sigmas[i + 1],
+                        &x,
+                        true,
+                        false,
+                    )
+                    .cfg_pp(),
+                );
                 continue;
             }
             // d = (x − uncond_x0)/σ  (the UNCONDITIONAL derivative); land on the GUIDED x0.
             let d = to_d(ops, &x, sigma, &uncond)?;
             x = ops.axpy(1.0, &guided, sigmas[i + 1], &d)?;
+            ops.observe_solver(
+                SolverObservation::update(Solver::Euler, i, sigma, sigmas[i + 1], &x, false, false)
+                    .cfg_pp(),
+            );
         }
         Ok(x)
     }
@@ -122,12 +150,29 @@ impl<L: LatentOps> CfgPpSampler<L> for Dpmpp2mCfgPp {
         for i in 0..sigmas.len().saturating_sub(1) {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
+            ops.observe_solver(
+                SolverObservation::callback(
+                    Solver::Dpmpp2m,
+                    i,
+                    sigma,
+                    s_next,
+                    SolverEvaluation::Primary,
+                    &x,
+                )
+                .history(old_uncond.as_ref(), None, None)
+                .cfg_pp(),
+            );
             let (guided, uncond) = denoise(&x, sigma)?;
             if is_terminal(sigma) {
                 // Degenerate leading σ==0: land on the guided x0, avoid the a = s_next/σ division.
                 // Mirrors EulerCfgPp's leading guard (and the base solvers').
                 x = guided;
                 old_uncond = Some(uncond);
+                ops.observe_solver(
+                    SolverObservation::update(Solver::Dpmpp2m, i, sigma, s_next, &x, true, false)
+                        .history(old_uncond.as_ref(), None, None)
+                        .cfg_pp(),
+                );
                 continue;
             }
             let a = s_next / sigma; // exp(−h)
@@ -144,10 +189,30 @@ impl<L: LatentOps> CfgPpSampler<L> for Dpmpp2mCfgPp {
                                                                    // + c·(guided − old_uncond)
                     let diff = ops.axpy(1.0, &guided, -1.0, old)?;
                     x_next = ops.axpy(1.0, &x_next, c, &diff)?;
+                    ops.observe_solver(
+                        SolverObservation::update(
+                            Solver::Dpmpp2m,
+                            i,
+                            sigma,
+                            s_next,
+                            &x_next,
+                            false,
+                            false,
+                        )
+                        .history(old_uncond.as_ref(), None, None)
+                        .stage(2)
+                        .correction()
+                        .cfg_pp(),
+                    );
                 }
             }
             x = x_next;
             old_uncond = Some(uncond);
+            ops.observe_solver(
+                SolverObservation::update(Solver::Dpmpp2m, i, sigma, s_next, &x, false, false)
+                    .history(old_uncond.as_ref(), None, None)
+                    .cfg_pp(),
+            );
         }
         Ok(x)
     }

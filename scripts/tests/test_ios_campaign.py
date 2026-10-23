@@ -8,8 +8,13 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import argparse
 import unittest
 from unittest import mock
+
+
+def argparse_error():
+    return argparse.ArgumentTypeError
 
 MODULE = Path(__file__).resolve().parents[1] / "ios/campaign.py"
 spec = importlib.util.spec_from_file_location("ios_campaign", MODULE)
@@ -22,11 +27,19 @@ class CampaignTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # Rung 2 declares a quality-first selection space (two decode tiles); the others none.
-        self.selections = {2: ("t768", "t512")}
-        self.keys = [f"fake/fake/{tier}/{edge}/{mode}/{rung}/{sel}" for tier in campaign.TIERS for edge in (512, 768, 1024) for mode in ("text", "reference", "restore", "depth") for rung in range(5) for sel in self.selections.get(rung, ("base",))]
+        # The anchor listing: per tier x mode a resident (rung 0) and an optimized (rung 4, cheapest
+        # selection, 3 repeats) anchor at 512 with 1 step; plus the two validation cases.
+        self.entries = []
+        for tier in campaign.TIERS:
+            for mode in ("text", "reference"):
+                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/0/base/1", "purpose": "resident", "repeats": 1})
+                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/4/s_t256/1", "purpose": "optimized", "repeats": 2})
+        self.entries.append({"case": "fake/fake/q4/512/text/4/s_t256/0", "purpose": "validation_steps", "repeats": 1})
+        self.entries.append({"case": "fake/fake/q4/1024/text/4/s_t256/1", "purpose": "validation_geometry", "repeats": 1})
+        self.entries.append({"case": "fake/fake/q4/1024/control/4/s_t256/1", "purpose": "validation_mode", "repeats": 1})
+        self.keys = [e["case"] for e in self.entries]
         self.catalog = self.root / "catalog.json"
-        self.catalog.write_text(json.dumps({"schema": 1, "cases": self.keys}), encoding="utf-8")
+        self.catalog.write_text(json.dumps({"schema": 2, "cases": self.entries}), encoding="utf-8")
         self.guard = mock.patch.object(campaign.subprocess, "Popen", side_effect=AssertionError("TEST MUST NOT START ANY REAL PROCESS"))
         self.guard.start()
         self.addCleanup(self.guard.stop)
@@ -61,7 +74,7 @@ class CampaignTests(unittest.TestCase):
             elif remote == "launch-memory.txt":
                 local.write_text("launch: increased-memory-limit = " + entitlement, encoding="utf-8")
             elif remote == "renders.txt":
-                local.write_text("campaign-" + row["case"].replace("/", "-") + "-0.png\n", encoding="utf-8")
+                local.write_text("campaign-" + campaign.artifact_stem(row["case"]) + "-0.png\n", encoding="utf-8")
             else:
                 local.write_bytes(b"fixture PNG")
             return subprocess.CompletedProcess([], 0, "", "")
@@ -69,21 +82,106 @@ class CampaignTests(unittest.TestCase):
         return session
 
     def test_public_cli_listing_is_pure_and_rung_zero_is_selected(self):
-        self.assertEqual(self.main("list", "--tier", "q8", "--edge", "768", "--mode", "restore", "--rung", "4"), 0)
+        self.assertEqual(self.main("list", "--tier", "q8", "--mode", "reference", "--rung", "4"), 0)
         args = campaign.parser().parse_args(["list", "--rung", "0"])
-        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1/base"))
-        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0/base"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1/base/1"))
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0/base/1"))
         args = campaign.parser().parse_args(["list", "--selection", "t512"])
-        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/2/t512"))
-        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/2/t768"))
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/2/t512/1"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/2/t768/1"))
+        args = campaign.parser().parse_args(["list", "--purpose", "optimized"])
+        self.assertEqual([e["purpose"] for e in self.entries if campaign.selected(args, e)], ["optimized"] * 6)
+        args = campaign.parser().parse_args(["list", "--steps", "0"])
+        self.assertEqual([e["case"] for e in self.entries if campaign.selected(args, e)], ["fake/fake/q4/512/text/4/s_t256/0"])
+
+    def test_the_listing_is_the_anchor_shape_and_malformed_listings_are_refused(self):
+        args = campaign.parser().parse_args(["list", "--catalog", str(self.catalog)])
+        self.assertEqual(campaign.catalog(args)["cases"], self.entries)
+        bad = {
+            "schema 1 grid": {"schema": 1, "cases": self.keys},
+            "bare key": {"schema": 2, "cases": [self.keys[0]]},
+            "unknown purpose": {"schema": 2, "cases": [dict(self.entries[0], purpose="ladder")]},
+            "too few optimized repeats": {"schema": 2, "cases": [dict(self.entries[1], repeats=1)]},
+            "zero repeats": {"schema": 2, "cases": [dict(self.entries[0], repeats=0)]},
+            "seven-field key": {"schema": 2, "cases": [dict(self.entries[0], case="fake/fake/q4/512/text/0/base")]},
+            "duplicate": {"schema": 2, "cases": [self.entries[0], self.entries[0]]},
+            "extra field": {"schema": 2, "cases": [dict(self.entries[0], edge=512)]},
+            "empty": {"schema": 2, "cases": []},
+        }
+        for name, listing in bad.items():
+            with self.subTest(name=name):
+                path = self.root / (name.replace(" ", "-") + ".json")
+                path.write_text(json.dumps(listing), encoding="utf-8")
+                with self.assertRaises((ValueError, argparse_error())):
+                    campaign.catalog(campaign.parser().parse_args(["list", "--catalog", str(path)]))
+        # No 20,000-case budget: the listing is finite by construction and --max-cases optional.
+        self.assertIsNone(campaign.parser().parse_args(["run"]).max_cases)
+        self.assertEqual(campaign.parser().parse_args(["run", "--max-cases", "50000"]).max_cases, 50000)
 
     def test_invalid_finite_budgets_and_cases(self):
-        for options in (("--case", "p/../q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0"), ("--case", "p/p/q4/512/text/0/t5.1"), ("--timeout-seconds", "0"), ("--max-cases", "20001"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5")):
+        for options in (("--case", "p/../q4/512/text/0/base/1"), ("--case", "p/p/q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0/t5.1/1"), ("--case", "p/p/q4/512/text/0/base/4294967296"), ("--timeout-seconds", "0"), ("--timeout-seconds", "20001"), ("--max-cases", "0"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5"), ("--steps", "4294967296"), ("--steps", "-1"), ("--steps", "not-an-integer"), ("--purpose", "ladder")):
             with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.parser().parse_args(["run", *options])
         with self.assertRaises(SystemExit):
             self.main("run", "--device", "fake", "--output", str(self.root / "not-written"))
         self.assertFalse((self.root / "not-written").exists())
+
+    def test_capture_step_transport_preserves_u32_domain_without_enumerated_choices(self):
+        for steps in (0, 1, 101, (1 << 32) - 1):
+            key = f"p/p/q4/512/text/0/base/{steps}"
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parsed = campaign.parser().parse_args(["list", "--steps", str(steps), "--case", key])
+            except SystemExit as error:
+                self.fail(f"legal wire/default step count {steps} was refused by scalar parser: exit={error.code}")
+            self.assertEqual(parsed.steps, steps)
+            self.assertEqual(parsed.case, key)
+        action = next(action for action in campaign.parser()._actions if action.dest == "steps")
+        self.assertIsNone(action.choices, "argparse must not enumerate a step-sized domain even on invalid input")
+        # Zero remains the existing explicit default sentinel, not a request for zero solver steps.
+        self.assertEqual(campaign.step_count("0"), 0)
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        for invalid_count in (0, True, -1, 1 << 32):
+            row["steps"] = invalid_count
+            self.assertIsNone(campaign.capture_of(row), "recorded actual solver steps must be nonzero u32, never the CLI default sentinel")
+        row["steps"] = (1 << 32) - 1
+        self.assertIsNotNone(campaign.capture_of(row))  # Schema only; does not execute a large run.
+        for invalid in ("-1", "4294967296", "not-an-integer"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                campaign.step_count(invalid)
+
+    def test_long_recipe_case_preserves_wire_identity_with_digest_artifact_paths(self):
+        key = "sdxl/sdxl/q4/1024/text/4/base/3/sdxl1-" + "ab" * 1024
+        self.assertEqual(campaign.case_key(key), key)
+        self.assertEqual(campaign.parser().parse_args(["run", "--case", key]).case, key)
+        stem = campaign.artifact_stem(key)
+        self.assertEqual(stem, "recipe-" + campaign.hashlib.sha256(key.encode("utf-8")).hexdigest())
+        self.assertLess(len(stem), 128)
+        self.assertNotEqual(stem, campaign.artifact_stem(key + "ab"))
+        legacy = self.keys[0]
+        self.assertEqual(campaign.artifact_stem(legacy), legacy.replace("/", "-"))
+        session = self.fake_session(self.success(key))
+        result = session.run_case(key)
+        self.assertEqual(result["case"], key)
+        self.assertEqual(result["status"], "successful", result)
+        files = list((self.root / "run.artifacts" / stem).glob("*.png"))
+        self.assertEqual(len(files), 1)
+        self.assertLess(len(files[0].name), 255)
+        for invalid in (key + "/extra", key + "/", key + "."):
+            with self.assertRaises(argparse_error()):
+                campaign.case_key(invalid)
+
+    def test_step_validation_never_pairs_different_sampling_recipes(self):
+        short_key = "sdxl/sdxl/q4/512/text/4/base/3/sdxl1-aa"
+        full_key = "sdxl/sdxl/q4/512/text/4/base/0/sdxl1-bb"
+        short = dict(self.capture_row(short_key, "diagnostic_success"), purpose="optimized")
+        full = dict(self.capture_row(full_key, "diagnostic_success"), purpose="validation_steps")
+        report = campaign.steps_validation([short, full])
+        self.assertEqual(report[0]["problem"], "no completed optimized anchor of the same case")
+        full["case"] = full_key.replace("sdxl1-bb", "sdxl1-aa")
+        matched = campaign.steps_validation([short, full])
+        self.assertIn("ratio", matched[0])
+        self.assertNotIn("problem", matched[0])
 
     def test_install_once_budget_and_all_explicit_status_rows(self):
         output = self.root / "evidence.jsonl"
@@ -221,10 +319,9 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("--install-only", run.call_args.args[0])
         self.assertNotIn("--campaign-case", run.call_args.args[0])
 
-    def test_table_has_all_metrics_and_no_diagnostic_largest_edge(self):
+    def test_table_has_all_metrics_and_typed_capacity_probes(self):
         row = dict(self.success(), status="diagnostic_success", production_success=False, diagnostic=True)
         table = campaign.render([row])
-        self.assertIn("diagnostics excluded): {}", table)
         self.assertIn("Active MiB | Cache MiB | Combined MiB", table)
         row.update(status="admitted_refused", refusal_only=True, refusal_kind="no_evidence")
         self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
@@ -235,95 +332,66 @@ class CampaignTests(unittest.TestCase):
 
     def capture_row(self, key, status):
         row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
-                   evidence_key={"machine": "iPhone17,2", "provider": "fake"}, run_id="fixture-run",
-                   baseline_phys_footprint_bytes=40)
+                   evidence_key={"machine": "iPhone17,2", "provider": "fake", "execution": key.split("/")[5],
+                                 "reference_count": 0, "mask_count": 0, "control_count": 0}, run_id="fixture-run",
+                   baseline_phys_footprint_bytes=40, steps=int(key.split("/")[7]) or 16,  # Synthetic resolved default, not the CLI0 sentinel.
+                   anchor_selection={"rung": int(key.split("/")[5])},
+                   phase_peaks={"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
+        # Synthetic ABI/transport fixture only, not device evidence or a physical transfer proof.
+        def snapshot(current, highwater):
+            return {"method": "task_vm_info", "query_status": 0, "requested_words": 93, "returned_words": 93,
+                    "current_required_words": 38, "peak_required_words": 84,
+                    "current_bytes": current, "lifetime_peak_bytes": highwater}
+        row.update(before_request_snapshot=snapshot(40, 40), before_model_load_snapshot=snapshot(60, 60),
+                   ending_snapshot=snapshot(100, 150), observed_current_peak_bytes=150,
+                   observed_model_current_peak_bytes=150, valid_kernel_queries=3, valid_model_kernel_queries=2,
+                   sampling_coverage=self.observed_fixture(), quantum_query_gaps=0,
+                   quantum_coverage={"checks": [{"phase": "denoise", "label": "synthetic_kernel", "context": [0], "count": 1}],
+                                     "total_checks": 1, "dropped_checks": 0, "truncated": False})
         if status == "capture_refused":
             row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
         return row
 
-    def test_capture_walks_each_ladder_upward_and_stops_at_the_first_refusal(self):
-        outcome = {512: "diagnostic_success", 768: "capture_refused", 1024: "diagnostic_success"}
+    def test_capture_runs_exactly_the_listed_anchor_cases_with_their_repeats(self):
         calls = []
         def fake(session, key, **kw):
             calls.append(key)
-            return self.capture_row(key, outcome[int(key.split("/")[3])])
+            # Resident anchors refuse before allocation (their evidence); optimized complete.
+            status = "capture_refused" if key.split("/")[5] == "0" else "diagnostic_success"
+            row = self.capture_row(key, status)
+            row["run_id"] = f"run-{len(calls)}"
+            return row
         output = self.root / "capture.jsonl"
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
             cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--device", "fake", "--output", str(output))
+            code = self.main("capture", "--all-cases", "--device", "fake", "--output", str(output))
         self.assertEqual(code, 0)
-        ladders = {}
-        for key in calls:
-            fields = key.split("/")
-            ladders.setdefault(fields[5], []).append((int(fields[3]), fields[6]))
-        self.assertEqual(set(ladders), {"0", "1", "2", "3", "4"})
-        for rung, steps in ladders.items():
-            if rung == "2":
-                # Every selection tried at the refused size, quality first; never past it.
-                self.assertEqual(steps, [(512, "t768"), (768, "t768"), (768, "t512")])
-            else:
-                self.assertEqual(steps, [(512, "base"), (768, "base")], "never past the refused size, never a retry")
-        self.assertEqual(len(calls), len(set(calls)), "no cell runs twice")
+        expected = [e["case"] for e in self.entries if e["purpose"] not in campaign.ADMITTED_VALIDATIONS for _ in range(e["repeats"])]
+        self.assertEqual(calls, expected, "each capture case its listed repeats, in listing order; no ladder, no admitted validation")
         rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
         self.assertTrue(all(r["diagnostic"] is True and r["production_success"] is False for r in rows))
+        self.assertEqual([r["repeat"] for r in rows if r["case"] == self.keys[1]], [0, 1])
         table = campaign.render(rows)
-        self.assertIn('"largest_completed_edge": 512', table)
-        self.assertIn('"refused_before_jetsam_edge": 768', table)
         self.assertIn("refused before construction: SANA block", table)
-        self.assertIn("diagnostics excluded): {}", table)
+        self.assertIn('"completed_demand_mib": [0.0, 0.0]', table)
 
-    def test_capture_steps_to_a_cheaper_selection_and_carries_it_up_the_ladder(self):
-        # The quality selection refuses from 768 up; the cheaper one completes 768 and 1024. At 1024
-        # the ladder starts from the selection that completed 768 (the quality one cannot fit a
-        # larger size), and the cheapest refusing everywhere would stop it.
-        def outcome(edge, sel):
-            if sel == "t768" and edge >= 768:
-                return "capture_refused"
-            return "diagnostic_success"
+    def test_an_optimized_anchor_that_does_not_complete_is_a_defect_and_is_not_repeated(self):
         calls = []
         def fake(session, key, **kw):
             calls.append(key)
-            fields = key.split("/")
-            return self.capture_row(key, outcome(int(fields[3]), fields[6]))
-        output = self.root / "ladder.jsonl"
+            return self.capture_row(key, "capture_refused")
+        output = self.root / "defect.jsonl"
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
             cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(output))
-        self.assertEqual(code, 0)
-        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("768", "t768"), ("768", "t512"), ("1024", "t512")])
-        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-        table = campaign.render(rows)
-        self.assertIn('"completed_selection": "t512"', table)
-        self.assertIn('"largest_completed_edge": 1024', table)
-        self.assertNotIn("refused_before_jetsam_edge", table, "a size a cheaper selection completed is not a refused size")
-        # Every selection refusing at a size stops the ladder there.
-        calls.clear()
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), self.capture_row(key, "capture_refused"))[1]):
-            cls.return_value.blocked = False
-            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "stop.jsonl"))
-        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("512", "t512")])
-        rows = [json.loads(line) for line in (self.root / "stop.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertIn('"refused_before_jetsam_edge": 512', campaign.render(rows))
-        # A failure (not a capture refusal) at a selection stops the ladder, no cheaper retry.
-        calls.clear()
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), campaign.failure(key, "load failed"))[1]):
-            cls.return_value.blocked = False
-            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "fail2.jsonl"))
-        self.assertEqual(len(calls), 1)
-
-    def test_capture_rejects_edge_selectors_and_failure_stops_the_ladder(self):
-        for options in (("--edge", "512"), ("--case", self.keys[0]), ("--next-edge", "1024"), ("--selection", "t512")):
+            code = self.main("capture", "--purpose", "optimized", "--tier", "q4", "--mode", "text", "--device", "fake", "--output", str(output))
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, ["fake/fake/q4/512/text/4/s_t256/1"], "a refused case is not repeated")
+        row = json.loads(output.read_text(encoding="utf-8"))
+        self.assertIn("must complete", row["anchor_defect"])
+        self.assertIn("DEFECT", campaign.render([row]))
+        for options in (("--case", self.keys[0]), ("--next-edge", "1024")):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 self.main("capture", "--provider", "fake", "--device", "fake", "--output", str(self.root / "x.jsonl"), *options)
-        calls = []
-        def fake(session, key, **kw):
-            calls.append(key)
-            return campaign.failure(key, "load failed")
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
-            cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "0", "--device", "fake", "--output", str(self.root / "fail.jsonl"))
-        self.assertEqual(code, 2)
-        self.assertEqual(len(calls), 1)
 
     def test_capture_refusal_rows_need_the_typed_quantum_record(self):
         key = self.keys[0]
@@ -334,18 +402,200 @@ class CampaignTests(unittest.TestCase):
         artifact = dict(self.success(key), status="admitted_refused", production_success=False, refusal_kind="artifact")
         self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(artifact), key)["status"], "admitted_refused")
 
-    def test_evidence_rows_come_only_from_completed_captures_with_telemetry(self):
-        key = self.keys[0]
-        rows = [self.capture_row(key, "diagnostic_success"), self.capture_row(key, "capture_refused"),
-                dict(self.capture_row(key, "diagnostic_success"), kernel_lifetime_phys_footprint_peak_bytes=None),
-                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=None),
-                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=150),
-                dict(self.success(key), evidence_key={"machine": "x"})]
-        out = campaign.evidence_rows(rows)
-        self.assertEqual(len(out), 1, "no row without a capture baseline below the peak")
-        self.assertEqual(set(out[0]), {"key", "footprint_bytes", "baseline_footprint_bytes", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds", "evidence_class", "run_id", "build_sha"})
-        self.assertEqual((out[0]["footprint_bytes"], out[0]["baseline_footprint_bytes"]), (150, 40))
-        self.assertEqual(out[0]["evidence_class"], "device_capture")
+    @staticmethod
+    def observed_fixture():
+        # Schema fixture ONLY; it is not a native execution/physical-demand proof.
+        return {"marks": [{"provider": "curated", "kind": "solver_primary", "fields": {"step": 0, "state_dtype": 3}},
+                          {"provider": "curated", "kind": "solve_complete", "fields": {"evaluations": 3}},
+                          {"provider": "ios_capture", "kind": "conditioning-roles", "fields": {"reference_count": 0, "mask_count": 0, "control_count": 0}}],
+                "counts": {"curated": {"solver_primary": 1, "solve_complete": 1}, "ios_capture": {"conditioning-roles": 1}},
+                "total_marks": 3, "dropped_marks": 0, "malformed_marks": 0, "truncated": False}
+
+    def test_anchor_import_preserves_complete_sampling_recipe_and_execution_identity(self):
+        recipe = {"version": 1, "sampler": "euler", "scheduler": "normal", "steps": 3,
+                  "guidance": 7.0, "guidance_method": "cfg", "cfg_batching": "batched",
+                  "strength": None, "reference_strength": None, "use_pid": False, "pid_capture_sigma": None}
+        token = "sdxl1-" + json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode("utf-8").hex()
+        key = "sdxl/sdxl/q4/512/text/4/base/3/" + token
+        rows = []
+        for run in ("a", "b"):
+            row = dict(self.capture_row(key, "diagnostic_success"), purpose="optimized", run_id=run)
+            row["evidence_key"].update(provider="sdxl", sampling_recipe=token, execution="Sequential|DeferredMaterialization|recipe=" + token)
+            row["sampling_recipe"] = recipe
+            row.update(sampling_coverage=self.observed_fixture(), sampling_metadata_required=True, sampling_metadata_missing=False)
+            rows.append(row)
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0]["key"]["sampling_recipe"], token)
+        self.assertEqual(anchors[0]["key"]["execution"], rows[0]["evidence_key"]["execution"])
+        decoded = json.loads(bytes.fromhex(anchors[0]["key"]["sampling_recipe"].removeprefix("sdxl1-")))
+        self.assertEqual(decoded, recipe)
+        self.assertEqual([c["run_id"] for c in anchors[0]["outcome"]["completed"]["captures"]], ["a", "b"])
+
+    def test_capture_preserves_both_real_baseline_ledgers_and_refuses_short_forged_queries(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        capture = campaign.capture_of(row)
+        self.assertEqual(capture["before_request_snapshot"]["current_bytes"], 40)
+        self.assertEqual(capture["before_model_load_snapshot"]["current_bytes"], 60)
+        for boundary in ("before_request_snapshot", "before_model_load_snapshot", "ending_snapshot"):
+            for field, bad in (("query_status", 1), ("returned_words", 83), ("returned_words", 94),
+                               ("current_required_words", 1), ("peak_required_words", 1), ("current_bytes", False)):
+                broken = json.loads(json.dumps(row))
+                broken[boundary][field] = bad
+                self.assertIsNone(campaign.capture_of(broken), (boundary, field, bad))
+            missing = json.loads(json.dumps(row))
+            del missing[boundary]
+            self.assertIsNone(campaign.capture_of(missing), boundary)
+        mismatched_end = json.loads(json.dumps(row))
+        mismatched_end["ending_snapshot"]["lifetime_peak_bytes"] = 160
+        self.assertIsNone(campaign.capture_of(mismatched_end), "raw ending kernel peak must agree with imported upper")
+        masked = json.loads(json.dumps(row))
+        masked["kernel_lifetime_phys_footprint_peak_bytes"] = 200
+        for boundary in ("before_request_snapshot", "before_model_load_snapshot", "ending_snapshot"):
+            masked[boundary]["lifetime_peak_bytes"] = 200
+        masked_capture = campaign.capture_of(masked)
+        self.assertIsNotNone(masked_capture)  # Upper retained, never replaced by sampled current150.
+        self.assertEqual(masked_capture["footprint_bytes"], 200)
+        self.assertEqual(masked_capture["observed_model_current_peak_bytes"], 150)
+
+    def test_quantum_coverage_preserves_actual_context_and_refuses_dangling_or_truncated_transport(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        self.assertEqual(campaign.capture_of(row)["quantum_coverage"], row["quantum_coverage"])
+        mutations = [lambda q: q["checks"][0].update(context=[99]),
+                     lambda q: q["checks"][0].update(count=0),
+                     lambda q: q.update(total_checks=2),
+                     lambda q: q.update(truncated=True, dropped_checks=1, total_checks=2)]
+        for mutate in mutations:
+            broken = json.loads(json.dumps(row))
+            mutate(broken["quantum_coverage"])
+            self.assertIsNone(campaign.capture_of(broken))
+        row["quantum_query_gaps"] = 1
+        self.assertEqual(campaign.capture_of(row)["quantum_query_gaps"], 1)  # Valid whole-run upper, not phase/class authority.
+
+    def test_role_distinct_receipts_do_not_deduplicate_and_role_aliases_keep_repeat_groups(self):
+        # Transport grouping is exact-key only; Python must not invent its own additivity law.
+        rows = []
+        for references in (0, 1):
+            for run, kind in (("a", "pose"), ("b", "canny")):
+                mode = ("reference_" if references else "control_") + kind
+                key = f"fake/fake/q4/512/{mode}/4/s_t256/1"
+                row = dict(self.capture_row(key, "diagnostic_success"), purpose="optimized",
+                           run_id=f"{references}-{run}")
+                # Existing wire reference_count is aggregate: Control + optional true Reference.
+                roles = {"reference_count": references + 1, "mask_count": 0, "control_count": 1}
+                row["evidence_key"].update(mode="control", **roles)
+                row["sampling_coverage"]["marks"][2]["fields"].update(roles)
+                rows.append(row)
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(anchors), 2)
+        self.assertEqual({anchor["key"]["reference_count"] for anchor in anchors}, {1, 2})
+        for anchor in anchors:
+            self.assertEqual(anchor["key"]["control_count"], 1)
+            captures = anchor["outcome"]["completed"]["captures"]
+            self.assertEqual(len(captures), 2)
+            self.assertEqual({capture["run_id"] for capture in captures},
+                             {f"{anchor['key']['reference_count'] - 1}-a", f"{anchor['key']['reference_count'] - 1}-b"})
+
+    def test_actual_conditioning_roles_are_required_and_match_prepared_carrier_witness(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        row["evidence_key"]["sampling_recipe"] = "synthetic-schema-fixture"
+        row.update(sampling_coverage=self.observed_fixture(), sampling_metadata_required=True, sampling_metadata_missing=False)
+        self.assertIsNotNone(campaign.capture_of(row))
+        for field in ("reference_count", "mask_count", "control_count"):
+            for bad in (None, False, True, -1, 1 << 32):
+                broken = json.loads(json.dumps(row))
+                broken["evidence_key"][field] = bad
+                self.assertIsNone(campaign.capture_of(broken), (field, bad))
+            missing = json.loads(json.dumps(row))
+            del missing["evidence_key"][field]
+            self.assertIsNone(campaign.capture_of(missing), field)
+            forged = json.loads(json.dumps(row))
+            forged["sampling_coverage"]["marks"][2]["fields"][field] = 1
+            self.assertIsNone(campaign.capture_of(forged), field)
+
+    def test_observed_metadata_is_bounded_preserved_and_quantum_context_is_validated(self):
+        row = self.capture_row(self.keys[1], "diagnostic_success")
+        row["sampling_coverage"] = self.observed_fixture()
+        row["quanta"] = {"q": {"priced_scratch_bytes": 100, "observed_bytes": 80, "exact": True, "preceding_sampling_mark": 0}}
+        captured = campaign.capture_of(row)
+        self.assertEqual(captured["sampling_coverage"], row["sampling_coverage"])
+        self.assertEqual(captured["quanta"]["q"]["preceding_sampling_mark"], 0)
+        def oversized(c):
+            copies = campaign.SAMPLING_MARKS_MAX // len(c["marks"]) + 1
+            c["marks"] *= copies
+            c["counts"] = {"curated": {"solver_primary": copies, "solve_complete": copies}, "ios_capture": {"conditioning-roles": copies}}
+            c["total_marks"] = len(c["marks"])
+        for mutate in (
+            lambda c: c["counts"]["curated"].update(solver_primary=2),
+            lambda c: c.update(total_marks=c["total_marks"] + 1),
+            lambda c: c.update(dropped_marks=1, total_marks=3, truncated=True),
+            lambda c: c["marks"][0]["fields"].update(step=True),
+            lambda c: c["marks"][0].update(provider="x" * (campaign.SAMPLING_NAME_BYTES_MAX + 1)),
+            oversized,
+            lambda c: c["marks"][0].update(fields={f"f{i}": i for i in range(campaign.SAMPLING_FIELDS_MAX + 1)}),
+        ):
+            broken = json.loads(json.dumps(row))
+            mutate(broken["sampling_coverage"])
+            self.assertTrue(campaign.capture_of(broken) is None, "invalid bounded observation data must be rejected")
+        broken = json.loads(json.dumps(row))
+        broken["quanta"]["q"]["preceding_sampling_mark"] = 99
+        self.assertIsNone(campaign.capture_of(broken))
+        required = json.loads(json.dumps(row))
+        required["evidence_key"]["sampling_recipe"] = "fixture-token-not-a-class-claim"
+        required.update(sampling_metadata_required=True, sampling_metadata_missing=False)
+        self.assertIsNotNone(campaign.capture_of(required))
+        for missing in (None, {"marks": [], "counts": {}, "total_marks": 0, "dropped_marks": 0, "malformed_marks": 0, "truncated": False}):
+            broken = json.loads(json.dumps(required))
+            broken["quanta"] = {}
+            broken["sampling_coverage"] = missing
+            self.assertIsNone(campaign.capture_of(broken), "declared recipe/progress alone is not observed metadata")
+
+    def test_anchor_rows_come_only_from_completed_captures_and_resident_refusals(self):
+        opt, res = self.keys[1], self.keys[0]
+        def completed(run, **kw):
+            return dict(self.capture_row(opt, "diagnostic_success"), purpose="optimized", run_id=run, **kw)
+        rows = [completed("a"), completed("b"), completed("c", kernel_lifetime_phys_footprint_peak_bytes=170),
+                dict(self.capture_row(res, "capture_refused"), purpose="resident"),
+                # Not captures: no telemetry / no baseline below the peak / not a capture.
+                completed("d", kernel_lifetime_phys_footprint_peak_bytes=None),
+                completed("e", baseline_phys_footprint_bytes=150)]
+        # The valid changed ledger peak is recorded by the same ending kernel query.
+        rows[2]["ending_snapshot"]["lifetime_peak_bytes"] = 170
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        # A non-capture row under another key is reported, never turned into an anchor.
+        junk, junk_problems = campaign.anchor_rows([dict(self.success(opt), purpose="optimized", evidence_key={"machine": "x"})])
+        self.assertEqual(junk, [])
+        self.assertEqual(len(junk_problems), 1)
+        kinds = {a["anchor_kind"]: a for a in anchors}
+        self.assertEqual(set(kinds), {"optimized", "resident"})
+        optimized = kinds["optimized"]
+        # The serde shape of `evidence::AnchorRow` (deny_unknown_fields on the Rust side).
+        self.assertEqual(set(optimized), {"key", "anchor_kind", "selection", "outcome", "evidence_class"})
+        captures = optimized["outcome"]["completed"]["captures"]
+        self.assertEqual([c["run_id"] for c in captures], ["a", "b", "c"])
+        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "sampling_coverage", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds",
+                         "before_request_snapshot", "before_model_load_snapshot", "ending_snapshot", "observed_current_peak_bytes", "observed_model_current_peak_bytes",
+                         "valid_kernel_queries", "valid_model_kernel_queries", "quantum_coverage", "quantum_query_gaps"})
+        self.assertEqual((captures[2]["footprint_bytes"], captures[2]["baseline_footprint_bytes"]), (170, 40))
+        self.assertEqual(captures[0]["phase_peaks"], {"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
+        self.assertEqual(captures[0]["steps"], 1)
+        self.assertEqual(optimized["evidence_class"], "device_capture")
+        refused = kinds["resident"]["outcome"]["refused"]
+        self.assertEqual(refused["refused_quantum"], {"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
+        # A phase peak outside [baseline, lifetime peak] is dropped, never kept.
+        odd = completed("z", phase_peaks={"decode": {"peak_bytes": 10, "exact": True}, "denoise": {"peak_bytes": 999, "exact": True}})
+        self.assertEqual(campaign.capture_of(odd)["phase_peaks"], {})
+        # Fewer than three completed optimized repeats: no margin basis, a problem, no row.
+        anchors, problems = campaign.anchor_rows(rows[:1])
+        self.assertEqual(anchors, [])
+        self.assertIn("2 needed", problems[0])
+        # An optimized anchor that only refused is a DEFECT problem, never refusal evidence.
+        anchors, problems = campaign.anchor_rows([dict(self.capture_row(opt, "capture_refused"), purpose="optimized")])
+        self.assertEqual(anchors, [])
+        self.assertIn("DEFECT", problems[0])
         source = self.root / "capture.jsonl"
         source.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
         table = Path(campaign.ROOT / campaign.EVIDENCE_TABLE)
@@ -353,7 +603,55 @@ class CampaignTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(campaign.main(["evidence", "--input", str(source)]), 0)
         self.assertIn("never changes admission", printed.getvalue())
+        self.assertIn('"schema": 3', printed.getvalue())
         self.assertEqual(table.read_bytes(), before, "evidence output is printed, never written")
+
+    def test_the_per_formula_device_calibration_table(self):
+        mib = 1 << 20
+        def row(run, quanta):
+            value = dict(self.capture_row(self.keys[1], "diagnostic_success"), run_id=run, kernel_lifetime_phys_footprint_peak_bytes=4000 * mib, baseline_phys_footprint_bytes=100 * mib, quanta=quanta)
+            for name in ("before_request_snapshot", "before_model_load_snapshot"):
+                value[name].update(current_bytes=100 * mib, lifetime_peak_bytes=100 * mib)
+            value["ending_snapshot"].update(current_bytes=150 * mib, lifetime_peak_bytes=4000 * mib)
+            value.update(observed_current_peak_bytes=4000 * mib, observed_model_current_peak_bytes=4000 * mib)
+            return value
+        q = lambda p, o, e: {"priced_scratch_bytes": p * mib, "observed_bytes": o * mib, "exact": e}
+        rows = [row("a", {"tile": q(400, 200, True), "block": q(100, 95, True)}),
+                row("b", {"tile": q(400, 260, True), "block": q(100, 300, False)}),
+                row("c", {"tile": q(400, 999, False), "bad": {"priced_scratch_bytes": True, "observed_bytes": 1, "exact": True}})]
+        table = campaign.calibration_table(rows)
+        self.assertEqual(set(table), {"tile", "block"}, "malformed observations are dropped")
+        self.assertEqual((table["tile"]["priced_scratch_bytes"], table["tile"]["observed_bytes"]), (400 * mib, 260 * mib))
+        self.assertEqual((table["tile"]["exact_captures"], table["tile"]["masked_captures"]), (2, 1))
+        self.assertTrue(table["tile"]["over_priced_beyond_margin"], "400 priced vs 260 observed > 32 MiB")
+        self.assertFalse(table["block"]["over_priced_beyond_margin"], "100 vs 95 is within the margin")
+        self.assertEqual(table["tile"]["priced_over_observed"], round(400 / 260, 4))
+
+    def test_steps_and_geometry_validation_reports(self):
+        opt = self.keys[1].replace("/text/", "/text/")
+        short = [dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/1", "diagnostic_success"), purpose="optimized", run_id=r) for r in "abc"]
+        full = dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/0", "diagnostic_success"), purpose="validation_steps",
+                    kernel_lifetime_phys_footprint_peak_bytes=160, phase_peaks={"denoise": {"peak_bytes": 130, "exact": True}})
+        full["ending_snapshot"]["lifetime_peak_bytes"] = 160
+        full["steps"] = 16  # Synthetic provider's actually resolved default; case0 remains the sentinel.
+        report = campaign.steps_validation(short + [full])
+        self.assertEqual(len(report), 1)
+        self.assertEqual((report[0]["full_steps_demand_bytes"], report[0]["short_steps_demand_bytes"]), (120, 110))
+        self.assertEqual(report[0]["ratio"], round(120 / 110, 4))
+        self.assertEqual(report[0]["phase_ratios"], {"denoise": round(90 / 80, 4)})
+        self.assertEqual(campaign.steps_validation([full])[0]["problem"], "no completed optimized anchor of the same case")
+        admitted = dict(self.success("fake/fake/q4/1024/text/4/s_t256/1"), purpose="validation_geometry",
+                        baseline_phys_footprint_bytes=40, admitted={"demand_bytes": 100, "margin_bytes": 5, "basis": "Derived { from: Optimized }"})
+        geometry = campaign.geometry_validation([admitted])
+        self.assertEqual(geometry[0]["measured_demand_bytes"], 110)
+        self.assertEqual(geometry[0]["relative_error"], round(-10 / 110, 4))
+        self.assertEqual(geometry[0]["basis"], "Derived { from: Optimized }")
+        output = self.root / "validate.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", return_value=admitted) as run:
+            cls.return_value.blocked = False
+            self.assertEqual(self.main("validate", "--all-cases", "--device", "fake", "--output", str(output)), 0)
+            self.assertEqual([c.args[1] for c in run.call_args_list], ["fake/fake/q4/1024/text/4/s_t256/1", "fake/fake/q4/1024/control/4/s_t256/1"])
+            self.assertFalse(cls.call_args.args[0].diagnostic, "the geometry validation runs ADMITTED")
 
     def primitive_row(self):
         reading = {"available_bytes": 6000 << 20, "footprint_bytes": 40 << 20, "kernel_lifetime_peak_bytes": 60 << 20,
@@ -444,5 +742,24 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(campaign.validate_primitive(row, session.run_id)["status"], "diagnostic_success")
 
 
+class SourceContextWireTests(unittest.TestCase):
+    def test_source_context_payload_survives_sorted_key_roundtrip(self):
+        key = {"provider": "sdxl", "reference_count": 1, "mask_count": 0, "control_count": 1,
+            "sdxl_work": {"sha256": "ab" * 32, "facts": {
+                "work": {"reference_count": 0, "mask_count": 0, "control_count": 1},
+                "text": {"prompt_utf8_bytes": 19, "negative_prompt_utf8_bytes": 7},
+                "reference_index": None, "mask": None,
+                "controls": [{"source_index": 0, "image": {"width": 7, "height": 3, "buffer_bytes": 62}}]}}}
+        # Refused-fixture wire only, not fabricated completed native evidence or a valid digest.
+        row = {"purpose": "resident", "case": "source-wire-fixture", "evidence_key": key,
+            "anchor_selection": {"rung": 0}, "status": "capture_refused",
+            "refused_quantum": {"label": "fixture", "scratch_bytes": 1, "reserve_bytes": 0, "available_bytes": 0},
+            "run_id": "fixture", "build_sha": "a" * 40}
+        anchors, problems = campaign.anchor_rows([row])
+        self.assertEqual(problems, [])
+        self.assertEqual(anchors[0]["key"], key)
+
+
 if __name__ == "__main__":
     unittest.main()
+

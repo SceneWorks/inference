@@ -146,17 +146,12 @@ impl VisionEncoderLayer {
     /// iOS quantum scratch (sc-26270) of this layer over `x` `[B, N, D]`, from the loaded widths
     /// (hidden from `layer_norm1`, MLP width from `fc1`; [`crate::quantum::clip_layer_bytes`]).
     fn quantum_scratch(&self, x: &Array) -> u64 {
-        let s = x.shape();
-        crate::quantum::clip_layer_bytes(
-            s[0],
-            s[1],
+        crate::ip_adapter::pricing::vision_layer_scratch(
+            &crate::quantum::activation_facts(x),
             self.ln1_w.shape()[0] as u64,
             crate::quantum::linear_out(&self.fc1),
             self.num_heads,
             self.head_dim,
-            false,
-            crate::quantum::element_bytes(x),
-            crate::quantum::Backend::current(),
         )
     }
 
@@ -289,7 +284,7 @@ impl ClipVisionEncoder {
     /// L{n-1}_out]` (length `num_layers + 1`). IP-Adapter "plus" reads `[-2]` (= the penultimate
     /// layer's output).
     pub fn hidden_states(&self, pixel_values: &Array) -> Result<Vec<Array>> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut x = self.embed_quantum(pixel_values)?;
         let mut states = Vec::with_capacity(self.layers.len() + 1);
         states.push(x.clone());
@@ -314,18 +309,12 @@ impl ClipVisionEncoder {
     /// then the class/patch concatenation and the LayerNorm (`[B, tokens, hidden]`;
     /// `quantum::layer_norm_buffers`; the position sum donates the concatenation; measured).
     fn embed_scratch(&self, pixel_values: &Array) -> u64 {
-        let s = pixel_values.shape();
-        let tokens = (s[1] / self.patch) * (s[2] / self.patch) + 1;
-        let act = crate::quantum::element_bytes(pixel_values);
-        let call = crate::quantum::ConvCall::new(s, act, &self.patch_embedding, self.patch, 0);
-        let backend = crate::quantum::Backend::current();
-        let units = 1 + crate::quantum::layer_norm_buffers(backend);
-        crate::quantum::single_conv_bytes(&call, 0, 0, backend)
-            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
-                act,
-                &[units, s[0] as u64, tokens as u64, self.hidden as u64],
-            ))
-            .saturating_add(crate::quantum::page_slack(units))
+        crate::ip_adapter::pricing::vision_embedding_scratch(
+            &crate::quantum::activation_facts(pixel_values),
+            &crate::quantum::activation_facts(&self.patch_embedding),
+            self.patch,
+            self.hidden,
+        )
     }
 
     /// The embedding quantum's price and body (sc-26270 proof tests).
@@ -360,7 +349,7 @@ impl ClipVisionEncoder {
     /// so forwarding the whole tower and discarding the last layer + every intermediate state was
     /// wasted work (one ViT-H layer + the retained states; F-076).
     pub fn penultimate(&self, pixel_values: &Array) -> Result<Array> {
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let mut x = self.embed_quantum(pixel_values)?;
         let keep = self.layers.len().saturating_sub(1);
         for layer in &self.layers[..keep] {

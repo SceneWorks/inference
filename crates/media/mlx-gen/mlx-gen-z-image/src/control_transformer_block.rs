@@ -34,6 +34,28 @@ pub struct ZImageControlBlock {
 }
 
 impl ZImageControlBlock {
+    const BEFORE_PROJ_PATH: &'static str = "before_proj";
+    const AFTER_PROJ_PATH: &'static str = "after_proj";
+
+    /// The exact named Linear set visited by this block's quantizer, not every 2-D header in a
+    /// checkpoint. The base schema is shared with its native adapter/constructor targets; control
+    /// projection keys below are the SAME constants the constructor consumes. The patch embedder
+    /// and norm parameters are not members of this set.
+    pub(crate) fn quantization_header_targets(
+        prefix: &str,
+        has_before_proj: bool,
+    ) -> Vec<(String, bool)> {
+        let mut targets = crate::transformer_block::adapter_target_paths()
+            .into_iter()
+            .map(|path| (format!("{prefix}.{path}"), false))
+            .collect::<Vec<_>>();
+        targets.push((format!("{prefix}.{}", Self::AFTER_PROJ_PATH), false));
+        if has_before_proj {
+            targets.push((format!("{prefix}.{}", Self::BEFORE_PROJ_PATH), false));
+        }
+        targets
+    }
+
     /// Load a control block from the Fun-Controlnet-Union checkpoint under `prefix` (e.g.
     /// `"control_layers.0"`). The base-block keys (`attention.*`, `feed_forward.*`,
     /// `attention_norm{1,2}`, `ffn_norm{1,2}`, `adaLN_modulation.0`) map 1:1 onto
@@ -49,11 +71,12 @@ impl ZImageControlBlock {
         // Packed-detect (sc-8670): the control projections load packed from a pre-quantized control
         // snapshot or dense otherwise; both carry a bias. Their in-features (3840) are group-64
         // divisible, so they pack in a quantized tier.
-        let after_proj = crate::quant::lin(w, &format!("{prefix}.after_proj"), true)?;
+        let after_proj =
+            crate::quant::lin(w, &format!("{prefix}.{}", Self::AFTER_PROJ_PATH), true)?;
         let before_proj = if has_before_proj {
             Some(crate::quant::lin(
                 w,
-                &format!("{prefix}.before_proj"),
+                &format!("{prefix}.{}", Self::BEFORE_PROJ_PATH),
                 true,
             )?)
         } else {
@@ -93,13 +116,21 @@ impl ZImageControlBlock {
 
     /// The packed bytes [`Self::quantize`] builds from this block's dense projections (0 when packed).
     pub(crate) fn quantize_bytes(&self, bits: i32) -> u64 {
+        self.projections()
+            .into_iter()
+            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+            .sum()
+    }
+
+    /// Every projection [`Self::quantize`] packs: the base block's, `after_proj` and (block 0)
+    /// `before_proj`.
+    pub(crate) fn projections(&self) -> Vec<&AdaptableLinear> {
         self.base
             .projections()
             .into_iter()
             .chain(std::iter::once(&self.after_proj))
             .chain(self.before_proj.iter())
-            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
-            .sum()
+            .collect()
     }
 
     /// The block's iOS quantum price over control state `c` (`[1, L, D]`): the base block's
@@ -136,11 +167,8 @@ impl ZImageControlBlock {
     /// Every weight array the block's projections hold (packed: weight, scales, biases, bias), for
     /// the iOS load-time packing quantum to materialize.
     pub(crate) fn weight_arrays(&self) -> Vec<&Array> {
-        self.base
-            .projections()
+        self.projections()
             .into_iter()
-            .chain(std::iter::once(&self.after_proj))
-            .chain(self.before_proj.iter())
             .flat_map(|lin| match lin.quantized_params() {
                 Some((w, scales, biases, bias, ..)) => {
                     let mut v = vec![w, scales, biases];

@@ -344,8 +344,8 @@ impl MlxRequestScopeCore {
     }
 }
 
-impl MemoryRequestScope for MlxRequestScopeCore {
-    fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()> {
+impl MlxRequestScopeCore {
+    fn validate_configuration(&self, request: &GenerationRequest) -> Result<()> {
         self.ensure_active()?;
         if request.use_pid != self.config.use_pid {
             return Err(Error::Unsupported(format!(
@@ -375,6 +375,9 @@ impl MemoryRequestScope for MlxRequestScopeCore {
                 self.config.geometry.reference_count
             )));
         }
+        Ok(())
+    }
+    fn arm_configuration(&mut self) -> Result<()> {
         if let Some(authorization) = self.config.decode_authorization.clone() {
             GEOMETRY_DECODE_AUTHORIZATION.with(|slot| {
                 let mut active = slot.borrow_mut();
@@ -389,8 +392,47 @@ impl MemoryRequestScope for MlxRequestScopeCore {
             })?;
             self.decode_authorization_armed = true;
         }
+        Ok(())
+    }
+}
+
+impl MemoryRequestScope for MlxRequestScopeCore {
+    fn configure_request(&mut self, request: &mut GenerationRequest) -> Result<()> {
+        self.validate_configuration(request)?;
+        self.arm_configuration()?;
         request.memory = self.config.memory;
         Ok(())
+    }
+    fn configure_admitted_request(&mut self, request: &GenerationRequest) -> Result<()> {
+        self.validate_configuration(request)?;
+        // The scope selects the ladder, not independent execution domains.
+        // Preserve the original admitted cadence/CFG/FFN/cache/fault controls;
+        // the provider's ordinary request floor validates those domains.
+        let mut ladder = request.memory.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: immutable admitted configuration requires explicit memory, not legacy None",
+                self.config.provider_id
+            ))
+        })?;
+        let selected = self.config.memory.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: immutable admitted configuration has no selected ladder",
+                self.config.provider_id
+            ))
+        })?;
+        ladder.graph_eval_cadence = selected.graph_eval_cadence;
+        ladder.ffn_chunk = selected.ffn_chunk;
+        ladder.cfg_batching = selected.cfg_batching;
+        ladder.prefix_kv_cache = selected.prefix_kv_cache;
+        ladder.calibration_error_phase = selected.calibration_error_phase;
+        ladder.calibration_fault_harness_authorized = selected.calibration_fault_harness_authorized;
+        if ladder != selected {
+            return Err(Error::Unsupported(format!(
+                "{}: immutable request ladder differs from admitted canonical configuration",
+                self.config.provider_id
+            )));
+        }
+        self.arm_configuration()
     }
 
     fn enter_phase(&mut self, _phase: MemoryPhase) -> Result<()> {
@@ -517,6 +559,53 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn immutable_admitted_configuration_borrows_original_and_never_rewrites_legacy_none() {
+        let mut admitted = config(20);
+        admitted.memory = Some(GenerationMemory::default());
+        let mut scope = MlxRequestScopeCore::with_cleanup_action(admitted, Box::new(|| Ok(())));
+        let memory = GenerationMemory {
+            cfg_batching: Some(crate::gen_core::CfgBatching::Sequential),
+            ..Default::default()
+        };
+        let request = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            memory: Some(memory),
+            ..Default::default()
+        };
+        let original = &request as *const GenerationRequest;
+        scope.configure_admitted_request(&request).unwrap();
+        assert_eq!(&request as *const GenerationRequest, original);
+        assert_eq!(
+            request.memory,
+            Some(memory),
+            "independent admitted execution must survive read-only ladder setup"
+        );
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+
+        let mut admitted = config(20);
+        admitted.memory = Some(GenerationMemory::default());
+        let mut scope = MlxRequestScopeCore::with_cleanup_action(admitted, Box::new(|| Ok(())));
+        let mut legacy = GenerationRequest {
+            width: 64,
+            height: 64,
+            count: 1,
+            memory: None,
+            ..Default::default()
+        };
+        assert!(scope.configure_admitted_request(&legacy).is_err());
+        assert_eq!(
+            legacy.memory, None,
+            "immutable failure must not normalize/clone a fake carrier"
+        );
+        // Existing explicit mutable bridge retains exactly its former behavior.
+        scope.configure_request(&mut legacy).unwrap();
+        assert_eq!(legacy.memory, Some(GenerationMemory::default()));
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
     }
 
     fn reference() -> Conditioning {

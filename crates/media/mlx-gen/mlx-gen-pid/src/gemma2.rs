@@ -499,6 +499,25 @@ impl Gemma2 {
         let dtype = self.compute_dtype();
         let element_bytes = dtype_bytes(dtype);
         let (b64, l64) = (b as u64, l as u64);
+        // Actual shared Gemma source path (SANA and PiD), not a pricing replay.
+        // A fixed scalar tuple neither retains arrays nor evaluates their graph.
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "gemma2",
+            "native-forward",
+            &[
+                ("schema", 1),
+                ("batch", b64),
+                ("tokens", l64),
+                ("hidden", self.cfg.hidden_size as u64),
+                ("layers", self.layers.len() as u64),
+                ("heads", self.cfg.num_heads as u64),
+                ("kv_heads", self.cfg.num_kv_heads as u64),
+                ("head_dim", self.cfg.head_dim as u64),
+                ("intermediate", self.cfg.intermediate_size as u64),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(dtype)),
+                ("pad_mask", u64::from(pad_mask.is_some())),
+            ],
+        );
         mlx_gen::ios_quantum::before(
             "Gemma embedding/mask",
             gemma_embedding_bytes(&self.cfg, b64, l64, element_bytes),
@@ -755,6 +774,7 @@ mod quantum_proofs {
     }
 
     #[test]
+    #[ignore = "expensive stalled fixture capture; run through the selected iOS capture workflow"]
     fn gemma_quanta_track_their_measured_peaks() {
         const CHILD: &str = "GEMMA_QUANTUM_PROOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -762,9 +782,12 @@ mod quantum_proofs {
                 .args([
                     "--exact",
                     "gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks",
+                    "--include-ignored",
                     "--nocapture",
+                    "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env("IOS_CAPTURE_IN_CHILD", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -872,5 +895,8 @@ mod quantum_proofs {
             "the largest-copy-only pricing ({single} B) must under-price the measured peak \
              ({measured} B), or this shape cannot tell the models apart"
         );
+        if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
+            eprintln!("\nIOS_CAPTURE_BODY_COMPLETED gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks");
+        }
     }
 }

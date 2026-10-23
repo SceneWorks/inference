@@ -11,6 +11,7 @@ autotests = false
 
 [dependencies]
 mlx-gen = { path = ".." }
+serde = { workspace = true }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # SANA's text conditioning REUSES PiD's already-native gemma-2-2b-it CHI caption encoder (epic 8485,
@@ -19,6 +20,8 @@ mlx-rs = { workspace = true }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 
 [dev-dependencies]
+# Pin CPU-native stream before any weights-free fixture allocation; trap Metal submissions.
+mlx-sys = { workspace = true }
 # The shared weights-free conformance suite (epic SC-22657): the crate's contract tests assert
 # the provider-declared architecture axes against it.
 sceneworks-gen-core-testkit = { workspace = true }

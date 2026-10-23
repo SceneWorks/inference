@@ -1047,6 +1047,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def assert_candle_metal_pins_select_real_modules(self, run: str) -> None:
         command = " ".join(run.split())
         self.assertIn("--features metal --test integration --", command)
+        # The collector's separator is not the test-binary argument separator.
+        command = command.removeprefix("python3 scripts/ci/run_ci_collection.py -- ")
         filters = command.split(" -- ", 1)[1].split()
         self.assertEqual(sorted(filters), sorted(f"{name}::" for name in self.CANDLE_METAL_PINS))
         root = WORKFLOW.parents[2]
@@ -4043,7 +4045,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
         # The device-capture surface is tested and linted on the host lane.
         self.assertTrue(
-            any("cargo test --locked --lib -p runtime-ios --features device-capture" in run for run in metal)
+            any("cargo test --locked --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)
         )
         # The capture-gating doctests run both ways (the `--lib` steps never run doctests).
         lines = {
@@ -4053,12 +4055,18 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             for line in step["run"].splitlines()
         }
         for doc in (
-            "cargo test --locked --doc -p runtime-ios --features device-capture",
-            "cargo test --locked --doc -p runtime-ios",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --doc -p runtime-ios --features device-capture",
+            "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --doc -p runtime-ios",
         ):
             self.assertIn(doc, lines)
+        doc_runs = [run for run in metal if "--doc -p runtime-ios" in run]
+        self.assertEqual(len(doc_runs), 2)
+        for run in doc_runs:
+            self.assertTrue(run.startswith(
+                "python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast "
+            ))
         self.assertTrue(
-            any("cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
+            any("cargo test --locked --no-fail-fast --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
         )
         self.assertTrue(
             any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)
@@ -5025,6 +5033,17 @@ class WindowsBashSelectionTests(unittest.TestCase):
         self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
 
 
+def workflow_dispatch_input_errors(workflow: dict) -> list[str]:
+    events = workflow.get("on", workflow.get(True, {}))
+    if not isinstance(events, dict):
+        return []
+    dispatch = events.get("workflow_dispatch") or {}
+    inputs = dispatch.get("inputs") or {}
+    if len(inputs) > 25:
+        return ["workflow_dispatch exceeds GitHub's maximum of 25 inputs"]
+    return []
+
+
 class WorkflowFileSizeTests(unittest.TestCase):
     # GitHub refuses any workflow file over 512,000 bytes and every run of it then startup-fails
     # ("Workflow file exceeds the maximum allowed size of 500 KB"). real-weights.yml reached
@@ -5032,6 +5051,20 @@ class WorkflowFileSizeTests(unittest.TestCase):
     # leaves room for more lanes before the next extraction is due, instead of finding out from a
     # run that never starts.
     MAXIMUM_WORKFLOW_BYTES = 450_000
+
+    def test_every_workflow_dispatch_obeys_github_input_limit(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertEqual(workflow_dispatch_input_errors(workflow), [])
+
+    def test_dispatch_input_platform_limit_accepts_25_and_rejects_26(self) -> None:
+        workflow = {"on": {"workflow_dispatch": {"inputs": {
+            f"input_{index}": {"type": "string"} for index in range(25)
+        }}}}
+        self.assertEqual(workflow_dispatch_input_errors(workflow), [])
+        workflow["on"]["workflow_dispatch"]["inputs"]["overflow"] = {"type": "string"}
+        self.assertEqual(len(workflow_dispatch_input_errors(workflow)), 1)
 
     def test_every_workflow_file_stays_well_under_the_github_size_limit(self) -> None:
         for path in sorted(WORKFLOW.parent.glob("*.y*ml")):

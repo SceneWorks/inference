@@ -28,6 +28,22 @@ use mlx_rs::{Array, Dtype};
 /// release's projection widths (2560, 768, 256, 64, …) divide.
 pub const QUANT_GROUP_SIZE: usize = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
 
+/// Recheck file-backed pending constructor and stored-grid evaluation allocations after build.
+/// The earlier joint check is not a reservation against intervening owned allocations.
+pub(crate) const ADAPTED_BASE_EVAL_QUANTUM: &str = "Iris adapted base evaluation";
+
+/// Called by the file-backed model loader immediately before evaluating the built DiT parameters.
+/// The byte count comes from the same captured-header constructor law as the early load guard.
+/// Its raw base inputs were evaluated by read_backbone_tensor; accepted Iris adapter files attach
+/// residuals without replacing that base (header_inventory rejects diff-patch files). Loader::linear
+/// has already evaluated and synchronized those residuals, so no adapter producer feeds a base cast.
+/// The captured source plan also includes still-pending stored-grid outputs/workspace and excludes
+/// its already-active build scalars. It does not certify arbitrary caller-supplied Array graphs or
+/// oversized incoming backing. Even a zero-target build reaches this real evaluation boundary.
+pub(crate) fn before_adapted_base_eval(pending_constructor_bytes: u64) -> Result<()> {
+    mlx_gen::ios_quantum::before(ADAPTED_BASE_EVAL_QUANTUM, pending_constructor_bytes)
+}
+
 /// The load-time quantization of one backbone build (sc-26266): the affine width of the `q8` /
 /// `q4` tier.
 ///
@@ -126,16 +142,57 @@ pub struct AdaptedLinears {
     linears: RefCell<BTreeMap<String, AdaptableLinear>>,
     adapted: BTreeSet<String>,
     consumed: RefCell<BTreeSet<String>>,
+    load_facts: BTreeMap<String, crate::adapters::ProjectionAdapterLoadFacts>,
 }
 
 impl AdaptedLinears {
+    /// All known-file accepted residual materialization allocations still potentially pending.
+    /// Source file inputs are already evaluated. Diff/merged-base adapters are refused upstream.
+    pub(crate) fn pending_materialization_bytes(&self) -> Result<u64> {
+        self.load_facts.values().try_fold(0u64, |sum, facts| {
+            sum.checked_add(facts.materialize_scratch_bytes()?)
+                .ok_or_else(|| {
+                    Error::Unsupported("Iris pending adapter materialization sum overflow".into())
+                })
+        })
+    }
+
     /// `linears` are every projection the install could reach; `adapted` the paths it changed.
     pub fn new(linears: BTreeMap<String, AdaptableLinear>, adapted: BTreeSet<String>) -> Self {
         Self {
             linears: RefCell::new(linears),
             adapted,
             consumed: RefCell::new(BTreeSet::new()),
+            load_facts: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn with_load_facts(
+        mut self,
+        facts: BTreeMap<String, crate::adapters::ProjectionAdapterLoadFacts>,
+    ) -> Self {
+        self.load_facts = facts;
+        self
+    }
+
+    /// The actual ordered payload inventory before the Loader moves the projections into the
+    /// graph. Keys are the same upstream projection paths used by the header-only inventory.
+    pub fn adapter_facts(&self) -> crate::adapters::ProjectionAdapterFacts {
+        self.linears
+            .borrow()
+            .iter()
+            .filter(|(_, linear)| !linear.adapters().is_empty())
+            .map(|(path, linear)| {
+                (
+                    path.clone(),
+                    linear
+                        .adapters()
+                        .iter()
+                        .map(mlx_gen::adapters::facts::AdapterFacts::of)
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     /// Adapted paths no module consumed as a projection — must be empty after a model build.
@@ -158,7 +215,12 @@ impl Loader<'_> {
     /// codes / scales / biases and the bias at bf16 — exactly what [`pack_projection`] builds from
     /// the dense weight at load — and the zero columns its input is padded by. `None` when the
     /// projection is stored dense.
-    fn packed(&self, prefix: &str, bias: bool) -> Result<Option<(AdaptableLinear, i32)>> {
+    fn packed(
+        &self,
+        prefix: &str,
+        bias: bool,
+        resolved_width: Option<i32>,
+    ) -> Result<Option<(AdaptableLinear, i32)>> {
         let scales_key = format!("{prefix}.scales");
         if !self.has(&scales_key) {
             crate::packed::check_loaded_projection(self.weights, prefix, None)?;
@@ -181,7 +243,13 @@ impl Loader<'_> {
         let padded_in = scales.shape()[1] * group;
         let in_key = format!("{prefix}{}", crate::packed::IN_FEATURES_SUFFIX);
         let in_features = if self.has(&in_key) {
-            self.require(&in_key)?.item::<i32>()
+            let source = self.require(&in_key)?; // Preserve exact consumed-key accounting.
+            match resolved_width {
+                // The install already evaluated this immutable marker with the original
+                // try_item conversion. Reuse the actual value, not a second conversion buffer.
+                Some(width) => width,
+                None => source.item::<i32>(), // Original bare packed-loader conversion path.
+            }
         } else {
             padded_in
         };
@@ -216,12 +284,32 @@ impl Loader<'_> {
                     )));
                 }
                 adapted.consumed.borrow_mut().insert(prefix.to_owned());
-                // Every adapter factor is read and evaluated here, at the load boundary, so no
-                // forward ever waits on a lazy adapter read.
+                // Raw file reads and graph scalar construction are a separate guarded quantum.
+                // This is the ACTUAL lazy reconstruction boundary: all new casts, factor products,
+                // kron/Hadamard/einsum outputs are checked BEFORE evaluation allocates them. The
+                // already-held base/source tensors are deliberately absent from this scratch.
+                let load = adapted.load_facts.get(prefix);
+                if let Some(load) = load {
+                    mlx_gen::ios_quantum::before(
+                        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+                        load.materialize_scratch_bytes()?,
+                    )?;
+                }
+                // Every payload is evaluated at load, never on the first forward.
                 inner.materialize_adapters()?;
+                if load.is_some() {
+                    let arrays: Vec<&Array> =
+                        inner.adapters().iter().flat_map(|a| a.arrays()).collect();
+                    mlx_gen::ios_quantum::finish(
+                        crate::adapters::ADAPTER_MATERIALIZE_QUANTUM,
+                        &arrays,
+                    )?;
+                }
                 // A packed artifact's base is stored packed: the install acted on a zero-stride
                 // placeholder of its logical shape, and the adapters ride on the stored pack.
-                if let Some((mut packed, in_pad)) = self.packed(prefix, bias)? {
+                if let Some((mut packed, in_pad)) =
+                    self.packed(prefix, bias, Some(inner.base_shape()[1]))?
+                {
                     packed.set_adapters(inner.adapters().to_vec());
                     return Ok(Linear {
                         inner: packed,
@@ -259,7 +347,7 @@ impl Loader<'_> {
                 });
             }
         }
-        if let Some((inner, in_pad)) = self.packed(prefix, bias)? {
+        if let Some((inner, in_pad)) = self.packed(prefix, bias, None)? {
             return Ok(Linear {
                 inner,
                 compute: self.compute,
@@ -343,8 +431,9 @@ pub fn pack_projection(
 
 /// `nn.Linear` (`[out, in]` weight, stored in the compute dtype), as the repo's
 /// [`AdaptableLinear`]: the bare forward is `addmm(b, x, Wᵀ)` / `x·Wᵀ` exactly as before adapters
-/// existed, and an installed LoRA/LoKr adds its residual `Σ adapter(x)` on top (LoKr through the
-/// structured Kronecker product, never a materialized `[out, in]` delta).
+/// existed, and an installed LoRA/LoKr/LoHa adds its residual `Σ adapter(x)` on top. Iris's dense
+/// install host reconstructs LoKr/LoHa as materialized `[out, in]` deltas even over a packed base;
+/// packing the base does not change or re-install the adapter stack.
 pub struct Linear {
     inner: AdaptableLinear,
     compute: Dtype,
@@ -367,18 +456,29 @@ impl Linear {
         self.inner.forward(&x)
     }
 
-    /// The base parameters — dense weight and bias, or the packed codes, scales, biases and bias
-    /// (adapter factors are evaluated at load by the [`Loader`]).
+    /// All retained parameters: the dense/packed base AND the materialized adapter-owned
+    /// payloads. Transpose views are listed once; reconstruction-only source factors are absent.
     pub fn arrays(&self) -> Vec<&Array> {
-        if let Some((weight, bias)) = self.inner.dense_weight() {
-            return std::iter::once(weight).chain(bias).collect();
-        }
-        match self.inner.quantized_params() {
-            Some((codes, scales, biases, bias, _, _)) => {
-                [codes, scales, biases].into_iter().chain(bias).collect()
+        let mut arrays: Vec<&Array> = if let Some((weight, bias)) = self.inner.dense_weight() {
+            std::iter::once(weight).chain(bias).collect()
+        } else {
+            match self.inner.quantized_params() {
+                Some((codes, scales, biases, bias, _, _)) => {
+                    [codes, scales, biases].into_iter().chain(bias).collect()
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
-        }
+        };
+        arrays.extend(self.inner.adapters().iter().flat_map(|a| a.arrays()));
+        arrays
+    }
+
+    pub fn adapter_facts(&self) -> Vec<mlx_gen::adapters::facts::AdapterFacts> {
+        self.inner
+            .adapters()
+            .iter()
+            .map(mlx_gen::adapters::facts::AdapterFacts::of)
+            .collect()
     }
 
     /// The checkpoint's `[out, in]`, whatever the projection is held as.
@@ -684,4 +784,111 @@ pub fn expect_dims(name: &str, have: &[i32], want: &[i32]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// One source graph serves fresh-A runtime budgets and the conservative-U cumulative ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuantAllocationStage {
+    Build,
+    Evaluate,
+}
+
+pub(crate) fn visit_stored_grid_stages(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+    metal: bool,
+    mut allocate: impl FnMut(QuantAllocationStage, u64) -> Result<()>,
+) -> Result<()> {
+    let overflow = || Error::Unsupported("Iris stored-grid allocation arithmetic overflow".into());
+    if group == 0 || !input.is_multiple_of(group) || !matches!(bits, 2 | 4 | 8) {
+        return Err(overflow());
+    }
+    let n = rows.checked_mul(input).ok_or_else(overflow)?;
+    let groups = n / group;
+    let words = n.checked_mul(bits).ok_or_else(overflow)? / 32;
+    let mut emit = |stage, width: u64, elements: u64, count: u64| {
+        let request = width.checked_mul(elements).ok_or_else(overflow)?;
+        for _ in 0..count {
+            allocate(stage, request)?;
+        }
+        Ok::<(), Error>(())
+    };
+    use QuantAllocationStage::{Build, Evaluate};
+    emit(Evaluate, 2, n, 1)?; // conditional Quantize input contiguity copy
+    emit(Evaluate, 4, words, 1)?;
+    emit(Evaluate, 2, groups, 2)?; // quantized scale/bias siblings, even discarded codes count
+    emit(Evaluate, 4, n, 1)?; // weight -> f32
+    emit(Evaluate, 4, groups, 2)?; // scale and bias -> f32
+    emit(Evaluate, 4, n, 5)?; // subtract, divide, round, max, min
+    emit(Build, 4, 1, 2)?; // clip endpoint from_f32 constructors
+    emit(Evaluate, 4, n, 1)?; // uint32 cast
+    emit(Build, 4, 32 / bits, 1)?; // place Array::from_slice
+    emit(Evaluate, 4, n, 1)?; // disjoint-field multiplication
+                              // Last-axis extent <=16. output==1 implies input<=16, so the native all-reduce
+                              // input>4096 branch is impossible. Preserve CPU zero-output vs Metal minimum-4 semantics.
+    let output = words.checked_mul(4).ok_or_else(overflow)?;
+    allocate(Evaluate, if metal { output.max(4) } else { output })
+}
+
+pub(crate) fn visit_stored_grid_allocations(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+    metal: bool,
+    mut allocate: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    visit_stored_grid_stages(rows, input, group, bits, metal, |_, bytes| allocate(bytes))
+}
+
+pub(crate) fn stored_grid_allocation_parts(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+) -> Result<(u64, u64)> {
+    let mut build = 0u64;
+    let mut evaluate = 0u64;
+    visit_stored_grid_stages(rows, input, group, bits, true, |stage, bytes| {
+        let bytes =
+            mlx_gen::ios_quantum::fresh_metal_allocation_bytes(bytes, crate::retention::PAGE_BYTES)
+                .ok_or_else(|| {
+                    Error::Unsupported("Iris stored-grid fresh allocation overflow".into())
+                })?;
+        let sum = if stage == QuantAllocationStage::Build {
+            &mut build
+        } else {
+            &mut evaluate
+        };
+        *sum = sum
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Unsupported("Iris stored-grid fresh sum overflow".into()))?;
+        Ok(())
+    })?;
+    Ok((build, evaluate))
+}
+
+pub(crate) fn stored_grid_allocation_bytes(
+    rows: u64,
+    input: u64,
+    group: u64,
+    bits: u64,
+) -> Result<u64> {
+    let (build, evaluate) = stored_grid_allocation_parts(rows, input, group, bits)?;
+    build
+        .checked_add(evaluate)
+        .ok_or_else(|| Error::Unsupported("Iris stored-grid complete sum overflow".into()))
+}
+
+pub(crate) const PENDING_CONSTRUCTION_QUANTUM: &str = "Iris pending construction";
+
+/// A real check immediately before constructor graph creation. The closure is intentionally
+/// lazy: disabled execution performs NONE of the new budget-only facts/overflow arithmetic.
+pub(crate) fn before_pending_construction(plan: impl FnOnce() -> Result<u64>) -> Result<()> {
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    mlx_gen::ios_quantum::before(PENDING_CONSTRUCTION_QUANTUM, plan()?)
 }

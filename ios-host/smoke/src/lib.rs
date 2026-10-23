@@ -14,6 +14,10 @@
 //! of MLX. The FFI entry point returns a report string so the app can display it and an XCTest
 //! can assert on it.
 
+// Keep the complete capture/selection JSON schema; its serde_json expansion exceeds the
+// default macro recursion depth. This is a compile-time macro limit, not a runtime memory cap.
+#![recursion_limit = "256"]
+
 use std::ffi::{c_char, CString};
 use std::path::Path;
 use std::time::Instant;
@@ -263,6 +267,39 @@ fn bound_mlx_to_the_jetsam_limit() -> String {
             },
             avail = l.os_available_mib,
         ),
+    }
+}
+
+/// The source-derived host upper of THIS lane's progress callback (`on_progress` below): one
+/// formatted stage String per event, at most the longest `Progress` rendering (`Step` with two
+/// `u32::MAX` values; `Decoding`; `Loading(TextEncoder|Renderer)`), replacing the previous stage
+/// (no drop credit taken). Under the labelled toolchain assumption that a `format!` String grown
+/// to `n` bytes allocates at most `4·n + 8` cumulative bytes. No listener; no preview sink.
+#[cfg(feature = "media")]
+fn sampler_progress_callback_host() -> runtime_ios::media::IosCallbackHost {
+    let longest = [
+        format!("Step {}/{}", u32::MAX, u32::MAX).len(),
+        format!("{:?}", runtime_ios::gen_core::Progress::Decoding).len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::TextEncoder)
+        )
+        .len(),
+        format!(
+            "{:?}",
+            runtime_ios::gen_core::Progress::Loading(runtime_ios::gen_core::LoadPhase::Renderer)
+        )
+        .len(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0) as u64;
+    runtime_ios::media::IosCallbackHost::Bounded {
+        fixed_bytes: 0,
+        per_progress_event_bytes: longest * 4 + 8,
+        per_preview_event_bytes: 0,
+        per_quantum_mark_bytes: 0,
+        per_quantum_label_byte_bytes: 0,
     }
 }
 
@@ -1404,9 +1441,12 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 )
             } else {
                 Box::new(
-                    runtime_ios::media::load_sana(std::slice::from_ref(&candidate))
-                        .map_err(|e| format!("{label}: load failed: {e}"))?
-                        .1,
+                    runtime_ios::media::load_sana_with(
+                        std::slice::from_ref(&candidate),
+                        sampler_progress_callback_host(),
+                    )
+                    .map_err(|e| format!("{label}: load failed: {e}"))?
+                    .1,
                 )
             };
             // Tiling asked for through the CONTRACT (the candidate wrote the provider's ladder
@@ -1538,7 +1578,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 }
 
 /// The Z-Image Turbo lane (`--zimage`, sc-26433): one bounded device CAPTURE of a Z-Image campaign
-/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit` — through
+/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1` — through
 /// the same capture path every catalog model runs (`campaign_media::report` → `capture_permit`, every
 /// quantum checked against live headroom before its graph is built). A quantum refusal is evidence
 /// (the size does not fit) and passes; only a failure fails. The snapshot is the campaign slot
@@ -1548,7 +1588,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 fn check_zimage_generation() -> Check {
     const NAME: &str = "Z-Image Turbo bounded capture";
     let case = std::env::var("IOS_SMOKE_ZIMAGE_CASE").unwrap_or_else(|_| {
-        "z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit".into()
+        "z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1".into()
     });
     // Capture runs only on a real device, against a provisioned slot; anywhere else the lane skips,
     // as every snapshot-backed lane does.
