@@ -979,6 +979,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         include:
