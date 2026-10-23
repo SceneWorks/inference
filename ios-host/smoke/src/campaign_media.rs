@@ -1109,6 +1109,111 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
     Ok(spec)
 }
 
+// Descriptive source counts and a known requested-layout fragment only: never
+// a completed native scope, total HOST/NTPK bound, RAM estimate, or model permit.
+fn observe_selected_sana_capture(
+    view: runtime_ios::media::SelectedAdmissionView<'_>,
+) -> runtime_ios::media::AdmissionResult<()> {
+    use runtime_ios::media::evidence::{
+        BASE_SAMPLING_MARKS, MAX_QUANTUM_CHECKS, NATIVE_RETIREMENT_ROOT_MARKS,
+    };
+    use runtime_ios::media::{
+        AdmissionError, IosCallbackHost, IosNativeRetirementExecution, RefusalKind,
+    };
+    if view.admission.native_retirement_execution()
+        != IosNativeRetirementExecution::ProviderLifecycle
+        || !matches!(
+            view.candidate.provider.as_str(),
+            "sana_1600m" | "sana_sprint_1600m"
+        )
+    {
+        return Ok(());
+    }
+    let missing = |reason| AdmissionError::refused(RefusalKind::NoEvidence, reason);
+    let page_bytes =
+        runtime_ios::media::ios_quantum::native_metal_page_bytes().ok_or_else(|| {
+            missing("actual native page size unavailable before observation planning")
+        })?;
+    if view.boundary.execution_facts.analysis_budget_bytes == 0 {
+        return Err(missing(
+            "actual observation analysis allowance unavailable before load",
+        ));
+    }
+    let plan = runtime_ios::media::sana_capture_observation_plan(
+        view.candidate,
+        view.admission.evidence_key(),
+        page_bytes,
+        view.boundary.execution_facts.analysis_budget_bytes,
+    )?;
+    // This actor emits exactly one before-model-load mark (the valid/invalid
+    // kernel-query branches are exclusive) and one conditioning-roles mark.
+    // It installs no enclosing observed allocation scope.
+    let ordinary_marks = plan
+        .ordinary_sampling_marks
+        .checked_add(2)
+        .ok_or_else(|| missing("ordinary observation count overflow"))?;
+    if ordinary_marks > BASE_SAMPLING_MARKS as u64
+        || plan.checked_quanta > MAX_QUANTUM_CHECKS as u64
+        || plan.native_epoch_marks > MAX_QUANTUM_CHECKS as u64
+        || plan.native_joined_marks > MAX_QUANTUM_CHECKS as u64
+        || plan.native_shape_marks > MAX_QUANTUM_CHECKS as u64
+        || plan.native_root_marks > NATIVE_RETIREMENT_ROOT_MARKS as u64
+    {
+        return Err(missing("source-known observation recorder quota is insufficient before load; not an input step/output limit"));
+    }
+    let (fixed, per_mark, per_label) = match view.boundary.execution_facts.callback_host {
+        Some(IosCallbackHost::Bounded {
+            fixed_bytes,
+            per_progress_event_bytes: 0,
+            per_preview_event_bytes: 0,
+            per_quantum_mark_bytes,
+            per_quantum_label_byte_bytes,
+        }) => (
+            fixed_bytes,
+            per_quantum_mark_bytes,
+            per_quantum_label_byte_bytes,
+        ),
+        _ => {
+            return Err(missing(
+                "installed observer requires its actual source callback descriptor",
+            ))
+        }
+    };
+    let known_metadata = per_mark
+        .checked_mul(plan.quantum_events)
+        .and_then(|events| {
+            per_label
+                .checked_mul(plan.quantum_label_bytes)
+                .and_then(|labels| {
+                    fixed
+                        .checked_add(events)
+                        .and_then(|bytes| bytes.checked_add(labels))
+                })
+        })
+        .ok_or_else(|| missing("source-known requested observation layout overflow"))?;
+    (view.boundary.source_metadata_capacity)(known_metadata)
+        .map_err(|error| AdmissionError::refused(RefusalKind::Capacity, error.to_string()))
+}
+
+#[derive(Clone, Copy)]
+struct AdmittedSummary {
+    demand_bytes: u64,
+    margin_bytes: u64,
+    required_bytes: u64,
+    basis: runtime_ios::media::AdmissionBasis,
+    callbacks: runtime_ios::media::IosCallbackHost,
+}
+impl AdmittedSummary {
+    fn to_json(self) -> Value {
+        json!({
+            "demand_bytes": self.demand_bytes,
+            "margin_bytes": self.margin_bytes,
+            "required_bytes": self.required_bytes,
+            "basis": format!("{:?}", self.basis),
+        })
+    }
+}
+
 struct DeviceProvider<'a> {
     registry: &'a ProviderRegistry,
     device_allowed: bool,
@@ -1126,13 +1231,18 @@ struct DeviceProvider<'a> {
     refused_quantum: Option<Value>,
     refusal_only: bool,
     /// An admitted case's price: demand, margin and its basis (measured anchor or derived).
-    admitted: Option<Value>,
+    admitted: Option<AdmittedSummary>,
     /// Actual sampler state shared only by the on-device capture, so its second baseline is taken
     /// after real request carriers exist and before model/admit-load work.
     telemetry: Option<Arc<Mutex<Extrema>>>,
 }
 impl DeviceProvider<'_> {
+    #[cfg(test)]
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
+        self.prepare_for_programme(c, false)
+    }
+
+    fn prepare_for_programme(&mut self, c: &Case, capture: bool) -> Result<(), AdmissionError> {
         // REAL source boundary BEFORE snapshot/configured-load/contract/work/candidate reads.
         // A later key or permit check cannot retroactively protect this prelude.
         let source_capacity_refused = std::cell::Cell::new(false);
@@ -1266,12 +1376,21 @@ impl DeviceProvider<'_> {
         // The memory-relevant key (path-free layout digest, mode, geometry, execution, token
         // window). A malformed artifact is a failure here, before any evidence question.
         // Reuse the authoritative callback installed before the pre-candidate prelude.
-        let mut key = runtime_ios::media::evidence_key_with_key_capacity(
-            self.registry,
-            &mut candidate,
-            &runtime_ios::device_machine(),
-            &mut key_next,
-        )
+        let mut key = if capture {
+            runtime_ios::media::capture_evidence_key_with_key_capacity(
+                self.registry,
+                &mut candidate,
+                &runtime_ios::device_machine(),
+                &mut key_next,
+            )
+        } else {
+            runtime_ios::media::evidence_key_with_key_capacity(
+                self.registry,
+                &mut candidate,
+                &runtime_ios::device_machine(),
+                &mut key_next,
+            )
+        }
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if c.provider == "sdxl" {
             #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
@@ -1345,17 +1464,68 @@ impl DeviceProvider<'_> {
                                 .map_err(|e| e.to_string())?,
                         ),
                         None => {
+                            let callbacks = self
+                                .admitted
+                                .as_ref()
+                                .ok_or("no actual callback declaration")?
+                                .callbacks;
                             let one = std::slice::from_ref(candidate);
                             let loaded = match c.provider.as_str() {
-                                "sdxl" => runtime_ios::media::load_sdxl(one),
-                                "anima_turbo" => runtime_ios::media::load_anima_turbo(one),
-                                "iris_3b" => runtime_ios::media::load_iris(one),
-                                id if runtime_ios::media::zimage::is_z_image(id) => {
-                                    runtime_ios::media::load_z_image_turbo(one)
+                                "sdxl" => runtime_ios::media::load_sdxl_with(one, callbacks),
+                                "anima_turbo" => {
+                                    runtime_ios::media::load_anima_turbo_with(one, callbacks)
                                 }
-                                _ => runtime_ios::media::load_sana(one),
+                                "iris_3b" => runtime_ios::media::load_iris_with(one, callbacks),
+                                id if runtime_ios::media::zimage::is_z_image(id) => {
+                                    runtime_ios::media::load_z_image_turbo_with(one, callbacks)
+                                }
+                                _ => runtime_ios::media::load_sana_with_observer(
+                                    one,
+                                    callbacks,
+                                    &mut observe_selected_sana_capture,
+                                ),
                             };
-                            Box::new(loaded.map_err(refused)?.1)
+                            let loaded = loaded.map_err(refused)?.1;
+                            if candidate.provider.starts_with("sana_") {
+                                // The selected requirement is metadata, NOT a completed
+                                // native scope or permission to fabricate an observation.
+                                let key = self
+                                    .evidence_key
+                                    .as_mut()
+                                    .ok_or("no prepared evidence key")?;
+                                let mut next = |bytes| {
+                                    runtime_ios::media::source_metadata_capacity(bytes)
+                                        .map_err(Into::into)
+                                };
+                                runtime_ios::media::bind_sana_retirement_key(
+                                    key,
+                                    candidate,
+                                    loaded.native_retirement_execution(),
+                                    Some(&mut next),
+                                )
+                                .map_err(refused)?;
+                            }
+                            let selected = loaded.admitted_selection();
+                            if selected.index() != 0 {
+                                return Err(
+                                    "SDK admission silently changed the selected case".into()
+                                );
+                            }
+                            let key = self
+                                .evidence_key
+                                .as_ref()
+                                .ok_or("no prepared evidence key")?;
+                            if key != selected.evidence_key() {
+                                return Err("realised SDK admission changed the prepared case evidence identity".into());
+                            }
+                            self.admitted = Some(AdmittedSummary {
+                                demand_bytes: selected.demand_bytes(),
+                                margin_bytes: selected.margin_bytes(),
+                                required_bytes: selected.required_bytes(),
+                                basis: selected.basis(),
+                                callbacks,
+                            });
+                            Box::new(loaded)
                         }
                     };
                     generator.validate(request).map_err(|e| e.to_string())?;
@@ -1377,9 +1547,17 @@ impl DeviceProvider<'_> {
                             .load_restorer(registry, capture_capacity)
                             .map_err(|e| e.to_string())?,
                         None => {
-                            runtime_ios::media::load_iris_restore(std::slice::from_ref(candidate))
-                                .map_err(refused)?
-                                .1
+                            let callbacks = self
+                                .admitted
+                                .as_ref()
+                                .ok_or("no actual callback declaration")?
+                                .callbacks;
+                            runtime_ios::media::load_iris_restore_with(
+                                std::slice::from_ref(candidate),
+                                callbacks,
+                            )
+                            .map_err(refused)?
+                            .1
                         }
                     };
                     let image = restorer
@@ -1394,9 +1572,17 @@ impl DeviceProvider<'_> {
                             .load_depth(capture_capacity)
                             .map_err(|e| e.to_string())?,
                         None => {
-                            runtime_ios::media::load_iris_depth(std::slice::from_ref(candidate))
-                                .map_err(refused)?
-                                .1
+                            let callbacks = self
+                                .admitted
+                                .as_ref()
+                                .ok_or("no actual callback declaration")?
+                                .callbacks;
+                            runtime_ios::media::load_iris_depth_with(
+                                std::slice::from_ref(candidate),
+                                callbacks,
+                            )
+                            .map_err(refused)?
+                            .1
                         }
                     };
                     let output = depth
@@ -1461,7 +1647,28 @@ impl Provider for DeviceProvider<'_> {
         if !self.device_allowed {
             return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
         }
-        self.prepare(c)?;
+        let callbacks = support::capture_listener_callback_host(&c.provider)?;
+        let known_fixed_metadata = match callbacks {
+            runtime_ios::media::IosCallbackHost::Bounded { fixed_bytes, .. } => fixed_bytes,
+            runtime_ios::media::IosCallbackHost::NonAllocating => {
+                return Err(
+                    "installed capture listener needs its actual requested-metadata declaration"
+                        .into(),
+                );
+            }
+        };
+        // A known requested-layout fragment, NOT total HOST/NTPK, RAM,
+        // allocator retirement, or a permission to execute the native programme.
+        runtime_ios::media::source_metadata_capacity(known_fixed_metadata).map_err(|error| {
+            classify(
+                &mut self.refusal_kind,
+                runtime_ios::media::AdmissionError::refused(
+                    runtime_ios::media::RefusalKind::Capacity,
+                    error.to_string(),
+                ),
+            )
+        })?;
+        self.prepare_for_programme(c, diagnostic)?;
         // Provenance storage exists before the real counter boundary. Both capture ledger and
         // SDK sidecar use THIS query, not a second arbitrarily timed footprint or budget guess.
         let baseline_source =
@@ -1535,10 +1742,24 @@ impl Provider for DeviceProvider<'_> {
                 ("control_count", control_count),
             ],
         );
+        let facts = runtime_ios::media::execution_facts(Some(callbacks))
+            .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        let premise_policy = runtime_ios::media::PremisePolicy::default();
+        let mut source_next =
+            |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
         if diagnostic {
             // CAPTURE: labelled, bounded per quantum, no evidence row consulted or created.
-            let permit = runtime_ios::media::capture_permit(candidate)
-                .map_err(|e| classify(&mut self.refusal_kind, e))?;
+            let permit = runtime_ios::media::capture_permit_with_observer(
+                candidate,
+                runtime_ios::media::SourceCapacityBoundary {
+                    request_baseline: &baseline,
+                    execution_facts: &facts,
+                    premise_policy: &premise_policy,
+                    source_metadata_capacity: &mut source_next,
+                },
+                &mut observe_selected_sana_capture,
+            )
+            .map_err(|e| classify(&mut self.refusal_kind, e))?;
             self.permit = Some(permit);
             return Ok(());
         }
@@ -1553,28 +1774,54 @@ impl Provider for DeviceProvider<'_> {
         // The full SDK boundary: this campaign is the execution owner, so it states the facts of
         // the run it is about to execute, including its OWN callbacks: the no-op progress closures
         // and the capture listener installed for this case (source-derived upper, not zero).
-        let callbacks = support::capture_listener_callback_host(&candidate.provider)?;
-        let facts = runtime_ios::media::execution_facts(Some(callbacks))
-            .map_err(|e| classify(&mut self.refusal_kind, e))?;
-        let admitted = runtime_ios::media::admit_with_boundary(
+        let admitted = runtime_ios::media::admit_with_sana_lifecycle_fallback(
             self.registry,
             std::slice::from_ref(candidate),
             &runtime_ios::device_machine(),
             budget,
-            &baseline,
-            &facts,
-            &runtime_ios::media::PremisePolicy::default(),
+            runtime_ios::media::SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy: &premise_policy,
+                source_metadata_capacity: &mut source_next,
+            },
         )
         .map_err(|e| classify(&mut self.refusal_kind, e))?;
         if admitted.index() != 0 {
             return Err("admission silently changed the selected case".into());
         }
-        self.admitted = Some(json!({
-            "demand_bytes": admitted.demand_bytes(),
-            "margin_bytes": admitted.margin_bytes(),
-            "required_bytes": admitted.required_bytes(),
-            "basis": format!("{:?}", admitted.basis()),
-        }));
+        observe_selected_sana_capture(runtime_ios::media::SelectedAdmissionView {
+            candidate,
+            admission: &admitted,
+            boundary: runtime_ios::media::SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy: &premise_policy,
+                source_metadata_capacity: &mut source_next,
+            },
+        })
+        .map_err(|error| classify(&mut self.refusal_kind, error))?;
+        let key = self
+            .evidence_key
+            .as_mut()
+            .ok_or("no prepared evidence key")?;
+        runtime_ios::media::bind_sana_retirement_key(
+            key,
+            candidate,
+            admitted.native_retirement_execution(),
+            Some(&mut source_next),
+        )
+        .map_err(|error| classify(&mut self.refusal_kind, error))?;
+        if key != admitted.evidence_key() {
+            return Err("selected admission changed the prepared case evidence identity".into());
+        }
+        self.admitted = Some(AdmittedSummary {
+            demand_bytes: admitted.demand_bytes(),
+            margin_bytes: admitted.margin_bytes(),
+            required_bytes: admitted.required_bytes(),
+            basis: admitted.basis(),
+            callbacks,
+        });
         Ok(())
     }
     fn execute(&mut self, c: &Case) -> Result<(), ExecuteError> {
@@ -1820,22 +2067,37 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                 adapter.deadline.saturating_duration_since(Instant::now()),
             );
             let (mut status, mut reason) = campaign::run(&mut adapter, &case, diagnostic);
-            if adapter.cancel.is_cancelled() {
+            if adapter.cancel.is_cancelled()
+                && matches!(status, Status::Successful | Status::DiagnosticSuccess)
+            {
                 status = Status::DiagnosticFailure;
                 reason = "device cooperative deadline cancelled the case".into();
             }
             drop(deadline);
             runtime_ios::media::ios_quantum::set_quantum_listener(None);
-            let e = sampler.finish()?;
+            let completed = matches!(status, Status::Successful | Status::DiagnosticSuccess);
+            let e = sampler
+                .finish()
+                .map_err(|error| if completed { error } else { reason.clone() })?;
             let ending_snapshot = footprint_snapshot();
             if listener_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err("capture observation listener failed".into());
+                return Err(if completed {
+                    "capture observation listener failed".into()
+                } else {
+                    reason
+                });
             }
-            let captured = marks
-                .lock()
-                .map_err(|_| "capture observation collector was poisoned")?;
-            captured.sampling.validate()?;
-            captured.quantum.validate(&captured.sampling)?;
+            let captured = marks.lock().map_err(|_| {
+                if completed {
+                    "capture observation collector was poisoned".into()
+                } else {
+                    reason.clone()
+                }
+            })?;
+            if completed {
+                captured.sampling.validate()?;
+                captured.quantum.validate(&captured.sampling)?;
+            }
             let observed_current_peak = before_request_snapshot
                 .current()
                 .into_iter()
@@ -1945,7 +2207,10 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             } else {
                 (status, reason)
             };
-            let sampling_identity = adapter
+            // Failed/cancelled runs describe an attempt, not completed evidence.
+            // Optional report metadata must not replace their primary body error.
+            let completed = matches!(status, Status::Successful | Status::DiagnosticSuccess);
+            let sampling_identity_result = adapter
                 .evidence_key
                 .as_ref()
                 .and_then(|key| key.sampling_recipe.as_deref())
@@ -1953,8 +2218,14 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                     runtime_ios::media::sampling::from_token(&case.provider, token)
                         .map_err(|e| e.to_string())
                 })
-                .transpose()?;
-            if sampling_identity.is_none()
+                .transpose();
+            let sampling_identity = if completed {
+                sampling_identity_result?
+            } else {
+                sampling_identity_result.ok().flatten()
+            };
+            if completed
+                && sampling_identity.is_none()
                 && adapter.candidate.as_ref().is_some_and(|candidate| {
                     matches!(&candidate.work, runtime_ios::media::IosWork::Generate(_))
                 })
@@ -1966,7 +2237,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             let resolved_steps = sampling_identity
                 .as_ref()
                 .map_or(case.steps, |identity| identity.steps());
-            let expected_render_count = adapter
+            let expected_render_count_result = adapter
                 .candidate
                 .as_ref()
                 .map(|candidate| match &candidate.work {
@@ -1975,7 +2246,12 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                     }
                     _ => Ok(1),
                 })
-                .transpose()?;
+                .transpose();
+            let expected_render_count = if completed {
+                expected_render_count_result?
+            } else {
+                expected_render_count_result.ok().flatten()
+            };
             let mut row = json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
@@ -1995,7 +2271,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "sampling_metadata_required":sampling_required, "sampling_metadata_missing":sampling_missing,
             "sampling_coverage":if captured.sampling.total_marks > 0 { Some(&captured.sampling) } else { None },
             "quantum_coverage":Some(&captured.quantum), "quantum_query_gaps":captured.quantum_query_gaps,
-            "admitted":adapter.admitted,
+            "admitted":adapter.admitted.map(AdmittedSummary::to_json),
             "evidence_class": if diagnostic { "capture" } else { "admitted" }, "refused_quantum":adapter.refused_quantum,
             "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),

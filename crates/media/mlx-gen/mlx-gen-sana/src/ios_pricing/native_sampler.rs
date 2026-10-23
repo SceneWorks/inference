@@ -59,12 +59,22 @@ impl mlx_gen::gen_core::sampling::LatentOps for NativeOps {
 }
 
 pub(super) enum NativeSampling {
-    Flow(mlx_gen::sampler::flow_sampling::ResolvedFlowSampling),
+    Flow {
+        resolved: mlx_gen::sampler::flow_sampling::ResolvedFlowSampling,
+        start_step: usize,
+    },
     Scm(crate::sampling::ResolvedSprintSampling),
 }
 impl NativeSampling {
-    fn guided(&self) -> bool {
-        matches!(self,Self::Flow(flow) if flow.effective_guidance().is_some_and(|g|g>1.0))
+    pub(super) fn guided(&self) -> bool {
+        matches!(self,Self::Flow { resolved, .. } if resolved.effective_guidance().is_some_and(|g|g>1.0))
+    }
+    fn reference_active(&self, has_reference: bool) -> bool {
+        has_reference
+            && match self {
+                Self::Flow { start_step, .. } => *start_step > 0,
+                Self::Scm(resolved) => resolved.start_step() > 0,
+            }
     }
 }
 impl Walk<'_> {
@@ -92,8 +102,8 @@ impl Walk<'_> {
         forward.trunk(plan)?;
         let forward_upper = forward.ledger.total;
         match sampling {
-            NativeSampling::Flow(flow) => {
-                if plan.img2img {
+            NativeSampling::Flow { resolved: flow, .. } => {
+                if sampling.reference_active(plan.img2img) {
                     self.scalars(2)?;
                     self.ops(n, 3)?;
                 }
@@ -137,7 +147,7 @@ impl Walk<'_> {
             }
             NativeSampling::Scm(scm) => {
                 self.scalars(1)?; // embedded guidance, once outside the SCM loop
-                if plan.img2img {
+                if sampling.reference_active(plan.img2img) {
                     // x0=clean*sd, noise_sd=noise*sd; two angle products and their sum.
                     self.scalars(4)?;
                     self.ops(n, 5)?;
@@ -164,8 +174,8 @@ impl Walk<'_> {
                 self.a(n)?; // terminal divide, also zero-transition path
             }
         }
-        // model::materialize_latent_batch/concatenate and the per-image decode.
-        self.a(n)?;
+        // model::materialize_latent_batch evaluates the existing owner set;
+        // it does NOT concatenate or allocate a fictitious latent target.
         self.decode(plan)
     }
 }
@@ -232,7 +242,7 @@ pub(super) fn cumulative_upper(
     }
     prefix.inventory(&facts.trunk)?;
     prefix.inventory(&facts.vae)?;
-    if plan.img2img {
+    if sampling.reference_active(plan.img2img) {
         prefix.encode(plan)?;
     }
     let mut render = Walk::new(facts, page, backend)?;

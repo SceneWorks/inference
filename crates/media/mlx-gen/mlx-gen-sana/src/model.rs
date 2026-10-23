@@ -599,7 +599,28 @@ impl Sana {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Only THIS original invocation carrier can inherit the joined program.
+        // A direct ordinary generation launched by a callback (including legacy
+        // None) must not inherit an unrelated thread-local native selector.
+        let matching = req.memory.is_some()
+            && mlx_gen::ios_quantum::native_retirement_request_matches(
+                req as *const GenerationRequest as usize,
+            )?
+            && mlx_gen::ios_quantum::native_retirement_binding()
+                .is_some_and(|binding| binding.provider == self.descriptor.id);
+        let _ordinary =
+            (!matching).then(mlx_gen::ios_quantum::OrdinaryNativeRetirementScope::enter);
+        let _native_model = if matching {
+            Some(mlx_gen::ios_quantum::enter_native_retirement_model()?)
+        } else {
+            None
+        };
         validate_request(&self.descriptor, req)?;
+        let mut progress = |event| {
+            let _ordinary_callback = mlx_gen::ios_quantum::OrdinaryNativeRetirementScope::enter();
+            on_progress(event);
+        };
+        let on_progress: &mut dyn FnMut(Progress) = &mut progress;
         mlx_gen::ios_quantum::diagnostic_metadata(
             self.descriptor.id,
             "request",
@@ -839,7 +860,9 @@ pub(crate) fn run_staged_img2img<T, C, E, H, L, M, O>(
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
     let reference = {
         let encoder = load_encoder()?;
-        encode_reference(&encoder)?
+        let reference = encode_reference(&encoder)?;
+        crate::pipeline::retire_staged_reference_encoder()?;
+        reference
     };
     boundary()?;
     let (light, latents) = {

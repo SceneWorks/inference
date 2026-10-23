@@ -409,20 +409,206 @@ fn fixture_conditioning(encoder: &Gemma2, sprint: bool) -> Result<SanaConditioni
     };
     let (cond, cond_mask) = encode(0)?;
     let uncond = if sprint { None } else { Some(encode(3)?) };
-    let mut arrays = vec![&cond, &cond_mask];
-    if let Some((u, um)) = &uncond {
-        arrays.push(u);
-        arrays.push(um);
-    }
-    mlx_rs::transforms::eval(arrays)?;
-    Ok(SanaConditioning {
+    let conditioning = SanaConditioning {
         cond,
         cond_mask,
         uncond,
-    })
+    };
+    if crate::quantum::retired_lifecycle()? {
+        crate::pipeline::materialize_conditioning_if_retired(&conditioning)?;
+    } else {
+        let mut arrays = vec![&conditioning.cond, &conditioning.cond_mask];
+        if let Some((u, um)) = &conditioning.uncond {
+            arrays.push(u);
+            arrays.push(um);
+        }
+        mlx_rs::transforms::eval(arrays)?;
+    }
+    Ok(conditioning)
 }
 
 impl Request {
+    /// The fixture's REAL input carrier. The pipeline below borrows this same
+    /// image/control object; no metadata-only request or pixel clone is used.
+    fn actual_generation(&self) -> mlx_gen::GenerationRequest {
+        mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: EDGE,
+            height: EDGE,
+            count: 1,
+            steps: Some(2),
+            seed: Some(3),
+            strength: self.img2img.then_some(0.9),
+            memory: Some(self.execution),
+            conditioning: if self.img2img {
+                vec![mlx_gen::Conditioning::Reference {
+                    image: mlx_gen::Image {
+                        width: EDGE,
+                        height: EDGE,
+                        pixels: (0..EDGE * EDGE * 3).map(|i| (i % 251) as u8).collect(),
+                    },
+                    strength: Some(0.9),
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        }
+    }
+    fn pipeline_request<'a>(
+        &self,
+        actual: &'a mlx_gen::GenerationRequest,
+    ) -> SanaGenerateRequest<'a> {
+        SanaGenerateRequest {
+            width: actual.width,
+            height: actual.height,
+            steps: actual.steps.map(|n| n as usize),
+            seed: actual.seed,
+            init_image: actual.conditioning.iter().find_map(|role| match role {
+                mlx_gen::Conditioning::Reference { image, .. } => Some(image),
+                _ => None,
+            }),
+            strength: actual.strength,
+            ..SanaGenerateRequest::new(&actual.prompt)
+        }
+    }
+    /// Actual provider begin/configure, then the SAME shared native invocation
+    /// envelope used by BoundGenerator. Diagnostic budget is the ALREADY active
+    /// CPU fixture reading, explicitly not phone RAM/process admission evidence.
+    fn with_native_lifecycle<T>(
+        &self,
+        actual: &mlx_gen::GenerationRequest,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        use mlx_gen::gen_core::{
+            MemoryBehaviorRoute, MemoryBudget, MemoryGeometry, MemoryMode, MemoryRunOutcome,
+        };
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let provider = if self.sprint {
+            crate::SPRINT_MODEL_ID
+        } else {
+            crate::MODEL_ID
+        };
+        let contract =
+            crate::memory_strategy::weights_free_memory_strategy_contract(provider, &self.spec)?;
+        let tier = MemoryNumericTier {
+            precision: self.spec.precision,
+            quant: self.spec.quantize,
+            component_precision_floors: &[],
+        };
+        let selection = MemoryStrategy::ALL
+            .into_iter()
+            .find_map(|strategy| {
+                contract
+                    .selection_space(strategy, tier, false)
+                    .ok()?
+                    .into_iter()
+                    .find(|selection| contract.generation_memory(selection) == Some(self.execution))
+            })
+            .ok_or_else(|| Error::Unsupported("fixture has no actual provider selection".into()))?;
+        let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            selection.strategy,
+            tier,
+            MemoryBehaviorRoute {
+                mode: if self.img2img {
+                    MemoryMode::ImageToImage
+                } else {
+                    MemoryMode::TextToImage
+                },
+                reference_count: u32::from(self.img2img),
+                use_pid: false,
+                has_phases: true,
+                overlay: None,
+            },
+        )?;
+        context.selection = selection;
+        context.geometry = MemoryGeometry {
+            width: actual.width,
+            height: actual.height,
+            batch: actual.count,
+            frames: 1,
+            reference_count: actual.memory_reference_count(),
+        };
+        context.budget = MemoryBudget {
+            total_bytes: mlx_gen::ios_quantum::available_bytes().ok_or_else(|| {
+                Error::Unsupported("actual CPU diagnostic allowance missing".into())
+            })?,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let page = mlx_gen::ios_quantum::native_metal_page_bytes()
+            .ok_or_else(|| Error::Unsupported("actual native page metadata missing".into()))?;
+        let sampling = super::native_certificate::fixture_sampling(
+            actual,
+            self.sprint,
+            self.img2img,
+            1 << 20,
+        )?;
+        context.predicted_peak_bytes = super::native_graph::cumulative_upper(
+            &self.facts(),
+            &self.plan(),
+            &sampling,
+            page,
+            super::native_alloc::NativeBackend::Cpu,
+        )?;
+        let streams = mlx_gen::ios_quantum::NativeRetirementStreams::prepare()?;
+        streams.drain()?;
+        let mut scope =
+            crate::memory_strategy::begin_request(provider, &self.spec, &contract, &context)?
+                .ok_or_else(|| {
+                    Error::Unsupported("actual fixture provider has no lifecycle".into())
+                })?;
+        if let Err(primary) = scope.configure_admitted_request(actual) {
+            if let Err(cleanup) = streams.drain() {
+                eprintln!("fixture configure drain failed: {cleanup}");
+            }
+            if let Err(cleanup) = scope.finish(MemoryRunOutcome::Error {
+                message: primary.to_string(),
+            }) {
+                eprintln!("fixture provider cleanup failed: {cleanup}");
+            }
+            if let Err(cleanup) = streams.drain() {
+                eprintln!("fixture final configure drain failed: {cleanup}");
+            }
+            return Err(primary.into());
+        }
+        // Exact fixture-only identity streams the ORIGINAL request's derived
+        // Debug into SHA, never allocates a whole Debug String or clones media.
+        // It is not presented as the catalog's reusable admission binding.
+        struct Writer<'a>(&'a mut Sha256);
+        impl std::fmt::Write for Writer<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0.update(text.as_bytes());
+                Ok(())
+            }
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"sana-actual-capture-input-v1\0");
+        write!(Writer(&mut digest), "{actual:?}").expect("infallible digest writer");
+        let registration = mlx_gen::ios_quantum::ConfiguredNativeRetirement::register(
+            mlx_gen::ios_quantum::NativeRetirementBinding {
+                owner_token: actual as *const mlx_gen::GenerationRequest as usize,
+                work: digest.finalize().into(),
+                provider,
+            },
+        );
+        mlx_gen::ios_quantum::invoke_native_retirement(
+            &registration.lease(),
+            &streams,
+            actual,
+            body,
+            |outcome| {
+                let result = scope.finish(outcome);
+                registration.invalidate();
+                result.map_err(Error::from)
+            },
+            |error| matches!(error, Error::Canceled),
+        )
+    }
+
     /// The plan exactly as [`super::ios_pricing`] resolves it for this actual endpoint load.
     fn plan(&self) -> SanaPricingPlan {
         let memory = Some(self.execution);
@@ -472,21 +658,42 @@ impl Request {
     }
 
     fn pricing(&self) -> IosPricing {
-        price(&self.facts(), &self.plan()).unwrap()
+        let mut pricing = IosPricing::default();
+        for quantum in priced_quanta_in_regime(
+            &self.facts(),
+            &self.plan(),
+            !self.sprint,
+            SanaPricingRegime::RetiredLifecycle,
+        )
+        .unwrap()
+        {
+            pricing.take_window(quantum.window);
+        }
+        if !self.img2img {
+            pricing.phase_not_run(IosPhase::Encode, "text mode has no reference encode");
+        }
+        pricing
     }
 
     /// One fresh load + generate in the generator's `Sequential` phase order
     /// (`model::Sana::generate_impl`: `Residency::run_staged`, or `run_staged_img2img` for a
     /// reference), with the production loaders' guards and materialization at the fixture's
     /// geometry.
-    fn run(&self) -> Result<()> {
+    fn run(&self, actual: &mlx_gen::GenerationRequest) -> Result<[u8; 32]> {
+        self.with_native_lifecycle(actual, || self.run_body(actual))
+    }
+    fn ordinary_pixels(&self, actual: &mlx_gen::GenerationRequest) -> [u8; 32] {
+        assert_eq!(mlx_gen::ios_quantum::native_retirement_binding(), None);
+        with_cpu_diagnostic_headroom(AMPLE, || self.run_body(actual)).unwrap()
+    }
+    fn run_body(&self, actual: &mlx_gen::GenerationRequest) -> Result<[u8; 32]> {
         let root = &self.root;
         let (sprint, img2img) = (self.sprint, self.img2img);
         let memory = Some(self.execution);
         let plan = self.plan();
-        let cancel = mlx_gen::CancelFlag::default();
+        let cancel = actual.cancel.clone();
         if !plan.sequential {
-            return self.run_resident();
+            return self.run_resident_body(actual, |_| {});
         }
 
         // Optimized: the actual encoder is dropped before either heavy component loads.
@@ -496,20 +703,7 @@ impl Request {
         };
         mlx_gen::residency::drain_allocator_cache();
 
-        let image = mlx_gen::Image {
-            width: EDGE,
-            height: EDGE,
-            pixels: (0..EDGE * EDGE * 3).map(|i| (i % 251) as u8).collect(),
-        };
-        let req = SanaGenerateRequest {
-            width: EDGE,
-            height: EDGE,
-            steps: Some(2),
-            seed: Some(3),
-            init_image: img2img.then_some(&image),
-            strength: img2img.then_some(0.9),
-            ..SanaGenerateRequest::new("a fox")
-        };
+        let req = self.pipeline_request(actual);
 
         // Phase A': the reference encode with only the DC-AE encoder resident
         // (`load_reference_encoder`), then the encoder dropped.
@@ -533,6 +727,7 @@ impl Request {
                 plan.encode_tile,
             )?;
             assert!(r.is_some(), "the img2img case must encode");
+            crate::pipeline::retire_staged_reference_encoder()?;
             r
         } else {
             None
@@ -576,20 +771,25 @@ impl Request {
 
         // Phase C: the decode with only the decoder resident.
         let tiling = crate::pipeline::resolve_decode_tiling(memory, true);
-        SanaHeavy::light_view(&light).decode_one(&latent, &cancel, tiling.as_ref())?;
-        Ok(())
+        let image = SanaHeavy::light_view(&light).decode_one(&latent, &cancel, tiling.as_ref())?;
+        Ok(pixel_digest(&image))
     }
 
     /// The production warm-pair state machine owns the literal resident endpoint. In particular,
     /// its heavy callback receives true even for TEXT and retains one DC-AE encoder alongside the
     /// decoder from the same source. Nothing here invents extra component copies or retention.
-    fn run_resident(&self) -> Result<()> {
-        self.run_resident_observing(|_| {})
-    }
-
     // Test-only scalar observation of the SAME borrowed conditioning owners. It neither clones
     // arrays nor evaluates extra graphs and does not change the resident warm-pair lifecycle.
-    fn run_resident_observing(&self, mut observe: impl FnMut(&SanaConditioning)) -> Result<()> {
+    fn run_resident_observing(&self, observe: impl FnMut(&SanaConditioning)) -> Result<()> {
+        let actual = self.actual_generation();
+        self.with_native_lifecycle(&actual, || self.run_resident_body(&actual, observe))
+            .map(|_| ())
+    }
+    fn run_resident_body(
+        &self,
+        actual: &mlx_gen::GenerationRequest,
+        mut observe: impl FnMut(&SanaConditioning),
+    ) -> Result<[u8; 32]> {
         let text_root = self.root.clone();
         let heavy_root = self.root.clone();
         let sprint = self.sprint;
@@ -627,9 +827,9 @@ impl Request {
         assert!(!residency.is_sequential());
         let memory = Some(self.execution);
         let plan = self.plan();
-        let cancel = mlx_gen::CancelFlag::default();
-        residency
-            .with_resident_parts(|encoder, heavy| -> Result<()> {
+        let cancel = actual.cancel.clone();
+        let output = residency
+            .with_resident_parts(|encoder, heavy| -> Result<[u8; 32]> {
                 assert_eq!(
                     heavy.endpoint_inventory(),
                     (2, true, false),
@@ -647,20 +847,7 @@ impl Request {
                 );
                 let conditioning = fixture_conditioning(encoder, sprint)?;
                 observe(&conditioning);
-                let image = mlx_gen::Image {
-                    width: EDGE,
-                    height: EDGE,
-                    pixels: (0..EDGE * EDGE * 3).map(|i| (i % 251) as u8).collect(),
-                };
-                let req = SanaGenerateRequest {
-                    width: EDGE,
-                    height: EDGE,
-                    steps: Some(2),
-                    seed: Some(3),
-                    init_image: self.img2img.then_some(&image),
-                    strength: self.img2img.then_some(0.9),
-                    ..SanaGenerateRequest::new("a fox")
-                };
+                let req = self.pipeline_request(actual);
                 let reference =
                     heavy.prepare_reference_with_tiling(&req, &cancel, plan.encode_tile)?;
                 assert_eq!(reference.is_some(), self.img2img);
@@ -688,7 +875,7 @@ impl Request {
                     "no resident shedding before decode"
                 );
                 let tiling = crate::pipeline::resolve_decode_tiling(memory, false);
-                heavy
+                let image = heavy
                     .decode_view()
                     .decode_one(&latent, &cancel, tiling.as_ref())?;
                 // Both actual owners are still borrowed from the SAME warm pair through decode.
@@ -703,7 +890,7 @@ impl Request {
                     "same materialized trunk parameters survive conditioning, denoise and decode"
                 );
                 let _ = encoder;
-                Ok(())
+                Ok(pixel_digest(&image))
             })?
             .expect("Resident must own the eager warm pair")?;
         assert_eq!(
@@ -714,11 +901,16 @@ impl Request {
         assert!(residency
             .with_resident_parts(|_, heavy| heavy.endpoint_inventory())?
             .is_some());
-        Ok(())
+        Ok(output)
     }
 
     /// [`RUNS`] measured runs (each a fresh load + generate).
     fn measure(&self) -> Measured {
+        // Same saved weights, seed, controls and ORIGINAL carrier, ordinary
+        // graph first. Joined scheduling must preserve the actual RGB bytes.
+        // This comparison lives only in already selected heavy CPU captures.
+        let actual = self.actual_generation();
+        let expected_pixels = self.ordinary_pixels(&actual);
         let mut worst = MeasuredRun {
             demand: 0,
             phases: BTreeMap::new(),
@@ -726,8 +918,12 @@ impl Request {
         let mut least: BTreeMap<IosPhase, u64> = BTreeMap::new();
         let mut observations = Vec::new();
         for _ in 0..RUNS {
-            let (result, observation) = capture_observations::measure(|| self.run());
-            let ((), run) = result.unwrap();
+            let (result, observation) = capture_observations::measure(|| self.run(&actual));
+            let (pixels, run) = result.unwrap();
+            assert_eq!(
+                pixels, expected_pixels,
+                "joined SANA changed actual pixels/seed/controls"
+            );
             observations.push(observation);
             worst.demand = worst.demand.max(run.demand);
             for (phase, bytes) in run.phases {
@@ -752,6 +948,15 @@ impl Request {
 
 /// One configuration's measurement: the worst of [`RUNS`] fresh runs per phase, and how far the
 /// runs disagreed per phase (the capture's own spread).
+fn pixel_digest(image: &mlx_gen::Image) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(image.width.to_le_bytes());
+    digest.update(image.height.to_le_bytes());
+    digest.update(&image.pixels);
+    digest.finalize().into()
+}
+
 struct Measured {
     worst: MeasuredRun,
     spread: BTreeMap<IosPhase, u64>,
@@ -860,6 +1065,43 @@ fn verdict(
     )
 }
 
+/// Remove one REAL recorded source epoch, keeping scalar chronology contiguous.
+/// The independent exact source multiplicity check must still reject the trace.
+fn remove_actual_block_epoch(observation: &mut IosAnchorObservation) {
+    let index = observation
+        .checks
+        .iter()
+        .position(|check| check.label == labels::BLOCK)
+        .expect("actual trunk block must execute");
+    let check = observation.checks.remove(index);
+    let epoch = check
+        .context
+        .into_iter()
+        .find_map(|index| {
+            let mark = &observation.metadata[index as usize];
+            (mark.provider == "mlx" && mark.kind == "native-quantum").then(|| mark.fields["epoch"])
+        })
+        .expect("actual block epoch context");
+    for mark in &mut observation.metadata {
+        if mark.provider == "mlx"
+            && matches!(mark.kind.as_str(), "native-quantum" | "native-joined")
+        {
+            let actual = mark.fields.get_mut("epoch").expect("actual epoch scalar");
+            if *actual == epoch {
+                mark.kind = "actual-test-removed-epoch".into();
+            } else if *actual > epoch {
+                *actual -= 1;
+            }
+        }
+        if mark.kind == "native-lifecycle-completed" {
+            *mark
+                .fields
+                .get_mut("epochs")
+                .expect("actual endpoint epoch total") -= 1;
+        }
+    }
+}
+
 /// Every derived SANA case at both selections and every tier, from the `sana_1600m` text anchor.
 /// `tamper` edits each derived request's pricing (the mutation check). Returns the failures.
 fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<String> {
@@ -890,6 +1132,14 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
             at_anchor.observations = measured_anchor.observations.clone();
             let anchor_facts = anchor.facts();
             let anchor_plan = anchor.plan();
+            let anchor_generation = anchor.actual_generation();
+            let anchor_sampling = super::native_certificate::fixture_sampling(
+                &anchor_generation,
+                false,
+                false,
+                1 << 20,
+            )
+            .unwrap();
             let cases = [
                 (
                     "sana_1600m reference",
@@ -926,11 +1176,7 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                 priced.observations = measured.observations.clone();
                 let facts = request.facts();
                 let plan = request.plan();
-                let generation = mlx_gen::GenerationRequest {
-                    steps: Some(2),
-                    strength: request.img2img.then_some(0.9),
-                    ..Default::default()
-                };
+                let generation = request.actual_generation();
                 let sampling = super::native_certificate::fixture_sampling(
                     &generation,
                     request.sprint,
@@ -939,16 +1185,24 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                 )
                 .unwrap();
                 let certify = |observed_anchor: &IosPricing, supplied: &IosPricing| {
+                    use super::native_certificate::CertificateProfile;
                     super::native_certificate::certify_profiles(
-                        &anchor_facts,
-                        &anchor_plan,
-                        &expected_anchor,
-                        observed_anchor,
-                        &facts,
-                        &plan,
-                        &sampling,
-                        &expected,
-                        supplied,
+                        CertificateProfile {
+                            facts: &anchor_facts,
+                            plan: &anchor_plan,
+                            expected: &expected_anchor,
+                            observed: observed_anchor,
+                            sampling: Some(&anchor_sampling),
+                        },
+                        CertificateProfile {
+                            facts: &facts,
+                            plan: &plan,
+                            expected: &expected,
+                            observed: supplied,
+                            sampling: Some(&sampling),
+                        },
+                        SanaPricingRegime::RetiredLifecycle,
+                        1 << 20,
                     )
                 };
                 // BOTH positive and mutation captures require the intact source
@@ -982,6 +1236,12 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                     ("sana", "native-pixels", "nchw_view_of_decoder"),
                     ("sana", "native-pixels", "held_unscaled_elements"),
                     ("mlx", "allocation-scope", "page_bytes"),
+                    (crate::MODEL_ID, "native-lifecycle", "configured"),
+                    (crate::MODEL_ID, "native-lifecycle-completed", "status"),
+                    ("mlx", "native-joined", "all_source_streams"),
+                    ("mlx", "native-joined", "range_captured_prefix"),
+                    ("sana", "native-dcae-glu", "original_elements"),
+                    ("sana", "native-selected", "caption_elements"),
                 ] {
                     let mut changed = at_anchor.clone();
                     let mut edits = 0;
@@ -1007,6 +1267,31 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                         "changed {provider}/{kind}/{field} certified"
                     );
                 }
+                let mut truncated = at_anchor.clone();
+                for observation in &mut truncated.observations {
+                    observation.telemetry_complete = false;
+                }
+                assert_eq!(
+                    super::observed_pricing_regime(&truncated),
+                    SanaPricingRegime::Ordinary
+                );
+                assert!(
+                    certify(&truncated, &priced).is_err(),
+                    "truncated receipts granted additional tight credit"
+                );
+                let mut missing_epoch = at_anchor.clone();
+                for observation in &mut missing_epoch.observations {
+                    remove_actual_block_epoch(observation);
+                }
+                assert_eq!(
+                    super::observed_pricing_regime(&missing_epoch),
+                    SanaPricingRegime::RetiredLifecycle,
+                    "mutation must preserve a structurally complete chronology"
+                );
+                assert!(
+                    certify(&missing_epoch, &priced).is_err(),
+                    "missing whole source block epoch certified"
+                );
                 tamper(&request, &mut priced);
                 let bounds = match certify(&at_anchor, &priced) {
                     Ok(bounds) => bounds,

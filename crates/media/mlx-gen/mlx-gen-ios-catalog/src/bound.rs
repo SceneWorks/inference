@@ -11,8 +11,63 @@ fn generation_binding(req: &GenerationRequest) -> [u8; 32] {
     crate::binding::generation_binding(req)
 }
 
+/// One actual configured invocation. Preserve the original typed body error;
+/// drain on success/error/cancel and after provider cleanup. A successful
+/// endpoint is published only after ALL body/fence/provider outcomes succeeded.
+fn invoke_native_retirement<T>(
+    lease: &mlx_gen::ios_quantum::NativeRetirementLease,
+    streams: &std::rc::Rc<mlx_gen::ios_quantum::NativeRetirementStreams>,
+    actual: &GenerationRequest,
+    body: impl FnOnce() -> Result<T>,
+    finish: impl FnOnce(MemoryRunOutcome) -> Result<()>,
+) -> Result<T> {
+    mlx_gen::ios_quantum::invoke_native_retirement(lease, streams, actual, body, finish, |error| {
+        matches!(error, Error::Canceled)
+    })
+}
+
+/// Read-only description of the SAME realised selection that created this
+/// generator. No load/permit methods, public constructor, mutation or authority.
+pub struct GeneratorAdmissionInfo {
+    pub(crate) index: usize,
+    pub(crate) key: crate::evidence::EvidenceKey,
+    pub(crate) demand_bytes: u64,
+    pub(crate) margin_bytes: u64,
+    pub(crate) required_bytes: u64,
+    pub(crate) basis: crate::ios_admission::AdmissionBasis,
+}
+impl GeneratorAdmissionInfo {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+    pub fn evidence_key(&self) -> &crate::evidence::EvidenceKey {
+        &self.key
+    }
+    pub fn demand_bytes(&self) -> u64 {
+        self.demand_bytes
+    }
+    pub fn margin_bytes(&self) -> u64 {
+        self.margin_bytes
+    }
+    pub fn required_bytes(&self) -> u64 {
+        self.required_bytes
+    }
+    pub fn basis(&self) -> crate::ios_admission::AdmissionBasis {
+        self.basis
+    }
+}
+
+pub(crate) struct GeneratorExecution {
+    pub info: GeneratorAdmissionInfo,
+    pub envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
+    pub native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution,
+    pub streams: Option<std::rc::Rc<mlx_gen::ios_quantum::NativeRetirementStreams>>,
+}
 pub struct BoundGenerator {
     inner: Box<dyn Generator>,
+    admission_info: GeneratorAdmissionInfo,
+    native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution,
+    retirement_streams: Option<std::rc::Rc<mlx_gen::ios_quantum::NativeRetirementStreams>>,
     spec: LoadSpec,
     context: MemoryRunContext,
     request: [u8; 32],
@@ -32,11 +87,14 @@ impl BoundGenerator {
         request: [u8; 32],
         footprint: u64,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
-        envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
+        execution: GeneratorExecution,
     ) -> Self {
         Self {
-            _envelope: envelope,
+            _envelope: execution.envelope,
             inner,
+            admission_info: execution.info,
+            native_retirement: execution.native_retirement,
+            retirement_streams: execution.streams,
             spec,
             context,
             request,
@@ -46,6 +104,87 @@ impl BoundGenerator {
     }
     pub fn admitted_context(&self) -> &MemoryRunContext {
         &self.context
+    }
+    pub fn admitted_selection(&self) -> &GeneratorAdmissionInfo {
+        &self.admission_info
+    }
+    /// ACTUAL selected receipt requirement (ordinary-first may choose either).
+    /// Metadata identity only; not device success or physical/process permission.
+    pub fn native_retirement_execution(
+        &self,
+    ) -> mlx_gen::ios_pricing::IosNativeRetirementExecution {
+        self.native_retirement
+    }
+    fn requires_retired_lifecycle(&self) -> bool {
+        self.native_retirement
+            == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+    }
+    fn retirement_binding(&self) -> mlx_gen::ios_quantum::NativeRetirementBinding {
+        mlx_gen::ios_quantum::NativeRetirementBinding {
+            owner_token: self as *const Self as usize,
+            work: self.request,
+            provider: self.inner.descriptor().id,
+        }
+    }
+    fn run_generation<T>(
+        &self,
+        req: &GenerationRequest,
+        call: impl FnOnce(&dyn Generator, &GenerationRequest) -> Result<T>,
+    ) -> Result<T> {
+        if !self.requires_retired_lifecycle() {
+            let _ordinary = mlx_gen::ios_quantum::OrdinaryNativeRetirementScope::enter();
+            return self.run(req, |inner| call(inner, req));
+        }
+        let outcome=self.run(req, |inner| {
+            let binding = self.retirement_binding();
+            let streams=self.retirement_streams.as_ref().ok_or_else(||Error::Unsupported("required native lifecycle has no pre-load stream cache".into()))?;
+            streams.validate_current()?;
+            mlx_gen::ios_quantum::validate_native_retirement_scope()?;
+            if mlx_gen::ios_quantum::native_retirement_binding().is_some() {
+                return Err(Error::Unsupported("generation cannot reenter an active admitted retirement invocation".into()));
+            }
+            // A matching external scope has ALREADY run the exact provider
+            // configure hook. Holding it alone does not activate retirement.
+            if let Some(lease) = configured_bound_retirement(binding) {
+                return invoke_native_retirement(&lease, streams, req, || call(inner, req), |_| Ok(()));
+            }
+            // Caller omitted optional begin: establish the real provider scope
+            // internally. Borrow the ORIGINAL carrier; never deep-clone pixels
+            // or manufacture a metadata-only GenerationRequest.
+            let mut scope = self.begin_memory_strategy_request(&self.context)?
+                .ok_or_else(|| Error::Unsupported("admitted retirement requires a provider lifecycle scope".into()))?;
+            if let Err(primary) = scope.configure_admitted_request(req) {
+                if let Err(cleanup)=streams.drain(){eprintln!("configuration native drain failed: {cleanup}");}
+                if let Err(cleanup) = scope.finish(MemoryRunOutcome::Error { message: primary.to_string() }) {
+                    eprintln!("admitted lifecycle configuration cleanup failed: {cleanup}");
+                }
+                if let Err(cleanup)=streams.drain(){eprintln!("configuration final native drain failed: {cleanup}");}
+                return Err(primary);
+            }
+            let lease=match configured_bound_retirement(binding) {
+                Some(lease)=>lease,
+                None=>{
+                    let primary=Error::Unsupported("successful provider configuration did not bind source retirement lifecycle".into());
+                    if let Err(cleanup)=streams.drain(){eprintln!("unbound configuration drain failed: {cleanup}");}
+                    if let Err(cleanup)=scope.finish(MemoryRunOutcome::Error{message:primary.to_string()}){eprintln!("unbound provider cleanup failed: {cleanup}");}
+                    if let Err(cleanup)=streams.drain(){eprintln!("unbound configuration final drain failed: {cleanup}");}
+                    return Err(primary);
+                }
+            };
+            invoke_native_retirement(&lease, streams, req, || call(inner, req), |outcome| scope.finish(outcome))
+        });
+        // Includes cancellation/capacity/source-pin refusal BEFORE the body: an
+        // already-loaded generator may still have load-check captures to drain.
+        if outcome.is_err() {
+            let cleanup = self
+                .retirement_streams
+                .as_ref()
+                .map_or(Ok(()), |streams| streams.drain());
+            if let Err(cleanup) = cleanup {
+                eprintln!("admitted generation final error-path drain failed: {cleanup}");
+            }
+        }
+        outcome
     }
     fn check_request(&self, req: &GenerationRequest) -> Result<()> {
         if req.cancel.is_cancelled() {
@@ -131,7 +270,11 @@ impl Generator for BoundGenerator {
             .read_prepared_files_unchanged(|| self.inner.begin_memory_strategy_request(context))
             .map(|scope| {
                 scope.map(|inner| {
-                    Box::new(BoundScope { inner, owner: self }) as Box<dyn MemoryRequestScope>
+                    Box::new(BoundScope {
+                        inner,
+                        owner: self,
+                        retirement_scope: None,
+                    }) as Box<dyn MemoryRequestScope>
                 })
             })
     }
@@ -143,7 +286,7 @@ impl Generator for BoundGenerator {
         req: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.run(req, |inner| inner.generate(req, progress))
+        self.run_generation(req, |inner, exact| inner.generate(exact, progress))
     }
     fn generate_streaming(
         &self,
@@ -151,14 +294,18 @@ impl Generator for BoundGenerator {
         chunk: &mut dyn FnMut(AudioChunk),
         progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.run(req, |inner| inner.generate_streaming(req, chunk, progress))
+        self.run_generation(req, |inner, exact| {
+            inner.generate_streaming(exact, chunk, progress)
+        })
     }
     fn generate_with_report(
         &self,
         req: &GenerationRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
-        self.run(req, |inner| inner.generate_with_report(req, progress))
+        self.run_generation(req, |inner, exact| {
+            inner.generate_with_report(exact, progress)
+        })
     }
     fn open_conversation(
         &self,
@@ -171,13 +318,70 @@ impl Generator for BoundGenerator {
     }
 }
 
+// Only successful configuration by this PRIVATE wrapper enters the reuse
+// registry. A public shared selector/registration cannot bypass provider setup.
+struct BoundConfiguredRetirement {
+    binding: mlx_gen::ios_quantum::NativeRetirementBinding,
+    registration: mlx_gen::ios_quantum::ConfiguredNativeRetirement,
+}
+thread_local! {
+    static BOUND_RETIREMENT: std::cell::RefCell<Vec<std::rc::Weak<BoundConfiguredRetirement>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn configured_bound_retirement(
+    binding: mlx_gen::ios_quantum::NativeRetirementBinding,
+) -> Option<mlx_gen::ios_quantum::NativeRetirementLease> {
+    BOUND_RETIREMENT.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.retain(|entry| entry.strong_count() != 0);
+        entries
+            .iter()
+            .rev()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|entry| entry.binding == binding)
+            .map(|entry| entry.registration.lease())
+    })
+}
+impl BoundConfiguredRetirement {
+    fn register(binding: mlx_gen::ios_quantum::NativeRetirementBinding) -> std::rc::Rc<Self> {
+        let record = std::rc::Rc::new(Self {
+            binding,
+            registration: mlx_gen::ios_quantum::ConfiguredNativeRetirement::register(binding),
+        });
+        BOUND_RETIREMENT.with(|slot| {
+            let mut entries = slot.borrow_mut();
+            entries.retain(|entry| entry.strong_count() != 0);
+            entries.push(std::rc::Rc::downgrade(&record));
+        });
+        record
+    }
+}
 struct BoundScope<'a> {
     inner: Box<dyn MemoryRequestScope + 'a>,
     owner: &'a BoundGenerator,
+    retirement_scope: Option<std::rc::Rc<BoundConfiguredRetirement>>,
+}
+impl BoundScope<'_> {
+    fn register_configured_retirement(&mut self, req: &GenerationRequest) -> Result<()> {
+        self.owner.check_request(req)?;
+        if self.owner.requires_retired_lifecycle() {
+            if req.memory.is_none() {
+                return Err(Error::Unsupported("retired lifecycle requires the exact admitted Some(execution), not legacy None".into()));
+            }
+            if self.retirement_scope.is_none() {
+                self.retirement_scope = Some(BoundConfiguredRetirement::register(
+                    self.owner.retirement_binding(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 impl MemoryRequestScope for BoundScope<'_> {
     fn configure_request(&mut self, req: &mut GenerationRequest) -> Result<()> {
         self.owner.check_request(req)?;
+        if self.owner.requires_retired_lifecycle() && self.retirement_scope.is_some() {
+            return Ok(());
+        }
         let admitted_memory = req.memory;
         let ladder_memory = self
             .owner
@@ -197,7 +401,19 @@ impl MemoryRequestScope for BoundScope<'_> {
             ));
         }
         req.memory = admitted_memory;
-        self.owner.check_request(req)
+        self.register_configured_retirement(req)
+    }
+    fn configure_admitted_request(&mut self, req: &GenerationRequest) -> Result<()> {
+        self.owner.check_request(req)?;
+        if self.owner.requires_retired_lifecycle() && self.retirement_scope.is_some() {
+            return Ok(());
+        }
+        self.owner
+            .spec
+            .read_prepared_files_unchanged(|| self.inner.configure_admitted_request(req))?;
+        // Unlike mutable ladder configuration, the read-only delegate must
+        // accept the ORIGINAL full canonical request without rewriting it.
+        self.register_configured_retirement(req)
     }
     fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()> {
         self.owner
@@ -258,8 +474,19 @@ impl MemoryRequestScope for BoundScope<'_> {
     fn finish(&mut self, outcome: MemoryRunOutcome) -> Result<()> {
         // Cleanup must run even when a source was replaced or the request cancelled.
         let result = self.inner.finish(outcome);
-        self.owner.spec.validate_prepared_file_pins()?;
-        result
+        if let Some(record) = &self.retirement_scope {
+            record.registration.invalidate();
+        }
+        self.retirement_scope.take();
+        let pins = self.owner.spec.validate_prepared_file_pins();
+        match (result, pins) {
+            (Err(primary), Err(secondary)) => {
+                eprintln!("provider cleanup source-pin recheck also failed: {secondary}");
+                Err(primary)
+            }
+            (Err(primary), _) => Err(primary),
+            (Ok(()), pins) => pins,
+        }
     }
 }
 
@@ -384,6 +611,10 @@ impl IrisDepthEstimator for BoundDepth {
             .read_prepared_files_unchanged(|| self.inner.estimate(req, on_progress))
     }
 }
+
+#[cfg(test)]
+#[path = "bound_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

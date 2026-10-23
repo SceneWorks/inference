@@ -209,6 +209,15 @@ impl EvidenceKey {
                 self.provider
             ));
         }
+        // Joined DC-AE/native-retirement is a distinct memory execution
+        // program, NOT a pin/currency event. Ordinary families remain intact.
+        if matches!(self.provider.as_str(), "sana_1600m" | "sana_sprint_1600m")
+            && self
+                .execution
+                .ends_with(mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX)
+        {
+            variant.push_str("/sana-native-retirement-v1");
+        }
         if let Some(configured) = &self.configured_variant_sha256 {
             variant.push_str("/configured=");
             variant.push_str(configured);
@@ -339,7 +348,16 @@ pub struct PhasePeak {
 }
 
 /// Engineering bounds on observation storage, NOT a memory estimate, step cap or fit gate.
-pub const MAX_SAMPLING_MARKS: usize = 1024;
+pub const BASE_SAMPLING_MARKS: usize = 1024;
+/// Per actually retained Checked: native epoch + joined receipt + at most one
+/// GLU/selected-owner shape mark. Root start/end and owned-encoder release add3.
+/// This composes the EXISTING observation/check bounds, not a private step cap.
+pub const NATIVE_RETIREMENT_MARKS_PER_CHECK: usize = 3;
+pub const NATIVE_RETIREMENT_ROOT_MARKS: usize = 3;
+pub const MAX_NATIVE_RETIREMENT_CHECK_MARKS: usize =
+    NATIVE_RETIREMENT_MARKS_PER_CHECK * MAX_QUANTUM_CHECKS;
+pub const MAX_SAMPLING_MARKS: usize =
+    BASE_SAMPLING_MARKS + MAX_NATIVE_RETIREMENT_CHECK_MARKS + NATIVE_RETIREMENT_ROOT_MARKS;
 pub const MAX_SAMPLING_FIELDS: usize = 64;
 pub const MAX_SAMPLING_NAME_BYTES: usize = 128;
 
@@ -366,7 +384,115 @@ pub struct SamplingCoverage {
     pub truncated: bool,
 }
 
+/// Execution identity, not native/physical proof or a currency gate. Completed
+/// SANA captures cannot label the joined program as ordinary (or vice versa).
+/// Old ordinary keys with no new native marks remain valid unchanged.
+pub(crate) fn validate_sana_capture_program(
+    provider: &str,
+    execution: &str,
+    coverage: &SamplingCoverage,
+    quantum: Option<&QuantumCoverage>,
+) -> Result<(), String> {
+    if !matches!(provider, "sana_1600m" | "sana_sprint_1600m") {
+        return Ok(());
+    }
+    let tagged = execution.ends_with(mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX);
+    let mut start = None;
+    let mut end = None;
+    for mark in &coverage.marks {
+        if mark.provider != provider {
+            continue;
+        }
+        if mark.kind == "native-lifecycle" && start.replace(mark).is_some() {
+            return Err("SANA capture has multiple native invocation identities".into());
+        }
+        if mark.kind == "native-lifecycle-completed" && end.replace(mark).is_some() {
+            return Err("SANA capture has multiple native completions".into());
+        }
+    }
+    if !tagged && start.is_none() && end.is_none() {
+        if coverage
+            .marks
+            .iter()
+            .any(|mark| observation_storage_class(&mark.provider, &mark.kind) != 0)
+        {
+            return Err(
+                "ordinary SANA completed evidence contains unbound retirement claims".into(),
+            );
+        }
+        return Ok(());
+    }
+    let valid = match (start, end) {
+        (Some(start), Some(end)) => {
+            tagged
+                && start.fields.get("schema") == Some(&1)
+                && start.fields.get("started") == Some(&1)
+                && start.fields.get("configured") == Some(&1)
+                && start.fields.get("invocation").is_some_and(|id| *id > 0)
+                && start.fields.get("invocation") == end.fields.get("invocation")
+                && end.fields.get("schema") == Some(&1)
+                && end.fields.get("status") == Some(&1)
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(
+            "SANA capture execution key disagrees with its actual configured native invocation"
+                .into(),
+        );
+    }
+    let quantum = quantum.ok_or("successful native SANA claim lacks actual checked receipts")?;
+    // Reuse the SAME source-owned receipt validator through borrowed views;
+    // no metadata/media clone, duplicate protocol, invented epoch or unsafe cast.
+    use mlx_gen_sana::ios_pricing::{RetirementCheckView, RetirementMetadataView};
+    mlx_gen_sana::ios_pricing::validate_retirement_receipts(
+        coverage.marks.len(),
+        |index| {
+            coverage
+                .marks
+                .get(index)
+                .map(|mark| RetirementMetadataView {
+                    provider: &mark.provider,
+                    kind: &mark.kind,
+                    fields: &mark.fields,
+                })
+        },
+        quantum.checks.iter().map(|check| RetirementCheckView {
+            phase: check.phase.as_deref().and_then(IosPhase::from_key),
+            label: &check.label,
+            context: &check.context,
+            count: check.count,
+        }),
+        !coverage.truncated
+            && coverage.dropped_marks == 0
+            && coverage.malformed_marks == 0
+            && !quantum.truncated
+            && quantum.dropped_checks == 0,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn observation_storage_class(provider: &str, kind: &str) -> usize {
+    match (provider, kind) {
+        ("mlx", "native-quantum") => 1,
+        ("mlx", "native-joined") => 2,
+        ("sana", "native-dcae-glu" | "native-selected") => 3,
+        ("sana_1600m" | "sana_sprint_1600m", "native-lifecycle" | "native-lifecycle-completed")
+        | ("sana", "native-owned-phase-retired") => 4,
+        _ => 0,
+    }
+}
 impl SamplingCoverage {
+    fn category_usage(&self) -> Option<[u64; 5]> {
+        let mut used = [0u64; 5];
+        for (provider, kinds) in &self.counts {
+            for (kind, count) in kinds {
+                let class = observation_storage_class(provider, kind);
+                used[class] = used[class].checked_add(*count)?;
+            }
+        }
+        Some(used)
+    }
     /// Return the retained mark ordinal for temporal quantum attribution. An oversized/malformed
     /// event cannot leave a stale mark active; callers clear their preceding ordinal on None.
     pub fn record(&mut self, provider: &str, kind: &str, fields: &[(&str, u64)]) -> Option<u32> {
@@ -384,7 +510,18 @@ impl SamplingCoverage {
                 .iter()
                 .enumerate()
                 .any(|(i, (name, _))| fields[..i].iter().any(|(prior, _)| prior == name));
-        if malformed || self.marks.len() >= MAX_SAMPLING_MARKS {
+        let class = observation_storage_class(provider, kind);
+        let limits = [
+            BASE_SAMPLING_MARKS as u64,
+            MAX_QUANTUM_CHECKS as u64,
+            MAX_QUANTUM_CHECKS as u64,
+            MAX_QUANTUM_CHECKS as u64,
+            NATIVE_RETIREMENT_ROOT_MARKS as u64,
+        ];
+        let category_full = self
+            .category_usage()
+            .is_none_or(|used| used[class] >= limits[class]);
+        if malformed || category_full || self.marks.len() >= MAX_SAMPLING_MARKS {
             self.dropped_marks += 1;
             if malformed {
                 self.malformed_marks += 1;
@@ -428,6 +565,17 @@ impl SamplingCoverage {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        let used = self
+            .category_usage()
+            .ok_or("sampling category counter overflow")?;
+        if used[0] > BASE_SAMPLING_MARKS as u64
+            || used[1..4]
+                .iter()
+                .any(|used| *used > MAX_QUANTUM_CHECKS as u64)
+            || used[4] > NATIVE_RETIREMENT_ROOT_MARKS as u64
+        {
+            return Err("ordinary/native observation storage categories exceed their independent source budgets".into());
+        }
         if self.marks.len() > MAX_SAMPLING_MARKS
             || self.malformed_marks > self.dropped_marks
             || self.total_marks
@@ -1009,6 +1157,13 @@ pub(crate) fn validate_rows(rows: &[AnchorRow]) -> Result<(), String> {
                         })?;
                     if let Some(coverage) = &c.sampling_coverage {
                         coverage.validate().map_err(|e| format!("row {k:?}: {e}"))?;
+                        validate_sana_capture_program(
+                            &k.provider,
+                            &k.execution,
+                            coverage,
+                            c.quantum_coverage.as_ref(),
+                        )
+                        .map_err(|error| format!("row {k:?}: {error}"))?;
                     }
                     if crate::sampling::requires_recipe(&k.provider) {
                         let mut roles = c
@@ -1325,7 +1480,7 @@ mod tests {
         assert!(coverage.truncated);
         coverage.validate().unwrap();
         let mut bounded = SamplingCoverage::default();
-        for i in 0..MAX_SAMPLING_MARKS {
+        for i in 0..BASE_SAMPLING_MARKS {
             assert!(bounded
                 .record("curated", "solver_update", &[("step", i as u64)])
                 .is_some());
@@ -1334,10 +1489,10 @@ mod tests {
             .record(
                 "curated",
                 "solve_complete",
-                &[("evaluations", MAX_SAMPLING_MARKS as u64)]
+                &[("evaluations", BASE_SAMPLING_MARKS as u64)]
             )
             .is_none());
-        assert_eq!(bounded.marks.len(), MAX_SAMPLING_MARKS);
+        assert_eq!(bounded.marks.len(), BASE_SAMPLING_MARKS);
         assert_eq!(bounded.dropped_marks, 1);
         assert!(bounded.truncated);
         bounded.validate().unwrap();
@@ -1664,5 +1819,185 @@ mod tests {
             ..s.clone()
         };
         assert!(bad.parameters().is_none());
+    }
+    /// Wire identity/receipt protocol only: synthetic metadata never obtains a
+    /// source/native/physical certificate or a successful model admission.
+    #[test]
+    fn completed_sana_programme_key_requires_actual_complete_receipts() {
+        let provider = "sana_1600m";
+        let execution = format!(
+            "ordinary{}",
+            mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX
+        );
+        let mut metadata = SamplingCoverage::default();
+        let cache = [
+            ("selected_stream", 1),
+            ("stream_mask", 2),
+            ("stream_count", 1),
+            ("stream_0", 0),
+            ("stream_1", 1),
+            ("stream_2", 0),
+            ("compute_cpu", 1),
+        ];
+        let start = metadata
+            .record(
+                provider,
+                "native-lifecycle",
+                &[
+                    ("schema", 1),
+                    ("invocation", 9),
+                    ("started", 1),
+                    ("configured", 1),
+                    ("epoch", 0),
+                    ("exclusive_request_ownership", 0),
+                    ("host_reserve_declared", 0),
+                    cache[0],
+                    cache[1],
+                    cache[2],
+                    cache[3],
+                    cache[4],
+                    cache[5],
+                    cache[6],
+                ],
+            )
+            .unwrap();
+        let label = mlx_gen_sana::ios_pricing::GEMMA_LABELS[0];
+        let label_id = mlx_gen::ios_quantum::retirement_label_id(label);
+        let pre = metadata
+            .record(
+                "mlx",
+                "native-quantum",
+                &[
+                    ("schema", 1),
+                    ("invocation", 9),
+                    ("epoch", 1),
+                    ("label", label_id),
+                ],
+            )
+            .unwrap();
+        let mut quantum = QuantumCoverage::default();
+        quantum.record(Some(IosPhase::Conditioning), label, vec![start, pre]);
+        let joined = metadata
+            .record(
+                "mlx",
+                "native-joined",
+                &[
+                    ("schema", 1),
+                    ("invocation", 9),
+                    ("epoch", 1),
+                    ("label", label_id),
+                    ("all_source_streams", 1),
+                    ("status", 1),
+                    cache[0],
+                    cache[1],
+                    cache[2],
+                    cache[3],
+                    cache[4],
+                    cache[5],
+                    cache[6],
+                    ("range_captured_prefix", 1),
+                    ("exclusive_request_ownership", 0),
+                    ("alias_release_credit", 0),
+                    ("cache_release_credit", 0),
+                    ("process_release_credit", 0),
+                    ("caller_receipts_live_upper", 1),
+                    ("host_reserve_declared", 0),
+                ],
+            )
+            .unwrap();
+        metadata
+            .record(
+                provider,
+                "native-lifecycle-completed",
+                &[
+                    ("schema", 1),
+                    ("invocation", 9),
+                    ("status", 1),
+                    ("epochs", 1),
+                ],
+            )
+            .unwrap();
+        validate_sana_capture_program(provider, &execution, &metadata, Some(&quantum)).unwrap();
+        assert!(
+            validate_sana_capture_program(provider, "ordinary", &metadata, Some(&quantum)).is_err(),
+            "capture query must describe forced programme"
+        );
+        assert!(validate_sana_capture_program(provider, &execution, &metadata, None).is_err());
+        let mut missing = metadata.clone();
+        missing.marks[joined as usize].kind = "missing-native-joined".into();
+        assert!(
+            validate_sana_capture_program(provider, &execution, &missing, Some(&quantum)).is_err()
+        );
+        let mut repeated = quantum;
+        repeated.checks[0].count = 2;
+        assert!(
+            validate_sana_capture_program(provider, &execution, &metadata, Some(&repeated))
+                .is_err()
+        );
+        validate_sana_capture_program(provider, "ordinary", &SamplingCoverage::default(), None)
+            .unwrap();
+        // Failed/cancelled rows never call this completed-evidence validator;
+        // their existing diagnostic serialization and primary reason survive.
+    }
+
+    #[test]
+    fn source_composed_observation_budget_covers_existing_check_bound() {
+        let mut coverage = SamplingCoverage::default();
+        for _ in 0..MAX_QUANTUM_CHECKS {
+            for (provider, kind) in [
+                ("mlx", "native-quantum"),
+                ("mlx", "native-joined"),
+                ("sana", "native-dcae-glu"),
+            ] {
+                assert!(coverage.record(provider, kind, &[("schema", 1)]).is_some());
+            }
+        }
+        for (provider, kind) in [
+            ("sana_1600m", "native-lifecycle"),
+            ("sana_1600m", "native-lifecycle-completed"),
+            ("sana", "native-owned-phase-retired"),
+        ] {
+            assert!(coverage.record(provider, kind, &[("schema", 1)]).is_some());
+        }
+        for _ in 0..BASE_SAMPLING_MARKS {
+            assert!(coverage
+                .record("existing", "ordinary", &[("schema", 1)])
+                .is_some());
+        }
+        assert_eq!(coverage.marks.len(), MAX_SAMPLING_MARKS);
+        assert!(!coverage.truncated);
+        coverage.validate().unwrap();
+        assert!(coverage
+            .record("overflow", "actual-extra", &[("schema", 1)])
+            .is_none());
+        assert!(coverage.truncated);
+        // Storage shape/guard chronology only; no step/render/RAM allowance.
+    }
+
+    #[test]
+    fn ordinary_and_native_observation_categories_cannot_borrow_each_others_capacity() {
+        for (provider, kind, limit) in [
+            ("ordinary", "actual", BASE_SAMPLING_MARKS),
+            ("mlx", "native-quantum", MAX_QUANTUM_CHECKS),
+            ("mlx", "native-joined", MAX_QUANTUM_CHECKS),
+            ("sana", "native-dcae-glu", MAX_QUANTUM_CHECKS),
+            (
+                "sana_1600m",
+                "native-lifecycle",
+                NATIVE_RETIREMENT_ROOT_MARKS,
+            ),
+        ] {
+            let mut coverage = SamplingCoverage::default();
+            for _ in 0..limit {
+                assert!(coverage.record(provider, kind, &[("schema", 1)]).is_some());
+            }
+            assert!(coverage.marks.len() < MAX_SAMPLING_MARKS);
+            assert!(
+                coverage.record(provider, kind, &[("schema", 1)]).is_none(),
+                "category {provider}/{kind} escaped independent bound"
+            );
+            assert!(coverage.truncated);
+            assert_eq!(coverage.dropped_marks, 1);
+        }
     }
 }

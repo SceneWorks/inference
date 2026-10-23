@@ -380,6 +380,59 @@ impl Block {
             Block::Evit { attn, conv_out } => conv_out.forward(&attn.forward(x)?),
         }
     }
+
+    fn run_quantum(&self, x: &Array, cancel: &CancelFlag, encode: bool) -> Result<Array> {
+        if crate::quantum::retired_lifecycle()? {
+            if let Block::Evit { attn, conv_out } = self {
+                let (b, h, w, c) = nhwc(x);
+                let attention_label = if encode {
+                    labels::ENCODER_ATTENTION
+                } else {
+                    labels::DECODER_ATTENTION
+                };
+                let glu_label = if encode {
+                    labels::ENCODER_GLU
+                } else {
+                    labels::DECODER_GLU
+                };
+                let attended = quantum(
+                    cancel,
+                    attention_label,
+                    crate::quantum::dcae_attention_bytes(b, h, w, c, attn.projs.len() as u64),
+                    || attn.forward(x),
+                )?;
+                // The stage still owns its OLD feature until run_quantum returns
+                // and its assignment replaces it. The attended result is a
+                // distinct owner; successful retirement erases neither one.
+                mlx_gen::ios_quantum::diagnostic_metadata(
+                    "sana",
+                    "native-dcae-glu",
+                    &[
+                        ("schema", 1),
+                        ("encode", u64::from(encode)),
+                        ("original_elements", x.size() as u64),
+                        ("attended_elements", attended.size() as u64),
+                        ("batch", b),
+                        ("height", h),
+                        ("width", w),
+                        ("channels", c),
+                    ],
+                );
+                return quantum(
+                    cancel,
+                    glu_label,
+                    crate::quantum::dcae_glu_bytes(b, h, w, c),
+                    || conv_out.forward(&attended),
+                );
+            }
+        }
+        let label = if encode {
+            labels::ENCODER_BLOCK
+        } else {
+            labels::DECODER_BLOCK
+        };
+        quantum(cancel, label, self.quantum_bytes(x), || self.forward(x))
+    }
 }
 
 /// `DCUpBlock2d` (interpolate path): `nearest-upsample → conv`, + `repeat_interleave → pixel_shuffle`
@@ -641,12 +694,7 @@ impl Stage {
             )?;
         }
         for block in &self.blocks {
-            h = quantum(
-                cancel,
-                labels::DECODER_BLOCK,
-                block.quantum_bytes(&h),
-                || block.forward(&h),
-            )?;
+            h = block.run_quantum(&h, cancel, false)?;
         }
         Ok(h)
     }
@@ -998,12 +1046,7 @@ impl EncStage {
     fn run_encoder(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let mut h = x.clone();
         for block in &self.blocks {
-            h = quantum(
-                cancel,
-                labels::ENCODER_BLOCK,
-                block.quantum_bytes(&h),
-                || block.forward(&h),
-            )?;
+            h = block.run_quantum(&h, cancel, true)?;
         }
         if let Some(down) = &self.downsample {
             h = quantum(

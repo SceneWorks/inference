@@ -1,5 +1,62 @@
 use super::*;
 
+#[test]
+fn retired_projection_selects_real_subwindows_without_erasing_original_feature() {
+    let cfg = DcAeConfig::sana_f32c32();
+    for encode in [false, true] {
+        let mut ordinary = Quanta::default();
+        let mut retired = Quanta::default();
+        dcae_block_quanta(
+            &cfg,
+            3,
+            16,
+            24,
+            encode,
+            SanaPricingRegime::Ordinary,
+            &mut ordinary,
+        );
+        dcae_block_quanta(
+            &cfg,
+            3,
+            16,
+            24,
+            encode,
+            SanaPricingRegime::RetiredLifecycle,
+            &mut retired,
+        );
+        assert_eq!(ordinary.0.len(), 1);
+        assert_eq!(retired.0.len(), 2);
+        let (attention, glu, combined) = if encode {
+            (
+                labels::ENCODER_ATTENTION,
+                labels::ENCODER_GLU,
+                labels::ENCODER_BLOCK,
+            )
+        } else {
+            (
+                labels::DECODER_ATTENTION,
+                labels::DECODER_GLU,
+                labels::DECODER_BLOCK,
+            )
+        };
+        assert_eq!(ordinary.0[0].1, combined);
+        assert_eq!(retired.0[0].1, attention);
+        assert_eq!(retired.0[1].1, glu);
+        assert_eq!(
+            ordinary.0[0].0,
+            retired.0[0].0 + retired.0[1].0,
+            "ordinary single graph retains both halves; this is no renamed whole guard"
+        );
+        assert_eq!(
+            retired.0[1].3,
+            tensor_bytes(4, &[1, 16, 24, cfg.block_out_channels[3] as u64]),
+            "original feature survives the attention join while GLU reads attended output"
+        );
+        assert_eq!(retired.0[0].2, Some((16, 24)));
+        assert_eq!(retired.0[1].2, Some((16, 24)));
+    }
+}
+
 /// Pure source recipe, not a measurement: every decode route must price its
 /// real final conversion and ONE decoded input backing (the NCHW is a view).
 #[test]

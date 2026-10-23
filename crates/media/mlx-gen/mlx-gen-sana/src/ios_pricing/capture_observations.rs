@@ -73,10 +73,14 @@ pub(super) fn measure<T>(
         )
     });
     drop(guard);
-    let observation = stored
+    let mut observation = stored
         .lock()
         .expect("Sana actual source mark lock")
         .0
         .clone();
+    // This isolated listener stores every actual event (overflow is a hard
+    // failure), and the original measurement must complete successfully.
+    // Native receipt validity is separate; no source marks are synthesized.
+    observation.telemetry_complete = result.is_ok();
     (result, observation)
 }

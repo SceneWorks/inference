@@ -67,13 +67,15 @@ mod layout;
 pub mod pricing;
 mod refusal;
 pub mod sampling;
-pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
+pub use bound::{BoundDepth, BoundGenerator, BoundTransform, GeneratorAdmissionInfo};
 pub use ios_admission::{
     admit, admit_with_baseline, admit_with_boundary, admit_with_boundary_and_key_capacity,
-    build_candidate, capacity_budget, configured_endpoint, configured_load_form, evidence_key,
-    evidence_key_with_key_capacity, execution_for, execution_key, tier_label, token_window,
-    validate_actual, work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork,
-    PremisePolicy, SourceCapacityBoundary, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+    admit_with_sana_lifecycle_fallback, bind_sana_retirement_key, build_candidate, capacity_budget,
+    capture_evidence_key, capture_evidence_key_with_key_capacity, configured_endpoint,
+    configured_load_form, evidence_key, evidence_key_with_key_capacity, execution_for,
+    execution_key, sana_capture_observation_plan, tier_label, token_window, validate_actual,
+    work_binding, work_mode, Admission, AdmissionBasis, IosCandidate, IosWork, PremisePolicy,
+    SelectedAdmissionView, SourceCapacityBoundary, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
 /// The labelled bounded device-capture permit; compiled only for the device harness.
 #[cfg(feature = "device-capture")]
@@ -84,11 +86,12 @@ pub use layout::{
 };
 pub use mlx_gen::ios_pricing::{
     IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosMemoryBaseline, IosMemoryCoordinate,
-    IosMemoryDomain,
+    IosMemoryDomain, IosNativeRetirementExecution,
 };
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads
 /// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
 pub use mlx_gen::ios_quantum;
+pub use mlx_gen_sana::ios_pricing::CaptureObservationPlan as SanaCaptureObservationPlan;
 pub use refusal::{AdmissionError, AdmissionResult, Refusal, RefusalKind};
 
 use mlx_gen::gen_core::{

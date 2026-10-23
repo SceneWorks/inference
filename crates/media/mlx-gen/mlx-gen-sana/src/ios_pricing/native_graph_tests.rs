@@ -111,7 +111,7 @@ impl Headers {
         }
     }
 }
-fn facts(sprint: bool) -> SanaPricingFacts {
+pub(super) fn facts(sprint: bool) -> SanaPricingFacts {
     let mut dcae = DcAeConfig::sana_f32c32();
     dcae.block_out_channels = vec![32; 6];
     dcae.layers_per_block = vec![1; 6];
@@ -253,7 +253,7 @@ fn facts(sprint: bool) -> SanaPricingFacts {
         vae: vae.0,
     }
 }
-fn plan(sprint: bool, img2img: bool, tiled: bool) -> SanaPricingPlan {
+pub(super) fn plan(sprint: bool, img2img: bool, tiled: bool) -> SanaPricingPlan {
     SanaPricingPlan {
         sprint,
         sequential: tiled,
@@ -266,7 +266,7 @@ fn plan(sprint: bool, img2img: bool, tiled: bool) -> SanaPricingPlan {
         attention: AttentionBudget::from_score_elements(128, true),
     }
 }
-fn sampling(sprint: bool, img2img: bool, steps: u32) -> NativeSampling {
+pub(super) fn sampling(sprint: bool, img2img: bool, steps: u32) -> NativeSampling {
     let generation = mlx_gen::GenerationRequest {
         steps: Some(steps),
         strength: img2img.then_some(0.9),
@@ -275,7 +275,7 @@ fn sampling(sprint: bool, img2img: bool, steps: u32) -> NativeSampling {
     super::super::native_certificate::fixture_sampling(&generation, sprint, img2img, 1 << 20)
         .unwrap()
 }
-fn packed(mut facts: SanaPricingFacts, bits: u64) -> SanaPricingFacts {
+pub(super) fn packed(mut facts: SanaPricingFacts, bits: u64) -> SanaPricingFacts {
     for inv in [&mut facts.text_encoder, &mut facts.trunk] {
         let names: Vec<_> = inv
             .0
@@ -424,11 +424,11 @@ fn load_coherence_prices_cpu_reference_and_every_gpu_retry() {
     // U8 lanes to U32, then reduces: independently allocated 8-byte + 4-byte.
     let load = operand(2) + operand(4);
     let checksum = operand(8) + operand(4);
-    assert_eq!(cpu.ledger.total, load);
-    assert_eq!(
-        metal.ledger.total,
-        load + checksum * (2 + u64::from(mlx_gen::coherence::MAX_RETRIES))
-    );
+    let complete = load + checksum * (2 + u64::from(mlx_gen::coherence::MAX_RETRIES));
+    // Compute stream CPU does NOT prove explicit default-GPU load checks are
+    // absent. Both lowerings price the same complete possible checksum union.
+    assert_eq!(cpu.ledger.total, complete);
+    assert_eq!(metal.ledger.total, complete);
 }
 
 #[test]

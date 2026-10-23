@@ -216,6 +216,7 @@ fn approved() -> PremisePolicy {
 
 fn cpu_scoped() -> IosExecutionFacts {
     IosExecutionFacts {
+        native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary,
         stream: mlx_gen::ios_pricing::IosExecutionStream::Cpu,
         ios_quantum_scope: true,
         analysis_budget_bytes: 1 << 20,
@@ -1029,6 +1030,7 @@ fn certified_derivation_refuses_exactly_without_facts_audited_stream_or_certific
             "text_to_image",
         );
         let facts = |stream, ios_quantum_scope| IosExecutionFacts {
+            native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary,
             stream,
             ios_quantum_scope,
             analysis_budget_bytes: 1 << 20,

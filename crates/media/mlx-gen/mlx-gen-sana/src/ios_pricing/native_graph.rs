@@ -91,7 +91,11 @@ impl<'a> Walk<'a> {
             }
             self.ledger.bytes(tensor.bytes)?;
             self.a(tensor.elements)?;
-            if self.ledger.backend == NativeBackend::Metal && tensor.bytes > 0 {
+            if tensor.bytes > 0 {
+                // Explicit default-GPU load checks are independent of a CPU
+                // task-local COMPUTE stream. Charge their complete source
+                // envelope on BOTH compute backends; CPU-only fixtures may
+                // skip the real checks, never the conservative source price.
                 // weights::materialize_batch -> coherence::verify_gpu_view:
                 // one CPU checksum, then up to MAX_RETRIES+1 GPU checksums.
                 // Safetensors source leaves are row-contiguous, so flatten and
@@ -108,12 +112,14 @@ impl<'a> Walk<'a> {
                 }
                 cpu.reduce(4, words, 1, words, true)?;
                 self.ledger.total = sum(self.ledger.total, cpu.total)?;
+                let mut gpu = NativeLedger::new(self.ledger.page, NativeBackend::Metal)?;
                 for _ in 0..=mlx_gen::coherence::MAX_RETRIES {
                     if !tensor.bytes.is_multiple_of(4) {
-                        self.a(words)?;
+                        gpu.array(4, words)?;
                     }
-                    self.ledger.reduce(4, words, 1, words, true)?;
+                    gpu.reduce(4, words, 1, words, true)?;
                 }
+                self.ledger.total = sum(self.ledger.total, gpu.total)?;
             }
         }
         Ok(())
@@ -377,37 +383,43 @@ impl<'a> Walk<'a> {
     }
     fn dcae_blocks(&mut self, encode: bool, i: usize, h: u64, w: u64) -> Result<()> {
         let cfg = &self.facts.dc_ae;
-        let c = dim(cfg.block_out_channels[i])?;
         let count = if encode {
             cfg.encoder_layers_per_block[i]
         } else {
             cfg.layers_per_block[i]
         };
-        let side = if encode { "encoder" } else { "decoder" };
         for j in 0..count {
-            let prefix = if encode {
-                format!("{side}.down_blocks.{i}.{j}")
-            } else {
-                format!(
-                    "decoder.up_blocks.{i}.{}",
-                    j + i32::from(i + 1 < cfg.num_stages())
-                )
-            };
-            match cfg.block_types[i] {
-                BlockType::Res => self.dcae_res(&prefix, h, w, c)?,
-                BlockType::EfficientVit => {
-                    self.dcae_attn(&format!("{prefix}.attn"), h, w, c)?;
-                    self.glu(
-                        &self.facts.vae,
-                        &format!("{prefix}.conv_out"),
-                        h,
-                        w,
-                        c,
-                        true,
-                    )?;
-                }
+            self.dcae_block(encode, i, j, h, w)?;
+        }
+        Ok(())
+    }
+    fn dcae_block(&mut self, encode: bool, i: usize, j: i32, h: u64, w: u64) -> Result<()> {
+        let cfg = &self.facts.dc_ae;
+        let c = dim(cfg.block_out_channels[i])?;
+        let side = if encode { "encoder" } else { "decoder" };
+        let prefix = if encode {
+            format!("{side}.down_blocks.{i}.{j}")
+        } else {
+            format!(
+                "decoder.up_blocks.{i}.{}",
+                j + i32::from(i + 1 < cfg.num_stages())
+            )
+        };
+        match cfg.block_types[i] {
+            BlockType::Res => self.dcae_res(&prefix, h, w, c)?,
+            BlockType::EfficientVit => {
+                self.dcae_attn(&format!("{prefix}.attn"), h, w, c)?;
+                self.glu(
+                    &self.facts.vae,
+                    &format!("{prefix}.conv_out"),
+                    h,
+                    w,
+                    c,
+                    true,
+                )?;
             }
         }
+
         Ok(())
     }
 }
@@ -658,9 +670,76 @@ impl Walk<'_> {
     }
 }
 
+const NATIVE_EPOCH_LABELS: usize = labels::ALL.len() + GEMMA_LABELS.len() + 1;
+pub(super) fn native_epoch_labels() -> impl Iterator<Item = &'static str> {
+    labels::ALL
+        .iter()
+        .copied()
+        .chain(GEMMA_LABELS.iter().copied())
+        .chain(std::iter::once(mlx_gen::sampler::SAMPLER_STEP_QUANTUM))
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NativeEpochCounts {
+    epochs: [u64; NATIVE_EPOCH_LABELS],
+    pub(super) solver_marks: u64,
+}
+impl NativeEpochCounts {
+    fn new() -> Self {
+        Self {
+            epochs: [0; NATIVE_EPOCH_LABELS],
+            solver_marks: 0,
+        }
+    }
+    fn note(&mut self, label: &str) -> Result<()> {
+        let index = native_epoch_labels()
+            .position(|known| known == label)
+            .ok_or_else(|| invalid("unknown closed source quantum label"))?;
+        self.epochs[index] = sum(self.epochs[index], 1)?;
+        Ok(())
+    }
+    pub(super) fn count(&self, label: &str) -> Result<u64> {
+        let index = native_epoch_labels()
+            .position(|known| known == label)
+            .ok_or_else(|| invalid("unknown observed quantum label"))?;
+        Ok(self.epochs[index])
+    }
+}
+
 include!("native_gemma.rs");
 include!("native_trunk.rs");
 include!("native_sampler.rs");
+#[path = "native_retired.rs"]
+mod retired;
+pub(super) fn retired_upper(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    sampling: &NativeSampling,
+    page: u64,
+    backend: NativeBackend,
+    budget: u64,
+) -> Result<u64> {
+    retired::retired_upper(facts, plan, sampling, page, backend, budget)
+}
+pub(super) fn retired_profile(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    sampling: &NativeSampling,
+    page: u64,
+    backend: NativeBackend,
+    budget: u64,
+) -> Result<(u64, NativeEpochCounts)> {
+    retired::retired_profile(facts, plan, sampling, page, backend, budget)
+}
+
+pub(super) fn source_epoch_counts(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    sampling: &NativeSampling,
+    page: u64,
+    budget: u64,
+) -> Result<NativeEpochCounts> {
+    retired::source_epoch_counts(facts, plan, sampling, page, budget)
+}
 
 #[cfg(test)]
 #[path = "native_graph_tests.rs"]

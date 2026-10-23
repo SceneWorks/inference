@@ -1035,6 +1035,76 @@ pub struct SanaConditioning {
     pub uncond: Option<(Array, Array)>,
 }
 
+/// Real selected-output boundary for the joined program. Ordinary callers retain
+/// the historical lazy/residency cadence. This executes before text can be shed.
+pub(crate) fn materialize_conditioning_if_retired(conditioning: &SanaConditioning) -> Result<()> {
+    if !crate::quantum::retired_lifecycle()? {
+        return Ok(());
+    }
+    let captions = conditioning.cond.size() as u64
+        + conditioning
+            .uncond
+            .as_ref()
+            .map_or(0, |(u, _)| u.size() as u64);
+    let masks = conditioning.cond_mask.size() as u64
+        + conditioning
+            .uncond
+            .as_ref()
+            .map_or(0, |(_, m)| m.size() as u64);
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-selected",
+        &[
+            ("schema", 1),
+            ("branches", 1 + u64::from(conditioning.uncond.is_some())),
+            ("caption_elements", captions),
+            ("mask_elements", masks),
+        ],
+    );
+    mlx_gen::ios_quantum::before(
+        crate::quantum::labels::TEXT_SELECTED,
+        crate::quantum::selected_caption_bytes(captions, masks),
+    )?;
+    match &conditioning.uncond {
+        Some((u, m)) => mlx_gen::ios_quantum::finish(
+            crate::quantum::labels::TEXT_SELECTED,
+            &[&conditioning.cond, &conditioning.cond_mask, u, m],
+        ),
+        None => mlx_gen::ios_quantum::finish(
+            crate::quantum::labels::TEXT_SELECTED,
+            &[&conditioning.cond, &conditioning.cond_mask],
+        ),
+    }
+}
+
+/// Close queued load/encode captures while the UNIQUE staged reference encoder
+/// is still owned by its caller. The caller drops it immediately after this
+/// return; the receipt itself grants no external-alias/cache/process credit.
+/// Required even when strength zero skips encode and only the load ran.
+pub(crate) fn retire_staged_reference_encoder() -> Result<()> {
+    if !crate::quantum::retired_lifecycle()? {
+        return Ok(());
+    }
+    mlx_gen::ios_quantum::drain_native_retirement()?;
+    let epoch = mlx_gen::ios_quantum::native_retirement_epoch()?
+        .ok_or_else(|| Error::Unsupported("SANA reference phase lost native invocation".into()))?;
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-owned-phase-retired",
+        &[
+            ("schema", 1),
+            ("invocation", epoch.invocation),
+            ("after_epoch", epoch.epoch),
+            ("component", 1),
+            ("prefix_complete", 1),
+            ("rust_drop_pending", 1),
+            ("external_alias_release_credit", 0),
+            ("host_reserve_declared", 0),
+        ],
+    );
+    Ok(())
+}
+
 /// Encode the prompt (and, for base SANA with CFG active, the negative prompt) into [`SanaConditioning`]
 /// — the phase-A step of the shared residency seam. Encodes WITH the caption pad mask (SANA's `attn2`
 /// masks PAD keys; dropping it lets padding swamp short-prompt conditioning). `sprint` and the resolved
@@ -1056,11 +1126,13 @@ pub fn encode_conditioning(
     } else {
         None
     };
-    Ok(SanaConditioning {
+    let conditioning = SanaConditioning {
         cond,
         cond_mask,
         uncond,
-    })
+    };
+    materialize_conditioning_if_retired(&conditioning)?;
+    Ok(conditioning)
 }
 
 /// The heavy render-phase components (everything but the Gemma text encoder): the Linear-DiT trunk, the

@@ -44,15 +44,18 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     use labels::*;
     match label {
         TEXT_LOAD | REFERENCE_ENCODER_LOAD | HEAVY_LOAD => Some(IosPhase::Load),
+        TEXT_SELECTED => Some(IosPhase::Conditioning),
         l if GEMMA_LABELS.contains(&l) => Some(IosPhase::Conditioning),
         ENCODER_INPUT | ENCODER_BLOCK | ENCODER_DOWNSAMPLE | ENCODER_STITCH | ENCODER_OUTPUT
-        | REFERENCE_LATENT => Some(IosPhase::Encode),
+        | REFERENCE_LATENT | ENCODER_ATTENTION | ENCODER_GLU => Some(IosPhase::Encode),
         ENTRY | BLOCK | OUTPUT | SCM_STEP | SCM_FINAL | LATENT | LATENT_BATCH => {
             Some(IosPhase::Denoise)
         }
         mlx_gen::sampler::SAMPLER_STEP_QUANTUM => Some(IosPhase::Denoise),
         DECODER_INPUT | DECODER_UPSAMPLE | DECODER_BLOCK | DECODER_OUTPUT | TILE_FOLD
-        | TILE_FINALIZE | DECODED_PIXELS => Some(IosPhase::Decode),
+        | TILE_FINALIZE | DECODED_PIXELS | DECODER_ATTENTION | DECODER_GLU => {
+            Some(IosPhase::Decode)
+        }
         _ => None,
     }
 }
@@ -240,6 +243,20 @@ impl SanaPricingFacts {
     }
 }
 
+/// Identity of the actual joined memory program, not a pin/currency key.
+/// Ordinary execution keeps its existing keys and measurements unchanged.
+pub const NATIVE_RETIREMENT_EXECUTION_SUFFIX: &str = "|sana-native-retirement=v1";
+
+/// Source graph projection, not proof authority by enum. RetiredLifecycle is
+/// usable only when the bound executor actually configures/holds the exact
+/// source lifecycle and each new native fence succeeds. Ordinary never changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SanaPricingRegime {
+    #[default]
+    Ordinary,
+    RetiredLifecycle,
+}
+
 /// The memory-relevant execution of one request, resolved the way the generator resolves it.
 #[derive(Clone, Copy, Debug)]
 pub struct SanaPricingPlan {
@@ -264,11 +281,66 @@ pub struct SanaPricingPlan {
 /// The DC-AE x32 spatial scale and latent width the noise is drawn at (`pipeline::create_noise`).
 const LATENT_SCALE: u32 = 32;
 
+fn dcae_block_quanta(
+    cfg: &DcAeConfig,
+    i: usize,
+    h: u64,
+    w: u64,
+    encode: bool,
+    regime: SanaPricingRegime,
+    out: &mut Quanta,
+) {
+    let c = cfg.block_out_channels[i] as u64;
+    let ordinary = if encode {
+        labels::ENCODER_BLOCK
+    } else {
+        labels::DECODER_BLOCK
+    };
+    match (cfg.block_types[i], regime) {
+        (BlockType::EfficientVit, SanaPricingRegime::RetiredLifecycle) => {
+            let (attention, glu) = if encode {
+                (labels::ENCODER_ATTENTION, labels::ENCODER_GLU)
+            } else {
+                (labels::DECODER_ATTENTION, labels::DECODER_GLU)
+            };
+            out.take_at(
+                quantum::dcae_attention_bytes(1, h, w, c, cfg.qkv_multiscales.len() as u64),
+                attention,
+                h,
+                w,
+            );
+            out.take_at(quantum::dcae_glu_bytes(1, h, w, c), glu, h, w);
+            // The caller's original feature is still held while the GLU takes
+            // the newly attended feature; its own input is already in scratch.
+            out.0.last_mut().unwrap().3 = tensor_bytes(4, &[1, h, w, c]);
+        }
+        (BlockType::Res, _) => {
+            out.take_at(quantum::dcae_res_block_bytes(1, h, w, c), ordinary, h, w)
+        }
+        (BlockType::EfficientVit, _) => out.take_at(
+            quantum::dcae_evit_block_bytes(1, h, w, c, cfg.qkv_multiscales.len() as u64),
+            ordinary,
+            h,
+            w,
+        ),
+    }
+}
+
 /// Largest counted DC-AE decode quantum of one latent `[1, C, lh, lw]` (`DcAeDecoder::decode_head`,
 /// then the tail tiled by `pipeline::decode_tiled` or whole).
 fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>, out: &mut Quanta) {
+    decode_quanta_in_regime(cfg, lh, lw, tiling, SanaPricingRegime::Ordinary, out)
+}
+fn decode_quanta_in_regime(
+    cfg: &DcAeConfig,
+    lh: u64,
+    lw: u64,
+    tiling: Option<(i32, i32)>,
+    regime: SanaPricingRegime,
+    out: &mut Quanta,
+) {
     let start = out.0.len();
-    decode_quanta_body(cfg, lh, lw, tiling, out);
+    decode_quanta_body(cfg, lh, lw, tiling, regime, out);
     let (height, width) = (lh * u64::from(LATENT_SCALE), lw * u64::from(LATENT_SCALE));
     let elements = 3 * height * width;
     out.take_at(
@@ -297,6 +369,7 @@ fn decode_quanta_body(
     lh: u64,
     lw: u64,
     tiling: Option<(i32, i32)>,
+    regime: SanaPricingRegime,
     out: &mut Quanta,
 ) {
     let ch = |i: usize| cfg.block_out_channels[i] as u64;
@@ -306,12 +379,6 @@ fn decode_quanta_body(
         .iter()
         .take_while(|t| **t == BlockType::Res)
         .count();
-    let block = |i: usize, h: u64, w: u64| match cfg.block_types[i] {
-        BlockType::Res => quantum::dcae_res_block_bytes(1, h, w, ch(i)),
-        BlockType::EfficientVit => {
-            quantum::dcae_evit_block_bytes(1, h, w, ch(i), cfg.qkv_multiscales.len() as u64)
-        }
-    };
     let latent_channels = cfg.latent_channels as u64;
     out.take_at(
         quantum::dcae_decoder_input_bytes(1, lh, lw, latent_channels, ch(n - 1)),
@@ -334,7 +401,7 @@ fn decode_quanta_body(
                 );
             }
             for _ in 0..cfg.layers_per_block[i] {
-                out.take_at(block(i, h, w), labels::DECODER_BLOCK, h, w);
+                dcae_block_quanta(cfg, i, h, w, false, regime, out);
             }
         }
         (h, w)
@@ -424,6 +491,16 @@ fn decode_quanta_body(
 /// Largest counted DC-AE encode quantum of an `height x width` image (`DcAeEncoder::encode`, or
 /// `encode_tiled` at `tile` image pixels).
 fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, out: &mut Quanta) {
+    encode_quanta_in_regime(cfg, height, width, tile, SanaPricingRegime::Ordinary, out)
+}
+fn encode_quanta_in_regime(
+    cfg: &DcAeConfig,
+    height: u64,
+    width: u64,
+    tile: Option<i32>,
+    regime: SanaPricingRegime,
+    out: &mut Quanta,
+) {
     let ch = |i: usize| cfg.block_out_channels[i] as u64;
     let n = cfg.num_stages();
     let prefix = cfg
@@ -431,17 +508,11 @@ fn encode_quanta(cfg: &DcAeConfig, height: u64, width: u64, tile: Option<i32>, o
         .iter()
         .take_while(|t| **t == BlockType::Res)
         .count();
-    let block = |i: usize, h: u64, w: u64| match cfg.block_types[i] {
-        BlockType::Res => quantum::dcae_res_block_bytes(1, h, w, ch(i)),
-        BlockType::EfficientVit => {
-            quantum::dcae_evit_block_bytes(1, h, w, ch(i), cfg.qkv_multiscales.len() as u64)
-        }
-    };
     // `EncStage::run_encoder` over stages `range` from extent (h, w): blocks, then the downsample.
     let stages = |range: std::ops::Range<usize>, mut h: u64, mut w: u64, out: &mut Quanta| {
         for i in range {
             for _ in 0..cfg.encoder_layers_per_block[i] {
-                out.take_at(block(i, h, w), labels::ENCODER_BLOCK, h, w);
+                dcae_block_quanta(cfg, i, h, w, true, regime, out);
             }
             if i + 1 < n {
                 out.take_at(
@@ -691,6 +762,14 @@ fn priced_quanta_with_cfg(
     plan: &SanaPricingPlan,
     cfg_on: bool,
 ) -> Result<Vec<PricedQuantum>> {
+    priced_quanta_in_regime(facts, plan, cfg_on, SanaPricingRegime::Ordinary)
+}
+fn priced_quanta_in_regime(
+    facts: &SanaPricingFacts,
+    plan: &SanaPricingPlan,
+    cfg_on: bool,
+    regime: SanaPricingRegime,
+) -> Result<Vec<PricedQuantum>> {
     let cfg = &facts.transformer;
     let dcae = &facts.dc_ae;
     let mut out = Vec::new();
@@ -884,11 +963,29 @@ fn priced_quanta_with_cfg(
         );
     }
 
+    if regime == SanaPricingRegime::RetiredLifecycle {
+        let m = facts.caption_tokens;
+        let mut selected = Quanta::default();
+        selected.take(
+            quantum::selected_caption_bytes(n_cond * m * g.hidden_size as u64, n_cond * m),
+            labels::TEXT_SELECTED,
+        );
+        phase(
+            IosPhase::Conditioning,
+            resident(te_bytes) + n_cond * tensor_bytes(4, &[1, l, g.hidden_size as u64]),
+            selected,
+        );
+    }
+
     // ---- Encode (img2img: the reference, from the preprocessed f32 NCHW image) ----
     if plan.img2img {
         let (h, w) = (u64::from(plan.height), u64::from(plan.width));
         let mut enc = Quanta::default();
-        encode_quanta(dcae, h, w, plan.encode_tile, &mut enc);
+        if regime == SanaPricingRegime::Ordinary {
+            encode_quanta(dcae, h, w, plan.encode_tile, &mut enc);
+        } else {
+            encode_quanta_in_regime(dcae, h, w, plan.encode_tile, regime, &mut enc);
+        }
         enc.take(
             elementwise_bytes(latent_elems + 1, 1),
             labels::REFERENCE_LATENT,
@@ -991,7 +1088,11 @@ fn priced_quanta_with_cfg(
 
     // ---- Decode (one latent at a time; every latent of the batch is held) ----
     let mut dec = Quanta::default();
-    decode_quanta(dcae, lh, lw, plan.decode_tiling, &mut dec);
+    if regime == SanaPricingRegime::Ordinary {
+        decode_quanta(dcae, lh, lw, plan.decode_tiling, &mut dec);
+    } else {
+        decode_quanta_in_regime(dcae, lh, lw, plan.decode_tiling, regime, &mut dec);
+    }
     phase(
         IosPhase::Decode,
         resident(dec_bytes) + count * latent_bytes,
@@ -1003,12 +1104,21 @@ fn priced_quanta_with_cfg(
 /// Price an iOS SANA (`sana_1600m`) or SANA-Sprint (`sana_sprint_1600m`) request: text-to-image or
 /// img2img (one reference), under the request's load policy and execution levers. A request the
 /// generator would refuse (an out-of-domain lever, the withheld rung 4) is refused here too.
+#[derive(Clone)]
 enum PricingSampling {
     Flow(mlx_gen::sampler::flow_sampling::ResolvedFlowControls),
     Scm(crate::sampling::ResolvedSprintControls),
 }
 
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
+    ios_pricing_in_regime(req, SanaPricingRegime::Ordinary)
+}
+/// Actual source-regime projection. This is raw pricing only, not authority
+/// to execute a joined regime or to obtain optimistic native bounds.
+pub fn ios_pricing_in_regime(
+    req: &IosPricingRequest<'_>,
+    regime: SanaPricingRegime,
+) -> Result<IosPricing> {
     req.validate_work_context()?;
     let generation = mlx_gen::sampler::flow_sampling::require_generation(req.generation)?;
     let has_init = matches!(req.mode, MemoryMode::ImageToImage);
@@ -1025,7 +1135,11 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
             )))
         }
     };
-    price_request_controls(req, generation.count, sampling)
+    if regime == SanaPricingRegime::Ordinary {
+        price_request_controls(req, generation.count, sampling)
+    } else {
+        price_request_controls_in_regime(req, generation.count, sampling, regime)
+    }
 }
 
 /// Explicit payload-free captured-controls replay. No GenerationRequest or media carrier is
@@ -1034,6 +1148,14 @@ pub fn ios_pricing_with_token(
     req: &IosPricingRequest<'_>,
     token: &str,
     count: u32,
+) -> Result<IosPricing> {
+    ios_pricing_with_token_in_regime(req, token, count, SanaPricingRegime::Ordinary)
+}
+pub fn ios_pricing_with_token_in_regime(
+    req: &IosPricingRequest<'_>,
+    token: &str,
+    count: u32,
+    regime: SanaPricingRegime,
 ) -> Result<IosPricing> {
     req.validate_work_context()?;
     let has_init = matches!(req.mode, MemoryMode::ImageToImage);
@@ -1060,7 +1182,7 @@ pub fn ios_pricing_with_token(
             )))
         }
     };
-    price_request_controls(req, count, sampling)
+    price_request_controls_in_regime(req, count, sampling, regime)
 }
 
 fn resolve_source_plan(
@@ -1129,9 +1251,34 @@ fn price_request_controls(
     count: u32,
     sampling: PricingSampling,
 ) -> Result<IosPricing> {
+    price_request_controls_in_regime(req, count, sampling, SanaPricingRegime::Ordinary)
+}
+fn price_request_controls_in_regime(
+    req: &IosPricingRequest<'_>,
+    count: u32,
+    sampling: PricingSampling,
+    regime: SanaPricingRegime,
+) -> Result<IosPricing> {
     let (facts, plan) = resolve_source_plan(req, count)?;
     let (sprint, img2img) = (plan.sprint, plan.img2img);
     let cfg_on = matches!(&sampling, PricingSampling::Flow(flow) if flow.effective_guidance().is_some_and(|g| g > 1.0));
+    let init_start = if img2img {
+        match &sampling {
+            PricingSampling::Flow(flow) => mlx_gen::img2img::init_time_step(
+                flow.steps(),
+                Some(mlx_gen::img2img::resolve_strength(
+                    None,
+                    flow.recipe().effective_strength(),
+                )),
+            ),
+            PricingSampling::Scm(scm) => scm.start_step(),
+        }
+    } else {
+        0
+    };
+    let reference_active = img2img && init_start > 0;
+    let zero_flow =
+        matches!(&sampling,PricingSampling::Flow(flow) if img2img&&init_start>=flow.steps());
     let elements = u64::from(plan.width / crate::pipeline::SPATIAL_SCALE)
         * u64::from(plan.height / crate::pipeline::SPATIAL_SCALE)
         * facts.transformer.in_channels as u64;
@@ -1155,13 +1302,17 @@ fn price_request_controls(
         let PricingSampling::Flow(sampling) = &sampling else {
             unreachable!("typed FLOW branch")
         };
-        let callbacks = mlx_gen::sampler::solver_memory::solver_callback_windows(
-            sampling.solver(),
-            sampling.convention(),
-            elements,
-            4,
-            4,
-        )?;
+        let callbacks = if regime == SanaPricingRegime::RetiredLifecycle && zero_flow {
+            Vec::new()
+        } else {
+            mlx_gen::sampler::solver_memory::solver_callback_windows(
+                sampling.solver(),
+                sampling.convention(),
+                elements,
+                4,
+                4,
+            )?
+        };
         let cfg = sampling.effective_guidance().is_some_and(|g| g > 1.0);
         let mut families = Vec::new();
         for callback in callbacks {
@@ -1192,7 +1343,13 @@ fn price_request_controls(
         (families, sampling.host_schedule_bytes()?, false)
     };
     let mut pricing = IosPricing::default();
-    for quantum in priced_quanta_with_cfg(&facts, &plan, cfg_on)? {
+    for quantum in priced_quanta_in_regime(&facts, &plan, cfg_on, regime)? {
+        if regime == SanaPricingRegime::RetiredLifecycle
+            && !reference_active
+            && quantum.phase == IosPhase::Encode
+        {
+            continue;
+        }
         let forward = matches!(
             quantum.label,
             labels::ENTRY | labels::BLOCK | labels::OUTPUT
@@ -1246,6 +1403,11 @@ fn price_request_controls(
     }
     if !img2img {
         pricing.phase_not_run(IosPhase::Encode, "text mode has no reference encode");
+    } else if regime == SanaPricingRegime::RetiredLifecycle && !reference_active {
+        pricing.phase_not_run(
+            IosPhase::Encode,
+            "actual sampling has no active reference encode",
+        );
     }
     Ok(pricing)
 }
@@ -1253,7 +1415,11 @@ fn price_request_controls(
 mod native_alloc;
 mod native_certificate;
 mod native_graph;
-pub use native_certificate::ios_certified_bounder;
+pub use native_certificate::{
+    capture_observation_plan, ios_certified_bounder, observed_pricing_regime,
+    validate_retirement_receipts, CaptureObservationPlan, RetirementCheckView,
+    RetirementMetadataView,
+};
 
 #[cfg(all(test, target_os = "macos"))]
 mod additivity;

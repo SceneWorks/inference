@@ -265,6 +265,18 @@ pub enum IosExecutionStream {
     Metal,
 }
 
+/// Source execution requirement for native-owner retirement, not authority by
+/// assertion. ProviderLifecycle claims must be carried into a bound executor
+/// that actually configures and holds the exact thread-affine lifecycle scope;
+/// its successful native barriers, not this enum, authorize lifetime credit.
+/// Ordinary is the compatibility default and grants no such credit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IosNativeRetirementExecution {
+    #[default]
+    Ordinary,
+    ProviderLifecycle,
+}
+
 /// Facts about the execution being CERTIFIED, stated at the admission boundary by the caller that
 /// owns that execution (SDK/runtime/capture harness). Never sampled from whichever thread happens
 /// to evaluate a pure pricing/bounding function, and never defaulted when absent.
@@ -275,6 +287,9 @@ pub struct IosExecutionFacts {
     /// Whether the execution runs inside the iOS quantum scope (`ios_quantum::enabled()`), which
     /// selects graph branches (bounded attention, tiled encode) the pricing assumes.
     pub ios_quantum_scope: bool,
+    /// Explicit source-backed execution requirement. A missing/ordinary scope
+    /// must retain cumulative bounds even when Some(memory) or a listener exists.
+    pub native_retirement: IosNativeRetirementExecution,
     /// Explicit host byte budget for EXACT schedule/epoch analysis (checked with
     /// `ResolvedFlowControls::check_capture_schedule_bytes` before any schedule is built). A
     /// request whose schedule exceeds it is refused, never clamped.

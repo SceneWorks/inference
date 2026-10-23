@@ -31,6 +31,8 @@ pub const MAX_RATIO: f64 = 1.5;
 pub mod labels {
     /// Gemma-2 caption encoder load floor.
     pub const TEXT_LOAD: &str = "SANA text load";
+    /// Joined selected captions/masks, before the text encoder can be shed.
+    pub const TEXT_SELECTED: &str = "SANA selected captions";
     /// Sequential img2img: the DC-AE encoder alone.
     pub const REFERENCE_ENCODER_LOAD: &str = "SANA reference encoder load";
     /// The trunk + DC-AE decoder (+ encoder where the bundle builds it).
@@ -65,6 +67,11 @@ pub mod labels {
     pub const TILE_FINALIZE: &str = "DC-AE final normalize";
     /// The actual decoded RGB tensor's F32 denormalize/clamp/round/readback.
     pub const DECODED_PIXELS: &str = "SANA decoded pixels";
+    /// Actual certified-retirement EfficientViT attention/GLU subquanta.
+    pub const DECODER_ATTENTION: &str = "DC-AE decoder attention joined";
+    pub const DECODER_GLU: &str = "DC-AE decoder GLU joined";
+    pub const ENCODER_ATTENTION: &str = "DC-AE encoder attention joined";
+    pub const ENCODER_GLU: &str = "DC-AE encoder GLU joined";
     /// DC-AE encoder `conv_in`.
     pub const ENCODER_INPUT: &str = "DC-AE encoder input";
     /// DC-AE encoder `ResBlock` / `EfficientViT` block.
@@ -79,6 +86,7 @@ pub mod labels {
     /// Every label above.
     pub const ALL: &[&str] = &[
         TEXT_LOAD,
+        TEXT_SELECTED,
         REFERENCE_ENCODER_LOAD,
         HEAVY_LOAD,
         ENTRY,
@@ -96,12 +104,43 @@ pub mod labels {
         TILE_FOLD,
         TILE_FINALIZE,
         DECODED_PIXELS,
+        DECODER_ATTENTION,
+        DECODER_GLU,
+        ENCODER_ATTENTION,
+        ENCODER_GLU,
         ENCODER_INPUT,
         ENCODER_BLOCK,
         ENCODER_DOWNSAMPLE,
         ENCODER_STITCH,
         ENCODER_OUTPUT,
     ];
+}
+
+/// Only the actual configured invocation selects the joined source program.
+/// Observers, ordinary budgets, Some(memory), and holding a scope do not.
+pub(crate) fn retired_lifecycle() -> mlx_gen::Result<bool> {
+    mlx_gen::ios_quantum::validate_native_retirement_scope()?;
+    match mlx_gen::ios_quantum::native_retirement_binding() {
+        None => Ok(false),
+        Some(binding) if matches!(binding.provider, crate::MODEL_ID | crate::SPRINT_MODEL_ID) => {
+            if !mlx_gen::ios_quantum::enabled() {
+                return Err(mlx_gen::Error::Unsupported(
+                    "SANA retired lifecycle lost its actual quantum scope".into(),
+                ));
+            }
+            Ok(true)
+        }
+        Some(_) => Err(mlx_gen::Error::Unsupported(
+            "SANA graph does not match the active native-retirement provider".into(),
+        )),
+    }
+}
+
+/// Caption gather targets, selected masks and their shared selected-index
+/// uploads. Full hidden parents are existing owners, separately held/priced.
+pub(crate) fn selected_caption_bytes(caption_elements: u64, mask_elements: u64) -> u64 {
+    tensor_bytes(4, &[caption_elements])
+        .saturating_add(tensor_bytes(4, &[mask_elements]).saturating_mul(2))
 }
 
 fn sum(values: &[u64]) -> u64 {
@@ -451,8 +490,17 @@ const RES_LIVE: u64 = 6;
 ///   product fits in released halves), plus the 1x1 point conv's explicit-GEMM workspace over its
 ///   `4C` input.
 pub fn dcae_evit_block_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64 {
-    let attention = stage(b, h, w, c, c, 7 + 6 * scales + 11 * (1 + scales), 0);
-    let glu = stage(b, h, w, c, 8 * c, 1, GLU_EXPANDED_LIVE).saturating_add(conv_workspace_bytes(
+    dcae_attention_bytes(b, h, w, c, scales).saturating_add(dcae_glu_bytes(b, h, w, c))
+}
+/// Existing attention half's SAME raw counted formula. Separate execution is
+/// legal only when the actual certified source regime joins its result.
+pub fn dcae_attention_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64 {
+    stage(b, h, w, c, c, 7 + 6 * scales + 11 * (1 + scales), 0)
+}
+/// Existing GLUMBConv half's SAME raw formula; original feature ownership
+/// outside this half must remain in the source held-owner ledger.
+pub fn dcae_glu_bytes(b: u64, h: u64, w: u64, c: u64) -> u64 {
+    stage(b, h, w, c, 8 * c, 1, GLU_EXPANDED_LIVE).saturating_add(conv_workspace_bytes(
         b,
         (h, w),
         (h, w),
@@ -460,8 +508,7 @@ pub fn dcae_evit_block_bytes(b: u64, h: u64, w: u64, c: u64, scales: u64) -> u64
         c,
         1,
         0,
-    ));
-    attention.saturating_add(glu)
+    ))
 }
 const GLU_EXPANDED_LIVE: u64 = 5;
 

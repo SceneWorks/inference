@@ -570,6 +570,30 @@ mod tests {
 /// Reprice sealed anchor metadata through the real provider path. No GenerationRequest, RGB,
 /// prompt or task image is constructed or cloned. Original conditioning roles stay explicit;
 /// provider code alone decides whether a reference is an init or an IP/control input.
+/// SANA-only projection of the ACTUAL observed joined program. Called after
+/// ordinary replay/source validation, never a fabricated GenerationRequest.
+pub(crate) fn price_sana_metadata_in_regime(
+    req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
+    token: &str,
+    regime: mlx_gen_sana::ios_pricing::SanaPricingRegime,
+) -> Result<mlx_gen::ios_pricing::IosPricing> {
+    if !matches!(req.provider, "sana_1600m" | "sana_sprint_1600m")
+        || req.generation.is_some()
+        || req.transform.is_some()
+        || req.depth.is_some()
+    {
+        return Err(Error::Unsupported(
+            "joined SANA replay requires its actual payload-free metadata context".into(),
+        ));
+    }
+    mlx_gen_sana::ios_pricing::ios_pricing_with_token_in_regime(
+        req,
+        token,
+        req.geometry.batch,
+        regime,
+    )
+}
+
 pub(crate) fn price_metadata(
     req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
     token: &str,

@@ -66,10 +66,62 @@ impl Walk<'_> {
         self.a(n)?; // concatenate halves
         self.ops(n, 3) // x*cos, rotate_half*sin, sum
     }
-    fn gemma(&mut self, guided: bool) -> Result<()> {
+    fn gemma_layer(&mut self, i: i32) -> Result<()> {
         let cfg = &self.facts.gemma;
         let inv = &self.facts.text_encoder;
         let (l, hidden, heads, kv, hd) = (
+            self.facts.gemma_tokens,
+            dim(cfg.hidden_size)?,
+            dim(cfg.num_heads)?,
+            dim(cfg.num_kv_heads)?,
+            dim(cfg.head_dim)?,
+        );
+        if !heads.is_multiple_of(kv) {
+            return Err(invalid("Gemma head ratio mismatch"));
+        }
+        let prefix = format!("model.layers.{i}");
+        self.rms(l, hidden, false)?;
+        for name in ["q_proj", "k_proj", "v_proj"] {
+            self.linear(inv, &format!("{prefix}.self_attn.{name}"), l, hidden)?;
+        }
+        self.gemma_rope(l, heads, hd)?;
+        self.gemma_rope(l, kv, hd)?;
+        if heads != kv {
+            self.ops(mul(mul(l, heads)?, hd)?, 2)?;
+        }
+        self.mm(heads, l, l, hd)?;
+        self.scalars(6)?; // typed scale, cap and inverse cap
+        let scores = mul(heads, mul(l, l)?)?;
+        self.ops(scores, 4)?; // scale, inverse-cap product, tanh, cap product
+        self.a(scores)?; // scores Float32 cast
+        self.a(mul(l, l)?)?; // mask Float32 cast
+        self.a(scores)?; // additive mask
+        self.ledger.softmax(4, scores)?;
+        self.a(scores)?; // attention cast back
+        self.mm(heads, l, hd, l)?;
+        self.a(mul(mul(l, heads)?, hd)?)?; // transposed output reshape copy
+        self.linear(
+            inv,
+            &format!("{prefix}.self_attn.o_proj"),
+            l,
+            mul(heads, hd)?,
+        )?;
+        self.rms(l, hidden, false)?;
+        self.a(mul(l, hidden)?)?;
+        self.rms(l, hidden, false)?;
+        let intermediate = self.linear(inv, &format!("{prefix}.mlp.gate_proj"), l, hidden)?;
+        self.gelu(mul(l, intermediate)?)?;
+        self.linear(inv, &format!("{prefix}.mlp.up_proj"), l, hidden)?;
+        self.a(mul(l, intermediate)?)?;
+        self.linear(inv, &format!("{prefix}.mlp.down_proj"), l, intermediate)?;
+        self.rms(l, hidden, false)?;
+        self.a(mul(l, hidden)?)?;
+
+        Ok(())
+    }
+    fn gemma(&mut self, guided: bool) -> Result<()> {
+        let cfg = &self.facts.gemma;
+        let (l, hidden, heads, kv, _hd) = (
             self.facts.gemma_tokens,
             dim(cfg.hidden_size)?,
             dim(cfg.num_heads)?,
@@ -87,44 +139,7 @@ impl Walk<'_> {
         for _ in 0..if guided { 2 } else { 1 } {
             self.gemma_embedding(l, hidden)?;
             for i in 0..cfg.num_layers {
-                let prefix = format!("model.layers.{i}");
-                self.rms(l, hidden, false)?;
-                for name in ["q_proj", "k_proj", "v_proj"] {
-                    self.linear(inv, &format!("{prefix}.self_attn.{name}"), l, hidden)?;
-                }
-                self.gemma_rope(l, heads, hd)?;
-                self.gemma_rope(l, kv, hd)?;
-                if heads != kv {
-                    self.ops(mul(mul(l, heads)?, hd)?, 2)?;
-                }
-                self.mm(heads, l, l, hd)?;
-                self.scalars(6)?; // typed scale, cap and inverse cap
-                let scores = mul(heads, mul(l, l)?)?;
-                self.ops(scores, 4)?; // scale, inverse-cap product, tanh, cap product
-                self.a(scores)?; // scores Float32 cast
-                self.a(mul(l, l)?)?; // mask Float32 cast
-                self.a(scores)?; // additive mask
-                self.ledger.softmax(4, scores)?;
-                self.a(scores)?; // attention cast back
-                self.mm(heads, l, hd, l)?;
-                self.a(mul(mul(l, heads)?, hd)?)?; // transposed output reshape copy
-                self.linear(
-                    inv,
-                    &format!("{prefix}.self_attn.o_proj"),
-                    l,
-                    mul(heads, hd)?,
-                )?;
-                self.rms(l, hidden, false)?;
-                self.a(mul(l, hidden)?)?;
-                self.rms(l, hidden, false)?;
-                let intermediate =
-                    self.linear(inv, &format!("{prefix}.mlp.gate_proj"), l, hidden)?;
-                self.gelu(mul(l, intermediate)?)?;
-                self.linear(inv, &format!("{prefix}.mlp.up_proj"), l, hidden)?;
-                self.a(mul(l, intermediate)?)?;
-                self.linear(inv, &format!("{prefix}.mlp.down_proj"), l, intermediate)?;
-                self.rms(l, hidden, false)?;
-                self.a(mul(l, hidden)?)?;
+                self.gemma_layer(i)?;
             }
             self.rms(l, hidden, false)?;
             self.a(mul(self.facts.caption_tokens, hidden)?)?;

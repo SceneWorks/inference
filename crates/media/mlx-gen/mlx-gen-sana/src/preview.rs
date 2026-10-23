@@ -123,6 +123,9 @@ fn emit_preview(
     if !sink.is_active() {
         return;
     }
+    // The projection remains the same borrowed/native operation recipe, but a
+    // user preview callback cannot inherit this model's retirement selector.
+    let _ordinary_callback = mlx_gen::ios_quantum::OrdinaryNativeRetirementScope::enter();
     mlx_gen::preview::emit_preview(sink, counter, schedule, position, || {
         let shape = latents.shape();
         if shape.len() != 4 || shape[0] != 1 || shape[1] != 32 {

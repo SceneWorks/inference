@@ -43,6 +43,24 @@ pub struct QuantumRefusal {
     pub available_bytes: Option<u64>,
 }
 
+#[path = "ios_quantum_retirement.rs"]
+mod retirement;
+pub use retirement::{
+    begin_native_retirement_epoch, bind_native_retirement_request, enter_native_retirement_model,
+    native_retirement_binding, native_retirement_epoch, native_retirement_request_matches,
+    validate_native_retirement_scope, ConfiguredNativeRetirement, NativeRetirementBinding,
+    NativeRetirementEpoch, NativeRetirementLease, NativeRetirementModelScope,
+    NativeRetirementScope, OrdinaryNativeRetirementScope,
+};
+#[path = "ios_quantum_retirement_native.rs"]
+mod retirement_native;
+pub use retirement_native::{
+    begin_native_retirement_invocation, capture_native_retirement_completion,
+    drain_native_retirement, invoke_native_retirement, retirement_label_id,
+    retirement_selected_stream_index, retirement_stream_is_cpu, validate_native_retirement_streams,
+    NativeRetirementCompletion, NativeRetirementStreamScope, NativeRetirementStreams,
+};
+
 static LAST_REFUSAL: std::sync::Mutex<Option<QuantumRefusal>> = std::sync::Mutex::new(None);
 
 fn record_refusal(label: &str, scratch: u64, reserve: u64, available: Option<u64>) {
@@ -153,7 +171,10 @@ fn notify(_event: impl FnOnce() -> QuantumEventArg) {
                 QuantumEvent::Synchronized { label, stream }
             }
         };
-        observer(&event);
+        {
+            let _ordinary_callback = OrdinaryNativeRetirementScope::enter();
+            observer(&event);
+        }
         CPU_FIXTURE_OBSERVER.with(|s| {
             let mut slot = s.borrow_mut();
             if slot.is_none() {
@@ -655,6 +676,7 @@ pub fn set_quantum_listener(listener: Option<Listener>) -> bool {
 fn mark(m: QuantumMark<'_>) {
     if let Ok(slot) = LISTENER.read() {
         if let Some(listener) = slot.as_ref() {
+            let _ordinary_callback = OrdinaryNativeRetirementScope::enter();
             listener(m);
         }
     }
@@ -759,6 +781,7 @@ fn requirement(_label: &str, available: Option<u64>, scratch: u64) -> (u64, u64)
 }
 
 pub fn before(label: &str, scratch: u64) -> Result<()> {
+    validate_native_retirement_scope()?;
     if enabled() {
         let available = available_for(label, scratch);
         let (required, reserve) = requirement(label, available, scratch);
@@ -766,6 +789,7 @@ pub fn before(label: &str, scratch: u64) -> Result<()> {
             record_refusal(label, required, reserve, available);
             Error::Unsupported(format!("{label}: {e}; scratch {required} bytes + engineering reserve {reserve} bytes (not a process bound)"))
         })?;
+        retirement_native::checked_native_retirement(label)?;
         notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
         mark(QuantumMark::Checked { label, scratch });
     }
@@ -776,20 +800,28 @@ pub fn before(label: &str, scratch: u64) -> Result<()> {
 /// leave earlier command-buffer resources live across the next headroom check. Synchronize the
 /// stream this quantum executed on: a caller-installed task-local stream, else the default.
 fn synchronize(label: &str) -> Result<()> {
-    let stream = mlx_rs::Stream::task_local_or_default();
-    let status = unsafe { mlx_sys::mlx_synchronize(stream.as_ptr()) };
-    if status != 0 {
-        return Err(Error::Msg(
-            "iOS quantum stream synchronization failed".into(),
-        ));
-    }
-    let index = stream.get_index().unwrap_or(-1);
+    validate_native_retirement_scope()?;
+    let index = if native_retirement_binding().is_some() {
+        // Cleanup uses cached handles/indices, not allocating device discovery.
+        retirement_native::synchronize_native_retirement(label)?;
+        retirement_selected_stream_index()?
+    } else {
+        let stream = mlx_rs::Stream::task_local_or_default();
+        let status = unsafe { mlx_sys::mlx_synchronize(stream.as_ptr()) };
+        if status != 0 {
+            return Err(Error::Msg(
+                "iOS quantum stream synchronization failed".into(),
+            ));
+        }
+        stream.get_index().unwrap_or(-1)
+    };
     notify(|| QuantumEventArg::Synchronized(label.to_string(), index));
     mark(QuantumMark::Synchronized { label });
     Ok(())
 }
 
 pub fn finish(label: &str, arrays: &[&Array]) -> Result<()> {
+    validate_native_retirement_scope()?;
     if enabled() {
         mlx_rs::transforms::eval(arrays.iter().copied())?;
         synchronize(label)?;
@@ -799,6 +831,7 @@ pub fn finish(label: &str, arrays: &[&Array]) -> Result<()> {
 }
 
 pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> Result<Array> {
+    validate_native_retirement_scope()?;
     if !enabled() {
         return build();
     }
@@ -811,6 +844,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
         reserve,
         || {
             checked.set(true);
+            retirement_native::checked_native_retirement(label)?;
             notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
             mark(QuantumMark::Checked { label, scratch });
             build()

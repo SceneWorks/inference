@@ -475,6 +475,47 @@ pub fn execution_key(candidate: &IosCandidate) -> AdmissionResult<String> {
     ))
 }
 
+/// Describe the SDK's actually selected SANA memory program. Identity only:
+/// this does not configure a scope, grant credit, or change an ordinary key.
+/// A guarded caller reuses its SAME source-capacity check for the new String.
+pub fn bind_sana_retirement_key(
+    key: &mut EvidenceKey,
+    candidate: &IosCandidate,
+    requirement: mlx_gen::ios_pricing::IosNativeRetirementExecution,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<()> {
+    if !matches!(
+        candidate.provider.as_str(),
+        "sana_1600m" | "sana_sprint_1600m"
+    ) {
+        return Ok(());
+    }
+    if key.provider != candidate.provider {
+        return Err(mismatch("retirement key provider"));
+    }
+    let suffix = mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX;
+    let joined = requirement
+        == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+        && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some());
+    if !joined {
+        if key.execution.ends_with(suffix) {
+            key.execution.truncate(key.execution.len() - suffix.len());
+        }
+        return Ok(());
+    }
+    if key.execution.ends_with(suffix) {
+        return Ok(());
+    }
+    key.execution = match next {
+        Some(next) => source_string_parts(
+            std::iter::once(key.execution.as_str()).chain(std::iter::once(suffix)),
+            next,
+        )?,
+        None => format!("{}{suffix}", key.execution),
+    };
+    Ok(())
+}
+
 fn key_negative_prompt(request: &GenerationRequest) -> Result<Option<&str>> {
     let cfg_on = crate::sdxl::sampling::ResolvedSampling::resolve(request)?.guidance() > 1.0;
     Ok(cfg_on.then(|| request.negative_prompt.as_deref().unwrap_or("")))
@@ -690,6 +731,77 @@ pub fn evidence_key(
     key_unchecked(candidate, machine, route)
 }
 
+/// Exact SANA source event cardinalities for capture-storage preflight only.
+/// The actual original request is borrowed; this is not a RAM/model permit.
+pub fn sana_capture_observation_plan(
+    candidate: &IosCandidate,
+    key: &EvidenceKey,
+    page_bytes: u64,
+    analysis_budget: u64,
+) -> AdmissionResult<mlx_gen_sana::ios_pricing::CaptureObservationPlan> {
+    let IosWork::Generate(actual) = &candidate.work else {
+        return Err(mismatch("SANA capture work kind"));
+    };
+    if candidate.provider != key.provider
+        || !matches!(
+            candidate.provider.as_str(),
+            "sana_1600m" | "sana_sprint_1600m"
+        )
+    {
+        return Err(mismatch("SANA capture plan provider"));
+    }
+    let pricing = IosPricingRequest {
+        provider: &candidate.provider,
+        spec: &candidate.spec,
+        mode: &candidate.context.mode,
+        geometry: candidate.context.geometry,
+        selection: &candidate.context.selection,
+        execution: &candidate.execution,
+        token_window: key.token_window,
+        generation: Some(actual),
+        transform: None,
+        depth: None,
+    };
+    mlx_gen_sana::ios_pricing::capture_observation_plan(&pricing, page_bytes, analysis_budget)
+        .map_err(pricing_error)
+}
+
+/// SDK capture-program identity. SANA captures with explicit memory use the
+/// configured/joined program; catalog ordinary keys remain unchanged. This
+/// describes the future required program, never authorizes execution itself.
+pub fn capture_evidence_key(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    machine: &str,
+) -> AdmissionResult<EvidenceKey> {
+    let mut key = evidence_key(registry, candidate, machine)?;
+    bind_sana_retirement_key(
+        &mut key,
+        candidate,
+        mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle,
+        None,
+    )?;
+    Ok(key)
+}
+
+/// Same SDK capture identity with the SAME real source-capacity callback for
+/// source capture/tokenization AND execution-tag String ownership.
+pub fn capture_evidence_key_with_key_capacity(
+    registry: &ProviderRegistry,
+    candidate: &mut IosCandidate,
+    machine: &str,
+    next: KeyCapacity<'_>,
+) -> AdmissionResult<EvidenceKey> {
+    let mut key = evidence_key_with_key_capacity(registry, candidate, machine, &mut *next)?;
+    bind_sana_retirement_key(
+        &mut key,
+        candidate,
+        mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle,
+        Some(next),
+    )?;
+    Ok(key)
+}
+
 /// Capture key for EVERY provider under the real byte-sensitive source callback.
 /// Only token_window uses the SDXL-specific tokenizer guard. Reuses an existing inventory;
 /// otherwise retains the ordinary inventory on the candidate for its later capture permit.
@@ -863,6 +975,9 @@ pub struct Admission {
     /// Every unproved premise the admitted derivation rests on; non-empty only under an explicit
     /// policy that approved each of them. Recorded, never implicit.
     pub(crate) premises: Vec<IosCertificatePremise>,
+    /// Required SOURCE execution, carried into the bound generator. This is
+    /// never satisfied merely by the caller stating an execution-fact enum.
+    pub(crate) native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution,
 }
 
 fn bound_domain(bound: &IosWindowBound) -> IosMemoryDomain {
@@ -1002,6 +1117,13 @@ impl Admission {
     }
     pub fn basis(&self) -> AdmissionBasis {
         self.basis
+    }
+    /// Actual sealed selection requirement, descriptive only (not a successful
+    /// native range, physical permission or a substitute for execution).
+    pub fn native_retirement_execution(
+        &self,
+    ) -> mlx_gen::ios_pricing::IosNativeRetirementExecution {
+        self.native_retirement
     }
     /// The anchor's per-quantum DEVICE calibration (label → priced scratch vs device-observed
     /// growth) the admitted work's guards use inside the measured envelope.
@@ -1229,6 +1351,25 @@ fn price_anchor_using_source_capacity<'row>(
         .map_err(pricing_error)?,
     };
     anchor::attach_observations(&mut pricing, row).map_err(no_evidence)?;
+    if matches!(context.provider, "sana_1600m" | "sana_sprint_1600m")
+        && row
+            .key
+            .execution
+            .ends_with(mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX)
+        && mlx_gen_sana::ios_pricing::observed_pricing_regime(&pricing)
+            == mlx_gen_sana::ios_pricing::SanaPricingRegime::RetiredLifecycle
+    {
+        // Ordinary replay above retains original source/error chronology.
+        // Only complete actual observations select the reachable split windows.
+        let mut joined = crate::sampling::price_sana_metadata_in_regime(
+            &context.request(),
+            context.token,
+            mlx_gen_sana::ios_pricing::SanaPricingRegime::RetiredLifecycle,
+        )
+        .map_err(pricing_error)?;
+        joined.observations = pricing.observations;
+        pricing = joined;
+    }
     Ok((context, pricing))
 }
 
@@ -1562,16 +1703,33 @@ fn anchored_demand_using_source_capacity(
     );
     #[cfg(test)]
     let iris_source_pricing = iris_source_pricing && !crate::pricing::test_pricing_active();
-    let mut request = match (iris_source_pricing, source_metadata_capacity.as_mut()) {
-        (true, Some(next)) => with_source_metadata_capacity(&mut **next, |next| {
-            mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
-                &request_context,
-                None,
-                next,
-            )
-            .map(|facts| facts.pricing)
-        })?,
-        _ => pricer(&request_context).map_err(pricing_error)?,
+    let sana_joined = matches!(
+        candidate.provider.as_str(),
+        "sana_1600m" | "sana_sprint_1600m"
+    ) && execution_facts.is_some_and(|facts| {
+        facts.native_retirement
+            == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+    }) && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some());
+    #[cfg(test)]
+    let sana_joined = sana_joined && !crate::pricing::test_pricing_active();
+    let mut request = if sana_joined {
+        mlx_gen_sana::ios_pricing::ios_pricing_in_regime(
+            &request_context,
+            mlx_gen_sana::ios_pricing::SanaPricingRegime::RetiredLifecycle,
+        )
+        .map_err(pricing_error)?
+    } else {
+        match (iris_source_pricing, source_metadata_capacity.as_mut()) {
+            (true, Some(next)) => with_source_metadata_capacity(&mut **next, |next| {
+                mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
+                    &request_context,
+                    None,
+                    next,
+                )
+                .map(|facts| facts.pricing)
+            })?,
+            _ => pricer(&request_context).map_err(pricing_error)?,
+        }
     };
     // A fact from the SDK boundary, not an inferred budget/zero or a process-transfer proof.
     request.request_baseline = request_baseline.cloned();
@@ -1830,6 +1988,19 @@ fn admit_one_using_key_capacity(
 ) -> AdmissionResult<Admission> {
     let AdmissionAttempt { evidence, mut next } = attempt;
     validate_actual(registry, candidate)?;
+    let native_retirement = if matches!(
+        candidate.provider.as_str(),
+        "sana_1600m" | "sana_sprint_1600m"
+    ) && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some())
+        && (rows.is_none()
+            || evidence.execution_facts.is_some_and(|facts| {
+                facts.native_retirement
+                    == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+            })) {
+        mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+    } else {
+        mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary
+    };
     let route = route_of(candidate)?;
     if let Some(rows) = rows {
         // Cheap pre-check: refuse before opening any source when no anchor can match.
@@ -1870,7 +2041,7 @@ fn admit_one_using_key_capacity(
     let consume = |mut next: Option<KeyCapacity<'_>>| -> AdmissionResult<Admission> {
         // Reborrow the SAME callback for the key, retaining it for both guarded
         // request/anchor repricings below. Never spend it with Option::map.
-        let key = match next.as_mut() {
+        let mut key = match next.as_mut() {
             Some(next) => key_unchecked_using_key_capacity(
                 candidate,
                 machine,
@@ -1879,6 +2050,22 @@ fn admit_one_using_key_capacity(
             ),
             None => key_unchecked(candidate, machine, route.clone()),
         }?;
+        match next.as_mut() {
+            Some(next) => {
+                bind_sana_retirement_key(&mut key, candidate, native_retirement, Some(&mut **next))?
+            }
+            None => bind_sana_retirement_key(&mut key, candidate, native_retirement, None)?,
+        }
+        if native_retirement
+            == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+            && evidence
+                .execution_facts
+                .is_some_and(|facts| !facts.ios_quantum_scope)
+        {
+            return Err(no_evidence(
+                "required SANA native lifecycle has no actual quantum execution scope".into(),
+            ));
+        }
         if let (Some(binding), IosWork::Generate(request)) = (&key.sdxl_work, &candidate.work) {
             binding.validate_actual(request).map_err(pricing_error)?;
         }
@@ -2028,6 +2215,7 @@ fn admit_one_using_key_capacity(
             binding: work_binding(&candidate.work),
             key,
             premises,
+            native_retirement,
         })
     };
     match next {
@@ -2099,8 +2287,39 @@ fn admit_rows_with_facts_using_key_capacity(
     budget: MemoryBudget,
     rows: &[AnchorRow],
     evidence: AdmissionEvidence<'_>,
-    mut next: Option<KeyCapacity<'_>>,
+    next: Option<KeyCapacity<'_>>,
 ) -> AdmissionResult<Admission> {
+    admit_rows_using_lifecycle_policy(
+        registry,
+        candidates,
+        machine,
+        budget,
+        rows,
+        evidence,
+        AdmissionRunPolicy {
+            next,
+            sana_fallback: false,
+        },
+    )
+}
+
+struct AdmissionRunPolicy<'a> {
+    next: Option<KeyCapacity<'a>>,
+    sana_fallback: bool,
+}
+fn admit_rows_using_lifecycle_policy(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    rows: &[AnchorRow],
+    evidence: AdmissionEvidence<'_>,
+    policy: AdmissionRunPolicy<'_>,
+) -> AdmissionResult<Admission> {
+    let AdmissionRunPolicy {
+        mut next,
+        sana_fallback,
+    } = policy;
     if let Some(baseline) = evidence.request_baseline {
         if baseline.domain != IosMemoryDomain::ProcessGrowth
             || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
@@ -2116,7 +2335,7 @@ fn admit_rows_with_facts_using_key_capacity(
     let mut first_failure: Option<Error> = None;
     let mut reasons = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let result = match next.as_mut() {
+        let mut result = match next.as_mut() {
             Some(next) => admit_one_using_key_capacity(
                 registry,
                 index,
@@ -2139,6 +2358,56 @@ fn admit_rows_with_facts_using_key_capacity(
                 evidence,
             ),
         };
+        // Preserve candidate preference AND existing ordinary measurements:
+        // attempt ordinary first for THIS candidate, then only its explicitly
+        // supported joined program. Never replace a malformed-artifact failure
+        // with a speculative fallback or try a lower-preference tier first.
+        if sana_fallback
+            && evidence.execution_facts.is_some_and(|facts| {
+                facts.native_retirement
+                    == mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary
+            })
+            && matches!(
+                candidate.provider.as_str(),
+                "sana_1600m" | "sana_sprint_1600m"
+            )
+            && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some())
+            && matches!(&result,Err(AdmissionError::Refused(refusal)) if matches!(refusal.kind,RefusalKind::NoEvidence|RefusalKind::Capacity))
+        {
+            let actual = evidence
+                .execution_facts
+                .expect("explicit ordinary execution facts checked above");
+            let mut native = *actual;
+            native.native_retirement =
+                mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle;
+            let native_evidence = AdmissionEvidence {
+                execution_facts: Some(&native),
+                ..evidence
+            };
+            result = match next.as_mut() {
+                Some(next) => admit_one_using_key_capacity(
+                    registry,
+                    index,
+                    candidate,
+                    machine,
+                    budget,
+                    Some(rows),
+                    AdmissionAttempt {
+                        evidence: native_evidence,
+                        next: Some(&mut **next),
+                    },
+                ),
+                None => admit_one(
+                    registry,
+                    index,
+                    candidate,
+                    machine,
+                    budget,
+                    Some(rows),
+                    native_evidence,
+                ),
+            };
+        }
         match result {
             Ok(admitted) => return Ok(admitted),
             Err(AdmissionError::Refused(r)) => {
@@ -2244,6 +2513,15 @@ pub struct SourceCapacityBoundary<'a> {
     pub source_metadata_capacity: &'a mut dyn FnMut(u64) -> mlx_gen::Result<()>,
 }
 
+/// Borrowed metadata for the ACTUAL selected admission, before any model payload is loaded.
+/// Observing or constructing this view confers no load authority and approves no premise.
+/// An observer may refuse known recorder/storage work using the same next-allocation guard.
+pub struct SelectedAdmissionView<'a> {
+    pub candidate: &'a IosCandidate,
+    pub admission: &'a Admission,
+    pub boundary: SourceCapacityBoundary<'a>,
+}
+
 impl std::fmt::Debug for SourceCapacityBoundary<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceCapacityBoundary")
@@ -2276,6 +2554,37 @@ pub fn admit_with_boundary_and_key_capacity(
             premise_policy: boundary.premise_policy,
         },
         Some(boundary.source_metadata_capacity),
+    )
+    .map_err(source_metadata_gap_refusal)
+}
+
+/// SDK policy: keep every candidate's existing ordinary measured/derived path
+/// first, then its required SANA native lifecycle only when ordinary refused.
+/// This preserves caller preference, legacy None, and valid ordinary evidence.
+/// The selected receipt—not this preference—carries the execution requirement.
+pub fn admit_with_sana_lifecycle_fallback(
+    registry: &ProviderRegistry,
+    candidates: &[IosCandidate],
+    machine: &str,
+    budget: MemoryBudget,
+    boundary: SourceCapacityBoundary<'_>,
+) -> AdmissionResult<Admission> {
+    let rows = evidence::rows().map_err(no_evidence)?;
+    admit_rows_using_lifecycle_policy(
+        registry,
+        candidates,
+        machine,
+        budget,
+        rows,
+        AdmissionEvidence {
+            request_baseline: Some(boundary.request_baseline),
+            execution_facts: Some(boundary.execution_facts),
+            premise_policy: boundary.premise_policy,
+        },
+        AdmissionRunPolicy {
+            next: Some(boundary.source_metadata_capacity),
+            sana_fallback: true,
+        },
     )
     .map_err(source_metadata_gap_refusal)
 }
@@ -2357,6 +2666,26 @@ impl Admission {
     }
 
     fn check_load_form(&self) -> Result<()> {
+        if matches!(self.provider.as_str(), "sana_1600m" | "sana_sprint_1600m")
+            && (self.native_retirement
+                == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle)
+                != self
+                    .key
+                    .execution
+                    .ends_with(mlx_gen_sana::ios_pricing::NATIVE_RETIREMENT_EXECUTION_SUFFIX)
+        {
+            return Err(Error::Unsupported(
+                "sealed SANA execution requirement disagrees with its key".into(),
+            ));
+        }
+        if self.native_retirement
+            == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+            && !mlx_gen::ios_quantum::enabled()
+        {
+            return Err(Error::Unsupported(
+                "required SANA native lifecycle lost quantum scope before model load".into(),
+            ));
+        }
         let prefix = format!("{:?}|{:?}|", self.spec.offload_policy, self.spec.load_shape);
         if self.context.load_shape != self.spec.load_shape
             || !self.key.execution.starts_with(&prefix)
@@ -2404,11 +2733,31 @@ impl Admission {
     ) -> Result<crate::bound::BoundGenerator> {
         self.check_load_form()?;
         capacity(self.required_bytes())?;
+        let streams = if self.native_retirement
+            == mlx_gen::ios_pricing::IosNativeRetirementExecution::ProviderLifecycle
+        {
+            // Resolve/drop allocating device metadata BEFORE any model load or
+            // critical cleanup. The initial range is preexisting stream work,
+            // not attributed to this request and never credited as its demand.
+            let streams = mlx_gen::ios_quantum::NativeRetirementStreams::prepare()?;
+            streams.drain()?;
+            Some(streams)
+        } else {
+            None
+        };
         let envelope = self.envelope();
         let required = self.required_bytes();
-        let inner = self
-            .spec
-            .read_prepared_files_unchanged(|| load(&self.spec))?;
+        let inner = match self.spec.read_prepared_files_unchanged(|| load(&self.spec)) {
+            Ok(inner) => inner,
+            Err(primary) => {
+                if let Some(streams) = &streams {
+                    if let Err(cleanup) = streams.drain() {
+                        eprintln!("native load-error cleanup failed: {cleanup}");
+                    }
+                }
+                return Err(primary);
+            }
+        };
         Ok(crate::bound::BoundGenerator::new(
             inner,
             self.spec,
@@ -2416,7 +2765,19 @@ impl Admission {
             self.binding,
             required,
             capacity,
-            envelope,
+            crate::bound::GeneratorExecution {
+                info: crate::bound::GeneratorAdmissionInfo {
+                    index: self.index,
+                    key: self.key,
+                    demand_bytes: self.demand_bytes,
+                    margin_bytes: self.margin_bytes,
+                    required_bytes: required,
+                    basis: self.basis,
+                },
+                envelope,
+                native_retirement: self.native_retirement,
+                streams,
+            },
         ))
     }
 
@@ -2555,12 +2916,8 @@ mod guarded_clone_tests {
             None,
             "text_to_image",
         );
-        let key = crate::evidence::fixture::capture(
-            &registry,
-            &candidate,
-            crate::evidence::ANCHOR_MARGIN_FLOOR_BYTES,
-        )
-        .key;
+        let key =
+            crate::source_work::fixture_key(&registry, &candidate, crate::sdxl::tests::DEVICE);
         let premises = [
             IosCertificatePremise {
                 id: "first".into(),

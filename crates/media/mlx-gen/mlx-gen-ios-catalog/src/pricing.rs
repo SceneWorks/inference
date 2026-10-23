@@ -1298,6 +1298,7 @@ mod host_integration {
                 replay: None,
             };
             let mut facts = IosExecutionFacts {
+                native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary,
                 stream: IosExecutionStream::Metal,
                 ios_quantum_scope: false,
                 analysis_budget_bytes: 0,
@@ -1417,6 +1418,7 @@ mod host_integration {
             token_window: 0,
         };
         let facts = IosExecutionFacts {
+            native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary,
             stream: IosExecutionStream::Metal,
             ios_quantum_scope: true,
             analysis_budget_bytes: 1 << 20,
@@ -1482,6 +1484,7 @@ mod host_integration {
         let mode = MemoryMode::TextToImage;
         let foreign: u32 = 7;
         let facts = IosExecutionFacts {
+            native_retirement: mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary,
             stream: IosExecutionStream::Cpu,
             ios_quantum_scope: true,
             analysis_budget_bytes: 1 << 20,

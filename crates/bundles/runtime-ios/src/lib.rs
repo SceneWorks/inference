@@ -66,24 +66,34 @@ pub mod media {
     #[cfg(feature = "device-capture")]
     use mlx_gen_ios_catalog::capture_permit_with_key_capacity as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::control_required;
-    pub use mlx_gen_ios_catalog::{admit, admit_with_baseline, admit_with_boundary, PremisePolicy};
+    pub use mlx_gen_ios_catalog::{
+        admit, admit_with_baseline, admit_with_boundary, admit_with_sana_lifecycle_fallback,
+        PremisePolicy, SelectedAdmissionView, SourceCapacityBoundary,
+    };
     pub use mlx_gen_ios_catalog::{
         anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
         build_candidate, capacity_budget, capture_adapters, capture_artifact_stem,
-        configured_load_form, configured_variant_digest, evidence, evidence_key,
-        evidence_key_with_key_capacity, hex, ios_memory_budget, ios_quantum, pricing,
-        record_source_context, sampling, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
-        serialize_capture_failure, serialize_capture_row, source_context_requested_bytes,
-        work_mode, zimage, Admission, AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth,
-        BoundGenerator, BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal,
-        RefusalKind, SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
+        configured_load_form, configured_variant_digest, evidence, hex, ios_memory_budget,
+        ios_quantum, pricing, record_source_context, sampling, sana_decode_plan,
+        sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory, sana_load_spec,
+        sana_snapshot_profile, sdxl, serialize_capture_failure, serialize_capture_row,
+        source_context_requested_bytes, work_mode, zimage, Admission, AdmissionBasis,
+        AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
+        FootprintBound, GeneratorAdmissionInfo, IosCandidate, IosWork, Refusal, RefusalKind,
+        SanaDeviceFootprint, SanaSnapshotProfile, SourceRequestBudget, ANIMA_TURBO_ID,
         CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
         IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
         SANA_DEVICE_FOOTPRINTS,
     };
-    pub use mlx_gen_ios_catalog::{IosCallbackHost, IosExecutionFacts, IosExecutionStream};
+    pub use mlx_gen_ios_catalog::{
+        bind_sana_retirement_key, capture_evidence_key, capture_evidence_key_with_key_capacity,
+        evidence_key, evidence_key_with_key_capacity, sana_capture_observation_plan,
+        SanaCaptureObservationPlan,
+    };
+    pub use mlx_gen_ios_catalog::{
+        IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosNativeRetirementExecution,
+    };
     pub use mlx_gen_ios_catalog::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
@@ -180,13 +190,19 @@ pub mod media {
     pub fn execution_facts(
         callbacks: Option<IosCallbackHost>,
     ) -> AdmissionResult<IosExecutionFacts> {
-        let device = mlx_rs::Device::try_default().map_err(|e| {
+        let stream = mlx_rs::Stream::task_local_or_default();
+        // A task-local CPU stream may coexist with explicit default-GPU load
+        // checks. State the actual selected compute family, never infer it
+        // from the global default device. The metadata handle is dropped inside
+        // this safe helper before any allocation window is claimed.
+        let cpu = ios_quantum::retirement_stream_is_cpu(&stream).map_err(|e| {
             AdmissionError::Failed(Error::Unsupported(format!(
-                "iOS admission cannot state the execution stream (no MLX default device): {e}"
+                "iOS admission cannot state the selected execution stream: {e}"
             )))
         })?;
         Ok(IosExecutionFacts {
-            stream: if device == mlx_rs::Device::cpu() {
+            native_retirement: mlx_gen_ios_catalog::IosNativeRetirementExecution::Ordinary,
+            stream: if cpu {
                 IosExecutionStream::Cpu
             } else {
                 IosExecutionStream::Metal
@@ -204,6 +220,15 @@ pub mod media {
         providers: &[&str],
         candidates: &[IosCandidate],
         callbacks: Option<IosCallbackHost>,
+    ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
+        admitted_observing(providers, candidates, callbacks, &mut |_| Ok(()))
+    }
+
+    fn admitted_observing(
+        providers: &[&str],
+        candidates: &[IosCandidate],
+        callbacks: Option<IosCallbackHost>,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
     ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
         require_limits_bound()?;
         if let Some(c) = candidates
@@ -225,6 +250,9 @@ pub mod media {
         let baseline_source = String::from(
             "TASK_VM_INFO.phys_footprint after request construction, before model admission/load",
         );
+        // The safe stream query owns allocating metadata handles. Resolve and
+        // DROP them before the baseline; no getter runs in later OOM cleanup.
+        let mut facts = execution_facts(callbacks)?;
         let now = super::process_memory();
         let baseline = IosMemoryBaseline {
             domain: IosMemoryDomain::ProcessGrowth,
@@ -268,9 +296,13 @@ pub mod media {
         })?;
         // The full SDK boundary: baseline AND stated execution facts. The default policy approves
         // no premise, so native certificates still refuse process-domain derivation by default.
-        let facts = execution_facts(callbacks)?;
+        // Refresh only allocation-free live scope/analysis facts after source
+        // parsing. The selected stream metadata was already dropped pre-baseline.
+        facts.ios_quantum_scope = ios_quantum::enabled();
+        facts.analysis_budget_bytes = super::process_memory().available.unwrap_or(0);
         let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
-        let admission = mlx_gen_ios_catalog::admit_with_boundary_and_key_capacity(
+        let premise_policy = PremisePolicy::default();
+        let admission = mlx_gen_ios_catalog::admit_with_sana_lifecycle_fallback(
             &registry,
             candidates,
             &super::device_machine(),
@@ -278,13 +310,26 @@ pub mod media {
             mlx_gen_ios_catalog::SourceCapacityBoundary {
                 request_baseline: &baseline,
                 execution_facts: &facts,
-                premise_policy: &PremisePolicy::default(),
+                premise_policy: &premise_policy,
                 source_metadata_capacity: &mut key_next,
             },
         )?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
         incremental_capacity(admission.required_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
+        // Selection is final for this load. Observe the SAME sealed admission and
+        // original candidate, under the SAME source boundary, before ANY weight payload.
+        // In particular this sees a late native fallback, not an earlier host prediction.
+        observer(SelectedAdmissionView {
+            candidate: &candidates[admission.index()],
+            admission: &admission,
+            boundary: SourceCapacityBoundary {
+                request_baseline: &baseline,
+                execution_facts: &facts,
+                premise_policy: &premise_policy,
+                source_metadata_capacity: &mut key_next,
+            },
+        })?;
         Ok((registry, admission, now))
     }
 
@@ -318,6 +363,27 @@ pub mod media {
             candidates,
             Some(callbacks),
         )
+    }
+
+    /// [`load_sana_with`] with a synchronous metadata-only observer of the actual selected
+    /// admission. Called after ordinary-first/native-fallback selection and before model load;
+    /// observer failure propagates without allocating model weights. No permission is conveyed.
+    pub fn load_sana_with_observer(
+        candidates: &[IosCandidate],
+        callbacks: IosCallbackHost,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        let (registry, admission, at) = admitted_observing(
+            &["sana_1600m", "sana_sprint_1600m"],
+            candidates,
+            Some(callbacks),
+            observer,
+        )?;
+        let index = admission.index();
+        Ok((
+            index,
+            admission.load_generator(&registry, capacity_from(at))?,
+        ))
     }
 
     /// The SDXL family (every checkpoint route): text, image-to-image, edit/inpaint, control and
@@ -458,6 +524,39 @@ pub mod media {
             &super::device_machine(),
             &mut key_next,
         )?;
+        Ok((registry, permit))
+    }
+
+    /// Labelled capture with the caller's ACTUAL source boundary and a synchronous
+    /// pre-load metadata observer. Uses the same next-layout callback for capture
+    /// key construction and observation. This remains a bounded diagnostic permit,
+    /// not evidence admission or approval of a physical/process premise.
+    #[cfg(feature = "device-capture")]
+    pub fn capture_permit_with_observer(
+        candidate: &IosCandidate,
+        boundary: SourceCapacityBoundary<'_>,
+        observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
+    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+        if cfg!(target_os = "ios") {
+            require_limits_bound()?;
+        }
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let permit = catalog_capture_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+            &mut *boundary.source_metadata_capacity,
+        )?;
+        observer(SelectedAdmissionView {
+            candidate,
+            admission: &permit,
+            boundary: SourceCapacityBoundary {
+                request_baseline: boundary.request_baseline,
+                execution_facts: boundary.execution_facts,
+                premise_policy: boundary.premise_policy,
+                source_metadata_capacity: &mut *boundary.source_metadata_capacity,
+            },
+        })?;
         Ok((registry, permit))
     }
 
