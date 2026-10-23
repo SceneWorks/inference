@@ -409,10 +409,11 @@ fn refuses_missing_and_inconsistent_pruned_topologies() {
     }
 
     let mut headers = tiny_pruned_headers();
-    headers
+    let projection = headers
         .get_mut("transformer_blocks.0.adaln_proj.linear.weight")
-        .unwrap()
-        .1 = vec![36, 3];
+        .unwrap();
+    projection.1 = vec![36, 3];
+    projection.2.resize(36 * 3, 0.0);
     let w = tiny_weights(&headers);
     assert!(
         detect(&w, &cfg).is_err(),

@@ -240,11 +240,30 @@ fn native_projections_match_pinned_kitchen() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("weights.safetensors");
         write_parts(&file, k, n, g, None, 1.);
+        let headers =
+            candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&file).unwrap();
+        let bias_header = headers
+            .iter()
+            .find(|header| header.name == "p.bias")
+            .unwrap();
+        assert_eq!(
+            bias_header.dtype,
+            candle_gen::gen_core::weightsmeta::Dtype::F32
+        );
+        assert_eq!(bias_header.shape, [n]);
+        let expected_bias_bytes =
+            bias_header.shape.iter().product::<usize>() * bias_header.dtype.size();
         let w = Weights::from_files_native_int8(&[&file], &device).unwrap();
         let mut loaded = lin(&w, DIT, "p", true, dtype).unwrap();
         assert!(loaded.linear.is_convrot_int8());
         assert!(loaded.linear.is_packed());
-        assert_eq!(loaded.base_bytes, n * k + n * 4 + n * dtype.size_in_bytes());
+        let stored_bias = w.require("p.bias").unwrap();
+        assert_eq!(
+            stored_bias.dtype(),
+            DType::F32,
+            "the fixture stores its bias F32 regardless of activation dtype"
+        );
+        assert_eq!(loaded.base_bytes, n * k + n * 4 + expected_bias_bytes);
         assert_eq!(loaded.linear.base_shape(), (n, k));
         drop(w);
         let x = Tensor::from_vec(floats(&case["input"]), (m, k), &device)
