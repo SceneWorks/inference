@@ -7,6 +7,15 @@
 
 use serde::Deserialize;
 
+/// Stable source/storage and native execution identity of this validated operand format.
+///
+/// Consumers may persist this identity only after validating the descriptor and operands with
+/// [`ConvRotInt8`]. It is distinct from the unrotated `int8-per-row-v1` codec: reporting that
+/// codec for these rotated codes would describe the wrong basis and activation arithmetic.
+/// This identifier does not register a generic dense decoder or authorize a dense fallback;
+/// native MLX and CUDA projections consume the original signed codes and F32 row scales.
+pub const CODEC_ID: &str = "convrot-int8-native";
+
 /// Maximum descriptor payload; checked before copying a descriptor off a device.
 pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
 
