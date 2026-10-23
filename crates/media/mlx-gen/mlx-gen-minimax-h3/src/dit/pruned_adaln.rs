@@ -83,6 +83,29 @@ pub fn binding_identity(w: &Weights, topology: &PrunedAdaLn) -> Result<PruningId
                 operand.name
             ))
         })?;
+        // The loaded source must agree with the topology's *declared* dtype and shape before it is
+        // hashed under that declaration — otherwise a caller could bind a topology from one basis
+        // and feed values from another, mislabelling whose bytes the identity digests.
+        let source_dtype = gen_dtype(array.dtype()).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax-h3 pruned adaln: {} has dtype {:?}, not a dense F16/BF16/F32 source",
+                operand.name,
+                array.dtype()
+            ))
+        })?;
+        if source_dtype != operand.dtype {
+            return Err(Error::Msg(format!(
+                "minimax-h3 pruned adaln: {} declares {:?} but the loaded source is {:?}",
+                operand.name, operand.dtype, source_dtype
+            )));
+        }
+        let actual: Vec<usize> = array.shape().iter().map(|&d| d as usize).collect();
+        if actual.as_slice() != operand.shape.as_slice() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 pruned adaln: {} declares {:?} but the loaded source is {actual:?}",
+                operand.name, operand.shape
+            )));
+        }
         let widened = array.as_dtype(Dtype::Float32)?;
         builder
             .operand_values(&operand.name, widened.as_slice::<f32>().iter().copied())
@@ -112,9 +135,15 @@ pub struct PrunedTable {
 impl PrunedTable {
     /// Load `adaln_t_table` at its published F32 dtype, `[grid, rank]`.
     pub fn from_weights(w: &Weights, grid: usize, rank: usize) -> Result<Self> {
-        let table = w
-            .require(TABLE_KEY)?
-            .as_dtype(Dtype::Float32)?;
+        let table = w.require(TABLE_KEY)?.clone();
+        // Refuse a non-F32 table *before* any cast — widening a BF16/F16 table into validity
+        // would fake the contract the header-only `inspect` already enforced.
+        if table.dtype() != Dtype::Float32 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 pruned adaln: {TABLE_KEY} must be F32, got {:?}",
+                table.dtype()
+            )));
+        }
         let want = [grid as i32, rank as i32];
         if table.shape() != want {
             return Err(Error::Msg(format!(
@@ -380,6 +409,10 @@ impl PrunedAdaLnRuntime {
     /// [`AdaLnCache::precompute`]. The projections are a few tens of MB, so there is no eviction
     /// step: [`AdaLnCache::from_layers_pruned`] still forces evaluation per block (the lazy-eval
     /// discipline) and binds the cache to this topology's content identity.
+    ///
+    /// `num_blocks` must equal the reduced projection count exactly; the modulation is projected
+    /// **only** from this runtime's own `block_projections` — never from caller-passed block bodies,
+    /// whose identity belongs to the source binding, not the pruning identity.
     pub fn precompute(
         &self,
         schedule: TimestepSchedule,

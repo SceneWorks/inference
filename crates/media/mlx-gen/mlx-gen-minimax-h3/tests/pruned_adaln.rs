@@ -21,7 +21,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
-    detect, AdaLayerNormOut, DitBlock, LinearBias, MiniMaxH3DitConfig, MmRope,
+    detect, AdaLayerNormOut, DitBlock, LinearBias, MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope,
 };
 
 /// The shared generated fixture, resolved against the repo root after integration.
@@ -374,4 +374,110 @@ fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
     assert!(close(rows[2], 1.5), "t=0.5 lerps to the midpoint");
     assert!(close(rows[4], 3.0), "t=1 addresses the last interval at fraction 1");
     assert!(close(rows[6], 3.0), "t=2 clamps to the last row");
+}
+
+/// Deterministic, non-degenerate synthetic values for the heads/refiner the block/final-only
+/// oracle omits. The pruning identity deliberately does NOT cover these, so their exact values are
+/// irrelevant — they only need correct shapes so the production loader succeeds.
+fn ramp(n: usize) -> Vec<f64> {
+    (0..n).map(|i| (i as f64 % 41.0 - 20.0) / 128.0).collect()
+}
+
+/// The ten body tensors a transformer block and a token-refiner block both consume.
+const BLOCK_BODY_NAMES: [&str; 10] = [
+    "norm1.weight",
+    "attn.to_q.weight",
+    "attn.to_k.weight",
+    "attn.to_v.weight",
+    "attn.norm_q.weight",
+    "attn.norm_k.weight",
+    "attn.to_out.0.weight",
+    "norm2.weight",
+    "ff.net.0.proj.weight",
+    "ff.net.2.weight",
+];
+
+/// Build the **entire** pruned checkpoint map: the oracle's block/final tensors plus the heads and
+/// token refiner a real diffusers layout also ships. `table_perturb` is added to one table value so
+/// a same-shape, different-basis model can be built without changing any shape.
+fn full_pruned_map(json: &serde_json::Value, table_perturb: f64) -> HashMap<String, Array> {
+    let mut map: HashMap<String, Array> = HashMap::new();
+    for (name, tensor) in json["tensors"].as_object().unwrap() {
+        let shape: Vec<i64> = tensor["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        let mut data: Vec<f64> = tensor["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        if name == "adaln_t_table" && data.len() > 3 {
+            data[3] += table_perturb;
+        }
+        map.insert(name.clone(), array_from_json(&shape, tensor["dtype"].as_str().unwrap(), &data));
+    }
+    let heads: [(&str, Vec<i64>); 6] = [
+        ("proj_in.weight", vec![8, 4]),
+        ("proj_in.bias", vec![8]),
+        ("audio_proj_in.weight", vec![8, 4]),
+        ("audio_proj_in.bias", vec![8]),
+        ("context_embedder.weight", vec![8, 8]),
+        ("context_embedder.bias", vec![8]),
+    ];
+    for (name, shape) in heads {
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        map.insert(name.to_string(), array_from_json(&shape, "F32", &ramp(n)));
+    }
+    for body in BLOCK_BODY_NAMES {
+        let src = map
+            .get(&format!("transformer_blocks.0.{body}"))
+            .unwrap_or_else(|| panic!("fixture lacks transformer_blocks.0.{body}"))
+            .clone();
+        map.insert(format!("token_refiner.refiner_blocks.0.{body}"), src);
+    }
+    map.insert(
+        "token_refiner.final_norm.weight".to_string(),
+        array_from_json(&[8i64], "F32", &ramp(8)),
+    );
+    map
+}
+
+/// Build the **whole** pruned DiT through `MiniMaxH3Dit::from_weights` — the production resident
+/// load path `load_dir` funnels into — and exercise the pruning identity / compatibility predicate
+/// against a matching and a same-shape different-basis model. The pruned operands (table + reduced
+/// projections + folded biases) bind the identity; the synthetic heads/refiner do not.
+#[test]
+fn full_model_detects_pruned_and_checks_pruning_identity() {
+    let json: serde_json::Value = serde_json::from_str(FIXTURE).expect("the pruned oracle fixture");
+    let cfg = oracle_cfg();
+
+    let mut w = Weights::from_map(full_pruned_map(&json, 0.0));
+    let dit = MiniMaxH3Dit::from_weights(&mut w, &cfg, Dtype::Float32)
+        .expect("a complete pruned checkpoint loads the full DiT");
+
+    let identity = dit.pruning_identity().expect("a pruned DiT carries an identity");
+    dit.ensure_pruning_identity(&identity).expect("identity matches itself");
+
+    let mut other = identity;
+    other.0[0] ^= 0xff;
+    assert!(
+        dit.ensure_pruning_identity(&other).is_err(),
+        "a different basis must refuse against the expected identity"
+    );
+
+    // Same shapes, one perturbed table value: the second model bound a DIFFERENT basis and must
+    // refuse the original model's identity.
+    let mut w2 = Weights::from_map(full_pruned_map(&json, 0.5));
+    let dit2 = MiniMaxH3Dit::from_weights(&mut w2, &cfg, Dtype::Float32)
+        .expect("the perturbed checkpoint is still a complete pruned topology");
+    let identity2 = dit2.pruning_identity().expect("the perturbed DiT still carries an identity");
+    assert_ne!(identity2, identity, "same-shape different basis must identify differently");
+    assert!(
+        dit2.ensure_pruning_identity(&identity).is_err(),
+        "the perturbed model must refuse the original basis"
+    );
 }
