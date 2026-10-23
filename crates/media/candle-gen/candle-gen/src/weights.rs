@@ -40,6 +40,8 @@ fn coerce_float(v: Tensor, dtype: DType) -> Result<Tensor> {
 /// A loaded checkpoint weight map (every tensor coerced to the requested compute dtype on load).
 pub struct Weights {
     map: HashMap<String, Tensor>,
+    int8: std::sync::Mutex<Option<crate::quant::Int8Context>>,
+    convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
 }
 
 impl Weights {
@@ -62,7 +64,7 @@ impl Weights {
         for (k, v) in raw {
             map.insert(k, coerce_float(v, dtype)?);
         }
-        Ok(Self { map })
+        Ok(Self::from_map(map))
     }
 
     /// Load and MERGE every `.safetensors` file in `files` into one weight map, in the given order
@@ -96,7 +98,7 @@ impl Weights {
                 }
             }
         }
-        Ok(Self { map })
+        Ok(Self::from_map(map))
     }
 
     /// Load only the tensors whose key starts with one of `prefixes`, via a header-only mmap
@@ -127,7 +129,7 @@ impl Weights {
             let v = coerce_float(st.load(&k, device)?, dtype)?;
             map.insert(k, v);
         }
-        Ok(Self { map })
+        Ok(Self::from_map(map))
     }
 
     /// Shard-aware [`from_file_filtered`](Self::from_file_filtered): apply the same header-only,
@@ -165,7 +167,7 @@ impl Weights {
                 }
             }
         }
-        Ok(Self { map })
+        Ok(Self::from_map(map))
     }
 
     /// Fetch a required tensor, erroring (not panicking) when a checkpoint is missing a key.
@@ -191,7 +193,136 @@ impl Weights {
     /// IP-Adapter image-encoder fixtures, sc-5872) construct synthetic weights without a file, and a
     /// caller can assemble a checkpoint programmatically.
     pub fn from_map(map: HashMap<String, Tensor>) -> Self {
-        Self { map }
+        Self {
+            map,
+            int8: std::sync::Mutex::new(None),
+            convrot_rotations: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Native INT8-aware shard loading. Candle has no signed-byte dtype; preserve an I8
+    /// weight's exact two's-complement bytes as U8, not an 8x I64/dense floating expansion.
+    /// Row scales remain F32. Other tensors retain the ordinary loader's dtype policy.
+    pub fn from_files_native_int8(
+        files: &[impl AsRef<Path>],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Header/descriptor/scale pass first: no tensor, CUDA handle or rotation is allocated
+        // until every native projection is validated, even when companions live in other shards.
+        let mut stores = Vec::with_capacity(files.len());
+        let mut headers = HashMap::new();
+        for (index, path) in files.iter().enumerate() {
+            // SAFETY: caller-provisioned read-only checkpoint, identical to from_files_filtered.
+            let st = unsafe { MmapedSafetensors::new(path.as_ref())? };
+            for (key, view) in st.tensors() {
+                if key.ends_with(".comfy_quant")
+                    && (view.dtype() != safetensors::Dtype::U8
+                        || view.shape().len() != 1
+                        || view.data().len() > gen_core::convrot_int8::MAX_DESCRIPTOR_BYTES)
+                {
+                    return Err(CandleError::Msg(format!(
+                        "{key}: descriptor must be a bounded U8 vector"
+                    )));
+                }
+                if headers
+                    .insert(key.clone(), (index, view.dtype(), view.shape().to_vec()))
+                    .is_some()
+                {
+                    return Err(CandleError::Msg(format!("duplicate tensor key {key:?}")));
+                }
+            }
+            stores.push(st);
+        }
+        for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
+            let base = key.trim_end_matches(".comfy_quant");
+            let weight = format!("{base}.weight");
+            let scale = format!("{base}.weight_scale");
+            let (_, wd, ws) = headers
+                .get(&weight)
+                .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight")))?;
+            let (si, sd, ss) = headers
+                .get(&scale)
+                .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight_scale")))?;
+            if *wd != safetensors::Dtype::I8 || *sd != safetensors::Dtype::F32 {
+                return Err(CandleError::Msg(format!(
+                    "{key}: native ConvRot requires original I8 storage and F32 scales"
+                )));
+            }
+            if headers.contains_key(&format!("{base}.scales"))
+                || headers.contains_key(&format!("{base}.biases"))
+            {
+                return Err(CandleError::Msg(format!(
+                    "{key}: contradictory affine and ConvRot operands"
+                )));
+            }
+            let payload = stores[*di].get(key)?;
+            let descriptor = gen_core::convrot_int8::ConvRotInt8::parse(payload.data(), ws, ss)
+                .map_err(CandleError::Msg)?;
+            let scales = stores[*si].get(&scale)?;
+            descriptor
+                .validate_scale_values(
+                    scales
+                        .data()
+                        .chunks_exact(4)
+                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])),
+                )
+                .map_err(CandleError::Msg)?;
+        }
+        for (key, (_, stored_dtype, _)) in &headers {
+            if (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
+                || key.ends_with(".weight_scale")
+            {
+                let base = key.rsplit_once('.').expect("suffix above contains a dot").0;
+                if !headers.contains_key(&format!("{base}.comfy_quant")) {
+                    return Err(CandleError::Msg(format!(
+                        "{key}: native INT8 requires .comfy_quant"
+                    )));
+                }
+            }
+        }
+        let mut map = HashMap::with_capacity(headers.len());
+        for st in &stores {
+            for (key, view) in st.tensors() {
+                let tensor = if view.dtype() == safetensors::Dtype::I8 {
+                    Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
+                } else if key.ends_with(".weight_scale") || key.ends_with(".comfy_quant") {
+                    st.load(&key, device)?
+                } else {
+                    coerce_float(st.load(&key, device)?, dtype)?
+                };
+                map.insert(key, tensor);
+            }
+        }
+        Ok(Self::from_map(map))
+    }
+
+    /// One lazy cuBLASLt handle/workspace for every native INT8 projection in this map.
+    pub fn int8_context(&self, device: &Device) -> Result<crate::quant::Int8Context> {
+        let mut cached = self.int8.lock().unwrap_or_else(|p| p.into_inner());
+        if cached.is_none() {
+            *cached = Some(crate::quant::Int8Context::new(device)?);
+        }
+        Ok(cached.as_ref().expect("initialized above").clone())
+    }
+
+    /// Share one immutable rotation per group on this map's device (no per-layer matrix copies).
+    pub fn convrot_rotation(&self, group: usize, device: &Device) -> Result<Tensor> {
+        let mut cache = self
+            .convrot_rotations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = cache.get(&group) {
+            if !r.device().same_device(device) {
+                return Err(CandleError::Msg(
+                    "ConvRot map contains multiple devices".into(),
+                ));
+            }
+            return Ok(r.clone());
+        }
+        let r = crate::quant::regular_hadamard(group, device)?;
+        cache.insert(group, r.clone());
+        Ok(r)
     }
 }
 

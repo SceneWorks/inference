@@ -62,6 +62,7 @@ pub mod adapters;
 // a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
 // candle ops — builds everywhere (CPU tests + CUDA).
 pub mod convrot;
+pub mod convrot_int8;
 
 // The cuBLASLt 8-bit GEMM compute leg (sc-9299 spike, epic 9083's 8-bit pivot): fp8 E4M3 + int8
 // IGEMM matmul over cudarc's raw cublasLt sys bindings, plus the `Fp8Linear`/`Int8Linear` linear

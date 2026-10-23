@@ -43,6 +43,9 @@ mod bounded_attention;
 #[path = "bounded_attention_real.rs"]
 mod bounded_attention_real;
 
+#[path = "convrot_int8.rs"]
+mod convrot_int8;
+
 #[path = "cross_backend_record.rs"]
 mod cross_backend_record;
 
