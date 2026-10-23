@@ -87,7 +87,7 @@ pub fn total_bytes() -> Result<u64> {
     let mut size = std::mem::size_of::<u64>();
     let status = unsafe {
         libc::sysctlbyname(
-            b"hw.memsize\0".as_ptr().cast(),
+            c"hw.memsize".as_ptr(),
             (&mut total as *mut u64).cast(),
             &mut size,
             std::ptr::null_mut(),

@@ -928,9 +928,9 @@ mod source_abi_tests {
             (0.0, 0x0000_u16),
             (-0.0, 0x8000),
             (1.0, 0x3f80),
-            (1.00390625, 0x3f80),
-            (1.01171875, 0x3f82),
-            (-1.00390625, 0xbf80),
+            (f32::from_bits(0x3f80_8000), 0x3f80),
+            (f32::from_bits(0x3f81_8000), 0x3f82),
+            (f32::from_bits(0xbf80_8000), 0xbf80),
         ] {
             assert_eq!(bf16_bytes(value).unwrap(), bits.to_le_bytes());
         }
@@ -953,10 +953,9 @@ mod source_abi_tests {
             "text_encoder/model.safetensors",
             "vae/diffusion_pytorch_model.safetensors",
         ] {
-            let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(
-                &fixture.root.join(relative),
-            )
-            .unwrap();
+            let headers =
+                gen_core::weightsmeta::safetensors_path_tensor_headers(fixture.root.join(relative))
+                    .unwrap();
             assert!(!headers.is_empty());
             for header in headers {
                 let expected =

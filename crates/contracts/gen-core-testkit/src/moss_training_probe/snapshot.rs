@@ -515,7 +515,7 @@ mod tests {
             "block.alpha":{"dtype":"F32","shape":[1],"data_offsets":[16,20]},
             "__d":{"dtype":"F32","shape":[1],"data_offsets":[20,24]}});
         let mut h = serde_json::to_vec(&header).unwrap();
-        while h.len() % 8 != 0 {
+        while !h.len().is_multiple_of(8) {
             h.push(b' ');
         }
         let mut f = File::create(path).unwrap();
@@ -572,7 +572,7 @@ mod tests {
                 header["__metadata__"] = metadata;
             }
             let mut bytes = serde_json::to_vec(&header).unwrap();
-            while bytes.len() % 8 != 0 {
+            while !bytes.len().is_multiple_of(8) {
                 bytes.push(b' ');
             }
             let mut f = File::create(&path).unwrap();
