@@ -330,6 +330,50 @@ fn architecture_facts(s: &Sources) -> MemoryArchitectureFacts {
     }
 }
 
+/// Cold typed edit admission: validates controls and exact package before device dispatch.
+pub fn edit_request_peak(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    request: &GenerationRequest,
+    inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
+) -> gen_core::Result<u64> {
+    inputs.validate()?;
+    let request = gen_core::moss_image_edit::edit_request(request)?;
+    let resolved = MossImageResolved::resolve(variant, &request)?;
+    let images = inputs.advanced.validate(&request, &resolved)?;
+    crate::checked_host_elements(&request, images)?;
+    check_request(&request)?;
+    crate::transformer::check_cancel(&request.cancel)?;
+    crate::edit::EditAssets::prepare(spec)?;
+    let sources =
+        Sources::selected_with_cancel(variant, spec, MossImageAcceleration::Off, &request.cancel)?;
+    let staged = request
+        .memory
+        .map_or(spec.offload_policy == OffloadPolicy::Sequential, |m| {
+            m.stage_residency
+        });
+    estimate(&sources, &resolved, &request, images, staged)?
+        .checked_add(crate::edit::extra_peak(inputs, &request)?)
+        .ok_or_else(|| gen_core::Error::Unsupported("MOSS edit peak overflow".into()))
+}
+pub(crate) fn safety_check(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    if (context.geometry.reference_count != 0
+        && !(context.geometry.reference_count == 1
+            && spec
+                .components
+                .contains_key(gen_core::moss_image_edit::EDIT_COMPONENT)))
+        || context.use_pid
+        || context.has_phases
+    {
+        return MemorySafetyDecision::Reject { reason: "MOSS accepts one typed edit reference only with its exact edit component; PID/phases are unsupported".into() };
+    }
+    gen_core::default_registered_memory_strategy_safety_check(spec, contract, context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -934,3 +934,86 @@ fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325(
     .unwrap();
     assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }
+
+#[test]
+fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
+    let generator = synthetic_generator();
+    let ordinary = fixture("fixture.json");
+    let model = Transformer::load(
+        &weights(&ordinary["weights"], DType::F32),
+        geometry(&ordinary),
+        None,
+    )
+    .unwrap();
+    let report = MossImageEditExecutionReport {
+        base: synthetic_report(),
+        adapter_path: "synthetic-only".into(),
+        edit_contract: EDIT_CONTRACT.into(),
+        adapter_repository: EDIT_REPOSITORY.into(),
+        adapter_revision: EDIT_REVISION.into(),
+        adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+        config_sha256: EDIT_CONFIG_SHA256.into(),
+        applied_projections: 252,
+        references: vec![],
+        reference_max_edge: 512,
+        use_kv_cache: true,
+    };
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = Some(synthetic_report());
+        state.edit_report = Some(report.clone());
+        state.renderer = Some(pipeline::Renderer {
+            mode: MossImageAcceleration::Off,
+            transformer: model,
+            dataspace: None,
+            adapter_reports: vec![],
+        });
+    }
+    assert!(generator.moss_image_owned_weight_bytes().unwrap() > 0);
+    assert!(generator
+        .generate_moss_image_edit(
+            &GenerationRequest::default(),
+            MossImageEditInputs::default(),
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.moss_image_edit_execution_report().is_none());
+    assert!(generator.moss_image_execution_report().is_none());
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(0));
+    let references = [Image {
+        width: 16,
+        height: 16,
+        pixels: vec![0; 16 * 16 * 3],
+    }];
+    let inputs = MossImageEditInputs {
+        references: &references,
+        ..Default::default()
+    };
+    let canceled = GenerationRequest::default();
+    canceled.cancel.cancel();
+    assert!(matches!(
+        generator.generate_moss_image_edit(&canceled, inputs, &mut |_| {}),
+        Err(gen_core::Error::Canceled)
+    ));
+    let request = GenerationRequest::default();
+    let error = generator
+        .generate_moss_image_edit(&request, inputs, &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exact moss-image-edit package"),
+        "fresh call must re-enter validation: {error}"
+    );
+    candle_gen::lock_recover(&generator.state).edit_report = Some(report);
+    assert!(generator
+        .generate(
+            &GenerationRequest {
+                width: 17,
+                ..Default::default()
+            },
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.moss_image_edit_execution_report().is_none());
+    assert!(generator.validate(&GenerationRequest::default()).is_ok());
+}
