@@ -9,6 +9,8 @@ if (-not $root.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or 
 }
 New-Item -ItemType Directory -Path $root | Out-Null
 $issues = [Collections.Generic.List[string]]::new()
+# Optional metadata is bounded by the same three windows and 256-PID cohorts.
+$warnings = [Collections.Generic.List[string]]::new()
 $record = [ordered]@{
     schemaVersion = 1; purpose = 'read-only GPU1 evidence; not admission'
     host = [Environment]::MachineName; runner = $env:RUNNER_NAME
@@ -17,6 +19,7 @@ $record = [ordered]@{
     collectionComplete = $false; telemetryComplete = $false; evidenceTruncated = $false
     admission = 'not_evaluated'; applicationJobOwnership = 'unknown'
     physicalGpu = 1; mapping = $null; samples = @(); queries = @(); errors = $issues
+    optionalMetadataWarnings = $warnings
 }
 function Evidence-Label($Value) {
     $text = [string]$Value
@@ -41,7 +44,7 @@ function Save-Record {
             source = (Evidence-Label $record.source); metadataStringLimit = 128
             originalCompactUtf8Bytes = $originalBytes; limitUtf8Bytes = 4MB
             originalSampleCount = $record.samples.Count; originalQueryCount = $record.queries.Count
-            originalErrorCount = $issues.Count
+            originalErrorCount = $issues.Count; originalOptionalMetadataWarningCount = $warnings.Count
             sampleRows = @($record.samples | Select-Object -First 3 | ForEach-Object {
                 @{ counters = $_.counters.Count; utc = (Evidence-Label $_.utc) }
             })
@@ -107,8 +110,8 @@ function Process-Identity([int[]]$ProcessIds) {
     foreach ($processIdValue in @($ProcessIds | Sort-Object -Unique)) {
         try {
             $row = Get-CimInstance Win32_Process -Filter "ProcessId=$processIdValue" -Property ProcessId,Name,CreationDate,ParentProcessId,ExecutablePath -ErrorAction Stop
-            if ($null -eq $row -or $null -eq $row.CreationDate -or -not $row.Name) { throw 'Process identity unavailable or exited' }
-            if (-not $row.ExecutablePath) { $issues.Add("Executable path unavailable for PID $processIdValue") }
+            if ($null -eq $row -or $row.ProcessId -ne $processIdValue -or $null -eq $row.CreationDate -or -not $row.Name) { throw 'Process identity unavailable or exited' }
+            if (-not $row.ExecutablePath) { $warnings.Add("Executable path unavailable for PID $processIdValue") }
             $result += @{ status = 'resolved'; pathAvailable = [bool]$row.ExecutablePath; pid = $row.ProcessId; name = $row.Name; createdUtc = $row.CreationDate.ToUniversalTime().ToString('o'); parentPid = $row.ParentProcessId; path = $row.ExecutablePath }
         } catch {
             $issues.Add("CIM identity unknown for PID $processIdValue")
@@ -231,8 +234,11 @@ try {
             foreach ($before in $sample.identitiesBefore) {
                 $after = @($sample.identitiesAfter | Where-Object { $_.pid -eq $before.pid })
                 if ($before.status -ne 'resolved' -or $after.Count -ne 1 -or $after[0].status -ne 'resolved') { continue }
-                if ($before.createdUtc -ne $after[0].createdUtc -or $before.name -ne $after[0].name -or $before.path -ne $after[0].path) {
+                if ($before.createdUtc -ne $after[0].createdUtc -or $before.name -ne $after[0].name -or ($before.pathAvailable -and $after[0].pathAvailable -and $before.path -ne $after[0].path)) {
                     $issues.Add("Process identity changed for PID $($before.pid)")
+                }
+                if ($before.pathAvailable -ne $after[0].pathAvailable) {
+                    $warnings.Add("Executable path availability changed for PID $($before.pid)")
                 }
             }
         } catch { $issues.Add('GPU1 sample incomplete'); $sample['error'] = $_.Exception.Message }

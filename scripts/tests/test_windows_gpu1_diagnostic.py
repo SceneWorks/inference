@@ -73,6 +73,54 @@ def scalar_predicate(script, name, **values):
     return bool(eval(expression, {'__builtins__': {}}, dict(values, isnan=math.isnan, isinf=math.isinf)))
 
 
+def identity_observation_contract(script, before, after, *, telemetry_errors=()):
+    """Exercise the actual PS branch predicates in a narrow Python subset.
+
+    Source-wiring assertions bind the mandatory/optional destinations. This does
+    not emulate PowerShell, CIM access, or prove Windows runtime behavior.
+    """
+    def condition(marker, bindings):
+        line = next(line for line in script.splitlines() if marker in line)
+        expression = re.search(r'if \((.*)\) \{', line)[1]
+        values = {}
+        for index, (token, value) in enumerate(sorted(bindings.items(), key=lambda item: -len(item[0]))):
+            name = f'v{index}'
+            expression = expression.replace(token, name)
+            values[name] = value
+        for op, py in (('-not ', 'not '), ('-and', 'and'), ('-or', 'or'), ('-ne', '!='), ('-eq', '==')):
+            expression = expression.replace(op, py)
+        if re.search(r'[^\w\s()!.=]', expression):
+            raise AssertionError('identity condition outside tested subset: ' + expression)
+        return bool(eval(expression, {'__builtins__': {}}, values))
+
+    errors, warnings, identities = list(telemetry_errors), [], []
+    for row in (before, after):
+        fields = row or {}
+        bindings = {'$null': None, '$row': row, '$row.ProcessId': fields.get('pid'),
+                    '$processIdValue': 42, '$row.CreationDate': fields.get('created'),
+                    '$row.Name': fields.get('name')}
+        if condition("throw 'Process identity unavailable or exited'", bindings):
+            errors.append('identity unavailable')
+            identities.append(None)
+            continue
+        path_available = bool(fields.get('path'))
+        if condition('if (-not $row.ExecutablePath)', {'$row.ExecutablePath': fields.get('path')}):
+            warnings.append('path unavailable')
+        identities.append(dict(fields, pathAvailable=path_available))
+    if all(identities):
+        bindings = {}
+        for prefix, row in zip(('$before', '$after[0]'), identities):
+            for ps, field in (('createdUtc', 'created'), ('name', 'name'), ('path', 'path'), ('pathAvailable', 'pathAvailable')):
+                bindings[prefix + '.' + ps] = row.get(field)
+        if condition('if ($before.createdUtc', bindings):
+            errors.append('identity changed')
+        if condition('if ($before.pathAvailable', bindings):
+            warnings.append('path availability changed')
+    return {'telemetryComplete': not errors, 'errors': errors,
+            'optionalMetadataWarnings': warnings, 'identities': identities,
+            'admission': 'not_evaluated', 'applicationJobOwnership': 'unknown'}
+
+
 def cohort_structure_errors(script):
     """Pin the pre-window identity boundary, including non-NVML counter PIDs."""
     errors = []
@@ -122,6 +170,7 @@ def evidence_budget_contract(record):
         'originalSampleCount': len(record.get('samples', [])),
         'originalQueryCount': len(record.get('queries', [])),
         'originalErrorCount': len(record.get('errors', [])),
+        'originalOptionalMetadataWarningCount': len(record.get('optionalMetadataWarnings', [])),
         'sampleRows': [{'counters': len(sample['counters']), 'utc': sample['utc'][:128]}
                        for sample in record.get('samples', [])[:3]],
     }
@@ -250,6 +299,64 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         for index, mutated in enumerate(mutations):
             with self.subTest(mutation=index):
                 self.assertNotEqual(cohort_structure_errors(mutated), [])
+
+    def test_optional_path_metadata_does_not_hide_required_identity_failures(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        row = dict(pid=42, name='system.exe', created='2026-10-22T23:00:00Z', path=None)
+        observed = identity_observation_contract(script, row, row)
+        self.assertTrue(observed['telemetryComplete'])
+        self.assertEqual(observed['optionalMetadataWarnings'], ['path unavailable'] * 2)
+        self.assertTrue(all(not x['pathAvailable'] for x in observed['identities']))
+        self.assertEqual(observed['admission'], 'not_evaluated')
+        self.assertEqual(observed['applicationJobOwnership'], 'unknown')
+        encoded, full = evidence_budget_contract(observed)
+        self.assertTrue(full)
+        self.assertEqual(json.loads(encoded), observed)
+        for bad in (None, dict(row, pid=43), dict(row, name=''), dict(row, created=None),
+                    dict(row, created='2026-10-22T23:01:00Z'), dict(row, name='other.exe')):
+            with self.subTest(bad=bad):
+                self.assertFalse(identity_observation_contract(script, row, bad)['telemetryComplete'])
+        for failure in ('mapping unknown', 'query failed', 'invalid counter', 'new PID', 'device value N/A'):
+            self.assertFalse(identity_observation_contract(script, row, row, telemetry_errors=[failure])['telemetryComplete'])
+
+    def test_path_availability_transitions_are_optional_but_known_mismatch_is_mandatory(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        row = dict(pid=42, name='system.exe', created='2026-10-22T23:00:00Z', path=None)
+        known = dict(row, path=r'C:\Windows\System32\system.exe')
+        for before, after in ((row, known), (known, row)):
+            observed = identity_observation_contract(script, before, after)
+            self.assertTrue(observed['telemetryComplete'])
+            self.assertIn('path unavailable', observed['optionalMetadataWarnings'])
+            self.assertIn('path availability changed', observed['optionalMetadataWarnings'])
+            self.assertEqual([x['pathAvailable'] for x in observed['identities']], [bool(before['path']), bool(after['path'])])
+        self.assertTrue(identity_observation_contract(script, known, known)['telemetryComplete'])
+        changed = identity_observation_contract(script, known, dict(known, path=r'C:\Other\system.exe'))
+        self.assertFalse(changed['telemetryComplete'])
+        self.assertIn('identity changed', changed['errors'])
+        # Removing the both-known guard is discriminated by the transition case.
+        mutant = script.replace('$before.pathAvailable -and $after[0].pathAvailable -and ', '')
+        self.assertFalse(identity_observation_contract(mutant, row, known)['telemetryComplete'])
+
+    def test_optional_warning_wiring_keeps_mandatory_errors_and_budget_bounds(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('optionalMetadataWarnings = $warnings', script)
+        self.assertIn('$warnings = [Collections.Generic.List[string]]::new()', script)
+        self.assertIn('$warnings.Add("Executable path unavailable for PID $processIdValue")', script)
+        self.assertIn('$warnings.Add("Executable path availability changed for PID $($before.pid)")', script)
+        self.assertNotIn('$issues.Add("Executable path', script)
+        self.assertIn('$issues.Add("CIM identity unknown for PID $processIdValue")', script)
+        self.assertIn('$issues.Add("Process identity changed for PID $($before.pid)")', script)
+        self.assertIn("$record['telemetryComplete'] = ($issues.Count -eq 0)", script)
+        self.assertIn('originalOptionalMetadataWarningCount = $warnings.Count', script)
+        # Optional details are explicitly counted if the unchanged budget overflows.
+        record = {'optionalMetadataWarnings': ['x' * 2048] * 4096}
+        encoded, full = evidence_budget_contract(record)
+        self.assertFalse(full)
+        result = json.loads(encoded)
+        self.assertLess(len(encoded), 8192)
+        self.assertEqual(result['originalOptionalMetadataWarningCount'], 4096)
+        self.assertFalse(result['telemetryComplete'])
+        self.assertTrue(result['recordDetailsOmitted'])
 
     def test_evidence_budget_below_exact_and_above_limit(self):
         envelope = {'completed': False, 'payload': ''}
