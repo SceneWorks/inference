@@ -165,6 +165,7 @@ impl SourceInventory {
         Err(Error::Unsupported(reason.into()))
     }
 
+    #[cfg(target_vendor = "apple")]
     fn changed_with_capacity<T>(next: &mut dyn FnMut(u64) -> Result<()>) -> Result<T> {
         Self::metadata_gap(next, "source inventory changed after admission")
     }
@@ -311,6 +312,7 @@ impl SourceInventory {
         }
     }
 
+    #[cfg(target_vendor = "apple")]
     fn expected_is_file(&self, path: &Path) -> bool {
         // Both acquisition paths retain pins in sorted file-path order.
         self.pins
@@ -318,6 +320,7 @@ impl SourceInventory {
             .is_ok()
     }
 
+    #[cfg(any(test, target_vendor = "apple"))]
     fn expected_child_index(&self, directory: &Path, name: &std::ffi::OsStr) -> Option<usize> {
         // Compare a BORROWED joined component sequence against the sorted closure.
         // No joined PathBuf, name allocation or quadratic full-member scan.

@@ -4934,7 +4934,7 @@ impl NativeLedger {
                 let mut state = initial;
                 for _ in 0..steps {
                     self.preview_graph(n, state.width, false)?;
-                    let eps = self.forward_request(c, r, native_dtype(state.width)?)?;
+                    let eps = self.forward_request(c, r, native_dtype(state.width))?;
                     state.width =
                         self.ancestral_update(n, state.width, q::dtype_bytes(eps.dtype))?;
                     if r.route == Route::Mask {

@@ -799,12 +799,12 @@ pub(crate) fn bound_ancestral_forward_windows(
             .iter()
             .filter(|window| window.owner_domain == "sdxl/ancestral/forward-input-native-v1")
         {
-            if ancestral_body_coordinate(at_anchor, states[0])? != requested_body {
+            let Some(anchor_class) = at_anchor.profile_class() else {
+                continue;
+            };
+            if ancestral_body_coordinate(anchor_class, states[0])? != requested_body {
                 continue;
             }
-            let anchor_class = at_anchor
-                .profile_class()
-                .expect("validated body coordinate");
             // This checks that the generated ledger still describes the identical common body.
             // It does NOT turn either scratch upper into a physical anchor lower bound.
             if requested.label != at_anchor.label
