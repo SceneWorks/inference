@@ -666,7 +666,7 @@ class ScratchFreshnessTests(unittest.TestCase):
                             return gate.os.stat_result(fields)
                         if mode == 'deadline': clock[0] = 60
                     if mode == 'destination' and name == self.name+'.run-build-fingerprint':
-                        fd = gate.os.open(name, gate.os.O_WRONLY | gate.os.O_CREAT | gate.os.O_EXCL, 0o600, dir_fd=kwargs['dir_fd'])
+                        fd = os.open(name, gate.os.O_WRONLY | gate.os.O_CREAT | gate.os.O_EXCL, 0o600, dir_fd=kwargs['dir_fd'])
                         gate.os.close(fd)
                     return original_stat(name, *args, **kwargs)
                 def rename(source, *args, **kwargs):
