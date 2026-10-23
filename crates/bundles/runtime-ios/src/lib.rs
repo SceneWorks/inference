@@ -1258,7 +1258,8 @@ mod tests {
     fn every_admitted_facade_requires_bound_limits_and_refuses_without_evidence() {
         use crate::media::{self, AdmissionError, RefusalKind};
         let root = tempfile::tempdir().unwrap();
-        let candidates = fixtures::candidates(root.path());
+        let artifacts = root.path().join("artifacts");
+        let candidates = fixtures::candidates(&artifacts);
         type Facade = fn(&[media::IosCandidate]) -> Result<usize, AdmissionError>;
         let facades: [(&str, Facade); 8] = [
             ("sana_1600m", |c| media::load_sana(c).map(|r| r.0)),
@@ -1313,28 +1314,6 @@ mod tests {
                 ),
                 "{id}: off-iOS must not fabricate a process baseline or reach admission"
             );
-            // This is the existing metadata-only catalog seam, NOT an SDK admission
-            // with invented footprint/headroom. Empty rows reject source-unopened
-            // before the zero budget could authorize or price any work.
-            assert_eq!(
-                kind(
-                    mlx_gen_ios_catalog::ios_admission::admit_with_rows(
-                        &registry,
-                        std::slice::from_ref(candidate),
-                        "no-reviewed-device",
-                        crate::gen_core::MemoryBudget {
-                            total_bytes: 0,
-                            committed_bytes: 0,
-                            reclaimable_bytes: 0,
-                            reserved_headroom_bytes: 0,
-                        },
-                        &[],
-                    )
-                    .map(|admission| admission.index())
-                ),
-                Some(RefusalKind::NoEvidence),
-                "{id}"
-            );
             let other = candidates
                 .iter()
                 .find(|c| !c.provider.starts_with(&id[..4]))
@@ -1344,6 +1323,40 @@ mod tests {
                 Some(RefusalKind::Mode),
                 "{id} accepted a {} candidate",
                 other.provider
+            );
+        }
+        // Prove the metadata seam refuses BEFORE source access or budget work:
+        // NONE of the candidates' artifact paths now exists; a source read would
+        // fail, and consuming the zero budget would refuse capacity instead.
+        // No process baseline or live permit is fabricated for this pure query.
+        std::fs::rename(&artifacts, root.path().join("unreachable-artifacts")).unwrap();
+        assert!(!artifacts.exists());
+        for candidate in &candidates {
+            let refusal = match mlx_gen_ios_catalog::ios_admission::admit_with_rows(
+                &registry,
+                std::slice::from_ref(candidate),
+                "no-reviewed-device",
+                crate::gen_core::MemoryBudget {
+                    total_bytes: 0,
+                    committed_bytes: 0,
+                    reclaimable_bytes: 0,
+                    reserved_headroom_bytes: 0,
+                },
+                &[],
+            ) {
+                Err(AdmissionError::Refused(refusal)) => refusal,
+                _ => panic!("metadata-only empty-row query must refuse before work"),
+            };
+            assert_eq!(
+                refusal.kind,
+                RefusalKind::NoEvidence,
+                "{}",
+                candidate.provider
+            );
+            assert!(
+                refusal.reason.contains("(source unopened)"),
+                "{}",
+                refusal.reason
             );
         }
         // Tokenizer corruption is tested at SANA's actual gemma_window parser.

@@ -55,6 +55,269 @@ fn tensor(path: &Path, key: &str) {
     bytes.resize(bytes.len() + 256, 0);
     std::fs::write(path, bytes).unwrap();
 }
+
+// These tests exercise metadata admission/identity, never a render or model
+// load. Supply valid small tensor dictionaries over the COMPLETE constructor
+// namespaces and affine group-64 packing; do not substitute an arbitrary `x`
+// tensor for a base projection which the real overlay normalizer must inspect.
+#[derive(Default)]
+struct MetadataTensors(Vec<(String, &'static str, Vec<usize>)>);
+impl MetadataTensors {
+    fn put(&mut self, name: impl Into<String>, dtype: &'static str, shape: &[usize]) {
+        self.0.push((name.into(), dtype, shape.to_vec()));
+    }
+    fn linear(&mut self, name: &str, rows: usize, columns: usize, bits: Option<u32>) {
+        if let Some(bits) = bits {
+            assert!(columns.is_multiple_of(64));
+            self.put(
+                format!("{name}.weight"),
+                "U32",
+                &[rows, columns * bits as usize / 32],
+            );
+            self.put(format!("{name}.scales"), "BF16", &[rows, columns / 64]);
+            self.put(format!("{name}.biases"), "BF16", &[rows, columns / 64]);
+        } else {
+            self.put(format!("{name}.weight"), "BF16", &[rows, columns]);
+        }
+        self.put(format!("{name}.bias"), "BF16", &[rows]);
+    }
+    fn conv(&mut self, name: &str) {
+        self.put(format!("{name}.weight"), "BF16", &[64, 64, 1, 1]);
+        self.put(format!("{name}.bias"), "BF16", &[64]);
+    }
+    fn save(&self, path: &Path) {
+        let tensors: Vec<_> = self
+            .0
+            .iter()
+            .map(|(name, dtype, shape)| (name.as_str(), *dtype, shape.as_slice()))
+            .collect();
+        gen_core_testkit::wan_i2v::write_safetensors(path, &tensors);
+    }
+}
+
+fn zimage_transformer_fixture(path: &Path, bits: Option<u32>) {
+    let mut t = MetadataTensors::default();
+    // ZImageTransformerConfig::turbo and the SAME block/global header schema
+    // used by configured_overlay_semantic_facts_for (not a one-key workaround).
+    for (stack, blocks, adaln) in [
+        ("layers", 30, true),
+        ("noise_refiner", 2, true),
+        ("context_refiner", 2, false),
+    ] {
+        for block in 0..blocks {
+            let base = format!("{stack}.{block}");
+            if adaln {
+                t.linear(&format!("{base}.adaLN_modulation.0"), 256, 64, bits);
+            }
+            for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                t.linear(&format!("{base}.attention.{leaf}"), 64, 64, bits);
+            }
+            for leaf in ["w1", "w2", "w3"] {
+                t.linear(&format!("{base}.feed_forward.{leaf}"), 64, 64, bits);
+            }
+        }
+    }
+    for base in [
+        "all_x_embedder.2-1",
+        "cap_embedder.1",
+        "t_embedder.mlp.0",
+        "t_embedder.mlp.2",
+        "all_final_layer.2-1.linear",
+        "all_final_layer.2-1.adaLN_modulation.0",
+    ] {
+        t.linear(base, 64, 64, bits);
+    }
+    t.save(path);
+}
+fn zimage_fixture(root: &Path, bits: Option<u32>) {
+    zimage_transformer_fixture(&root.join("transformer/model.safetensors"), bits);
+    tensor(&root.join("vae/model.safetensors"), "x");
+    let config = bits.map_or_else(
+        || "{}".to_owned(),
+        |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+    );
+    std::fs::write(root.join("transformer/config.json"), &config).unwrap();
+    std::fs::write(root.join("vae/config.json"), config).unwrap();
+    gen_core_testkit::write_encoder_contract_fixture_with_quant(
+        &root.join("text_encoder"),
+        runtime_ios::media::zimage::ENCODER_CONTRACT,
+        bits.map(|bits| bits as i32),
+    )
+    .unwrap();
+}
+
+fn anima_fixture(root: &Path) {
+    let mut t = MetadataTensors::default();
+    // Shipped Anima DiT: 28 blocks; Qwen conditioner: 6 blocks. These are
+    // metadata-only, group-aligned projection facts, not runnable model weights.
+    for block in 0..28 {
+        for attention in ["self_attn", "cross_attn"] {
+            for leaf in ["q_proj", "k_proj", "v_proj", "output_proj"] {
+                t.linear(
+                    &format!("net.blocks.{block}.{attention}.{leaf}"),
+                    64,
+                    64,
+                    None,
+                );
+            }
+        }
+        for leaf in ["layer1", "layer2"] {
+            t.linear(&format!("net.blocks.{block}.mlp.{leaf}"), 64, 64, None);
+        }
+        for norm in ["self_attn", "cross_attn", "mlp"] {
+            for leaf in [1, 2] {
+                t.linear(
+                    &format!("net.blocks.{block}.adaln_modulation_{norm}.{leaf}"),
+                    64,
+                    64,
+                    None,
+                );
+            }
+        }
+    }
+    for leaf in [
+        "x_embedder.proj.1",
+        "t_embedder.1.linear_1",
+        "t_embedder.1.linear_2",
+        "final_layer.adaln_modulation.1",
+        "final_layer.adaln_modulation.2",
+        "final_layer.linear",
+        "llm_adapter.out_proj",
+    ] {
+        t.linear(&format!("net.{leaf}"), 64, 64, None);
+    }
+    for block in 0..6 {
+        for attention in ["self_attn", "cross_attn"] {
+            for leaf in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                t.linear(
+                    &format!("net.llm_adapter.blocks.{block}.{attention}.{leaf}"),
+                    64,
+                    64,
+                    None,
+                );
+            }
+        }
+        for leaf in [0, 2] {
+            t.linear(
+                &format!("net.llm_adapter.blocks.{block}.mlp.{leaf}"),
+                64,
+                64,
+                None,
+            );
+        }
+    }
+    t.save(&root.join("split_files/diffusion_models/anima-turbo-v1.0.safetensors"));
+    tensor(
+        &root.join("split_files/text_encoders/qwen_3_06b_base.safetensors"),
+        "x",
+    );
+    tensor(
+        &root.join("split_files/vae/qwen_image_vae.safetensors"),
+        "x",
+    );
+}
+
+fn sdxl_unet(path: &Path, include_up: bool) {
+    fn transformer(t: &mut MetadataTensors, base: &str, depth: usize) {
+        t.linear(&format!("{base}.proj_in"), 64, 64, None);
+        t.linear(&format!("{base}.proj_out"), 64, 64, None);
+        for block in 0..depth {
+            for attention in ["attn1", "attn2"] {
+                for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                    t.linear(
+                        &format!("{base}.transformer_blocks.{block}.{attention}.{leaf}"),
+                        64,
+                        64,
+                        None,
+                    );
+                }
+            }
+            t.linear(
+                &format!("{base}.transformer_blocks.{block}.ff.net.0.proj"),
+                128,
+                64,
+                None,
+            );
+            t.linear(
+                &format!("{base}.transformer_blocks.{block}.ff.net.2"),
+                64,
+                64,
+                None,
+            );
+        }
+    }
+    fn resnet(t: &mut MetadataTensors, base: &str) {
+        for leaf in ["conv1", "conv2"] {
+            t.conv(&format!("{base}.{leaf}"));
+        }
+    }
+    let mut t = MetadataTensors::default();
+    t.conv("conv_in");
+    if include_up {
+        t.conv("conv_out");
+    }
+    // Exact SDXL-base BlockSpec order; optional time/shortcut projections are
+    // genuinely absent, not fabricated selectors or missing required headers.
+    for (stack, index, count, depth) in [
+        ("down", 0, 2, 0),
+        ("down", 1, 2, 2),
+        ("down", 2, 2, 10),
+        ("up", 0, 3, 10),
+        ("up", 1, 3, 2),
+        ("up", 2, 3, 0),
+    ] {
+        if stack == "up" && !include_up {
+            continue;
+        }
+        for block in 0..count {
+            resnet(&mut t, &format!("{stack}_blocks.{index}.resnets.{block}"));
+            if depth != 0 {
+                transformer(
+                    &mut t,
+                    &format!("{stack}_blocks.{index}.attentions.{block}"),
+                    depth,
+                );
+            }
+        }
+        if stack == "down" && index < 2 {
+            t.conv(&format!("down_blocks.{index}.downsamplers.0.conv"));
+        }
+        if stack == "up" && index < 2 {
+            t.conv(&format!("up_blocks.{index}.upsamplers.0.conv"));
+        }
+    }
+    resnet(&mut t, "mid_block.resnets.0");
+    transformer(&mut t, "mid_block.attentions.0", 10);
+    resnet(&mut t, "mid_block.resnets.1");
+    t.save(path);
+}
+fn sdxl_fixture(root: &Path) {
+    sdxl_unet(&root.join("unet/diffusion_pytorch_model.safetensors"), true);
+    tensor(&root.join("vae/diffusion_pytorch_model.safetensors"), "x");
+    for component in ["text_encoder", "text_encoder_2"] {
+        tensor(&root.join(component).join("model.safetensors"), "x");
+    }
+    tokenizer(&root.join("tokenizer"));
+    tokenizer(&root.join("tokenizer_2"));
+}
+fn sdxl_ip(root: &Path) {
+    tensor(&root.join("models/image_encoder/model.safetensors"), "x");
+    let mut t = MetadataTensors::default();
+    // SAME complete SDXL-base cross-attention walk: down 4+20, mid 10,
+    // up 30+6; each index has a real K/V pair in the h94 snapshot directory.
+    for index in 0..70 {
+        for role in ["k", "v"] {
+            t.linear(
+                &format!("ip_adapter.{}.to_{role}_ip", 2 * index + 1),
+                64,
+                64,
+                None,
+            );
+        }
+    }
+    t.save(&root.join("sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors"));
+}
+
 fn sana(root: &Path) {
     tensor(&root.join("transformer/a.safetensors"), "proj.weight");
     tensor(
@@ -129,22 +392,10 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
 fn campaign_injected_device_sdxl_anima_iris_no_evidence_is_not_capacity() {
     let catalog = runtime_ios::catalog().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let sdxl = temp.path().join("sdxl/bf16");
-    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
-        tensor(&sdxl.join(component).join("model.safetensors"), "x");
-    }
-    tokenizer(&sdxl.join("tokenizer"));
-    tokenizer(&sdxl.join("tokenizer_2"));
-    let anima = temp.path().join("anima_turbo/bf16");
-    for component in ["diffusion_models", "text_encoders", "vae"] {
-        tensor(
-            &anima
-                .join("split_files")
-                .join(component)
-                .join("fixture.safetensors"),
-            "x",
-        );
-    }
+    let sdxl_root = temp.path().join("sdxl/bf16");
+    sdxl_fixture(&sdxl_root);
+    let anima_root = temp.path().join("anima_turbo/bf16");
+    anima_fixture(&anima_root);
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/media/mlx-gen/mlx-gen-iris/tests/fixtures");
     copy_tree(
@@ -296,7 +547,9 @@ fn task_vm_info_layout_matches_the_sdk_header() {
 fn campaign_sdxl_malformed_shard_is_failure_before_missing_evidence() {
     let catalog = runtime_ios::catalog().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("sdxl/bf16/unet/model.safetensors");
+    let path = root
+        .path()
+        .join("sdxl/bf16/unet/diffusion_pytorch_model.safetensors");
     tensor(&path, "x");
     std::fs::write(path, b"invalid").unwrap();
     let mut p = adapter(catalog.media(), root.path().into());
@@ -423,11 +676,7 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
     assert!(sdxl.modes.contains(&"control".to_string()));
     let temp = tempfile::tempdir().unwrap();
     let slot = temp.path().join("sdxl/q4");
-    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
-        tensor(&slot.join(component).join("model.safetensors"), "x");
-    }
-    tokenizer(&slot.join("tokenizer"));
-    tokenizer(&slot.join("tokenizer_2"));
+    sdxl_fixture(&slot);
     for mode in ["control", "ip_adapter"] {
         let case = cell(&format!("sdxl/sdxl/q4/512/{mode}/2"));
         let mut p = adapter(catalog.media(), temp.path().into());
@@ -436,11 +685,11 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
         assert!(reason.contains("provisioned"), "{reason}");
         assert_eq!(p.refusal_kind, None);
     }
-    tensor(&slot.join("control/model.safetensors"), "x");
-    tensor(&slot.join("ip_adapter.safetensors"), "x");
+    sdxl_unet(&slot.join("control/model.safetensors"), false);
+    sdxl_ip(&slot.join("ip_adapter"));
     std::fs::write(
         slot.join("components.json"),
-        r#"{"control":"control","ip_adapter":"ip_adapter.safetensors"}"#,
+        r#"{"control":"control","ip_adapter":"ip_adapter"}"#,
     )
     .unwrap();
     let spec =
@@ -452,7 +701,7 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
     assert!(spec("control").ip_adapter.is_none());
     assert!(matches!(
         spec("ip_adapter").ip_adapter,
-        Some(WeightsSource::File(_))
+        Some(WeightsSource::Dir(_))
     ));
     assert!(spec("ip_adapter").control.is_none());
     // An image-to-image case never loads the IP-Adapter (it would take the reference image).
@@ -481,20 +730,7 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
     let catalog = runtime_ios::catalog().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let slot = temp.path().join("z_image_turbo/q4");
-    for component in ["transformer", "vae"] {
-        tensor(&slot.join(component).join("model.safetensors"), "x");
-        std::fs::write(
-            slot.join(component).join("config.json"),
-            r#"{"quantization":{"bits":4,"group_size":64}}"#,
-        )
-        .unwrap();
-    }
-    gen_core_testkit::write_encoder_contract_fixture_with_quant(
-        &slot.join("text_encoder"),
-        runtime_ios::media::zimage::ENCODER_CONTRACT,
-        Some(4),
-    )
-    .unwrap();
+    zimage_fixture(&slot, Some(4));
     let run = |prefix: &str| {
         let case = cell(prefix);
         let mut p = adapter(catalog.media(), temp.path().into());
@@ -666,20 +902,7 @@ fn campaign_cells_execute_their_own_declared_selection() {
     let temp = tempfile::tempdir().unwrap();
     let zslot = |tier: &str, bits: Option<u32>| {
         let slot = temp.path().join("z_image_turbo").join(tier);
-        for component in ["transformer", "vae"] {
-            tensor(&slot.join(component).join("model.safetensors"), "x");
-            let config = match bits {
-                Some(b) => format!(r#"{{"quantization":{{"bits":{b},"group_size":64}}}}"#),
-                None => "{}".into(),
-            };
-            std::fs::write(slot.join(component).join("config.json"), config).unwrap();
-        }
-        gen_core_testkit::write_encoder_contract_fixture_with_quant(
-            &slot.join("text_encoder"),
-            runtime_ios::media::zimage::ENCODER_CONTRACT,
-            bits.map(|b| b as i32),
-        )
-        .unwrap();
+        zimage_fixture(&slot, bits);
     };
     zslot("bf16", None);
     zslot("q4", Some(4));
@@ -725,11 +948,7 @@ fn campaign_cells_execute_their_own_declared_selection() {
     assert!(key.contains("decode_tile_edge: Some(512)"), "{key}");
     // SDXL: a non-first native tile.
     let slot = temp.path().join("sdxl/q4");
-    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
-        tensor(&slot.join(component).join("model.safetensors"), "x");
-    }
-    tokenizer(&slot.join("tokenizer"));
-    tokenizer(&slot.join("tokenizer_2"));
+    sdxl_fixture(&slot);
     let (parameters, memory, _) = selected("sdxl/sdxl/q4/1024/text/2/t512_o64/1");
     assert_eq!(parameters.decode_tile_edge, Some(512));
     assert_eq!(memory.decode_tile_edge, Some(512));
