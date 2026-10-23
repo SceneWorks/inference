@@ -357,8 +357,11 @@ impl MiniMaxH3Dit {
             .count()
     }
 
-    /// Bytes of `adaln_proj` weight the blocks currently hold — the eviction's headline number.
+    /// Resident AdaLN bytes: full block projections, or the pruned table and F32 compute operands.
     pub fn adaln_nbytes(&self) -> usize {
+        if let Some(curve) = &self.curve {
+            return curve.nbytes();
+        }
         self.blocks
             .iter()
             .filter_map(DitBlock::adaln_proj)
@@ -719,7 +722,7 @@ impl JointDit {
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
             if let Some(curve) = &dit.curve {
                 // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
-                // are ~90 MB resident — so PrecomputeAndEvict reports zero released bytes and
+                // are ~175 MB of F32 compute buffers — so PrecomputeAndEvict releases zero and
                 // Resident simply re-interpolates the table per step; both residencies are
                 // legal, and neither touches a timestep MLP (there is none to call).
                 match residency {

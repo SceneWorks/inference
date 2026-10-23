@@ -159,17 +159,20 @@ The frozen pruned INT8 artifact at
 [`a56850c870825d6a8ae501a595c4dbbbc77bbc7e`](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/tree/a56850c870825d6a8ae501a595c4dbbbc77bbc7e)
 has 50 blocks, a **stored F32 `[1025,8]` table**, 50 BF16 `[96768,8]`
 projections plus final BF16 `[10752,8]`, and folded F16 biases of the
-corresponding output widths. Stored precision is retained and identified per
-operand; F32 projection compute losslessly widens these values, matching the
-pinned runtime's curve-mode `_lock_dtype`. It does not misreport the pruner's
-F32 output dtype as the artifact's stored precision. The 200 body ConvRot
+corresponding output widths. Stored precision is identified and hashed per operand
+before lossless F32 compute widening, matching the pinned runtime's `_lock_dtype`.
+The engine retains one widened compute operand set, not both source and compute
+copies, and never recasts weights/biases per timestep. Resident-byte accessors report
+the actual F32 allocations (174,602,272 B including the table at this geometry),
+not the narrower checkpoint bytes. The pruner's F32 output is not misreported as
+the artifact's stored precision. The 200 body ConvRot
 group-256 projections remain native INT8, not dense AdaLN or group-64 substitutes.
 
 The shared Candle loader now takes `Weights::from_files_native_int8(files, device)`:
 there is no load-time compute-dtype argument. It preserves **all** floating source
 dtypes, including unrelated F32 I/O heads, and materializes original signed INT8
 codes as exact U8 two's-complement storage with F32 scales. H3 projections choose
-their compute dtype at execution. Consumers migrating from the former three-argument
+their compute dtype at the projection construction boundary. Consumers migrating from the former three-argument
 API must remove that argument, not add a pre-load cast or reread pruning operands.
 
 `PruningIdentity` binds the table, **every** reduced projection and folded bias,

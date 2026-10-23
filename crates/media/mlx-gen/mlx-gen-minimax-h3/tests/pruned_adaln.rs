@@ -447,15 +447,18 @@ fn reduced_operands_retain_stored_dtypes_and_clamp_endpoints() {
     )
     .unwrap();
     assert_eq!(
-        block.weight().dtype(),
+        block.source_weight_dtype(),
         Dtype::Bfloat16,
-        "reduced weight stays BF16"
+        "source reduced weight is BF16"
     );
     assert_eq!(
-        block.bias().dtype(),
+        block.source_bias_dtype(),
         Dtype::Float16,
-        "folded bias stays F16"
+        "source folded bias is F16"
     );
+    assert_eq!(block.weight().dtype(), Dtype::Float32);
+    assert_eq!(block.bias().dtype(), Dtype::Float32);
+    assert_eq!(block.nbytes(), (36 * 2 + 36) * 4);
 
     let table = mlx_gen_minimax_h3::PrunedTable::from_weights(&w, 4, 2).unwrap();
     let coords = table.coordinates(&[-1.0, 0.0, 1.0, 2.0]).unwrap();
@@ -619,6 +622,10 @@ fn full_model_live_coordinates_match_cache_and_refuse_foreign_basis() {
     let cfg = oracle_cfg();
     let mut weights = Weights::from_map(full_pruned_map(&json, 0.0));
     let runtime = detect(&weights, &cfg).unwrap().unwrap();
+    assert_eq!(
+        runtime.nbytes(),
+        (1025 * 8 + 2 * (144 * 8 + 144) + 16 * 8 + 16) * 4
+    );
     let model = MiniMaxH3Dit::from_weights(&mut weights, &cfg, Dtype::Float32).unwrap();
     let times = f32s(json["cases"][4]["timesteps"].as_array().unwrap());
     let schedule = TimestepSchedule::new(vec![times.clone()]).unwrap();

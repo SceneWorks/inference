@@ -13,12 +13,12 @@
 //! **no factor of 1000 and no SiLU**: the SiLU is already inside the basis the curve was factored
 //! from, so the reduced projections are plain Linears over the interpolated coordinates.
 //!
-//! Storage precision is per operand (F32 table, BF16 weight, F16 bias — the frozen INT8 artifact's
-//! *reduced* dtypes, not the pruner's F32 intermediates). Compute widens to F32, matching the pinned
-//! curve runtime's `_lock_dtype`, without ever recasting the stored source arrays.
+//! Storage precision is identified per operand (F32 table, BF16 weight, F16 bias in the frozen
+//! artifact). After source identity validation, compute operands are widened losslessly once to
+//! F32 and evaluated once; no source tensor copies or per-step casts remain resident.
 //!
 //! The complete reduced topology — and nothing else — is what
-//! [`gen_core::pruned_adaln`] validates and hashes. Body weights and quantization codes are
+//! [`mlx_gen::gen_core::pruned_adaln`] validates and hashes. Body weights and quantization codes are
 //! deliberately **not** read or hashed here: the source-binding/ConvRot layers own those, and a
 //! second basis with identical shapes must still produce a different identity.
 
@@ -197,19 +197,21 @@ impl PrunedTable {
     }
 }
 
-/// A reduced dense projection — `W*Vh.T` BF16 `[out, rank]` plus folded bias `b + W*mean` F16
-/// `[out]` — held at their **stored** dtypes and computed at F32 (the pinned curve runtime's
-/// `_lock_dtype`), with no SiLU.
+/// A reduced dense projection with one resident F32 compute weight and folded bias.
+/// Original BF16/F16 source dtype metadata remains bound to its source content identity;
+/// construction widens once, matching the pinned runtime's `_lock_dtype`, with no SiLU.
 #[derive(Debug, Clone)]
 pub struct PrunedReducedLinear {
     weight: Array,
     bias: Array,
+    source_weight_dtype: Dtype,
+    source_bias_dtype: Dtype,
     out_features: i32,
     rank: i32,
 }
 
 impl PrunedReducedLinear {
-    /// Load `{prefix}.weight` (BF16) and `{prefix}.bias` (F16) at their stored dtypes.
+    /// Load source operands, record their original dtypes, and materialize compute F32 once.
     pub fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -244,23 +246,45 @@ impl PrunedReducedLinear {
                 bias.dtype()
             )));
         }
+        let source_weight_dtype = weight.dtype();
+        let source_bias_dtype = bias.dtype();
+        let compute_weight = weight.as_dtype(Dtype::Float32)?;
+        let compute_bias = bias.as_dtype(Dtype::Float32)?;
+        // Force the cast once so evaluations cannot retain or re-execute a cast graph.
+        mlx_rs::transforms::eval([&compute_weight, &compute_bias])?;
         Ok(Self {
-            weight,
-            bias,
+            weight: compute_weight,
+            bias: compute_bias,
+            source_weight_dtype,
+            source_bias_dtype,
             out_features: out_features as i32,
             rank: rank as i32,
         })
     }
 
-    /// The stored weight, at its source dtype — exposed so a test can assert **which** precision the
-    /// checkpoint ships, not just that the forward produced the right numbers.
+    /// The single resident F32 compute weight; source precision is metadata below.
     pub fn weight(&self) -> &Array {
         &self.weight
     }
 
-    /// The stored folded bias, at its source dtype.
+    /// The single resident F32 compute folded bias.
     pub fn bias(&self) -> &Array {
         &self.bias
+    }
+
+    /// Original checkpoint weight dtype, hashed before compute widening.
+    pub fn source_weight_dtype(&self) -> Dtype {
+        self.source_weight_dtype
+    }
+
+    /// Original checkpoint folded-bias dtype, hashed before compute widening.
+    pub fn source_bias_dtype(&self) -> Dtype {
+        self.source_bias_dtype
+    }
+
+    /// Actual resident F32 compute bytes, not source storage bytes.
+    pub fn nbytes(&self) -> usize {
+        self.weight.nbytes() + self.bias.nbytes()
     }
 
     pub fn out_features(&self) -> i32 {
@@ -271,14 +295,18 @@ impl PrunedReducedLinear {
         self.rank
     }
 
-    /// `coords @ Wᵀ + b` at F32 — the stored BF16/F16 operands are widened losslessly for the
-    /// matmul and never recast in place. No SiLU: the coordinates are already in the post-SiLU
-    /// curve basis.
+    /// `coords @ Wᵀ + b` at F32, using operands widened once at construction.
+    /// No SiLU and no repeated operand casts or source tensor copies.
     pub fn forward(&self, coords: &Array) -> Result<Array> {
-        let coords = coords.as_dtype(Dtype::Float32)?;
-        let weight = self.weight.as_dtype(Dtype::Float32)?;
-        let bias = self.bias.as_dtype(Dtype::Float32)?;
-        mlx_gen::nn::linear(&coords, &weight, &bias)
+        if coords.dtype() != Dtype::Float32
+            || coords.shape().len() != 2
+            || coords.shape()[1] != self.rank
+        {
+            return Err(Error::Msg(
+                "minimax-h3 pruned adaln: coordinates must be F32 [steps, rank]".into(),
+            ));
+        }
+        mlx_gen::nn::linear(coords, &self.weight, &self.bias)
     }
 }
 
@@ -392,6 +420,7 @@ impl PrunedAdaLnRuntime {
         topology: &PrunedAdaLn,
         cfg: &MiniMaxH3DitConfig,
     ) -> Result<Self> {
+        let identity = binding_identity(w, topology)?;
         let table = PrunedTable::from_weights(w, topology.grid, topology.rank)?;
         let block_projections = (0..cfg.num_layers)
             .map(|i| {
@@ -409,7 +438,6 @@ impl PrunedAdaLnRuntime {
             cfg.hidden_size as usize,
             topology.rank,
         )?;
-        let identity = binding_identity(w, topology)?;
         Ok(Self {
             table,
             block_projections,
@@ -419,7 +447,7 @@ impl PrunedAdaLnRuntime {
     }
 
     /// Project the whole schedule's modulation from the reduced projections — the pruned twin of
-    /// [`AdaLnCache::precompute`]. The projections are a few tens of MB, so there is no eviction
+    /// [`AdaLnCache::precompute`]. One F32 operand set is ~175 MB at shipped geometry; no eviction
     /// step: [`AdaLnCache::from_layers_pruned`] still forces evaluation per block (the lazy-eval
     /// discipline) and binds the cache to this topology's content identity.
     ///
@@ -473,6 +501,17 @@ impl PrunedAdaLnRuntime {
 
     pub fn final_projection(&self) -> &PrunedFinalProjection {
         &self.final_projection
+    }
+
+    /// Actual resident table and once-widened F32 reduced operand bytes.
+    pub fn nbytes(&self) -> usize {
+        self.table.table.nbytes()
+            + self
+                .block_projections
+                .iter()
+                .map(|projection| projection.linear.nbytes())
+                .sum::<usize>()
+            + self.final_projection.linear.nbytes()
     }
 }
 

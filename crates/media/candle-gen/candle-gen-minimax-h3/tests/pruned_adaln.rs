@@ -275,11 +275,31 @@ fn curve_operands_keep_their_stored_dtypes() {
     assert_eq!(c.rank(), 8);
     for layer in 0..config().num_layers {
         let p = c.block_projection(layer).unwrap();
-        assert_eq!(p.dtype(), DType::BF16, "block {layer} weight stays BF16");
-        let _ = p.nbytes();
+        assert_eq!(
+            p.source_dtype(),
+            DType::BF16,
+            "block {layer} source weight is BF16"
+        );
+        assert_eq!(p.compute_dtype(), DType::F32);
+        assert_eq!(
+            p.nbytes(),
+            (18 * c.topology().hidden_size) * (c.rank() + 1) * 4
+        );
     }
     let n = c.norm_out_projection().unwrap();
-    assert_eq!(n.dtype(), DType::BF16, "the final weight stays BF16");
+    assert_eq!(
+        n.source_dtype(),
+        DType::BF16,
+        "the final source weight is BF16"
+    );
+    assert_eq!(n.compute_dtype(), DType::F32);
+    let compute_elements: usize = c
+        .topology()
+        .operands()
+        .iter()
+        .map(|operand| operand.shape.iter().product::<usize>())
+        .sum();
+    assert_eq!(c.nbytes(), compute_elements * 4);
 }
 
 #[test]
@@ -1073,7 +1093,14 @@ fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision()
         DType::F32,
         "the table stays F32 through the loader"
     );
-    assert_eq!(curve.block_projection(0).unwrap().dtype(), DType::BF16);
+    assert_eq!(
+        curve.block_projection(0).unwrap().source_dtype(),
+        DType::BF16
+    );
+    assert_eq!(
+        curve.block_projection(0).unwrap().compute_dtype(),
+        DType::F32
+    );
 }
 
 // -------------------------------------------------------------------------------------------

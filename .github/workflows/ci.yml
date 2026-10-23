@@ -1075,13 +1075,14 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Isolate persistent-runner HF caches
-        shell: pwsh
+        shell: cmd
         run: |
-          $outer = Join-Path $env:RUNNER_TEMP "inference-ci-h3-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          New-Item -ItemType Directory -Force $outer | Out-Null
-          "HF_HOME=$(Join-Path $outer 'hf-home')" >> $env:GITHUB_ENV
-          "HF_HUB_CACHE=$(Join-Path $outer 'hub')" >> $env:GITHUB_ENV
-          "HUGGINGFACE_HUB_CACHE=$(Join-Path $outer 'hub')" >> $env:GITHUB_ENV
+          set "HF_OUTER=%RUNNER_TEMP%\inference-ci-h3-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          if not exist "%HF_OUTER%" mkdir "%HF_OUTER%"
+          if errorlevel 1 exit /b 1
+          echo HF_HOME=%HF_OUTER%\hf-home>>"%GITHUB_ENV%"
+          echo HF_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
+          echo HUGGINGFACE_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |

@@ -13,32 +13,32 @@
 //! plausible-looking model with nothing behind it. This module therefore:
 //!
 //! * never reconstructs a basis, never substitutes stock weights, and never builds the curve from
-//!   the timestep MLP — [`gen_core::pruned_adaln::PrunedAdaLn::inspect`] refuses every incomplete
+//!   the timestep MLP — [`candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect`] refuses every incomplete
 //!   or inconsistent topology *before* any tensor is executed;
-//! * stores every operand at its **source precision** (table F32, reduced weights BF16, folded
-//!   biases F16 in the frozen artifact) and widens to F32 only inside the projection — exactly the
-//!   pinned runtime's `_lock_dtype = torch.float32`, without converting the checkpoint's bytes;
+//! * hashes every operand at its **source precision** (F32 table, BF16 reduced weights, F16
+//!   folded biases in the frozen artifact), then retains one losslessly widened F32 compute
+//!   operand set matching the pinned runtime's `_lock_dtype`, without modifying source bytes;
 //! * applies **no SiLU** to the interpolated coordinates: the table already stores the MLP's
 //!   post-activation output, and the pruned `AdalnProj` is built with `apply_silu=False`;
 //! * interpolates with the pinned addressing — `t` clamped to `[0, 1]` (t is already `1 − σ`, and
 //!   there is deliberately **no ×1000 rescale**), `position = t · (grid − 1)`, `lower` clamped to
 //!   `grid − 2` so `t = 1` selects the last interval with `fraction = 1` — reproduced elementwise
-//!   from [`gen_core::pruned_adaln::interpolation_position`].
+//!   from [`candle_gen::gen_core::pruned_adaln::interpolation_position`].
 //!
 //! # Identity is content, not metadata
 //!
-//! [`CurveAdaLn::identity`] is the [`gen_core::pruned_adaln::PruningIdentity`] hashed over **every**
+//! [`CurveAdaLn::identity`] is the [`candle_gen::gen_core::pruned_adaln::PruningIdentity`] hashed over **every**
 //! operand's stored values at load — the table *and* every reduced projection *and* every folded
 //! bias, in contract order, each with its stored dtype in the digest. Two checkpoints with the same
 //! shapes but different bases therefore hash differently, and a cache or compatibility check keyed
 //! on the identity cannot serve one checkpoint's modulation to the other. A table alone cannot
-//! identify the model: [`gen_core::pruned_adaln::PruningIdentityBuilder::finish`] refuses a partial
+//! identify the model: [`candle_gen::gen_core::pruned_adaln::PruningIdentityBuilder::finish`] refuses a partial
 //! hash.
 //!
 //! # Memory
 //!
-//! The pruned checkpoint has no 26.02 GB to evict: all 103 curve operands together are ~90 MB at
-//! the shipped rank, and the projections stay resident. [`AdaLnCache::precompute_and_evict`]'s
+//! The pruned checkpoint has no 26.02 GB to evict: its single widened compute operand set is
+//! ~175 MB at the shipped rank, and stays resident. [`AdaLnCache::precompute_and_evict`]'s
 //! discipline is not re-implemented here — [`CurveAdaLn::precompute`] builds the same
 //! [`AdaLnCache`] from the schedule's own distinct timesteps and reports **zero** released bytes,
 //! because there is nothing to release. The cache is keyed on the schedule *and* the pruning
@@ -57,16 +57,14 @@ use crate::dit::block::AdaLnModulation;
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
 use crate::dit::heads::NormOutModulation;
 
-/// One reduced `adaln_proj.linear` (or `norm_out.linear`): `[out_features, rank]` weight plus its
-/// `[out_features]` folded bias, at their **stored** dtype.
-///
-/// The widening to F32 happens inside [`Self::forward`], per evaluation — never at load, never
-/// persisted — so the checkpoint's own bytes remain the single source of truth and the identity
-/// hash reads them back unchanged.
+/// One reduced projection with a single resident F32 compute weight and folded bias.
+/// Source dtype metadata and the pruning identity are captured before lossless widening;
+/// repeated evaluations neither recast the operands nor retain a second source tensor copy.
 #[derive(Debug, Clone)]
 pub struct CurveProjection {
     weight: Tensor,
     bias: Tensor,
+    source_dtype: DType,
     out_features: usize,
     rank: usize,
     /// The block geometry the `[num_timesteps · MODALITY_NUM, 6·hidden]` reshape needs.
@@ -83,14 +81,14 @@ impl CurveProjection {
         self.identity
     }
 
-    /// Assemble from the two stored operand tensors, checking shapes.
+    /// Assemble views of the already-validated, once-widened compute operands.
     fn from_operands(
         weight: Tensor,
         bias: Tensor,
         out_features: usize,
         rank: usize,
         hidden_size: usize,
-        identity: PruningIdentity,
+        binding: (PruningIdentity, DType),
         what: &str,
     ) -> Result<Self> {
         if weight.dims() != [out_features, rank] {
@@ -111,16 +109,22 @@ impl CurveProjection {
             out_features,
             rank,
             hidden_size,
-            identity,
+            identity: binding.0,
+            source_dtype: binding.1,
         })
     }
 
-    /// The dtype the stored weight carries — BF16 in the frozen artifact.
-    pub fn dtype(&self) -> DType {
+    /// Original checkpoint weight dtype, bound into the identity before compute widening.
+    pub fn source_dtype(&self) -> DType {
+        self.source_dtype
+    }
+
+    /// Actual resident compute dtype; source precision is reported separately.
+    pub fn compute_dtype(&self) -> DType {
         self.weight.dtype()
     }
 
-    /// Device bytes the stored operands hold.
+    /// Actual resident compute bytes, not the narrower checkpoint storage bytes.
     pub fn nbytes(&self) -> usize {
         self.weight.elem_count() * self.weight.dtype().size_in_bytes()
             + self.bias.elem_count() * self.bias.dtype().size_in_bytes()
@@ -128,24 +132,20 @@ impl CurveProjection {
 
     /// Project interpolated coordinates into the full-width output, **without any activation**.
     ///
-    /// `coords` is `[num_timesteps, rank]` F32 ([`CurveAdaLn::coordinates`]); the result is
-    /// `[num_timesteps, out_features]` F32. Both operands are widened to F32 for the multiply —
-    /// the pinned runtime's `_lock_dtype` — and the folded bias is added broadcast.
+    /// `coords` and resident operands are F32, matching the pinned runtime's `_lock_dtype`.
+    /// Source weights and folded biases were widened exactly once during validated assembly.
     pub fn forward(&self, coords: &Tensor) -> Result<Tensor> {
         let s = coords.dims();
-        if s.len() != 2 || s[1] != self.rank {
+        if s.len() != 2 || s[1] != self.rank || coords.dtype() != DType::F32 {
             return Err(CandleError::Msg(format!(
                 "minimax-h3 dit curve projection: expected coordinates [num_timesteps, {rank}], \
                  got {s:?}",
                 rank = self.rank
             )));
         }
-        let weight = self.weight.to_dtype(DType::F32)?;
-        let bias = self.bias.to_dtype(DType::F32)?;
         Ok(coords
-            .to_dtype(DType::F32)?
-            .matmul(&weight.t()?)?
-            .broadcast_add(&bias)?)
+            .matmul(&self.weight.t()?)?
+            .broadcast_add(&self.bias)?)
     }
 
     /// [`Self::forward`] reshaped into the six modulation tables, exactly as
@@ -198,9 +198,9 @@ pub struct CurveAdaLn {
     device: Device,
     /// The stored F32 table, `[grid, rank]`, kept at source precision.
     table: Tensor,
-    /// Every canonical operand at its stored dtype, keyed by canonical name. The per-block
-    /// projections are handed to their blocks from here; `norm_out.linear` stays resident here.
-    operands: HashMap<String, Tensor>,
+    /// One F32 compute tensor per canonical operand, plus original storage dtype metadata.
+    /// Cloned projections share these allocations; no resident source tensor set is retained.
+    operands: HashMap<String, (Tensor, DType)>,
 }
 
 impl CurveAdaLn {
@@ -261,6 +261,7 @@ impl CurveAdaLn {
             )));
         }
         let mut builder = topology.identity_builder();
+        let mut compute_operands = HashMap::with_capacity(operands.len());
         for operand in topology.operands() {
             let tensor = operands.get(&operand.name).ok_or_else(|| {
                 CandleError::Msg(format!(
@@ -285,23 +286,23 @@ impl CurveAdaLn {
                     operand.shape
                 )));
             }
-            let values = tensor
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
+            let compute = tensor.to_dtype(DType::F32)?;
+            let values = compute.flatten_all()?.to_vec1::<f32>()?;
             builder
                 .operand_values(&operand.name, values)
                 .map_err(CandleError::Msg)?;
+            compute_operands.insert(operand.name.clone(), (compute, tensor.dtype()));
         }
         let identity = builder.finish().map_err(CandleError::Msg)?;
 
-        let table = operands
+        let table = compute_operands
             .get(TABLE_KEY)
             .ok_or_else(|| {
                 CandleError::Msg(
                     "minimax-h3 dit curve: the validated topology lost its table".into(),
                 )
             })?
+            .0
             .clone();
         Ok(Self {
             grid: topology.grid,
@@ -310,7 +311,7 @@ impl CurveAdaLn {
             topology,
             identity,
             table,
-            operands,
+            operands: compute_operands,
             device: device.clone(),
         })
     }
@@ -336,11 +337,11 @@ impl CurveAdaLn {
         self.grid
     }
 
-    /// Device bytes every stored curve operand holds.
+    /// Actual F32 resident compute bytes, including the unchanged F32 coordinate table.
     pub fn nbytes(&self) -> usize {
         self.operands
             .values()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .map(|(tensor, _)| tensor.elem_count() * tensor.dtype().size_in_bytes())
             .sum()
     }
 
@@ -353,15 +354,15 @@ impl CurveAdaLn {
     pub fn block_projection(&self, layer: usize) -> Result<CurveProjection> {
         let prefix = format!("transformer_blocks.{layer}.adaln_proj.linear");
         let out = self.hidden_size * 18;
-        let weight = self.operand(&format!("{prefix}.weight"))?;
-        let bias = self.operand(&format!("{prefix}.bias"))?;
+        let (weight, source_dtype) = self.operand(&format!("{prefix}.weight"))?;
+        let (bias, _) = self.operand(&format!("{prefix}.bias"))?;
         CurveProjection::from_operands(
             weight,
             bias,
             out,
             self.rank,
             self.hidden_size,
-            self.identity,
+            (self.identity, source_dtype),
             &prefix,
         )
     }
@@ -370,20 +371,20 @@ impl CurveAdaLn {
     pub fn norm_out_projection(&self) -> Result<CurveProjection> {
         let prefix = "norm_out.linear";
         let out = self.hidden_size * 2;
-        let weight = self.operand(&format!("{prefix}.weight"))?;
-        let bias = self.operand(&format!("{prefix}.bias"))?;
+        let (weight, source_dtype) = self.operand(&format!("{prefix}.weight"))?;
+        let (bias, _) = self.operand(&format!("{prefix}.bias"))?;
         CurveProjection::from_operands(
             weight,
             bias,
             out,
             self.rank,
             self.hidden_size,
-            self.identity,
+            (self.identity, source_dtype),
             prefix,
         )
     }
 
-    fn operand(&self, name: &str) -> Result<Tensor> {
+    fn operand(&self, name: &str) -> Result<(Tensor, DType)> {
         self.operands.get(name).cloned().ok_or_else(|| {
             CandleError::Msg(format!("minimax-h3 dit curve: missing operand {name}"))
         })
@@ -452,7 +453,7 @@ impl CurveAdaLn {
     /// The resulting [`AdaLnCache`] carries this checkpoint's [`PruningIdentity`], so a held cache
     /// can only be reused for a request whose schedule **and** basis match
     /// ([`AdaLnCache::is_current_for_pruning`]). There is nothing to evict — the curve operands are
-    /// ~90 MB resident — so callers report zero released bytes and keep the projections.
+    /// ~175 MB of F32 compute buffers — so callers report zero released bytes and keep them.
     pub fn precompute(
         &self,
         blocks: &[crate::dit::block::DitBlock],
