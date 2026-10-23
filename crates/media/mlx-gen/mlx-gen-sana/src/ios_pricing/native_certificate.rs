@@ -27,10 +27,8 @@ fn context<'a>(
             .metadata
             .get(index as usize)
             .ok_or_else(|| invalid("observation context is out of range"))?;
-        if mark.provider == provider && mark.kind == kind {
-            if found.replace(&mark.fields).is_some() {
-                return Err(invalid("duplicate actual source context"));
-            }
+        if mark.provider == provider && mark.kind == kind && found.replace(&mark.fields).is_some() {
+            return Err(invalid("duplicate actual source context"));
         }
     }
     found.ok_or_else(|| invalid(&format!("missing actual {provider}/{kind} source mark")))

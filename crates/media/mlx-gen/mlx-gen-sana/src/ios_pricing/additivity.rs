@@ -771,18 +771,28 @@ fn bound(
     (d.bytes, " (source-native cumulative)")
 }
 
+/// Diagnostic identity of one case; no pricing/proof inputs are bundled or changed.
+struct VerdictCase<'a> {
+    case: &'a str,
+    selection: &'a str,
+    tier: &'a str,
+}
+
 /// Derive `request` from the measured `anchor` and compare it with `measured`: the table row and
 /// any failures.
 fn verdict(
-    case: &str,
-    selection: &str,
-    tier: &str,
+    label: VerdictCase<'_>,
     anchor: &Measured,
     at_anchor: &IosPricing,
     request: &IosPricing,
     bounds: &[IosWindowBound],
     measured: &Measured,
 ) -> (String, Vec<String>) {
+    let VerdictCase {
+        case,
+        selection,
+        tier,
+    } = label;
     let a = area(EDGE, EDGE, 1);
     let derived = derive_certified(&anchor.worst.anchor(a), at_anchor, request, bounds)
         .unwrap_or_else(|e| panic!("{case} {selection} {tier}: not derivable: {e}"));
@@ -947,9 +957,11 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                     panic!("{case} {name} {tier}: intact source certificate refused: {e}")
                 });
                 let (_, baseline_failures) = verdict(
-                    case,
-                    name,
-                    tier,
+                    VerdictCase {
+                        case,
+                        selection: name,
+                        tier,
+                    },
                     &measured_anchor,
                     &at_anchor,
                     &priced,
@@ -1006,9 +1018,11 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                     }
                 };
                 let (line, f) = verdict(
-                    case,
-                    name,
-                    tier,
+                    VerdictCase {
+                        case,
+                        selection: name,
+                        tier,
+                    },
                     &measured_anchor,
                     &at_anchor,
                     &priced,
