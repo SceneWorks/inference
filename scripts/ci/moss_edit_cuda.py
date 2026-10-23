@@ -219,15 +219,18 @@ def validate_final(record, previous, lease, env, now):
             require(row['path'].casefold() == prior[pid]['path'].casefold(), 'known path changed after counters')
 
 
-def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=False, job_type=WindowsJob, popen=subprocess.Popen):
+def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=False, finalize_failed_collector_descendants=False, job_type=WindowsJob, popen=subprocess.Popen):
     """Spawn suspended; only the retained Job/child handles may be terminated."""
     require(seconds > 0, 'execution deadline expired')
     require(not finalize_compile_descendants or label == 'compile', 'descendant finalization is compile-only')
+    require(not finalize_failed_collector_descendants or re.fullmatch(r'(edit|layout|encoder)-admission-[0-9]{3}-collector', label),
+            'failed collector finalization is admission-collector-only')
     paths = [out / (label + suffix) for suffix in ('.stdout.log', '.stderr.log')]
     with paths[0].open('wb') as stdout, paths[1].open('wb') as stderr:
         job, child = job_type(), None
         receipt = {'argv': args, 'startedUtc': utc().isoformat(), 'assigned': False,
-                   'finalizeCompileDescendants': finalize_compile_descendants}
+                   'finalizeCompileDescendants': finalize_compile_descendants,
+                   'finalizeFailedCollectorDescendants': finalize_failed_collector_descendants}
         started = time.monotonic()
         try:
             child = popen(args, cwd=ROOT, env=env, stdout=stdout, stderr=stderr, creationflags=0x00000004)
@@ -247,6 +250,7 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
             receipt['rootExitObservedUtc'] = utc().isoformat()
             # Root exit alone does not establish that the whole owned Job has drained.
             # Permit natural completion briefly, without extending the command deadline.
+            failed_collector = finalize_failed_collector_descendants and child.returncode != 0
             drain_started = time.monotonic()
             drain_deadline = min(started + seconds, drain_started + 1.0)
             receipt['jobDrainObservations'] = []
@@ -256,12 +260,18 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 receipt['jobDrainObservations'].append({
                     'elapsedSeconds': round(observed - started, 6), 'pids': members,
                 })
+                if members and finalize_failed_collector_descendants and 'ownedMemberIdentities' not in receipt:
+                    receipt['ownedMemberIdentities'] = job.member_identities(members)
+                    observed = time.monotonic()
                 # Cargo may leave owned descendants after a completed build. Only this
-                # compile policy may finalize them through the retained Job in finally;
+                # compile policy, or an already failed admission collector, may finalize
+                # them through the retained Job in finally;
                 # that cleanup must succeed before Python can return the result.
-                if finalize_compile_descendants:
-                    require(observed < started + seconds, 'owned command deadline exceeded during compile drain')
+                if finalize_compile_descendants or failed_collector:
+                    require(observed < started + seconds, 'owned command deadline exceeded during finalization drain')
                     if observed >= drain_deadline or attempt == 20:
+                        if members:
+                            receipt['jobDrainAnomaly'] = 'owned descendants survived root exit drain'
                         break
                 require(observed <= drain_deadline, 'owned Job drain deadline exceeded')
                 if not members:
@@ -286,9 +296,16 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 receipt['cleanupError'] = str(error)
                 raise
             finally:
-                job.close()
-                receipt['finishedUtc'] = utc().isoformat()
-                (out / (label + '.owned.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+                try:
+                    job.close()
+                    receipt['jobCloseSucceeded'] = True
+                except BaseException as error:
+                    receipt['jobCloseSucceeded'] = False
+                    receipt['jobCloseError'] = str(error)
+                    raise
+                finally:
+                    receipt['finishedUtc'] = utc().isoformat()
+                    (out / (label + '.owned.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
     # No retained descendant can append to the accepted compiler output snapshot.
     return child.returncode, paths[0].read_text(encoding='utf-8', errors='replace')
 
@@ -352,7 +369,8 @@ def await_arm_admission(label, entry, target, lease, env, out, runner, now, slee
         reason = None
         phase_start = now()
         args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(full_dir)]
-        code, _ = runner(args, env, out, f'{label}-admission-{attempt:03d}-collector', min(300, remaining()))
+        code, _ = runner(args, env, out, f'{label}-admission-{attempt:03d}-collector', min(300, remaining()),
+                         finalize_failed_collector_descendants=True)
         require(source_check() == source_before, 'source changed during collector')
         checked_binary(entry, target)
         try:

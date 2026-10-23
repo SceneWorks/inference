@@ -236,5 +236,228 @@ class ExecutionBoundaryTests(unittest.TestCase):
             self.assertEqual(receipt['prelaunch'], {'fresh': True}); self.assertEqual(receipt['remaining'], [])
 
 
+class PreparationCapacityTests(unittest.TestCase):
+    def test_measured_capacity_is_distinct_and_telemetry_errors_are_terminal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            with patch.object(gate.os, 'cpu_count', return_value=18), patch.object(gate.os, 'getloadavg', return_value=(6, 6, 6)), \
+                 patch.object(gate, 'rows', return_value=[]), patch.object(gate, 'metadata', return_value='System-wide memory free percentage: 29%'), \
+                 patch.object(gate.os, 'statvfs') as disk:
+                disk.return_value.f_bavail = 100 * 1024**3; disk.return_value.f_frsize = 1
+                with self.assertRaises(gate.CapacityUnavailable) as caught: gate.capacity(out, prelaunch=True)
+                self.assertEqual(caught.exception.sample['memoryFreePercent'], 29)
+                self.assertIn('memory', caught.exception.predicate)
+                disk.return_value.f_bavail = 1
+                with patch.object(gate, 'metadata', return_value='System-wide memory free percentage: 30%'):
+                    with self.assertRaises(gate.CapacityUnavailable) as caught: gate.capacity(out)
+                    self.assertIn('disk', caught.exception.predicate)
+                with patch.object(gate, 'metadata', return_value='not a capacity sample'):
+                    with self.assertRaises(ValueError) as caught: gate.capacity(out)
+                    self.assertNotIsInstance(caught.exception, gate.CapacityUnavailable)
+            self.assertEqual(len((out / 'capacity-history.log').read_text(encoding='utf-8').splitlines()), 2)
+
+    def context(self, out, samples, *, deadline=1200):
+        from contextlib import ExitStack
+        stack = self.enterContext(ExitStack())
+        target = out / 'target'; target.mkdir()
+        env = {'CARGO_TARGET_DIR': str(target)}; clock = [0.0]; launches = []; signals = []; processes = []
+        sample_iter = iter(samples)
+        def capacity(*args, **kwargs):
+            value = next(sample_iter, 30)
+            if value < 30: raise gate.CapacityUnavailable('memory', {'memoryFreePercent': value})
+        class Process:
+            def __init__(self, pid, code): self.pid, self.code = pid, code
+            def poll(self): return self.code
+            def wait(self, **_kwargs): return self.code
+        def popen(command, **kwargs):
+            if launches: self.assertEqual((target / 'partial').read_bytes(), b'preserved')
+            (target / 'partial').write_bytes(b'preserved')
+            process = Process(900 + len(launches), None if not launches else 0)
+            processes.append(process); launches.append((command, kwargs['env']['CARGO_TARGET_DIR'], clock[0]))
+            kwargs['stdout'].write('attempt ' + str(len(launches))); kwargs['stdout'].flush()
+            return process
+        def rows(*_args):
+            return [(p.pid, 1, p.pid, 'owned-birth', '/cargo') for p in processes if p.code is None] + [(777, 1, 777, 'foreign-birth', '/foreign')]
+        def kill(pid, sig):
+            signals.append((pid, sig)); self.assertNotEqual(pid, 777)
+            next(p for p in processes if p.pid == pid).code = -sig
+        stack.enter_context(patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]))
+        stack.enter_context(patch.object(gate.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+        stack.enter_context(patch.object(gate, 'capacity', side_effect=capacity))
+        stack.enter_context(patch.object(gate, 'inventory', return_value={'source': 'fixed'}))
+        stack.enter_context(patch.object(gate, 'runtime_identity', return_value={'rustc': 'fixed'}))
+        stack.enter_context(patch.object(gate.subprocess, 'Popen', side_effect=popen))
+        stack.enter_context(patch.object(gate, 'rows', side_effect=rows))
+        stack.enter_context(patch.object(gate.os, 'kill', side_effect=kill))
+        return env, clock, launches, signals, processes
+
+    def test_initial_wait_then_owned_interruption_reuses_partial_target_and_preserves_receipts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            env, clock, launches, signals, processes = self.context(out, [29, 30, 30, 30, 29, 30, 30, 30])
+            log = gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+            self.assertEqual(log, 'attempt 2')
+            self.assertEqual(len(launches), 2)
+            self.assertEqual(launches[0][:2], launches[1][:2])
+            self.assertGreaterEqual(launches[0][2], 60)
+            self.assertEqual(signals, [(900, gate.signal.SIGTERM)])
+            first = gate.read(out / 'compile-001-process.json'); second = gate.read(out / 'compile-002-process.json')
+            self.assertTrue(first['capacityInterrupted']); self.assertEqual(first['remaining'], [])
+            self.assertEqual(first['exitCode'], -gate.signal.SIGTERM); self.assertEqual(second['exitCode'], 0)
+            self.assertEqual((out / 'compile-001.log').read_text(encoding='utf-8'), 'attempt 1')
+            states = [row['status'] for row in gate.read(out / 'preparation-queue.json')['events']]
+            self.assertIn('owned-drained', states); self.assertIn('retrying', states)
+            self.assertLess(states.index('owned-draining'), states.index('owned-drained'))
+            self.assertEqual(first['sentSignals'], [{'pid': 900, 'birth': 'owned-birth', 'signal': int(gate.signal.SIGTERM)}])
+            self.assertEqual(states[-1], 'compiled')
+            self.assertFalse((out / 'prepared.json').exists())
+
+    def test_persistent_or_oscillating_shortage_consumes_one_deadline_without_launch(self):
+        for samples in ([29] * 100, [29, 30] * 50):
+            with self.subTest(samples=samples[:2]), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); env, clock, launches, *_ = self.context(out, samples)
+                with self.assertRaisesRegex(ValueError, 'deadline expired'):
+                    gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 190)
+                self.assertEqual(launches, []); self.assertEqual(clock[0], 120)
+                self.assertEqual(gate.read(out / 'preparation-queue.json')['events'][-1]['status'], 'deadline-expired')
+
+    def test_compiler_cleanup_source_runtime_and_target_failures_never_retry(self):
+        for failure in ('compiler', 'cleanup', 'source', 'runtime', 'target', 'telemetry'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); env, clock, launches, *_ = self.context(out, [30] * 20)
+                calls = []
+                def run(*args, **kwargs):
+                    calls.append(args[3])
+                    if failure == 'compiler': raise ValueError('compiler failed')
+                    if failure == 'cleanup':
+                        gate.write(out / (args[3] + '-process.json'), {'capacityUnavailable': {'predicate': 'memory'}, 'remaining': [[900, 'owned-birth']], 'capacityInterrupted': True, 'exitCode': -15})
+                        raise gate.CapacityUnavailable('memory', {})
+                    return 'compiled'
+                with patch.object(gate, 'run_owned', side_effect=run):
+                    if failure == 'source': self.enterContext(patch.object(gate, 'inventory', side_effect=[{'source': 'fixed'}, {'source': 'changed'}]))
+                    if failure == 'runtime': self.enterContext(patch.object(gate, 'runtime_identity', side_effect=[{'rustc': 'fixed'}, {'rustc': 'changed'}]))
+                    if failure == 'target': (out / 'target').rmdir()
+                    if failure == 'telemetry': self.enterContext(patch.object(gate, 'capacity', side_effect=ValueError('unparseable memory')))
+                    with self.assertRaises(ValueError): gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+                self.assertLessEqual(len(calls), 1)
+                self.assertEqual(launches, [])
+
+
+    def test_source_or_runtime_change_after_drained_interruption_prevents_second_launch(self):
+        for identity in ('inventory', 'runtime_identity'):
+            with self.subTest(identity=identity), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); env, clock, launches, *_ = self.context(out, [30, 30, 30, 29])
+                key = 'source' if identity == 'inventory' else 'rustc'
+                with patch.object(gate, identity, side_effect=[{key: 'fixed'}] * 3 + [{key: 'changed'}]):
+                    with self.assertRaisesRegex(ValueError, 'changed'):
+                        gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+                self.assertEqual(len(launches), 1)
+                self.assertEqual(gate.read(out / 'compile-001-process.json')['remaining'], [])
+
+    def test_final_prelaunch_capacity_refusal_records_no_child(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            with patch.object(gate.subprocess, 'Popen') as launch:
+                with self.assertRaises(gate.CapacityUnavailable):
+                    gate.run_owned(['inert'], {}, out, 'refused', 10, prelaunch=lambda: (_ for _ in ()).throw(gate.CapacityUnavailable('memory', {})))
+                launch.assert_not_called()
+            row = gate.read(out / 'refused-process.json')
+            self.assertFalse(row['launched']); self.assertEqual(row['remaining'], []); self.assertIsNone(row['exitCode'])
+
+    def test_listing_mismatch_or_exhausted_shared_deadline_cannot_publish_prepared(self):
+        for failure in ('listing', 'deadline'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp); clock = [0.0]
+                def compiled(*args):
+                    binary = out / 'target' / 'inert'; binary.write_bytes(b'inert')
+                    if failure == 'deadline': clock[0] = 1201
+                    return json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'mlx_gen_moss_image'}, 'profile': {'test': True}, 'executable': str(binary)})
+                with patch.object(gate.sys, 'platform', 'darwin'), patch.dict(os.environ, {'RUNNER_NAME': 'nax-macos'}), \
+                     patch.object(gate, 'paths', return_value=out), patch.object(gate, 'inventory', return_value={}), \
+                     patch.object(gate, 'runtime_identity', return_value={}), patch.object(gate, 'prepare_compile', side_effect=compiled), \
+                     patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate, 'run_owned', return_value='wrong: test') as run, \
+                     patch.object(gate, 'snapshot') as gpu_metadata:
+                    with self.assertRaisesRegex(ValueError, 'membership' if failure == 'listing' else 'deadline'): gate.prepare()
+                self.assertEqual(run.call_count, 1 if failure == 'listing' else 0)
+                gpu_metadata.assert_not_called(); self.assertFalse((out / 'prepared.json').exists())
+
+
+    def test_external_signal_between_capacity_poll_and_cleanup_is_terminal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes = self.context(out, [30, 30, 30, 29])
+            original_capacity = gate.capacity.side_effect; original_launch = gate.subprocess.Popen.side_effect
+            armed = [False]; polls = [0]
+            def capacity(*args, **kwargs):
+                try: return original_capacity(*args, **kwargs)
+                except gate.CapacityUnavailable:
+                    armed[0] = True
+                    raise
+            def launch(*args, **kwargs):
+                process = original_launch(*args, **kwargs)
+                def poll():
+                    if armed[0]:
+                        polls[0] += 1
+                        if polls[0] >= 2: process.code = -gate.signal.SIGTERM
+                    return process.code
+                process.poll = poll
+                return process
+            with patch.object(gate, 'capacity', side_effect=capacity), patch.object(gate.subprocess, 'Popen', side_effect=launch):
+                with self.assertRaisesRegex(ValueError, 'not a controller-initiated'):
+                    gate.prepare_compile(out, env, {'source': 'fixed'}, {'rustc': 'fixed'}, 1200)
+            self.assertEqual(len(launches), 1); self.assertEqual(signals, [])
+            receipt = gate.read(out / 'compile-001-process.json')
+            self.assertTrue(receipt['capacityInterrupted']); self.assertEqual(receipt['exitCode'], -gate.signal.SIGTERM)
+            self.assertEqual(receipt['remaining'], []); self.assertEqual(receipt['sentSignals'], [])
+
+    def test_slow_prelaunch_cannot_shift_absolute_work_deadline_or_launch_late(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); clock = [0.0]
+            def prelaunch(): clock[0] = 91
+            with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.subprocess, 'Popen') as launch:
+                with self.assertRaisesRegex(ValueError, 'absolute preparation operation deadline'):
+                    gate.run_owned(['inert'], {}, out, 'slow-prelaunch', 90, prelaunch=prelaunch, absolute_deadline=100)
+                launch.assert_not_called()
+            receipt = gate.read(out / 'slow-prelaunch-process.json')
+            self.assertFalse(receipt['launched']); self.assertEqual(receipt['workDeadline'], 90)
+
+    def test_slow_monitor_is_bounded_and_drains_owned_child_within_cleanup_reserve(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes = self.context(out, [30])
+            timeouts = []
+            def metadata_run(*args, **kwargs):
+                timeouts.append(kwargs['timeout'])
+                clock[0] += kwargs['timeout']
+                raise gate.subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+            def monitor(_owned):
+                clock[0] = 88
+                gate.metadata(['inert-telemetry'], deadline=90)
+            with patch.object(gate.subprocess, 'run', side_effect=metadata_run):
+                with self.assertRaises(gate.subprocess.TimeoutExpired):
+                    gate.run_owned(['inert'], env, out, 'slow-monitor', 90, monitor=monitor, absolute_deadline=100)
+            self.assertEqual(timeouts, [2]); self.assertEqual(clock[0], 90)
+            self.assertEqual(signals, [(900, gate.signal.SIGTERM)])
+            receipt = gate.read(out / 'slow-monitor-process.json')
+            self.assertEqual(receipt['remaining'], []); self.assertEqual(receipt['workDeadline'], 90)
+            self.assertNotIn('capacityUnavailable', receipt)
+
+    def test_slow_observation_uses_remaining_work_budget_and_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp); env, clock, launches, signals, processes = self.context(out, [30])
+            original_rows = gate.rows.side_effect; observed_limits = []
+            def rows(limit=None):
+                observed_limits.append(limit)
+                if len(observed_limits) == 1:
+                    clock[0] = 90
+                    raise gate.subprocess.TimeoutExpired('ps', 90)
+                return original_rows()
+            with patch.object(gate, 'rows', side_effect=rows):
+                with self.assertRaises(gate.subprocess.TimeoutExpired):
+                    gate.run_owned(['inert'], env, out, 'slow-observe', 90, absolute_deadline=100)
+            self.assertEqual(observed_limits[0], 90)
+            self.assertTrue(all(value == 100 for value in observed_limits[1:]))
+            self.assertEqual(signals, [(900, gate.signal.SIGTERM)])
+            self.assertEqual(gate.read(out / 'slow-observe-process.json')['remaining'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

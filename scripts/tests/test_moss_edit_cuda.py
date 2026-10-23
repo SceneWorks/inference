@@ -135,7 +135,9 @@ class OrchestrationTests(unittest.TestCase):
     def runner(self, args, env, out, label, seconds, **policy):
         self.calls.append((label, args, env.copy()))
         self.assertGreater(seconds, 0)
-        self.assertEqual(policy, {'finalize_compile_descendants': True} if label == 'compile' else {})
+        expected_policy = {'finalize_compile_descendants': True} if label == 'compile' else (
+            {'finalize_failed_collector_descendants': True} if label.endswith('-collector') else {})
+        self.assertEqual(policy, expected_policy)
         if label == 'compile':
             if self.fail_arm == 'compile': return 1, ''
             self.assertEqual(env['CUDA_VISIBLE_DEVICES'], '-1'); self.assertIn('--no-run', args)
@@ -423,6 +425,167 @@ class OwnershipTests(unittest.TestCase):
                     self.assertNotIn('cleanupCompletedUtc', receipt)
         with self.assertRaisesRegex(ValueError, 'compile-only'):
             gate.run_owned(['test'], {}, Path('.'), 'edit-tests', 1, finalize_compile_descendants=True)
+
+
+class CollectorFinalizationTests(unittest.TestCase):
+    def run_case(self, directory, mode, label='edit-admission-005-collector', policy=True):
+        events, clock = [], [0.0]
+        class Child:
+            pid = 123
+            returncode = 0 if mode == 'success' else 7
+            def poll(self): return None if mode == 'timeout' else self.returncode
+            def wait(self, timeout): return self.returncode
+        class Job:
+            live = True
+            def assign_and_resume(self, child): events.append('assigned')
+            def members(self):
+                if mode == 'query-error': raise RuntimeError('membership failed')
+                return {456} if self.live else set()
+            def member_identities(self, members):
+                events.append('owned-metadata')
+                return {'processes': [{'pid': 456, 'status': 'open-unavailable', 'path': None}]}
+            def terminate_and_reap(self, child, grace):
+                events.append('owned-finalize')
+                if mode == 'cleanup-error': raise RuntimeError('cleanup failed')
+                if mode != 'cleanup-survivor': self.live = False
+            def close(self):
+                events.append('close')
+                if mode == 'close-error': raise RuntimeError('CloseHandle/job failed')
+        def sleep(seconds): clock[0] += seconds
+        with patch.object(gate.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(gate.time, 'sleep', side_effect=sleep):
+            result = gate.run_owned(['powershell'], {}, directory, label, 2,
+                                    finalize_failed_collector_descendants=policy,
+                                    job_type=Job, popen=lambda *a, **kw: Child())
+        return result, events
+
+    def test_nonzero_collector_returns_original_refusal_only_after_checked_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            result, events = self.run_case(directory, 'nonzero')
+            self.assertEqual(result, (7, ''))
+            self.assertEqual(events, ['assigned', 'owned-metadata', 'owned-finalize', 'close'])
+            record = json.loads((directory/'edit-admission-005-collector.owned.json').read_text(encoding='utf-8'))
+            self.assertEqual(record['returncode'], 7)
+            self.assertEqual(len(record['jobDrainObservations']), 21)
+            self.assertIn('survived', record['jobDrainAnomaly'])
+            self.assertEqual(record['ownedMemberIdentities']['processes'][0]['status'], 'open-unavailable')
+            self.assertEqual(record['remainingOwnedPids'], [])
+            self.assertTrue(record['jobCloseSucceeded'])
+            self.assertNotIn('error', record)
+
+    def test_success_timeout_membership_cleanup_and_close_failures_remain_terminal(self):
+        for mode in ('success', 'timeout', 'query-error', 'cleanup-error', 'cleanup-survivor', 'close-error'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.run_case(directory, mode)
+                record = json.loads((directory/'edit-admission-005-collector.owned.json').read_text(encoding='utf-8'))
+                if mode == 'close-error':
+                    self.assertFalse(record['jobCloseSucceeded'])
+                    self.assertIn('CloseHandle', record['jobCloseError'])
+                    self.assertEqual(record['remainingOwnedPids'], [])
+                elif mode.startswith('cleanup-'):
+                    self.assertIn('cleanupError', record)
+                else:
+                    self.assertIn('error', record)
+
+    def test_refresh_numerical_and_unmarked_collectors_cannot_use_finalization(self):
+        for label in ('edit-admission-005-refresh', 'edit-tests', 'compile', 'edit-admission-005-collector-extra'):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, 'admission-collector-only'):
+                    self.run_case(Path(tmp), 'nonzero', label)
+        for label in ('edit-admission-005-refresh', 'edit-tests', 'edit-admission-005-collector'):
+            with self.subTest(strict_label=label), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, 'owned (Job drain deadline exceeded|descendants survived root exit drain)'):
+                    self.run_case(Path(tmp), 'nonzero', label, policy=False)
+
+    def test_cleaned_failed_collector_queues_once_before_fresh_admission(self):
+        fixture = OrchestrationTests('test_two_binaries_all_compilation_before_three_exact_invocations')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        sleeps = []
+        def runner(args, env, out, label, seconds, **policy):
+            if label == 'edit-admission-001-collector':
+                fixture.calls.append((label, args, env.copy()))
+                return self.run_case(out, 'nonzero', label)[0]
+            return fixture.runner(args, env, out, label, seconds, **policy)
+        result = gate.execute(fixture.spec, fixture.env, fixture.out, runner=runner, now=lambda: NOW,
+                              sleep=sleeps.append, source_check=lambda: {'fixed': 'source'})
+        self.assertEqual(sleeps, [30])
+        self.assertEqual(len(result), 3)
+        self.assertEqual([label for label, _, _ in fixture.calls if label.endswith('-tests')],
+                         ['edit-tests', 'layout-tests', 'encoder-tests'])
+        first = json.loads((fixture.out/'edit-admission-001/admission.json').read_text(encoding='utf-8'))
+        second = json.loads((fixture.out/'edit-admission-002/admission.json').read_text(encoding='utf-8'))
+        self.assertEqual(first['refusal'], 'fresh collector failed')
+        self.assertFalse(first['admitted']); self.assertTrue(second['admitted'])
+        self.assertTrue((fixture.out/'edit-admission-001-collector.owned.json').exists())
+
+
+class WindowsJobMetadataTests(unittest.TestCase):
+    def test_metadata_never_queries_reused_or_unproven_handles(self):
+        from scripts import media_campaign_windows as windows
+        for mode in ('resolved', 'left-job', 'open-failed', 'reused', 'membership-unavailable', 'metadata-unavailable', 'close-failed'):
+            with self.subTest(mode=mode):
+                events = []
+                class Kernel:
+                    def OpenProcess(self, access, inherit, pid):
+                        events.append('open'); self_case.assertEqual(access, 0x1000)
+                        return 0 if mode == 'open-failed' else 55
+                    def IsProcessInJob(self, process, job, owned):
+                        events.append('membership'); owned._obj.value = mode != 'reused'
+                        return mode != 'membership-unavailable'
+                    def GetProcessTimes(self, process, created, *unused):
+                        events.append('times'); created._obj.dwHighDateTime = 2; created._obj.dwLowDateTime = 3
+                        return mode != 'metadata-unavailable'
+                    def QueryFullProcessImageNameW(self, process, flags, buffer, size):
+                        events.append('path'); buffer.value = 'C:/owned/helper.exe'
+                        return mode != 'metadata-unavailable'
+                    def CloseHandle(self, process):
+                        events.append('close'); return mode != 'close-failed'
+                self_case = self
+                job = windows.WindowsJob.__new__(windows.WindowsJob)
+                job.handle = 99; job.kernel = Kernel()
+                job.members = lambda: set() if mode == 'left-job' else {123}
+                with patch.object(windows, '_failed', side_effect=lambda op: windows.WindowsJobError(op)):
+                    if mode == 'close-failed':
+                        with self.assertRaisesRegex(windows.WindowsJobError, 'owned-identity'):
+                            job.member_identities([123])
+                        continue
+                    result = job.member_identities([123])
+                row = result['processes'][0]
+                if mode == 'resolved':
+                    self.assertEqual(row['createdFileTime'], (2 << 32) | 3)
+                    self.assertEqual(row['path'], 'C:/owned/helper.exe')
+                    self.assertEqual(row['status'], 'owned-identity-resolved')
+                    self.assertEqual(events, ['open', 'membership', 'times', 'path', 'close'])
+                elif mode == 'metadata-unavailable':
+                    self.assertEqual(row['status'], 'owned-identity-partial')
+                    self.assertIsNone(row['path']); self.assertIsNone(row['createdFileTime'])
+                else:
+                    self.assertNotIn('times', events); self.assertNotIn('path', events)
+                    self.assertIsNone(row['path']); self.assertIsNone(row['createdFileTime'])
+                if 'membership' in events: self.assertEqual(events[-1], 'close')
+
+    def test_metadata_is_bounded_and_close_failure_retains_handle(self):
+        from scripts import media_campaign_windows as windows
+        job = windows.WindowsJob.__new__(windows.WindowsJob)
+        job.handle = 99
+        job.members = lambda: set()
+        result = job.member_identities(list(range(100)))
+        self.assertEqual(len(result['processes']), 32)
+        self.assertTrue(result['truncated']); self.assertEqual(result['observedCount'], 100)
+        calls = []
+        class Kernel:
+            success = False
+            def CloseHandle(self, handle): calls.append(handle); return self.success
+        job.kernel = Kernel()
+        with patch.object(windows, '_failed', side_effect=lambda op: windows.WindowsJobError(op)):
+            with self.assertRaisesRegex(windows.WindowsJobError, 'CloseHandle/job'): job.close()
+        self.assertEqual(job.handle, 99)
+        job.kernel.success = True
+        job.close(); self.assertIsNone(job.handle)
+        job.close(); self.assertEqual(calls, [99, 99])
 
 
 class WorkflowTests(unittest.TestCase):

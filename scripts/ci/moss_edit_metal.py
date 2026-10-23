@@ -27,6 +27,13 @@ class AdmissionDeferred(ValueError):
     pass
 
 
+class CapacityUnavailable(ValueError):
+    """Only a valid measured capacity shortage may wait or retry preparation."""
+    def __init__(self, predicate, sample):
+        super().__init__(predicate)
+        self.predicate, self.sample = predicate, sample
+
+
 COMPILERS = {'rustc', 'rustdoc', 'clippy-driver', 'clang', 'clang++', 'cc', 'c++', 'gcc', 'g++', 'cc1', 'cc1plus', 'cmake', 'ninja', 'make', 'nvcc', 'ld', 'ld64', 'metal', 'metallib'}
 
 def require(condition, message):
@@ -47,15 +54,22 @@ def unique_fields(pairs):
 def read(path):
     require(path.stat().st_size <= MAX_LOG, 'oversized JSON evidence')
     return json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=unique_fields)
-def metadata(command):
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30, encoding='utf-8')
+def operation_timeout(maximum, deadline=None):
+    if deadline is None: return maximum
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, 'absolute preparation operation deadline expired')
+    return min(maximum, remaining)
+
+def metadata(command, deadline=None):
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=operation_timeout(30, deadline), encoding='utf-8')
+    operation_timeout(30, deadline)
     require(result.returncode == 0, 'metadata command failed: ' + command[0])
     require(len(result.stdout.encode()) <= MAX_LOG, 'oversized metadata output')
     return result.stdout
 
-def rows():
+def rows(deadline=None):
     result = []
-    for line in metadata(['ps', '-axo', 'pid,ppid,pgid,lstart,comm']).splitlines()[1:]:
+    for line in metadata(['ps', '-axo', 'pid,ppid,pgid,lstart,comm'], deadline).splitlines()[1:]:
         fields = line.strip().split(None, 8)
         if len(fields) == 9:
             result.append((int(fields[0]), int(fields[1]), int(fields[2]), ' '.join(fields[3:8]), fields[8]))
@@ -117,13 +131,13 @@ def token_identity(path):
     return {'path': str(path.resolve()), 'device': info.st_dev, 'inode': info.st_ino}
 
 
-def snapshot():
+def snapshot(deadline=None):
     import plistlib
-    forest = plistlib.loads(subprocess.check_output(['/usr/sbin/ioreg', '-a', '-l', '-r', '-c', 'AGXAccelerator'], timeout=30))
+    forest = plistlib.loads(subprocess.check_output(['/usr/sbin/ioreg', '-a', '-l', '-r', '-c', 'AGXAccelerator'], timeout=operation_timeout(30, deadline)))
     require(isinstance(forest, list) and len(forest) == 1, 'expected one physical Apple GPU')
     device = forest[0]
     identity = {key: device[key] for key in ('IORegistryEntryID', 'IORegistryEntryName', 'IOObjectClass')}
-    all_processes = process_records(rows())
+    all_processes = process_records(rows(deadline))
     processes = {row['pid']: (row['birth'], row['comm']) for row in all_processes}
     clients, device_clients = [], []
     def visit(node):
@@ -143,7 +157,8 @@ def snapshot():
     visit(device)
     require(device_clients and set(device_clients) <= {row['entry_id'] for row in clients}, 'incomplete physical GPU client census')
     listeners, current = {}, None
-    listing = subprocess.run(['/usr/sbin/lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'], capture_output=True, text=True, timeout=30, encoding='utf-8')
+    listing = subprocess.run(['/usr/sbin/lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'], capture_output=True, text=True, timeout=operation_timeout(30, deadline), encoding='utf-8')
+    operation_timeout(30, deadline)
     require(listing.returncode == 0 or (listing.returncode == 1 and not listing.stdout and not listing.stderr), 'listener census failed')
     for line in listing.stdout.splitlines():
         if line.startswith('p'):
@@ -156,11 +171,16 @@ def snapshot():
     for row in listeners.values(): row['endpoints'] = sorted(set(row['endpoints']))
     return {'utc': utc().isoformat(), 'host': platform.node(), 'runner': os.environ['RUNNER_NAME'], 'device': identity, 'device_client_count': len(device_clients), 'clients': sorted(clients, key=lambda row: row['entry_id']), 'listeners': sorted(listeners.values(), key=lambda row: row['pid']), 'processes': relevant_processes(all_processes), 'controllerJobOwner': job_owner(all_processes, os.getpid())}
 
-def inventory():
-    require(metadata(['git', 'rev-parse', 'HEAD']).strip() == os.environ['MOSS_METAL_SOURCE'] == os.environ['GITHUB_SHA'], 'source revision mismatch')
-    require(not metadata(['git', 'status', '--porcelain']).strip(), 'source checkout is dirty')
-    files = metadata(['git', 'ls-files', '-z']).split('\0')
-    return {name: sha(ROOT / name) for name in files if name}
+def inventory(deadline=None):
+    require(metadata(['git', 'rev-parse', 'HEAD'], deadline).strip() == os.environ['MOSS_METAL_SOURCE'] == os.environ['GITHUB_SHA'], 'source revision mismatch')
+    require(not metadata(['git', 'status', '--porcelain'], deadline).strip(), 'source checkout is dirty')
+    files = metadata(['git', 'ls-files', '-z'], deadline).split('\0')
+    result = {}
+    for name in files:
+        operation_timeout(30, deadline)
+        if name: result[name] = sha(ROOT / name)
+    operation_timeout(30, deadline)
+    return result
 
 def paths(create=False):
     require(os.environ['GITHUB_REPOSITORY'] == 'SceneWorks/inference', 'wrong repository')
@@ -176,17 +196,29 @@ def child_env(out):
     env.update(CARGO_TARGET_DIR=str(out / 'target'), CARGO_BUILD_JOBS='4', CMAKE_BUILD_PARALLEL_LEVEL='4', RUSTUP_TOOLCHAIN='1.96.0', RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='', CARGO_NET_OFFLINE='true', CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_PROFILE_DEV_STRIP='none', CARGO_PROFILE_TEST_STRIP='none', RUSTFLAGS='-C strip=none', RUST_TEST_THREADS='1', RAYON_NUM_THREADS='1', OMP_NUM_THREADS='1', HF_HOME=str(out / 'hf'), HF_HUB_CACHE=str(out / 'hub'), HUGGINGFACE_HUB_CACHE=str(out / 'hub-legacy'), HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_DATASETS_OFFLINE='1', SCENEWORKS_WHISPER_SMOKE_CACHE=str(out / 'whisper'), SCENEWORKS_WHISPER_SMOKE_FRESH='0', TMPDIR=str(out / 'tmp'), TMP=str(out / 'tmp'), TEMP=str(out / 'tmp'), SCENEWORKS_API_URL='http://127.0.0.1:1', SCENEWORKS_ACCESS_TOKEN='source-fixture-deny', RUSTUP_AUTO_INSTALL='0', PYTHONDONTWRITEBYTECODE='1', VECLIB_MAXIMUM_THREADS='1', CUDA_VISIBLE_DEVICES='', MACOSX_DEPLOYMENT_TARGET='26.2')
     return env
 
-def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None):
-    receipt = {'command': command, 'startedUtc': utc().isoformat(), 'observed': {}}
+def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None, absolute_deadline=None):
+    receipt = {'command': command, 'startedUtc': utc().isoformat(), 'observed': {}, 'sentSignals': []}
     observed = receipt['observed']
+    # Preparation's final ten seconds are reserved for owned cleanup. The end
+    # is fixed BEFORE slow prelaunch metadata and never reset after admission.
+    end = min(time.monotonic() + timeout, absolute_deadline - 10) if absolute_deadline is not None else None
+    if absolute_deadline is not None: receipt.update(absoluteDeadline=absolute_deadline, workDeadline=end)
     with (out / (label + '.log')).open('w', encoding='utf-8') as log:
-        # No hashing/capacity/network operation is inserted after this final
-        # callback and before Popen. Even a fast child must pass this callback.
-        if prelaunch: receipt['prelaunch'] = prelaunch()
+        try:
+            if prelaunch: receipt['prelaunch'] = prelaunch()
+            if end is not None: operation_timeout(timeout, end)
+        except BaseException as error:
+            receipt.update(error=str(error), launched=False, remaining=[], exitCode=None, finishedUtc=utc().isoformat())
+            if isinstance(error, CapacityUnavailable): receipt['capacityUnavailable'] = {'predicate': error.predicate, 'sample': error.sample}
+            write(out / (label + '-process.json'), receipt)
+            raise
+        # The ordinary oracle retains its final admission callback directly
+        # before Popen; no source scan or capacity query is inserted here.
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        receipt['pid'] = process.pid
-        def observe():
-            current = rows(); owned = {process.pid} if process.poll() is None else set()
+        receipt['pid'] = process.pid; receipt['launched'] = True
+        def observe(limit=None):
+            current = rows(limit) if limit is not None else rows()
+            owned = {process.pid} if process.poll() is None else set()
             for pid, parent, group, birth, comm in current:
                 if observed.get(str(pid), {}).get('birth') == birth: owned.add(pid)
             while True:
@@ -200,53 +232,72 @@ def run_owned(command, env, out, label, timeout, monitor=None, prelaunch=None):
             return living
         def cleanup():
             for sig in (signal.SIGTERM, signal.SIGKILL):
-                living = observe()
+                living = observe(absolute_deadline)
                 if not living: return
                 for pid, birth in living:
-                    if any(p == pid and b == birth for p, parent, group, b, comm in rows()):
+                    current = rows(absolute_deadline) if absolute_deadline is not None else rows()
+                    if any(p == pid and b == birth for p, parent, group, b, comm in current):
                         try: os.kill(pid, sig)
                         except ProcessLookupError: pass
+                        else: receipt['sentSignals'].append({'pid': pid, 'birth': birth, 'signal': int(sig)})
                 until = time.monotonic() + 3
-                while observe() and time.monotonic() < until: process.poll(); time.sleep(.1)
-        end = time.monotonic() + timeout
+                if absolute_deadline is not None: until = min(until, absolute_deadline)
+                while observe(absolute_deadline) and time.monotonic() < until: process.poll(); time.sleep(max(0, min(.1, until - time.monotonic())))
+        if end is None: end = time.monotonic() + timeout
         try:
             while process.poll() is None:
-                observe(); write(out / (label + '-process.json'), receipt)
-                require(time.monotonic() < end, 'owned phase deadline exceeded')
+                operation_timeout(timeout, end)
+                observe(end if absolute_deadline is not None else None); write(out / (label + '-process.json'), receipt)
+                operation_timeout(timeout, end)
                 require((out / (label + '.log')).stat().st_size <= MAX_LOG, 'phase log bound exceeded')
                 if monitor: monitor(observed)
-                time.sleep(.5)
+                operation_timeout(timeout, end)
+                time.sleep(max(0, min(.5, end - time.monotonic())))
         except BaseException as error:
             receipt['error'] = str(error)
+            if isinstance(error, CapacityUnavailable):
+                receipt['capacityUnavailable'] = {'predicate': error.predicate, 'sample': error.sample}
+                receipt['capacityInterrupted'] = process.poll() is None
             raise
         finally:
-            cleanup(); receipt['remaining'] = observe(); receipt['exitCode'] = process.wait(); receipt['finishedUtc'] = utc().isoformat(); write(out / (label + '-process.json'), receipt)
+            try:
+                cleanup(); receipt['remaining'] = observe(absolute_deadline)
+                receipt['exitCode'] = process.wait(timeout=operation_timeout(10, absolute_deadline)) if absolute_deadline is not None else process.wait()
+            finally:
+                receipt['finishedUtc'] = utc().isoformat(); write(out / (label + '-process.json'), receipt)
+            require(not receipt['remaining'], 'owned cleanup incomplete')
     require(not receipt['remaining'] and receipt['exitCode'] == 0, 'owned phase failed: ' + label)
     return (out / (label + '.log')).read_text(encoding='utf-8')
 
-def capacity(out, prelaunch=False, high_since=None):
+def capacity(out, prelaunch=False, high_since=None, deadline=None):
     cores = os.cpu_count()
     require(cores is not None and cores >= 8, 'four-job build needs a reviewed host with at least eight logical cores')
-    memory = metadata(['/usr/bin/memory_pressure', '-Q'])
+    memory = metadata(['/usr/bin/memory_pressure', '-Q'], deadline)
     match = re.search(r'System-wide memory free percentage:\s*(\d+)%', memory)
     require(match is not None, 'unparseable memory capacity')
-    active = [{'pid': pid, 'birth': birth, 'comm': comm} for pid, parent, group, birth, comm in rows() if Path(comm).name in COMPILERS]
+    active = [{'pid': pid, 'birth': birth, 'comm': comm} for pid, parent, group, birth, comm in rows(deadline) if Path(comm).name in COMPILERS]
     disk = os.statvfs(out)
-    sample = {'utc': utc().isoformat(), 'logicalCores': cores, 'actualCompilers': active, 'load1m': os.getloadavg()[0], 'memoryFreePercent': int(match.group(1)), 'diskFreeBytes': disk.f_bavail * disk.f_frsize}
+    sample = {'utc': utc().isoformat(), 'logicalCores': cores, 'actualCompilers': active, 'load1m': os.getloadavg()[0], 'memoryFreePercent': int(match.group(1)), 'memoryPressureRaw': memory, 'diskFreeBytes': disk.f_bavail * disk.f_frsize}
     write(out / 'capacity.json', sample)
+    history = out / 'capacity-history.log'
+    encoded = json.dumps(sample) + '\n'
+    require((history.stat().st_size if history.exists() else 0) + len(encoded.encode('utf-8')) <= MAX_LOG, 'capacity history bound exceeded')
+    with history.open('a', encoding='utf-8') as stream: stream.write(encoded)
     # Compiler process count is telemetry, not a proxy for measured CPU capacity.
-    require(sample['memoryFreePercent'] >= 30 and sample['diskFreeBytes'] >= 80 * 1024**3, 'memory or disk capacity exceeded')
-    if prelaunch: require(sample['load1m'] <= cores - 4, 'prelaunch CPU capacity exceeded')
+    if sample['memoryFreePercent'] < 30: raise CapacityUnavailable('memory free percentage below thirty', sample)
+    if sample['diskFreeBytes'] < 80 * 1024**3: raise CapacityUnavailable('disk free bytes below eighty GiB', sample)
+    if prelaunch and sample['load1m'] > cores - 4: raise CapacityUnavailable('prelaunch CPU capacity exceeded', sample)
     if sample['load1m'] > cores - 2:
         high_since = high_since if high_since is not None else time.monotonic()
-        require(time.monotonic() - high_since < 30, 'CPU capacity exceeded for thirty seconds')
+        if time.monotonic() - high_since >= 30: raise CapacityUnavailable('CPU capacity exceeded for thirty seconds', sample)
     else: high_since = None
     return high_since
 
 
-def runtime_identity(env):
-    rustc = Path(metadata(['rustup', 'which', '--toolchain', '1.96.0', 'rustc']).strip()).resolve(strict=True)
-    version = subprocess.check_output([str(rustc), '--version'], env=env, text=True, timeout=30).strip()
+def runtime_identity(env, deadline=None):
+    rustc = Path(metadata(['rustup', 'which', '--toolchain', '1.96.0', 'rustc'], deadline).strip()).resolve(strict=True)
+    version = subprocess.check_output([str(rustc), '--version'], env=env, text=True, timeout=operation_timeout(30, deadline), encoding='utf-8').strip()
+    operation_timeout(30, deadline)
     require(version.startswith('rustc 1.96.0 '), 'wrong native Rust version')
     return {'rustc': str(rustc), 'rustcSha256': sha(rustc), 'version': version, 'python': str(Path(sys.executable).resolve()), 'pythonSha256': sha(Path(sys.executable).resolve())}
 
@@ -282,19 +333,83 @@ def validate_lease(lease):
         require(job['repository'] in ('SceneWorks/inference', 'SceneWorks/SceneWorks') and type(job['runId']) is int and type(job['attempt']) is int, 'unreviewed compute repository or run')
 
 
+def prepare_compile(out, env, source, runtime, deadline):
+    """Wait only for measured capacity; retain each interrupted private build."""
+    target = out / 'target'
+    require(target.is_dir() and not target.is_symlink() and Path(env['CARGO_TARGET_DIR']) == target, 'private preparation target missing or changed')
+    target_identity = (target.stat().st_dev, target.stat().st_ino)
+    history = []
+    def state(status, **details):
+        history.append(dict(utc=utc().isoformat(), status=status, **details))
+        require(len(history) <= 200, 'preparation history bound exceeded')
+        write(out / 'preparation-queue.json', {'deadlineMonotonic': deadline, 'events': history})
+    def budget(reserve=0):
+        left = deadline - time.monotonic()
+        if left <= reserve:
+            state('deadline-expired')
+            raise ValueError('bounded preparation deadline expired')
+        return left - reserve
+    def revalidate():
+        budget(70)
+        require(target.is_dir() and not target.is_symlink() and (target.stat().st_dev, target.stat().st_ino) == target_identity, 'private preparation target missing or changed')
+        require(inventory(deadline - 70) == source, 'source changed during preparation queue')
+        require(runtime_identity(env, deadline - 70) == runtime, 'runtime changed during preparation queue')
+        budget(70)
+    def cooldown():
+        state('waiting')
+        time.sleep(min(POLL_SECONDS, budget(70)))
+        budget(70)
+    attempt = 0
+    while True:
+        consecutive = 0
+        while consecutive < 2:
+            revalidate()
+            try: capacity(out, prelaunch=True, deadline=deadline - 70)
+            except CapacityUnavailable as error:
+                consecutive = 0
+                state('capacity-unavailable', predicate=error.predicate, sample=error.sample)
+            else:
+                consecutive += 1
+                state('capacity-pass', consecutive=consecutive)
+            if consecutive < 2: cooldown()
+        state('capacity-restored')
+        revalidate()
+        attempt += 1; label = f'compile-{attempt:03d}'
+        high_since = None
+        def monitor_build(_owned):
+            nonlocal high_since
+            try: high_since = capacity(out, high_since=high_since, deadline=deadline - 70)
+            except CapacityUnavailable:
+                state('owned-draining', attempt=attempt)
+                raise
+        def prelaunch():
+            budget(70)
+            return capacity(out, prelaunch=True, deadline=deadline - 70)
+        state('retrying' if attempt > 1 else 'compiling', attempt=attempt)
+        try:
+            log = run_owned(['cargo', 'test', '--locked', '--lib', '-p', 'mlx-gen-moss-image', '--no-run', '--message-format=json'], env, out, label, budget(70), monitor_build, prelaunch, absolute_deadline=deadline - 60)
+        except CapacityUnavailable:
+            receipt = read(out / (label + '-process.json'))
+            require(receipt.get('capacityUnavailable') and receipt['remaining'] == [], 'capacity interruption lacks complete owned cleanup')
+            sent_root_signal = any(row['pid'] == receipt.get('pid') and row['birth'] == receipt.get('observed', {}).get(str(receipt.get('pid')), {}).get('birth') and row['signal'] == -receipt.get('exitCode', 0) for row in receipt.get('sentSignals', []))
+            require((receipt.get('launched') is False and receipt['exitCode'] is None) or (receipt.get('capacityInterrupted') is True and sent_root_signal and receipt['exitCode'] in (-signal.SIGTERM, -signal.SIGKILL)), 'not a controller-initiated capacity interruption')
+            state('owned-drained', attempt=attempt, receipt=label + '-process.json')
+            cooldown()
+            continue
+        revalidate()
+        state('compiled', attempt=attempt)
+        return log
+
+
 def prepare():
+    deadline = time.monotonic() + 1200
     require(sys.platform == 'darwin' and os.environ['RUNNER_NAME'] in ('nax-macos', 'nax-macos-2'), 'known NAX runner required')
     out = paths(True)
     for name in ('target', 'tmp', 'hf', 'hub', 'hub-legacy', 'whisper'): (out / name).mkdir()
-    source = inventory(); write(out / 'source.json', source)
+    source = inventory(deadline - 70); write(out / 'source.json', source)
     env = child_env(out)
-    runtime = runtime_identity(env); write(out / 'runtime.json', runtime)
-    capacity(out, prelaunch=True)
-    high_since = None
-    def monitor_build(_owned):
-        nonlocal high_since
-        high_since = capacity(out, high_since=high_since)
-    log = run_owned(['cargo', 'test', '--locked', '--lib', '-p', 'mlx-gen-moss-image', '--no-run', '--message-format=json'], env, out, 'compile', 1200, monitor_build)
+    runtime = runtime_identity(env, deadline - 70); write(out / 'runtime.json', runtime)
+    log = prepare_compile(out, env, source, runtime, deadline)
     binaries = []
     for line in log.splitlines():
         try: event = json.loads(line)
@@ -303,14 +418,18 @@ def prepare():
             binaries.append(Path(event['executable']).resolve())
     require(len(binaries) == 1 and binaries[0].is_relative_to(out / 'target'), 'missing or escaping prepared binary')
     binary = binaries[0]
-    listed = run_owned([str(binary), TEST, '--exact', '--list', '--ignored'], env, out, 'list', 60)
+    remaining = deadline - time.monotonic() - 10
+    require(remaining > 0, 'preparation deadline expired before listing')
+    listed = run_owned([str(binary), TEST, '--exact', '--list', '--ignored'], env, out, 'list', min(60, remaining), absolute_deadline=deadline)
     require(re.findall(r'^(.+): test$', listed, re.M) == [TEST], 'missing or extra ignored oracle membership')
-    require(runtime_identity(env) == runtime, 'build runtime changed')
-    current = snapshot(); write(out / 'metadata.json', current)
+    require(runtime_identity(env, deadline) == runtime, 'build runtime changed')
+    require(time.monotonic() < deadline, 'preparation deadline expired before metadata')
+    current = snapshot(deadline); write(out / 'metadata.json', current)
     token = token_path(); token.parent.mkdir(parents=True, exist_ok=True)
     with token.open('a', encoding='utf-8'): pass
-    require(inventory() == source, 'source changed during preparation')
+    require(inventory(deadline) == source, 'source changed during preparation')
     prepared = {'source': os.environ['GITHUB_SHA'], 'actor': os.environ['GITHUB_ACTOR'], 'runId': int(os.environ['GITHUB_RUN_ID']), 'attempt': 1, 'host': current['host'], 'runner': current['runner'], 'binary': str(binary), 'binarySha256': sha(binary), 'controllerSha256': sha(Path(__file__)), 'jobOwner': current['controllerJobOwner'], 'tokenIdentity': token_identity(token), 'sourceInventorySha256': sha(out / 'source.json'), 'runtimeSha256': sha(out / 'runtime.json'), 'metadataSha256': sha(out / 'metadata.json'), 'members': [TEST], 'preparedUtc': utc().isoformat()}
+    require(time.monotonic() < deadline, 'preparation deadline expired before publication')
     write(out / 'prepared.json', prepared)
     with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output: output.write('evidence=' + str(out) + '\n')
     print(json.dumps(prepared))
