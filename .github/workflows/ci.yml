@@ -1103,6 +1103,9 @@ jobs:
         # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
         env:
           REQUIRE_SM120: "1"
+          # Iris' multi-process fixtures explicitly opt into sharing this lane's one visible card.
+          # Without it rank 1 asks for cuda:1, exits InvalidMesh, and peers time out in rendezvous.
+          IRIS_DIST_SHARE_DEVICE: "1"
         run: |
           call "%VCVARS%"
           cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast

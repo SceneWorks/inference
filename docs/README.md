@@ -127,6 +127,13 @@ typecheck and device execution remain distinct evidence. SceneWorks catalog
 admission and its consumer pin are a paired change, not implied by this inference
 implementation; AdaLN pruning/tables and asymmetric W4A8 remain separate slices.
 
+The manual lane's broad CUDA package-test step sets `IRIS_DIST_SHARE_DEVICE=1`:
+Iris' real multi-process fixtures explicitly share the lane's one visible card,
+rather than requesting absent `cuda:1`/`cuda:2`/`cuda:3` devices and failing before
+rendezvous. Their separate missing-device test still exercises both the explicit
+refusal and opt-in-sharing paths. This does not skip scenarios or relax numeric
+assertions.
+
 ## Migration records
 
 The [`migration/`](migration/) directory records how this repository was assembled from the
