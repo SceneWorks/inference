@@ -40,6 +40,9 @@ mod joint_denoise;
 #[path = "quant_policy.rs"]
 mod quant_policy;
 
+#[path = "pruned_adaln.rs"]
+mod pruned_adaln;
+
 #[path = "real_weights.rs"]
 mod real_weights;
 

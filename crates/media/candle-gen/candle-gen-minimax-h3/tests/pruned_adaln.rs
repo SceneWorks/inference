@@ -26,26 +26,11 @@ fn floats(v: &Value) -> Vec<f32> {
 }
 
 fn config() -> MiniMaxH3DitConfig {
+    // Every config key the oracle recorded is one `from_diffusers_json` consumes — including the
+    // in_channels / audio_in_channels / patch_size the final heads are shaped by — so the config
+    // is parsed from the fixture bytes rather than re-typed here and allowed to drift.
     let f = fixture();
-    let c = &f["config"];
-    MiniMaxH3DitConfig {
-        num_attention_heads: c["num_attention_heads"].as_u64().unwrap() as usize,
-        attention_head_dim: c["attention_head_dim"].as_u64().unwrap() as usize,
-        hidden_size: c["hidden_size"].as_u64().unwrap() as usize,
-        num_layers: c["num_layers"].as_u64().unwrap() as usize,
-        num_refiner_layers: c["num_refiner_layers"].as_u64().unwrap() as usize,
-        ffn_dim: c["ffn_dim"].as_u64().unwrap() as usize,
-        text_dim: c["text_dim"].as_u64().unwrap() as usize,
-        freq_dim: c["freq_dim"].as_u64().unwrap() as usize,
-        time_embed_hidden_dim: c["time_embed_hidden_dim"].as_u64().unwrap() as usize,
-        time_embed_dim: c["time_embed_dim"].as_u64().unwrap() as usize,
-        rope_freq_dim: c["rope_freq_dim"].as_u64().unwrap() as usize,
-        rope_theta: c["rope_theta"].as_f64().unwrap(),
-        norm_eps: c["norm_eps"].as_f64().unwrap(),
-        qk_norm_eps: c["qk_norm_eps"].as_f64().unwrap(),
-        final_norm_eps: c["final_norm_eps"].as_f64().unwrap(),
-        ..MiniMaxH3DitConfig::default()
-    }
+    MiniMaxH3DitConfig::from_diffusers_json(&f["config"].to_string()).expect("fixture config")
 }
 
 /// One fixture tensor as a candle tensor **at its stored dtype**.
@@ -129,7 +114,10 @@ fn assert_close(got: &[f32], want: &[f32], tol: f64, what: &str) {
 // Refusal before execution — the fail-closed half of the contract
 // -------------------------------------------------------------------------------------------
 
-fn lookup_of(f: &Value, extra: &[(&str, &str, Vec<usize>)]) -> impl Fn(&str) -> Option<(candle_gen::gen_core::weightsmeta::Dtype, Vec<usize>)> + '_ {
+fn lookup_of(
+    f: &Value,
+    extra: &[(&str, &str, Vec<usize>)],
+) -> impl Fn(&str) -> Option<(candle_gen::gen_core::weightsmeta::Dtype, Vec<usize>)> {
     let mut map: HashMap<String, (String, Vec<usize>)> = f["tensors"]
         .as_object()
         .unwrap()
@@ -150,8 +138,7 @@ fn lookup_of(f: &Value, extra: &[(&str, &str, Vec<usize>)]) -> impl Fn(&str) -> 
         })
         .collect();
     for (name, dtype, shape) in extra {
-        map.entry(name.to_string())
-            .insert((dtype.to_string(), shape));
+        map.insert(name.to_string(), (dtype.to_string(), shape.clone()));
     }
     move |name: &str| {
         map.get(name).map(|(d, s)| {
@@ -759,6 +746,69 @@ fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
     assert!(!cache.is_current_for_pruning(&other, c.identity()));
 }
 
+#[test]
+fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
+    let f = fixture();
+    let device = dev();
+    let cfg = config();
+    let basis_a = curve(&f, &device);
+    // Basis B: same shapes, one reduced block weight moved.
+    let mut map = weight_map(&f, &device);
+    let t = map
+        .get_mut("transformer_blocks.0.adaln_proj.linear.weight")
+        .unwrap();
+    let dtype = t.dtype();
+    let mut v = t
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    v[1] += 0.5;
+    map.insert(
+        "transformer_blocks.0.adaln_proj.linear.weight".to_string(),
+        Tensor::from_vec(v, t.dims().to_vec(), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap(),
+    );
+    let w_b = Weights::from_map(map);
+    let topology_b = CurveAdaLn::inspect(&w_b, &cfg).unwrap().unwrap();
+    let operands_b: HashMap<String, Tensor> = topology_b
+        .operands()
+        .iter()
+        .map(|o| (o.name.clone(), w_b.require(&o.name).unwrap()))
+        .collect();
+    let basis_b = CurveAdaLn::assemble(topology_b, operands_b, &cfg, &device).unwrap();
+    assert_ne!(basis_a.identity(), basis_b.identity());
+
+    // Blocks carrying basis B's projections, precomputed under basis A: the cache would be
+    // labelled with A's identity while holding B's modulation, so the precompute refuses before
+    // any projection runs.
+    let blocks_b = (0..cfg.num_layers)
+        .map(|i| {
+            DitBlock::from_weights_curve(
+                &w_b,
+                &format!("transformer_blocks.{i}"),
+                &cfg,
+                DType::F32,
+                basis_b.block_projection(i).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let schedule = TimestepSchedule::new(vec![vec![0.5, 0.6, 0.7, 1.0]]).unwrap();
+    let err = basis_a
+        .precompute(&blocks_b, &schedule)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("different pruning basis"),
+        "mixed-basis precompute must be refused: {err}"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // The model-level seams: fail-closed embedding, identity exposure, curve precompute
 // -------------------------------------------------------------------------------------------
@@ -831,6 +881,186 @@ fn the_stock_path_is_untouched_and_refuses_curve_coordinates() {
         err.contains("full timestep MLP"),
         "curve access is refused on the stock path: {err}"
     );
+}
+
+#[test]
+fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision() {
+    // A synthetic **complete** pruned `transformer/` partition: the fixture's canonical curve
+    // operands plus the top-level tensors the fixture omits (the input projections, the text
+    // embedder, and a token-refiner body copied from block 0). Written to a real safetensors file
+    // with the fixture config, this exercises the changed loader path (`load_from_dir` →
+    // stored-precision native load → `from_weights`) and the public identity end to end, without
+    // a real checkpoint campaign.
+    let f = fixture();
+    let cfg = config();
+    let dir = tempfile::tempdir().unwrap();
+    let mut tensors: HashMap<String, (safetensors::Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
+    for (name, entry) in f["tensors"].as_object().unwrap() {
+        let dtype = match entry["dtype"].as_str().unwrap() {
+            "F32" => safetensors::Dtype::F32,
+            "BF16" => safetensors::Dtype::BF16,
+            "F16" => safetensors::Dtype::F16,
+            other => panic!("fixture dtype {other}"),
+        };
+        let shape: Vec<usize> = entry["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_u64().unwrap() as usize)
+            .collect();
+        let t = stored_tensor(name, &f, &Device::Cpu);
+        // Write the STORED dtype's bytes back — the loader must see a real BF16/F16 tensor, not
+        // an F32 stand-in, or the source-precision assertions below would be vacuous.
+        let values = t
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bytes: Vec<u8> = match dtype {
+            safetensors::Dtype::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            safetensors::Dtype::BF16 => values
+                .iter()
+                .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+                .collect(),
+            safetensors::Dtype::F16 => values
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect(),
+            other => panic!("fixture dtype {other:?}"),
+        };
+        tensors.insert(name.clone(), (dtype, shape, bytes));
+    }
+    // The omitted top-level inputs: deterministic fillers at the published shapes.
+    let filler = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i % 7) as i8 - 3) as u8)
+            .collect::<Vec<_>>()
+    };
+    let (patch, hidden, text) = (cfg.video_patch_dim(), cfg.hidden_size, cfg.text_dim);
+    let mut push = |name: String, dtype: safetensors::Dtype, shape: Vec<usize>, data: Vec<u8>| {
+        tensors.insert(name, (dtype, shape, data));
+    };
+    push(
+        "proj_in.weight".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden, patch],
+        filler(hidden * patch * 4),
+    );
+    push(
+        "proj_in.bias".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden],
+        filler(hidden * 4),
+    );
+    push(
+        "audio_proj_in.weight".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden, cfg.audio_in_channels],
+        filler(hidden * cfg.audio_in_channels * 4),
+    );
+    push(
+        "audio_proj_in.bias".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden],
+        filler(hidden * 4),
+    );
+    push(
+        "context_embedder.weight".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden, text],
+        filler(hidden * text * 4),
+    );
+    push(
+        "context_embedder.bias".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden],
+        filler(hidden * 4),
+    );
+    for name in [
+        "norm1.weight",
+        "norm2.weight",
+        "attn.to_q.weight",
+        "attn.to_k.weight",
+        "attn.to_v.weight",
+        "attn.norm_q.weight",
+        "attn.norm_k.weight",
+        "attn.to_out.0.weight",
+        "ff.net.0.proj.weight",
+        "ff.net.2.weight",
+    ] {
+        let src = format!("transformer_blocks.0.{name}");
+        let entry = &f["tensors"][&src];
+        let dtype = match entry["dtype"].as_str().unwrap() {
+            "F32" => safetensors::Dtype::F32,
+            other => panic!("refiner body dtype {other}"),
+        };
+        let shape: Vec<usize> = entry["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_u64().unwrap() as usize)
+            .collect();
+        let t = stored_tensor(&src, &f, &Device::Cpu);
+        push(
+            format!("token_refiner.refiner_blocks.0.{name}"),
+            dtype,
+            shape,
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        );
+    }
+    push(
+        "token_refiner.final_norm.weight".to_string(),
+        safetensors::Dtype::F32,
+        vec![hidden],
+        filler(hidden * 4),
+    );
+
+    let views: HashMap<String, safetensors::tensor::TensorView> = tensors
+        .iter()
+        .map(|(k, (d, s, data))| {
+            (
+                k.clone(),
+                safetensors::tensor::TensorView::new(*d, s.clone(), data).unwrap(),
+            )
+        })
+        .collect();
+    let file = dir.path().join("transformer.safetensors");
+    safetensors::tensor::serialize_to_file(views, &None, &file).unwrap();
+    std::fs::write(dir.path().join("config.json"), f["config"].to_string()).unwrap();
+
+    let model = candle_gen_minimax_h3::dit::MiniMaxH3Dit::load_from_dir(
+        dir.path(),
+        &Device::Cpu,
+        DType::F32,
+    )
+    .expect("the synthetic pruned partition loads");
+    let identity = model
+        .pruning_identity()
+        .expect("the pruned model exposes its identity");
+    assert_eq!(
+        identity,
+        curve(&f, &Device::Cpu).identity(),
+        "the identity binds the loaded bytes"
+    );
+    assert!(
+        !model.holds_adaln(),
+        "no full-width projection exists on the pruned path"
+    );
+    let curve = model.curve().expect("the curve is resident");
+    assert_eq!(
+        curve.table().dtype(),
+        DType::F32,
+        "the table stays F32 through the loader"
+    );
+    assert_eq!(curve.block_projection(0).unwrap().dtype(), DType::BF16);
 }
 
 // -------------------------------------------------------------------------------------------

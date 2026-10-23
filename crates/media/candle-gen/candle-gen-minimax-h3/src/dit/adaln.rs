@@ -638,12 +638,12 @@ impl AdaLnCache {
     /// Whether this cache can serve `schedule`, i.e. whether the schedule is bitwise the one it was
     /// built from. A changed step count, a changed sigma shift or a changed solver all produce a
     /// different [`ScheduleKey`] and therefore a `false` here.
-    ///
-    /// **Unwired in production today** — see [`ScheduleKey`]: [`crate::dit::JointDit`] builds a
-    /// fresh cache per request, so nothing currently holds a cache long enough for this to answer
-    /// `false`. It is the check a cross-request cache-reuse seam must run before serving.
+    /// Schedule currency alone is **not** reuse permission on a pruned checkpoint: two
+    /// same-shaped bases are different models. A reuse seam on the sc-26684 path must also run
+    /// [`Self::is_current_for_pruning`], and this legacy boolean refuses any cache that carries a
+    /// pruning identity it cannot bind.
     pub fn is_current_for(&self, schedule: &TimestepSchedule) -> bool {
-        self.schedule.key() == schedule.key()
+        self.schedule.key() == schedule.key() && self.identity.is_none()
     }
 
     /// The pruning identity this cache's basis carries, `None` on the stock path.

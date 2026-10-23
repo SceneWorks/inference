@@ -99,15 +99,38 @@ impl MiniMaxH3Dit {
         // or the F16 folded biases is refused here (`table must be finite F32`), not silently
         // rebuilt from the rounded bytes.
         if let Some(topology) = CurveAdaLn::inspect(w, cfg)? {
-            let operands = (0..topology.operands().len())
-                .map(|i| {
-                    let operand = &topology.operands()[i];
-                    Ok((operand.name.clone(), w.require(&operand.name)?))
-                })
+            // The curve is assembled from THIS map — its projections are bound to the identity
+            // hashed from these very bytes — so there is no constructor accepting a curve from
+            // elsewhere: a caller cannot pair a `CurveAdaLn` with an unrelated weight map.
+            let operands = topology
+                .operands()
+                .iter()
+                .map(|o| (o.name.clone(), w.require(&o.name)?))
                 .collect::<Result<HashMap<String, Tensor>>>()?;
-            let curve =
-                CurveAdaLn::assemble(topology, operands, cfg, device)?;
-            return Self::from_weights_curve(w, cfg, device, dtype, curve);
+            let curve = CurveAdaLn::assemble(topology, operands, cfg, device)?;
+            let projections = DitProjections::from_weights_curve(w, cfg)?;
+            let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
+            let blocks = (0..cfg.num_layers)
+                .map(|i| {
+                    DitBlock::from_weights_curve(
+                        w,
+                        &format!("transformer_blocks.{i}"),
+                        cfg,
+                        dtype,
+                        curve.block_projection(i)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Self {
+                cfg: cfg.clone(),
+                projections,
+                refiner,
+                blocks,
+                rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
+                curve: Some(curve),
+                dtype,
+                device: device.clone(),
+            });
         }
         let projections = DitProjections::from_weights(w, cfg)?;
         let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
@@ -121,44 +144,6 @@ impl MiniMaxH3Dit {
             blocks,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             curve: None,
-            dtype,
-            device: device.clone(),
-        })
-    }
-
-    /// Build from an already-populated [`Weights`] map against an already-validated
-    /// [`CurveAdaLn`] — the loader-side entry point for a pruned (sc-26684) checkpoint whose
-    /// curve operands were read at their stored dtype from the shards (see
-    /// [`crate::dit::curve::CurveScan`]), while the body loads through the ordinary tier-aware
-    /// path.
-    pub fn from_weights_curve(
-        w: &Weights,
-        cfg: &MiniMaxH3DitConfig,
-        device: &Device,
-        dtype: DType,
-        curve: CurveAdaLn,
-    ) -> Result<Self> {
-        cfg.validate()?;
-        let projections = DitProjections::from_weights_curve(w, cfg)?;
-        let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
-        let blocks = (0..cfg.num_layers)
-            .map(|i| {
-                DitBlock::from_weights_curve(
-                    w,
-                    &format!("transformer_blocks.{i}"),
-                    cfg,
-                    dtype,
-                    curve.block_projection(i)?,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            cfg: cfg.clone(),
-            projections,
-            refiner,
-            blocks,
-            rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
-            curve: Some(curve),
             dtype,
             device: device.clone(),
         })
@@ -201,15 +186,15 @@ impl MiniMaxH3Dit {
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
         let shards = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 dit")?;
-        // Header-only scan first: a pruned (sc-26684) checkpoint carries `adaln_t_table` and its
-        // AdaLN operands at source precisions (F32 table, BF16 reduced weights, F16 folded
-        // biases) that the ordinary loader's dtype coercion would destroy. On the curve path the
-        // body still loads through the ordinary tier-aware loader (the frozen pruned artifact
-        // packs its body INT8), while the ~90 MB of curve operands are re-read from the shards at
-        // their stored dtype.
+        // Header-only scan first: a pruned (sc-26684) checkpoint is refused here, from the
+        // safetensors headers alone, if its reduced topology is incomplete or inconsistent —
+        // before any tensor of a ~62 GB checkpoint is materialized. The full topology and value
+        // validation then runs again inside `from_weights` over the loaded map, which is where
+        // the identity is hashed, so the early scan is a load-boundary gate, not a second
+        // authority.
         let scan = crate::dit::curve::CurveScan::read(&shards)?;
         if scan.has_curve() {
-            let topology = candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect(
+            candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect(
                 cfg.hidden_size,
                 cfg.num_layers,
                 cfg.time_embed_dim,
@@ -223,15 +208,12 @@ impl MiniMaxH3Dit {
                         .into(),
                 )
             })?;
-            let operands = scan.load_operands(&shards, device)?;
-            let curve =
-                CurveAdaLn::assemble(topology, operands, &cfg, device)?;
-            let w = Weights::from_files_native_int8(&shards, device, dtype)?;
-            let model = Self::from_weights_curve(&w, &cfg, device, dtype, curve)?;
-            drop(w);
-            return Ok(model);
         }
-        let w = Weights::from_files_native_int8(&shards, device, dtype)?;
+        // One load, at stored precision: the native loader keeps every float tensor's own dtype
+        // (the F32 table, the BF16 reduced weights, the F16 folded biases included), so
+        // `from_weights`'s curve inspection sees the checkpoint's actual bytes and no curve
+        // operand is ever re-read or re-cast.
+        let w = Weights::from_files_native_int8(&shards, device)?;
         let model = Self::from_weights(&w, &cfg, device, dtype)?;
         // Drop the map here rather than at the call site: every tensor in it shares storage with
         // the model's, and a surviving clone is exactly what makes an eviction free nothing.

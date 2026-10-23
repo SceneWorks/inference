@@ -74,9 +74,18 @@ pub struct CurveProjection {
     rank: usize,
     /// The block geometry the `[num_timesteps · MODALITY_NUM, 6·hidden]` reshape needs.
     hidden_size: usize,
+    /// The pruning identity of the checkpoint this projection was taken from — bound at
+    /// assembly, zero-cost ([`PruningIdentity`] is `Copy`), so a projection from one basis can
+    /// never be silently projected under another's cache label.
+    identity: PruningIdentity,
 }
 
 impl CurveProjection {
+    /// The pruning identity of the checkpoint this projection came from.
+    pub fn pruning_identity(&self) -> PruningIdentity {
+        self.identity
+    }
+
     /// Assemble from the two stored operand tensors, checking shapes.
     fn from_operands(
         weight: Tensor,
@@ -84,6 +93,7 @@ impl CurveProjection {
         out_features: usize,
         rank: usize,
         hidden_size: usize,
+        identity: PruningIdentity,
         what: &str,
     ) -> Result<Self> {
         if weight.dims() != [out_features, rank] {
@@ -104,6 +114,7 @@ impl CurveProjection {
             out_features,
             rank,
             hidden_size,
+            identity,
         })
     }
 
@@ -190,9 +201,6 @@ pub struct CurveAdaLn {
     device: Device,
     /// The stored F32 table, `[grid, rank]`, kept at source precision.
     table: Tensor,
-    /// The table's F32 values on the host — interpolation is a pure host read of these (the pinned
-    /// runtime lerps in f32), and 8200 f32 do not justify a device round-trip per call.
-    table_values: Vec<f32>,
     /// Every canonical operand at its stored dtype, keyed by canonical name. The per-block
     /// projections are handed to their blocks from here; `norm_out.linear` stays resident here.
     operands: HashMap<String, Tensor>,
@@ -296,7 +304,6 @@ impl CurveAdaLn {
                 CandleError::Msg("minimax-h3 dit curve: the validated topology lost its table".into())
             })?
             .clone();
-        let table_values = table.flatten_all()?.to_vec1::<f32>()?;
         Ok(Self {
             grid: topology.grid,
             rank: topology.rank,
@@ -304,7 +311,6 @@ impl CurveAdaLn {
             topology,
             identity,
             table,
-            table_values,
             operands,
             device: device.clone(),
         })
@@ -350,7 +356,15 @@ impl CurveAdaLn {
         let out = self.hidden_size * 18;
         let weight = self.operand(&format!("{prefix}.weight"))?;
         let bias = self.operand(&format!("{prefix}.bias"))?;
-        CurveProjection::from_operands(weight, bias, out, self.rank, self.hidden_size, &prefix)
+        CurveProjection::from_operands(
+            weight,
+            bias,
+            out,
+            self.rank,
+            self.hidden_size,
+            self.identity,
+            &prefix,
+        )
     }
 
     /// The final `norm_out.linear` reduced projection.
@@ -359,7 +373,15 @@ impl CurveAdaLn {
         let out = self.hidden_size * 2;
         let weight = self.operand(&format!("{prefix}.weight"))?;
         let bias = self.operand(&format!("{prefix}.bias"))?;
-        CurveProjection::from_operands(weight, bias, out, self.rank, self.hidden_size, prefix)
+        CurveProjection::from_operands(
+            weight,
+            bias,
+            out,
+            self.rank,
+            self.hidden_size,
+            self.identity,
+            prefix,
+        )
     }
 
     fn operand(&self, name: &str) -> Result<Tensor> {
@@ -372,21 +394,35 @@ impl CurveAdaLn {
     /// Interpolate the table at `timesteps` — `[num_timesteps, rank]` F32.
     ///
     /// The pinned addressing, per row: `position = clamp(t, 0, 1) · (grid − 1)`,
-    /// `lower = min(floor(position), grid − 2)`, `fraction = position − lower`, and
-    /// `lerp(table[lower], table[lower + 1], fraction)` in f32 — `start + weight · (end − start)`,
-    /// torch's own formula. No SiLU, no ×1000.
+    /// `lower = min(floor(position), grid − 2)`, `fraction = position − lower` — the tiny host
+    /// index/fraction arrays come from
+    /// [`interpolation_position`](candle_gen::gen_core::pruned_adaln::interpolation_position) —
+    /// and then the table gather and the lerp run **on the device**: `table.index_select` at
+    /// `lower` and `lower + 1`, combined as `start + weight · (end − start)` in f32, torch's own
+    /// `torch.lerp` formula. No SiLU, no ×1000. The table is never copied to the host to do this —
+    /// the resident F32 tensor is the only copy the model holds.
     pub fn coordinates(&self, timesteps: &[f32], device: &Device) -> Result<Tensor> {
-        let mut out = Vec::with_capacity(timesteps.len() * self.rank);
-        for &t in timesteps {
-            let (lower, fraction) =
-                pruned_adaln::interpolation_position(t, self.grid).map_err(CandleError::Msg)?;
-            let start = &self.table_values[lower * self.rank..(lower + 1) * self.rank];
-            let end = &self.table_values[(lower + 1) * self.rank..(lower + 2) * self.rank];
-            for j in 0..self.rank {
-                out.push(start[j] + fraction * (end[j] - start[j]));
-            }
+        if timesteps.is_empty() {
+            return Err(CandleError::Msg(
+                "minimax-h3 dit curve: cannot interpolate an empty timestep list".into(),
+            ));
         }
-        Ok(Tensor::from_vec(out, (timesteps.len(), self.rank), device)?)
+        let mut lower: Vec<u32> = Vec::with_capacity(timesteps.len());
+        let mut upper: Vec<u32> = Vec::with_capacity(timesteps.len());
+        let mut fraction: Vec<f32> = Vec::with_capacity(timesteps.len());
+        for &t in timesteps {
+            let (lo, frac) =
+                pruned_adaln::interpolation_position(t, self.grid).map_err(CandleError::Msg)?;
+            lower.push(lo as u32);
+            upper.push(lo as u32 + 1);
+            fraction.push(frac);
+        }
+        let lower = Tensor::from_vec(lower, (timesteps.len(),), device)?;
+        let upper = Tensor::from_vec(upper, (timesteps.len(),), device)?;
+        let weight = Tensor::from_vec(fraction, (timesteps.len(), 1), device)?;
+        let start = self.table.index_select(&lower, 0)?;
+        let end = self.table.index_select(&upper, 0)?;
+        start.broadcast_add(&weight.broadcast_mul(&end.broadcast_sub(&start)?)?)
     }
 
     /// The final `norm_out` modulation from the reduced projection: `shift` is the FIRST half,
@@ -429,9 +465,30 @@ impl CurveAdaLn {
                 "minimax-h3 dit curve: the block stack is empty".into(),
             ));
         }
+        if blocks.len() != self.topology.num_layers {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 dit curve: {} blocks against a {}-layer pruned topology — an \
+                 incomplete block stack must not precompute a partial cache",
+                blocks.len(),
+                self.topology.num_layers
+            )));
+        }
         let coords = self.coordinates(schedule.distinct_timesteps(), &self.device)?;
         let mut layers = Vec::with_capacity(blocks.len());
         for (layer, block) in blocks.iter().enumerate() {
+            let projected = block.curve_pruning_identity().ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 dit curve: layer {layer} carries no reduced curve projection — \
+                     a stock block cannot be projected under a curve identity"
+                ))
+            })?;
+            if projected != self.identity {
+                return Err(CandleError::Msg(format!(
+                    "minimax-h3 dit curve: layer {layer}'s reduced projection belongs to a \
+                     different pruning basis (content identity mismatch) — refusing to project it \
+                     under this curve's identity"
+                )));
+            }
             layers.push(block.curve_modulation(&coords).map_err(|e| {
                 CandleError::Msg(format!("minimax-h3 dit curve: layer {layer}: {e}"))
             })?);
@@ -509,68 +566,5 @@ impl CurveScan {
         Some((dtype, shape.clone()))
     }
 
-    /// Load every canonical operand at its **stored** dtype, from whichever shard holds it.
-    ///
-    /// The pruned artifact's AdaLN operands are dense by construction
-    /// (`adalnQuantDescriptorCount = 0`); a packed (`.comfy_quant`) sibling under a curve name is a
-    /// topology the contract refuses, and the missing-name error below says so rather than
-    /// silently loading garbage codes.
-    pub fn load_operands(&self, files: &[impl AsRef<std::path::Path>], device: &Device) -> Result<HashMap<String, Tensor>> {
-        let mut stores = Vec::with_capacity(files.len());
-        for path in files {
-            // SAFETY: read-only, process-owned weight file, mapped only for this load — the
-            // standard candle weight-loading invariant.
-            let st = unsafe { MmapedSafetensors::new(path.as_ref())? };
-            stores.push(st);
-        }
-        let mut out = HashMap::new();
-        for (key, (dtype, _)) in &self.headers {
-            if !is_curve_key(key) {
-                continue;
-            }
-            if !matches!(
-                dtype,
-                safetensors::Dtype::F16 | safetensors::Dtype::BF16 | safetensors::Dtype::F32
-            ) {
-                return Err(CandleError::Msg(format!(
-                    "minimax-h3 dit curve: {key} is stored as {dtype:?}; a curve operand must be \
-                     dense F16/BF16/F32, never packed codes"
-                )));
-            }
-            for st in &stores {
-                if st.get(key).is_ok() {
-                    out.insert(key.clone(), st.load(key, device)?);
-                    break;
-                }
-            }
-            if !out.contains_key(key) {
-                return Err(CandleError::Msg(format!(
-                    "minimax-h3 dit curve: {key} is in the scanned headers but no shard carries it"
-                )));
-            }
-        }
-        Ok(out)
-    }
 }
 
-/// Whether a tensor name is one of the curve's canonical operands — the table, a block's reduced
-/// `adaln_proj.linear` pair, or the final `norm_out.linear` pair.
-///
-/// Shape-blind on purpose: the header scan runs before [`PrunedAdaLn::inspect`] has confirmed the
-/// geometry, so the filter must not depend on a width that could itself be the inconsistency under
-/// test.
-fn is_curve_key(name: &str) -> bool {
-    if name == TABLE_KEY {
-        return true;
-    }
-    if let Some(rest) = name.strip_prefix("transformer_blocks.") {
-        let Some((layer, tail)) = rest.split_once('.') else {
-            return false;
-        };
-        return layer
-            .parse::<usize>()
-            .is_ok()
-            && matches!(tail, "adaln_proj.linear.weight" | "adaln_proj.linear.bias");
-    }
-    matches!(name, "norm_out.linear.weight" | "norm_out.linear.bias")
-}
