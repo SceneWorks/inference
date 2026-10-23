@@ -108,7 +108,12 @@ def venue(backend: str) -> dict:
 def mutations(backend: str) -> list[dict]:
     memory = MLX_MEMORY if backend == "mlx" else "crates/media/candle-gen/candle-gen-moss-image/src/training_memory.rs"
     result = [{"id": "phase-isolation", "path": memory, "old": "            only.checkpoint = 0;\n",
-               "new": "", "test": PHASE_TEST, "panic": "isolated phase retains another demand"}]
+               "new": "", "test": PHASE_TEST, "panic": "isolated phase retains another demand"},
+              {"id": "ignored-export-factor-update",
+               "path": "crates/contracts/gen-core-testkit/src/moss_training_probe/snapshot.rs",
+               "old": "                let difference = f64::from(b) - f64::from(a);",
+               "new": "                let difference = 0.0_f64;",
+               "test": fixture.CASES[0], "panic": "native portable factors did not numerically update"}]
     if backend == "mlx":
         result.append({"id": "partial-window-cadence", "path": TRAINING,
                        "old": "    if c.sample_every > 0 && !c.sample_prompts.is_empty() && c.sample_steps == 0 {",

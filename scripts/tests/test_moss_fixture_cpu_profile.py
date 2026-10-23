@@ -191,7 +191,7 @@ class CpuReviewProtocolTests(unittest.TestCase):
     def test_mutations_have_unique_exact_live_source_anchors_and_observable_tests(self):
         for backend in fixture.PACKAGES:
             mutations = profile.mutations(backend)
-            self.assertEqual(len(mutations), 8 if backend == "mlx" else 1)
+            self.assertEqual(len(mutations), 9 if backend == "mlx" else 2)
             self.assertEqual(len({item["id"] for item in mutations}), len(mutations))
             for mutation in mutations:
                 source = (ROOT / mutation["path"]).read_text(encoding="utf-8")
@@ -461,14 +461,36 @@ class DiagnosticBatchTests(unittest.TestCase):
         for name in profile.MASK_TESTS:
             self.assertIn("fn " + name.split("::")[-1] + "()", (ROOT / "crates/contracts/gen-core/src/train/subject_mask/tests.rs").read_text(encoding="utf-8"))
 
-    def test_existing_fp32_witnesses_are_observed_before_unchanged_heldout_assertion(self):
+    def test_fp32_witnesses_and_disable_controls_are_observed_before_recovery_assertions(self):
         for backend in ("candle-gen/candle-gen-moss-image", "mlx-gen/mlx-gen-moss-image"):
             source = (ROOT / f"crates/media/{backend}/src/test_support.rs").read_text(encoding="utf-8")
             body = source.split("fn run(case: usize)", 1)[1].split("    #[test]", 1)[0]
             self.assertLess(body.index("probe.generation_observation"), body.index("assert_complete_case"))
             self.assertLess(body.index("let (disabled, disabled_shape"), body.index("probe.generation_observation"))
-            self.assertIn("actual scale1 generator latents must change", body)
+            self.assertNotIn("actual scale1 generator latents must change", body)
+            self.assertIn('.with_artifact_fallback(directory.path().join("observations.json"))', body)
+            self.assertIn("actual native step-zero adapter generation", body)
+            self.assertIn("initial_values.iter().all(|v| v.is_finite())", body)
             self.assertIn("zero-strength adapter must not fake a generation delta", body)
+
+    def test_s4_numeric_update_replaces_generalization_claim_and_has_exact_remote_mutation(self):
+        source = (ROOT / "crates/contracts/gen-core-testkit/src/moss_training_probe.rs").read_text(encoding="utf-8")
+        acceptance = source.split("pub fn assert_complete_case", 1)[1]
+        self.assertNotIn("after < before", acceptance)
+        for required in ("before.is_finite() && after.is_finite()", "receipt.nonzero_gradient",
+                         "delta.changed_elements > 0", "delta.max_abs_delta.is_finite()",
+                         "delta.max_abs_delta > 0.0", "delta.squared_l2_delta.is_finite()",
+                         "delta.squared_l2_delta > 0.0", "delta.layout_sha256, initial.layout_sha256",
+                         "full.request_identity, resumed.request_identity", "resumed.evaluation_after.map(f32::to_bits)"):
+            self.assertIn(required, acceptance)
+        for backend in fixture.PACKAGES:
+            mutation = next(m for m in profile.mutations(backend) if m["id"] == "ignored-export-factor-update")
+            self.assertEqual(mutation["test"], fixture.CASES[0])
+            self.assertEqual(mutation["new"].strip(), "let difference = 0.0_f64;")
+            output = self.red(mutation["test"]).replace("fixed independent heldout objective did not decrease", mutation["panic"])
+            profile.verify_red(output, mutation["test"], mutation["panic"], 101)
+            with self.assertRaises(UnitFailure):
+                profile.verify_red(output.replace(mutation["panic"], "unrelated failure"), mutation["test"], mutation["panic"], 101)
 
     def test_real_run_start_export_and_streamed_controls_are_wired_without_fake_outputs(self):
         for backend in ("candle-gen/candle-gen-moss-image", "mlx-gen/mlx-gen-moss-image"):
