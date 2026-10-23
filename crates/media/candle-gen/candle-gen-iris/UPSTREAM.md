@@ -120,6 +120,16 @@ A checkpointed backward drops the loss graph as soon as its plain backward has r
 (`backward_segmented` owns the loss): everything downstream of the last regions — the backbone's
 head, and here the LPIPS and critic tapes — is off the tape before the first region is replayed
 rather than resident under every replay.
+Shared conditioning is retained behind three cotangent frontiers: the timestep embedding before
+its trunk/pixel fan-out, the image/text adaLN cores together, and the conditioning read by every
+pixel block. Full and selective checkpointing accumulate all readers' cotangents at each frontier
+before traversing its original graph once, as the plain backward does. In particular, a BF16
+cast or nonlinear backward must not run separately per reader and merge only at the f32 masters:
+casting a sum is not summing individually rounded casts. The frontiers retain only the existing
+small conditioning graphs; block interiors are still recomputed one at a time, and the plain
+forward/inference hooks move tensors unchanged. The scalar BF16 multi-reader unit regression
+checks each frontier and the paired cores against the plain graph, with a discriminating
+per-reader-propagation control; lifecycle and parity tests retain their original numeric bounds.
 Upstream ships neither task with checkpointing; it changes memory and compute only, so it is no
 part of a run's identity. The MLX depth and restoration trainers take the same option (MLX's
 checkpoint transform per region; see the section of the same name in the MLX crate's `UPSTREAM.md`).

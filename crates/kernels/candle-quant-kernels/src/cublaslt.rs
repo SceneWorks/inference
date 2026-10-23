@@ -193,6 +193,13 @@ pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::Ker
     cc_floor: (7, 0),
 };
 
+/// Kitchen's dtype-rounded dynamic per-token activation quantizer (sc-26683).
+pub const KITCHEN_INT8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "kitchen_int8_rowwise_v1",
+    src: include_str!("kitchen_int8.cu"),
+    cc_floor: (7, 0),
+};
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -986,8 +993,22 @@ mod cuda_impl {
             check_alignment(k, n)?;
             let mut out = self.stream.alloc_zeros::<i32>(m * n).map_err(drv_err)?;
             {
-                let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
-                let (b_ptr, _gb) = x.buf.device_ptr(&self.stream);
+                let (ws, _) = w.buf.storage_and_layout();
+                let (xs, _) = x.buf.storage_and_layout();
+                let Storage::Cuda(ws) = &*ws else {
+                    candle_core::bail!("INT8 weight is not on CUDA")
+                };
+                let Storage::Cuda(xs) = &*xs else {
+                    candle_core::bail!("INT8 activation is not on CUDA")
+                };
+                let CudaStorageSlice::U8(wb) = &ws.slice else {
+                    candle_core::bail!("INT8 weight is not bytes")
+                };
+                let CudaStorageSlice::U8(xb) = &xs.slice else {
+                    candle_core::bail!("INT8 activation is not bytes")
+                };
+                let (a_ptr, _ga) = wb.device_ptr(&self.stream);
+                let (b_ptr, _gb) = xb.device_ptr(&self.stream);
                 let (d_ptr, _gd) = out.device_ptr_mut(&self.stream);
                 unsafe {
                     self.run(
@@ -1275,6 +1296,106 @@ mod cuda_impl {
         /// Stage an int8-code tensor (`F32`/`I64`) as an owned device `i8` buffer + its shape.
         pub fn stage_int8(&self, t: &Tensor) -> Result<DevInt8> {
             DevInt8::stage(self, t)
+        }
+        /// Stage exact signed-code bytes without a dense float/i64 intermediate.
+        pub fn stage_int8_bytes(&self, bytes: &Tensor) -> Result<DevInt8> {
+            let (rows, cols) = bytes.dims2()?;
+            if bytes.dtype() != DType::U8 {
+                candle_core::bail!("INT8 codes must be raw U8 byte patterns");
+            }
+            let bytes = bytes
+                .to_device(&Device::Cuda(self.device.clone()))?
+                .flatten_all()?
+                .contiguous()?;
+            let bytes = if bytes.layout().start_offset() != 0 {
+                bytes.force_contiguous()?
+            } else {
+                bytes
+            };
+            Ok(DevInt8 {
+                buf: bytes,
+                rows,
+                cols,
+            })
+        }
+
+        /// Kitchen's activation codes and unrounded F32 row scales, entirely on device.
+        /// `x` already contains the source-dtype rotation result; `dtype` preserves its rounding.
+        pub fn quantize_kitchen_int8(&self, x: &Tensor, dtype: DType) -> Result<(DevInt8, Tensor)> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            if m == 0
+                || k == 0
+                || m > u32::MAX as usize
+                || k > i32::MAX as usize
+                || !x.device().same_device(&Device::Cuda(self.device.clone()))
+            {
+                candle_core::bail!("Kitchen INT8 activation shape/device mismatch");
+            }
+            let dtype = match dtype {
+                DType::F32 => 0i32,
+                DType::BF16 => 1,
+                DType::F16 => 2,
+                _ => candle_core::bail!("Kitchen INT8 source dtype"),
+            };
+            let module = KITCHEN_INT8_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("kitchen_int8_quantize")
+                .map_err(candle_core::Error::wrap)?;
+            let xf = Self::flux3_f32_input(x)?;
+            let (storage, _) = xf.storage_and_layout();
+            let Storage::Cuda(cs) = &*storage else {
+                candle_core::bail!("Kitchen INT8 requires CUDA")
+            };
+            let CudaStorageSlice::F32(xs) = &cs.slice else {
+                candle_core::bail!("Kitchen INT8 requires F32 launch input")
+            };
+            let mut q = unsafe { self.stream.alloc::<u8>(m * k) }.map_err(drv_err)?;
+            let mut scales = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
+            let ki = k as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(xs)
+                    .arg(&mut q)
+                    .arg(&mut scales)
+                    .arg(&ki)
+                    .arg(&dtype)
+                    .launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let scales = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::F32(scales),
+                    device: self.device.clone(),
+                }),
+                (m, 1),
+                BackpropOp::none(),
+                false,
+            );
+            let q = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(q),
+                    device: self.device.clone(),
+                }),
+                (m, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok((
+                DevInt8 {
+                    buf: q,
+                    rows: m,
+                    cols: k,
+                },
+                scales,
+            ))
         }
 
         // --- internals -------------------------------------------------------------------------
@@ -1827,7 +1948,8 @@ mod cuda_impl {
     /// instead of a DtoH copy + CPU round loop + HtoD copy (the dominant cost once the dequant fold
     /// moved on-device). A CPU operand (weights loaded to host, tests) still narrows on the host.
     pub struct DevInt8 {
-        buf: cudarc::driver::CudaSlice<u8>,
+        // Tensor's Arc shares an already compact source; staging must not copy the model's codes.
+        buf: Tensor,
         rows: usize,
         cols: usize,
     }
@@ -1846,20 +1968,16 @@ mod cuda_impl {
                     .to_dtype(DType::U8)?
                     .flatten_all()?
                     .contiguous()?;
-                let (storage, _l) = u8t.storage_and_layout();
-                let buf = match &*storage {
-                    Storage::Cuda(cs) => match &cs.slice {
-                        CudaStorageSlice::U8(s) => s.try_clone().map_err(drv_err)?,
-                        _ => candle_core::bail!("DevInt8::stage: expected U8 storage"),
-                    },
-                    _ => candle_core::bail!("DevInt8::stage: not a CUDA tensor"),
-                };
-                return Ok(Self { buf, rows, cols });
+                return Ok(Self {
+                    buf: u8t,
+                    rows,
+                    cols,
+                });
             }
             // CPU operand (weights staged from host, tests): narrow on the host to the same byte pattern.
             let host = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
             let bytes: Vec<u8> = host.iter().map(|&v| v.round() as i8 as u8).collect();
-            let buf = lt.stream.clone_htod(&bytes).map_err(drv_err)?;
+            let buf = Tensor::from_vec(bytes, (rows, cols), &Device::Cuda(lt.device.clone()))?;
             Ok(Self { buf, rows, cols })
         }
     }

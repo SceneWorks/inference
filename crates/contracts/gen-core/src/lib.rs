@@ -21,6 +21,7 @@ pub mod checkpoint_codec;
 pub mod checkpoint_facts;
 pub mod comfy_quant;
 pub mod control;
+pub mod convrot_int8;
 pub mod duration_head;
 pub mod encoder_contract;
 pub mod error;

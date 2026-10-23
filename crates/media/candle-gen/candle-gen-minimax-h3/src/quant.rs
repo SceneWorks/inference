@@ -166,6 +166,21 @@ pub fn lin(
     let scales_key = format!("{base}.scales");
     let bias_key = format!("{base}.bias");
 
+    if let Some(native) =
+        candle_gen::quant::convrot_int8::ConvRotLinear::from_weights(w, base, bias)?
+    {
+        let base_bytes = native.descriptor().resident_bytes()
+            + if bias {
+                dense_bytes(&w.require(&bias_key)?)
+            } else {
+                0
+            };
+        return Ok(TieredLinear {
+            base_bytes,
+            linear: AdaptLinear::from_convrot(native),
+        });
+    }
+
     if w.contains(&scales_key) {
         let wq = w.require(&weight_key)?;
         if wq.dtype() != DType::U32 {

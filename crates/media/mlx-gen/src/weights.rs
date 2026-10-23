@@ -16,6 +16,7 @@ pub struct Weights {
     tensors: HashMap<String, Array>,
     metadata: HashMap<String, String>,
     accessed: RefCell<std::collections::HashSet<String>>,
+    convrot_rotations: RefCell<HashMap<usize, Array>>,
 }
 
 impl Weights {
@@ -25,6 +26,7 @@ impl Weights {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
@@ -35,6 +37,7 @@ impl Weights {
             tensors: HashMap::new(),
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         }
     }
 
@@ -45,6 +48,7 @@ impl Weights {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -246,6 +250,7 @@ impl Weights {
             tensors,
             metadata: HashMap::new(),
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -302,6 +307,7 @@ impl Weights {
             tensors,
             metadata,
             accessed: RefCell::new(std::collections::HashSet::new()),
+            convrot_rotations: RefCell::new(HashMap::new()),
         })
     }
 
@@ -323,6 +329,15 @@ impl Weights {
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Share the tiny immutable ConvRot constants across every projection loaded together.
+    pub(crate) fn convrot_rotation(&self, group: usize, build: impl FnOnce() -> Array) -> Array {
+        self.convrot_rotations
+            .borrow_mut()
+            .entry(group)
+            .or_insert_with(build)
+            .clone()
     }
 
     /// Insert (or overwrite) a tensor under `key`. Used by checkpoint remapping (diffusers →

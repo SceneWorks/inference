@@ -41,6 +41,7 @@ pub mod block_residency;
 // A/B authority and a truthful opt-out for any path that cannot run one.
 pub mod capability;
 pub mod coherence;
+pub mod convrot_int8;
 pub mod error;
 pub mod img2img;
 pub mod logical_weights;

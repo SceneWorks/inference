@@ -66,6 +66,74 @@ clause for every term assigned to a licence family.
   section is the authoritative list of checkpoints that were left without a row rather than given a
   guessed one.
 
+## Native H3 ConvRot INT8 checkpoints (sc-26683)
+
+The H3 projection loaders distinguish symmetric ConvRot INT8 from MLX affine Q8:
+`weight` is I8 `[out, in]`, `weight_scale` is **F32 `[out, 1]`**, and a bounded U8
+`.comfy_quant` JSON tensor declares `int8_tensorwise`, `convrot: true`, and
+`convrot_groupsize: 64` or `256`. These are **rotation** groups, not scale groups.
+Partial rotation tails, unknown fields/formats, contradictory affine operands,
+nonpositive/nonfinite scales, and missing descriptors fail before execution.
+
+Tiny HTTP ranges of both `Minimax-h3_Singularity_ref2va_v2_int8.safetensors` and
+`Minimax-h3_Singularity_ref2va_v1.3_int8.safetensors` at
+[`WarmBloodAban/Minimax-h3_Singularity@a56850c870825d6a8ae501a595c4dbbbc77bbc7e`](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/tree/a56850c870825d6a8ae501a595c4dbbbc77bbc7e)
+established 1,035 tensors, a 129,920-byte header, and 250 descriptors in a
+17,950-byte descriptor span in **each** file: 50 group-64 AdaLN projections and
+200 group-256 attention/MLP projections. All 250 pairs are I8 codes and F32 row
+scales. No checkpoint weight payload or full-model inference was used for this evidence.
+
+The executable authority is
+[`comfy-kitchen@f8b7e97a1418d2e529bd5405fbf86312be198ae6`](https://github.com/Comfy-Org/comfy-kitchen/tree/f8b7e97a1418d2e529bd5405fbf86312be198ae6),
+with exporter
+[`comfy-model-tools@d6797787e6bdb1a1fb0094d588a26f8e71a1c757`](https://github.com/Comfy-Org/comfy-model-tools/tree/d6797787e6bdb1a1fb0094d588a26f8e71a1c757).
+The separate
+[`starsFriday W4A8 loader@ad1d4e072bd2ed5eec1d30d07ec390f327a3af52`](https://github.com/starsFriday/ComfyUI-W4A8-Loader/tree/ad1d4e072bd2ed5eec1d30d07ec390f327a3af52)
+is not authority for this INT8 dialect. Shared regular Hadamard rotation is
+followed by dynamic per-token quantization: store the unrounded F32 scale,
+round the divisor and quotient through the activation dtype, nearest-even
+integer rounding, and clamp activation codes to `[-128, 127]`. The projection
+accumulates integer products in I32, applies both row scales in F32, adds bias,
+and rounds the output once. Weights remain compact; no full dense weight set is
+created. Candle reuses `Int8Linear` / one `Int8Context` / cuBLASLt, retaining the
+original byte Tensor storage rather than copying it during staging. MLX uses a
+shared signed-integer Metal projection through MLX's existing `MetalKernel`
+compiler seam and the shared adapter base. Two immutable rotation matrices are
+shared per load, not duplicated per layer. CPU Candle refuses native execution.
+
+[`scripts/h3_convrot_int8_oracle.py`](../scripts/h3_convrot_int8_oracle.py) regenerates
+the six small tensor-valued cases in
+[`tests/fixtures/h3_convrot_int8.json`](../tests/fixtures/h3_convrot_int8.json).
+It **executes** the pinned upstream Hadamard helpers on CPU Torch; its activation
+quantizer/epilogue are an explicit arithmetic port of the separately hashed
+pinned CUDA source, not a claim to have executed that CUDA source on CPU.
+Cases cover both groups, multiple rotation blocks, five token rows, source
+F32/BF16/F16 rounding, zero rows, halfway values and a large outlier. F32 native
+output tolerance is `2e-5 * max(1, abs(expected))`; BF16/F16 outputs require exact
+agreement with the committed oracle. The host test checks rotation and every
+activation code/scale; native tests load actual synthetic I8 safetensors through
+the production H3 projection dispatcher, check selected execution, then compare
+all output values. Neither an ignored test nor a CUDA compile is a device pass.
+
+Explicit device commands (exclusive coordinator-reserved device required):
+
+```sh
+cargo test --locked -p mlx-gen-minimax-h3 --test integration convrot_int8::native_projections_match_pinned_kitchen -- --ignored --exact --nocapture
+cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8::native_projections_match_pinned_kitchen -- --ignored --exact --nocapture
+```
+
+The existing manual `windows-cuda` CI lane runs the latter command. CUDA
+typecheck and device execution remain distinct evidence. SceneWorks catalog
+admission and its consumer pin are a paired change, not implied by this inference
+implementation; AdaLN pruning/tables and asymmetric W4A8 remain separate slices.
+
+The manual lane's broad CUDA package-test step sets `IRIS_DIST_SHARE_DEVICE=1`:
+Iris' real multi-process fixtures explicitly share the lane's one visible card,
+rather than requesting absent `cuda:1`/`cuda:2`/`cuda:3` devices and failing before
+rendezvous. Their separate missing-device test still exercises both the explicit
+refusal and opt-in-sharing paths. This does not skip scenarios or relax numeric
+assertions.
+
 ## Migration records
 
 The [`migration/`](migration/) directory records how this repository was assembled from the

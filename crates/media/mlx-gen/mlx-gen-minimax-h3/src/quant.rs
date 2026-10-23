@@ -33,6 +33,9 @@ pub const GROUP_SIZE: i32 = crate::convert::GROUP_SIZE;
 /// is present, else dense. `bias` additionally loads the dense `{base}.bias` (the quantization's own
 /// `{base}.biases` is distinct and always loaded on the packed path).
 pub fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
+    if let Some(q) = mlx_gen::convrot_int8::ConvRotLinear::from_weights(w, base, bias)? {
+        return Ok(AdaptableLinear::from_convrot(q));
+    }
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
 
@@ -45,6 +48,8 @@ pub fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
 pub fn nbytes(lin: &AdaptableLinear) -> usize {
     if let Some((wq, scales, biases, bias, _, _)) = lin.quantized_params() {
         wq.nbytes() + scales.nbytes() + biases.nbytes() + bias.map_or(0, |b| b.nbytes())
+    } else if let Some(q) = lin.convrot_base() {
+        q.nbytes()
     } else if let Some((weight, bias)) = lin.dense_weight() {
         weight.nbytes() + bias.map_or(0, |b| b.nbytes())
     } else {
@@ -58,6 +63,9 @@ pub fn nbytes(lin: &AdaptableLinear) -> usize {
 /// carry it — [`mlx_gen::quant::quantize_map`] casts to bf16 before packing, so the scales are bf16
 /// and an activation fed in at f32 would mismatch the quantized matmul.
 pub fn compute_dtype(lin: &AdaptableLinear) -> mlx_rs::Dtype {
+    if lin.convrot_base().is_some() {
+        return mlx_rs::Dtype::Bfloat16;
+    }
     lin.weight_dtype().unwrap_or_else(|| {
         lin.quantized_params()
             .map(|(_, scales, ..)| scales.dtype())

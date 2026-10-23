@@ -98,6 +98,7 @@ impl AdaLnModulation {
 pub struct AdaLnProjection {
     linear: AdaptableLinear,
     hidden_size: i32,
+    compute_dtype: Dtype,
 }
 
 /// Logical shape and packed-ness, not the opaque u32 code buffer.
@@ -166,9 +167,15 @@ impl AdaLnProjection {
                 linear.base_shape()
             )));
         }
+        let compute_dtype = if linear.convrot_base().is_some() {
+            dtype
+        } else {
+            crate::quant::compute_dtype(&linear)
+        };
         Ok(Self {
             linear,
             hidden_size: cfg.hidden_size,
+            compute_dtype,
         })
     }
 
@@ -190,9 +197,9 @@ impl AdaLnProjection {
             )));
         }
         let steps = s[0];
-        // On a packed tier the compute dtype comes from the scales (bf16), not from a dense weight
-        // that no longer exists — see `crate::quant::compute_dtype`.
-        let activated = silu(temb)?.as_dtype(crate::quant::compute_dtype(&self.linear))?;
+        // Affine packed tiers follow their scales; native INT8 follows the requested
+        // activation precision, never the F32 storage dtype of its row scales.
+        let activated = silu(temb)?.as_dtype(self.compute_dtype)?;
         let projected = self.linear.forward(&activated)?;
 
         // `view(-1, 6·hidden)` BEFORE the chunk: modality becomes a row axis, not a column one.
