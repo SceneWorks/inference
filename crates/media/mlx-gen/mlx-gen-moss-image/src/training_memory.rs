@@ -1182,7 +1182,12 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
             "cache audit staging",
         )?,
         backward: sum(
-            [backward, r.audit_workspace_bytes],
+            [
+                backward,
+                r.audit_workspace_bytes,
+                f.host_metadata_bytes,
+                r.dataset_metadata_bytes,
+            ],
             "backward audit staging",
         )?,
         preview: if preview > 0 {
@@ -1199,7 +1204,12 @@ pub(crate) fn estimate(f: &FootprintFacts, r: &EstimateRequest) -> Result<Memory
             0
         },
         checkpoint: sum(
-            [checkpoint, r.audit_workspace_bytes],
+            [
+                checkpoint,
+                r.audit_workspace_bytes,
+                f.host_metadata_bytes,
+                r.dataset_metadata_bytes,
+            ],
             "checkpoint audit staging",
         )?,
         context_token_bound: r.context_tokens,
@@ -1316,16 +1326,75 @@ pub(crate) mod tests {
             only.cache = 0;
             only.backward = 0;
             only.preview = 0;
+            only.checkpoint = 0;
             match phase {
                 Phase::Load => only.load = n,
                 Phase::Cast => only.cast = n,
                 Phase::Cache => only.cache = n,
                 Phase::Backward => only.backward = n,
                 Phase::Preview => only.preview = n,
+                Phase::Checkpoint => only.checkpoint = n,
+            }
+            for isolated in [
+                Phase::Load,
+                Phase::Cast,
+                Phase::Cache,
+                Phase::Backward,
+                Phase::Preview,
+                Phase::Checkpoint,
+            ] {
+                assert_eq!(only.bytes(isolated), if isolated == phase { n } else { 0 });
             }
             assert!(only.check_all(n - 1).is_err());
+            assert!(only.check_all(n).is_ok());
         }
         assert!(e.check_all(e.peak()).is_ok());
+    }
+    #[test]
+    fn persistent_metadata_raises_backward_checkpoint_and_admission_boundary() {
+        // Removing either persistent owner from backward/checkpoint must fail exact deltas,
+        // independently of which phase dominates the full-run peak.
+        let (facts, request) = tiny();
+        let baseline = estimate(&facts, &request).unwrap();
+        for host_metadata in [true, false] {
+            let mut facts = facts.clone();
+            let mut request = request.clone();
+            let delta = if host_metadata { 4096 } else { 8192 };
+            if host_metadata {
+                facts.host_metadata_bytes += delta;
+            } else {
+                request.dataset_metadata_bytes += delta;
+            }
+            let enlarged = estimate(&facts, &request).unwrap();
+            for phase in [
+                Phase::Load,
+                Phase::Cast,
+                Phase::Cache,
+                Phase::Backward,
+                Phase::Preview,
+                Phase::Checkpoint,
+            ] {
+                if phase == Phase::Preview && baseline.preview == 0 {
+                    assert_eq!(enlarged.preview, 0);
+                    continue;
+                }
+                let before = baseline.bytes(phase);
+                assert_eq!(
+                    enlarged.bytes(phase),
+                    before + delta,
+                    "{phase:?}, host={host_metadata}"
+                );
+                assert!(baseline.check(phase, before).is_ok());
+                assert!(
+                    matches!(enlarged.check(phase, before), Err(AdmissionError::BudgetExceeded { phase: actual, required, budget }) if actual == phase && required == before + delta && budget == before)
+                );
+                assert!(enlarged.check(phase, before + delta).is_ok());
+            }
+            assert!(baseline.check_all(baseline.peak()).is_ok());
+            assert!(enlarged.check_all(baseline.peak()).is_err());
+            assert_eq!(enlarged.peak(), baseline.peak() + delta);
+            assert!(enlarged.check_all(enlarged.peak()).is_ok());
+        }
     }
     #[test]
     fn native_budget_does_not_mistake_soft_limit_for_physical_working_set() {

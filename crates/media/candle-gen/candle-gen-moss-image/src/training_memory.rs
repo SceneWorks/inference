@@ -1454,14 +1454,27 @@ pub(crate) mod tests {
             only.cache = 0;
             only.backward = 0;
             only.preview = 0;
+            only.checkpoint = 0;
             match phase {
                 Phase::Load => only.load = n,
                 Phase::Cast => only.cast = n,
                 Phase::Cache => only.cache = n,
                 Phase::Backward => only.backward = n,
                 Phase::Preview => only.preview = n,
+                Phase::Checkpoint => only.checkpoint = n,
+            }
+            for isolated in [
+                Phase::Load,
+                Phase::Cast,
+                Phase::Cache,
+                Phase::Backward,
+                Phase::Preview,
+                Phase::Checkpoint,
+            ] {
+                assert_eq!(only.bytes(isolated), if isolated == phase { n } else { 0 });
             }
             assert!(only.check_all(n - 1).is_err());
+            assert!(only.check_all(n).is_ok());
         }
         assert!(e.check_all(e.peak()).is_ok());
     }

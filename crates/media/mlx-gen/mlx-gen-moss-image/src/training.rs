@@ -38,6 +38,12 @@ use mlx_rs::{
 };
 use std::path::Path;
 
+#[cfg(test)]
+std::thread_local! {
+    // Actual eager-loader entries on this test thread, not inferred retained trainer state.
+    static EAGER_LOAD_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct LoadedTrainer {
     #[cfg(feature = "test-support")]
     test_probe: Option<RunProbe>,
@@ -314,6 +320,8 @@ fn load_weights(
     prepared: Preparation,
     cancel: &CancelFlag,
 ) -> Result<LoadedTrainer> {
+    #[cfg(test)]
+    EAGER_LOAD_ENTRIES.with(|entries| entries.set(entries.get() + 1));
     crate::pipeline::check(cancel)?;
     sources.clear_cache()?;
     let encoder = Encoder::load(&sources, cancel)?;
@@ -454,12 +462,6 @@ fn validate_floors(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Re
             ))
             .into());
         }
-    }
-    if c.resume && c.save_every > 0 && !c.save_every.is_multiple_of(c.gradient_accumulation) {
-        return Err(Error::Unsupported(
-            "MOSS resume checkpoints must fall on complete accumulation windows".into(),
-        )
-        .into());
     }
     if c.sample_every > 0 && !c.sample_prompts.is_empty() && c.sample_steps == 0 {
         return Err(
@@ -1374,6 +1376,30 @@ mod review_admission_tests {
         assert_eq!(loads.get(), 1);
     }
     #[test]
+    fn resume_accepts_checkpoint_cadence_inside_accumulation_window() {
+        let request = TrainingRequest {
+            items: vec![gen_core::TrainingItem::captioned(
+                "not-opened.png".into(),
+                "caption".into(),
+            )],
+            config: TrainingConfig {
+                resolution: 32,
+                rank: 1,
+                steps: 6,
+                gradient_accumulation: 2,
+                save_every: 1,
+                resume: true,
+                ..Default::default()
+            },
+            output_dir: "not-created".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: Default::default(),
+        };
+        assert!(validate_floors(&descriptor(MossImageVariant::Base), &request).is_ok(),
+            "complete recovery stores pending gradients, token denominator and cursor; cadence need not align to updates");
+    }
+    #[test]
     fn concrete_trainer_override_refuses_before_missing_model_or_dataset_can_load() {
         let _device = crate::cpu_test_device();
         let (facts, _) = admission::tests::tiny();
@@ -1410,14 +1436,19 @@ mod review_admission_tests {
             trigger_words: Vec::new(),
             cancel: Default::default(),
         };
+        EAGER_LOAD_ENTRIES.with(|entries| entries.set(0));
         let result = trainer.train(&request, &mut |_| {
             panic!("no model/cache/progress before refusal")
         });
         assert!(
-            matches!(result,Err(gen_core::Error::Unsupported(message)) if message.contains("structural working-set")),
-            "request reached missing assets instead of admission"
+            matches!(result,Err(gen_core::Error::Unsupported(message)) if message == "training memory budget must be positive"),
+            "zero override must produce the typed positive-budget refusal before missing assets"
         );
-        assert!(trainer.loaded.is_none());
+        assert_eq!(
+            EAGER_LOAD_ENTRIES.with(std::cell::Cell::get),
+            0,
+            "refused request entered the actual eager tensor loader"
+        );
         assert!(!output.exists());
     }
 }
