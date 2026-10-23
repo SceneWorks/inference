@@ -273,6 +273,23 @@ impl ResolvedFlowControls {
         }
         Ok(())
     }
+    /// Materialize the exact canonical schedule from already resolved controls,
+    /// without manufacturing a GenerationRequest or media carrier. The caller
+    /// must first pass `check_capture_schedule_bytes` (bounded analysis) or own
+    /// runtime admission. `native` and `mu` are the provider's unchanged builder
+    /// inputs; this is the SAME path as `ResolvedFlowSampling::resolve`.
+    pub fn materialize_schedule(self, native: &[f32], mu: f32) -> Result<ResolvedFlowSampling> {
+        let sigmas =
+            resolve_flow_schedule(self.recipe.0.scheduler.as_deref(), mu, self.steps(), native);
+        Ok(ResolvedFlowSampling {
+            recipe: self.recipe,
+            solver: self.solver,
+            sigmas,
+            convention: self.convention,
+            effective_guidance: self.effective_guidance,
+        })
+    }
+
     /// Bounded symbolic factory envelope, NEVER replay user N here. FLOW input scaling is identity;
     /// the representative reaches every fixed-order history/secondary/update branch. No actual
     /// execution/physical donation/equivalence is claimed by this raw no-donation upper.
@@ -316,20 +333,7 @@ impl ResolvedFlowSampling {
         mu: f32,
         convention: TimestepConvention,
     ) -> Result<Self> {
-        let controls = ResolvedFlowControls::resolve(req, defaults, convention)?;
-        let sigmas = resolve_flow_schedule(
-            controls.recipe.0.scheduler.as_deref(),
-            mu,
-            controls.steps(),
-            native,
-        );
-        Ok(Self {
-            recipe: controls.recipe,
-            solver: controls.solver,
-            sigmas,
-            convention,
-            effective_guidance: controls.effective_guidance,
-        })
+        ResolvedFlowControls::resolve(req, defaults, convention)?.materialize_schedule(native, mu)
     }
     pub fn recipe(&self) -> &FlowSamplingRecipe {
         &self.recipe

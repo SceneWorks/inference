@@ -1,5 +1,52 @@
 use super::*;
 
+/// Pure source recipe, not a measurement: every decode route must price its
+/// real final conversion and ONE decoded input backing (the NCHW is a view).
+#[test]
+fn decoded_pixels_window_is_present_once_after_every_decode_route() {
+    for no_tail in [false, true] {
+        let mut cfg = DcAeConfig::sana_f32c32();
+        if no_tail {
+            cfg.block_types.fill(BlockType::EfficientVit);
+        }
+        for (lh, lw, tiling) in [
+            (2, 3, None),
+            (2, 3, Some((192, 48))),
+            (8, 12, Some((192, 48))),
+        ] {
+            let mut quanta = Quanta::default();
+            decode_quanta(&cfg, lh, lw, tiling, &mut quanta);
+            let elements = 3 * lh * u64::from(LATENT_SCALE) * lw * u64::from(LATENT_SCALE);
+            let terminal = quanta.0.last().expect("decode has a terminal window");
+            assert_eq!(
+                terminal.1,
+                labels::DECODED_PIXELS,
+                "conversion must not disappear behind an early decode return"
+            );
+            assert_eq!(
+                quanta
+                    .0
+                    .iter()
+                    .filter(|q| q.1 == labels::DECODED_PIXELS)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                terminal.0,
+                mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(elements)
+            );
+            assert_eq!(terminal.2, Some((lh * 32, lw * 32)));
+            let unscaled = tensor_bytes(4, &[1, cfg.latent_channels as u64, lh, lw]);
+            assert_eq!(
+                terminal.3,
+                tensor_bytes(4, &[elements]) + unscaled,
+                "one decoded input (transpose alias), plus the still-owned unscaled latent"
+            );
+            assert_eq!(ios_quantum_phase(terminal.1), Some(IosPhase::Decode));
+        }
+    }
+}
+
 /// Every quantum label the crate's guards pass — and the foreign labels a SANA request runs (the
 /// shared Gemma-2 encoder's, the curated sampler's step) — is attributed to a phase, and each
 /// family lands in the phase it runs in.

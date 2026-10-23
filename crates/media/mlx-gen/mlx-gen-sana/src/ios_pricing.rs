@@ -52,7 +52,7 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
         }
         mlx_gen::sampler::SAMPLER_STEP_QUANTUM => Some(IosPhase::Denoise),
         DECODER_INPUT | DECODER_UPSAMPLE | DECODER_BLOCK | DECODER_OUTPUT | TILE_FOLD
-        | TILE_FINALIZE => Some(IosPhase::Decode),
+        | TILE_FINALIZE | DECODED_PIXELS => Some(IosPhase::Decode),
         _ => None,
     }
 }
@@ -67,6 +67,7 @@ pub const IOS_NON_ADDITIVE_MODES: &[&str] = &[];
 #[derive(Clone, Debug)]
 struct Tensor {
     dtype: Dtype,
+    shape: Vec<u64>,
     elements: u64,
     bytes: u64,
 }
@@ -105,6 +106,7 @@ impl Inventory {
                 .map(|h| {
                     let tensor = Tensor {
                         dtype: mlx_dtype(h.dtype),
+                        shape: h.shape.iter().map(|d| *d as u64).collect(),
                         elements: h.shape.iter().map(|d| *d as u64).product(),
                         bytes: h.data_bytes,
                     };
@@ -265,6 +267,38 @@ const LATENT_SCALE: u32 = 32;
 /// Largest counted DC-AE decode quantum of one latent `[1, C, lh, lw]` (`DcAeDecoder::decode_head`,
 /// then the tail tiled by `pipeline::decode_tiled` or whole).
 fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>, out: &mut Quanta) {
+    let start = out.0.len();
+    decode_quanta_body(cfg, lh, lw, tiling, out);
+    let (height, width) = (lh * u64::from(LATENT_SCALE), lw * u64::from(LATENT_SCALE));
+    let elements = 3 * height * width;
+    out.take_at(
+        mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(elements),
+        labels::DECODED_PIXELS,
+        height,
+        width,
+    );
+    // NHWC decoder result and its NCHW transpose are two handles to ONE
+    // source backing. The shared raw guard counts the new conversion buffer;
+    // the still-owned decoded input is a separate, non-subtractive held term.
+    out.0.last_mut().unwrap().3 = tensor_bytes(4, &[elements]);
+    let unscaled = tensor_bytes(4, &[1, cfg.latent_channels as u64, lh, lw]);
+    for q in &mut out.0[start..] {
+        if q.1 != labels::DECODER_INPUT {
+            // decode_to_image_with_tiling owns `unscaled` until it returns.
+            // The head-input guard already includes that input; later quanta
+            // operate on features while this distinct source target stays held.
+            q.3 = q.3.saturating_add(unscaled);
+        }
+    }
+}
+
+fn decode_quanta_body(
+    cfg: &DcAeConfig,
+    lh: u64,
+    lw: u64,
+    tiling: Option<(i32, i32)>,
+    out: &mut Quanta,
+) {
     let ch = |i: usize| cfg.block_out_channels[i] as u64;
     let n = cfg.num_stages();
     let tail = cfg
@@ -636,6 +670,9 @@ pub fn price(facts: &SanaPricingFacts, plan: &SanaPricingPlan) -> Result<IosPric
     let mut pricing = IosPricing::default();
     for q in priced_quanta(facts, plan)? {
         pricing.take_window(q.window);
+    }
+    if !plan.img2img {
+        pricing.phase_not_run(IosPhase::Encode, "text mode has no reference encode");
     }
     Ok(pricing)
 }
@@ -1026,11 +1063,10 @@ pub fn ios_pricing_with_token(
     price_request_controls(req, count, sampling)
 }
 
-fn price_request_controls(
+fn resolve_source_plan(
     req: &IosPricingRequest<'_>,
     count: u32,
-    sampling: PricingSampling,
-) -> Result<IosPricing> {
+) -> Result<(SanaPricingFacts, SanaPricingPlan)> {
     if count == 0 {
         return Err(Error::Unsupported(
             "pricing requires a positive serial output count".into(),
@@ -1061,9 +1097,13 @@ fn price_request_controls(
     crate::memory_strategy::validate_request_memory(req.provider, req.spec, req.execution)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
     let facts = SanaPricingFacts::read(root, sprint)?;
-    let cfg_on = matches!(&sampling, PricingSampling::Flow(flow) if flow.effective_guidance().is_some_and(|g| g > 1.0));
     let sequential = req.spec.offload_policy == OffloadPolicy::Sequential;
-    let memory = Some(*req.execution);
+    // The actual legacy None path has existing Sequential/env decode defaults;
+    // Some(GenerationMemory::default()) is NOT equivalent to it. Payload-free
+    // catalog replay carries its already resolved effective execution instead.
+    let memory = req
+        .generation
+        .map_or(Some(*req.execution), |generation| generation.memory);
     let plan = SanaPricingPlan {
         sprint,
         sequential,
@@ -1081,6 +1121,17 @@ fn price_request_controls(
         )?
         .attention,
     };
+    Ok((facts, plan))
+}
+
+fn price_request_controls(
+    req: &IosPricingRequest<'_>,
+    count: u32,
+    sampling: PricingSampling,
+) -> Result<IosPricing> {
+    let (facts, plan) = resolve_source_plan(req, count)?;
+    let (sprint, img2img) = (plan.sprint, plan.img2img);
+    let cfg_on = matches!(&sampling, PricingSampling::Flow(flow) if flow.effective_guidance().is_some_and(|g| g > 1.0));
     let elements = u64::from(plan.width / crate::pipeline::SPATIAL_SCALE)
         * u64::from(plan.height / crate::pipeline::SPATIAL_SCALE)
         * facts.transformer.in_channels as u64;
@@ -1198,6 +1249,11 @@ fn price_request_controls(
     }
     Ok(pricing)
 }
+
+mod native_alloc;
+mod native_certificate;
+mod native_graph;
+pub use native_certificate::ios_certified_bounder;
 
 #[cfg(all(test, target_os = "macos"))]
 mod additivity;

@@ -327,7 +327,7 @@ fn certified_scope(provider: &str, execution: &IosExecutionFacts) -> mlx_gen::Re
 pub type ExecutionGate = fn(&str, &IosExecutionFacts) -> mlx_gen::Result<()>;
 
 /// The registered source-owned transfer bounder of a provider, if it exposes one, with the gate of
-/// the executions its source authority covers. Providers without one (Sana, Anima) are admitted
+/// the executions its source authority covers. Providers without one (Anima) are admitted
 /// only at their anchors' own keys. Never selects a premise-mode bounder.
 pub fn provider_bounder(provider: &str) -> Option<(IosCertifiedBounder, ExecutionGate)> {
     provider_bounder_under(provider, |_| false).map(|selected| (selected.0, selected.1))
@@ -357,6 +357,10 @@ pub fn provider_bounder_under(
 fn provider_proven_bounder(provider: &str) -> Option<(IosCertifiedBounder, ExecutionGate)> {
     match provider {
         crate::sdxl::SDXL_ID => Some((sdxl_certified_bounder, certified_scope)),
+        "sana_1600m" | "sana_sprint_1600m" => Some((
+            mlx_gen_sana::ios_pricing::ios_certified_bounder,
+            certified_scope,
+        )),
         "iris_3b" | crate::ios_admission::IRIS_RESTORE_ID | crate::ios_admission::IRIS_DEPTH_ID => {
             Some((iris_certified_bounder, certified_scope))
         }
@@ -1232,6 +1236,126 @@ mod host_integration {
             }
         }
         println!("{checked} fully optimized cells priced through the catalog dispatch");
+    }
+
+    /// HOST: the REAL Sana catalog callback receives explicit execution facts.
+    /// An analysis resource stop precedes snapshot access and cannot be replaced
+    /// by a test-only bounder or an invented private step cap.
+    #[test]
+    fn sana_catalog_bounder_propagates_scope_and_analysis_budget() {
+        use mlx_gen::gen_core::{
+            GenerationMemory, GenerationRequest, MemoryGeometry, MemoryMode, MemoryNumericTier,
+            MemorySelection, MemoryStrategy,
+        };
+        use mlx_gen::ios_pricing::{
+            IosBoundRequest, IosExecutionFacts, IosExecutionStream, IosPricing, IosPricingRequest,
+        };
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+            "/absent/sana-native-budget-must-refuse-before-source".into(),
+        ));
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::Resident,
+            parameters: Default::default(),
+            tier: MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            },
+        };
+        let execution = GenerationMemory::default();
+        let mode = MemoryMode::TextToImage;
+        let generation = GenerationRequest {
+            steps: Some(u32::MAX),
+            ..Default::default()
+        };
+        for provider in ["sana_1600m", "sana_sprint_1600m"] {
+            let (bounder, gate, premise) = super::provider_bounder_under(provider, |_| true)
+                .expect("both served Sana providers expose their production source callback");
+            assert!(
+                premise.is_none(),
+                "native Sana must not enable an unapproved retirement premise"
+            );
+            let req = IosPricingRequest {
+                provider,
+                spec: &spec,
+                mode: &mode,
+                geometry: MemoryGeometry {
+                    width: generation.width,
+                    height: generation.height,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 0,
+                },
+                selection: &selection,
+                execution: &execution,
+                token_window: 0,
+                generation: Some(&generation),
+                transform: None,
+                depth: None,
+            };
+            let side = IosBoundRequest {
+                pricing: &req,
+                replay: None,
+            };
+            let mut facts = IosExecutionFacts {
+                stream: IosExecutionStream::Metal,
+                ios_quantum_scope: false,
+                analysis_budget_bytes: 0,
+                callback_host: None,
+            };
+            assert!(gate(provider, &facts).is_err());
+            assert!(matches!(bounder(&side, &IosPricing::default(), &side,
+                &IosPricing::default(), &facts), Err(mlx_gen::Error::Unsupported(reason))
+                if reason.contains("outside the iOS quantum")));
+            facts.ios_quantum_scope = true;
+            gate(provider, &facts).unwrap();
+            assert!(
+                matches!(bounder(&side, &IosPricing::default(), &side,
+                &IosPricing::default(), &facts), Err(mlx_gen::Error::Unsupported(reason))
+                if reason.contains("explicit host byte budget")),
+                "{provider}: actual callback lost the caller's budget"
+            );
+            // The callback must use the REAL generation carrier, not trust a
+            // smaller geometry or missing role supplied beside it.
+            let mut wrong_geometry = generation.clone();
+            wrong_geometry.width += 32;
+            let mut wrong_roles = generation.clone();
+            wrong_roles
+                .conditioning
+                .push(mlx_gen::Conditioning::Reference {
+                    image: mlx_gen::Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    },
+                    strength: None,
+                });
+            let mut wrong_memory = generation.clone();
+            wrong_memory.memory = Some(GenerationMemory {
+                tile_vae_decode: true,
+                ..Default::default()
+            });
+            for (changed, reason_part) in [
+                (&wrong_geometry, "geometry/count"),
+                (&wrong_roles, "reference role"),
+                (&wrong_memory, "memory levers"),
+            ] {
+                let bad_req = IosPricingRequest {
+                    generation: Some(changed),
+                    ..req
+                };
+                let bad_side = IosBoundRequest {
+                    pricing: &bad_req,
+                    replay: None,
+                };
+                assert!(
+                    matches!(bounder(&side, &IosPricing::default(), &bad_side,
+                    &IosPricing::default(), &facts), Err(mlx_gen::Error::Unsupported(reason))
+                    if reason.contains(reason_part)),
+                    "{provider}: actual transport mismatch {reason_part} was not rejected"
+                );
+            }
+        }
     }
 
     /// HOST: an Iris anchor replay is parsed only under its own task's recipe prefix, and one

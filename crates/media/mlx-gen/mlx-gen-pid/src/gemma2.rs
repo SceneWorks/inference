@@ -499,6 +499,25 @@ impl Gemma2 {
         let dtype = self.compute_dtype();
         let element_bytes = dtype_bytes(dtype);
         let (b64, l64) = (b as u64, l as u64);
+        // Actual shared Gemma source path (SANA and PiD), not a pricing replay.
+        // A fixed scalar tuple neither retains arrays nor evaluates their graph.
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "gemma2",
+            "native-forward",
+            &[
+                ("schema", 1),
+                ("batch", b64),
+                ("tokens", l64),
+                ("hidden", self.cfg.hidden_size as u64),
+                ("layers", self.layers.len() as u64),
+                ("heads", self.cfg.num_heads as u64),
+                ("kv_heads", self.cfg.num_kv_heads as u64),
+                ("head_dim", self.cfg.head_dim as u64),
+                ("intermediate", self.cfg.intermediate_size as u64),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(dtype)),
+                ("pad_mask", u64::from(pad_mask.is_some())),
+            ],
+        );
         mlx_gen::ios_quantum::before(
             "Gemma embedding/mask",
             gemma_embedding_bytes(&self.cfg, b64, l64, element_bytes),

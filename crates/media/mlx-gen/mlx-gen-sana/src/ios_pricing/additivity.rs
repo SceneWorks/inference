@@ -1,14 +1,14 @@
-//! The iOS anchor law's ADDITIVITY proofs for SANA (epic 16774): iOS admission anchors on the TEXT
-//! mode of the base architecture (`sana_1600m`), and the other requests this crate serves are
-//! DERIVED from that anchor by [`mlx_gen::ios_anchor_law::derive`] over the counted pricing
-//! ([`super::price`]):
+//! SANA source-native bounds exercised through the iOS anchor law's
+//! [`mlx_gen::ios_anchor_law::derive_certified`] consumer (epic 16774).
+//! Base img2img and Sprint text/reference requests retain their actual source
+//! paths, parameter/tier/geometry domains and endpoint ownership. Raw counted
+//! prices never supply native proof authority or a subtractable anchor lower.
 //!
-//! * `sana_1600m` reference (img2img): the reference DC-AE encoder re-added through the request's
-//!   counted residency and its encode phase priced by its counted formula plus the anchor's largest
-//!   unpriced overhead;
-//! * `sana_sprint_1600m` text and reference: Sprint shares the Linear-DiT architecture and differs by
-//!   its steps and its CFG-free SCM sampler (one conditioning instead of the CFG pair, the SCM step
-//!   state instead of the flow-match step), all of which the counted pricing carries.
+//! The safe certificate here is a complete cumulative native backing upper,
+//! including every source operation and actual solver evaluation, with NO
+//! retirement credit. It is deliberately not a claim of useful phone fit,
+//! physical-process transfer or text-anchor cancellation. Such credit requires
+//! a verified native owner-retirement contract and persistent-owner proof.
 //!
 //! Each case runs the production modules on a tiny, structurally real snapshot (a 6-stage x32 DC-AE,
 //! a two-block trunk, a two-layer Gemma-2, at widths the production converter can pack), dense and
@@ -28,7 +28,11 @@ use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, LoadSpec, MemoryNumericTier, MemoryStrategy,
     MemoryStrategySupport, OffloadPolicy, Quant,
 };
-use mlx_gen::ios_anchor_law::{area, derive, measure_phases, MeasuredRun};
+use mlx_gen::ios_anchor_law::{area, derive_certified, MeasuredRun};
+use mlx_gen::ios_pricing::{IosAnchorObservation, IosWindowBound};
+
+#[path = "capture_observations.rs"]
+mod capture_observations;
 use mlx_gen::ios_quantum::with_cpu_diagnostic_headroom;
 use mlx_gen::weights::Weights;
 use mlx_gen::StagedHeavy;
@@ -720,11 +724,11 @@ impl Request {
             phases: BTreeMap::new(),
         };
         let mut least: BTreeMap<IosPhase, u64> = BTreeMap::new();
+        let mut observations = Vec::new();
         for _ in 0..RUNS {
-            let ((), run) = with_cpu_diagnostic_headroom(AMPLE, || {
-                measure_phases(ios_quantum_phase, || self.run())
-            })
-            .unwrap();
+            let (result, observation) = capture_observations::measure(|| self.run());
+            let ((), run) = result.unwrap();
+            observations.push(observation);
             worst.demand = worst.demand.max(run.demand);
             for (phase, bytes) in run.phases {
                 let slot = worst.phases.entry(phase).or_insert(0);
@@ -738,7 +742,11 @@ impl Request {
             .iter()
             .map(|(p, &hi)| (*p, hi - least[p]))
             .collect();
-        Measured { worst, spread }
+        Measured {
+            worst,
+            spread,
+            observations,
+        }
     }
 }
 
@@ -747,33 +755,20 @@ impl Request {
 struct Measured {
     worst: MeasuredRun,
     spread: BTreeMap<IosPhase, u64>,
+    observations: Vec<IosAnchorObservation>,
 }
 
-/// The bound a mode's measured phase must stay under, and how it was formed.
-///
-/// * A phase the mode prices IDENTICALLY to the anchor (same resident bytes, scratch and binding
-///   quantum) runs the same work: the law returns the anchor's own measurement for it, so the
-///   mode's capture is a RECAPTURE of the anchor and may differ from it only by capture noise —
-///   bounded by the law's measured same-cell recapture spread
-///   ([`mlx_gen::ios_anchor_law::CONSISTENCY_TOLERANCE`]).
-/// * A phase the mode CHANGES is held to the derivation, up to the larger of the two captures' own
-///   run-to-run spread in that phase (MLX's CPU executor releases buffers asynchronously, so
-///   identical runs differ by up to ~3% of a small phase; a derivation cannot be asked to beat the
-///   noise of the measurement it is derived from).
+/// A source-certified cumulative upper is an absolute native ceiling, not a
+/// calibrated recapture. Preserve measured spread as a diagnostic, NEVER as an
+/// allowance that could turn an undercounted native certificate green.
 fn bound(
-    at_anchor: &IosPricing,
-    request: &IosPricing,
-    anchor: &Measured,
-    mode: &Measured,
+    _at_anchor: &IosPricing,
+    _request: &IosPricing,
+    _anchor: &Measured,
+    _mode: &Measured,
     d: &mlx_gen::ios_anchor_law::DerivedPhase,
 ) -> (u64, &'static str) {
-    if at_anchor.phase(d.phase).is_some() && at_anchor.phase(d.phase) == request.phase(d.phase) {
-        let spread = d.bytes as f64 * mlx_gen::ios_anchor_law::CONSISTENCY_TOLERANCE;
-        (d.bytes + spread.ceil() as u64, " (recapture)")
-    } else {
-        let noise = |m: &Measured| m.spread.get(&d.phase).copied().unwrap_or(0);
-        (d.bytes + noise(anchor).max(noise(mode)), "")
-    }
+    (d.bytes, " (source-native cumulative)")
 }
 
 /// Derive `request` from the measured `anchor` and compare it with `measured`: the table row and
@@ -785,10 +780,11 @@ fn verdict(
     anchor: &Measured,
     at_anchor: &IosPricing,
     request: &IosPricing,
+    bounds: &[IosWindowBound],
     measured: &Measured,
 ) -> (String, Vec<String>) {
     let a = area(EDGE, EDGE, 1);
-    let derived = derive(&anchor.worst.anchor(a), at_anchor, request, a)
+    let derived = derive_certified(&anchor.worst.anchor(a), at_anchor, request, bounds)
         .unwrap_or_else(|e| panic!("{case} {selection} {tier}: not derivable: {e}"));
     let mut failures = Vec::new();
     let mut phases = Vec::new();
@@ -800,6 +796,17 @@ fn verdict(
         .max()
         .unwrap_or(0);
     for d in &derived.phases {
+        if request.absent_phases.contains_key(&d.phase) {
+            assert_eq!(
+                d.bytes, 0,
+                "an actually absent phase has zero native demand"
+            );
+            assert!(
+                !measured.worst.phases.contains_key(&d.phase),
+                "an absent phase must not execute"
+            );
+            continue;
+        }
         let Some(&m) = measured.worst.phases.get(&d.phase) else {
             failures.push(format!(
                 "{case} {selection} {tier}: missing measured phase {}",
@@ -810,9 +817,10 @@ fn verdict(
         let (limit, tag) = bound(at_anchor, request, anchor, measured, d);
         let ok = m <= limit;
         phases.push(format!(
-            "{} {m}/{}{tag}{}",
+            "{} {m}/{}{tag} spread={}{}",
             d.phase.as_key(),
             d.bytes,
+            measured.spread.get(&d.phase).copied().unwrap_or(0),
             if ok { "" } else { " FAIL" }
         ));
         if !ok {
@@ -867,7 +875,11 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                 spec: base_spec.clone(),
             };
             let measured_anchor = anchor.measure();
-            let at_anchor = anchor.pricing();
+            let expected_anchor = anchor.pricing();
+            let mut at_anchor = expected_anchor.clone();
+            at_anchor.observations = measured_anchor.observations.clone();
+            let anchor_facts = anchor.facts();
+            let anchor_plan = anchor.plan();
             let cases = [
                 (
                     "sana_1600m reference",
@@ -898,8 +910,101 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                 ),
             ];
             for (case, request) in cases {
-                let mut priced = request.pricing();
+                let measured = request.measure();
+                let expected = request.pricing();
+                let mut priced = expected.clone();
+                priced.observations = measured.observations.clone();
+                let facts = request.facts();
+                let plan = request.plan();
+                let generation = mlx_gen::GenerationRequest {
+                    steps: Some(2),
+                    strength: request.img2img.then_some(0.9),
+                    ..Default::default()
+                };
+                let sampling = super::native_certificate::fixture_sampling(
+                    &generation,
+                    request.sprint,
+                    request.img2img,
+                    1 << 20,
+                )
+                .unwrap();
+                let certify = |observed_anchor: &IosPricing, supplied: &IosPricing| {
+                    super::native_certificate::certify_profiles(
+                        &anchor_facts,
+                        &anchor_plan,
+                        &expected_anchor,
+                        observed_anchor,
+                        &facts,
+                        &plan,
+                        &sampling,
+                        &expected,
+                        supplied,
+                    )
+                };
+                // BOTH positive and mutation captures require the intact source
+                // certificate and successful derivation before any negative edit.
+                let baseline = certify(&at_anchor, &priced).unwrap_or_else(|e| {
+                    panic!("{case} {name} {tier}: intact source certificate refused: {e}")
+                });
+                let (_, baseline_failures) = verdict(
+                    case,
+                    name,
+                    tier,
+                    &measured_anchor,
+                    &at_anchor,
+                    &priced,
+                    &baseline,
+                    &measured,
+                );
+                assert!(
+                    baseline_failures.is_empty(),
+                    "intact certificate underbounds: {baseline_failures:#?}"
+                );
+                // Mutate ACTUAL marks, not made-up observation fixtures. Changed
+                // graph/lifetime context, missing geometry and invalid allocator
+                // metadata must each invalidate the source correspondence.
+                for (provider, kind, field) in [
+                    ("gemma2", "native-forward", "tokens"),
+                    ("sana", "native-trunk", "streamed"),
+                    ("sana", "native-decoder", "tail_stages"),
+                    ("sana", "native-pixels", "nchw_view_of_decoder"),
+                    ("sana", "native-pixels", "held_unscaled_elements"),
+                    ("mlx", "allocation-scope", "page_bytes"),
+                ] {
+                    let mut changed = at_anchor.clone();
+                    let mut edits = 0;
+                    for observation in &mut changed.observations {
+                        for mark in &mut observation.metadata {
+                            if mark.provider == provider && mark.kind == kind {
+                                if field == "page_bytes" {
+                                    mark.fields.insert(field.into(), 3);
+                                } else if field == "streamed" {
+                                    mark.fields.insert(field.into(), 1);
+                                } else if field == "held_unscaled_elements" {
+                                    mark.fields.insert(field.into(), 0);
+                                } else {
+                                    mark.fields.remove(field);
+                                }
+                                edits += 1;
+                            }
+                        }
+                    }
+                    assert!(edits > 0, "actual {provider}/{kind} mark was not exercised");
+                    assert!(
+                        certify(&changed, &priced).is_err(),
+                        "changed {provider}/{kind}/{field} certified"
+                    );
+                }
                 tamper(&request, &mut priced);
+                let bounds = match certify(&at_anchor, &priced) {
+                    Ok(bounds) => bounds,
+                    Err(error) => {
+                        failures.push(format!(
+                            "{case} {name} {tier}: denoise source certificate invalid: {error}"
+                        ));
+                        continue;
+                    }
+                };
                 let (line, f) = verdict(
                     case,
                     name,
@@ -907,7 +1012,8 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
                     &measured_anchor,
                     &at_anchor,
                     &priced,
-                    &request.measure(),
+                    &bounds,
+                    &measured,
                 );
                 println!("{line}");
                 failures.extend(f);

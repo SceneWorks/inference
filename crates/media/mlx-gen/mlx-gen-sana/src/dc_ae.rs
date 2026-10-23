@@ -545,6 +545,24 @@ impl DcAeDecoder {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let (b, lh, lw, lc) = nhwc(&latent);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-decoder",
+            &[
+                ("schema", 1),
+                ("batch", b),
+                ("height", lh),
+                ("width", lw),
+                ("channels", lc),
+                ("stages", self.stages.len() as u64),
+                ("tail_stages", self.num_tail_stages() as u64),
+                ("input_width", self.conv_in.w.shape()[0] as u64),
+                (
+                    "dtype",
+                    mlx_gen::sampler::sampling_dtype_code(latent.dtype()),
+                ),
+            ],
+        );
         let mut h = quantum(
             cancel,
             labels::DECODER_INPUT,
@@ -824,6 +842,21 @@ impl DcAeEncoder {
     /// each. NHWC f32 in; NHWC prefix features out.
     fn encode_prefix(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let (b, xh, xw, xc) = nhwc(x);
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-encoder",
+            &[
+                ("schema", 1),
+                ("batch", b),
+                ("height", xh),
+                ("width", xw),
+                ("channels", xc),
+                ("stages", self.stages.len() as u64),
+                ("prefix_stages", self.num_prefix_stages() as u64),
+                ("input_width", self.conv_in.w.shape()[0] as u64),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(x.dtype())),
+            ],
+        );
         let mut h = quantum(
             cancel,
             labels::ENCODER_INPUT,

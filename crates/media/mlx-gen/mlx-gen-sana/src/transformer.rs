@@ -1073,6 +1073,36 @@ impl SanaTransformer {
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sana",
+            "native-trunk",
+            &[
+                ("schema", 1),
+                ("batch", b as u64),
+                ("height", height as u64),
+                ("width", width as u64),
+                ("channels", lsh[1] as u64),
+                ("caption_tokens", caption.shape()[1] as u64),
+                ("caption_width", caption.shape()[2] as u64),
+                ("layers", self.blocks.len() as u64),
+                ("dim", cfg.inner_dim() as u64),
+                ("patch", p as u64),
+                ("qk_norm", u64::from(cfg.qk_norm)),
+                ("guidance_embeds", u64::from(cfg.guidance_embeds)),
+                ("dtype", mlx_gen::sampler::sampling_dtype_code(dt)),
+                ("caption_mask", u64::from(caption_mask.is_some())),
+                ("streamed", u64::from(plan.window.is_some())),
+                (
+                    "query_rows",
+                    plan.attention.query_block(
+                        b,
+                        cfg.num_cross_attention_heads,
+                        ph * pw,
+                        caption.shape()[1],
+                    ) as u64,
+                ),
+            ],
+        );
         // The previous step's CFG combine + sampler update is lazy and materializes here.
         mlx_gen::ios_quantum::before(
             crate::quantum::labels::ENTRY,

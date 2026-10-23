@@ -63,6 +63,8 @@ pub mod labels {
     pub const TILE_FOLD: &str = "DC-AE tile fold";
     /// Tiled decode: the final normalization.
     pub const TILE_FINALIZE: &str = "DC-AE final normalize";
+    /// The actual decoded RGB tensor's F32 denormalize/clamp/round/readback.
+    pub const DECODED_PIXELS: &str = "SANA decoded pixels";
     /// DC-AE encoder `conv_in`.
     pub const ENCODER_INPUT: &str = "DC-AE encoder input";
     /// DC-AE encoder `ResBlock` / `EfficientViT` block.
@@ -93,6 +95,7 @@ pub mod labels {
         DECODER_OUTPUT,
         TILE_FOLD,
         TILE_FINALIZE,
+        DECODED_PIXELS,
         ENCODER_INPUT,
         ENCODER_BLOCK,
         ENCODER_DOWNSAMPLE,

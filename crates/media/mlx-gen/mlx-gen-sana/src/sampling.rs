@@ -4,6 +4,97 @@
 mod tests {
     use super::*;
     #[test]
+    fn payload_free_native_schedule_matches_actual_sana_assembly() {
+        for sampler in crate::model::descriptor().capabilities.samplers {
+            for scheduler in crate::model::descriptor().capabilities.schedulers {
+                for has_init in [false, true] {
+                    let req = GenerationRequest {
+                        sampler: Some(sampler.into()),
+                        scheduler: Some(scheduler.into()),
+                        steps: Some(5),
+                        guidance: Some(1.0),
+                        true_cfg: Some(7.0),
+                        strength: Some(0.2),
+                        ..Default::default()
+                    };
+                    let actual = resolve_base_capture(&req, has_init, 1 << 20).unwrap();
+                    let recipe =
+                        FlowSamplingRecipe::from_token(&actual.recipe().canonical_token()).unwrap();
+                    let controls = ResolvedFlowControls::from_recipe(
+                        &recipe,
+                        base_defaults(),
+                        TimestepConvention::Sigma,
+                    )
+                    .unwrap();
+                    controls.check_capture_schedule_bytes(1 << 20).unwrap();
+                    let native = FlowMatchEuler::for_static_shift(
+                        controls.steps(),
+                        crate::pipeline::SCHEDULE_SHIFT,
+                    );
+                    let mut replay = controls
+                        .materialize_schedule(&native.sigmas, crate::pipeline::SCHEDULE_SHIFT.ln())
+                        .unwrap();
+                    if has_init {
+                        let strength =
+                            mlx_gen::img2img::resolve_strength(None, recipe.effective_strength());
+                        let start = mlx_gen::img2img::init_time_step(5, Some(strength));
+                        replay.window(start, replay.sigmas().len()).unwrap();
+                    }
+                    assert_eq!(
+                        actual
+                            .sigmas()
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        replay
+                            .sigmas()
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{sampler}/{scheduler} init={has_init}"
+                    );
+                    assert_eq!(actual.solver(), replay.solver());
+                    assert_eq!(actual.convention(), replay.convention());
+                    assert_eq!(replay.effective_guidance(), Some(7.0));
+                    recipe.validate_resolved(&replay).unwrap();
+                }
+            }
+        }
+        for has_init in [false, true] {
+            for strength in [None, Some(0.0), Some(0.2), Some(1.0)] {
+                let req = GenerationRequest {
+                    steps: Some(5),
+                    strength,
+                    ..Default::default()
+                };
+                let actual = resolve_sprint_capture(&req, has_init, 1 << 20).unwrap();
+                let recipe =
+                    ScmSamplingRecipe::from_token(&actual.recipe().canonical_token()).unwrap();
+                let replay = ResolvedSprintControls::from_recipe(&recipe, has_init)
+                    .unwrap()
+                    .materialize_capture(1 << 20)
+                    .unwrap();
+                assert_eq!(
+                    actual
+                        .scheduler()
+                        .timesteps
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    replay
+                        .scheduler()
+                        .timesteps
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(actual.start_step(), replay.start_step());
+                assert_eq!(actual.epochs(), replay.epochs());
+            }
+        }
+    }
+
+    #[test]
     fn largest_legal_metadata_requests_do_not_materialize_flow_or_scm_steps() {
         let req = GenerationRequest {
             steps: Some(u32::MAX),
@@ -328,6 +419,30 @@ impl ResolvedSprintControls {
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| Error::Unsupported("SCM schedule bytes overflow".into()))
     }
+    /// O(1) bound on exact analysis before any scheduler/epoch allocation.
+    pub fn check_capture_budget(&self, host_budget_bytes: u64) -> Result<()> {
+        let schedule = self.host_schedule_bytes()?;
+        let bytes = (self.steps() as u64)
+            .checked_mul(std::mem::size_of::<ScmEpoch>() as u64)
+            .and_then(|n| n.checked_add(schedule))
+            .ok_or_else(|| Error::Unsupported("SCM capture bytes overflow".into()))?;
+        if bytes > host_budget_bytes {
+            return Err(Error::Unsupported(
+                "SCM capture exceeds explicit host byte budget".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Exact payload-free native analysis under the caller's stated budget.
+    pub fn materialize_capture(self, host_budget_bytes: u64) -> Result<ResolvedSprintSampling> {
+        self.check_capture_budget(host_budget_bytes)?;
+        let scheduler = sprint_scheduler(self.steps());
+        Ok(ResolvedSprintSampling {
+            recipe: self.recipe,
+            scheduler,
+            start: self.start,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -436,16 +551,5 @@ pub fn resolve_sprint_capture(
     has_init: bool,
     host_budget_bytes: u64,
 ) -> Result<ResolvedSprintSampling> {
-    let controls = resolve_sprint_with_init(req, has_init)?;
-    let schedule_bytes = controls.host_schedule_bytes()?;
-    let epoch_bytes = (controls.steps() as u64)
-        .checked_mul(std::mem::size_of::<ScmEpoch>() as u64)
-        .and_then(|n| n.checked_add(schedule_bytes))
-        .ok_or_else(|| Error::Unsupported("SCM capture bytes overflow".into()))?;
-    if epoch_bytes > host_budget_bytes {
-        return Err(Error::Unsupported(
-            "SCM capture exceeds explicit host byte budget".into(),
-        ));
-    }
-    resolve_sprint_actual_with_init(req, has_init)
+    resolve_sprint_with_init(req, has_init)?.materialize_capture(host_budget_bytes)
 }

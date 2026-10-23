@@ -294,7 +294,48 @@ pub(crate) fn decode_to_image_with_tiling(
         None => decoder.decode(&unscaled, cancel)?,
     }; // [1, H, W, 3] NHWC, f32
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
-    decoded_to_image(&decoded_nchw)
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+    let shape = decoded_nchw.shape();
+    mlx_gen::ios_quantum::diagnostic_metadata(
+        "sana",
+        "native-pixels",
+        &[
+            ("schema", 1),
+            ("batch", shape[0] as u64),
+            ("channels", shape[1] as u64),
+            ("height", shape[2] as u64),
+            ("width", shape[3] as u64),
+            (
+                "dtype",
+                mlx_gen::sampler::sampling_dtype_code(decoded_nchw.dtype()),
+            ),
+            // Transpose is a native view: these handles share ONE decoded input owner.
+            ("nchw_view_of_decoder", 1),
+            ("held_unscaled_elements", unscaled.size() as u64),
+        ],
+    );
+    convert_decoded_pixels_with(
+        decoded_nchw.size() as u64,
+        |scratch| mlx_gen::ios_quantum::before(crate::quantum::labels::DECODED_PIXELS, scratch),
+        || decoded_to_image(&decoded_nchw),
+        || mlx_gen::ios_quantum::finish(crate::quantum::labels::DECODED_PIXELS, &[]),
+    )
+}
+
+// The actual conversion is a lazy builder: rejection cannot construct/execute
+// scale/clamp/round/readback work, and a failed final barrier remains a failure.
+fn convert_decoded_pixels_with<T>(
+    elements: u64,
+    before: impl FnOnce(u64) -> Result<()>,
+    convert: impl FnOnce() -> Result<T>,
+    finish: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    before(mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(
+        elements,
+    ))?;
+    let image = convert()?;
+    finish()?;
+    Ok(image)
 }
 
 /// Measured production DC-AE tile domain. All edges use one fixed 48-pixel overlap; edges below
@@ -2118,6 +2159,48 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_tests {
     use super::*;
+
+    #[test]
+    fn decoded_pixels_refusal_precedes_builder_and_finish_errors_propagate() {
+        let built = std::cell::Cell::new(false);
+        let result = convert_decoded_pixels_with(
+            3 * 4 * 8,
+            |scratch| {
+                assert_eq!(
+                    scratch,
+                    mlx_gen::ios_quantum::decoded_to_image_bytes_from_metadata(3 * 4 * 8)
+                );
+                Err(Error::Unsupported("pixel conversion refused".into()))
+            },
+            || {
+                built.set(true);
+                Ok(7u8)
+            },
+            || panic!("a refused pixel builder cannot reach its completion barrier"),
+        );
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == "pixel conversion refused")
+        );
+        assert!(!built.get(), "rejection must precede all conversion work");
+        let result = convert_decoded_pixels_with(
+            3 * 4 * 8,
+            |_| Ok(()),
+            || {
+                built.set(true);
+                Ok(7u8)
+            },
+            || Err(Error::Unsupported("pixel completion failed".into())),
+        );
+        assert!(built.get());
+        assert!(
+            matches!(result, Err(Error::Unsupported(reason)) if reason == "pixel completion failed")
+        );
+        assert_eq!(
+            convert_decoded_pixels_with(3 * 4 * 8, |_| Ok(()), || Ok(7u8), || Ok(())).unwrap(),
+            7
+        );
+    }
+
     use crate::config::BlockType;
     use mlx_gen::ios_quantum::{
         with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
