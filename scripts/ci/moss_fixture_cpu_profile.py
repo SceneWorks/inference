@@ -47,6 +47,7 @@ MASK_TESTS = tuple("train::subject_mask::tests::" + name for name in (
 SNAPSHOT_TESTS = (
     "moss_training_probe::snapshot::tests::streamed_factor_deltas_match_independent_known_values_and_saved_scalars",
     "moss_training_probe::snapshot::tests::streamed_reader_rejects_other_parent_layout_alpha_and_unadmitted_buffers",
+    "moss_training_probe::snapshot::tests::optimizer_metadata_null_absent_and_map_preserve_strict_scalar_validation",
 )
 TRAINING = "crates/media/mlx-gen/mlx-gen-moss-image/src/training.rs"
 MLX_MEMORY = "crates/media/mlx-gen/mlx-gen-moss-image/src/training_memory.rs"

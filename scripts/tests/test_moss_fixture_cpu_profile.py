@@ -482,6 +482,9 @@ class DiagnosticBatchTests(unittest.TestCase):
         reader=(ROOT/"crates/contracts/gen-core-testkit/src/moss_training_probe/snapshot.rs").read_text(encoding="utf-8")
         for name in profile.SNAPSHOT_TESTS:
             self.assertIn("fn "+name.split("::")[-1]+"()",reader)
+        self.assertIn("moss_training_probe::snapshot::tests::optimizer_metadata_null_absent_and_map_preserve_strict_scalar_validation",
+                      profile.SNAPSHOT_TESTS)
+        self.assertIn("map.next_value::<Option<ScalarMetadata>>()?", reader)
         self.assertIn("snapshot_reader_controls",profile.run.__code__.co_consts)
 
     def test_contract_compile_error_is_blocked_not_a_runtime_red(self):

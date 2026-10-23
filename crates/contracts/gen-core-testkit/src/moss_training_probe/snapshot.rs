@@ -210,9 +210,12 @@ impl<'de> DeserializeSeed<'de> for HeaderSeed {
                 };
                 while let Some(key) = map.next_key::<String>()? {
                     if key == "__metadata__" {
-                        let metadata = map.next_value::<ScalarMetadata>()?;
-                        header.scalars = metadata.0;
-                        header.identity = metadata.1;
+                        // MLX optimizer exports legitimately use null (or omit metadata);
+                        // their adaptive scalars live in tensors, not this optional map.
+                        if let Some(metadata) = map.next_value::<Option<ScalarMetadata>>()? {
+                            header.scalars = metadata.0;
+                            header.identity = metadata.1;
+                        }
                     } else {
                         if header.entries.len() == self.0 {
                             return Err(serde::de::Error::custom("native header changed"));
@@ -555,6 +558,70 @@ mod tests {
         let identity = delta(&a, &a, super::super::AUDIT_WORKSPACE_BYTES).unwrap();
         assert_eq!(identity.changed_elements, 0);
         assert_eq!(identity.squared_l2_delta, 0.0);
+    }
+    #[test]
+    fn optimizer_metadata_null_absent_and_map_preserve_strict_scalar_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("optimizer.safetensors");
+        // IO-only format controls, matching the native optimizer's optional metadata.
+        let write = |metadata: Option<serde_json::Value>, dtype: &str, scalar: f32| {
+            let mut header = serde_json::json!({
+                "__d": {"dtype":dtype,"shape":[1],"data_offsets":[0,4]}
+            });
+            if let Some(metadata) = metadata {
+                header["__metadata__"] = metadata;
+            }
+            let mut bytes = serde_json::to_vec(&header).unwrap();
+            while bytes.len() % 8 != 0 {
+                bytes.push(b' ');
+            }
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&bytes).unwrap();
+            f.write_all(&scalar.to_le_bytes()).unwrap();
+        };
+        let budget = super::super::AUDIT_WORKSPACE_BYTES;
+        for metadata in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"optim.d":"0.000001"})),
+        ] {
+            let map_has_scalar = metadata
+                .as_ref()
+                .is_some_and(|m| m.get("optim.d").is_some());
+            write(metadata, "F32", 1e-6);
+            let (scalars, workspace) = optimizer_scalars(&path, budget).unwrap();
+            assert_eq!(scalars["__d"], f64::from(1e-6_f32));
+            assert_eq!(
+                scalars.get("optim.d").copied(),
+                map_has_scalar.then_some(1e-6)
+            );
+            assert!(workspace <= budget);
+            assert!(optimizer_scalars(&path, workspace - 1).is_err());
+        }
+        for metadata in [
+            serde_json::json!([]),
+            serde_json::json!("wrong"),
+            serde_json::json!(42),
+            serde_json::json!({"optim.d":null}),
+            serde_json::json!({"optim.d":1}),
+            serde_json::json!({"optim.d":"NaN"}),
+            serde_json::json!({"optim.d":"inf"}),
+            serde_json::json!({"optim.d":"-inf"}),
+            serde_json::json!({"unrelated":false}),
+        ] {
+            write(Some(metadata), "F32", 1e-6);
+            assert!(optimizer_scalars(&path, budget).is_err());
+        }
+        for metadata in [None, Some(serde_json::Value::Null)] {
+            for scalar in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                write(metadata.clone(), "F32", scalar);
+                assert!(optimizer_scalars(&path, budget).is_err());
+            }
+            write(metadata, "F64", 1e-6);
+            assert!(optimizer_scalars(&path, budget).is_err());
+        }
     }
     #[test]
     fn streamed_reader_rejects_other_parent_layout_alpha_and_unadmitted_buffers() {
