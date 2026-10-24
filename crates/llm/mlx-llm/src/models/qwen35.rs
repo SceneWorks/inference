@@ -2586,6 +2586,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"]
     fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu() {
         on_cpu(|| {
             let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
