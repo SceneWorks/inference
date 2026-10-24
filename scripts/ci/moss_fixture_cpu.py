@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compile and supervise only the explicit native MOSS full-pipeline CPU fixture tests.
+"""Compile explicit MOSS CPU fixtures and share bounded native-test supervision.
 
 Compilation has its separate CI job budget. Each actual test runs alone under an owned process
-session, 180-second deadline and 2-GiB RSS cap. No GPU inventory, models, caches or driver APIs.
+session, 180-second deadline and 2-GiB RSS cap. The separate manual Metal profile reuses only
+the owner/result protocol; this helper never selects a device or discovers model weights.
 """
 from __future__ import annotations
 import argparse
@@ -420,7 +421,17 @@ def read_observations(log: Path, head: str, required: bool) -> dict | None:
                 and generation["route_matched_initial"].get("adapter_applied") is True}
 
 
-def execute(binary: Path, name: str, log: Path) -> str:
+def verification_text(output: str, name: str, device_marker: str | None) -> str:
+    if device_marker is None:
+        return output
+    # --nocapture may print the prolog on libtest's unfinished `test NAME ... ` line.
+    lines = [line.removeprefix(f"test {name} ... ") for line in output.splitlines()]
+    if lines.count(device_marker) != 1:
+        raise UnitFailure("manual Metal device/stream observation missing; no CPU fallback")
+    return output.replace(device_marker, "", 1)
+
+
+def execute(binary: Path, name: str, log: Path, *, device_marker: str | None = None) -> str:
     environment = dict(os.environ)
     environment.update(RUST_TEST_THREADS="1", VECLIB_MAXIMUM_THREADS="1", OMP_NUM_THREADS="1",
                        MOSS_CPU_RECEIPT_PATH=str(log.with_suffix(".receipts.json")))
@@ -429,27 +440,27 @@ def execute(binary: Path, name: str, log: Path) -> str:
     started = time.monotonic()
     failed = False
     try:
-        output = supervise([str(binary), name, "--exact", "--nocapture", "--color", "never", "--test-threads=1"],
+        output = supervise([str(binary), name, "--exact", "--include-ignored", "--nocapture", "--color", "never", "--test-threads=1"],
                            owner, log, deadline=DEADLINE, rss_cap=RSS_CAP, env=environment)
     except UnitFailure as error:
         # Resource/ownership/protocol failures are fatal, never an independently runnable red case.
         if str(error) != "test process exited with 101" or owner.child.returncode != 101:
             raise
         output = log_tail(log)
-        verify_assertion_failure(output, name)
+        verify_assertion_failure(verification_text(output, name, device_marker), name)
         failed = True
     if owner.collect():
         raise UnitFailure("owned CPU child/descendants not proven released")
     if source_stamp() != stamp or file_digest(binary) != digest:
         raise UnitFailure("source/executable changed during named case")
     if not failed:
-        verify(output, name)
+        verify(verification_text(output, name, device_marker), name)
     observation = read_observations(log, stamp["head"], name in CASES)
     if name in CASES and not failed and not observation["route_matched_observed"]:
         raise UnitFailure("positive full case lacks actual route-matched FP32 generation observations")
     result = {"test": name, "status": "assertion_failed" if failed else "passed",
               "source": stamp, "binary_sha256": digest, "log_sha256": file_digest(log),
-              "observations": observation, "observed_elapsed_seconds": time.monotonic() - started,
+              "observations": observation, "device_contract_observation": device_marker, "observed_elapsed_seconds": time.monotonic() - started,
               "observed_peak_child_rss_bytes": owner.peak, "configured_rss_cap_bytes": RSS_CAP,
               "configured_deadline_seconds": DEADLINE, "owned_released": True}
     log.with_suffix(".result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

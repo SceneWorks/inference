@@ -184,6 +184,7 @@ fn compare(actual: &Array, expected: &Value, tolerance: f32) {
     );
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn cpu_train_export_and_import_portable_adapters() {
     // This dedicated functional seam observes no allocator, memory-limit, peak, footprint or
     // process-global resource counters. The older S1 checkpoint-counter test is not selected.
@@ -352,6 +353,7 @@ fn cpu_train_export_and_import_portable_adapters() {
     });
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn committed_candle_cpu_adapters_generate_portably() {
     let _device = crate::cpu_test_device();
     assert!(matches!(
@@ -439,6 +441,7 @@ pub(crate) fn import_candle_exchange(root: &Path) {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
     let _device = crate::cpu_test_device();
     mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
@@ -599,6 +602,7 @@ fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn periodic_and_final_exports_preserve_request_trigger_words() {
     let _device = crate::cpu_test_device();
     mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
