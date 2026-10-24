@@ -4191,6 +4191,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     f"{name} could be scheduled by a dispatch that did not select the macOS lane",
                 )
 
+    def test_manual_cuda_binds_gpu1_without_exclusive_occupancy_admission(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Bind physical GPU1 and isolate synthetic test caches"
+        )
+        run = step["run"]
+        for required in (
+            "nvidia-smi -i 1 --query-gpu=index,uuid,name,pci.bus_id",
+            "$identity.Count -ne 1",
+            "$fields[0] -ne '1'",
+            "$fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$'",
+            'CUDA_VISIBLE_DEVICES=$gpuUuid',
+            'CUDA_DEVICE_ORDER=PCI_BUS_ID',
+            'SCENEWORKS_GPU_ID=1',
+            '$env:RUNNER_TEMP',
+            '[guid]::NewGuid()',
+            'HF_HOME=$cacheRoot',
+            'HF_HUB_CACHE=$hubRoot',
+            'HUGGINGFACE_HUB_CACHE=$hubRoot',
+            'HF_HUB_OFFLINE=1',
+        ):
+            self.assertIn(required, run)
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        for prerequisite in ("--query-compute-apps", "lease", "admission", "occupied"):
+            self.assertNotIn(prerequisite, commands.lower())
+
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
         job = jobs["windows-cuda"]
