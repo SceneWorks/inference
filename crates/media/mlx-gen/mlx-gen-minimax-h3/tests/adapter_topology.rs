@@ -40,7 +40,7 @@ use mlx_gen_minimax_h3::adapters::convert_comfyui_key_space;
 use mlx_gen_minimax_h3::{
     adaln_schedule, adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
     is_comfyui_key_space, AdaLnSurface, JointSchedule, MiniMaxH3Dit, MiniMaxH3DitConfig,
-    AUDIO_SIGMA_SHIFT,
+    AUDIO_SIGMA_SHIFT, VIDEO_SIGMA_SHIFT,
 };
 
 use common::{dit_fixture_config, DIT_FIXTURE};
@@ -146,14 +146,45 @@ fn pruned_weights(cfg: &MiniMaxH3DitConfig) -> Weights {
 
 /// A second body: every checkpoint tensor doubled — a different base, identical geometry. The
 /// table is part of the map, so this is a genuinely different pruning basis as well.
-fn doubled_pruned_weights(cfg: &MiniMaxH3DitConfig) -> Weights {
+fn doubled_pruned_map(cfg: &MiniMaxH3DitConfig) -> HashMap<String, Array> {
     let mut m = pruned_fixture_map(cfg);
     for key in m.keys().cloned().collect::<Vec<_>>() {
         let t = m[&key].clone();
         let two = Array::from_slice(&[2.0f32], &[1]);
         m.insert(key, multiply(&t, &two).expect("double"));
     }
-    Weights::from_map(m)
+    m
+}
+
+fn doubled_pruned_weights(cfg: &MiniMaxH3DitConfig) -> Weights {
+    Weights::from_map(doubled_pruned_map(cfg))
+}
+
+/// The fixture DiT geometry as a `config.json` document, for staging a checkpoint directory the
+/// production `MiniMaxH3Dit::load` path reads.
+fn fixture_config_json() -> String {
+    r#"{
+        "num_attention_heads": 4, "attention_head_dim": 24, "hidden_size": 64,
+        "num_layers": 2, "num_refiner_layers": 2, "ffn_dim": 32,
+        "in_channels": 24, "audio_in_channels": 32, "patch_size": [1, 2, 2],
+        "text_dim": 40, "freq_dim": 16, "time_embed_hidden_dim": 64,
+        "time_embed_dim": 48, "rope_freq_dim": 2, "rope_theta": 10000.0,
+        "norm_eps": 1e-05, "qk_norm_eps": 1e-05, "final_norm_eps": 1e-05
+    }"#
+    .to_string()
+}
+
+/// Stage one partition directory: `config.json` plus every tensor of `map` in one shard.
+fn stage_partition(dir: &Path, partition: &str, map: HashMap<String, Array>) {
+    let root = dir.join(partition);
+    std::fs::create_dir_all(&root).expect("partition dir");
+    std::fs::write(root.join("config.json"), fixture_config_json()).expect("config.json");
+    let mut entries: Vec<(String, Array)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let no_meta: HashMap<String, String> = HashMap::new();
+    Array::save_safetensors(refs, Some(&no_meta), root.join("model.safetensors"))
+        .expect("partition shard");
 }
 
 fn pruned_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
@@ -918,4 +949,119 @@ fn native_pruned_turbo_adapter_residual_matches_reference() {
         .expect_err("a LoKr-declared file without factors refuses")
         .to_string();
     assert!(error.contains("declared LoKr"), "{error}");
+}
+
+/// **AC1 (partition selection):** the adapter install is a property of the SELECTED partition, and
+/// the same file folds the same delta on every partition of the checkpoint — exercised through the
+/// production `MiniMaxH3Dit::load(root, partition, …)` directory path, not `from_weights`, with
+/// two genuinely different partitions (`transformer`, `transformer_ref`) staged side by side.
+#[test]
+fn the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    stage_partition(dir.path(), "transformer", pruned_fixture_map(&cfg));
+    // The reference partition is a DIFFERENT checkpoint (different body, different pruning basis)
+    // with identical geometry — exactly what the ref2va task resolves as its DiT.
+    stage_partition(dir.path(), "transformer_ref", doubled_pruned_map(&cfg));
+
+    let lora = write_lora(
+        dir.path(),
+        "body.safetensors",
+        &all_targets(&cfg),
+        Some("128"),
+    );
+    let x = tensor(&[3, cfg.hidden_size], 0.7);
+    let s = segs(PROBE);
+    let probe = |partition: &str| -> Array {
+        let mut base = MiniMaxH3Dit::load(dir.path(), partition, Dtype::Float32)
+            .unwrap_or_else(|_| panic!("load {partition}"));
+        assert_eq!(
+            base.adapter_surface(),
+            AdaLnSurface::PrunedCurve,
+            "{partition} must present the pruned curve surface"
+        );
+        let y0 = base.adaptable_mut(&s).expect("probe").forward(&x).unwrap();
+        let mut adapted =
+            MiniMaxH3Dit::load(dir.path(), partition, Dtype::Float32).expect("reload");
+        let report = apply_minimax_h3_adapters(&mut adapted, &[spec(lora.clone(), 1.0)])
+            .unwrap_or_else(|_| panic!("install on {partition}"));
+        assert_eq!(
+            report.applied,
+            adapter_target_paths(&cfg).len(),
+            "{partition} coverage"
+        );
+        assert!(report.unmatched_paths.is_empty(), "{partition}");
+        let y1 = adapted
+            .adaptable_mut(&s)
+            .expect("probe")
+            .forward(&x)
+            .unwrap();
+        subtract(&y1, &y0).expect("residual")
+    };
+
+    let res_base = probe("transformer");
+    let res_ref = probe("transformer_ref");
+    assert!(max_abs(&res_base) > 0.0, "the residual must be nonzero");
+    // The delta is a property of the adapter factors, not of the partition it folds onto; f32
+    // addition rounding is the only difference (see the body-independence arm's note).
+    let diff = subtract(&res_base, &res_ref).unwrap();
+    let worst = max_abs(&diff) as f64;
+    let peak = max_abs(&res_base) as f64;
+    assert!(
+        worst <= 1.0e-4 * peak,
+        "the same adapter must fold the same delta on both partitions (worst {worst}, peak {peak})"
+    );
+}
+
+/// **AC1 (trained schedules):** every published turbo recipe the product resolves — the 50-NFE
+/// base regime and the four trained turbo variants — produces its documented evaluation count and
+/// video shift, keeps the audio shift at its pinned 3.0, and its coordinates stay the `t = 1 − σ`
+/// convention the pruned curve consumes.
+#[test]
+fn every_published_turbo_recipe_resolves_its_trained_schedule() {
+    // (name, requested steps, video shift, expected evaluations).
+    let recipes: [(&str, usize, f32, usize); 5] = [
+        ("base", 50, VIDEO_SIGMA_SHIFT, 50),
+        ("turbo_8step", 8, VIDEO_SIGMA_SHIFT, 8),
+        ("turbo_4step_768p", 4, 6.0, 4),
+        ("turbo_4step_v01", 4, VIDEO_SIGMA_SHIFT, 4),
+        ("ref2v_turbo_4step", 4, VIDEO_SIGMA_SHIFT, 4),
+    ];
+    for (name, requested, video_shift, evals) in recipes {
+        let joint = JointSchedule::with_shifts(requested + 1, video_shift, AUDIO_SIGMA_SHIFT)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            joint.num_evals(),
+            evals,
+            "{name}: N requested steps drive N evaluations (terminal σ=0 is not evaluated)"
+        );
+        assert_eq!(
+            joint.video().shift(),
+            video_shift,
+            "{name}: trained video shift"
+        );
+        assert_eq!(
+            joint.audio().shift(),
+            AUDIO_SIGMA_SHIFT,
+            "{name}: audio stays pinned"
+        );
+        let video = joint.video();
+        let sigmas = video.sigmas();
+        let timesteps = video.timesteps();
+        assert_eq!(timesteps.len(), evals, "{name}");
+        for (t, s) in timesteps.iter().zip(sigmas) {
+            assert!(
+                (0.0..1.0).contains(t),
+                "{name}: every coordinate is t = 1 − σ in [0, 1), got {t}"
+            );
+            assert!(
+                (t - (1.0 - s)).abs() < 1e-6,
+                "{name}: coordinate {t} must equal 1 − σ ({s}) — no ×1000, no SiLU"
+            );
+        }
+        assert!(
+            timesteps.windows(2).all(|w| w[1] > w[0]),
+            "{name}: coordinates ascend across the run"
+        );
+    }
 }
