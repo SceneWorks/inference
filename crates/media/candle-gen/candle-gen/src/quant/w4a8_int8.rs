@@ -243,10 +243,12 @@ impl W4A8Linear {
                     &self.packed,
                     &self.s_rel,
                     &self.codebook,
-                    rows,
-                    d.in_features,
-                    d.group_size,
-                    row,
+                    super::W4A8DecodeTile {
+                        rows,
+                        in_features: d.in_features,
+                        group: d.group_size,
+                        out0: row,
+                    },
                 )?;
                 let acc = self
                     .lt

@@ -1418,12 +1418,15 @@ mod cuda_impl {
             packed: &Tensor,
             s_rel: &Tensor,
             codebook: &Tensor,
-            rows: usize,
-            k: usize,
-            group: usize,
-            out0: usize,
+            tile: W4A8DecodeTile,
         ) -> Result<DevInt8> {
             use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let W4A8DecodeTile {
+                rows,
+                in_features: k,
+                group,
+                out0,
+            } = tile;
             if rows == 0 || k == 0 || rows.checked_mul(k).is_none() {
                 candle_core::bail!("W4A8 decode tile geometry");
             }
@@ -2052,6 +2055,26 @@ mod cuda_impl {
         cols: usize,
     }
 
+    /// Geometry of one bounded W4A8 output-row decode tile: the `rows` output features starting at
+    /// `out0`, each spanning the full `in_features` contraction, with one E4M3FN `s_rel` scale per
+    /// `group` columns.
+    ///
+    /// Four `usize`s passed positionally are indistinguishable to the compiler and to a reader, so
+    /// they travel as one named value (sc-26685 review: `dequant_w4a8_packed_tile` had eight
+    /// arguments). The resident-tensor operands stay separate — they are the kernel's inputs, and
+    /// this is only its launch geometry.
+    #[derive(Clone, Copy, Debug)]
+    pub struct W4A8DecodeTile {
+        /// Output features decoded by this tile (`<=` the caller's output-row tile bound).
+        pub rows: usize,
+        /// Logical contraction width (`in_features`), i.e. the decoded int8 row length.
+        pub in_features: usize,
+        /// Columns per E4M3FN relative scale (`W4A8Int8::group_size`, 16).
+        pub group: usize,
+        /// First output feature of the tile.
+        pub out0: usize,
+    }
+
     impl DevInt8 {
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {
             let (rows, cols) = t.dims2()?;
@@ -2421,7 +2444,7 @@ mod cuda_impl {
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, W4A8DecodeTile};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

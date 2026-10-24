@@ -10,16 +10,17 @@
 //! # The arithmetic is the pinned Kitchen chain, in three pieces
 //!
 //! 1. **Activation** — the pinned fused ConvRot quantization of
-//!    `int8_linear.cu::quantize_int8_rowwise_convrot_kernel`: [`convrot_fht_f32`] replays the
+//!    `int8_linear.cu::quantize_int8_rowwise_convrot_kernel`: `convrot_fht_f32` replays the
 //!    regular (non-Walsh) `H₄` butterfly of `convrot_groupsize = 256` in **F32** and in the kernel's
 //!    own `+` order (strides `1,4,16,64`, `0.5` per stage), then the row-wise int8 quantizer takes
 //!    the row absmax/scale from those F32 values and applies Kitchen's source-dtype cast chain to
 //!    the numerator, the divisor and the quotient (`quant_div_float_to_float`), with `rint` and the
 //!    `[-128, 127]` clamp. It runs **once per row, before any weight tile is decoded**: the pinned
 //!    `launch_w4a8_gemm` computes `xq`/`xs` before the per-tile decode, and a per-tile
-//!    re-quantization would change the result. The W4A8 quantizer is its own kernel
-//!    ([`QUANT`]/`sc_w4a8_int8_quant_v1`): its numerator rounding is the W4A8 authority's and must
-//!    not be conflated with the S4 ConvRot codec's kernel, which is fed an already-rounded rotation.
+//!    re-quantization would change the result. The W4A8 quantizer is its own kernel (`QUANT`,
+//!    registered as `sc_w4a8_int8_quant_v1`): its numerator rounding is the W4A8 authority's and
+//!    must not be conflated with the S4 ConvRot codec's kernel, which is fed an already-rounded
+//!    rotation.
 //! 2. **Weight** — `int8 = round_ties_even(codebook[q] · fp8_e4m3(s_rel))`, clamp `[-127, 127]` (a
 //!    different clamp from the activation side), decoded one output-column tile at a time
 //!    ([`TILE_COLS`]). The even column is the **low** nibble of the stored byte, exactly as

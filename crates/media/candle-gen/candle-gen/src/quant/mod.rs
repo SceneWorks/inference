@@ -108,7 +108,7 @@ pub use cublaslt::{
     NVFP4_N_ALIGN,
 };
 #[cfg(feature = "cuda")]
-pub use cublaslt::{CublasLt, DevNvfp4};
+pub use cublaslt::{CublasLt, DevNvfp4, W4A8DecodeTile};
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
