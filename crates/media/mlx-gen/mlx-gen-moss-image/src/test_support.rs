@@ -391,7 +391,7 @@ mod tests {
                 .expect("explicit CPU reference ceiling");
             assert!(actual + assets.base_bytes + assets.overlay_bytes < cap);
             assert!(released + assets.base_bytes + assets.overlay_bytes > cap);
-            let mut generator = fixture.generator(MossImageVariant::Base, Vec::new())?;
+            let generator = fixture.generator(MossImageVariant::Base, Vec::new())?;
             let mut request = generation_request();
             request.width = 4096;
             request.height = 4096;
