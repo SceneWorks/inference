@@ -124,8 +124,8 @@ cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration 
 
 The existing manual `windows-cuda` CI lane runs the latter command. CUDA
 typecheck and device execution remain distinct evidence. SceneWorks catalog
-admission and its consumer pin are a paired change, not implied by this inference
-implementation; AdaLN pruning/tables and asymmetric W4A8 remain separate slices.
+admission and its consumer pin are paired changes, not implied by this inference
+implementation. Asymmetric W4A8 remains a separate slice; table-driven AdaLN is below.
 
 The manual lane's broad CUDA package-test step sets `IRIS_DIST_SHARE_DEVICE=1`:
 Iris' real multi-process fixtures explicitly share the lane's one visible card,
@@ -133,6 +133,77 @@ rather than requesting absent `cuda:1`/`cuda:2`/`cuda:3` devices and failing bef
 rendezvous. Their separate missing-device test still exercises both the explicit
 refusal and opt-in-sharing paths. This does not skip scenarios or relax numeric
 assertions.
+
+## Native H3 centered-curve AdaLN checkpoints (sc-26684)
+
+Both H3 backends consume the supplied `adaln_t_table` and reduced projections
+directly. The shared `gen-core::pruned_adaln` contract validates the entire
+canonical topology before execution: one F32 `[grid >= 2, rank]` table, all
+`transformer_blocks.{i}.adaln_proj.linear.{weight,bias}`, and final
+`norm_out.linear.{weight,bias}`. Reduced block projections emit `18 * hidden`
+columns; the final projection emits `2 * hidden`. All consume the table's rank.
+A missing table, folded bias, mismatched width, nonfinite operand, or simultaneous
+full timestep MLP is refused, never replaced with stock weights or another basis.
+The source partition and complete block count remain unchanged.
+
+The arithmetic authority is the executable pruning, transformer, and packing code
+at [WanGP `47b06ff920c16b4b7b36de068367a5de0e0968e9`](https://github.com/deepbeepmeep/Wan2GP/tree/47b06ff920c16b4b7b36de068367a5de0e0968e9/models/minimax_h3).
+Its centered SVD stores `U*S` in the table, `W*Vh.T` in the reduced projections,
+and `b + W*mean` in the folded bias. Inference does **not** reconstruct `Vh`,
+rederive a basis, or apply a second SiLU. Coordinates interpolate at
+`clamp(t, 0, 1) * (grid - 1)` with `t = 1 - sigma`, without a factor of 1000.
+Text and target-video rows use the video timestep; conditioned-video rows use
+`max(video_t, .999)`, target audio uses `audio_t`, and conditioned audio uses 1.
+
+The frozen pruned INT8 artifact at
+[`a56850c870825d6a8ae501a595c4dbbbc77bbc7e`](https://huggingface.co/WarmBloodAban/Minimax-h3_Singularity/tree/a56850c870825d6a8ae501a595c4dbbbc77bbc7e)
+has 50 blocks, a **stored F32 `[1025,8]` table**, 50 BF16 `[96768,8]`
+projections plus final BF16 `[10752,8]`, and folded F16 biases of the
+corresponding output widths. Stored precision is identified and hashed per operand
+before lossless F32 compute widening, matching the pinned runtime's `_lock_dtype`.
+The engine retains one widened compute operand set, not both source and compute
+copies, and never recasts weights/biases per timestep. Resident-byte accessors report
+the actual F32 allocations (174,602,272 B including the table at this geometry),
+not the narrower checkpoint bytes. The pruner's F32 output is not misreported as
+the artifact's stored precision. The 200 body ConvRot
+group-256 projections remain native INT8, not dense AdaLN or group-64 substitutes.
+
+The shared Candle loader now takes `Weights::from_files_native_int8(files, device)`:
+there is no load-time compute-dtype argument. It preserves **all** floating source
+dtypes, including unrelated F32 I/O heads, and materializes original signed INT8
+codes as exact U8 two's-complement storage with F32 scales. H3 projections choose
+their compute dtype at the projection construction boundary. Consumers migrating from the former three-argument
+API must remove that argument, not add a pre-load cast or reread pruning operands.
+
+`PruningIdentity` binds the table, **every** reduced projection and folded bias,
+their canonical keys, shapes and stored dtypes. Same-shaped operands from a
+different centered basis are incompatible; content identity participates in
+modulation-cache reuse. It is not a filename, allowlist, or table-only identity.
+The existing provider/import platform remains the only route; SceneWorks import
+mapping/admission and its exact inference pin require their paired consumer change.
+
+[`scripts/h3_pruned_adaln_oracle.py`](../scripts/h3_pruned_adaln_oracle.py) executes
+hashed pinned definitions on CPU with deterministic synthetic data. It generates
+[`tests/fixtures/h3_pruned_adaln.json`](../tests/fixtures/h3_pruned_adaln.json),
+not the downloaded source table: 10 off-grid/endpoint/clamped/conditioned timestep
+cases, mixed stored precision, two complete tiny block outputs and final
+video/audio outputs. The F32-coordinate absolute bound is `2e-6`, reduced-projection
+bound `2e-5`, Candle block/output bound `2e-5`, and MLX block/output bound `2e-3`
+(its existing Metal F32 body-matmul precision). These are elementwise gates, not
+cosine-only or hash-only checks. Explicit native tests run in the existing hosted
+Metal and manual CUDA CI jobs, with private HF environments. Ignored tests or
+compile-only checks are not device evidence:
+
+```sh
+cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture
+cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture
+```
+
+Regeneration takes an offline `--reference-dir` containing the three pinned text
+files and verifies their SHA256 hashes before execution. Local CPU checks must
+use disposable `HF_HOME`, `HF_HUB_CACHE`, and `HUGGINGFACE_HUB_CACHE`, plus OS
+denial of production model roots and all networking. No real-weight downloads,
+full-checkpoint execution, memory campaign, or permanent consumer pin is part of S5.
 
 ## Migration records
 

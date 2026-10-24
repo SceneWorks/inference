@@ -780,6 +780,16 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests "${packages[@]}"
+      - name: Prove H3 pruned AdaLN against pinned CPU reference on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration
+          pruned_adaln::native_pruned_adaln_matches_pinned_reference
+          -- --ignored --exact --nocapture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1064,6 +1074,15 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Isolate persistent-runner HF caches
+        shell: cmd
+        run: |
+          set "HF_OUTER=%RUNNER_TEMP%\inference-ci-h3-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          if not exist "%HF_OUTER%" mkdir "%HF_OUTER%"
+          if errorlevel 1 exit /b 1
+          echo HF_HOME=%HF_OUTER%\hf-home>>"%GITHUB_ENV%"
+          echo HF_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
+          echo HUGGINGFACE_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -1097,6 +1116,13 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8::native_projections_match_pinned_kitchen -- --ignored --exact --nocapture
+      - name: Prove H3 pruned AdaLN against pinned CPU reference on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture
       - name: Test Candle CUDA packages
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run

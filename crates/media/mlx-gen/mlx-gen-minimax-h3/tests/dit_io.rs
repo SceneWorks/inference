@@ -283,7 +283,10 @@ fn the_seventeen_load_at_the_published_geometry() {
     let tiny = dit_fixture_config();
     let p = projections(&mut w, &tiny);
     assert_eq!(
-        p.time_embedder.time_embed_dim(),
+        p.time_embedder
+            .as_ref()
+            .expect("full fixture has a time embedder")
+            .time_embed_dim(),
         tiny.time_embed_dim,
         "the AdaLN projections consume this width"
     );

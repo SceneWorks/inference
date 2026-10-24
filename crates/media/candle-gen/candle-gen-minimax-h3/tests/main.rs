@@ -37,6 +37,9 @@ mod dit_parity;
 #[path = "joint_denoise.rs"]
 mod joint_denoise;
 
+#[path = "pruned_adaln.rs"]
+mod pruned_adaln;
+
 #[path = "quant_policy.rs"]
 mod quant_policy;
 

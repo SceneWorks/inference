@@ -237,10 +237,12 @@ pub use denoise::{
     ROPE_UNITS_PER_SECOND, TEXT_TAG, VIDEO_SIGMA_SHIFT, VIDEO_TAG,
 };
 pub use dit::{
-    AdaLayerNormOut, AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency, DitBlock,
-    DitProjections, JointDit, LinearBias, MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, MmRopeTables,
-    NormOutModulation, ScheduleKey, TimestepEmbedder, TimestepSchedule, TokenRefiner,
-    TokenRefinerBlock, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
+    detect, AdaLayerNormOut, AdaLnCache, AdaLnModulation, AdaLnProjection, AdaLnResidency,
+    DitBlock, DitProjections, JointDit, LinearBias, MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope,
+    MmRopeTables, NormOutModulation, PrunedAdaLnProjection, PrunedAdaLnRuntime,
+    PrunedFinalProjection, PrunedReducedLinear, PrunedTable, PruningIdentity, ScheduleKey,
+    TimestepEmbedder, TimestepSchedule, TokenRefiner, TokenRefinerBlock, MODALITY_NUM,
+    PUBLISHED_DIT_TENSORS,
 };
 pub use keyframe::{
     anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,

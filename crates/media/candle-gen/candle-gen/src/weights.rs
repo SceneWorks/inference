@@ -202,12 +202,10 @@ impl Weights {
 
     /// Native INT8-aware shard loading. Candle has no signed-byte dtype; preserve an I8
     /// weight's exact two's-complement bytes as U8, not an 8x I64/dense floating expansion.
-    /// Row scales remain F32. Other tensors retain the ordinary loader's dtype policy.
-    pub fn from_files_native_int8(
-        files: &[impl AsRef<Path>],
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Self> {
+    /// All floating operands retain their stored dtype, including F32 heads, timestep tables,
+    /// BF16 reduced projections and F16 folded biases. Compute conversion belongs to the
+    /// projection, not the checkpoint reader; one read preserves source identity and precision.
+    pub fn from_files_native_int8(files: &[impl AsRef<Path>], device: &Device) -> Result<Self> {
         // Header/descriptor/scale pass first: no tensor, CUDA handle or rotation is allocated
         // until every native projection is validated, even when companions live in other shards.
         let mut stores = Vec::with_capacity(files.len());
@@ -286,10 +284,8 @@ impl Weights {
             for (key, view) in st.tensors() {
                 let tensor = if view.dtype() == safetensors::Dtype::I8 {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
-                } else if key.ends_with(".weight_scale") || key.ends_with(".comfy_quant") {
-                    st.load(&key, device)?
                 } else {
-                    coerce_float(st.load(&key, device)?, dtype)?
+                    st.load(&key, device)?
                 };
                 map.insert(key, tensor);
             }
@@ -386,6 +382,38 @@ mod tests {
             Ok(_) => panic!("expected a duplicate-key error, but from_files succeeded"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn native_int8_loader_preserves_all_source_float_precisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("mixed.safetensors");
+        let device = Device::Cpu;
+        let source = Tensor::new(&[1.0001f32, -0.1234567, -0.0], &device).unwrap();
+        let mut map = HashMap::new();
+        for (name, dtype) in [
+            ("head", DType::F32),
+            ("projection", DType::BF16),
+            ("bias", DType::F16),
+        ] {
+            map.insert(name.to_owned(), source.to_dtype(dtype).unwrap());
+        }
+        cst::save(&map, &file).unwrap();
+        let loaded = Weights::from_files_native_int8(&[file], &device).unwrap();
+        for (name, original) in map {
+            let actual = loaded.require(&name).unwrap();
+            assert_eq!(actual.dtype(), original.dtype(), "{name}");
+            let bits = |tensor: &Tensor| {
+                tensor
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&actual), bits(&original), "{name}");
+        }
     }
 
     /// `from_file_filtered` materializes only the prefix-matched keys (byte-identical to `from_file`
