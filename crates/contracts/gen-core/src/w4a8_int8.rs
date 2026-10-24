@@ -1,4 +1,4 @@
-//! Native packed **W4A8 (asym_w4a8_int8) projection contract and bit-accurate host reference**
+//! Native packed **W4A8 (asym_w4a8_int8) projection contract and reference packed decode**
 //! (sc-26685).
 //!
 //! This is deliberately separate from both the plain `int8-per-row-v1` dense decoder and the
@@ -8,23 +8,39 @@
 //! fused ConvRot (regular Hadamard, block 256) + row-wise int8 quantization as the ConvRot INT8
 //! codec; only the weight half — packed codes, codebook, `s_rel`/`s_channel` — is new.
 //!
-//! # Authority
+//! This module owns the **contract** ([`W4A8Int8`] descriptor/geometry/value validation and
+//! residency) and the **host packed→int8 decode** ([`dequant_packed_to_int8`]) that the Candle
+//! CPU/Metal dequant-dense fallback consumes — the same production-decoder role
+//! `decode_int8_per_row` / `decode_nvfp4` / `decode_mxfp8` play in [`crate::comfy_quant`]. The
+//! bit-accurate *forward* reference (activation FHT + quantizer + int32 GEMM + epilogue) is
+//! **deliberately not here**: the fixture oracle is the pinned external executable below, not a
+//! host re-derivation of it. The ConvRot activation rotation itself is S4's proven
+//! `candle_gen::quant::regular_hadamard` / the MLX `convrot_rotation` builder — never re-derived.
 //!
-//! Comfy Kitchen PR#90, tree `06a261f8` (head `d908d589`) — pinned in the epic source-of-truth:
+//! # Authority (exact pinned blob SHAs at comfy-kitchen PR#90, tree `06a261f8`, head `d908d589`)
 //!
-//! * `comfy_kitchen/tensor/w4a8_int8.py` — the export dialect and the eager reference;
-//! * `comfy_kitchen/backends/cuda/ops/w4a8_gemm.cu` — `dequant_int4_grouped_to_int8_kernel`, the
-//!   memory-bound int4→int8 weight dequant: `int8_w = __float2int_rn(cb[q] · s_rel) clamp [-127,127]`
-//!   (codebook) / `(q−8)·s_rel` (uniform), fp8 scale decoded with `__NV_E4M3`;
-//! * `comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu` — the fused int32→float epilogue
-//!   `((acc · xs) · s_channel) + bias`, each float op round-to-nearest, store round-to-nearest;
-//! * `comfy_kitchen/backends/cuda/ops/int8_linear.cu` — `quantize_int8_rowwise_convrot_kernel`, the
-//!   f32 Fast-Hadamard rotation + row-wise int8 activation quantizer with the bf16 cast chain, and
-//!   `dequantize_int8_linear_kernel`, the same epilogue as `cutlass_gemm_int8.cu`.
+//! * `comfy_kitchen/backends/cuda/ops/w4a8_gemm.cu` — blob `21002ea10bf0d05d945083c61f79098324b76bb1`.
+//!   `dequant_int4_grouped_to_int8_kernel`: nibble unpack `c0 = byte & 0xF, c1 = (byte >> 4) & 0xF`
+//!   (even column low nibble, odd high); scale decode `__half2float(__nv_cvt_fp8_to_halfraw(v,
+//!   __NV_E4M3))`; level `v = codebook ? cb[c] : (float(c) - 8.0f)`; output
+//!   `static_cast<int8_t>(max(-127, min(127, __float2int_rn(v * s))))` — **`__float2int_rn` is
+//!   round-half-to-even, and the weight clamp is `[-127, 127]`**.
+//! * `comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu` — blob `f7142fa41973a808cd6a5fe4b0b1cd063a7b2a3b`.
+//!   Epilogue `D = (sum_k A·B) * x_scale[m] * w_scale[n] + bias[n]`: `ElementAcc = int32_t`,
+//!   `ElementCompute = float`, `XScale`/`WScale`/`Mul0`/`Mul1`/`Add2` all `round_to_nearest`
+//!   (`FloatRoundStyle::round_to_nearest`), store `round_to_nearest`. Fold order is
+//!   `((acc · xs) · ws) + bias`, each float op round-to-nearest, store round-to-nearest.
+//! * `comfy_kitchen/backends/cuda/ops/int8_linear.cu` — blob `4c7d49e72425aa868d388a5b73b98c585e1fbded`.
+//!   `quantize_int8_rowwise_convrot_kernel` (activation): f32 Fast-Hadamard butterfly of the
+//!   *regular* (non-Walsh) Hadamard block `H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`
+//!   (`h4_row_dot`), four stages stride `1,4,16,64` each `* 0.5`; row scale
+//!   `max(min(absmax, 3.38953139e38f) / 127, 1e-30)`; per-element `scaled = f32(bf16(f32(bf16(rot))
+//!   / f32(bf16(scale))))` (`quant_div_float_to_float`), then `nearbyintf(scaled)` (round-half-even)
+//!   clamp **`[-128, 127]`**. `dequantize_int8_linear_kernel` is the 2-pass twin of the epilogue
+//!   above (`value = float(acc) * x_scales[row] * weight_scale; value += bias; from_float(value)`).
 //!
-//! The reference functions in this module encode those kernels' **exact** rounding and fold order,
-//! in plain `f32`/`i8` — no tensor dependency — so both native backends' fixture tests compare
-//! against the same bit-accurate oracle rather than a re-derived approximation.
+//! Note the two clamps differ by design: the **weight** dequant clamps `[-127, 127]`, the
+//! **activation** quantizer clamps `[-128, 127]` — matching the two kernels verbatim.
 
 use serde::Deserialize;
 
@@ -44,24 +60,8 @@ pub const MAX_DESCRIPTOR_BYTES: usize = 4096;
 pub const GROUP_SIZE: usize = 16;
 
 /// The frozen dialect's fixed ConvRot rotation group (`{"convrot_groupsize":256}`): a regular
-/// (non-Walsh) Hadamard block, `H₄` Kronecker-power of order 256, normalized by `1/16`.
+/// (non-Walsh) Hadamard block of order 256, normalized by `1/16`.
 pub const CONVROT_GROUP: usize = 256;
-
-/// The regular `H₄` Hadamard block. **Sign order is load-bearing**: this is the PR#90 "regular"
-/// order, not the Sylvester/Walsh order, and the published checkpoint was quantized against exactly
-/// these signs.
-pub const H4: [[f32; 4]; 4] = [
-    [1.0, 1.0, 1.0, -1.0],
-    [1.0, 1.0, -1.0, 1.0],
-    [1.0, -1.0, 1.0, 1.0],
-    [-1.0, 1.0, 1.0, 1.0],
-];
-
-/// The largest finite bf16 value (`3.38953139e38`), bit-exact — the `finite_max_for_dtype<bf16>`
-/// clamp the pinned activation quantizer applies to the row absmax before the `1/127` scale. This
-/// is the H3 DiT's activation dtype, so it is the `dtype_max` the W4A8 oracle and fixtures pass to
-/// [`quantize_rotated_row`] / [`reference_forward`].
-pub const BF16_MAX: f32 = f32::from_bits(0x7F7F_0000);
 
 /// Validated logical geometry. The stored weight is `I8 [out, in/2]` (two uint4 codes per byte,
 /// even column in the **low** nibble); `in_features` is the logical (dequantized-int8) width.
@@ -177,8 +177,8 @@ impl W4A8Int8 {
         if scales.len() != self.out_features {
             return Err("W4A8 weight_s_channel length does not match the geometry".into());
         }
-        for s in scales {
-            if !s.is_finite() || *s <= 0.0 {
+        for &s in scales {
+            if !s.is_finite() || s <= 0.0 {
                 return Err("W4A8 weight_s_channel must be finite positive F32".into());
             }
         }
@@ -204,151 +204,12 @@ impl W4A8Int8 {
         self.out_features * (self.in_features / 2)                             // packed I8
             + self.out_features * (self.in_features / GROUP_SIZE)              // s_rel F8
             + self.out_features * 4                                            // s_channel F32
-            + 16 * 4 // codebook F32
+            + 16 * 4                                                           // codebook F32
     }
-}
-
-// =================================================================================================
-// Bit-accurate host reference (the fixture oracle).
-// =================================================================================================
-
-/// Round `v` (finite) to the nearest `f32` representable as bf16, ties **to even** — the exact
-/// semantics of CUDA `__float2bfloat16_rn` and MLX `as_dtype(BF16)`, and therefore of every
-/// bf16 cast in the pinned kernels' activation epilogue.
-pub fn bf16_rn(v: f32) -> f32 {
-    if v.is_nan() || v.is_infinite() {
-        return v;
-    }
-    let bits = v.to_bits();
-    // bf16 keeps the top 16 bits (1 sign + 8 exp + 7 mantissa), dropping the low 16 mantissa bits.
-    // Round-half-to-even on the dropped bits: add half-ulp (0x7FFF) plus the kept mantissa's LSB,
-    // then truncate the low 16 bits.
-    let rounded = bits.wrapping_add(0x0000_7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
-    f32::from_bits(rounded)
-}
-
-/// The dense regular-Hadamard rotation of `order` (`order` must be a power of 4), normalized by
-/// `1/√order`. Produced exactly as the native loaders build it: a Kronecker power of [`H4`] with
-/// per-element sign `∏ H4[i_d][j_d]`, scaled by `1/√order`.
-///
-/// This is the *reference* matrix; the fused CUDA activation kernel factors it as a radix-4 Fast
-/// Hadamard Transform ([`fht_rotate_row`]) that computes the same product in a different summation
-/// order.
-pub fn regular_hadamard(order: usize) -> Vec<f32> {
-    debug_assert!(order == 1 || (order.is_power_of_two() && order.is_multiple_of(4)));
-    let mut out = Vec::with_capacity(order * order);
-    for idx in 0..order * order {
-        let (mut r, mut c) = (idx / order, idx % order);
-        let mut s = 1.0f32;
-        while r != 0 || c != 0 {
-            s *= H4[r % 4][c % 4];
-            r /= 4;
-            c /= 4;
-        }
-        out.push(s / (order as f32).sqrt());
-    }
-    out
-}
-
-/// The four rows of [`H4`] dotted with `(x0, x1, x2, x3)` — the exact radix-4 butterfly used by the
-/// pinned `quantize_int8_rowwise_convrot_kernel`, with C's left-to-right float addition order.
-fn h4_row_dot(d: usize, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
-    match d {
-        0 => x0 + x1 + x2 - x3,
-        1 => x0 + x1 - x2 + x3,
-        2 => x0 - x1 + x2 + x3,
-        _ => -x0 + x1 + x2 + x3,
-    }
-}
-
-/// The fused ConvRot/quantizer's f32 Fast-Hadamard butterfly over one `CONVROT_GROUP` block.
-/// Four stages (strides 1, 4, 16, 64) each scaled by `1/2`, ping-ponging between `a` and `b`; an
-/// even number of stages leaves the result in `a`. Matches
-/// `quantize_int8_rowwise_convrot_kernel`'s arithmetic order bit-for-bit.
-fn fht_block(a: &mut [f32; CONVROT_GROUP], b: &mut [f32; CONVROT_GROUP]) {
-    let mut read = 0usize; // 0 = `a`, 1 = `b`
-    let mut write = 1usize;
-    for stage in 0..4usize {
-        let s = [1usize, 4, 16, 64][stage];
-        let (src, dst): (&[f32], &mut [f32]) = if read == 0 {
-            (&a[..], &mut b[..])
-        } else {
-            (&b[..], &mut a[..])
-        };
-        for (i, dst_i) in dst.iter_mut().enumerate() {
-            let d = (i / s) & 3;
-            let base = i - d * s;
-            *dst_i = 0.5
-                * h4_row_dot(
-                    d,
-                    src[base],
-                    src[base + s],
-                    src[base + 2 * s],
-                    src[base + 3 * s],
-                );
-        }
-        std::mem::swap(&mut read, &mut write);
-    }
-    debug_assert_eq!(read, 0, "four stages must land back in the first buffer");
-}
-
-/// Rotate one row (`k` elements, `k` a multiple of `CONVROT_GROUP`) by the block-diagonal regular
-/// Hadamard, in f32, using the FHT factorization above — the CUDA activation kernel's rotation.
-pub fn fht_rotate_row(x: &[f32], k: usize, out: &mut Vec<f32>) {
-    out.clear();
-    out.resize(k, 0.0);
-    let mut a = [0.0f32; CONVROT_GROUP];
-    let mut b = [0.0f32; CONVROT_GROUP];
-    for block in (0..k).step_by(CONVROT_GROUP) {
-        a.copy_from_slice(&x[block..block + CONVROT_GROUP]);
-        fht_block(&mut a, &mut b);
-        out[block..block + CONVROT_GROUP].copy_from_slice(&a);
-    }
-}
-
-/// Quantize one already-rotated f32 row to int8 codes + a per-row scale, replicating the pinned
-/// `quantize_int8_rowwise_convrot_kernel`'s post-FHT tail exactly:
-///
-/// ```text
-/// scale   = max(min(absmax(rot), bf16_max) / 127, 1e-30)
-/// scaled  = f32( bf16( f32(bf16(rot)) / f32(bf16(scale)) ) )
-/// code    = clamp( round_ties_even(scaled), -128, 127 )
-/// ```
-///
-/// `dtype_max` is [`BF16_MAX`] for a bf16 activation (the H3 DiT's compute dtype); pass
-/// `f32::MAX`/`65504.0` for the other two activation dtypes the codec admits.
-pub fn quantize_rotated_row(
-    rotated: &[f32],
-    dtype_max: f32,
-    out_codes: &mut Vec<i8>,
-    out_scale: &mut f32,
-) {
-    let mut abs_max = 0.0f32;
-    for &v in rotated {
-        let a = v.abs();
-        if !a.is_nan() && a > abs_max {
-            abs_max = a;
-        }
-    }
-    let scale = (abs_max.min(dtype_max) * (1.0 / 127.0)).max(1.0e-30);
-    let scale_bf16 = bf16_rn(scale);
-    out_codes.clear();
-    out_codes.reserve(rotated.len());
-    for &v in rotated {
-        let t = bf16_rn(v) / scale_bf16;
-        let scaled = bf16_rn(t);
-        let q = if scaled.is_nan() {
-            -128.0f32
-        } else {
-            scaled.round_ties_even().clamp(-128.0, 127.0)
-        };
-        out_codes.push(q as i8);
-    }
-    *out_scale = scale;
 }
 
 /// Decode the packed int4 weight into the grouped int8 the GEMM actually multiplies, replicating
-/// `dequant_int4_grouped_to_int8_kernel`:
+/// `dequant_int4_grouped_to_int8_kernel` (`w4a8_gemm.cu`, blob `21002ea10`, above):
 ///
 /// ```text
 /// byte  = packed[n, c/2]            (even col -> low nibble, odd -> high nibble)
@@ -357,9 +218,10 @@ pub fn quantize_rotated_row(
 /// int8  = round_ties_even(lvl · s)  clamped to [-127, 127]
 /// ```
 ///
-/// The group/convrot rotation is **not** applied here — the reference forward rotates the
-/// activation ([`fht_rotate_row`]), matching the native path, and this returns the rotated-basis
-/// int8 weight the GEMM consumes. `packed` is `[out, in/2]`, `s_rel` `[out, in/16]` raw E4M3 bytes.
+/// This is the production host decoder for the Candle CPU/Metal dequant-dense fallback; the
+/// rotation is **not** applied here (the stored weight is already in the rotated basis, and the
+/// activation rotation is S4's existing path). `packed` is `[out, in/2]`, `s_rel` `[out, in/16]`
+/// raw E4M3 bytes, `codebook` the 16 F32 levels.
 pub fn dequant_packed_to_int8(
     packed: &[i8],
     s_rel: &[u8],
@@ -397,76 +259,6 @@ pub fn dequant_packed_to_int8(
         }
     }
     Ok(())
-}
-
-/// The complete bit-accurate reference forward for one packed W4A8 projection — the frozen
-/// symmetric+codebook dialect — matching the pinned kernels end to end:
-///
-/// ```text
-/// xr[m,:]    = FHT_rotate(x[m,:])                       f32 butterfly
-/// xq[m,:],xs = quantize_rotated_row(xr)                 round_ties_even, clamp [-128,127]
-/// wq[n,:]    = dequant_packed_to_int8(weight)           round_ties_even, clamp [-127,127]
-/// acc        = Σ xq[m,k]·wq[n,k]                        exact int32
-/// out[m,n]   = bf16_rn( (f32(acc)·xs[m])·s_channel[n] + bias[n] )
-/// ```
-///
-/// `x` is the bf16 activation widened to f32 (each value already exactly representable), row-major
-/// `[m, in_features]`; `dtype_max` is the activation dtype's finite maximum. The result is
-/// row-major `[m, out_features]` f32, **in the same bf16 precision the native path stores** — this
-/// function returns the bf16-rounded values, which is what the fixtures compare element-for-element.
-/// The 10-argument shape is intentional: this is a tensor-free oracle consumed by both backend
-/// test crates, and every operand is a raw primitive slice rather than a backend tensor.
-#[allow(clippy::too_many_arguments)]
-pub fn reference_forward(
-    x: &[f32],
-    packed: &[i8],
-    s_rel: &[u8],
-    s_channel: &[f32],
-    codebook: &[f32],
-    bias: Option<&[f32]>,
-    m: usize,
-    out_features: usize,
-    in_features: usize,
-    dtype_max: f32,
-) -> Result<Vec<f32>, String> {
-    if x.len() != m * in_features {
-        return Err("W4A8 reference: activation length mismatch".into());
-    }
-    if s_channel.len() != out_features {
-        return Err("W4A8 reference: s_channel length mismatch".into());
-    }
-    if let Some(b) = bias {
-        if b.len() != out_features {
-            return Err("W4A8 reference: bias length mismatch".into());
-        }
-    }
-    let mut wq = Vec::new();
-    dequant_packed_to_int8(packed, s_rel, codebook, out_features, in_features, &mut wq)?;
-
-    let mut out = vec![0.0f32; m * out_features];
-    let mut xq = Vec::new();
-    let mut rotated = Vec::new();
-    for row in 0..m {
-        fht_rotate_row(
-            &x[row * in_features..(row + 1) * in_features],
-            in_features,
-            &mut rotated,
-        );
-        let mut scale = 0.0f32;
-        quantize_rotated_row(&rotated, dtype_max, &mut xq, &mut scale);
-        for n in 0..out_features {
-            let mut acc = 0i32;
-            for k in 0..in_features {
-                acc += i32::from(xq[k]) * i32::from(wq[n * in_features + k]);
-            }
-            let mut v = acc as f32 * scale * s_channel[n];
-            if let Some(b) = bias {
-                v += b[n];
-            }
-            out[row * out_features + n] = bf16_rn(v);
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -560,23 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn bf16_rounding_is_ties_to_even() {
-        assert_eq!(bf16_rn(1.0), 1.0);
-        // The halfway between two adjacent bf16 values rounds to the even mantissa (0.5).
-        let lo = 0.5f32;
-        let hi = f32::from_bits(0x3F01_0000); // 0.50390625
-        let mid = (lo + hi) / 2.0; // 0.501953125
-        assert_eq!(bf16_rn(mid), 0.5);
-    }
-
-    #[test]
-    fn regular_hadamard_order_4_is_regular_not_sylvester() {
-        let r = regular_hadamard(4);
-        let want: Vec<f32> = H4.iter().flatten().map(|&v| 0.5 * v).collect();
-        assert_eq!(r, want);
-    }
-
-    #[test]
     fn packed_dequant_honors_nibble_codebook_fp8_ties_and_saturation() {
         // --- ties to even ---
         // cb[0] = 0.5, cb[1] = 1.5. packed[0] = 0x10 -> col0 nibble 0, col1 nibble 1.
@@ -601,27 +376,5 @@ mod tests {
         dequant_packed_to_int8(&packed_sat, &s_rel_sat, &cb_ones, 1, 32, &mut out_sat).unwrap();
         assert_eq!(out_sat[0], 127); // saturated high
         assert_eq!(out_sat[16], 1); // group1 scale 1.0 -> 1
-    }
-
-    #[test]
-    fn reference_forward_is_pinned_elementwise_arithmetic() {
-        // in=256 (one rotation group), out=2, m=1, no bias. A codebook with cb[8] = 0 makes every
-        // packed nibble decode to int8 weight 0, so the int32 accumulation is exactly 0 and the
-        // epilogue yields exactly 0 — a bit-exact, non-fudged oracle check.
-        let m = 1usize;
-        let out = 2usize;
-        let k = 256usize;
-        let x: Vec<f32> = vec![1.0; m * k];
-        let cb: Vec<f32> = (0..16).map(|j| j as f32 / 8.0 - 1.0).collect();
-        let mut packed = vec![0i8; out * (k / 2)];
-        packed.fill(0x88u8 as i8); // both nibbles code 8 -> cb[8] = 0.0
-        let s_rel = vec![0x38u8; out * (k / 16)]; // 1.0
-        let s_channel = vec![1.0f32; out];
-        let r = reference_forward(
-            &x, &packed, &s_rel, &s_channel, &cb, None, m, out, k, BF16_MAX,
-        )
-        .unwrap();
-        assert_eq!(r.len(), m * out);
-        assert_eq!(r, vec![0.0f32; out]);
     }
 }
