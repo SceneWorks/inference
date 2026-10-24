@@ -151,6 +151,151 @@ pub const BLOCK_TARGETS: [&str; 6] = [
     "ff.net.2",
 ];
 
+/// The AdaLN modulation topology of the checkpoint an adapter install lands on — the candle twin
+/// of `mlx_gen_minimax_h3::adapters::AdaLnSurface` (sc-26688).
+///
+/// The strict install classifies every target it could not resolve against this axis, because the
+/// two topologies make an unmatched AdaLN stem mean different things. On the full path the module
+/// exists but is deliberately not adapter-addressable. On the pruned coordinate-table path
+/// (sc-26684) the full-width module does not exist at all, the reduced projections are owned by
+/// the curve runtime and are bound into the pruning identity, and **no validated full→pruned
+/// transformation exists for an adapter delta** — the table stores `U·S` and the projections
+/// `W·Vh.T` of the *centered, post-SiLU* embedding curve, so a full-trained delta cannot be mapped
+/// onto them without the basis the checkpoint never ships. Folding such a delta onto the curve,
+/// rederiving a basis from the table, or dropping the target silently would each be a substitution
+/// the story refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaLnSurface {
+    /// Full timestep-MLP path: `time_embedder`, full-width per-block `adaln_proj.linear`, and
+    /// full-width `norm_out.linear` exist as weights.
+    FullTimestepMlp,
+    /// Curve topology: the timestep MLP is absent and the reduced projections live in the curve
+    /// runtime. Body leaves (attention/FFN) are unchanged.
+    PrunedCurve,
+}
+
+/// The AdaLN stems a full-topology adapter may name that are never adapter-addressable, paired
+/// with the human wording the refusal uses. `time_embedder` matches as a path segment; the two
+/// projections match as dotted suffixes on the normalized module stem.
+const ADALN_SURFACE_TARGETS: [(&str, &str); 3] = [
+    (
+        "time_embedder",
+        "the full timestep-MLP embedding (`time_embedder`)",
+    ),
+    (
+        "adaln_proj.linear",
+        "a block's AdaLN projection (`adaln_proj.linear`)",
+    ),
+    (
+        "norm_out.linear",
+        "the final AdaLN projection (`norm_out.linear`)",
+    ),
+];
+
+/// Real modules on **both** topologies that no LoRA/LoKr can attach to — the bias-Linear I/O
+/// heads and the RMS norms the DiT owns directly. An unmatched stem landing here gets the
+/// "exists but is excluded from the adapter surface" refusal rather than the generic miss.
+const NON_ADAPTER_MODULE_STEMS: [&str; 8] = [
+    "proj_in",
+    "audio_proj_in",
+    "proj_out",
+    "audio_proj_out",
+    "context_embedder",
+    "norm_out.norm",
+    "norm1",
+    "norm2",
+];
+
+/// Whether a matched-nothing module stem names the topology-dependent AdaLN modulation surface.
+fn is_adaln_surface_target(path: &str) -> bool {
+    ADALN_SURFACE_TARGETS.iter().any(|(stem, _)| match *stem {
+        s if s.contains('.') => path.ends_with(s),
+        s => path.split('.').any(|seg| seg == s),
+    })
+}
+
+/// Whether a matched-nothing module stem names a real module no H3 adapter can ever attach to.
+fn is_known_non_adapter_module(path: &str) -> bool {
+    NON_ADAPTER_MODULE_STEMS
+        .iter()
+        .any(|stem| path == *stem || path.ends_with(stem))
+}
+
+/// What a matched-nothing adapter target means on a given [`AdaLnSurface`] — the typed half of
+/// the strict install's refusal contract (sc-26688), the candle twin of
+/// `mlx_gen_minimax_h3::adapters::UnmatchedTargetClass`. [`unmatched_targets_error`] renders
+/// these classes; tests assert the classification directly instead of pinning message wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmatchedTargetClass {
+    /// A full-topology AdaLN target against a pruned coordinate-table checkpoint: refused as a
+    /// topology mismatch, with no validated full→pruned transformation to apply.
+    PrunedCurveTopologyMismatch,
+    /// A real module on this checkpoint that no H3 adapter can ever attach to.
+    DeliberatelyExcluded,
+    /// No such module on this checkpoint — the generic strict-install miss.
+    NoSuchModule,
+}
+
+/// Classify one normalized, matched-nothing module stem against the checkpoint's surface.
+pub fn classify_unmatched_target(path: &str, surface: AdaLnSurface) -> UnmatchedTargetClass {
+    if is_adaln_surface_target(path) {
+        return match surface {
+            AdaLnSurface::PrunedCurve => UnmatchedTargetClass::PrunedCurveTopologyMismatch,
+            AdaLnSurface::FullTimestepMlp => UnmatchedTargetClass::DeliberatelyExcluded,
+        };
+    }
+    if is_known_non_adapter_module(path) {
+        return UnmatchedTargetClass::DeliberatelyExcluded;
+    }
+    UnmatchedTargetClass::NoSuchModule
+}
+
+/// The strict-install refusal for unmatched targets, classified by the checkpoint's AdaLN
+/// topology (sc-26688).
+///
+/// Everything here is an **error** — the classification only names the cause, exactly as the
+/// strict install demands: an unmatched target is surfaced, never dropped, and the install never
+/// returns `Ok` with targets unresolved. The per-path classification is
+/// [`classify_unmatched_target`] — the typed contract the tests assert; this render names the
+/// cause and lists every offending stem so a user can act on it.
+fn unmatched_targets_error(paths: &[String], surface: AdaLnSurface) -> CandleError {
+    let worst = paths
+        .iter()
+        .map(|p| classify_unmatched_target(p, surface))
+        .max_by_key(|class| match class {
+            UnmatchedTargetClass::PrunedCurveTopologyMismatch => 2,
+            UnmatchedTargetClass::DeliberatelyExcluded => 1,
+            UnmatchedTargetClass::NoSuchModule => 0,
+        })
+        .expect("at least one unmatched path");
+    match worst {
+        UnmatchedTargetClass::PrunedCurveTopologyMismatch => CandleError::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) address the full timestep-MLP AdaLN surface, \
+             which this pruned coordinate-table checkpoint does not carry in adapter-addressable \
+             form: the reduced projections are owned by the curve runtime and bound into its \
+             pruning identity, and no validated full→pruned transformation exists for an adapter \
+             delta. Refusing rather than dropping the targets, folding them onto the table, or \
+             rederiving a basis. All unmatched targets: {:?}",
+            paths.len(),
+            paths
+        )),
+        UnmatchedTargetClass::DeliberatelyExcluded => CandleError::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) name real modules that no MiniMax-H3 adapter \
+             can attach to — the adapter surface is exactly the attention/FFN leaves \
+             (`attn.to_q/to_k/to_v/to_out.0`, `ff.net.0.proj/2`) of every transformer and \
+             token-refiner block. Refusing rather than dropping. All unmatched targets: {:?}",
+            paths.len(),
+            paths
+        )),
+        UnmatchedTargetClass::NoSuchModule => CandleError::Msg(format!(
+            "minimax_h3 adapters: {} adapter target(s) matched no module (surfaced, not silently \
+             dropped): {:?}",
+            paths.len(),
+            paths
+        )),
+    }
+}
+
 /// Which half of a LoRA a key names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -1157,12 +1302,10 @@ pub fn apply_minimax_h3_adapters(
         }
     }
     if !report.unmatched_paths.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3 adapters: {} adapter target(s) matched no module (surfaced, not silently \
-             dropped): {:?}",
-            report.unmatched_paths.len(),
-            report.unmatched_paths
-        )));
+        return Err(unmatched_targets_error(
+            &report.unmatched_paths,
+            host.adapter_surface(),
+        ));
     }
     report.trainer_ranks.sort_unstable();
     report.trainer_ranks.dedup();

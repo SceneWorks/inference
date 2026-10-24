@@ -790,6 +790,16 @@ jobs:
           cargo test --locked -p mlx-gen-minimax-h3 --test integration
           pruned_adaln::native_pruned_adaln_matches_pinned_reference
           -- --ignored --exact --nocapture
+      - name: Prove H3 adapter topology folding against reference on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration
+          adapter_topology::native_pruned_turbo_adapter_residual_matches_reference
+          -- --ignored --exact --nocapture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1123,6 +1133,13 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture
+      - name: Prove H3 adapter topology folding against reference on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology::native_adapter_folds_on_the_pruned_curve -- --ignored --exact --nocapture
       - name: Test Candle CUDA packages
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run

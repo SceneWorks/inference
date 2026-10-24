@@ -413,8 +413,18 @@ fn an_unmatched_target_is_loud() {
     let err = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
         .expect_err("an unmatched target must fail the install");
     let msg = err.to_string();
+    // The offending stem is surfaced by name (actionability); the classification itself is the
+    // typed contract — asserted directly, never by pinning message wording (sc-26688).
     assert!(msg.contains("adaln_proj"), "got {msg}");
-    assert!(msg.contains("matched no module"), "got {msg}");
+    use mlx_gen_minimax_h3::{classify_unmatched_target, AdaLnSurface, UnmatchedTargetClass};
+    assert_eq!(
+        classify_unmatched_target(
+            "transformer_blocks.0.adaln_proj.linear",
+            AdaLnSurface::FullTimestepMlp
+        ),
+        UnmatchedTargetClass::DeliberatelyExcluded,
+        "the stray AdaLN projection is a real module the surface deliberately excludes"
+    );
 }
 
 /// `supports_lokr` is **reachable**, not merely declared: a genuine LoKr file (`networkType=lokr`
