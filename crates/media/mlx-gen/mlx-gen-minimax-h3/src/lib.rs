@@ -168,6 +168,17 @@
 //! stubbed; and the `_comfyui_` twin of each file is a different module shape (fused `qkv_proj`,
 //! swapped SwiGLU halves), detected on the keys and **converted** (sc-19443) rather than
 //! half-applied — folding one un-converted is shape-valid and numerically wrong.
+//!
+//! ## Adapters across the full and pruned AdaLN topologies (sc-26688)
+//!
+//! The pruned coordinate-table checkpoint (sc-26684) exposes the **same** body leaves, so a
+//! compatible attention/FFN LoRA/LoKr folds bit-identically on either topology. Targets that
+//! belong to the full AdaLN surface (`time_embedder`, `adaln_proj.linear`, `norm_out.linear`) are
+//! never adapter-addressable — and on a pruned checkpoint their refusal is topology-specific:
+//! there is **no validated full→pruned transformation** for an adapter delta, so they are refused
+//! by name rather than dropped, folded onto the table, or rederived. Turbo schedules resolve the
+//! same way on both topologies (`steps` + `scheduler_shift`); the pruned curve interpolates its
+//! table at `t = 1 − σ` with no ×1000 and no SiLU.
 
 pub mod adapters;
 pub mod alias_free;
@@ -199,9 +210,10 @@ pub mod vae;
 pub mod vae_encoder;
 
 pub use adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, is_comfyui_key_space,
-    normalize_minimax_h3_key, resolve_alpha, resolve_rank, MiniMaxH3LoraReport, ALPHA_METADATA_KEY,
-    BLOCK_TARGETS, DEFAULT_LORA_ALPHA, PREFIXES, RANK_METADATA_KEY,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, classify_unmatched_target,
+    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank, AdaLnSurface,
+    MiniMaxH3LoraReport, UnmatchedTargetClass, ALPHA_METADATA_KEY, BLOCK_TARGETS,
+    DEFAULT_LORA_ALPHA, PREFIXES, RANK_METADATA_KEY,
 };
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{

@@ -298,6 +298,15 @@ impl MiniMaxH3Dit {
         self.curve.as_ref().map(CurveAdaLn::identity)
     }
 
+    /// Which AdaLN modulation topology this checkpoint presents — the axis the strict adapter
+    /// install ([`crate::adapters`]) classifies unmatched targets against (sc-26688).
+    pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        match self.curve {
+            Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            None => crate::adapters::AdaLnSurface::FullTimestepMlp,
+        }
+    }
+
     /// Refuse an unpruned model or a different table/basis before serving an expected source.
     pub fn ensure_pruning_identity(
         &self,
