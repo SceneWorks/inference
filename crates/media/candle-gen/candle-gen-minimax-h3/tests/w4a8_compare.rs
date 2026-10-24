@@ -464,7 +464,7 @@ fn native_forward_matches_the_external_reference() {
             &w,
             DIT,
             "p",
-            case.get("bias").map_or(false, |b| !b.is_null()),
+            case.get("bias").is_some_and(|b| !b.is_null()),
             DType::BF16,
         )
         .expect("load W4A8");
