@@ -3,6 +3,16 @@
 //! Only packed codes and their original companions survive load. CUDA decodes bounded output-row
 //! tiles to INT8, reusing one full-row ConvRot activation quantization and the shared S4 integer
 //! GEMM/epilogue arithmetic. There is no resident dense INT8 shadow or floating-weight fallback.
+//!
+//! # The activation rotation is the pinned F32 butterfly, not a dense `x·H` matmul
+//!
+//! `int8_linear.cu::quantize_int8_rowwise_convrot_kernel` rotates inside the quantizer: the row
+//! lands in shared memory as F32, four radix-4 stages (strides `1,4,16,64`, `0.5f` each) build the
+//! rotated values in F32, and the row absmax — hence `x_scale` — is taken from those F32 values
+//! before `quant_div_float_to_float<T>` rounds the numerator, the divisor and the quotient to the
+//! activation dtype. [`super::convrot_fht_f32`] replays exactly that `+`-order in F32; feeding the
+//! quantizer a dtype-rounded dense rotation instead moves the peak (and the divisor) by whole
+//! dtypes' worth of ulps and changes the int8 codes.
 use crate::{CandleError, Result, Weights};
 use candle_core::{DType, Device, Tensor};
 use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
@@ -24,8 +34,6 @@ pub struct W4A8Linear {
     s_channel: Tensor,
     #[cfg(feature = "cuda")]
     bias: Option<Tensor>,
-    #[cfg(feature = "cuda")]
-    rotation: Tensor,
     #[cfg(feature = "cuda")]
     lt: std::sync::Arc<super::CublasLt>,
 }
@@ -179,7 +187,6 @@ impl W4A8Linear {
                 codes.device(),
             )?;
             let codebook = Tensor::from_vec(levels, 16, codes.device())?;
-            let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
             let s_channel = s_channel.to_device(codes.device())?;
             let bias = bias.map(|b| b.to_device(codes.device())).transpose()?;
             Ok(Some(Self {
@@ -190,7 +197,6 @@ impl W4A8Linear {
                 codebook,
                 s_channel,
                 bias,
-                rotation,
                 lt,
             }))
         }
@@ -218,8 +224,11 @@ impl W4A8Linear {
             {
                 candle_core::bail!("W4A8 activation shape/dtype/device mismatch");
             }
-            let rotated = super::convrot_rotate(x, &self.rotation)?
-                .to_dtype(x.dtype())?
+            // The pinned fused FHT, in F32 and in kernel butterfly order. NOT
+            // `convrot_rotate` (a dense matmul): see the module doc — it re-associates the
+            // additions and, in the source dtype, rounds the rotated values before the row
+            // absmax, which is what moves `x_scale` and the int8 codes.
+            let rotated = super::convrot_fht_f32(x, d.rotation_group)?
                 .reshape((x.elem_count() / d.in_features, d.in_features))?;
             // Full-row scale and codes are computed ONCE, outside the weight tile loop. Never
             // quantize per K-chunk: that would change the published activation arithmetic.

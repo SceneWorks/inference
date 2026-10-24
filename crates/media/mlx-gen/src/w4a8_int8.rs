@@ -9,13 +9,17 @@
 //!
 //! # The arithmetic is the pinned Kitchen chain, in three pieces
 //!
-//! 1. **Activation** — the S4 [`convrot_int8`](crate::convrot_int8) path verbatim: the regular
-//!    (non-Walsh) `H₄` Kronecker rotation of `convrot_groupsize = 256` (normalized `1/16`) applied in
-//!    the source dtype, then the row-wise int8 quantizer (`rint`, clamp `[-128, 127]`) with Kitchen's
-//!    bf16 cast chain. The same `QUANT` kernel name *and* source as the ConvRot codec are used, so
-//!    MLX compiles and caches ONE library for both. It runs **once per row, before any weight tile is
-//!    decoded**: the pinned `launch_w4a8_codebook_gemm_chunked` computes its `xq`/`xs` outside the
-//!    chunk loop, and a per-tile re-quantization would silently change the result.
+//! 1. **Activation** — the pinned fused ConvRot quantization of
+//!    `int8_linear.cu::quantize_int8_rowwise_convrot_kernel`: [`convrot_fht_f32`] replays the
+//!    regular (non-Walsh) `H₄` butterfly of `convrot_groupsize = 256` in **F32** and in the kernel's
+//!    own `+` order (strides `1,4,16,64`, `0.5` per stage), then the row-wise int8 quantizer takes
+//!    the row absmax/scale from those F32 values and applies Kitchen's source-dtype cast chain to
+//!    the numerator, the divisor and the quotient (`quant_div_float_to_float`), with `rint` and the
+//!    `[-128, 127]` clamp. It runs **once per row, before any weight tile is decoded**: the pinned
+//!    `launch_w4a8_gemm` computes `xq`/`xs` before the per-tile decode, and a per-tile
+//!    re-quantization would change the result. The W4A8 quantizer is its own kernel
+//!    ([`QUANT`]/`sc_w4a8_int8_quant_v1`): its numerator rounding is the W4A8 authority's and must
+//!    not be conflated with the S4 ConvRot codec's kernel, which is fed an already-rounded rotation.
 //! 2. **Weight** — `int8 = round_ties_even(codebook[q] · fp8_e4m3(s_rel))`, clamp `[-127, 127]` (a
 //!    different clamp from the activation side), decoded one output-column tile at a time
 //!    ([`TILE_COLS`]). The even column is the **low** nibble of the stored byte, exactly as
@@ -35,8 +39,13 @@
 //! kernel decodes them — a scale tensor never enters the float domain on the way in.
 
 use crate::{attention::slice_axis, weights::Weights, Result};
-use gen_core::w4a8_int8::{regular_hadamard, W4A8Int8, MAX_DESCRIPTOR_BYTES};
-use mlx_rs::{fast::MetalKernel, ops::matmul, transforms::eval, Array, Dtype};
+use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
+use mlx_rs::{
+    fast::MetalKernel,
+    ops::{add, concatenate_axis, multiply, negative, subtract},
+    transforms::eval,
+    Array, Dtype,
+};
 use std::cell::RefCell;
 
 /// Output-column width of one weight tile. The dequant kernel expands exactly `TILE_COLS ·
@@ -49,22 +58,27 @@ use std::cell::RefCell;
 /// are computed once for the full row and reused by every tile (see the module docs).
 pub const TILE_COLS: usize = 256;
 
-/// Identical to `convrot_int8.rs::QUANT` — same MLX kernel name *and* same source, so both codecs
-/// share one compiled library. Keep the two strings in lockstep; a divergence would not miscompute
-/// (each is its own kernel) but would make MLX clear and rebuild the library whenever a model mixes
-/// the two codecs.
+/// The pinned activation quantizer of `int8_linear.cu::quantize_int8_rowwise_convrot_kernel`, fed
+/// [`convrot_fht_f32`]'s F32 rotated row. `x` is F32 by construction; `T` is the *activation* dtype,
+/// so the abmax/scale are computed on the unrounded F32 values and only
+/// `quant_div_float_to_float<T>`'s three casts see the dtype: the numerator `T(rot)`, the divisor
+/// `T(scale)`, and the quotient `T(rot / divisor)`.
+///
+/// This is NOT `convrot_int8.rs::QUANT` (S4): that codec's authority rotates in the source-dtype
+/// dense path, so its input is already dtype-rounded and its kernel has no numerator cast. Sharing a
+/// kernel name across two different sources would let whichever library compiled first define both.
 const QUANT: &str = r#"
 uint row = thread_position_in_grid.x;
 if (row >= M) return;
 float peak = 0.0f;
 for (uint j=0; j<K; ++j) { float v=abs(float(x[row*K+j])); if (!isnan(v)) peak=max(peak,v); }
 peak = min(peak, DTYPE==1 ? 3.38953139e38f : DTYPE==2 ? 65504.0f : 3.402823466e38f);
-// Kitchen rounds scale and quotient to the activation dtype before nearbyintf.
+// quant_div_float_to_float<T>: T(numerator) / T(scale), quotient rounded to T, before nearbyintf.
 float scale = max(peak * (1.0f / 127.0f), 1.0e-30f);
 s[row] = scale;
 float divisor = float(T(scale));
 for (uint j=0; j<K; ++j) {
-    float z = float(T(float(x[row*K+j]) / divisor));
+    float z = float(T(float(T(float(x[row*K+j]))) / divisor));
     q[row*K+j] = char(isnan(z) ? -128.0f : clamp(rint(z), -128.0f, 127.0f));
 }
 "#;
@@ -125,7 +139,7 @@ fn kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel, &MetalKernel) -> Result
         let mut cache = cache.borrow_mut();
         if cache.is_none() {
             *cache = Some((
-                MetalKernel::new("sc_convrot_int8_quant_v1", &["x"], &["q", "s"], QUANT)?,
+                MetalKernel::new("sc_w4a8_int8_quant_v1", &["x"], &["q", "s"], QUANT)?,
                 MetalKernel::new(
                     "sc_convrot_int8_project_v1",
                     &["q", "w", "sx", "sw", "b"],
@@ -150,6 +164,57 @@ fn dims(shape: &[i32]) -> Vec<usize> {
     shape.iter().map(|&v| v as usize).collect()
 }
 
+/// The pinned fused ConvRot butterfly, in F32, in the kernel's own addition order.
+///
+/// `int8_linear.cu::quantize_int8_rowwise_convrot_kernel` never multiplies by a materialized
+/// rotation: it lands the row in shared memory as F32 and runs four radix-4 stages (strides
+/// `1,4,16,64`), each `0.5f * h4_row_dot(d, x0, x1, x2, x3)` — three left-to-right binary32 adds and
+/// one exact `* 0.5` — block-diagonally over `group`-wide blocks. The row absmax and `x_scale` are
+/// then taken from those **F32** values, before `quant_div_float_to_float<T>` rounds anything to the
+/// activation dtype.
+///
+/// A dense `matmul` by the same Hadamard basis is NOT equivalent: MLX re-associates the 256-term
+/// dot, and a rotation performed in the source dtype rounds the rotated values first, so the peak
+/// (and the divisor derived from it) moves by a dtype ulp — the review's BF16 `[1, 2^-8, 0, …]` row
+/// has an exact rotated peak of `257/4096` that a BF16 rotation stores as `0.0625`, selecting a
+/// different int8 code. Every add below is its own elementwise binary32 op, so the per-element order
+/// is `((a+b)+c)+(-d)`, `((a+b)-c)+d`, `((a-b)+c)+d`, `((-a)+b+c)+d`, matching `h4_row_dot`.
+fn convrot_fht_f32(x: &Array, rows: i32, k: i32, group: i32) -> Result<Array> {
+    if !(group > 0 && group.count_ones() == 1 && group.trailing_zeros().is_multiple_of(2))
+        || k % group != 0
+    {
+        return Err("W4A8 ConvRot group must be a power of four dividing K".into());
+    }
+    let mut cur = x.as_dtype(Dtype::Float32)?.reshape(&[rows, k])?;
+    let half = Array::from_slice(&[0.5f32], &[]);
+    let mut stride = 1i32;
+    while stride < group {
+        let blocks = rows * k / (4 * stride);
+        let view = cur.reshape(&[blocks, 4, stride])?;
+        let a = slice_axis(&view, 1, 0, 1)?;
+        let b = slice_axis(&view, 1, 1, 1)?;
+        let c = slice_axis(&view, 1, 2, 1)?;
+        let d = slice_axis(&view, 1, 3, 1)?;
+        let ab = add(&a, &b)?;
+        let o0 = subtract(&add(&ab, &c)?, &d)?;
+        let o1 = add(&subtract(&ab, &c)?, &d)?;
+        let o2 = add(&add(&subtract(&a, &b)?, &c)?, &d)?;
+        let o3 = add(&add(&add(&negative(&a)?, &b)?, &c)?, &d)?;
+        let stage = concatenate_axis(
+            &[
+                multiply(&o0, &half)?,
+                multiply(&o1, &half)?,
+                multiply(&o2, &half)?,
+                multiply(&o3, &half)?,
+            ],
+            1,
+        )?;
+        cur = stage.reshape(&[rows, k])?;
+        stride *= 4;
+    }
+    Ok(cur)
+}
+
 /// Is this `.comfy_quant` payload the frozen `asym_w4a8_int8` dialect? A **probe**, not a validator:
 /// everything it could get wrong is still refused by [`W4A8Int8::parse`] in
 /// [`W4A8Linear::from_weights`]. A descriptor naming any other dialect (`convrot-int8-native`,
@@ -171,7 +236,6 @@ pub struct W4A8Linear {
     s_rel: Array,
     s_channel: Array,
     pub(crate) bias: Option<Array>,
-    rotation: Array,
 }
 
 impl W4A8Linear {
@@ -269,13 +333,9 @@ impl W4A8Linear {
         }) {
             return Err(format!("{base}: invalid W4A8 bias").into());
         }
-        // The rotation is the shared, per-load constant the S4 loader builds: `convrot_rotation`
-        // hands the SAME array to every projection of the model, and the basis itself comes from the
-        // contract (`regular_hadamard`), so the two codecs cannot drift apart on the signs.
-        let g = descriptor.rotation_group;
-        let rotation = w.convrot_rotation(g, || {
-            Array::from_slice(&regular_hadamard(g), &[g as i32, g as i32])
-        });
+        // No rotation matrix is retained: the pinned W4A8 activation leg is a F32 butterfly inside
+        // the quantizer ([`convrot_fht_f32`]), so a resident `[256, 256]` basis would be dead weight
+        // *and* the wrong arithmetic (see the module doc).
         Ok(Some(Self {
             descriptor,
             packed: codes.clone(),
@@ -283,7 +343,6 @@ impl W4A8Linear {
             s_rel: s_rel.clone(),
             s_channel: s_channel.clone(),
             bias,
-            rotation,
         }))
     }
 
@@ -303,7 +362,8 @@ impl W4A8Linear {
         let rows = x.size() / d.in_features;
         if rows == 0
             || rows > i32::MAX as usize
-            || x.size() > u32::MAX as usize
+            // The butterfly shapes and the kernel's `row*K` strides are i32-indexed.
+            || x.size() > i32::MAX as usize
             || rows
                 .checked_mul(d.out_features)
                 .is_none_or(|s| s > u32::MAX as usize)
@@ -314,11 +374,14 @@ impl W4A8Linear {
             return Err("W4A8 INT8 activation exceeds native index geometry".into());
         }
         let m = rows as i32;
-        // Rotation in the source dtype, as Kitchen's _rotate_activation, NOT a permanent float weight.
-        let rotated =
-            matmul(&x.reshape(&[-1, g])?, &self.rotation.as_dtype(x.dtype())?)?.reshape(&[m, k])?;
+        // The pinned F32 butterfly, not a dense rotation and not a source-dtype one: the row
+        // absmax/scale below must come from these unrounded values (see [`convrot_fht_f32`]).
+        let rotated = convrot_fht_f32(x, m, k, g)?;
+        // The reference adds `bias.float()` in the F32 epilogue: convert the stored bias STRAIGHT to
+        // F32. A `b.as_dtype(x.dtype())` hop would round a BF16/F16-stored bias first and lose
+        // precision the reference keeps (a BF16 `-0.999` would become `-1.0`).
         let bias = match &self.bias {
-            Some(b) => b.as_dtype(x.dtype())?.as_dtype(Dtype::Float32)?,
+            Some(b) => b.as_dtype(Dtype::Float32)?,
             None => mlx_rs::ops::zeros::<f32>(&[n])?,
         };
         kernels(|quant, project, dequant| {
@@ -392,21 +455,15 @@ impl W4A8Linear {
     /// Retained native arrays only; no dense weight set can be materialized through this API.
     pub fn materialize(&self) -> Result<()> {
         eval(
-            [
-                &self.packed,
-                &self.s_rel,
-                &self.s_channel,
-                &self.codebook,
-                &self.rotation,
-            ]
-            .into_iter()
-            .chain(self.bias.iter()),
+            [&self.packed, &self.s_rel, &self.s_channel, &self.codebook]
+                .into_iter()
+                .chain(self.bias.iter()),
         )?;
         Ok(())
     }
 
-    /// Projection-owned resident bytes (packed codes + the three scale/codebook companions + bias);
-    /// the shared rotation constant is per-load and not counted here.
+    /// Projection-owned resident bytes (packed codes + the three scale/codebook companions + bias).
+    /// No rotation matrix is resident — the activation leg is the F32 butterfly computed per call.
     pub fn nbytes(&self) -> usize {
         self.descriptor.resident_bytes() + self.bias.as_ref().map_or(0, Array::nbytes)
     }

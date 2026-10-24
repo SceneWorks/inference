@@ -19,6 +19,14 @@ network are touched at execution time; the pinned source text is supplied
 separately through ``--reference-dir`` and is hash-verified (git blob SHA-1 and
 SHA-256) before any of it is executed.
 
+Besides one entry per successful forward, the fixture pins what the published
+contract must refuse (``refusedOperands``: negative/NaN ``s_rel`` and a
+non-positive ``s_channel``) and one operand set carrying a W4A8 layer next to a
+ConvRot INT8 layer (``mixedLayer``), whose ConvRot half reuses the external
+``h3_convrot_int8.json`` activation verbatim.  Every successful case is generated
+with an output width that is a multiple of 16, the CUDA INT8 IGEMM's geometry, so
+no native comparison has to skip a case.
+
 Test oracle only: never an inference dependency.
 """
 from __future__ import annotations
@@ -107,6 +115,7 @@ PINNED_SOURCES: dict[str, tuple[str, str, str]] = {
 REGEN_COMMAND = (
     "python3 scripts/ci/generate_minimax_h3_w4a8_fixture.py "
     "--reference-dir <pinned-comfy-kitchen-source-dir> "
+    "--convrot-fixture tests/fixtures/h3_convrot_int8.json "
     "--output tests/fixtures/minimax_h3_w4a8.json --receipt <receipt.json>"
 )
 
@@ -743,9 +752,12 @@ def verify_scale_constant() -> dict:
 
 def verify_source_constant_forms(reference_dir: Path) -> dict:
     """Assert the replayed constants actually appear in the hashed CUDA source text."""
-    linear = (reference_dir / "comfy_kitchen/backends/cuda/ops/int8_linear.cu").read_text()
-    gemm = (reference_dir / "comfy_kitchen/backends/cuda/ops/w4a8_gemm.cu").read_text()
-    cutlass = (reference_dir / "comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu").read_text()
+    linear = (reference_dir / "comfy_kitchen/backends/cuda/ops/int8_linear.cu").read_text(
+        encoding="utf-8")
+    gemm = (reference_dir / "comfy_kitchen/backends/cuda/ops/w4a8_gemm.cu").read_text(
+        encoding="utf-8")
+    cutlass = (reference_dir / "comfy_kitchen/backends/cuda/ops/cutlass_gemm_int8.cu").read_text(
+        encoding="utf-8")
     checks = {
         "int8_linear.h4_row_dot": "x0 + x1 + x2 - x3" in linear,
         "int8_linear.stage_strides": "const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64" in linear,
@@ -822,7 +834,7 @@ def build_cases(ns) -> list[Operands]:
 
     # 3 -- global row scale across ConvRot groups with very different maxima; no bias.
     rng = SplitMix64(0x26685_0003)
-    weight = synthetic_weight(rng, 8, 512, row_span=1.5, group_span=1.0)
+    weight = synthetic_weight(rng, 16, 512, row_span=1.5, group_span=1.0)
     x = []
     for r in range(2):
         row = []
@@ -837,16 +849,19 @@ def build_cases(ns) -> list[Operands]:
         "bias=null exercises the no-bias epilogue branch",
         weight, x, None))
 
-    # 4 -- FP8 e4m3 relative-scale extremes: zero / min subnormal / max finite (and sign).
+    # 4 -- FP8 e4m3 relative-scale extremes, NON-NEGATIVE only: the published contract's
+    #      `W4A8Int8::validate_s_rel` refuses a negative or NaN relative scale (the converter emits
+    #      only non-negative s_rel), so a successful-forward case must stay inside that domain.
+    #      The refused encodings live in `refusedOperands` instead.
     rng = SplitMix64(0x26685_0004)
-    k, n = 256, 8
+    k, n = 256, 16
     codebook = [0.0, 1.0, -1.0, 2.5, -2.5, 3.0, -3.0, 7.75, -7.75, 11.5, -11.5,
                 31.25, -31.25, 63.75, -63.75, 127.0]
     srel_bits = []
     for i in range(n):
         row = []
         for g in range(k // GROUP_SIZE):
-            row.append([0x00, 0x01, 0x7E, 0x80, 0x81, 0xFE, 0x38, 0x44][(i + g) % 8])
+            row.append([0x00, 0x01, 0x7E, 0x38, 0x44, 0x00, 0x7E, 0x38][(i + g) % 8])
         srel_bits.append(row)
     q_u = [[rng.int_in(0, 15) for _ in range(k)] for _ in range(n)]
     s_channel = [10.0 ** rng.uniform(-3, 3) for _ in range(n)]
@@ -854,14 +869,15 @@ def build_cases(ns) -> list[Operands]:
     bias = [rng.uniform(-0.5, 0.5) for _ in range(n)]
     cases.append(operands_constructed(
         "fp8_srel_extremes",
-        "relative-scale FP8 e4m3 extremes: +0 (0x00), min subnormal 2^-9 (0x01), max "
-        "finite 448 (0x7E) and their negatives (-0 at 0x80, -2^-9 at 0x81, -448 at 0xFE); "
-        "drives weight-decode saturation at +-127",
-        "sRelBits cycle 0x00,0x01,0x7E,0x80,0x81,0xFE,0x38,0x44 across rows and groups",
+        "relative-scale FP8 e4m3 extremes the production contract accepts: +0 (0x00), min "
+        "subnormal 2^-9 (0x01), max finite 448 (0x7E) and exact 1.0/3.0 (0x38/0x44); drives "
+        "weight-decode saturation at +127 and the zero/subnormal scale paths. Negative and NaN "
+        "s_rel bytes are production-invalid and are pinned by `refusedOperands`, never here",
+        "sRelBits cycle 0x00,0x01,0x7E,0x38,0x44,0x00,0x7E,0x38 across rows and groups",
         x, q_u, srel_bits, s_channel, codebook, bias))
 
     # 5 -- half-even weight ties and asymmetric [-127,127] saturation.
-    k, n = 256, 8
+    k, n = 256, 16
     codebook = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 127.5, -127.5, 128.0, -128.0,
                 200.0, -200.0, 3.5, -3.5, 255.5, -255.5]
     srel_bits = [[f32_to_fp8_e4m3fn_bits([1.0, 0.5, 2.0, 3.0][g % 4]) for g in range(k // GROUP_SIZE)]
@@ -880,7 +896,7 @@ def build_cases(ns) -> list[Operands]:
         x, q_u, srel_bits, s_channel, codebook, bias))
 
     # 6 -- packed nibble order (even column = low nibble).
-    k, n = 256, 4
+    k, n = 256, 16
     codebook = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
     srel_bits = [[0x38 for _ in range(k // GROUP_SIZE)] for _ in range(n)]
     q_u = []
@@ -900,7 +916,7 @@ def build_cases(ns) -> list[Operands]:
 
     # 7 -- complete-K chunk cancellation: the two 512-column halves cancel exactly.
     rng = SplitMix64(0x26685_0007)
-    k, n = 1024, 4
+    k, n = 1024, 16
     codebook = [0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 8.0, -8.0, 16.0, -16.0,
                 0.25, -0.25, 0.5, -0.5, 1.5]
     srel_bits = [[0x68 for _ in range(k // GROUP_SIZE)]] * n     # 64.0 exactly
@@ -934,7 +950,7 @@ def build_cases(ns) -> list[Operands]:
 
     # 8 -- bias FMA cancellation: separate roundings give exactly 0, a fused FMA does not.
     rng = SplitMix64(0x26685_0008)
-    k, n = 256, 4
+    k, n = 256, 16
     codebook = [0.0, 1.0, 2.0, 3.0, 5.5, -1.25, 7.75, -3.5, 11.0, -6.25, 13.5, -9.0,
                 16.25, -12.5, 19.5, -16.75]
     srel_bits = [[0x38 for _ in range(k // GROUP_SIZE)]] * n     # s_rel = 1.0
@@ -979,7 +995,7 @@ def build_cases(ns) -> list[Operands]:
     #      BF16 ulp, so a one-ulp perturbation of the rounded product crosses the halfway and
     #      the wrong ordering becomes detectable after the single BF16 round at the store.
     rng = SplitMix64(0x26685_0009)
-    k, n = 256, 4
+    k, n = 256, 16
     codebook = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
     srel_bits = [[0x38 for _ in range(k // GROUP_SIZE)]] * n
     srel_bits = [list(row) for row in srel_bits]
@@ -1046,8 +1062,10 @@ def build_cases(ns) -> list[Operands]:
             break
     if chosen is None:
         raise RuntimeError("bf16 halfway construction failed")
-    s_channel = list(chosen)
-    bias = [b for _t, b, _req in specs]
+    # 16 output rows = the four halfway specs repeated, so every row (not just the first four)
+    # sits on a tie and the CUDA lane's 16-wide output alignment is satisfiable.
+    s_channel = list(chosen) * (n // len(specs))
+    bias = [b for _t, b, _req in specs] * (n // len(specs))
     cases.append(operands_constructed(
         "bf16_halfway_and_early_cast",
         "the final store lands exactly on a BF16 halfway in the 2**20 binade: 2**20+4096 must "
@@ -1061,11 +1079,11 @@ def build_cases(ns) -> list[Operands]:
 
     # 10 -- activation quantization vs a dense floating fallback, plus xq == -128 saturation.
     rng = SplitMix64(0x26685_0010)
-    weight = synthetic_weight(rng, 4, 512, row_span=1.0, group_span=0.75)
+    weight = synthetic_weight(rng, 16, 512, row_span=1.0, group_span=0.75)
     # Weight columns in the second ConvRot block carry the dominant output contribution, so
     # the int8 path (which quantizes that block's tiny activation to zero) must lose it while
     # a dense floating fallback would keep it.  This makes the discriminator material.
-    for i in range(4):
+    for i in range(16):
         for j in range(CONVROT_GROUP, 512):
             weight[i][j] *= 1e3
     # Row 0 is searched so the asymmetric activation clamp [-128,127] is actually exercised
@@ -1084,7 +1102,7 @@ def build_cases(ns) -> list[Operands]:
     # path discards information the dense floating path would keep.
     row1 = [bf16_rn(2.0 ** -14 * rng.approx_gaussian()) for _ in range(512)]
     row1[11] = bf16_rn(2.0 ** 6 * rng.approx_gaussian())
-    bias = [rng.uniform(-1.0, 1.0) for _ in range(4)]
+    bias = [rng.uniform(-1.0, 1.0) for _ in range(16)]
     cases.append(operands_from_pinned_quantize(
         ns, "activation_quant_vs_dense",
         "activation quantized ONCE per row versus a dense floating fallback / no activation "
@@ -1095,7 +1113,195 @@ def build_cases(ns) -> list[Operands]:
         ">=200 quantization span; row 1 is a fixed outlier construction",
         weight, [chosen, row1], bias))
 
+    # 11 -- MLX output-column tile boundary: N = 320 > the 256-column weight tile, so the forward
+    #       must produce a full 256-wide tile plus a 64-wide remainder tile, and Candle's 64-row
+    #       tile five times. The rows either side of the 256 boundary carry very different weight
+    #       magnitudes, so a tile-join that reordered/dropped columns cannot pass.
+    rng = SplitMix64(0x26685_0011)
+    weight = synthetic_weight(rng, 320, 512, row_span=2.0, group_span=1.0)
+    for j in range(512):
+        weight[255][j] *= 2e2
+        weight[256][j] *= 2e-3
+    x = [[[1.0, 1e-3][r] * rng.approx_gaussian() for _ in range(512)] for r in range(2)]
+    bias = [rng.uniform(-1.5, 1.5) for _ in range(320)]
+    cases.append(operands_from_pinned_quantize(
+        ns, "mlx_tile_n320_k512",
+        "N=320 crosses the MLX 256-output-column weight tile boundary (a full 256-wide tile and "
+        "a 64-wide remainder) and the Candle 64-row tile five times; output rows 255/256 are "
+        "scaled 2e2/2e-3 so the tile join is numerically load-bearing; 2 ConvRot groups, biased",
+        "the second MLX column tile is a partial 64-wide tile",
+        weight, x, bias))
+
+    # 12 -- F32 bias precision: cutlass_gemm_int8.cu adds the STORED bias (`bias.float()`) in F32
+    #       and rounds ONCE at the store. A native epilogue that first casts the bias to the
+    #       activation dtype loses the bias's low bits — invisible unless the pre-bias product lands
+    #       near the rounded bias, so this row is searched for `(acc*xs)*s_channel == 1.0` exactly
+    #       with bias -0.999f (bf16(-0.999f) == -1.0f), making the two results 0.001 vs 0.0.
+    rng = SplitMix64(0x26685_0012)
+    k, n = 256, 16
+    codebook = [0.0, 1.0, 2.0, 3.0, 5.5, -1.25, 7.75, -3.5, 11.0, -6.25, 13.5, -9.0,
+                16.25, -12.5, 19.5, -16.75]
+    srel_bits = [[0x38 for _ in range(k // GROUP_SIZE)] for _ in range(n)]
+    q_u = [[3 if j == 0 else 0 for j in range(k)] for _ in range(n)]
+    bias_value = f32(-0.999)
+    if bf16_rn(bias_value) != -1.0:
+        raise RuntimeError("the bias-precision case needs a bias that rounds to -1.0 in BF16")
+    chosen, chosen_channel, trial = None, None, 0
+    for trial in range(8000):
+        amp = 10.0 ** rng.uniform(-2.0, 2.0)
+        row = [bf16_rn(amp * rng.approx_gaussian()) for _ in range(k)]
+        _, codes, scales, _ = quantize_int8_rowwise_convrot_replay([row])
+        if codes[0][0] == 0:
+            continue
+        acc = 3 * codes[0][0]
+        p1 = f32_mul(f32(float(acc)), scales[0])
+        if p1 <= 0.0:
+            continue
+        channel = f32(Fraction(1.0) / Fraction(p1))
+        if f32_mul(p1, channel) != 1.0:
+            continue
+        right = bf16_rn(f32_add(1.0, bias_value))
+        wrong = bf16_rn(f32_add(1.0, bf16_rn(bias_value)))
+        if right == wrong:
+            continue
+        chosen, chosen_channel = row, channel
+        break
+    if chosen is None:
+        raise RuntimeError("bias F32-precision counterexample search failed")
+    cases.append(operands_constructed(
+        "bias_f32_precision",
+        "the epilogue must add the stored F32 bias and round once at the store: this row lands "
+        "the pre-bias product on exactly 1.0 with bias -0.999f, so the reference stores ~0.001 "
+        "while an epilogue that first casts the bias to BF16 (-1.0) stores exactly 0.0",
+        f"searched {trial + 1} deterministic synthetic rows for (acc*xs)*s_channel == 1.0 exactly; "
+        f"bias={bias_value!r}",
+        [chosen], q_u, srel_bits, [chosen_channel] * n, codebook, [bias_value] * n))
+
     return cases
+
+
+def build_refusals(cases: list[Operands]) -> list[dict]:
+    """Operand sets the published contract must REFUSE, with the rule that refuses them.
+
+    The production loader (`W4A8Int8::validate_s_rel` / `validate_s_channel`) refuses a negative or
+    NaN relative scale (the converter emits only non-negative `s_rel`) and a non-positive channel
+    scale. These are the same bytes the old success case wrongly carried: a successful-forward case
+    cannot contain them, so they are covered as explicit expected refusals instead.
+    """
+    base = next(op for op in cases if op.case_id == "packed_nibble_order")
+    groups = base.k // GROUP_SIZE
+
+    def variant(case_id, purpose, srel_row0, s_channel, rule, expected_error):
+        srel = [list(row) for row in base.srel_bits]
+        srel[0] = list(srel_row0)
+        return {
+            "id": case_id,
+            "purpose": purpose,
+            "rule": rule,
+            "expectedError": expected_error,
+            "m": base.m, "n": base.n, "k": base.k,
+            "groupSize": GROUP_SIZE,
+            "convrotGroup": CONVROT_GROUP,
+            "inputDtype": "BF16",
+            "outputDtype": "BF16",
+            "x": [v for row in base.x_bf16 for v in row],
+            "packedWeight": [b for row in base.packed for b in row],
+            "sRelBits": [b for row in srel for b in row],
+            "sChannel": s_channel,
+            "codebook": base.codebook,
+            "bias": base.bias,
+        }
+
+    negative = [0x81 if g % 2 == 0 else 0xFE for g in range(groups)]
+    nan = [0x7F] * groups
+    zero_channel = list(base.s_channel)
+    zero_channel[0] = 0.0
+    return [
+        variant("refused_negative_s_rel",
+                "E4M3FN relative-scale bytes 0x81 (-2^-9) and 0xFE (-448): the converter only "
+                "emits non-negative s_rel, so a negative scale is not this dialect",
+                negative, list(base.s_channel), "s_rel must be non-negative finite E4M3FN",
+                "W4A8 weight_s_rel must be non-negative finite E4M3FN"),
+        variant("refused_nan_s_rel",
+                "E4M3FN NaN relative-scale byte 0x7F: there is no infinity and a NaN scale has no "
+                "decode",
+                nan, list(base.s_channel), "s_rel must be non-negative finite E4M3FN",
+                "W4A8 weight_s_rel must be non-negative finite E4M3FN"),
+        variant("refused_zero_s_channel",
+                "s_channel byte 0.0: the per-output-channel epilogue scale must be finite positive, "
+                "otherwise the whole output row is annihilated",
+                [0x38] * groups, zero_channel, "s_channel must be finite positive F32",
+                "W4A8 weight_s_channel must be finite positive F32"),
+    ]
+
+
+def build_mixed_layer(convrot_fixture: Path, w4a8_case_id: str) -> dict:
+    """One published operand set carrying BOTH native formats in adjacent layers.
+
+    Each half stays pinned to its own external authority: the W4A8 half is `w4a8_case_id` above
+    (comfy-kitchen PR#90 CPU kernel replay), and the ConvRot INT8 half reuses the exact pinned
+    activation — input, int8 codes and row scale — of the S4 fixture (`h3_convrot_int8.json`,
+    kitchen `f8b7e97a`), so the mixed case adds routing and an int8 GEMM/epilogue numeric check
+    rather than a second interpretation of the activation arithmetic. Its weights/scales/bias are
+    owned synthetic constants; the expected output is the pinned cutlass epilogue
+    `((acc*xs)*s_channel)+bias` in F32 over the pinned codes (the `f32` output dtype stores without
+    a BF16 round).
+    """
+    raw = convrot_fixture.read_bytes()
+    fx = json.loads(raw)
+    index = 3
+    case = fx["cases"][index]
+    if case["group"] != CONVROT_GROUP or case["dtype"] != "f32":
+        raise ValueError("mixed-layer authority case must be the group-256 f32 case")
+    m, n, k = case["m"], case["n"], case["k"]
+    codes = [[((i * 37 + j * 11) % 255) - 127 for j in range(k)] for i in range(n)]
+    weight_scale = [f32(0.5 + 0.25 * i) for i in range(n)]
+    bias = [f32(0.125 * (i - 8)) for i in range(n)]
+    xs = case["activation_scales"]
+    act = case["activation_codes"]
+    accumulators = [[sum(int(act[r * k + j]) * codes[c][j] for j in range(k))
+                     for c in range(n)] for r in range(m)]
+    expected = []
+    for r in range(m):
+        for c in range(n):
+            p = f32_mul(f32(float(accumulators[r][c])), xs[r])
+            expected.append(f32_add(f32_mul(p, weight_scale[c]), bias[c]))
+    # Numeric materiality: the pinned activation's row 0 is the all-zero row (bias passthrough at
+    # the 1e-30 scale floor), so at least one other row must carry a real accumulator and its
+    # output must differ from the bias-only result for every column.
+    if all(acc == 0 for row in accumulators for acc in row):
+        raise AssertionError("mixed-layer accumulator is identically zero")
+    material = sum(1 for r in range(m) for c in range(n)
+                   if accumulators[r][c] != 0 and expected[r * n + c] != bias[c])
+    if material < n:
+        raise AssertionError("mixed-layer expected output is bias-only for too many columns")
+    return {
+        "purpose": "one operand set carrying a packed W4A8 layer and a ConvRot INT8 layer: the "
+                   "loader must keep each in its own format (never densify one into the other) and "
+                   "each forward must reproduce its own pinned external arithmetic",
+        "w4a8Case": w4a8_case_id,
+        "convrot": {
+            "authority": {
+                "fixture": "tests/fixtures/h3_convrot_int8.json",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "caseIndex": index,
+                "kitchenRevision": fx["kitchen_revision"],
+                "referenceCuda": fx["reference_cuda"],
+            },
+            "m": m, "n": n, "k": k, "group": CONVROT_GROUP, "dtype": "F32",
+            "note": "row 0 of the pinned activation is its all-zero row (every code 0, scale at the "
+                    "1e-30 floor), so it pins the bias passthrough; rows 1..4 carry the int32 "
+                    "accumulator and the ((acc*xs)*s_channel)+bias chain, stored without a BF16 "
+                    "round because the output dtype is F32",
+            "input": case["input"],
+            "activationCodes": act,
+            "activationScales": xs,
+            "weight": [v for row in codes for v in row],
+            "weightScale": weight_scale,
+            "bias": bias,
+            "expected": expected,
+        },
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -1107,6 +1313,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-dir", type=Path, required=True,
                         help="directory holding the hash-pinned comfy-kitchen source text")
+    parser.add_argument("--convrot-fixture", type=Path,
+                        default=Path("tests/fixtures/h3_convrot_int8.json"),
+                        help="the S4 ConvRot INT8 fixture whose pinned activation the mixed-layer "
+                             "case reuses (sha256 recorded in the output)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True,
                         help="audit receipt (kept outside the checkout)")
@@ -1150,6 +1360,8 @@ def main() -> int:
     }
 
     cases = build_cases(ns)
+    refusals = build_refusals(cases)
+    mixed = build_mixed_layer(args.convrot_fixture, "native_tiles_n80_k512")
 
     counters = {
         "pinnedLayoutEncodeCalls": 0,
@@ -1269,6 +1481,11 @@ def main() -> int:
                              op.bias[c] if op.bias else 0.0)) for c in range(op.n)]
             for r in range(op.m)],
            "acc*xs cast to BF16 before the s_channel multiply")
+        cf("biasRoundedToActivationDtype",
+           [[bf16_rn(f32_add(f32_mul(f32_mul(f32(float(acc[r][c])), xs[r]), op.s_channel[c]),
+                              bf16_rn(op.bias[c]) if op.bias else 0.0)) for c in range(op.n)]
+            for r in range(op.m)],
+           "the stored F32 bias cast to the activation dtype (BF16) before the F32 epilogue add")
         cf("biasAddedInBf16",
            [[bf16_rn(f32_add(f32_mul(f32_mul(f32(float(acc[r][c])), xs[r]), op.s_channel[c]), 0.0))
              if op.bias is None else
@@ -1316,9 +1533,27 @@ def main() -> int:
     for required in ("native_tiles_n80_k1024", "native_tiles_n80_k512", "bias_fma_cancellation",
                      "activation_quant_vs_dense", "chunk_cancellation_k1024",
                      "convrot_global_row_scale", "fp8_srel_extremes", "weight_half_even_ties",
-                     "packed_nibble_order", "bf16_halfway_and_early_cast"):
+                     "packed_nibble_order", "bf16_halfway_and_early_cast", "mlx_tile_n320_k512",
+                     "bias_f32_precision"):
         if required not in by_id:
             raise AssertionError(f"missing required case {required}")
+
+    # Every successful forward must be loadable by the CUDA lane, whose INT8 IGEMM requires an
+    # output width that is a multiple of 16. A case the CUDA comparison silently skips is a case
+    # that asserts nothing, so the whole set is pinned to that geometry instead.
+    for case in out_cases:
+        if case["n"] % 16:
+            raise AssertionError(f"case {case['id']} n={case['n']} is not CUDA-loadable (n % 16)")
+    if not any(case["n"] > MLX_COLUMN_TILE for case in out_cases):
+        raise AssertionError("no case crosses the MLX 256-output-column tile boundary")
+
+    if len(mixed["convrot"]["expected"]) != mixed["convrot"]["m"] * mixed["convrot"]["n"]:
+        raise AssertionError("mixed-layer expected output is not [m, n]")
+    if mixed["w4a8Case"] not in by_id:
+        raise AssertionError("mixed-layer W4A8 half does not name a fixture case")
+    for refusal in refusals:
+        if not refusal["rule"] or not refusal["purpose"] or not refusal["expectedError"]:
+            raise AssertionError("refusal entry must name the contract rule it exercises")
 
     tile = by_id["native_tiles_n80_k1024"]
     if not (tile["n"] > CANDLE_OUTPUT_ROW_TILE and tile["k"] > MLX_COLUMN_TILE):
@@ -1412,7 +1647,7 @@ def main() -> int:
         "packedNibbleOrderSwapped", "denseFloatingFallback", "noActivationQuantization",
         "perTileRequant", "perChunkWeightScale", "weightClampSymmetric128", "weightRoundHalfAway",
         "fusedBiasFma", "reassociatedScales", "earlyBf16Cast", "biasAddedInBf16", "cpuPortableEager",
-        "rowScaleConstantForm",
+        "biasRoundedToActivationDtype", "rowScaleConstantForm",
     ]
     uncovered = [name for name in required_discriminators if not discriminators.get(name)]
     if uncovered:
@@ -1466,6 +1701,8 @@ def main() -> int:
                          "stream; no model weights, no HF payload and no cache are read.",
         },
         "cases": out_cases,
+        "refusedOperands": refusals,
+        "mixedLayer": mixed,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1497,6 +1734,11 @@ def main() -> int:
                     ("CUDA_VISIBLE_DEVICES", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")},
         },
         "literalQuantizedTensorDispatch": literal,
+        "refusedOperands": [r["id"] for r in refusals],
+        "mixedLayer": {
+            "w4a8Case": mixed["w4a8Case"],
+            "convrotAuthority": mixed["convrot"]["authority"],
+        },
         "kernelReplayCounters": counters,
         "internalChecks": {
             "fp8E4M3Decode": fp8_check,

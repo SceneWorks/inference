@@ -14,8 +14,10 @@
 //! `decode_int8_per_row` / `decode_nvfp4` / `decode_mxfp8` play in [`crate::comfy_quant`]. The
 //! bit-accurate *forward* reference (activation FHT + quantizer + int32 GEMM + epilogue) is
 //! **deliberately not here**: the fixture oracle is the pinned external executable below, not a
-//! host re-derivation of it. The ConvRot activation rotation itself is S4's proven
-//! `candle_gen::quant::regular_hadamard` / the MLX `convrot_rotation` builder — never re-derived.
+//! host re-derivation of it. The activation leg is the pinned **F32 butterfly** of
+//! `quantize_int8_rowwise_convrot_kernel` (four radix-4 stages, `0.5f` each, block 256), not a dense
+//! `x·H` product: the row absmax and `x_scale` come from the unrounded F32 values, so the backends
+//! replay the butterfly in its own addition order (they do **not** build a resident rotation matrix).
 //!
 //! # Authority (exact pinned blob SHAs at comfy-kitchen PR#90, tree `06a261f8`, head `d908d589`)
 //!
@@ -76,10 +78,11 @@ pub const H4: [[f32; 4]; 4] = [
 ];
 
 /// The dense regular-Hadamard rotation of `order` (a power of four), normalized by `1/√order` —
-/// the Kronecker power of [`H4`] with per-element sign `∏ H4[i_d][j_d]`. This is the **production**
-/// rotation basis: the MLX `W4A8Linear` builds its resident rotation from it (cached through
-/// `Weights::convrot_rotation`), so the packed W4A8 weight and the ConvRot activation leg share one
-/// authority. The activation-side fused CUDA path factors the same product as a radix-4 FHT.
+/// the Kronecker power of [`H4`] with per-element sign `∏ H4[i_d][j_d]`. This is the **dense**
+/// rotation basis the ConvRot INT8 codec (S4) applies on both backends. The W4A8 activation leg is
+/// the same product factored as the pinned radix-4 FHT, which the backends replay in F32 with the
+/// kernel's own addition order rather than materializing this matrix — a dense product re-associates
+/// those adds, and that is numerically observable in the row scale.
 pub fn regular_hadamard(order: usize) -> Vec<f32> {
     debug_assert!(order == 1 || (order.is_power_of_two() && order.is_multiple_of(4)));
     let mut out = Vec::with_capacity(order * order);

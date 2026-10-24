@@ -87,7 +87,7 @@ pub mod eight_bit_linear;
 
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
-pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
+pub use convrot::{convrot_fht_f32, convrot_rotate, is_power_of_four, regular_hadamard};
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
     NVFP4_BLOCK,
