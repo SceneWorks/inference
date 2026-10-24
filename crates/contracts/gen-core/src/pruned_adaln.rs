@@ -151,6 +151,95 @@ impl PrunedAdaLn {
     }
 }
 
+/// Header-derived memory facts for the direct reduced topology, shared by native providers.
+/// Source storage is not compute residency: the native runtimes widen the supplied operands
+/// once to F32, keep them after precompute, and retain F32 block/final modulation tables too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourcePruneSizing {
+    pub source_bytes: u64,
+    pub compute_bytes: u64,
+    /// Conservative schedule bound, including block/final outputs and interpolation coordinates.
+    pub retained_bytes: u64,
+}
+
+impl SourcePruneSizing {
+    /// `max_distinct_timesteps` is taken from the provider's longest admitted conditioned schedule,
+    /// not the source grid size: off-grid interpolation can evaluate arbitrarily many distinct t's.
+    pub fn for_topology(
+        topology: &PrunedAdaLn,
+        max_distinct_timesteps: usize,
+    ) -> Result<Self, String> {
+        if max_distinct_timesteps == 0 {
+            return Err("H3 AdaLN sizing: empty admitted schedule".into());
+        }
+        let mut source_bytes = 0u64;
+        let mut compute_bytes = 0u64;
+        let mut output_width = 0u64;
+        for operand in topology.operands() {
+            let elements = operand
+                .shape
+                .iter()
+                .try_fold(1u64, |n, &d| n.checked_mul(d as u64))
+                .ok_or("H3 AdaLN sizing: operand shape overflow")?;
+            source_bytes = elements
+                .checked_mul(operand.dtype.size() as u64)
+                .and_then(|n| source_bytes.checked_add(n))
+                .ok_or("H3 AdaLN sizing: stored bytes overflow")?;
+            compute_bytes = elements
+                .checked_mul(4)
+                .and_then(|n| compute_bytes.checked_add(n))
+                .ok_or("H3 AdaLN sizing: compute bytes overflow")?;
+            // Each folded bias names one projection output, including norm_out. Do not count
+            // weight columns as additional retained rows or omit the final projection.
+            if operand.name.ends_with(".bias") {
+                output_width = output_width
+                    .checked_add(elements)
+                    .ok_or("H3 AdaLN sizing: modulation width overflow")?;
+            }
+        }
+        let retained_bytes = output_width
+            .checked_add(topology.rank as u64)
+            .and_then(|n| n.checked_mul(max_distinct_timesteps as u64))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or("H3 AdaLN sizing: retained F32 bytes overflow")?;
+        let sizing = Self {
+            source_bytes,
+            compute_bytes,
+            retained_bytes,
+        };
+        sizing.resident_bytes()?;
+        Ok(sizing)
+    }
+
+    /// Nothing in the pruned runtime evicts the reduced operands. This bound covers their
+    /// coexistence with the retained F32 schedule outputs; it is not an eviction credit.
+    pub fn resident_bytes(self) -> Result<u64, String> {
+        self.compute_bytes
+            .checked_add(self.retained_bytes)
+            .ok_or_else(|| "H3 AdaLN sizing: live bytes overflow".into())
+    }
+
+    /// Replace only this topology's already-counted subset in a component materialization total.
+    /// FP32 projections have already widened it; ordinary stored-byte totals have not. Cache bytes
+    /// are added exactly once. No source/stock ratio or quantization-bit substitution is involved.
+    pub fn materialized_bytes(
+        self,
+        component_bytes: u64,
+        already_f32: bool,
+    ) -> Result<u64, String> {
+        let counted = if already_f32 {
+            self.compute_bytes
+        } else {
+            self.source_bytes
+        };
+        component_bytes
+            .checked_sub(counted)
+            .and_then(|n| n.checked_add(self.compute_bytes))
+            .and_then(|n| n.checked_add(self.retained_bytes))
+            .ok_or_else(|| "H3 AdaLN sizing: component bytes exclude operands or overflow".into())
+    }
+}
+
 /// Content identity for compatibility and modulation caches. Includes every reduced projection
 /// and folded bias as well as the table: another basis with the same shapes is incompatible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -336,5 +425,42 @@ mod tests {
             (128, 0.5)
         );
         assert!(interpolation_position(f32::NAN, 1025).is_err());
+    }
+    #[test]
+    fn source_sizing_charges_f32_operands_and_retained_outputs_once_without_eviction() {
+        let topology = inspect(&headers()).unwrap().unwrap();
+        let sizing = SourcePruneSizing::for_topology(&topology, 17).unwrap();
+        let table = 1025 * 8 * 4;
+        let weights = (18 * 2 + 2 * 2) * 8;
+        let biases = 18 * 2 + 2 * 2;
+        assert_eq!(sizing.source_bytes, table + weights * 2 + biases * 2);
+        assert_eq!(sizing.compute_bytes, table + weights * 4 + biases * 4);
+        assert_eq!(sizing.retained_bytes, 17 * (biases + 8) * 4);
+        let body = 1234;
+        assert_eq!(
+            sizing
+                .materialized_bytes(body + sizing.source_bytes, false)
+                .unwrap(),
+            body + sizing.compute_bytes + sizing.retained_bytes
+        );
+        assert_eq!(
+            sizing
+                .materialized_bytes(body + sizing.compute_bytes, true)
+                .unwrap(),
+            body + sizing.compute_bytes + sizing.retained_bytes
+        );
+        assert_eq!(
+            sizing.resident_bytes().unwrap(),
+            sizing.compute_bytes + sizing.retained_bytes
+        );
+        assert!(sizing
+            .materialized_bytes(sizing.source_bytes - 1, false)
+            .is_err());
+        assert!(sizing.materialized_bytes(u64::MAX, false).is_err());
+        assert!(SourcePruneSizing::for_topology(&topology, 0).is_err());
+        assert!(SourcePruneSizing::for_topology(&topology, usize::MAX).is_err());
+        let mut overflow = topology;
+        overflow.operands[0].shape = vec![usize::MAX, usize::MAX];
+        assert!(SourcePruneSizing::for_topology(&overflow, 17).is_err());
     }
 }
