@@ -1017,3 +1017,52 @@ fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
     assert!(generator.moss_image_edit_execution_report().is_none());
     assert!(generator.validate(&GenerationRequest::default()).is_ok());
 }
+
+#[test]
+fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
+    let mut base = synthetic_report().data().clone();
+    base.resolved.uncond_skip_layers.clear();
+    let mut report = MossImageEditExecutionReport {
+        base: MossImageExecutionReport::new(base).unwrap(),
+        adapter_path: "synthetic-only".into(),
+        edit_contract: EDIT_CONTRACT.into(),
+        adapter_repository: EDIT_REPOSITORY.into(),
+        adapter_revision: EDIT_REVISION.into(),
+        adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+        config_sha256: EDIT_CONFIG_SHA256.into(),
+        applied_projections: 252,
+        references: vec![],
+        reference_max_edge: 512,
+        use_kv_cache: true,
+    };
+    let slot = |dimensions, digest: char| MossImageEditReferenceReceipt {
+        original_dimensions: dimensions,
+        encoded_dimensions: dimensions,
+        pixels_sha256: digest.to_string().repeat(64),
+        resized_pixels_sha256: "b".repeat(64),
+        latent_sha256: "c".repeat(64),
+    };
+    let slots = [
+        slot([32, 32], 'a'),
+        slot([16, 48], 'b'),
+        slot([48, 16], 'c'),
+        slot([16, 48], 'b'),
+    ];
+    assert!(report.validate().is_err());
+    for count in 1..=4 {
+        report.references = slots[..count].to_vec();
+        report.validate().unwrap();
+        let roundtrip: MossImageEditExecutionReport =
+            serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(roundtrip, report);
+    }
+    report.references.reverse();
+    report.validate().unwrap();
+    assert_eq!(report.references[0], slots[3]);
+    report.references.push(slots[0].clone());
+    assert!(report.validate().is_err());
+    assert!(serde_json::from_value::<MossImageEditExecutionReport>(
+        serde_json::to_value(report).unwrap()
+    )
+    .is_err());
+}

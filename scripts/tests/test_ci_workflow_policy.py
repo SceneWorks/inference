@@ -4147,7 +4147,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4177,8 +4177,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if "macos" in json.dumps(job.get("runs-on", "")).lower()
         }
         self.assertIn("macos-nax", macos_jobs)
+        from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
         for name in macos_jobs:
             with self.subTest(job=name):
+                if name == "moss-edit-metal":
+                    self.assertIn("inputs.lanes == 'moss-edit-metal'", parsed["jobs"][name]["if"])
+                    for selected_override in (False, True):
+                        self.assertNotIn(name, selected_jobs(parsed, 'workflow_dispatch', 'windows-cuda', selected=selected_override))
+                    continue
                 self.assertIn(
                     "needs.changes.outputs.macos_metal == 'true'",
                     parsed["jobs"][name].get("if", ""),
@@ -4264,7 +4270,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             changes.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')",
             "topology remains unconditional except explicitly isolated manual dispatches",
         )
         for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
@@ -4319,7 +4325,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # check -- so the gate would report green on exactly the runs it exists to block.
         self.assertEqual(
             gate["if"],
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (always())",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())",
         )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))

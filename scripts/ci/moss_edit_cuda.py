@@ -1,14 +1,13 @@
-"""Manual, synthetic MOSS CUDA gate. Reviewed reservation != inferred GPU idle.
+"""Manual, synthetic MOSS CUDA gate. Actions schedules execution on the selected runner.
 
 Only the fixed libtest cases below may execute. Compilation/listing hides CUDA;
-GPU execution requires fresh collector and final identity records for each arm.
+Each numerical arm verifies the pinned physical GPU1 identity.
 """
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -30,9 +29,9 @@ ARMS = (
     ('encoder', FLUX, ['vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda', '--exact'], {
         'vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda'}, set()),
 )
-COUNTERS = {'GPU Engine(*)\\Utilization Percentage', 'GPU Process Memory(*)\\Dedicated Usage',
-            'GPU Process Memory(*)\\Shared Usage', 'GPU Adapter Memory(*)\\Dedicated Usage'}
 MAX_LOG = 16 * 1024 * 1024
+GPU_UUID = 'GPU-e4b79931-7be6-f216-460a-f5405cfafffe'
+GPU_PCI = '00000000:C1:00.0'
 
 
 def require(condition, message):
@@ -44,179 +43,16 @@ def utc():
     return dt.datetime.now(dt.timezone.utc)
 
 
-def timestamp(value):
-    require(isinstance(value, str) and value.endswith('Z'), 'UTC timestamp required')
-    return dt.datetime.fromisoformat(value[:-1] + '+00:00')
-
-
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def read_json(path, limit=4 * 1024 * 1024):
-    require(path.stat().st_size <= limit, 'JSON evidence exceeded bound')
-    return json.loads(path.read_text(encoding='utf-8-sig'), object_pairs_hook=unique_fields)
-
-
-def unique_fields(pairs):
-    result = {}
-    for key, value in pairs:
-        require(key not in result, 'duplicate JSON field')
-        result[key] = value
-    return result
-
-
-def fields(value, expected):
-    require(isinstance(value, dict) and set(value) == set(expected.split()), 'unexpected reservation schema')
-
-
-def finite(value):
-    require(type(value) in (int, float) and math.isfinite(value), 'unknown/nonfinite numeric telemetry')
-    return value
-
-
-def validate_reservation(lease, env, now):
-    fields(lease, 'schemaVersion reservationId source actor host physicalGpu uuid pci driver counterLuid reviewedEvidence ownerIdleConfirmedUtc validFromUtc expiresUtc testTimeoutSeconds processes')
-    require(lease['schemaVersion'] == 1 and lease['physicalGpu'] == 1, 'unsupported reservation/device')
-    require(re.fullmatch(r'[a-zA-Z0-9-]{1,80}', lease['reservationId']), 'invalid reservation ID')
-    require(re.fullmatch('[0-9a-f]{40}', lease['source']) and lease['source'] == env['GITHUB_SHA'], 'source mismatch')
-    require(env['GITHUB_EVENT_NAME'] == 'workflow_dispatch' and env['GITHUB_RUN_ATTEMPT'] == '1', 'manual first attempt required')
-    require(lease['actor'] == env['GITHUB_ACTOR'] and bool(lease['actor']), 'dispatcher mismatch')
-    require(lease['host'].casefold() == env['COMPUTERNAME'].casefold() == 'michael-trx50', 'host mismatch')
-    require(re.fullmatch(r'GPU-[0-9a-fA-F-]+', lease['uuid']), 'invalid GPU UUID')
-    require(re.fullmatch(r'00000000:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]', lease['pci']), 'invalid PCI address')
-    require(re.fullmatch(r'luid_0x[0-9a-f]{8}_0x[0-9a-f]{8}', lease['counterLuid']), 'invalid LUID')
-    require(isinstance(lease['driver'], str) and lease['driver'], 'driver unavailable')
-    fields(lease['reviewedEvidence'], 'run sha256 completedUtc')
-    require(re.fullmatch(r'[0-9]+', str(lease['reviewedEvidence']['run'])) and re.fullmatch('[0-9a-f]{64}', lease['reviewedEvidence']['sha256']), 'reviewed evidence provenance required')
-    start, end = timestamp(lease['validFromUtc']), timestamp(lease['expiresUtc'])
-    require(timestamp(lease['ownerIdleConfirmedUtc']) <= start and timestamp(lease['reviewedEvidence']['completedUtc']) <= start <= now < end, 'reservation not current')
-    require(type(lease['testTimeoutSeconds']) is int and 0 < lease['testTimeoutSeconds'] <= 7200, 'invalid bounded execution budget')
-    require(isinstance(lease['processes'], list) and len(lease['processes']) <= 256, 'process reservation bound')
-    seen = set()
-    for row in lease['processes']:
-        fields(row, 'pid name createdUtc contextType path engineTypes allowedActiveEngineTypes')
-        require(type(row['pid']) is int and row['pid'] > 0 and row['pid'] not in seen, 'duplicate/invalid reserved PID')
-        seen.add(row['pid'])
-        require(isinstance(row['name'], str) and row['name'], 'reserved name unavailable')
-        require(timestamp(row['createdUtc']) <= start, 'future process identity')
-        require(row['contextType'] in (None, 'C', 'G', 'C+G', 'M', 'M+C', 'O'), 'unknown reserved context')
-        require(row['path'] is None or isinstance(row['path'], str) and row['path'], 'invalid optional path')
-        for field in ('engineTypes', 'allowedActiveEngineTypes'):
-            require(isinstance(row[field], list) and len(row[field]) <= 64 and len(set(row[field])) == len(row[field]), 'invalid engine classification')
-            require(all(isinstance(x, str) and re.fullmatch('[a-z0-9_ -]{1,80}', x) for x in row[field]), 'invalid engine type')
-        require(set(row['allowedActiveEngineTypes']) <= set(row['engineTypes']), 'active engine not reviewed')
-        # This dedicated desktop-coexistence gate never grants foreign compute activity.
-        require(set(row['allowedActiveEngineTypes']) <= {'3d', 'copy'}, 'only reviewed 3d/copy background activity is supported')
-    return {row['pid']: row for row in lease['processes']}
-
-
-def device_matches(device, lease):
-    require(str(device['index']).strip() == '1' and device['driverModel'].strip() == 'WDDM', 'wrong physical device/driver model')
-    for field in ('uuid', 'pci', 'driver'):
-        require(device[field].strip().casefold() == lease[field].casefold(), 'device identity changed: ' + field)
-    numbers = device['measurements']
-    require(numbers['status'] == 'valid', 'unknown device measurement')
-    total, used, utilization = [finite(numbers[k]) for k in ('totalMiB', 'usedMiB', 'utilization')]
-    require(total > 0 and 0 <= used <= total and 0 <= utilization <= 100, 'invalid device measurement')
-    for key in ('totalMiB', 'usedMiB', 'utilization'):
-        require(float(device[key]) == numbers[key], 'raw/parsed measurement mismatch')
-
-
-def census_map(rows):
-    require(isinstance(rows, list) and len(rows) <= 256, 'census bound')
-    result = {}
-    for row in rows:
-        require(type(row['pid']) is int and row['pid'] > 0 and row['pid'] not in result, 'duplicate/invalid census PID')
-        require(row['type'] in ('C', 'G', 'C+G', 'M', 'M+C', 'O'), 'unknown census context')
-        result[row['pid']] = row['type']
-    return result
-
-
-def identities_match(rows, census, approved):
-    require(isinstance(rows, list) and len(rows) <= 256, 'identity bound')
-    result = {}
-    for row in rows:
-        pid = row['pid']
-        require(type(pid) is int and pid in approved and pid not in result and row['status'] == 'resolved', 'new/unresolved process incarnation')
-        expected = approved[pid]
-        require(row['name'] == expected['name'] and row['createdUtc'] == expected['createdUtc'], 'process incarnation changed')
-        require(census.get(pid) == expected['contextType'], 'process context changed')
-        require(type(row['pathAvailable']) is bool and row['pathAvailable'] == bool(row['path']), 'path metadata inconsistent')
-        if row['pathAvailable'] and expected['path']:
-            require(row['path'].casefold() == expected['path'].casefold(), 'known process path changed')
-        result[pid] = row
-    require(set(census) <= set(result), 'census process lacks identity')
-    return result
-
-
-def record_header(record, lease, env, earliest, now):
-    require(record['completed'] is True and record['evidenceTruncated'] is False and record['errors'] == [], 'incomplete/failed collector')
-    require(record['queries'] and all(type(q['exitCode']) is int and q['exitCode'] == 0 for q in record['queries']), 'failed/missing metadata query')
-    require(record['admission'] == 'not_evaluated' and record['applicationJobOwnership'] == 'unknown', 'collector cannot grant admission')
-    require(record['physicalGpu'] == 1 and record['source'] == lease['source'] and record['host'].casefold() == lease['host'].casefold(), 'foreign collector record')
-    require(str(record['run']) == env['GITHUB_RUN_ID'] and str(record['attempt']) == '1', 'foreign collector run')
-    require(earliest <= timestamp(record['startedUtc']) <= timestamp(record['completedUtc']) <= now, 'stale/future collector')
-    device_matches(record['identity'], lease)
-
-
-def validate_evidence(record, lease, env, earliest, now):
-    approved = validate_reservation(lease, env, now)
-    record_header(record, lease, env, earliest, now)
-    require(record['collectionComplete'] is True and record['telemetryComplete'] is True, 'mandatory telemetry incomplete')
-    require(record['mapping']['status'] == 'mapped' and record['mapping']['counterLuid'] == lease['counterLuid'], 'mapping changed')
-    require(len(record['samples']) == 3, 'three complete windows required')
-    last_end = timestamp(record['startedUtc'])
-    for sample in record['samples']:
-        device_matches(sample['device'], lease)
-        require(sample['device']['measurements']['totalMiB'] == record['identity']['measurements']['totalMiB'], 'device capacity changed')
-        require(last_end <= timestamp(sample['windowStartedUtc']) <= timestamp(sample['windowEndedUtc']) <= timestamp(record['completedUtc']), 'window ordering invalid')
-        last_end = timestamp(sample['windowEndedUtc'])
-        census = census_map(sample['processes'])
-        require(census == census_map(sample['processesAfter']), 'census changed within window')
-        before = identities_match(sample['identitiesBefore'], census, approved)
-        after = identities_match(sample['identitiesAfter'], census, approved)
-        require(set(before) == set(after), 'identity cohort changed')
-        for pid in before:
-            if before[pid]['pathAvailable'] and after[pid]['pathAvailable']:
-                require(before[pid]['path'].casefold() == after[pid]['path'].casefold(), 'known path changed within window')
-        categories = set()
-        require(0 < len(sample['counters']) <= 8192, 'counter bound')
-        for row in sample['counters']:
-            category = row['counter'].lstrip('\\')
-            require(category in COUNTERS, 'unknown counter category')
-            categories.add(category)
-            require(type(row['status']) is int and row['status'] in (0, 1) and row['valid'] is True and row['valuesValidated'] is True, 'invalid counter status')
-            require(timestamp(sample['windowStartedUtc']) <= timestamp(row['utc']) <= timestamp(sample['windowEndedUtc']), 'stale counter sample')
-            value = finite(row['value'])
-            require(value >= 0 and float(row['rawValue']) == value, 'unknown/inconsistent counter value')
-            require(re.search(r'(^|_)' + re.escape(lease['counterLuid']) + r'(_|$)', row['instance']), 'foreign counter LUID')
-            if category.startswith('GPU Adapter Memory'):
-                require(row['pid'] is None, 'adapter counter has process PID')
-                continue
-            match = re.search(r'(^|_)pid_(\d+)(_|$)', row['instance'])
-            require(match and int(match[2]) == row['pid'] and row['pid'] in before, 'counter process lacks pre-window identity')
-            if category.startswith('GPU Engine'):
-                engine = re.search(r'_engtype_(.+)$', row['instance'])
-                require(engine and engine[1] in approved[row['pid']]['engineTypes'], 'new/unreviewed engine')
-                require(value == 0 or engine[1] in approved[row['pid']]['allowedActiveEngineTypes'], 'unreviewed active engine')
-        require(categories == COUNTERS, 'missing mapped counter category')
-    return record['samples'][-1]
-
-
-def validate_final(record, previous, lease, env, now):
-    approved = validate_reservation(lease, env, now)
-    record_header(record, lease, env, timestamp(previous['completedUtc']), now)
-    require(record['snapshotKind'] == 'identity-census-only' and record['finalSnapshotComplete'] is True, 'final identity refresh incomplete')
-    require(record['identity']['measurements']['totalMiB'] == previous['identity']['measurements']['totalMiB'], 'capacity changed after collection')
-    census = census_map(record['processes'])
-    require(census == census_map(previous['samples'][-1]['processesAfter']), 'census changed since counter window')
-    rows = identities_match(record['identities'], census, approved)
-    prior = {r['pid']: r for r in previous['samples'][-1]['identitiesAfter']}
-    require(set(rows) == set(prior), 'final identity cohort changed')
-    for pid, row in rows.items():
-        if row['pathAvailable'] and prior[pid]['pathAvailable']:
-            require(row['path'].casefold() == prior[pid]['path'].casefold(), 'known path changed after counters')
+def device_identity(text):
+    rows = [line.strip().split(',') for line in text.splitlines() if line.strip()]
+    require(len(rows) == 1 and len(rows[0]) == 3, 'expected exactly one physical GPU1 identity')
+    index, uuid, pci = [field.strip() for field in rows[0]]
+    require(index == '1' and uuid == GPU_UUID and pci.upper() == GPU_PCI, 'physical GPU1 identity mismatch')
+    return {'index': 1, 'uuid': uuid, 'pciBusId': pci}
 
 
 def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=False, job_type=WindowsJob, popen=subprocess.Popen):
@@ -256,12 +92,12 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 receipt['jobDrainObservations'].append({
                     'elapsedSeconds': round(observed - started, 6), 'pids': members,
                 })
-                # Cargo may leave owned descendants after a completed build. Only this
-                # compile policy may finalize them through the retained Job in finally;
-                # that cleanup must succeed before Python can return the result.
+                # Completed Cargo descendants may be finalized through this retained Job.
                 if finalize_compile_descendants:
-                    require(observed < started + seconds, 'owned command deadline exceeded during compile drain')
+                    require(observed < started + seconds, 'owned command deadline exceeded during finalization drain')
                     if observed >= drain_deadline or attempt == 20:
+                        if members:
+                            receipt['jobDrainAnomaly'] = 'owned descendants survived root exit drain'
                         break
                 require(observed <= drain_deadline, 'owned Job drain deadline exceeded')
                 if not members:
@@ -286,9 +122,16 @@ def run_owned(args, env, out, label, seconds, *, finalize_compile_descendants=Fa
                 receipt['cleanupError'] = str(error)
                 raise
             finally:
-                job.close()
-                receipt['finishedUtc'] = utc().isoformat()
-                (out / (label + '.owned.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+                try:
+                    job.close()
+                    receipt['jobCloseSucceeded'] = True
+                except BaseException as error:
+                    receipt['jobCloseSucceeded'] = False
+                    receipt['jobCloseError'] = str(error)
+                    raise
+                finally:
+                    receipt['finishedUtc'] = utc().isoformat()
+                    (out / (label + '.owned.json')).write_text(json.dumps(receipt, indent=2), encoding='utf-8')
     # No retained descendant can append to the accepted compiler output snapshot.
     return child.returncode, paths[0].read_text(encoding='utf-8', errors='replace')
 
@@ -326,21 +169,29 @@ def successful_cases(code, text, expected):
     return code == 0 and summaries == [('ok', str(len(expected)), '0', '0')]
 
 
-def execute(lease, env, out, *, runner=run_owned, now=utc):
-    validate_reservation(lease, env, now())
+def source_snapshot(env):
+    def git(*args):
+        return subprocess.check_output(['git', *args], cwd=ROOT, text=True, encoding='utf-8', timeout=30)
+    require(git('rev-parse', 'HEAD').strip() == env['GITHUB_SHA'], 'source revision changed')
+    require(not git('status', '--porcelain').strip(), 'source checkout changed')
+    return {name: digest(ROOT / name) for name in git('ls-files', '-z').split('\0') if name}
+
+
+def execute(env, out, *, runner=run_owned, source_check=None):
+    source_check = source_check or (lambda: source_snapshot(env))
+    source_before = source_check()
+    (out / 'source.json').write_text(json.dumps(source_before, indent=2), encoding='utf-8')
     env = env.copy()
-    env.pop('MOSS_CUDA_ADMISSION', None)
     # Cargo's empty overrides disable config wrappers too; do not share a compiler service across owned Jobs.
-    env.update(RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='')
+    env.update(RUSTC_WRAPPER='', RUSTC_WORKSPACE_WRAPPER='', CARGO_BUILD_JOBS='4')
     for name in ('hf', 'hub', 'tmp'):
         (out / name).mkdir()
     env.update(CUDA_VISIBLE_DEVICES='-1', CUDA_COMPUTE_CAP='120', HF_HOME=str(out / 'hf'),
                HF_HUB_CACHE=str(out / 'hub'), HUGGINGFACE_HUB_CACHE=str(out / 'hub'), HF_HUB_OFFLINE='1',
                TMP=str(out / 'tmp'), TEMP=str(out / 'tmp'), TMPDIR=str(out / 'tmp'), RUST_TEST_THREADS='1')
     target = Path(env['CARGO_TARGET_DIR'])
-    remaining = lambda: (timestamp(lease['expiresUtc']) - now()).total_seconds()
     command = ['cargo', 'test', '--locked', '--lib', '-p', MOSS, '-p', FLUX, '--features', 'cuda', '--no-run', '--message-format=json']
-    code, output = runner(command, env, out, 'compile', remaining(), finalize_compile_descendants=True)
+    code, output = runner(command, env, out, 'compile', 3600, finalize_compile_descendants=True)
     require(code == 0, 'test compilation failed')
     binaries = prepared_binaries(output, target)
     (out / 'prepared.json').write_text(json.dumps(binaries, indent=2), encoding='utf-8')
@@ -350,37 +201,28 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
         for ignored in (False, True):
             args = [binary, *filters, '--list'] + (['--ignored'] if ignored else [])
             args[0] = checked_binary(binaries[package], target)
-            code, output = runner(args, env, out, label + ('-ignored' if ignored else '-list'), remaining())
+            code, output = runner(args, env, out, label + ('-ignored' if ignored else '-list'), 60)
             require(code == 0 and listed_tests(output) == (expected_ignored if ignored else expected), 'missing/extra/ignored numerical cases')
     results = []
-    collector = str(ROOT / 'scripts/ci/windows-gpu1-diagnostic.ps1')
     for label, package, filters, expected, expected_ignored in ARMS:
-        validate_reservation(lease, env, now())
+        require(source_check() == source_before, 'source changed before numerical invocation')
         binary = checked_binary(binaries[package], target)
-        phase_start = now()
-        evidence_dir, final_dir = out / (label + '-evidence'), out / (label + '-final')
-        args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(evidence_dir)]
-        code, _ = runner(args, env, out, label + '-collector', min(300, remaining()))
-        require(code == 0, 'fresh collector failed')
-        evidence = read_json(evidence_dir / 'evidence.json')
-        validate_evidence(evidence, lease, env, phase_start, now())
-        # Verify binaries before the final refresh; no compiler or test listing follows it.
+        # --id=1 restricts this query to the permitted physical device; never query GPU0.
+        code, output = runner(['nvidia-smi', '--id=1', '--query-gpu=index,uuid,pci.bus_id',
+                               '--format=csv,noheader,nounits'], env, out, label + '-device', 30)
+        require(code == 0, 'physical GPU1 identity query failed')
+        identity = device_identity(output)
         binary = checked_binary(binaries[package], target)
-        args = ['powershell', '-NoProfile', '-NonInteractive', '-File', collector, '-OutputDirectory', str(final_dir), '-PreviousEvidencePath', str(evidence_dir / 'evidence.json')]
-        code, _ = runner(args, env, out, label + '-refresh', min(60, remaining()))
-        require(code == 0, 'final identity refresh failed')
-        final = read_json(final_dir / 'evidence.json')
-        validate_final(final, evidence, lease, env, now())
-        binary = checked_binary(binaries[package], target)
-        seconds = lease['testTimeoutSeconds']
-        require(remaining() >= seconds, 'reservation does not cover invocation budget')
-        gpu_env = dict(env, CUDA_VISIBLE_DEVICES=lease['uuid'], CUDA_DEVICE_ORDER='PCI_BUS_ID', SCENEWORKS_GPU_ID='1', REQUIRE_SM120='1', CARGO_NET_OFFLINE='true')
+        gpu_env = dict(env, CUDA_VISIBLE_DEVICES=GPU_UUID, CUDA_DEVICE_ORDER='PCI_BUS_ID', SCENEWORKS_GPU_ID='1', REQUIRE_SM120='1', CARGO_NET_OFFLINE='true')
         execution_flags = ['--include-ignored'] if expected_ignored else []
-        code, output = runner([binary, *filters, *execution_flags, '--test-threads', '1', '--nocapture'], gpu_env, out, label + '-tests', seconds)
+        code, output = runner([binary, *filters, *execution_flags, '--test-threads', '1', '--nocapture'], gpu_env, out, label + '-tests', 600)
         results.append({'arm': label, 'binarySha256': binaries[package]['sha256'], 'expectedTests': sorted(expected), 'declaredIgnoredTests': sorted(expected_ignored),
                         'returncode': code, 'passed': successful_cases(code, output, expected),
-                        'collectorSha256': digest(evidence_dir / 'evidence.json'), 'finalSnapshotSha256': digest(final_dir / 'evidence.json')})
+                        'device': identity})
         (out / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
+        checked_binary(binaries[package], target)
+        require(source_check() == source_before, 'source changed during numerical invocation')
+        require(results[-1]['passed'], 'numerical arm failed')
     require(all(row['passed'] for row in results), 'one or more numerical arms failed')
     return results
 
@@ -388,17 +230,14 @@ def execute(lease, env, out, *, runner=run_owned, now=utc):
 def main():
     require(os.name == 'nt', 'Windows-only numerical transport')
     env = os.environ.copy()
-    raw = env['MOSS_CUDA_ADMISSION']
-    require(len(raw.encode('utf-8')) <= 48 * 1024, 'reservation JSON exceeded bound')
-    lease = json.loads(raw, object_pairs_hook=unique_fields)
-    validate_reservation(lease, env, utc())
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, encoding='utf-8').strip() == lease['source'], 'checkout mismatch')
-    require(not subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True, encoding='utf-8').strip(), 'dirty source')
+    require(env['GITHUB_REPOSITORY'] == 'SceneWorks/inference' and env['GITHUB_EVENT_NAME'] == 'workflow_dispatch', 'manual inference workflow required')
+    require(re.fullmatch('[0-9a-f]{40}', env['GITHUB_SHA']), 'exact source revision required')
+    require(env['GITHUB_RUN_ID'].isdigit() and int(env['GITHUB_RUN_ATTEMPT']) > 0, 'invalid Actions run identity')
     out = Path(env['RUNNER_TEMP']).resolve() / f"moss-edit-{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
     out.mkdir(exist_ok=False)
-    receipt = {'source': lease['source'], 'reservation': lease, 'completed': False, 'passed': False}
+    receipt = {'source': env['GITHUB_SHA'], 'runId': env['GITHUB_RUN_ID'], 'attempt': env['GITHUB_RUN_ATTEMPT'], 'completed': False, 'passed': False}
     try:
-        receipt['results'] = execute(lease, env, out)
+        receipt['results'] = execute(env, out)
         receipt['passed'] = True
     except BaseException as error:
         receipt['error'] = str(error)

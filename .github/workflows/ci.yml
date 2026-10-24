@@ -28,14 +28,10 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only; moss-edit-cuda = reserved synthetic MOSS GPU1 tests only"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only; moss-edit-cuda = synthetic MOSS GPU1 tests only; moss-edit-metal = exact synthetic Metal oracle"
         type: choice
-        options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda]
+        options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda, moss-edit-metal]
         default: all
-      moss_cuda_admission:
-        description: "For moss-edit-cuda only: reviewed exact-source GPU1 reservation JSON"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -64,12 +60,14 @@ permissions:
 # one entry and guarantee `check_response_timeout_minutes` evictions. GitHub cancels the run
 # itself when it dissolves a merge group, so nothing here needs to.
 concurrency:
-  group: inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  # Manual numerical runs on the same source remain independent Actions entries.
+  # Per-run groups also preserve every manual queue entry. Ordinary groups stay unchanged.
+  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: select affected lanes
     runs-on: ubuntu-latest
     outputs:
@@ -161,7 +159,7 @@ jobs:
   # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
   # fast manifest parse (no dependency resolution, no compile).
   resolve:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace manifest resolution
     runs-on: ubuntu-latest
     steps:
@@ -181,7 +179,7 @@ jobs:
   # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
   # this doubles as a second resolution tripwire — no compile, so it stays fast.
   format:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: workspace formatting
     runs-on: ubuntu-latest
     steps:
@@ -197,7 +195,7 @@ jobs:
     name: workspace graph invariants
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.workspace == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.workspace == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -257,7 +255,7 @@ jobs:
     name: contracts + conformance testkits (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.contracts == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.contracts == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -303,7 +301,7 @@ jobs:
     name: contracts testkit (Windows)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.contracts == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.contracts == 'true')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -353,7 +351,7 @@ jobs:
     name: Candle CPU lint + docs (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -409,7 +407,7 @@ jobs:
     name: Candle CPU package tests (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -545,7 +543,7 @@ jobs:
     name: Candle CPU conformance + SA3 gates (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -575,7 +573,7 @@ jobs:
     name: Candle CPU bundle profiles (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -604,7 +602,7 @@ jobs:
     name: MLX + Candle Metal packages (macOS)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.macos_metal == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.macos_metal == 'true')
     runs-on: macos-15
     env:
       # Hosted SDK 15 cannot compile the shipping macOS 26.2 NAX path. The root
@@ -868,7 +866,7 @@ jobs:
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true')
     runs-on: [self-hosted, macOS, ARM64, nax]
     env:
       MACOSX_DEPLOYMENT_TARGET: "26.2"
@@ -951,7 +949,7 @@ jobs:
     # keyed on `!= 'pull_request'` rather than an allowlist of trusted events, so a new trusted
     # event does not silently lose CUDA coverage.
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, windows, cuda]
     env:
       # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
@@ -1071,7 +1069,7 @@ jobs:
     name: Candle CUDA packages (Windows, manual)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true')
     runs-on: [self-hosted, windows, cuda]
     env:
       # Keep manual runs inside the same per-listener budget as the automatic compile check.
@@ -1167,7 +1165,7 @@ jobs:
           cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
   supply-chain:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
     name: dependency policy + advisories
     runs-on: ubuntu-latest
     steps:
@@ -1194,7 +1192,7 @@ jobs:
     name: repository documentation
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.docs == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.docs == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1205,7 +1203,7 @@ jobs:
     name: runtime manifest + SPDX SBOM
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (needs.changes.outputs.release == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.release == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1225,7 +1223,7 @@ jobs:
     name: tagged source archive + external smoke
     needs: [changes, release-metadata]
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (startsWith(github.ref, 'refs/tags/runtime-'))
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (startsWith(github.ref, 'refs/tags/runtime-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1282,12 +1280,13 @@ jobs:
       - windows-cuda
       - windows-gpu-diagnostic
       - moss-edit-cuda
+      - moss-edit-metal
       - supply-chain
       - docs
       - release-metadata
       - release-artifacts
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (always())
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to have succeeded or been skipped
@@ -1330,14 +1329,11 @@ jobs:
           retention-days: 3
 
   moss-edit-cuda:
-    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-edit-cuda' && github.run_attempt == 1
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-edit-cuda'
     runs-on: [self-hosted, windows, cuda]
-    concurrency:
-      group: moss-edit-physical-gpu1
-      cancel-in-progress: false
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: "12"
+      CARGO_BUILD_JOBS: "4"
       CUDA_VISIBLE_DEVICES: "-1"
       CUDA_COMPUTE_CAP: "120"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -1375,15 +1371,13 @@ jobs:
           if not defined REVIEWED_PYTHON exit /b 1
           "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
-      - name: Compile hidden-device tests then admit exact prepared numerical cases
+      - name: Compile hidden-device tests then run exact GPU1 numerical cases
         shell: cmd
-        env:
-          MOSS_CUDA_ADMISSION: ${{ inputs.moss_cuda_admission }}
         run: |
           call "%VCVARS%"
           if errorlevel 1 exit /b 1
           "%REVIEWED_PYTHON%" -m scripts.ci.moss_edit_cuda
-      - name: Preserve bounded numerical and admission receipts
+      - name: Preserve bounded numerical and owned-process receipts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -1391,6 +1385,43 @@ jobs:
           path: |
             ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.json
             ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.log
-            ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*/evidence.json
+          if-no-files-found: error
+          retention-days: 3
+
+
+  # Manual synthetic gate: Actions schedules preparation and direct execution.
+  moss-edit-metal:
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-edit-metal')
+    runs-on: [self-hosted, macOS, ARM64, nax]
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      RUSTUP_AUTO_INSTALL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Compile and list the exact oracle without allocating a Metal device
+        run: python3 scripts/ci/moss_edit_metal.py prepare
+      - name: Publish prepared source, runtime, binary, and test identities
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: moss-metal-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+          if-no-files-found: error
+          retention-days: 3
+      - name: Run the exact prepared Metal numerical oracle
+        run: python3 scripts/ci/moss_edit_metal.py execute
+      - name: Preserve numerical and owned-process receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: moss-metal-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
           if-no-files-found: error
           retention-days: 3

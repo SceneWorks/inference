@@ -17,7 +17,7 @@ pub const EDIT_WEIGHTS_LICENSE: Option<&str> = None;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MossImageEditInputs<'a> {
-    /// Ordered RGB images. The first delivery accepts exactly one reference.
+    /// One to four ordered RGB slots. Repeated images retain separate ordinals.
     pub references: &'a [Image],
     pub reference_max_edge: u32,
     pub use_kv_cache: bool,
@@ -35,9 +35,9 @@ impl Default for MossImageEditInputs<'_> {
 }
 impl MossImageEditInputs<'_> {
     pub fn validate(&self) -> Result<Vec<[u32; 2]>> {
-        if self.references.len() != 1 {
+        if !(1..=4).contains(&self.references.len()) {
             return Err(Error::Unsupported(
-                "MOSS edit currently requires exactly one ordered reference".into(),
+                "MOSS edit requires one to four ordered reference slots".into(),
             ));
         }
         self.references
@@ -67,6 +67,71 @@ pub fn reference_dimensions(width: u32, height: u32, max_edge: u32) -> Result<[u
     let scale = (limit as f64 / width.max(height) as f64).min(1.0);
     let aligned = |n: u32| (((n as f64 * scale / 16.0 + 0.5).floor() as u32) * 16).clamp(16, limit);
     Ok([aligned(width), aligned(height)])
+}
+/// Request-local reference residency plus the largest sequential encoder workspace.
+/// Both native encoders finish a logical F32 latent readback before the next image;
+/// all original RGB slots, packed latents and layer K/V remain accounted concurrently.
+/// No request-local allocation is eligible for a warm resident-weight credit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MossEditReferenceMemory {
+    pub tokens: u64,
+    pub persistent_bytes: u64,
+    pub encoder_bytes: u64,
+}
+impl MossEditReferenceMemory {
+    pub fn checked(inputs: MossImageEditInputs<'_>) -> Result<Self> {
+        let overflow = || Error::Unsupported("MOSS edit reference memory overflow".into());
+        let mut result = Self {
+            tokens: 0,
+            persistent_bytes: 0,
+            encoder_bytes: 0,
+        };
+        for ([width, height], original) in inputs.validate()?.into_iter().zip(inputs.references) {
+            let pixels = u64::from(width)
+                .checked_mul(u64::from(height))
+                .ok_or_else(overflow)?;
+            let tokens = pixels / 256;
+            result.tokens = result.tokens.checked_add(tokens).ok_or_else(overflow)?;
+            // Packed F32 reference latents plus all cached BF16 K/V, or one live
+            // layer pair when uncached. No cross-request cache receives a warm credit.
+            let kv_layers = if inputs.use_kv_cache { 42 } else { 1 };
+            result.persistent_bytes = tokens
+                .checked_mul(128 * 4 + 3072 * 2 * 2 * kv_layers)
+                .and_then(|n| n.checked_add(original.pixels.len() as u64))
+                .and_then(|n| n.checked_add(result.persistent_bytes))
+                .ok_or_else(overflow)?;
+            // Existing full-F32 encoder activation envelope, normalized host/device RGB,
+            // resized RGB, packed latent readback, and horizontal Lanczos intermediate.
+            // Coefficient storage: at most 6*max(input, output) + 2*output weights per axis, 4 bytes
+            // each, plus (start, Vec) metadata for each output coordinate.
+            let coefficients = u64::from(original.width.max(width))
+                .checked_add(u64::from(original.height.max(height)))
+                .and_then(|n| n.checked_mul(6 * 4))
+                .and_then(|n| n.checked_add((u64::from(width) + u64::from(height)) * (2 * 4 + 32)))
+                .ok_or_else(overflow)?;
+            let encoder = pixels
+                .checked_mul(384 * 4 * 12 + 3 * 4 * 2 + 3)
+                .and_then(|n| n.checked_add(tokens * 128 * 4))
+                .and_then(|n| n.checked_add(u64::from(width) * u64::from(original.height) * 3))
+                .and_then(|n| n.checked_add(coefficients))
+                .ok_or_else(overflow)?;
+            result.encoder_bytes = result.encoder_bytes.max(encoder);
+        }
+        Ok(result)
+    }
+
+    /// Full reference-only R*R or body B*(B+R) matrix, whichever is larger.
+    /// Batch images and CFG branches execute sequentially; K/V is shared, not tiled.
+    pub fn attention_elements(self, body_tokens: u64) -> Result<u64> {
+        let references = self.tokens.checked_mul(self.tokens);
+        let body = body_tokens
+            .checked_add(self.tokens)
+            .and_then(|n| n.checked_mul(body_tokens));
+        references
+            .zip(body)
+            .map(|(r, b)| r.max(b))
+            .ok_or_else(|| Error::Unsupported("MOSS edit attention memory overflow".into()))
+    }
 }
 /// Resolve edit-only defaults without mutating an ordinary request or accepting img2img strength.
 pub fn edit_request(request: &GenerationRequest) -> Result<GenerationRequest> {
@@ -159,7 +224,7 @@ impl MossImageEditExecutionReport {
             || r.acceleration != MossImageAcceleration::Off
             || !r.uncond_skip_layers.is_empty()
             || r.slg.is_some()
-            || self.references.len() != 1
+            || !(1..=4).contains(&self.references.len())
         {
             return Err(Error::Unsupported(
                 "invalid MOSS edit execution identity or policy".into(),
@@ -225,6 +290,94 @@ impl<'de> Deserialize<'de> for MossImageEditExecutionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordered_slots_and_aggregate_reference_memory() {
+        let image = |width, height, value| Image {
+            width,
+            height,
+            pixels: vec![value; (width * height * 3) as usize],
+        };
+        // 4, 3, 3, 3 tokens: mixed aspect ratios, with the last slot an exact repeat.
+        let references = [
+            image(32, 32, 1),
+            image(16, 48, 2),
+            image(48, 16, 3),
+            image(16, 48, 2),
+        ];
+        let mut previous = 0;
+        for (count, tokens, persistent, reference_square) in [
+            (1, 4, 2_069_504, 16),
+            (2, 7, 3_621_632, 49),
+            (3, 10, 5_173_760, 100),
+            (4, 13, 6_725_888, 169),
+        ] {
+            let inputs = MossImageEditInputs {
+                references: &references[..count],
+                ..Default::default()
+            };
+            assert_eq!(
+                inputs.validate().unwrap(),
+                references[..count]
+                    .iter()
+                    .map(|r| [r.width, r.height])
+                    .collect::<Vec<_>>()
+            );
+            let memory = MossEditReferenceMemory::checked(inputs).unwrap();
+            assert_eq!(memory.tokens, tokens);
+            // Independent arithmetic: each token owns 512 latent bytes, 516096 KV
+            // bytes, and 768 source RGB bytes. No unique-image or max-image reduction.
+            assert_eq!(memory.persistent_bytes, persistent);
+            assert!(memory.persistent_bytes > previous);
+            previous = memory.persistent_bytes;
+            assert_eq!(memory.encoder_bytes, 18_911_232);
+            assert_eq!(memory.attention_elements(2).unwrap(), reference_square);
+            assert_eq!(memory.attention_elements(20).unwrap(), 20 * (20 + tokens));
+            assert!(memory.attention_elements(u64::MAX).is_err());
+        }
+        let uncached = MossEditReferenceMemory::checked(MossImageEditInputs {
+            references: &references,
+            use_kv_cache: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(uncached.tokens, 13);
+        assert_eq!(
+            uncached.persistent_bytes, 176_384,
+            "all F32 latents/RGB plus one live KV pair"
+        );
+        assert_eq!(uncached.encoder_bytes, 18_911_232);
+        for references in [vec![], vec![references[0].clone(); 5]] {
+            assert!(MossImageEditInputs {
+                references: &references,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        let mut reversed = references.to_vec();
+        reversed.reverse();
+        assert_eq!(
+            MossImageEditInputs {
+                references: &reversed,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+            [[16, 48], [48, 16], [16, 48], [32, 32]]
+        );
+        let invalid = [Image {
+            width: u32::MAX,
+            height: u32::MAX,
+            pixels: vec![],
+        }];
+        assert!(MossImageEditInputs {
+            references: &invalid,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
     #[test]
     fn edit_contract_rejects_combination_and_preserves_controls() {
         let r = GenerationRequest {

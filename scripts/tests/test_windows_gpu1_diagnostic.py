@@ -197,6 +197,12 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
                 self.assertTrue(job['if'].startswith(guard))
                 mutated = copy.deepcopy(self.workflow)
                 tail = job['if'][len(guard):].removeprefix(' && ')
+                if name == 'moss-edit-metal':
+                    # Exact manual selectors provide a second independent barrier.
+                    # Mutate both barriers to demonstrate actual diagnostic leakage.
+                    selector = f"inputs.lanes == '{name}'"
+                    self.assertIn(selector, tail)
+                    tail = tail.replace(selector, f"inputs.lanes == '{LANE}'")
                 mutated['jobs'][name]['if'] = tail or 'True'
                 self.assertNotEqual(diagnostic_isolation_errors(mutated), [])
 
