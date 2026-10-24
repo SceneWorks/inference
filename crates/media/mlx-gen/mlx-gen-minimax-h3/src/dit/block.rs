@@ -219,10 +219,17 @@ impl AdaLnProjection {
 
 /// `x · (1 + scale[idx]) + shift[idx]`, gathering one modulation row per sequence row.
 fn modulate(x: &Array, scale: &Array, shift: &Array, indices: &Array) -> Result<Array> {
-    let scale = scale.take_axis(indices, 0)?;
-    let shift = shift.take_axis(indices, 0)?;
+    // Pinned WanGP _modulate casts at application, not in the resident F32 curve cache.
+    // Otherwise F32 pruning tables promote a BF16 stream before ConvRot quantizes its input.
+    let scale = scale.take_axis(indices, 0)?.as_dtype(x.dtype())?;
+    let shift = shift.take_axis(indices, 0)?.as_dtype(x.dtype())?;
     let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
     Ok(add(&multiply(x, &add(&one, &scale)?)?, &shift)?)
+}
+
+/// Pinned _gated_residual applies each gathered gate at the residual hidden stream's dtype.
+fn gate_rows(gate: &Array, indices: &Array, dtype: Dtype) -> Result<Array> {
+    Ok(gate.take_axis(indices, 0)?.as_dtype(dtype)?)
 }
 
 /// Reject an `adaln_indices` entry that does not address a modulation-table row.
@@ -472,7 +479,7 @@ impl DitBlock {
         let attn = self
             .attn
             .forward_bounded_veda(&normed, Some((rope, tables)), bounded, veda)?;
-        let gate = modulation.gate_msa.take_axis(adaln_indices, 0)?;
+        let gate = gate_rows(&modulation.gate_msa, adaln_indices, x.dtype())?;
         let x = add(x, &multiply(&gate, &attn)?)?;
 
         let normed = modulate(
@@ -482,7 +489,7 @@ impl DitBlock {
             adaln_indices,
         )?;
         let ff = self.ff.forward(&normed)?;
-        let gate = modulation.gate_mlp.take_axis(adaln_indices, 0)?;
+        let gate = gate_rows(&modulation.gate_mlp, adaln_indices, x.dtype())?;
         Ok(add(&x, &multiply(&gate, &ff)?)?)
     }
 
@@ -611,5 +618,40 @@ mod tests {
         let idx = Array::from_slice(&[1i32], &[1]);
         let out = modulate(&x, &scale, &shift, &idx).unwrap();
         assert_eq!(out.as_slice::<f32>(), &[2.0 * 1.5 + 1.0, 4.0 * 1.5 - 1.0]);
+    }
+
+    #[test]
+    fn f32_cached_modulation_and_gates_preserve_bf16_stream() {
+        let x = Array::from_slice(&[2.0f32, 4.0], &[1, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let scale = Array::from_slice(&[0.5f32, 0.25], &[1, 2]);
+        let shift = Array::from_slice(&[1.0f32, -1.0], &[1, 2]);
+        let indices = Array::from_slice(&[0i32], &[1]);
+        let modulated = modulate(&x, &scale, &shift, &indices).unwrap();
+        assert_eq!(modulated.dtype(), Dtype::Bfloat16);
+        let values = modulated.as_dtype(Dtype::Float32).unwrap();
+        values.eval().unwrap();
+        assert_eq!(values.as_slice::<f32>(), &[4.0, 4.0]);
+        let gate_values = Array::from_slice(&[0.003f32, 0.499], &[1, 2]);
+        let gate = gate_rows(&gate_values, &indices, x.dtype()).unwrap();
+        let rounded_gate = gate.as_dtype(Dtype::Float32).unwrap();
+        rounded_gate.eval().unwrap();
+        assert_eq!(rounded_gate.as_slice::<f32>(), &[0.0030059814, 0.49804688]);
+        let branch = Array::from_slice(&[1.0f32, 2.0], &[1, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let residual = add(&x, multiply(&gate, &branch).unwrap()).unwrap();
+        assert_eq!(residual.dtype(), Dtype::Bfloat16);
+        let values = residual.as_dtype(Dtype::Float32).unwrap();
+        values.eval().unwrap();
+        assert_eq!(values.as_slice::<f32>(), &[2.0, 5.0]);
+        // The source cache remains F32 and Float32 application remains a no-op cast.
+        assert_eq!(scale.dtype(), Dtype::Float32);
+        assert_eq!(shift.dtype(), Dtype::Float32);
+        let wide = gate_rows(&scale, &indices, Dtype::Float32).unwrap();
+        assert_eq!(wide.dtype(), Dtype::Float32);
+        wide.eval().unwrap();
+        assert_eq!(wide.as_slice::<f32>(), &[0.5, 0.25]);
     }
 }
