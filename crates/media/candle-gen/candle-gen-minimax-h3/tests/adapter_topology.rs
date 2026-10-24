@@ -535,6 +535,153 @@ fn real_but_unaddressable_modules_name_the_exclusion() {
     );
 }
 
+/// **AC2, incompatibility-only file (LoRA route):** an adapter that targets **only**
+/// `transformer_blocks.0.adaln_proj.linear` — zero compatible body targets — must be refused on
+/// the pruned curve with the topology-mismatch error that names the offending stem, never with the
+/// generic per-file "no target modules matched". The compatible body targets the earlier tests add
+/// are deliberately absent here: they are what let the per-file zero-match guard stay silent and
+/// concealed this hole.
+#[test]
+fn an_adaln_only_file_with_no_body_targets_is_refused_specifically() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let lora = write_lora(
+        dir.path(),
+        "adaln_only.safetensors",
+        &[(
+            "transformer_blocks.0.adaln_proj.linear".to_string(),
+            18 * cfg.hidden_size,
+            cfg.time_embed_dim,
+        )],
+        Some("128"),
+    );
+
+    let pruned_error = apply_minimax_h3_adapters(&mut pruned_dit(&cfg), &[spec(lora.clone(), 1.0)])
+        .expect_err("the pruned curve must refuse an AdaLN-only file")
+        .to_string();
+    assert!(
+        pruned_error.contains("pruned coordinate-table"),
+        "the refusal must name the topology mismatch, not the generic zero-match error: {pruned_error}"
+    );
+    assert!(
+        pruned_error.contains("adaln_proj.linear"),
+        "the refusal must name the offending target: {pruned_error}"
+    );
+    assert!(
+        !pruned_error.contains("no target modules matched"),
+        "the generic zero-match error must not swallow the topology mismatch: {pruned_error}"
+    );
+
+    let full_error = apply_minimax_h3_adapters(&mut full_dit(&cfg), &[spec(lora, 1.0)])
+        .expect_err("the full topology must refuse its own AdaLN modules")
+        .to_string();
+    assert!(
+        full_error.contains("no MiniMax-H3 adapter can attach"),
+        "on the full topology the AdaLN-only file is a deliberate exclusion: {full_error}"
+    );
+    assert!(
+        !full_error.contains("no target modules matched"),
+        "the generic zero-match error must not swallow the exclusion: {full_error}"
+    );
+}
+
+/// **AC2, incompatibility-only file (excluded modules):** a file that targets only real modules
+/// no H3 adapter can attach to (the I/O heads, the RMS norms) — again with **no** compatible body
+/// target — is refused with the exclusion error that lists them, not the generic zero-match error.
+#[test]
+fn an_excluded_only_file_with_no_body_targets_is_refused_specifically() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let lora = write_lora(
+        dir.path(),
+        "excluded_only.safetensors",
+        &[
+            (
+                "context_embedder".to_string(),
+                cfg.hidden_size,
+                cfg.text_dim,
+            ),
+            (
+                "transformer_blocks.0.norm1".to_string(),
+                cfg.hidden_size,
+                cfg.hidden_size,
+            ),
+        ],
+        Some("128"),
+    );
+
+    let error = apply_minimax_h3_adapters(&mut pruned_dit(&cfg), &[spec(lora, 1.0)])
+        .expect_err("an excluded-modules-only file must be refused")
+        .to_string();
+    assert!(
+        error.contains("no MiniMax-H3 adapter can attach"),
+        "the refusal must name the exclusion, not the generic zero-match error: {error}"
+    );
+    assert!(
+        error.contains("context_embedder") && error.contains("norm1"),
+        "the refusal must list the offending targets: {error}"
+    );
+    assert!(
+        !error.contains("no target modules matched"),
+        "the generic zero-match error must not swallow the exclusion: {error}"
+    );
+}
+
+/// **AC2, incompatibility-only file (LoKr route):** the LoKr zero-match guard has the same hole as
+/// the LoRA one. A valid LoKr file targeting only the full AdaLN surface — no compatible body
+/// target — must be refused on the pruned curve as a topology mismatch naming the stem, not with
+/// the generic per-file zero-match error.
+#[test]
+fn an_adaln_only_lokr_with_no_body_targets_is_refused_specifically() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let arrays = vec![
+        (
+            "transformer_blocks.0.adaln_proj.linear.lokr_w1".to_string(),
+            bf16(&tensor(&[8, 8], 1.0)),
+        ),
+        (
+            "transformer_blocks.0.adaln_proj.linear.lokr_w2".to_string(),
+            bf16(&tensor(&[12, 8], 2.0)),
+        ),
+    ];
+    let path = dir.path().join("adaln_only_lokr.safetensors");
+    write_safetensors(
+        &path,
+        &arrays,
+        &[
+            ("format", "pt"),
+            ("networkType", "lokr"),
+            ("rank", "8"),
+            ("alpha", "8"),
+        ],
+    );
+
+    let pruned_error = apply_minimax_h3_adapters(&mut pruned_dit(&cfg), &[spec(path.clone(), 1.0)])
+        .expect_err("the pruned curve must refuse an AdaLN-only LoKr file")
+        .to_string();
+    assert!(
+        pruned_error.contains("pruned coordinate-table"),
+        "the refusal must name the topology mismatch, not the generic zero-match error: {pruned_error}"
+    );
+    assert!(
+        pruned_error.contains("adaln_proj.linear"),
+        "the refusal must name the offending target: {pruned_error}"
+    );
+    assert!(
+        !pruned_error.contains("no target modules matched"),
+        "the generic zero-match error must not swallow the topology mismatch: {pruned_error}"
+    );
+
+    let full_error = apply_minimax_h3_adapters(&mut full_dit(&cfg), &[spec(path, 1.0)])
+        .expect_err("the full topology must refuse its own AdaLN modules")
+        .to_string();
+    assert!(
+        full_error.contains("no MiniMax-H3 adapter can attach"),
+        "on the full topology the AdaLN-only LoKr is a deliberate exclusion: {full_error}"
+    );
+}
+
 /// **AC1:** the published 768p turbo recipe (4 evaluations, video shift 6) resolves its
 /// coordinates as `t = 1 − σ` — every one inside `[0, 1]`, so a ×1000 convention would clamp every
 /// lookup to the table's final interval — and the pruned curve interpolates `adaln_t_table` at

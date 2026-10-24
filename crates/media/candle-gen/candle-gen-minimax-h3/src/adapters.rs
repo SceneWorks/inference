@@ -1213,6 +1213,12 @@ fn apply_one_lora(
 /// merged LoRA, a base checkpoint, a textual inversion) contributes neither an `applied` nor an
 /// `unmatched_path`, so only a per-spec check can see it. The MLX lane fixed exactly this in review.
 ///
+/// A zero-match file that DID collect unmatched targets is refused with the **classified**
+/// topology error ([`unmatched_targets_error`]) over THAT file's targets, before the generic
+/// zero-match error fires: the generic error is reserved for files carrying no recognized targets
+/// at all, and a full-topology AdaLN file against a pruned curve must be named as a topology
+/// mismatch, not swallowed by "no target modules matched".
+///
 /// A `_comfyui_` export is **converted** ([`convert_comfyui_key_space`]) rather than refused
 /// (sc-19443), and the conversion's own result is re-checked against [`is_comfyui_key_space`] so a
 /// conversion that left a fused module behind fails here instead of reaching the fold.
@@ -1227,6 +1233,7 @@ pub fn apply_minimax_h3_adapters(
     let mut report = MiniMaxH3LoraReport::default();
     for spec in specs {
         let before = report.applied;
+        let before_unmatched = report.unmatched_paths.len();
         let af = read_adapter(&spec.path)?;
         let trainer = classify_minimax_h3_trainer_namespace(
             af.tensors.keys().map(String::as_str),
@@ -1243,6 +1250,10 @@ pub fn apply_minimax_h3_adapters(
         if lokr {
             apply_one_lokr(host, &af.tensors, &af.meta, spec.scale, &mut report)?;
             if report.applied == before {
+                let fresh = &report.unmatched_paths[before_unmatched..];
+                if !fresh.is_empty() {
+                    return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+                }
                 return Err(CandleError::Msg(format!(
                     "minimax_h3 adapter {}: no target modules matched in this LoKr file",
                     spec.path.display()
@@ -1291,6 +1302,10 @@ pub fn apply_minimax_h3_adapters(
         apply_one_lora(host, &tensors, &af.meta, spec.scale, &mut report)?;
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something.
         if report.applied == before {
+            let fresh = &report.unmatched_paths[before_unmatched..];
+            if !fresh.is_empty() {
+                return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+            }
             return Err(CandleError::Msg(format!(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \

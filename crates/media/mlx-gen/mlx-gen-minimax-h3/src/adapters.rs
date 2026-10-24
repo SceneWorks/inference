@@ -1002,6 +1002,12 @@ fn apply_one_lora(
 /// nor an `unmatched_path`, so only a per-spec check can see it. Downstream, the aggregate form
 /// reaches a user as "my second LoRA did nothing, and there was no error".
 ///
+/// A zero-match file that DID collect unmatched targets is refused with the **classified**
+/// topology error ([`unmatched_targets_error`]) over THAT file's targets, before the generic
+/// zero-match error fires: the generic error is reserved for files carrying no recognized targets
+/// at all, and a full-topology AdaLN file against a pruned curve must be named as a topology
+/// mismatch, not swallowed by "no target modules matched".
+///
 /// The host is the **whole DiT**, not a sub-host, and that is load-bearing since sc-26688: the
 /// checkpoint's [`AdaLnSurface`] decides what an unmatched target **means**. A body stem that
 /// misses is a generic error; an AdaLN stem that misses is either a topology mismatch (full-trained
@@ -1029,6 +1035,7 @@ pub fn apply_minimax_h3_adapters(
     let mut report = MiniMaxH3LoraReport::default();
     for spec in specs {
         let before = report.applied;
+        let before_unmatched = report.unmatched_paths.len();
         let w = Weights::from_file(&spec.path)?;
         // sc-23402: the load boundary. Force and GPU-verify the whole file here, before anything
         // classifies, converts or folds it — see [`verify_adapter_file`] for why a stale adapter
@@ -1055,6 +1062,10 @@ pub fn apply_minimax_h3_adapters(
             report.applied += applied;
             report.unmatched_paths.extend(unmatched_paths);
             if report.applied == before {
+                let fresh = &report.unmatched_paths[before_unmatched..];
+                if !fresh.is_empty() {
+                    return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+                }
                 return Err(Error::Msg(format!(
                     "minimax_h3 adapter {}: no target modules matched in this file",
                     spec.path.display()
@@ -1105,6 +1116,10 @@ pub fn apply_minimax_h3_adapters(
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something. See the
         // doc comment — an aggregate check passes a junk file riding alongside a good one.
         if report.applied == before {
+            let fresh = &report.unmatched_paths[before_unmatched..];
+            if !fresh.is_empty() {
+                return Err(unmatched_targets_error(fresh, host.adapter_surface()));
+            }
             return Err(Error::Msg(format!(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
