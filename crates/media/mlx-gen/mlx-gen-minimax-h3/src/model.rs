@@ -860,9 +860,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         Precision::Fp32 => Dtype::Float32,
         _ => Dtype::Bfloat16,
     };
-    // sc-18650. Resolved here, at the one point that holds the spec, and carried on the generator so
-    // `Generator::memory_strategy_contract` has something to publish. `contract_for` only stats the
-    // component directories it has already probed above — no weight file is opened.
+    // Resolve the same source-aware contract used by registry preflight and retain it on the
+    // generator. This reads component metadata, source headers and configs, never tensor payloads.
     let memory_strategy = crate::memory_strategy::contract_for(spec).map_err(Error::from)?;
     let memory_tier = crate::memory_strategy::numeric_tier(spec);
     Ok(Box::new(MiniMaxH3 {
@@ -2213,8 +2212,16 @@ pub(crate) mod tests {
             ("vae", crate::memory_strategy::VIDEO_VAE_BYTES),
             ("audio_vae", crate::memory_strategy::AUDIO_VAE_BYTES),
         ] {
-            let shard = std::fs::File::create(root.join(component).join("model.safetensors"))
+            use std::io::Write;
+            let mut shard = std::fs::File::create(root.join(component).join("model.safetensors"))
                 .expect("shard");
+            if component == BASE_DIT_PARTITION {
+                let payload = bytes - 264;
+                let mut header = serde_json::json!({"fixture":{"dtype":"U8","shape":[payload],"data_offsets":[0,payload]}}).to_string();
+                header.extend(std::iter::repeat_n(' ', 256 - header.len()));
+                shard.write_all(&256u64.to_le_bytes()).unwrap();
+                shard.write_all(header.as_bytes()).unwrap();
+            }
             shard.set_len(bytes).expect("sparse shard");
         }
     }
