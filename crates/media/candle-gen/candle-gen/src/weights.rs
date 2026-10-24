@@ -346,10 +346,7 @@ impl Weights {
         let mut map = HashMap::with_capacity(headers.len());
         for st in &stores {
             for (key, view) in st.tensors() {
-                let tensor = if matches!(
-                    view.dtype(),
-                    safetensors::Dtype::I8 | safetensors::Dtype::F8_E4M3
-                ) {
+                let tensor = if view.dtype() == safetensors::Dtype::I8 {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
                 } else {
                     st.load(&key, device)?

@@ -5,8 +5,6 @@
 //! GEMM/epilogue arithmetic. There is no resident dense INT8 shadow or floating-weight fallback.
 use crate::{CandleError, Result, Weights};
 use candle_core::{DType, Device, Tensor};
-#[cfg(feature = "cuda")]
-use gen_core::w4a8_int8::dequant_packed_to_int8;
 use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
 
 /// Output rows decoded at a time; every tile spans the full contraction dimension.
@@ -17,11 +15,11 @@ pub struct W4A8Linear {
     pub(crate) descriptor: W4A8Int8,
     device: Device,
     #[cfg(feature = "cuda")]
-    packed: Vec<i8>,
+    packed: Tensor,
     #[cfg(feature = "cuda")]
-    s_rel: Vec<u8>,
+    s_rel: Tensor,
     #[cfg(feature = "cuda")]
-    codebook: Vec<f32>,
+    codebook: Tensor,
     #[cfg(feature = "cuda")]
     s_channel: Tensor,
     #[cfg(feature = "cuda")]
@@ -50,7 +48,7 @@ impl W4A8Linear {
         self.descriptor.resident_bytes()
     }
 
-    /// Peak transient decoded weight bytes on each of host and device (not a resident shadow).
+    /// Peak transient decoded weight bytes on the compute device (not a resident shadow).
     /// Activation/output buffers are request-shaped and are not included in this weight-only bound.
     pub fn weight_scratch_bytes(&self) -> usize {
         self.descriptor.out_features.min(TILE_ROWS) * self.descriptor.in_features
@@ -166,13 +164,16 @@ impl W4A8Linear {
                     "W4A8 CUDA output width must be a multiple of 16".into(),
                 ));
             }
-            let packed = codes
-                .to_device(&Device::Cpu)?
-                .flatten_all()?
-                .to_vec1::<u8>()?
-                .into_iter()
-                .map(|v| v as i8)
-                .collect();
+            let packed = codes.clone().contiguous()?;
+            let s_rel = Tensor::from_vec(
+                s_rel,
+                (
+                    descriptor.out_features,
+                    descriptor.in_features / descriptor.group_size,
+                ),
+                codes.device(),
+            )?;
+            let codebook = Tensor::from_vec(levels, 16, codes.device())?;
             let rotation = w.convrot_rotation(descriptor.rotation_group, codes.device())?;
             let s_channel = s_channel.to_device(codes.device())?;
             let bias = bias.map(|b| b.to_device(codes.device())).transpose()?;
@@ -181,7 +182,7 @@ impl W4A8Linear {
                 device: codes.device().clone(),
                 packed,
                 s_rel,
-                codebook: levels,
+                codebook,
                 s_channel,
                 bias,
                 rotation,
@@ -218,28 +219,21 @@ impl W4A8Linear {
             // Full-row scale and codes are computed ONCE, outside the weight tile loop. Never
             // quantize per K-chunk: that would change the published activation arithmetic.
             let (qx, xs) = self.lt.quantize_kitchen_int8(&rotated, x.dtype())?;
-            let mut decoded = Vec::with_capacity(self.weight_scratch_bytes());
             let mut outputs = Vec::with_capacity(d.out_features.div_ceil(TILE_ROWS));
             for row in (0..d.out_features).step_by(TILE_ROWS) {
                 let rows = (d.out_features - row).min(TILE_ROWS);
-                let packed_stride = d.in_features / 2;
-                let rel_stride = d.in_features / d.group_size;
-                dequant_packed_to_int8(
-                    &self.packed[row * packed_stride..(row + rows) * packed_stride],
-                    &self.s_rel[row * rel_stride..(row + rows) * rel_stride],
+                // Device-side weight decode of this bounded output-row tile: the packed codes,
+                // F8_E4M3 s_rel and F32 codebook are resident; the int8 tile is a transient scratch
+                // that dies with this turn. No host round-trip and no per-forward CPU→GPU upload.
+                let staged = self.lt.dequant_w4a8_packed_tile(
+                    &self.packed,
+                    &self.s_rel,
                     &self.codebook,
                     rows,
                     d.in_features,
-                    &mut decoded,
-                )
-                .map_err(candle_core::Error::Msg)?;
-                // SAFETY: i8/u8 have identical size/alignment and all bit patterns are valid.
-                // The borrowed byte view lives only through the synchronous Tensor upload.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(decoded.as_ptr().cast::<u8>(), decoded.len())
-                };
-                let codes = Tensor::from_slice(bytes, (rows, d.in_features), &self.device)?;
-                let staged = self.lt.stage_int8_bytes(&codes)?;
+                    d.group_size,
+                    row,
+                )?;
                 let acc = self
                     .lt
                     .matmul_int8_staged(&staged, &qx)?
