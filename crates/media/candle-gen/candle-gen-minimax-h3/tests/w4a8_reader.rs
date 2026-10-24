@@ -36,15 +36,18 @@ fn write_parts(path: &std::path::Path, s_rel_bytes: Vec<u8>, descriptor: serde_j
     serialize_to_file(tensors, &None, path).unwrap();
 }
 
-const W4A8_DESC: &str =
-    r#"{"convrot_groupsize":256,"format":"asym_w4a8_int8","group_size":16}"#;
+/// The frozen dialect descriptor, as a parsed JSON object (not a quoted string).
+fn w4a8_descriptor() -> serde_json::Value {
+    json!({"convrot_groupsize":256,"format":"asym_w4a8_int8","group_size":16})
+}
+
 
 #[test]
 fn native_reader_admits_w4a8_and_preserves_the_packed_operands() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("w4a8.safetensors");
     // One valid E4M3 scale per group: 0x38 = 1.0.
-    write_parts(&file, vec![0x38u8; 16 * 32], json!(W4A8_DESC));
+    write_parts(&file, vec![0x38u8; 16 * 32], w4a8_descriptor());
     let w = Weights::from_files_native_int8(&[&file], &Device::Cpu).unwrap();
     assert_eq!(w.require("p.weight").unwrap().dtype(), candle_gen::candle_core::DType::U8);
     // candle loads F8_E4M3 natively (not U8): the reader must not corrupt the source dtype.
@@ -63,14 +66,14 @@ fn native_reader_refuses_malformed_w4a8_operands_before_any_tensor_exists() {
     let nan = dir.path().join("nan.safetensors");
     let mut bytes = vec![0x38u8; 16 * 32];
     bytes[0] = 0x7F;
-    write_parts(&nan, bytes, json!(W4A8_DESC));
+    write_parts(&nan, bytes, w4a8_descriptor());
     assert!(Weights::from_files_native_int8(&[&nan], &Device::Cpu).is_err());
 
     // A negative group scale (0xA8 = -0.25) must refuse too.
     let neg = dir.path().join("neg.safetensors");
     let mut bytes = vec![0x38u8; 16 * 32];
     bytes[0] = 0xA8;
-    write_parts(&neg, bytes, json!(W4A8_DESC));
+    write_parts(&neg, bytes, w4a8_descriptor());
     assert!(Weights::from_files_native_int8(&[&neg], &Device::Cpu).is_err());
 
     // A contradictory `convrot:true` bool is not part of the W4A8 dialect.
