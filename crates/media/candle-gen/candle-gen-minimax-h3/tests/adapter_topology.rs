@@ -912,8 +912,10 @@ fn native_adapter_folds_on_the_pruned_curve() {
 // * `b` rows are one-hot basis probes with row/target-coded values `m ∈ [32, 63]` (≤ 6 significant
 //   bf16 bits), distinct signs per row — the second matmul is a single term and a wrong routing
 //   cannot hide behind a symmetric value;
-// * folds and gains are powers of two (1, 0.0625, 4, 0.75) — the dtype-matched scalar multiplies
-//   are exact on every conforming backend;
+// * the declared FOLDS are powers of two (1, 0.0625, 4) and the gain is dyadic with two
+//   significant bits (0.75 = 3·2⁻²) — not a power of two; with `b` carrying ≤ 6 significant bits,
+//   every folded/gained value stays at ≤ 8 significant bits, exactly representable in bf16 (and
+//   f32), so the dtype-matched scalar multiplies are exact on every conforming backend;
 // * the probe modules' base weights are ZERO in a dedicated fixture variant, so the observed
 //   module output IS the residual: `base(x) = 0` exactly and `0 + residual` is exact in f32. A
 //   bit-identical base graph with `(adapted − base)` would NOT prove the delta if the bf16
@@ -1024,7 +1026,7 @@ fn write_exact_corpus(
     for (tidx, (target, out, inn)) in all_targets(cfg).into_iter().enumerate() {
         let mut down = vec![0.0f32; rank * inn];
         for k in 0..inn {
-            down[k * inn + (tidx * 7 + k * 3) % inn] = 1.0;
+            down[k * inn + (tidx * 7 + k) % inn] = 1.0;
         }
         let mut up = vec![0.0f32; out * rank];
         for o in 0..out {
@@ -1072,16 +1074,32 @@ fn verify_corpus_bytes(tensors: &HashMap<String, Tensor>, target: &str, inn: usi
             .expect("lora_B"),
     );
     let rank = a.len() / inn;
+    let mut active_columns: Vec<usize> = Vec::new();
     for k in 0..rank {
         let nonzeros: Vec<usize> = (0..inn).filter(|&j| a[k * inn + j] != 0.0).collect();
+        match nonzeros.first() {
+            None => {}
+            Some(&j) => {
+                assert_eq!(
+                    a[k * inn + j],
+                    1.0,
+                    "{target}: down row {k} nonzeros must be 1.0 (a power of two)"
+                );
+                active_columns.push(j);
+            }
+        }
         assert!(
-            match nonzeros.first() {
-                None => true,
-                Some(&j) => a[k * inn + j] == 1.0,
-            },
+            nonzeros.len() <= 1,
             "{target}: down row {k} must be empty or a unit vector"
         );
     }
+    // Sub-permutation: at most one nonzero per COLUMN as well as per row.
+    let distinct: std::collections::BTreeSet<usize> = active_columns.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        active_columns.len(),
+        "{target}: down factor must be a sub-permutation (no shared column)"
+    );
     let out = b.len() / rank;
     for o in 0..out {
         let nonzeros: Vec<usize> = (0..rank).filter(|&k| b[o * rank + k] != 0.0).collect();

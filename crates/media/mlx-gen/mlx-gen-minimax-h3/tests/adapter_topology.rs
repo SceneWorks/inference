@@ -939,8 +939,10 @@ fn every_published_turbo_recipe_resolves_its_trained_schedule() {
 // * `b` rows are one-hot basis probes `e_k` with row/target-coded values `m·2^e`, `m ∈ [32, 63]`
 //   (≤ 6 significant bf16 bits), distinct signs/exponents per row — the second matmul is a single
 //   term and a wrong routing cannot hide behind a symmetric value;
-// * folds and gains are powers of two (1, 0.0625, 4, 0.75) — the dtype-matched scalar multiplies
-//   are exact on every conforming backend;
+// * the declared FOLDS are powers of two (1, 0.0625, 4) and the gain is dyadic with two
+//   significant bits (0.75 = 3·2⁻²) — not a power of two; with `b` carrying ≤ 6 significant bits,
+//   every folded/gained value stays at ≤ 8 significant bits, exactly representable in bf16 (and
+//   f32), so the dtype-matched scalar multiplies are exact on every conforming backend;
 // * the probe modules' base weights are ZERO in a dedicated fixture variant, so the observed
 //   module output IS the residual: `base(x) = 0` exactly, and `0 + residual` is exact in f32.
 //   (A bit-identical base graph with `(adapted − base)` would NOT prove the delta if the bf16
@@ -1031,7 +1033,7 @@ fn write_exact_corpus(
         // Sub-permutation: row k active only while k < inn (one nonzero per row AND column).
         let mut down = vec![0.0f32; rank * inn];
         for k in 0..inn {
-            down[k * inn + (tidx * 7 + k * 3) % inn] = 1.0;
+            down[k * inn + (tidx * 7 + k) % inn] = 1.0;
         }
         let mut up = vec![0.0f32; out * rank];
         for o in 0..out {
@@ -1074,17 +1076,30 @@ fn verify_corpus_bytes(w: &Weights, target: &str, inn: usize) {
             .expect("lora_B"),
     );
     let rank = a.len() / inn;
+    let mut active_columns: Vec<usize> = Vec::new();
     for k in 0..rank {
         let nonzeros: Vec<usize> = (0..inn).filter(|&j| a[k * inn + j] != 0.0).collect();
         assert!(
-            match nonzeros.first() {
-                None => true,
-                Some(&j) => a[k * inn + j] == 1.0,
-            },
+            nonzeros.len() <= 1,
             "{target}: down row {k} must be empty or a unit vector, got {:?}",
             &a[k * inn..(k + 1) * inn]
         );
+        if let Some(&j) = nonzeros.first() {
+            assert_eq!(
+                a[k * inn + j],
+                1.0,
+                "{target}: down row {k} nonzero must be 1.0 (a power of two)"
+            );
+            active_columns.push(j);
+        }
     }
+    // Sub-permutation: at most one nonzero per COLUMN as well as per row.
+    let distinct: std::collections::BTreeSet<usize> = active_columns.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        active_columns.len(),
+        "{target}: down factor must be a sub-permutation (no shared column)"
+    );
     let out = b.len() / rank;
     for o in 0..out {
         let nonzeros: Vec<usize> = (0..rank).filter(|&k| b[o * rank + k] != 0.0).collect();
