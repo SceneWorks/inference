@@ -245,9 +245,7 @@ impl Weights {
             let payload = stores[*di].get(key)?;
             let declared: serde_json::Value = serde_json::from_slice(payload.data())
                 .map_err(|e| CandleError::Msg(format!("{key}: {e}")))?;
-            let is_w4a8 = declared
-                .get("format")
-                .and_then(serde_json::Value::as_str)
+            let is_w4a8 = declared.get("format").and_then(serde_json::Value::as_str)
                 == Some("asym_w4a8_int8");
             if is_w4a8 {
                 // W4A8 (sc-26685): two int4 codes per I8 byte, F8_E4M3 per-group s_rel, F32
@@ -288,16 +286,17 @@ impl Weights {
                         "{key}: contradictory affine / ConvRot / W4A8 operands"
                     )));
                 }
-                let descriptor = gen_core::w4a8_int8::W4A8Int8::parse(payload.data(), ws, srs, scs, cbs)
-                    .map_err(CandleError::Msg)?;
+                let descriptor =
+                    gen_core::w4a8_int8::W4A8Int8::parse(payload.data(), ws, srs, scs, cbs)
+                        .map_err(CandleError::Msg)?;
                 descriptor
                     .validate_s_rel(stores[*sri].get(&s_rel)?.data())
                     .map_err(CandleError::Msg)?;
                 descriptor
-                    .validate_s_channel(f32_le_planes(stores[*sci].get(&s_channel)?.data()))
+                    .validate_s_channel(&f32_le_planes(stores[*sci].get(&s_channel)?.data()))
                     .map_err(CandleError::Msg)?;
                 descriptor
-                    .validate_codebook(f32_le_planes(stores[*cbi].get(&codebook)?.data()))
+                    .validate_codebook(&f32_le_planes(stores[*cbi].get(&codebook)?.data()))
                     .map_err(CandleError::Msg)?;
                 continue;
             }

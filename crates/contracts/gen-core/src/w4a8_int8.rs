@@ -237,7 +237,7 @@ impl W4A8Int8 {
         self.out_features * (self.in_features / 2)                             // packed I8
             + self.out_features * (self.in_features / GROUP_SIZE)              // s_rel F8
             + self.out_features * 4                                            // s_channel F32
-            + 16 * 4                                                           // codebook F32
+            + 16 * 4 // codebook F32
     }
 }
 

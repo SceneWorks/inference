@@ -119,9 +119,7 @@ thread_local! {
     static KERNELS: RefCell<Option<(MetalKernel, MetalKernel, MetalKernel)>> = const { RefCell::new(None) };
 }
 
-fn kernels<T>(
-    f: impl FnOnce(&MetalKernel, &MetalKernel, &MetalKernel) -> Result<T>,
-) -> Result<T> {
+fn kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel, &MetalKernel) -> Result<T>) -> Result<T> {
     crate::nn::prepare_retained_compilation_thread();
     KERNELS.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -394,9 +392,15 @@ impl W4A8Linear {
     /// Retained native arrays only; no dense weight set can be materialized through this API.
     pub fn materialize(&self) -> Result<()> {
         eval(
-            [&self.packed, &self.s_rel, &self.s_channel, &self.codebook, &self.rotation]
-                .into_iter()
-                .chain(self.bias.iter()),
+            [
+                &self.packed,
+                &self.s_rel,
+                &self.s_channel,
+                &self.codebook,
+                &self.rotation,
+            ]
+            .into_iter()
+            .chain(self.bias.iter()),
         )?;
         Ok(())
     }

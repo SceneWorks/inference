@@ -58,7 +58,9 @@ impl W4A8Linear {
     /// as dense. Candle carries original I8 two's-complement weight bytes as U8, as in S4.
     pub fn from_weights(w: &Weights, base: &str, bias: bool) -> Result<Option<Self>> {
         let companions = ["weight_codebook", "weight_s_rel", "weight_s_channel"];
-        let has_companions = companions.iter().any(|s| w.contains(&format!("{base}.{s}")));
+        let has_companions = companions
+            .iter()
+            .any(|s| w.contains(&format!("{base}.{s}")));
         let dk = format!("{base}.comfy_quant");
         if !w.contains(&dk) {
             if has_companions {
@@ -90,9 +92,7 @@ impl W4A8Linear {
         }
         for suffix in ["weight_scale", "scales", "biases", "weight_correction"] {
             if w.contains(&format!("{base}.{suffix}")) {
-                return Err(CandleError::Msg(format!(
-                    "{base}: W4A8 forbids .{suffix}"
-                )));
+                return Err(CandleError::Msg(format!("{base}: W4A8 forbids .{suffix}")));
             }
         }
         let codes = w.require(&format!("{base}.weight"))?;
@@ -121,18 +121,23 @@ impl W4A8Linear {
         let s_rel = {
             let (storage, layout) = rel_cpu.storage_and_layout();
             match &*storage {
-                candle_core::Storage::Cpu(candle_core::CpuStorage::F8E4M3(values)) => {
-                    values[layout.start_offset()..layout.start_offset() + rel_cpu.elem_count()]
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect::<Vec<u8>>()
+                candle_core::Storage::Cpu(candle_core::CpuStorage::F8E4M3(values)) => values
+                    [layout.start_offset()..layout.start_offset() + rel_cpu.elem_count()]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u8>>(),
+                _ => {
+                    return Err(CandleError::Msg(format!(
+                        "{base}: expected CPU FP8 storage"
+                    )))
                 }
-                _ => return Err(CandleError::Msg(format!("{base}: expected CPU FP8 storage"))),
             }
         };
         let levels = codebook.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
         let channels = s_channel.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
-        descriptor.validate_s_rel(&s_rel).map_err(CandleError::Msg)?;
+        descriptor
+            .validate_s_rel(&s_rel)
+            .map_err(CandleError::Msg)?;
         descriptor
             .validate_codebook(&levels)
             .map_err(CandleError::Msg)?;
@@ -243,9 +248,7 @@ impl W4A8Linear {
                 // pre-fold xs*s_channel, and round to the output dtype only after adding bias.
                 let y = acc.broadcast_mul(&xs)?.broadcast_mul(&scales)?;
                 let y = match &self.bias {
-                    Some(b) => {
-                        y.broadcast_add(&b.narrow(0, row, rows)?.to_dtype(DType::F32)?)?
-                    }
+                    Some(b) => y.broadcast_add(&b.narrow(0, row, rows)?.to_dtype(DType::F32)?)?,
                     None => y,
                 };
                 outputs.push(y.to_dtype(x.dtype())?);
@@ -282,8 +285,7 @@ mod tests {
         );
         map.insert(
             "p.weight_s_rel".into(),
-            Tensor::from_raw_buffer(&[0x38; 256], DType::F8E4M3, &[16, 16], device)
-                .unwrap(),
+            Tensor::from_raw_buffer(&[0x38; 256], DType::F8E4M3, &[16, 16], device).unwrap(),
         );
         map.insert(
             "p.weight_s_channel".into(),
@@ -333,8 +335,7 @@ mod tests {
         let mut map = operands();
         map.insert(
             "p.weight_s_rel".into(),
-            Tensor::from_raw_buffer(&[0x7f; 256], DType::F8E4M3, &[16, 16], &Device::Cpu)
-                .unwrap(),
+            Tensor::from_raw_buffer(&[0x7f; 256], DType::F8E4M3, &[16, 16], &Device::Cpu).unwrap(),
         );
         let err = W4A8Linear::from_weights(&Weights::from_map(map), "p", false).unwrap_err();
         assert!(err.to_string().contains("non-negative finite E4M3FN"));
@@ -347,16 +348,19 @@ mod tests {
             "p.weight".into(),
             Tensor::zeros((16, 256), DType::F32, &Device::Cpu).unwrap(),
         );
-        assert!(W4A8Linear::from_weights(&Weights::from_map(map), "p", false)
-            .unwrap()
-            .is_none());
+        assert!(
+            W4A8Linear::from_weights(&Weights::from_map(map), "p", false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn validated_w4a8_refuses_a_floating_fallback() {
-        let err = W4A8Linear::from_weights(&Weights::from_map(operands()), "p", false)
-            .unwrap_err();
-        assert!(err.to_string().contains("requires native CUDA; no floating fallback"));
+        let err = W4A8Linear::from_weights(&Weights::from_map(operands()), "p", false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires native CUDA; no floating fallback"));
     }
 }

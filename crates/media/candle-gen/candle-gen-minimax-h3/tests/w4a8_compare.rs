@@ -7,7 +7,10 @@
 //! external `output`. The JSON's optional provenance fields are ignored.
 use candle_gen::gen_core;
 #[cfg(feature = "cuda")]
-use candle_gen::{candle_core::{DType, Device, Tensor}, Weights};
+use candle_gen::{
+    candle_core::{DType, Device, Tensor},
+    Weights,
+};
 #[cfg(feature = "cuda")]
 use candle_gen_minimax_h3::quant::{lin, DIT};
 #[cfg(feature = "cuda")]
@@ -36,10 +39,19 @@ fn signed(v: &Value) -> Vec<i8> {
 #[test]
 fn host_packed_decode_matches_the_external_reference() {
     let fx = fixture();
-    assert_eq!(fx["reference"]["noDenseFallback"], true, "reference must declare no dense fallback");
+    assert_eq!(
+        fx["reference"]["noDenseFallback"], true,
+        "reference must declare no dense fallback"
+    );
     for case in fx["cases"].as_array().unwrap() {
-        let (n, k) = (case["n"].as_u64().unwrap() as usize, case["k"].as_u64().unwrap() as usize);
-        let packed: Vec<i8> = unsigned(&case["packedWeight"]).into_iter().map(|b| b as i8).collect();
+        let (n, k) = (
+            case["n"].as_u64().unwrap() as usize,
+            case["k"].as_u64().unwrap() as usize,
+        );
+        let packed: Vec<i8> = unsigned(&case["packedWeight"])
+            .into_iter()
+            .map(|b| b as i8)
+            .collect();
         let mut got = Vec::new();
         gen_core::w4a8_int8::dequant_packed_to_int8(
             &packed,
@@ -50,7 +62,12 @@ fn host_packed_decode_matches_the_external_reference() {
             &mut got,
         )
         .expect("decode");
-        assert_eq!(got, signed(&case["expected"]["decodedWeightI8"]), "case {}", case["id"]);
+        assert_eq!(
+            got,
+            signed(&case["expected"]["decodedWeightI8"]),
+            "case {}",
+            case["id"]
+        );
     }
 }
 
@@ -58,11 +75,20 @@ fn host_packed_decode_matches_the_external_reference() {
 /// production loader path rather than a hand-built `Weights` map.
 #[cfg(feature = "cuda")]
 fn write_case(path: &std::path::Path, case: &Value) {
-    let (n, k) = (case["n"].as_u64().unwrap() as usize, case["k"].as_u64().unwrap() as usize);
+    let (n, k) = (
+        case["n"].as_u64().unwrap() as usize,
+        case["k"].as_u64().unwrap() as usize,
+    );
     let packed = unsigned(&case["packedWeight"]);
     let s_rel = unsigned(&case["sRelBits"]);
-    let codebook: Vec<u8> = floats(&case["codebook"]).iter().flat_map(|&v| v.to_le_bytes()).collect();
-    let channel: Vec<u8> = floats(&case["sChannel"]).iter().flat_map(|&v| v.to_le_bytes()).collect();
+    let codebook: Vec<u8> = floats(&case["codebook"])
+        .iter()
+        .flat_map(|&v| v.to_le_bytes())
+        .collect();
+    let channel: Vec<u8> = floats(&case["sChannel"])
+        .iter()
+        .flat_map(|&v| v.to_le_bytes())
+        .collect();
     let bias: Option<Vec<u8>> = case
         .get("bias")
         .filter(|b| !b.is_null())
@@ -74,8 +100,14 @@ fn write_case(path: &std::path::Path, case: &Value) {
     }))
     .unwrap();
     let mut tensors = std::collections::HashMap::from([
-        ("p.weight", TensorView::new(Dtype::I8, vec![n, k / 2], &packed).unwrap()),
-        ("p.weight_codebook", TensorView::new(Dtype::F32, vec![16], &codebook).unwrap()),
+        (
+            "p.weight",
+            TensorView::new(Dtype::I8, vec![n, k / 2], &packed).unwrap(),
+        ),
+        (
+            "p.weight_codebook",
+            TensorView::new(Dtype::F32, vec![16], &codebook).unwrap(),
+        ),
         (
             "p.weight_s_rel",
             TensorView::new(Dtype::F8_E4M3, vec![n, k / 16], &s_rel).unwrap(),
@@ -84,10 +116,16 @@ fn write_case(path: &std::path::Path, case: &Value) {
             "p.weight_s_channel",
             TensorView::new(Dtype::F32, vec![n], &channel).unwrap(),
         ),
-        ("p.comfy_quant", TensorView::new(Dtype::U8, vec![desc.len()], &desc).unwrap()),
+        (
+            "p.comfy_quant",
+            TensorView::new(Dtype::U8, vec![desc.len()], &desc).unwrap(),
+        ),
     ]);
     if let Some(bytes) = &bias {
-        tensors.insert("p.bias", TensorView::new(Dtype::F32, vec![n], bytes).unwrap());
+        tensors.insert(
+            "p.bias",
+            TensorView::new(Dtype::F32, vec![n], bytes).unwrap(),
+        );
     }
     serialize_to_file(tensors, &None, path).unwrap();
 }
@@ -101,7 +139,10 @@ fn native_forward_matches_the_external_reference() {
     let fx = fixture();
     let device = Device::new_cuda(0).expect("reserved CUDA runner must provide a real device");
     for case in fx["cases"].as_array().unwrap() {
-        let (n, k) = (case["n"].as_u64().unwrap() as usize, case["k"].as_u64().unwrap() as usize);
+        let (n, k) = (
+            case["n"].as_u64().unwrap() as usize,
+            case["k"].as_u64().unwrap() as usize,
+        );
         let m = case["m"].as_u64().unwrap() as usize;
         // The shared cuBLASLt INT8 IGEMM requires an output width that is a multiple of 16; the
         // small-n discriminator cases (n=4/8) are covered by the host decode and the MLX native
@@ -113,7 +154,14 @@ fn native_forward_matches_the_external_reference() {
         let file = dir.path().join("case.safetensors");
         write_case(&file, case);
         let w = Weights::from_files_native_int8(&[&file], &device).expect("reader");
-        let loaded = lin(&w, DIT, "p", case.get("bias").map_or(false, |b| !b.is_null()), DType::BF16).expect("load W4A8");
+        let loaded = lin(
+            &w,
+            DIT,
+            "p",
+            case.get("bias").map_or(false, |b| !b.is_null()),
+            DType::BF16,
+        )
+        .expect("load W4A8");
         assert!(loaded.linear.is_w4a8(), "case {} must be W4A8", case["id"]);
         // The H3 hidden state is BF16; the production forward casts its output to the input dtype,
         // so BF16 input reproduces the reference's single BF16 RN store.
@@ -122,7 +170,18 @@ fn native_forward_matches_the_external_reference() {
             .to_dtype(DType::BF16)
             .expect("x bf16");
         let y = loaded.linear.forward(&x).expect("forward");
-        let got = y.to_dtype(DType::F32).expect("f32").flatten_all().expect("flat").to_vec1::<f32>().expect("vec");
-        assert_eq!(got, floats(&case["expected"]["output"]), "case {} forward", case["id"]);
+        let got = y
+            .to_dtype(DType::F32)
+            .expect("f32")
+            .flatten_all()
+            .expect("flat")
+            .to_vec1::<f32>()
+            .expect("vec");
+        assert_eq!(
+            got,
+            floats(&case["expected"]["output"]),
+            "case {} forward",
+            case["id"]
+        );
     }
 }

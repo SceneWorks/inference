@@ -88,7 +88,6 @@ pub mod eight_bit_linear;
 pub use adapt::{AdaptLinear, LokrFactors};
 pub use adapters::{install_dotted_adapters, AdditiveAdapterReport};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
-pub use w4a8_int8::W4A8Linear;
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
     NVFP4_BLOCK,
@@ -99,6 +98,7 @@ pub use repack::{
     repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
 pub use sidecar::PackedWeightSidecars;
+pub use w4a8_int8::W4A8Linear;
 
 pub use cublaslt::{
     compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor, quantize_activation_fp8,

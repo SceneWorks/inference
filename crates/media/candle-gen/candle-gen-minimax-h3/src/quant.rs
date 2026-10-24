@@ -564,7 +564,12 @@ mod tests {
 
     #[test]
     fn native_w4a8_markers_never_reach_dense_loaders() {
-        for suffix in ["comfy_quant", "weight_codebook", "weight_s_rel", "weight_s_channel"] {
+        for suffix in [
+            "comfy_quant",
+            "weight_codebook",
+            "weight_s_rel",
+            "weight_s_channel",
+        ] {
             let mut map = HashMap::new();
             map.insert(
                 format!("p.{suffix}"),

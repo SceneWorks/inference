@@ -31,14 +31,20 @@ fn unsigned(v: &Value) -> Vec<u8> {
 #[ignore = "requires coordinator-reserved exclusive local Metal token; never skip-as-pass"]
 fn native_forward_matches_the_external_reference() {
     let fx = fixture();
-    assert_eq!(fx["reference"]["noDenseFallback"], true, "reference must declare no dense fallback");
+    assert_eq!(
+        fx["reference"]["noDenseFallback"], true,
+        "reference must declare no dense fallback"
+    );
     for case in fx["cases"].as_array().unwrap() {
         let (m, n, k) = (
             case["m"].as_u64().unwrap() as i32,
             case["n"].as_u64().unwrap() as i32,
             case["k"].as_u64().unwrap() as i32,
         );
-        let packed: Vec<i8> = unsigned(&case["packedWeight"]).into_iter().map(|b| b as i8).collect();
+        let packed: Vec<i8> = unsigned(&case["packedWeight"])
+            .into_iter()
+            .map(|b| b as i8)
+            .collect();
         let desc = serde_json::to_vec(&serde_json::json!({
             "convrot_groupsize": 256,
             "format": "asym_w4a8_int8",
@@ -47,9 +53,18 @@ fn native_forward_matches_the_external_reference() {
         .unwrap();
         let mut parts: Vec<(String, Array)> = vec![
             ("p.weight".into(), Array::from_slice(&packed, &[n, k / 2])),
-            ("p.weight_codebook".into(), Array::from_slice(&floats(&case["codebook"]), &[16])),
-            ("p.weight_s_rel".into(), Array::from_slice(&unsigned(&case["sRelBits"]), &[n, k / 16])),
-            ("p.weight_s_channel".into(), Array::from_slice(&floats(&case["sChannel"]), &[n])),
+            (
+                "p.weight_codebook".into(),
+                Array::from_slice(&floats(&case["codebook"]), &[16]),
+            ),
+            (
+                "p.weight_s_rel".into(),
+                Array::from_slice(&unsigned(&case["sRelBits"]), &[n, k / 16]),
+            ),
+            (
+                "p.weight_s_channel".into(),
+                Array::from_slice(&floats(&case["sChannel"]), &[n]),
+            ),
             (
                 "p.comfy_quant".into(),
                 Array::from_slice(&desc, &[desc.len() as i32]),
@@ -64,15 +79,38 @@ fn native_forward_matches_the_external_reference() {
         Array::save_safetensors(parts.iter().map(|(k, v)| (k.as_str(), v)), None, &file).unwrap();
         let w = Weights::from_file(&file).unwrap();
         let linear = quant::lin(&w, "p", case.get("bias").map_or(false, |b| !b.is_null())).unwrap();
-        assert!(linear.w4a8_base().is_some(), "case {} must be W4A8", case["id"]);
-        assert!(linear.convrot_base().is_none(), "case {} is W4A8, not ConvRot", case["id"]);
-        assert!(linear.dense_weight().is_none(), "case {} must not be a dense fallback", case["id"]);
+        assert!(
+            linear.w4a8_base().is_some(),
+            "case {} must be W4A8",
+            case["id"]
+        );
+        assert!(
+            linear.convrot_base().is_none(),
+            "case {} is W4A8, not ConvRot",
+            case["id"]
+        );
+        assert!(
+            linear.dense_weight().is_none(),
+            "case {} must not be a dense fallback",
+            case["id"]
+        );
         drop(w);
         // The H3 hidden state is BF16; `compute_dtype` is Bfloat16 for W4A8, and the external
         // reference rounds the store to BF16 once (`single BF16 RN at the store`).
-        let x = Array::from_slice(&floats(&case["x"]), &[m, k]).as_dtype(Dtype::Bfloat16).unwrap();
-        let out = linear.forward(&x).unwrap().as_dtype(Dtype::Float32).unwrap();
+        let x = Array::from_slice(&floats(&case["x"]), &[m, k])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let out = linear
+            .forward(&x)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
         eval([&out]).unwrap();
-        assert_eq!(out.as_slice::<f32>(), floats(&case["expected"]["output"]).as_slice(), "case {} forward", case["id"]);
+        assert_eq!(
+            out.as_slice::<f32>(),
+            floats(&case["expected"]["output"]).as_slice(),
+            "case {} forward",
+            case["id"]
+        );
     }
 }
