@@ -1139,6 +1139,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024**2,
         }
         self.sampled = []
+        self.membership_samples = []
+        self.supervision_start = None
 
     def test_native_host_probe_and_trusted_cuda_probe_path(self):
         from scripts import media_campaign_windows as windows
@@ -1153,6 +1155,11 @@ class WindowsSupervisorTests(unittest.TestCase):
         path.write_text(json.dumps(policy_data), encoding="utf-8")
         policy = safety.load_policy(path)
         parent = self
+        def observed_real_clock():
+            now = time.monotonic()  # Observe, never pause/advance/substitute the real deadline clock.
+            if parent.supervision_start is None:
+                parent.supervision_start = now
+            return now
         class Probe:
             def host_free(self):
                 return 10**12
@@ -1163,6 +1170,8 @@ class WindowsSupervisorTests(unittest.TestCase):
             def tree_footprint(self, owner):
                 amount = owner.footprint_bytes()
                 parent.sampled.append(amount)
+                members = owner.members()
+                parent.membership_samples.append((observed_real_clock(), members))
                 return amount
             def gpu_free_and_tree_bytes(self, owner):
                 # GPU collection is separately fixture-tested; these children never touch CUDA.
@@ -1170,7 +1179,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
-            probe=Probe(),
+            probe=Probe(), clock=observed_real_clock,
             on_spawn=on_spawn,
         )
 
@@ -1196,17 +1205,29 @@ class WindowsSupervisorTests(unittest.TestCase):
             kernel.CloseHandle(handle)
 
     def test_deadline_reaps_root_and_grandchild_after_root_exit(self):
-        grandchild = "import os,time; b=bytearray(4*1024*1024); open('grandchild-pid','w').write(str(os.getpid())); time.sleep(10)"
+        grandchild = "import time; b=bytearray(4*1024*1024); time.sleep(10)"
+        # Popen already knows the real process identity. Publishing it here does not
+        # depend on a second interpreter reaching a self-report before the deadline.
         script = (
-            "import os,subprocess,sys,time; "
+            "import os,subprocess,sys; from pathlib import Path; "
             f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
-            "open('root-pid','w').write(str(os.getpid())); time.sleep(.5)"
-        )
+            "Path('root-pid').write_text(str(os.getpid()),encoding='ascii'); "
+            "Path('grandchild-pid').write_text(str(p.pid),encoding='ascii')"
+        )  # Root exits immediately; the real Job must still own its live descendant.
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
             self._run(script)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
-        self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
+        root_pid = int((self.root / "root-pid").read_text(encoding="ascii"))
+        grandchild_pid = int((self.root / "grandchild-pid").read_text(encoding="ascii"))
+        self.assertIsNotNone(self.supervision_start)
+        self.assertTrue(
+            any(grandchild_pid in members and root_pid not in members
+                and at < self.supervision_start + self.data["deadlineSeconds"]
+                for at, members in self.membership_samples),
+            "deadline test never observed an owned live grandchild after root exit and before the deadline",
+        )
+        self._assert_exited(root_pid)
+        self._assert_exited(grandchild_pid)
 
     def test_child_cap_aborts_and_reaps(self):
         with self.assertRaisesRegex(safety.SupervisionError, "child-footprint"):
