@@ -1,5 +1,8 @@
 // sc-26683: Kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6 rowwise semantics.
-// The input has already been ConvRot-rotated and rounded to the source dtype.
+// The input is the ConvRot-rotated row. It may arrive already rounded to the source dtype (the S4
+// ConvRot INT8 codec, whose authority rotates in the Python/dense path) or as the pinned F32 FHT
+// output (W4A8, whose authority fuses the butterfly into this kernel) — `source_round` below is
+// idempotent, so the identical scale/quotient rounding applies either way.
 __device__ float source_round(float x, int dtype) {
     if (dtype == 1) {
         unsigned int u = __float_as_uint(x);
@@ -34,7 +37,9 @@ extern "C" __global__ void kitchen_int8_quantize(
     if(tid==0) scales[blockIdx.x]=scale;
     float divisor=source_round(scale,dtype);
     for (int j=tid;j<k;j+=256) {
-        float z=source_round(x[offset+j]/divisor,dtype);
+        // int8_linear.cu `quant_div_float_to_float<T>`: the numerator is rounded to the source
+        // dtype, THEN divided by the dtype-rounded scale, then the quotient is rounded again.
+        float z=source_round(source_round(x[offset+j],dtype)/divisor,dtype);
         float rounded=fminf(127.0f,fmaxf(-128.0f,nearbyintf(z)));
         q[offset+j]=(unsigned char)(signed char)rounded;
     }

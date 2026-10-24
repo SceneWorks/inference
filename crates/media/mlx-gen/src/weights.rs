@@ -153,10 +153,10 @@ impl Weights {
 
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.
     ///
-    /// MLX has no fp8 storage dtype, but does expose byte-accurate E4M3
-    /// conversion. The regular loader therefore rejects fp8 files before a
-    /// provider can normalize them; this opt-in loader preserves the ordinary
-    /// path for all other dtypes and converts only fp8 tensor views.
+    /// MLX has no fp8 storage dtype: its safetensors reader maps `F8_E4M3` / `F8_E8M0` to **raw
+    /// uint8 bytes** (`mlx/io/safetensors.cpp`, sc-26685 audit), so the regular loader hands a W4A8
+    /// `weight_s_rel` back as `Dtype::Uint8`. This opt-in loader is the separate fp8→bf16 path for
+    /// the fp8 VAE weights that need the numeric conversion, and is never used by the H3 DiT.
     pub fn from_file_with_fp8(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_file_with_fp8_filter(path, |_| true)
     }

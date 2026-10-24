@@ -68,6 +68,7 @@ pub mod transcribe;
 pub mod transform;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
+pub mod w4a8_int8;
 pub mod wan_i2v_memory;
 pub mod weightsmeta;
 

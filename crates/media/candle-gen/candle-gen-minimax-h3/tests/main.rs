@@ -69,3 +69,9 @@ mod video_vae_parity;
 
 #[path = "vram_probe.rs"]
 mod vram_probe;
+
+#[path = "w4a8_compare.rs"]
+mod w4a8_compare;
+
+#[path = "w4a8_reader.rs"]
+mod w4a8_reader;

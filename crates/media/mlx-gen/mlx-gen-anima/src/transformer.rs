@@ -160,11 +160,20 @@ pub(crate) enum Qkv {
     /// Self-attention — all three read one activation, so they are packed.
     SelfFused(FusedQkvProjection),
     /// Cross-attention — `q` reads the query stream, `k`/`v` the encoder stream. Never packed.
-    Cross {
-        q: AdaptableLinear,
-        k: AdaptableLinear,
-        v: AdaptableLinear,
-    },
+    ///
+    /// Boxed: three [`AdaptableLinear`]s inline make this variant 360 bytes against the packed
+    /// arm's 152, and the enum is stored once per attention block (a `Qkv` is a construction-time
+    /// fact, never a per-call one), so the extra indirection costs one allocation at load and keeps
+    /// every `Qkv` move small.
+    Cross(Box<CrossQkv>),
+}
+
+/// The three independent projections of a cross-attention (the payload of [`Qkv::Cross`]).
+#[derive(Clone)]
+pub(crate) struct CrossQkv {
+    pub(crate) q: AdaptableLinear,
+    pub(crate) k: AdaptableLinear,
+    pub(crate) v: AdaptableLinear,
 }
 
 /// The projected q/k/v, owned so [`Projected::source`] can hand out a borrowing
@@ -189,7 +198,7 @@ impl Qkv {
     }
 
     pub(crate) fn cross_attn(q: AdaptableLinear, k: AdaptableLinear, v: AdaptableLinear) -> Self {
-        Qkv::Cross { q, k, v }
+        Qkv::Cross(Box::new(CrossQkv { q, k, v }))
     }
 
     /// `true` for a self-attention, i.e. the representation that assumes ONE input stream. The
@@ -203,10 +212,10 @@ impl Qkv {
     pub(crate) fn project(&self, q_src: &Array, kv_src: &Array) -> Result<Projected> {
         match self {
             Qkv::SelfFused(p) => Ok(Projected::Packed(p.forward_packed(q_src)?)),
-            Qkv::Cross { q, k, v } => Ok(Projected::Separate(
-                q.forward(q_src)?,
-                k.forward(kv_src)?,
-                v.forward(kv_src)?,
+            Qkv::Cross(c) => Ok(Projected::Separate(
+                c.q.forward(q_src)?,
+                c.k.forward(kv_src)?,
+                c.v.forward(kv_src)?,
             )),
         }
     }
@@ -215,10 +224,10 @@ impl Qkv {
     pub(crate) fn part_mut(&mut self, part: QkvPart) -> Option<&mut AdaptableLinear> {
         match self {
             Qkv::SelfFused(p) => p.part_mut(part).ok(),
-            Qkv::Cross { q, k, v } => Some(match part {
-                QkvPart::Q => q,
-                QkvPart::K => k,
-                QkvPart::V => v,
+            Qkv::Cross(c) => Some(match part {
+                QkvPart::Q => &mut c.q,
+                QkvPart::K => &mut c.k,
+                QkvPart::V => &mut c.v,
             }),
         }
     }
@@ -227,10 +236,10 @@ impl Qkv {
     pub(crate) fn part_facts(&self, part: QkvPart) -> LinearFacts {
         match self {
             Qkv::SelfFused(p) => p.part_facts(part),
-            Qkv::Cross { q, k, v } => LinearFacts::of(match part {
-                QkvPart::Q => q,
-                QkvPart::K => k,
-                QkvPart::V => v,
+            Qkv::Cross(c) => LinearFacts::of(match part {
+                QkvPart::Q => &c.q,
+                QkvPart::K => &c.k,
+                QkvPart::V => &c.v,
             }),
         }
     }
