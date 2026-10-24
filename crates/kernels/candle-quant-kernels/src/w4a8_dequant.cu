@@ -16,6 +16,10 @@
 
 typedef unsigned char uint8_t;
 typedef signed char int8_t;
+// nvrtc compiles this source without cuda_runtime.h, so the CUDA `uint` typedef is not visible
+// (nvcc gets it from its pre-included headers; nvrtc does not). Define it here rather than rely
+// on that toolchain difference.
+typedef unsigned int uint;
 
 // OCP E4M3FN byte -> f32, bit-identical to `gen_core::comfy_quant::fp8_e4m3fn_to_f32` and the MLX
 // DEQUANT kernel: exponent 0 is subnormal (mantissa/8 · 2^-6); 0x7F/0xFF are NaN (which

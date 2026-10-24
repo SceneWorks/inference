@@ -866,12 +866,15 @@ fn lokr_rejects_unknown_partial_unmatched_and_false_kind_claims() {
             "unknown tensor key",
         ),
         (
+            // A recognized target that matches no module classifies as the `NoSuchModule` generic
+            // strict-install miss — naming the path — NOT the file-level zero-match error (that
+            // one is reserved for files with no recognized targets at all).
             "unmatched.safetensors",
             vec![
                 ("transformer_blocks.99.attn.to_q.lokr_w1".into(), w1.clone()),
                 ("transformer_blocks.99.attn.to_q.lokr_w2".into(), w2.clone()),
             ],
-            "no target modules matched",
+            "matched no module",
         ),
     ] {
         let path = write_lokr(dir.path(), name, arrays, "1", "1");

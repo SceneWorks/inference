@@ -16,6 +16,9 @@ mod common;
 #[path = "adaln_evict_memory.rs"]
 mod adaln_evict_memory;
 
+#[path = "adapter_topology.rs"]
+mod adapter_topology;
+
 #[path = "audio_vae_encode_parity.rs"]
 mod audio_vae_encode_parity;
 

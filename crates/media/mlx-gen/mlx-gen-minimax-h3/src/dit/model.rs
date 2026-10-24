@@ -414,6 +414,15 @@ impl MiniMaxH3Dit {
         self.pruned.as_ref().map(PrunedAdaLnRuntime::identity)
     }
 
+    /// Which AdaLN modulation topology this checkpoint presents — the axis the strict adapter
+    /// install ([`crate::adapters`]) classifies unmatched targets against.
+    pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        match self.pruned {
+            Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            None => crate::adapters::AdaLnSurface::FullTimestepMlp,
+        }
+    }
+
     /// Refuse a compatibility mismatch: `Err` when this DiT is not pruned, or when its pruning
     /// identity differs from `expected`.
     pub fn ensure_pruning_identity(&self, expected: &PruningIdentity) -> Result<()> {
