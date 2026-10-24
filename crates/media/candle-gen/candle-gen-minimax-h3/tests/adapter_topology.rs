@@ -43,7 +43,7 @@ use candle_gen_minimax_h3::{
     JointSchedule, MiniMaxH3Dit, MiniMaxH3DitConfig, UnmatchedTargetClass, AUDIO_SIGMA_SHIFT,
 };
 
-use common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
+use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
 
 /// The module the numeric arms probe — `[96, 64]` at the fixture geometry.
 const PROBE: &str = "transformer_blocks.0.attn.to_q";
@@ -146,9 +146,8 @@ fn write_safetensors(path: &Path, arrays: &[(String, Tensor)], meta: &[(&str, &s
                 DType::F32 => safetensors::Dtype::F32,
                 other => panic!("unhandled fixture dtype {other:?}"),
             };
-            let view =
-                safetensors::tensor::TensorView::new(dtype, t.dims().to_vec(), &buffers[i])
-                    .expect("tensor view");
+            let view = safetensors::tensor::TensorView::new(dtype, t.dims().to_vec(), &buffers[i])
+                .expect("tensor view");
             (k.clone(), view)
         })
         .collect();
@@ -384,19 +383,25 @@ fn max_abs(t: &Tensor) -> f32 {
         .expect("scalar")
 }
 
-/// Independent `((x·a)·b)·scale` in f64, where `a` is the stored `[rank, in]` lora_A transposed
-/// and `b` the stored `[out, rank]` lora_B times the fold — computed from the **actual file
-/// bytes**, widened exactly, so the only tolerance left absorbs accumulation order.
-fn reference_residual(
-    a: &[f32],
-    b: &[f32],
+/// The stored factor bytes a reference computation reads: `a` is the `[rank, in]` lora_A and `b`
+/// the `[out, rank]` lora_B, both widened from the actual file bytes.
+struct LoraFactors<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
     in_dim: usize,
     out: usize,
+}
+
+/// Independent `((x·a)·b)·scale` in f64 — computed from the **actual file bytes**, widened
+/// exactly, so the only tolerance left absorbs accumulation order.
+fn reference_residual(
+    factors: LoraFactors<'_>,
     fold: f32,
     scale: f32,
     x: &[f32],
     rows: usize,
 ) -> Vec<f64> {
+    let LoraFactors { a, b, in_dim, out } = factors;
     let rank = a.len() / in_dim;
     assert_eq!(b.len() % rank, 0, "lora_B must be [out, rank]");
     let mut y = vec![0.0f64; rows * out];
@@ -438,8 +443,16 @@ fn fixture_factors(
         .tensors
         .get(&format!("{target}.lora_B.default.weight"))
         .unwrap_or_else(|| panic!("{target} lora_B"));
-    assert_eq!(a.dims2().expect("2-D"), (rank, inn), "{target} lora_A shape");
-    assert_eq!(b.dims2().expect("2-D"), (out, rank), "{target} lora_B shape");
+    assert_eq!(
+        a.dims2().expect("2-D"),
+        (rank, inn),
+        "{target} lora_A shape"
+    );
+    assert_eq!(
+        b.dims2().expect("2-D"),
+        (out, rank),
+        "{target} lora_B shape"
+    );
     (f32s(a), f32s(b))
 }
 
@@ -479,7 +492,12 @@ fn assert_matches_reference_rel(got: &[f32], want: &[f64], tol: f64, what: &str)
 fn body_deltas_are_identical_across_full_and_pruned_topologies() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
-    let lora = write_lora(dir.path(), "body.safetensors", &all_targets(&cfg), Some("128"));
+    let lora = write_lora(
+        dir.path(),
+        "body.safetensors",
+        &all_targets(&cfg),
+        Some("128"),
+    );
     let x = tensor(&[3, cfg.hidden_size], 0.7);
 
     for target in [PROBE, PROBE_FFN] {
@@ -501,7 +519,18 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
 
         let (a, b) = fixture_factors(&lora, target, PUBLISHED_RANK, inn, out);
         let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(&a, &b, inn, out, fold, 1.0, &f32s(&x), 3);
+        let want = reference_residual(
+            LoraFactors {
+                a: &a,
+                b: &b,
+                in_dim: inn,
+                out,
+            },
+            fold,
+            1.0,
+            &f32s(&x),
+            3,
+        );
         assert_matches_reference(&f32s(&full_res), &want, target);
     }
 }
@@ -531,7 +560,12 @@ fn full_topology_adaln_targets_are_refused_specifically_per_topology() {
         18 * cfg.hidden_size,
         cfg.time_embed_dim,
     ));
-    let lora = write_lora(dir.path(), "adaln_targets.safetensors", &targets, Some("128"));
+    let lora = write_lora(
+        dir.path(),
+        "adaln_targets.safetensors",
+        &targets,
+        Some("128"),
+    );
 
     // The typed contract: the same stems are a topology mismatch on the pruned curve and a
     // deliberate exclusion on the full surface — never a generic miss.
@@ -552,10 +586,9 @@ fn full_topology_adaln_targets_are_refused_specifically_per_topology() {
         );
     }
 
-    let pruned_error =
-        apply_minimax_h3_adapters(&mut pruned_dit(&cfg), &[spec(lora.clone(), 1.0)])
-            .expect_err("the pruned curve must refuse full-topology AdaLN targets")
-            .to_string();
+    let pruned_error = apply_minimax_h3_adapters(&mut pruned_dit(&cfg), &[spec(lora.clone(), 1.0)])
+        .expect_err("the pruned curve must refuse full-topology AdaLN targets")
+        .to_string();
     assert!(
         pruned_error.contains("pruned coordinate-table"),
         "the refusal must name the topology: {pruned_error}"
@@ -587,7 +620,11 @@ fn real_but_unaddressable_modules_name_the_exclusion() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
     let mut targets = all_targets(&cfg);
-    targets.push(("context_embedder".to_string(), cfg.hidden_size, cfg.text_dim));
+    targets.push((
+        "context_embedder".to_string(),
+        cfg.hidden_size,
+        cfg.text_dim,
+    ));
     targets.push((
         "transformer_blocks.0.norm1".to_string(),
         cfg.hidden_size,
@@ -789,7 +826,8 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
     );
 
     let af = candle_gen::train::merge::read_adapter(&comfy_path).expect("read back");
-    let converted = convert_comfyui_key_space(&af.tensors, &af.meta).expect("the ComfyUI conversion");
+    let converted =
+        convert_comfyui_key_space(&af.tensors, &af.meta).expect("the ComfyUI conversion");
     assert!(
         !is_comfyui_key_space(converted.keys().map(String::as_str)),
         "the conversion must leave no ComfyUI module behind"
@@ -843,8 +881,23 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
             .expect("converted lora_B"),
     );
     let fold = alpha_rank_fold(emitted_alpha, 2.0);
-    let want = reference_residual(&a, &b, in_dim, out_dim, fold, 1.0, &f32s(&x), 3);
-    assert_matches_reference(&f32s(&pruned_res), &want, "converted qkv on the pruned curve");
+    let want = reference_residual(
+        LoraFactors {
+            a: &a,
+            b: &b,
+            in_dim,
+            out: out_dim,
+        },
+        fold,
+        1.0,
+        &f32s(&x),
+        3,
+    );
+    assert_matches_reference(
+        &f32s(&pruned_res),
+        &want,
+        "converted qkv on the pruned curve",
+    );
 }
 
 /// The delta is independent of the body it folds onto: the same adapter file on a **different**
@@ -856,7 +909,12 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
 fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
-    let lora = write_lora(dir.path(), "body.safetensors", &all_targets(&cfg), Some("128"));
+    let lora = write_lora(
+        dir.path(),
+        "body.safetensors",
+        &all_targets(&cfg),
+        Some("128"),
+    );
     let x = tensor(&[3, cfg.hidden_size], 0.7);
     let s = segs(PROBE);
 
@@ -866,7 +924,11 @@ fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
             MiniMaxH3Dit::from_weights(&w, &cfg, &dev(), DType::F32)
                 .unwrap_or_else(|_| panic!("load {what}"))
         };
-        let y0 = base.adaptable_mut(&s).expect("probe").forward(&x).expect("base");
+        let y0 = base
+            .adaptable_mut(&s)
+            .expect("probe")
+            .forward(&x)
+            .expect("base");
         let mut adapted = {
             let w = if what == "pruned body" {
                 pruned_weights(&cfg, &dev())
@@ -877,7 +939,11 @@ fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
                 .unwrap_or_else(|_| panic!("load {what}"))
         };
         apply_minimax_h3_adapters(&mut adapted, &[spec(lora.clone(), 1.0)]).expect("install");
-        let y1 = adapted.adaptable_mut(&s).expect("probe").forward(&x).expect("adapted");
+        let y1 = adapted
+            .adaptable_mut(&s)
+            .expect("probe")
+            .forward(&x)
+            .expect("adapted");
         (y1 - y0).expect("residual")
     };
 
@@ -914,25 +980,35 @@ fn native_adapter_folds_on_the_pruned_curve() {
     let cfg = dit_fixture_config();
 
     let dir = tempfile::tempdir().expect("fixture dir");
-    let lora = write_lora(dir.path(), "body.safetensors", &all_targets(&cfg), Some("128"));
+    let lora = write_lora(
+        dir.path(),
+        "body.safetensors",
+        &all_targets(&cfg),
+        Some("128"),
+    );
     let x = tensor_on(&[3, cfg.hidden_size], 0.7, &device);
 
     for target in [PROBE, PROBE_FFN] {
         let (out, inn) = target_shape(&cfg, target);
-        let residual = probe_residual(
-            || pruned_dit_on(&cfg, &device),
-            &lora,
-            1.0,
-            target,
-            &x,
-        );
+        let residual = probe_residual(|| pruned_dit_on(&cfg, &device), &lora, 1.0, target, &x);
         assert!(
             max_abs(&residual) > 0.0,
             "{target}: the native residual must be nonzero"
         );
         let (a, b) = fixture_factors(&lora, target, PUBLISHED_RANK, inn, out);
         let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(&a, &b, inn, out, fold, 1.0, &f32s(&x), 3);
+        let want = reference_residual(
+            LoraFactors {
+                a: &a,
+                b: &b,
+                in_dim: inn,
+                out,
+            },
+            fold,
+            1.0,
+            &f32s(&x),
+            3,
+        );
         assert_matches_reference_rel(&f32s(&residual), &want, NATIVE_RELATIVE_TOL, target);
     }
 
