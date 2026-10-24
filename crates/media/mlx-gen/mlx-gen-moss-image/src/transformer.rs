@@ -1516,7 +1516,10 @@ mod edit_fixture_tests {
             std::env::var("MOSS_NATIVE_TEST_ADMITTED").as_deref(),
             Ok("1")
         );
-        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || run_oracle(false));
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            three_reference_negative_stage_probe();
+            run_oracle(false);
+        });
     }
     fn fixture_model(f: &Value, fp32: bool) -> Transformer {
         let weights = Weights::from_map(
@@ -1953,6 +1956,263 @@ mod edit_fixture_tests {
                     )
                 },
             );
+        }
+    }
+
+    // Diagnostic only: independent frozen-source inputs locate the first backend
+    // divergence. The unchanged complete oracle still runs and enforces every bound.
+    fn three_reference_negative_stage_probe() {
+        let f: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_metal_probe/fixture.json"
+        )).unwrap();
+        for case in f["cases"].as_array().unwrap() {
+            let fp32 = case["backbone_dtype"] == "float32";
+            let model = fixture_model(&f, fp32);
+            eprintln!("STAGE_PROBE case: reference_count=3 condition=negative normalized_timestep=0.73 dtype={}", case["backbone_dtype"]);
+            let stages = &case["stages"];
+            let cancel = CancelFlag::new();
+            let report = |label: &str, actual: &Array, expected: &Value| {
+                let values = logical_f32_readback(actual).unwrap();
+                let expected_values = logical_f32_readback(&array(expected)).unwrap();
+                let delta = checked_delta(
+                    &values,
+                    actual.shape(),
+                    &expected_values,
+                    array(expected).shape(),
+                );
+                eprintln!(
+                    "STAGE_PROBE {label}: max_abs={delta}, original_tensor_bound={}",
+                    if fp32 { 2e-5 } else { bf16_bound(expected) }
+                );
+            };
+            report(
+                "video projection",
+                &model
+                    .video
+                    .forward(&array(&stages["body.video_embedder_input"]))
+                    .unwrap(),
+                &stages["body.video_embedder"],
+            );
+            report(
+                "text projection",
+                &model
+                    .text
+                    .forward(&array(&stages["body.text_projection_input"]))
+                    .unwrap(),
+                &stages["body.text_projection"],
+            );
+            for (i, block) in model.text_blocks.iter().enumerate() {
+                let key = format!("body.text_blocks.{i}");
+                report(
+                    &key,
+                    &block
+                        .forward(
+                            &array(&stages[format!("{key}_input")]),
+                            &array(&stages[format!("{key}_rope_input")]),
+                            &model.g,
+                            &cancel,
+                        )
+                        .unwrap(),
+                    &stages[&key],
+                );
+            }
+            for (i, block) in model.blocks.iter().enumerate() {
+                let prefix = format!("body.layers.{i}");
+                let stage = |name: &str| &stages[format!("{prefix}.{name}")];
+                report(
+                    &format!("{prefix}.norm1"),
+                    &block.n1.forward(&array(stage("norm1_input"))).unwrap(),
+                    stage("norm1"),
+                );
+                report(
+                    &format!("{prefix}.norm2"),
+                    &block.n2.forward(&array(stage("norm2_input"))).unwrap(),
+                    stage("norm2"),
+                );
+                for (projection, name) in block.projections.iter().zip([
+                    "q_projected",
+                    "k_projected",
+                    "v_projected",
+                    "o_projected",
+                    "up_gate",
+                    "ffn_down",
+                ]) {
+                    report(
+                        &format!("{prefix}.{name}"),
+                        &projection
+                            .forward(&array(stage(&format!("{name}_input"))))
+                            .unwrap(),
+                        stage(name),
+                    );
+                }
+                report(
+                    &format!("{prefix}.q_norm"),
+                    &block.qn.forward(&array(stage("q_norm_input"))).unwrap(),
+                    stage("q_norm"),
+                );
+                report(
+                    &format!("{prefix}.k_norm"),
+                    &block.kn.forward(&array(stage("k_norm_input"))).unwrap(),
+                    stage("k_norm"),
+                );
+                let (q, k, v) = block
+                    .edit_qkv(
+                        &array(stage("input")),
+                        &array(stage("rope")),
+                        &array(stage("modulation")),
+                        &model.g,
+                    )
+                    .unwrap();
+                for (name, actual) in [("q_rope", &q), ("k_rope", &k), ("v_heads", &v)] {
+                    report(&format!("{prefix}.{name}"), actual, stage(name));
+                }
+                report(
+                    &format!("{prefix}.situ"),
+                    &situ(&array(stage("hidden")), &array(stage("gate"))).unwrap(),
+                    stage("situ"),
+                );
+                report(
+                    &format!("{prefix}.finish"),
+                    &block
+                        .edit_finish(
+                            &array(stage("input")),
+                            &array(stage("attention")),
+                            &array(stage("modulation")),
+                            &model.g,
+                        )
+                        .unwrap(),
+                    stage("output"),
+                );
+                let source_kv = (
+                    &case["reference_kv"][i]["key"],
+                    &case["reference_kv"][i]["value"],
+                );
+                report(
+                    &format!("{prefix}.whole_body_from_source_input"),
+                    &block
+                        .edit_body(
+                            &array(stage("input")),
+                            &(array(source_kv.0), array(source_kv.1)),
+                            EditBodyInput {
+                                rope: &array(stage("rope")),
+                                modulation: &array(stage("modulation")),
+                                geometry: &model.g,
+                                text: 2,
+                            },
+                            &cancel,
+                        )
+                        .unwrap(),
+                    stage("output"),
+                );
+            }
+            for (i, call) in case["attention_calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                let (q, k, v) = (array(&call["q"]), array(&call["k"]), array(&call["v"]));
+                report(
+                    &format!("attention.{i}.existing_fast"),
+                    &edit_attention(&q, &k, &v, &model.g, &cancel).unwrap(),
+                    &call["output"],
+                );
+                // Source-backed discriminator, not replacement production arithmetic:
+                // CPU Torch SDPA rounds unnormalized exponentials to BF16, while
+                // retaining F32 score, denominator and value accumulation boundaries.
+                let (qf, kf, vf) = (
+                    q.as_dtype(Dtype::Float32).unwrap(),
+                    k.as_dtype(Dtype::Float32).unwrap(),
+                    v.as_dtype(Dtype::Float32).unwrap(),
+                );
+                let dot = kf
+                    .expand_dims(2)
+                    .unwrap()
+                    .matmul(&qf.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .squeeze_axes(&[-1])
+                    .unwrap();
+                let scores = divide(
+                    &dot,
+                    constant((q.shape()[3] as f32).sqrt(), Dtype::Float32).unwrap(),
+                )
+                .unwrap();
+                let exponentials =
+                    mlx_rs::ops::subtract(&scores, scores.max_axis(-1, true).unwrap())
+                        .unwrap()
+                        .exp()
+                        .unwrap();
+                let denominator = exponentials.sum_axis(-1, true).unwrap();
+                let operand = exponentials
+                    .as_dtype(v.dtype())
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap();
+                let numerator = vf
+                    .transpose_axes(&[0, 1, 3, 2])
+                    .unwrap()
+                    .expand_dims(2)
+                    .unwrap()
+                    .matmul(&operand.expand_dims(-1).unwrap())
+                    .unwrap()
+                    .squeeze_axes(&[-1])
+                    .unwrap();
+                let source_rounded = divide(numerator, denominator)
+                    .unwrap()
+                    .as_dtype(v.dtype())
+                    .unwrap();
+                report(
+                    &format!("attention.{i}.source_rounded_exp"),
+                    &source_rounded,
+                    &call["output"],
+                );
+            }
+            report(
+                "final norm",
+                &model
+                    .norm
+                    .forward(&array(&stages["final.norm_input"]))
+                    .unwrap(),
+                &stages["final.norm"],
+            );
+            report(
+                "final projection",
+                &model
+                    .output
+                    .forward(&array(&stages["final.projection_input"]))
+                    .unwrap(),
+                &stages["final.projection"],
+            );
+            let input = &f["inputs"];
+            let refs: Vec<_> = input["references"].as_array().unwrap()[..3]
+                .iter()
+                .map(array)
+                .collect();
+            let negative = masked(&input["negative"], &input["negative_mask"]);
+            let cache = model.prepare_edit_cache(&refs, &cancel).unwrap();
+            for (label, cache) in [("cached", Some(&cache)), ("uncached", None)] {
+                let actual = model
+                    .forward_edit(
+                        &array(&input["hidden_states"]),
+                        0.73,
+                        EditConditioning {
+                            context: &negative,
+                            references: &refs,
+                            cache,
+                        },
+                        &cancel,
+                    )
+                    .unwrap();
+                report(
+                    &format!("three-reference negative {label}"),
+                    &actual,
+                    &case["expected"],
+                );
+                eprintln!(
+                    "STAGE_PROBE three-reference negative {label} values: {:?}",
+                    logical_f32_readback(&actual).unwrap()
+                );
+            }
         }
     }
 
