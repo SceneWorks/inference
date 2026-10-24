@@ -1214,7 +1214,7 @@ fn apply_one_lora(
 /// `unmatched_path`, so only a per-spec check can see it. The MLX lane fixed exactly this in review.
 ///
 /// A zero-match file that DID collect unmatched targets is refused with the **classified**
-/// topology error ([`unmatched_targets_error`]) over THAT file's targets, before the generic
+/// topology error (`unmatched_targets_error`) over THAT file's targets, before the generic
 /// zero-match error fires: the generic error is reserved for files carrying no recognized targets
 /// at all, and a full-topology AdaLN file against a pruned curve must be named as a topology
 /// mismatch, not swallowed by "no target modules matched".

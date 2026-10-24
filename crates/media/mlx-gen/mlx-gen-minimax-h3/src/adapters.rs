@@ -1003,7 +1003,7 @@ fn apply_one_lora(
 /// reaches a user as "my second LoRA did nothing, and there was no error".
 ///
 /// A zero-match file that DID collect unmatched targets is refused with the **classified**
-/// topology error ([`unmatched_targets_error`]) over THAT file's targets, before the generic
+/// topology error (`unmatched_targets_error`) over THAT file's targets, before the generic
 /// zero-match error fires: the generic error is reserved for files carrying no recognized targets
 /// at all, and a full-topology AdaLN file against a pruned curve must be named as a topology
 /// mismatch, not swallowed by "no target modules matched".
