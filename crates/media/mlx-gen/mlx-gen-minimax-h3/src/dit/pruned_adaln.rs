@@ -15,7 +15,10 @@
 //!
 //! Storage precision is identified per operand (F32 table, BF16 weight, F16 bias in the frozen
 //! artifact). After source identity validation, compute operands are widened losslessly once to
-//! F32 and evaluated once; no source tensor copies or per-step casts remain resident.
+//! F32 and evaluated once; no source tensor copies or per-step weight casts remain resident.
+//! The F32 modulation cache stays unchanged. Gathered modulation slices and residual gates are
+//! cast to the hidden stream dtype when applied, matching pinned `_modulate`/`_gated_residual`.
+//! Without those activation casts a BF16 stream is promoted before the next ConvRot quantizer.
 //!
 //! The complete reduced topology — and nothing else — is what
 //! [`mlx_gen::gen_core::pruned_adaln`] validates and hashes. Body weights and quantization codes are
