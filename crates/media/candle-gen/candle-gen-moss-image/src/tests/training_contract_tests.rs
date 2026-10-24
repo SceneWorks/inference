@@ -683,6 +683,7 @@ fn import_mlx_exchange(root: &std::path::Path) {
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn cpu_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload() {
     native_graph_cases(Device::Cpu);
     if let Some(path) = std::env::var_os("MOSS_PORTABLE_EXCHANGE_INPUT") {
@@ -690,6 +691,7 @@ fn cpu_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reloa
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn committed_mlx_cpu_adapters_generate_portably() {
     // Both the fixture tensor constructor and strict host loader explicitly use Device::Cpu.
     // Missing producer bytes are a hard failure, never a skip or an empty export hook.
@@ -794,6 +796,7 @@ fn registered_candle_trainers_match_both_actual_generator_methods() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn cached_renderer_invalidates_on_adapter_replacement_or_removal() {
     for remove in [false, true] {
         let temp = tempfile::tempdir().unwrap();
@@ -828,6 +831,7 @@ fn cached_renderer_invalidates_on_adapter_replacement_or_removal() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn structured_lokr_matches_independent_f64_kronecker_for_both_orders_and_decompositions() {
     for (a, b, c, d) in [(2, 3, 2, 4), (3, 2, 4, 2)] {
         for decomposed in [false, true] {
@@ -977,6 +981,7 @@ fn write_adapter_file(
     std::fs::write(path, file).unwrap();
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow() {
     let t = |v, shape| Tensor::full(v, shape, &Device::Cpu).unwrap();
     let valid = BTreeMap::from([
@@ -1086,6 +1091,7 @@ fn strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow() 
 
 /// A scaled finite coefficient does not make the pre-scale FP32 GEMMs finite.
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
     let temp = tempfile::tempdir().unwrap();
     for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
@@ -1187,6 +1193,7 @@ fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn periodic_and_final_exports_preserve_request_trigger_words() {
     let temp = tempfile::tempdir().unwrap();
     for variant in [MossImageVariant::Base, MossImageVariant::Sft] {

@@ -27,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights); moss-cpu-fixture = hosted CPU fixture and recovery assertion mutations only (not ordinary CI)"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights); moss-cpu-fixture = hosted CPU model proofs and recovery assertion mutations; moss-metal-fixture = only the two original Metal author proofs (neither is ordinary CI)"
         type: choice
-        options: [all, windows-cuda, moss-cuda-unit, moss-cpu-fixture]
+        options: [all, windows-cuda, moss-cuda-unit, moss-cpu-fixture, moss-metal-fixture]
         default: all
 
 permissions:
@@ -117,6 +117,8 @@ jobs:
           elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then
             python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then
+            python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-metal-fixture" ]]; then
             python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
@@ -366,6 +368,8 @@ jobs:
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --features candle-audio/testkit
           --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p candle-gen-moss-image --features test-support -- -D warnings
       - name: Reclaim Clippy artifacts before linking tests
         # RETAINED, and still between Clippy and rustdoc where it has always sat. The package tests
         # that used to follow now run on their own runners, so this no longer protects them — but
@@ -531,11 +535,6 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests -j 1 "${packages[@]}"
-          if [[ " $args " == *" -p candle-gen-moss-image "* ]]; then
-            # Compiler budget is separate; each exact CPU fixture child is bounded independently.
-            python3 scripts/ci/moss_fixture_cpu.py compile candle --binary-file "$RUNNER_TEMP/moss-fixture-candle.json"
-            python3 scripts/ci/moss_fixture_cpu.py run candle --binary-file "$RUNNER_TEMP/moss-fixture-candle.json"
-          fi
 
   # Independent hosted CPU evidence; this does not replace ordinary PR/CUDA CI. Keep the
   # existing push filters: publishing story/sc-26588-moss-recovery without a PR starts no jobs.
@@ -601,6 +600,60 @@ jobs:
         with:
           name: moss-cpu-${{ matrix.backend }}-${{ github.sha }}
           path: ${{ runner.temp }}/moss-cpu-${{ matrix.backend }}-evidence
+          if-no-files-found: error
+
+  # Narrow explicit Metal author proof route. No CUDA, NAX, weights or other model jobs.
+  moss-metal-fixture:
+    name: MOSS Metal author proofs (hosted)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: "line-tables-only"
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Ensure existing hosted Metal build toolchain
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Fetch pinned prebuilt MLX
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::building the pinned libmlx from source"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and pinned native dependencies
+        id: cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: moss-metal-fixture
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run only original Metal author model proofs
+        env:
+          MOSS_CPU_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: python3 scripts/ci/moss_fixture_cpu_profile.py mlx --metal-only
+      - name: Upload exact-head Metal evidence (not a pass by artifact existence)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-metal-${{ github.sha }}
+          path: ${{ runner.temp }}/moss-metal-evidence
           if-no-files-found: error
 
   candle-cpu-conformance:
@@ -800,6 +853,8 @@ jobs:
           cargo clippy --locked
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
           --all-targets -- -D warnings
+      - name: Compile and lint opt-in MOSS model tests without execution
+        run: cargo clippy --locked --all-targets -j 1 -p mlx-gen-moss-image --features test-support -- -D warnings
       - name: Rustdoc macOS MLX packages
         # This is the complete macOS/MLX package set the lane already builds. Keep its public
         # intra-doc graph under the same warnings-as-errors policy as the Linux and CUDA package
@@ -856,11 +911,6 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests "${packages[@]}"
-          if [[ " $args " == *" -p mlx-gen-moss-image "* ]]; then
-            # Explicit CPU device/stream scopes; this is not a Metal or real-weight campaign.
-            python3 scripts/ci/moss_fixture_cpu.py compile mlx --binary-file "$RUNNER_TEMP/moss-fixture-mlx.json"
-            python3 scripts/ci/moss_fixture_cpu.py run mlx --binary-file "$RUNNER_TEMP/moss-fixture-mlx.json"
-          fi
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1383,6 +1433,7 @@ jobs:
       - windows-cuda
       - moss-cuda-unit
       - moss-cpu-fixture
+      - moss-metal-fixture
       - supply-chain
       - docs
       - release-metadata
@@ -1398,6 +1449,8 @@ jobs:
           MOSS_CUDA_UNIT_RESULT: ${{ needs.moss-cuda-unit.result }}
           REQUIRE_MOSS_CPU_FIXTURE: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture' }}
           MOSS_CPU_FIXTURE_RESULT: ${{ needs.moss-cpu-fixture.result }}
+          REQUIRE_MOSS_METAL_FIXTURE: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture' }}
+          MOSS_METAL_FIXTURE_RESULT: ${{ needs.moss-metal-fixture.result }}
         run: |
           echo "lane results: $RESULTS"
           if [[ "$REQUIRE_MOSS_CUDA_UNIT" == "true" && "$MOSS_CUDA_UNIT_RESULT" != "success" ]]; then
@@ -1406,6 +1459,10 @@ jobs:
           fi
           if [[ "$REQUIRE_MOSS_CPU_FIXTURE" == "true" && "$MOSS_CPU_FIXTURE_RESULT" != "success" ]]; then
             echo "::error::the requested two-row moss-cpu-fixture profile did not succeed"
+            exit 1
+          fi
+          if [[ "$REQUIRE_MOSS_METAL_FIXTURE" == "true" && "$MOSS_METAL_FIXTURE_RESULT" != "success" ]]; then
+            echo "::error::the requested original Metal proof profile did not succeed"
             exit 1
           fi
           for result in $RESULTS; do

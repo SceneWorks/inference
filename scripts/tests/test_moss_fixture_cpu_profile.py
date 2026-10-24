@@ -71,7 +71,7 @@ class HostedCpuRoutingTests(unittest.TestCase):
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
         workflow = self.workflow()
         self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"],
-                         ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture"])
+                         ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture"])
         self.assertEqual(set(workflow["on"]["workflow_dispatch"]["inputs"]), {"lanes"})
         job = workflow["jobs"]["moss-cpu-fixture"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'")
@@ -560,6 +560,160 @@ class DiagnosticBatchTests(unittest.TestCase):
             self.assertEqual(evidence["mutations"][0]["status"], "blocked_baseline_red")
             self.assertFalse(evidence["mutations"][0]["runtime_assertion_red"])
             self.assertTrue(evidence["source_restored"])
+
+
+class MossManualPolicyTests(unittest.TestCase):
+    def source(self, backend, name):
+        crate = ("candle-gen/candle-gen-moss-image" if backend == "candle" else "mlx-gen/mlx-gen-moss-image")
+        root = ROOT / "crates/media" / crate / "src"
+        parts = name.split("::")[:-1]
+        candidates = [root.joinpath(*parts).with_suffix(".rs"), root / (parts[0] + ".rs")]
+        return next(p for p in candidates if p.is_file())
+
+    def test_each_excluded_model_has_exact_manual_registration_without_population_gate(self):
+        import re
+        for backend in fixture.PACKAGES:
+            expected = {}
+            for name in (*profile.CPU_MODEL_TESTS[backend], *fixture.CASES, fixture.TOKEN_TEST):
+                expected[(self.source(backend, name), name.split("::")[-1])] = "CPU"
+            if backend == "mlx":
+                for name in profile.METAL_MODEL_TESTS:
+                    expected[(self.source(backend, name), name.split("::")[-1])] = "Metal"
+            root = self.source(backend, fixture.CASES[0]).parent
+            observed = {}
+            for path in root.rglob("*.rs"):
+                text = path.read_text(encoding="utf-8")
+                for match in re.finditer(r'#\[ignore = "manual MOSS (CPU|Metal) model proof;[^"\n]+"\]\s*fn (\w+)\s*\(', text):
+                    observed[(path, match[2])] = match[1]
+            self.assertEqual(observed, expected)
+            self.assertTrue(set(profile.CAUSAL_TESTS[backend]).issubset(profile.CPU_MODEL_TESTS[backend]))
+            self.assertTrue(set(profile.CPU_MODEL_TESTS[backend]).isdisjoint(profile.METAL_MODEL_TESTS))
+            for pure in [fixture.DEMAND_TEST, *( [profile.STAGING_TEST] if backend == "mlx" else [])]:
+                text = self.source(backend, pure).read_text(encoding="utf-8")
+                prelude = text.split("fn " + pure.split("::")[-1], 1)[0].rsplit("#[test]", 1)[1]
+                self.assertNotIn("#[ignore", prelude)
+            for file in ["training_memory.rs", "loader.rs", "memory_strategy.rs"]:
+                self.assertNotIn("manual MOSS", (root / file).read_text(encoding="utf-8"))
+
+    def test_manual_native_and_mutation_invocations_include_ignored_but_verify_real_counts(self):
+        import inspect
+        self.assertIn('"--include-ignored"', inspect.getsource(fixture.execute))
+        self.assertIn('"--include-ignored"', inspect.getsource(profile.assertion_red))
+        ignored = "running 1 test\ntest exact::model ... ignored\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        with self.assertRaises(UnitFailure):
+            fixture.verify(ignored, "exact::model")
+
+    def test_narrow_metal_route_and_gate_never_activate_from_ordinary_or_other_choices(self):
+        helper = HostedCpuRoutingTests("test_exact_manual_choice_and_only_two_fixed_hosted_rows")
+        workflow = helper.workflow()
+        job = workflow["jobs"]["moss-metal-fixture"]
+        self.assertEqual(job["runs-on"], "macos-15")
+        self.assertEqual(job["timeout-minutes"], "120")
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'")
+        self.assertEqual({k for k,v in helper.select(helper.selector(), "workflow_dispatch", "moss-metal-fixture").items() if v == "true"}, {"workspace"})
+        self.assertEqual(next(s["run"] for s in job["steps"] if s.get("name") == "Run only original Metal author model proofs"),
+                         "python3 scripts/ci/moss_fixture_cpu_profile.py mlx --metal-only")
+        for ordinary in ["candle-cpu-test", "macos-metal"]:
+            for step in workflow["jobs"][ordinary]["steps"]:
+                self.assertNotIn("moss_fixture_cpu", step.get("run", ""))
+                self.assertNotIn("--include-ignored", step.get("run", ""))
+        for ordinary, package in [("candle-cpu-lint", "candle-gen-moss-image"), ("macos-metal", "mlx-gen-moss-image")]:
+            compile_only = next(step["run"] for step in workflow["jobs"][ordinary]["steps"]
+                                if step.get("name") == "Compile and lint opt-in MOSS model tests without execution")
+            self.assertEqual(compile_only, f"cargo clippy --locked --all-targets -j 1 -p {package} --features test-support -- -D warnings")
+        gate = workflow["jobs"]["gate"]
+        self.assertIn("moss-metal-fixture", gate["needs"])
+        for result in ["success", "skipped", "failure", "cancelled"]:
+            env = dict(os.environ, RESULTS="success skipped", REQUIRE_MOSS_CUDA_UNIT="false", REQUIRE_MOSS_CPU_FIXTURE="false",
+                       REQUIRE_MOSS_METAL_FIXTURE="true", MOSS_METAL_FIXTURE_RESULT=result)
+            run = subprocess.run(["bash", "-c", gate["steps"][0]["run"]], env=env, capture_output=True)
+            self.assertEqual(run.returncode == 0, result == "success")
+        addition = '\nelif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-metal-fixture" ]]; then\n  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"'
+        current = helper.selector()
+        self.assertEqual(current.count(addition), 1)
+        previous = current.replace(addition, "")
+        for event, ref in [("pull_request", "branch"), ("push", "branch"), ("push", "tag"), ("merge_group", "branch")]:
+            with self.subTest(event=event, ref=ref):
+                self.assertEqual(helper.select(current, event, "moss-metal-fixture", ref),
+                                 helper.select(previous, event, "moss-metal-fixture", ref))
+
+    def test_metal_guard_observes_but_never_forces_original_device_or_stream(self):
+        source = (ROOT / "crates/media/mlx-gen/mlx-gen-moss-image/src/test_support.rs").read_text(encoding="utf-8")
+        body = source.split("fn assert_default_metal_profile_device()", 1)[1].split("pub(crate) fn ensure_cpu", 1)[0]
+        self.assertIn("Device::try_default()", body)
+        self.assertIn("Stream::task_local_or_default()", body)
+        self.assertIn(profile.METAL_DEVICE_MARKER, body)
+        self.assertNotIn("set_default", body)
+        self.assertNotIn("with_new_default_stream", body)
+        for name in profile.METAL_MODEL_TESTS:
+            text = self.source("mlx", name).read_text(encoding="utf-8")
+            body = text.split("fn " + name.split("::")[-1] + "()", 1)[1].split("\n    }", 1)[0]
+            self.assertIn("assert_default_metal_profile_device", body)
+            self.assertNotIn("cpu_test_device()", body)
+
+    def test_metal_marker_missing_or_wrong_cannot_pass_a_nonignored_test_summary(self):
+        name = profile.METAL_MODEL_TESTS[0]
+        summary = f"running 1 test\ntest {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.1s\n"
+        for marker in ["", "MOSS_METAL_DEFAULT_DEVICE_AND_STREAM=cpu", profile.METAL_DEVICE_MARKER]:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory);binary=root/"binary";binary.write_bytes(b"source-protocol-only artifact")
+                log=root/"case.log";output=marker+"\n"+summary;log.write_text(output,encoding="utf-8")
+                stamp={"head":"a"*40}
+                with mock.patch.object(fixture,"CpuOwner") as owner, mock.patch.object(fixture,"supervise",return_value=output), mock.patch.object(
+                        fixture,"source_stamp",return_value=stamp), mock.patch.object(fixture,"read_observations",return_value=None), mock.patch("builtins.print"):
+                    owner.return_value.collect.return_value={};owner.return_value.peak=123
+                    if marker == profile.METAL_DEVICE_MARKER:
+                        fixture.execute(binary,name,log,device_marker=profile.METAL_DEVICE_MARKER)
+                        self.assertEqual(json.loads(log.with_suffix(".result.json").read_text(encoding="utf-8"))["device_contract_observation"],marker)
+                    else:
+                        with self.assertRaisesRegex(UnitFailure,"device/stream observation missing"):
+                            fixture.execute(binary,name,log,device_marker=profile.METAL_DEVICE_MARKER)
+
+    def test_metal_prolog_inline_libtest_output_remains_exact_and_duplicate_markers_refuse(self):
+        name = profile.METAL_MODEL_TESTS[0]
+        output = (f"running 1 test\ntest {name} ... {profile.METAL_DEVICE_MARKER}\nok\n"
+                  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.1s\n")
+        fixture.verify(fixture.verification_text(output, name, profile.METAL_DEVICE_MARKER), name)
+        failed = output.replace("\nok\n", "\nthread 'test' panicked at src.rs:1:1:\nintended failure\nFAILED\n").replace(
+            "test result: ok. 1 passed; 0 failed", "test result: FAILED. 0 passed; 1 failed")
+        fixture.verify_assertion_failure(fixture.verification_text(failed, name, profile.METAL_DEVICE_MARKER), name)
+        for broken in [output.replace("=gpu", "=cpu"), output+profile.METAL_DEVICE_MARKER+"\n"]:
+            with self.assertRaisesRegex(UnitFailure, "device/stream observation missing"):
+                fixture.verification_text(broken, name, profile.METAL_DEVICE_MARKER)
+
+    def test_metal_wrong_manual_choice_refuses_before_compile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);event=root/"event.json"
+            event.write_text(json.dumps({"inputs":{"lanes":"all"}}),encoding="utf-8")
+            with mock.patch.dict(os.environ,{"GITHUB_EVENT_PATH":str(event)}), mock.patch.object(profile,"venue",return_value={}), mock.patch.object(
+                    fixture,"source_stamp",return_value={"head":"a"*40}), mock.patch.object(profile,"compile_binary") as compile_:
+                with self.assertRaisesRegex(UnitFailure,"narrow explicit manual choice"):
+                    profile.run_metal(root/"evidence")
+                compile_.assert_not_called()
+
+    def test_metal_proof_requires_both_real_results_same_source_binary_and_device_marker(self):
+        stamp = {"head": "a"*40, "tracked_delta_sha256": "b"*64}
+        rows = [{"test": name, "status": "passed", "owned_released": True, "source": stamp,
+                 "binary_sha256": "c"*64, "device_contract_observation": profile.METAL_DEVICE_MARKER}
+                for name in profile.METAL_MODEL_TESTS]
+        for mode in ["pass", "missing", "ignored", "wrong-device", "wrong-source"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); event = root / "event.json"
+                event.write_text(json.dumps({"inputs":{"lanes":"moss-metal-fixture"}}), encoding="utf-8")
+                actual = copy.deepcopy(rows)
+                if mode == "missing": actual.pop()
+                if mode == "ignored": actual[0]["status"] = "ignored"
+                if mode == "wrong-device": actual[0]["device_contract_observation"] = None
+                if mode == "wrong-source": actual[0]["source"] = {}
+                listing = "\n".join(name+": test" for name in profile.METAL_MODEL_TESTS)
+                with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH":str(event)}), mock.patch.object(profile, "venue", return_value={"head":"a"*40}), mock.patch.object(
+                        fixture,"source_stamp",return_value=stamp), mock.patch.object(profile,"compile_binary",return_value=(root/"binary",{"binary_sha256":"c"*64})), mock.patch.object(
+                        profile,"supervise",return_value=listing), mock.patch.object(fixture,"CpuOwner") as owner, mock.patch.object(profile,"independent_tests",return_value=actual):
+                    owner.return_value.collect.return_value = {}
+                    proof = profile.run_metal(root / "evidence")
+                self.assertEqual(proof["passed"], mode == "pass")
+                self.assertTrue(proof["source_restored"])
+
 
 
 if __name__ == "__main__":

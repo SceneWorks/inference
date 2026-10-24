@@ -10,6 +10,31 @@ use std::path::Path;
 pub const HOST_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub use gen_core_testkit::moss_training_fixture::Fixture as HostFixture;
 
+/// Observe the original Metal contract without selecting or changing a device/stream.
+#[cfg(test)]
+pub(crate) fn assert_default_metal_profile_device() {
+    assert!(
+        matches!(
+            mlx_rs::Device::try_default()
+                .expect("MLX default device metadata")
+                .get_type()
+                .expect("MLX device type"),
+            mlx_rs::DeviceType::Gpu
+        ),
+        "manual MOSS author proof requires its original default Metal device"
+    );
+    assert_eq!(
+        mlx_rs::Stream::task_local_or_default()
+            .get_index()
+            .expect("MLX stream metadata"),
+        mlx_rs::Stream::gpu()
+            .get_index()
+            .expect("MLX GPU stream metadata"),
+        "manual MOSS author proof requires its original default GPU stream"
+    );
+    println!("MOSS_METAL_DEFAULT_DEVICE_AND_STREAM=gpu");
+}
+
 pub(crate) fn ensure_cpu() -> mlx_gen::Result<()> {
     if !matches!(
         mlx_rs::Device::try_default()?.get_type()?,
@@ -311,19 +336,23 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_base_lora_cached_adamw_resume_reentry() -> gen_core::Result<()> {
         run(0)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_base_lokr_uncached_text_adam_resume_reentry() -> gen_core::Result<()> {
         run(1)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_sft_lora_uncached_latents_prodigy_resume_reentry() -> gen_core::Result<()>
     {
         run(2)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_sft_lokr_uncached_both_rose_resume_reentry() -> gen_core::Result<()> {
         run(3)
     }
@@ -392,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn actual_ragged_token_bound_short_long_mixed_preview_trigger_and_truncation(
     ) -> gen_core::Result<()> {
         with_cpu(|| {

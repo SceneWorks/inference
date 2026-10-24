@@ -1094,10 +1094,13 @@ mod author_fixture_tests {
         )
     }
 
-    // These small numerical tests run on the ordinary hosted macOS MLX CI lane. Local invocation
-    // requires the same explicit Metal ownership admission as any other MLX Array numerical test.
+    // These original default-Metal numerical proofs run only on the explicit hosted
+    // moss-metal-fixture profile. Their device contract is not converted to CPU.
     #[test]
+    #[ignore = "manual MOSS Metal model proof; CI lanes=moss-metal-fixture"]
     fn frozen_author_full_graph_ragged_masks_fp32_bf16_and_skipping() {
+        #[cfg(feature = "test-support")]
+        crate::test_support::assert_default_metal_profile_device();
         let f = fixture("ordinary");
         let g = geometry(&f);
         let context = contexts(
@@ -1169,7 +1172,10 @@ mod author_fixture_tests {
         assert!(delta(&rope(2, 3, 3, 8).unwrap(), &f["leaf_ops"]["rope_2x3_text3"]) < 1e-6);
     }
     #[test]
+    #[ignore = "manual MOSS Metal model proof; CI lanes=moss-metal-fixture"]
     fn frozen_reference_unmerged_fp32_projection_and_three_step_dmd() {
+        #[cfg(feature = "test-support")]
+        crate::test_support::assert_default_metal_profile_device();
         let f = fixture("dmd");
         let g = geometry(&f);
         let w = weights(&f["base_weights"], Dtype::Bfloat16);
@@ -1265,6 +1271,7 @@ mod training_projection_tests {
     use super::*;
     use mlx_gen::adapters::{AdaptableLinear, Adapter};
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn custom_stack_is_fp32_scaled_and_keeps_dmd_separate() {
         let _device = crate::cpu_test_device();
         let weight = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2]);
@@ -1330,6 +1337,7 @@ mod training_graph_tests {
         crate::pipeline::logical_f32_readback(a).unwrap()
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn cpu_native_backward_updates_only_factors_and_reload_changes_generation() {
         let _device = crate::cpu_test_device();
         let f = fixture("ordinary");
@@ -1705,6 +1713,7 @@ mod training_bf16_cpu_tests {
         NetworkType, TrainingConfig,
     };
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload() {
         let _device = crate::cpu_test_device();
         let f = fixture("ordinary");
@@ -1892,6 +1901,7 @@ mod review_fix_tests {
         m
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn lokr_real_loader_rejects_crossed_axes_unused_factors_and_bad_scaling() {
         let _device = crate::cpu_test_device();
         for defect in [
@@ -1939,6 +1949,7 @@ mod review_fix_tests {
         }
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn installed_adapter_validation_rejects_finite_sources_that_overflow() {
         let _device = crate::cpu_test_device();
         for defect in [
@@ -2005,6 +2016,7 @@ mod review_fix_tests {
         }
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward() {
         let _device = crate::cpu_test_device();
         use mlx_gen::train::lora::{build_lokr_targets, TrainAdapter};
@@ -2070,6 +2082,7 @@ mod review_fix_tests {
         }
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn routing_owner_tracks_widening_and_dmd_weight_replacement() {
         let _device = crate::cpu_test_device();
         let original = full(&[2, 2], 0.25).as_dtype(Dtype::Bfloat16).unwrap();
@@ -2100,6 +2113,7 @@ mod review_publication_tests {
     use super::author_fixture_tests::*;
     use super::*;
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn final_optimizer_values_are_validated_before_adapter_file_is_written() {
         let _device = crate::cpu_test_device();
         let f = fixture("ordinary");
@@ -2165,6 +2179,7 @@ mod review_structured_math_tests {
             .collect()
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn raw_structured_full_and_decomposed_factors_match_independent_kronecker_math() {
         let _device = crate::cpu_test_device();
         for ((a, c), (b, d)) in [((2usize, 3usize), (4usize, 2usize)), ((4, 2), (2, 3))] {
@@ -2234,6 +2249,7 @@ mod review_structured_math_tests {
         }
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn real_loader_uses_nondefault_rank_alpha_and_user_strength_on_the_projection() {
         let _device = crate::cpu_test_device();
         let fixture = fixture("ordinary");

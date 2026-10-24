@@ -291,19 +291,23 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_base_lora_cached_adamw_resume_reentry() -> gen_core::Result<()> {
         run(0)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_base_lokr_uncached_text_adam_resume_reentry() -> gen_core::Result<()> {
         run(1)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_sft_lora_uncached_latents_prodigy_resume_reentry() -> gen_core::Result<()>
     {
         run(2)
     }
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn full_image_caption_sft_lokr_uncached_both_rose_resume_reentry() -> gen_core::Result<()> {
         run(3)
     }
@@ -321,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
     fn actual_ragged_token_bound_short_long_mixed_preview_trigger_and_truncation(
     ) -> gen_core::Result<()> {
         let root = tempfile::tempdir()?;

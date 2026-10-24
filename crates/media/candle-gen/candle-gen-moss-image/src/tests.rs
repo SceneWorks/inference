@@ -101,6 +101,7 @@ fn descriptors_keep_acceleration_explicit() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_author_graph_fp32_bf16_and_ragged_masks() {
     let d = fixture("fixture.json");
     let g = geometry(&d);
@@ -145,6 +146,7 @@ fn exact_author_graph_fp32_bf16_and_ragged_masks() {
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_author_leaf_functions() {
     let d = fixture("fixture.json");
     let l = &d["leaf_ops"];
@@ -210,6 +212,7 @@ fn same_owned_buffer_auth_rejects_substitution_even_while_original_pin_is_stable
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn exact_unmerged_fp32_residual_and_fixed_noise_recurrence() {
     let d = fixture("dmd_fixture.json");
     let base = weights(&d["base_weights"], DType::BF16);
@@ -283,6 +286,7 @@ fn exact_unmerged_fp32_residual_and_fixed_noise_recurrence() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn mask_and_cancellation_refuse_before_blocks() {
     let d = fixture("fixture.json");
     let model = Transformer::load(&weights(&d["weights"], DType::F32), geometry(&d), None).unwrap();
@@ -433,6 +437,7 @@ fn supplied_embeddings_compact_noncontiguous_masks_and_hash_exact_inputs() {
     assert_eq!(&actual[4096..], &values[8192..12288]);
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn supplied_fp32_conditioning_preserves_precision_until_selected_projection_sc26324() {
     // sc-26324 (F-276): the same ingestion path runs on CUDA and CPU. Deliberately
     // non-BF16 values plus a ragged mask expose narrowing before a full-FP32 consumer.
@@ -639,6 +644,7 @@ fn architecture_facts_and_structural_cost_scale_batch_context_and_guidance() {
         .all(|s| s.support == MemoryStrategySupport::Missing));
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn renderer_off_on_off_never_reuses_modified_backbone() {
     let ordinary = fixture("fixture.json");
     let g = geometry(&ordinary);
@@ -682,6 +688,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn warm_admission_credits_only_actual_provider_weights() {
     let d = fixture("fixture.json");
     let generator = synthetic_generator();
@@ -726,6 +733,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
 }
 
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch() {
     let d = fixture("fixture.json");
     let renderer = pipeline::Renderer {
@@ -853,6 +861,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
     }
 }
 #[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
     let d = fixture("fixture.json");
     let renderer = pipeline::Renderer {
