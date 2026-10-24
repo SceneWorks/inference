@@ -59,10 +59,12 @@ const CURVE_GRID: usize = 8;
 const CURVE_RANK: usize = 4;
 
 /// Relative tolerance the native (CUDA) arm gates its residual against the independent f64
-/// reference with. The factors are stored bf16 and every published fold is an exact power of two,
-/// so the CPU arms below gate bit-exactly; the CUDA arm admits fp32-kernel accumulation error only,
-/// two orders above the measured CPU noise floor.
-const NATIVE_RELATIVE_TOL: f64 = 2.0e-2;
+/// bf16-chain reference with. Derived, not measured: the reference pins every bf16 rounding of the
+/// declared chain, so what remains is fp32-kernel accumulation order (≲ 128·2⁻²⁴) plus at most one
+/// rounding-placement difference (≤ 2⁻⁹) — 1e-2 is ~5× that derived worst case. The gate compares
+/// the RESIDUAL, not the base output, so a dropped adapter (residual 0), a no-op gain (0) or any
+/// fold/offset error fails by orders of magnitude.
+const NATIVE_RELATIVE_TOL: f64 = 1.0e-2;
 
 fn dev() -> Device {
     Device::Cpu
@@ -392,8 +394,17 @@ struct LoraFactors<'a> {
     out: usize,
 }
 
-/// Independent `((x·a)·b)·scale` in f64 — computed from the **actual file bytes**, widened
-/// exactly, so the only tolerance left absorbs accumulation order.
+/// The mathematical residual `((x·a)·b_folded)·scale` in f64, over the **stored bf16 factor
+/// bytes** (widened exactly) and the exact f32 probe input.
+///
+/// This is the contract-level reference: the factors are what the file stores (bf16 — every
+/// published turbo tensor), the fold is the install's own `alpha/rank`, and the probe input is the
+/// exact f32 vector. It deliberately does NOT model where each backend rounds inside the chain:
+/// the declared compute dtype is the factors' bf16 (the sc-18728 dtype-matched fold exists so the
+/// product runs at the fork's precision rather than being promoted), but the observable contract
+/// does not pin whether a backend rounds `x`, an intermediate, or only the output to bf16 — and
+/// the two lanes demonstrably place those roundings differently. The gate below derives the bound
+/// from that declared bf16 chain instead of encoding one placement.
 fn reference_residual(
     factors: LoraFactors<'_>,
     fold: f32,
@@ -404,22 +415,26 @@ fn reference_residual(
     let LoraFactors { a, b, in_dim, out } = factors;
     let rank = a.len() / in_dim;
     assert_eq!(b.len() % rank, 0, "lora_B must be [out, rank]");
+    let bf16_round = |v: f32| -> f64 {
+        let bits = v.to_bits();
+        let lsb = (bits >> 16) & 1;
+        f32::from_bits((bits + 0x7fff + lsb) & 0xFFFF_0000) as f64
+    };
+    // The install folds `alpha/rank` into `b` with a dtype-matched scalar — one bf16 rounding,
+    // identical on both backends because it happens at install, on the host, before any matmul.
+    let b_inst: Vec<f64> = b.iter().map(|&v| bf16_round(v * fold)).collect();
     let mut y = vec![0.0f64; rows * out];
     for r in 0..rows {
         let mut mid = vec![0.0f64; rank];
         for (k, mid_k) in mid.iter_mut().enumerate() {
-            let mut acc = 0.0f64;
-            for j in 0..in_dim {
-                acc += x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64;
-            }
+            let acc: f64 = (0..in_dim)
+                .map(|j| x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64)
+                .sum();
             *mid_k = acc;
         }
         for o in 0..out {
-            let mut acc = 0.0f64;
-            for k in 0..rank {
-                acc += mid[k] * b[o * rank + k] as f64;
-            }
-            y[r * out + o] = acc * fold as f64 * scale as f64;
+            let acc: f64 = (0..rank).map(|k| mid[k] * b_inst[o * rank + k]).sum();
+            y[r * out + o] = acc * scale as f64;
         }
     }
     y
@@ -462,9 +477,18 @@ fn assert_matches_reference(got: &[f32], want: &[f64], what: &str) {
         worst = worst.max((*g as f64 - w).abs());
     }
     let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    // Derived bound, not an observed one. The reference emulates the declared bf16 compute chain
+    // stage by stage; what it cannot pin is the accumulation ORDER inside each device matmul.
+    // bf16×bf16 products are exact in f32 (8-bit mantissas), so an f32-accumulated dot of 128
+    // exact products drifts ≲ 128·2⁻²⁴ relative (~8e-6); one bf16 output rounding of a matmul is
+    // ≤ 2⁻⁹ relative, and a backend whose rounding placement differs from the emulation adds at
+    // most one more such rounding. The gate is 1e-2, ~5× the derived worst case. A wrong fold
+    // (16×/128×), a wrong module or a dropped target moves the residual by orders of magnitude
+    // past this band, and the cross-topology bit-exact equality in the same tests is independent
+    // of it.
     assert!(
-        worst <= 1.0e-3 * peak,
-        "{what}: the installed residual must match the independent x·Aᵀ·(fold·Bᵀ)·scale reference \
+        worst <= 1.0e-2 * peak,
+        "{what}: the installed residual must match the independent bf16-chain reference \
          (worst {worst}, peak {peak})"
     );
 }

@@ -310,6 +310,15 @@ fn max_abs(a: &Array) -> f32 {
         .item::<f32>()
 }
 
+/// Round-to-nearest-even f32 → bf16, matching every published turbo tensor's storage dtype and
+/// the compute dtype the residual chain runs at.
+fn bf16_round(v: f32) -> f32 {
+    let bits = v.to_bits();
+    let lsb = (bits >> 16) & 1;
+    let rounded = (bits + 0x7fff + lsb) & 0xFFFF_0000;
+    f32::from_bits(rounded)
+}
+
 /// The stored factor bytes a reference computation reads: `a` is the `[rank, in]` lora_A and `b`
 /// the `[out, rank]` lora_B, both widened from the actual file bytes.
 struct LoraFactors<'a> {
@@ -319,8 +328,17 @@ struct LoraFactors<'a> {
     out: usize,
 }
 
-/// Independent `((x·a)·b)·scale` in f64 — computed from the **actual file bytes**, widened
-/// exactly, so the only tolerance left absorbs accumulation order.
+/// The mathematical residual `((x·a)·b_folded)·scale` in f64, over the **stored bf16 factor
+/// bytes** (widened exactly) and the exact f32 probe input.
+///
+/// This is the contract-level reference: the factors are what the file stores (bf16 — every
+/// published turbo tensor), the fold is the install's own `alpha/rank`, and the probe input is the
+/// exact f32 vector. It deliberately does NOT model where each backend rounds inside the chain:
+/// the declared compute dtype is the factors' bf16 (the sc-18724 dtype-matched fold exists so the
+/// product runs at the fork's precision rather than being promoted), but the observable contract
+/// does not pin whether a backend rounds `x`, an intermediate, or only the output to bf16 — and
+/// the two lanes demonstrably place those roundings differently. The gate below derives the bound
+/// from that declared bf16 chain instead of encoding one placement.
 fn reference_residual(
     factors: LoraFactors<'_>,
     fold: f32,
@@ -331,22 +349,21 @@ fn reference_residual(
     let LoraFactors { a, b, in_dim, out } = factors;
     let rank = a.len() / in_dim;
     assert_eq!(b.len() % rank, 0, "lora_B must be [out, rank]");
+    // The install folds `alpha/rank` into `b` with a dtype-matched scalar — one bf16 rounding,
+    // identical on both backends because it happens at install, on the host, before any matmul.
+    let b_inst: Vec<f64> = b.iter().map(|&v| bf16_round(v * fold) as f64).collect();
     let mut y = vec![0.0f64; rows * out];
     for r in 0..rows {
         let mut mid = vec![0.0f64; rank];
         for (k, mid_k) in mid.iter_mut().enumerate() {
-            let mut acc = 0.0f64;
-            for j in 0..in_dim {
-                acc += x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64;
-            }
+            let acc: f64 = (0..in_dim)
+                .map(|j| x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64)
+                .sum();
             *mid_k = acc;
         }
         for o in 0..out {
-            let mut acc = 0.0f64;
-            for k in 0..rank {
-                acc += mid[k] * b[o * rank + k] as f64;
-            }
-            y[r * out + o] = acc * fold as f64 * scale as f64;
+            let acc: f64 = (0..rank).map(|k| mid[k] * b_inst[o * rank + k]).sum();
+            y[r * out + o] = acc * scale as f64;
         }
     }
     y
@@ -379,13 +396,19 @@ fn assert_matches_reference(got: &[f32], want: &[f64], what: &str) {
         worst = worst.max((*g as f64 - w).abs());
     }
     let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    // The gate is the bf16 factor precision: every published turbo tensor is bf16, so the engine
-    // runs the low-rank product at bf16 rounding (~2⁻⁸ relative) while the reference is exact f64
-    // over the same rounded factor bytes. A wrong fold (16×/128×), a wrong module or a dropped
-    // target moves the residual by orders of magnitude past this band.
+    // Derived bound, not an observed one. The reference is the exact f64 residual over the stored
+    // bf16 factor bytes; what it cannot pin is WHERE the declared bf16 chain rounds. Each bf16
+    // rounding of an operand/output is ≤ 2⁻⁹ relative and bf16×bf16 products are exact in f32, so
+    // a chain that rounds `x`, an intermediate, and the output — the declared bf16 compute dtype's
+    // worst placement — errs ≤ 3·2⁻⁹ ≈ 5.9e-3, plus f32 accumulation order (≲ 128·2⁻²⁴). The two
+    // lanes demonstrably place the roundings differently (Metal vs CUDA/CPU gemm internals are
+    // unpinned by the contract), so the gate is the union bound 1e-2, <2× the derived worst case —
+    // NOT a percentage copied from an observed output. A wrong fold (16×/128×), a wrong module or
+    // a dropped target moves the residual by orders of magnitude past this band, and the
+    // cross-topology bit-exact equality in the same tests is independent of it.
     assert!(
-        worst <= 2.0e-2 * peak,
-        "{what}: the installed residual must match the independent x·Aᵀ·(fold·Bᵀ)·scale reference \
+        worst <= 1.0e-2 * peak,
+        "{what}: the installed residual must match the independent bf16-chain reference \
          (worst {worst}, peak {peak})"
     );
 }
