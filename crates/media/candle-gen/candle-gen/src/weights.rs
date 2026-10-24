@@ -44,6 +44,14 @@ pub struct Weights {
     convrot_rotations: std::sync::Mutex<HashMap<usize, Tensor>>,
 }
 
+/// Decode a little-endian F32 plane into its `f32` values, for value-validating native scale and
+/// codebook operands directly off the mmap without materializing a `Tensor` copy.
+fn f32_le_planes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        .collect()
+}
 impl Weights {
     /// The device this weight set is resident on — every constructor loads all tensors onto one
     /// `device`, so any tensor's device answers for the set. `None` only for an empty map.
@@ -234,6 +242,65 @@ impl Weights {
         }
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
             let base = key.trim_end_matches(".comfy_quant");
+            let payload = stores[*di].get(key)?;
+            let declared: serde_json::Value = serde_json::from_slice(payload.data())
+                .map_err(|e| CandleError::Msg(format!("{key}: {e}")))?;
+            let is_w4a8 = declared
+                .get("format")
+                .and_then(serde_json::Value::as_str)
+                == Some("asym_w4a8_int8");
+            if is_w4a8 {
+                // W4A8 (sc-26685): two int4 codes per I8 byte, F8_E4M3 per-group s_rel, F32
+                // per-channel s_channel, and a F32[16] codebook. The F8 payload is preserved as
+                // raw bytes (U8) exactly like the I8 codes — never a generic floating coercion.
+                let s_rel = format!("{base}.weight_s_rel");
+                let s_channel = format!("{base}.weight_s_channel");
+                let codebook = format!("{base}.weight_codebook");
+                let weight = format!("{base}.weight");
+                let (_, wd, ws) = headers
+                    .get(&weight)
+                    .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight")))?;
+                let (sri, srd, srs) = headers
+                    .get(&s_rel)
+                    .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight_s_rel")))?;
+                let (sci, scd, scs) = headers
+                    .get(&s_channel)
+                    .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight_s_channel")))?;
+                let (cbi, cbd, cbs) = headers
+                    .get(&codebook)
+                    .ok_or_else(|| CandleError::Msg(format!("{key}: missing weight_codebook")))?;
+                if *wd != safetensors::Dtype::I8
+                    || *srd != safetensors::Dtype::F8_E4M3
+                    || *scd != safetensors::Dtype::F32
+                    || *cbd != safetensors::Dtype::F32
+                {
+                    return Err(CandleError::Msg(format!(
+                        "{key}: native W4A8 requires I8 weight, F8_E4M3 weight_s_rel, F32 \
+                         weight_s_channel and F32 weight_codebook"
+                    )));
+                }
+                if headers.contains_key(&format!("{base}.scales"))
+                    || headers.contains_key(&format!("{base}.biases"))
+                    || headers.contains_key(&format!("{base}.weight_scale"))
+                    || headers.contains_key(&format!("{base}.weight_correction"))
+                {
+                    return Err(CandleError::Msg(format!(
+                        "{key}: contradictory affine / ConvRot / W4A8 operands"
+                    )));
+                }
+                let descriptor = gen_core::w4a8_int8::W4A8Int8::parse(payload.data(), ws, srs, scs, cbs)
+                    .map_err(CandleError::Msg)?;
+                descriptor
+                    .validate_s_rel(stores[*sri].get(&s_rel)?.data())
+                    .map_err(CandleError::Msg)?;
+                descriptor
+                    .validate_s_channel(f32_le_planes(stores[*sci].get(&s_channel)?.data()))
+                    .map_err(CandleError::Msg)?;
+                descriptor
+                    .validate_codebook(f32_le_planes(stores[*cbi].get(&codebook)?.data()))
+                    .map_err(CandleError::Msg)?;
+                continue;
+            }
             let weight = format!("{base}.weight");
             let scale = format!("{base}.weight_scale");
             let (_, wd, ws) = headers
@@ -254,27 +321,24 @@ impl Weights {
                     "{key}: contradictory affine and ConvRot operands"
                 )));
             }
-            let payload = stores[*di].get(key)?;
             let descriptor = gen_core::convrot_int8::ConvRotInt8::parse(payload.data(), ws, ss)
                 .map_err(CandleError::Msg)?;
             let scales = stores[*si].get(&scale)?;
             descriptor
-                .validate_scale_values(
-                    scales
-                        .data()
-                        .chunks_exact(4)
-                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])),
-                )
+                .validate_scale_values(f32_le_planes(scales.data()))
                 .map_err(CandleError::Msg)?;
         }
         for (key, (_, stored_dtype, _)) in &headers {
-            if (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
+            let native = (key.ends_with(".weight") && *stored_dtype == safetensors::Dtype::I8)
                 || key.ends_with(".weight_scale")
-            {
+                || key.ends_with(".weight_s_rel")
+                || key.ends_with(".weight_s_channel")
+                || key.ends_with(".weight_codebook");
+            if native {
                 let base = key.rsplit_once('.').expect("suffix above contains a dot").0;
                 if !headers.contains_key(&format!("{base}.comfy_quant")) {
                     return Err(CandleError::Msg(format!(
-                        "{key}: native INT8 requires .comfy_quant"
+                        "{key}: native INT8/W4A8 requires .comfy_quant"
                     )));
                 }
             }
@@ -282,7 +346,10 @@ impl Weights {
         let mut map = HashMap::with_capacity(headers.len());
         for st in &stores {
             for (key, view) in st.tensors() {
-                let tensor = if view.dtype() == safetensors::Dtype::I8 {
+                let tensor = if matches!(
+                    view.dtype(),
+                    safetensors::Dtype::I8 | safetensors::Dtype::F8_E4M3
+                ) {
                     Tensor::from_raw_buffer(view.data(), DType::U8, view.shape(), device)?
                 } else {
                     st.load(&key, device)?
