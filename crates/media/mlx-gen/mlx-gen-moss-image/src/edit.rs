@@ -183,7 +183,8 @@ pub(crate) fn extra_peak(
         .ok_or_else(|| Error::Unsupported("MOSS edit precise projection bound overflow".into()))?;
     // The ordinary workspace reserves one full F32 B*B matrix. Extend it to
     // the concatenated reference/body geometry, including all cross-reference terms.
-    // Production BF16 uses fused SDPA; this full matrix also bounds its workspace.
+    // Keep the legacy full-matrix reserve, but explicitly price the new bounded
+    // source-faithful BF16 attention arrays if they exceed it (not a second full matrix).
     let body_tokens = text_tokens
         .checked_add(request.width as u64 * request.height as u64 / 256)
         .ok_or_else(|| Error::Unsupported("MOSS edit body scratch overflow".into()))?;
@@ -193,17 +194,43 @@ pub(crate) fn extra_peak(
         .saturating_sub(body_tokens)
         .checked_mul(4 * (12 * D + 4 * F))
         .ok_or_else(|| Error::Unsupported("MOSS edit reference scratch overflow".into()))?;
-    let attention_bytes = references
+    let old_attention = references
         .attention_elements(body_tokens)?
-        .checked_sub(
-            body_tokens
-                .checked_mul(body_tokens)
-                .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?,
-        )
+        .checked_mul(24 * 4)
+        .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?;
+    let combined_keys = body_tokens
+        .checked_add(reference_tokens)
+        .ok_or_else(|| Error::Unsupported("MOSS edit attention key overflow".into()))?;
+    let attention_workspace = [
+        (reference_tokens, reference_tokens),
+        (body_tokens, combined_keys),
+        (text_tokens, text_tokens),
+    ]
+    .into_iter()
+    .try_fold(0, |peak, (rows, keys)| {
+        crate::precision::edit_attention_workspace(rows, keys, D, 24)
+            .map(|bytes| peak.max(bytes))
+            .ok_or_else(|| Error::Unsupported("MOSS edit tiled attention bound overflow".into()))
+    })?;
+    let ordinary_attention = body_tokens
+        .checked_mul(body_tokens)
         .and_then(|n| n.checked_mul(24 * 4))
         .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?;
+    let attention_bytes = old_attention
+        .max(attention_workspace)
+        .checked_sub(ordinary_attention)
+        .ok_or_else(|| Error::Unsupported("MOSS edit attention scratch overflow".into()))?;
+
+    // Edit SiTU peaks at 18 bytes/FFN channel: borrowed BF16 hidden/gate (4),
+    // gated branch (2), rounded division (2), widened unary input/output (8),
+    // rounded unary output (2). Existing linear scratch reserves 4*F*4 = 16.
+    let situ_extra = body_tokens
+        .max(reference_tokens)
+        .checked_mul(2 * F)
+        .ok_or_else(|| Error::Unsupported("MOSS edit SiTU bound overflow".into()))?;
     total
-        .checked_add(precise_bytes)
+        .checked_add(situ_extra)
+        .and_then(|n| n.checked_add(precise_bytes))
         .and_then(|n| n.checked_add(reference_work))
         .and_then(|n| n.checked_add(attention_bytes))
         .and_then(|n| n.checked_add(2_000_000_000 + 297_271_296 * 2))

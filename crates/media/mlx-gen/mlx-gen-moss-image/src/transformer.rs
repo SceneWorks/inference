@@ -1,5 +1,5 @@
 //! Frozen MOSS graph. No FLUX DiT/scheduler or ordinary cast-down adapter abstraction is used.
-use crate::precision::{attention_fp32, linear_fp32};
+use crate::precision::{attention_edit_bf16, attention_fp32, linear_fp32};
 use mlx_gen::attention::slice_axis;
 use mlx_gen::gen_core::moss_image::{moss_time_features, MossImageConfig};
 use mlx_gen::weights::Weights;
@@ -251,6 +251,7 @@ fn attention(
     rope: &Array,
     g: &Geometry,
     cancel: &CancelFlag,
+    edit: bool,
 ) -> Result<Array> {
     let shape = [q.shape()[0], q.shape()[1], g.heads, g.dim / g.heads];
     let q = rotate(&q.reshape(&shape)?, rope)?
@@ -261,7 +262,9 @@ fn attention(
         .transpose_axes(&[0, 2, 1, 3])?;
     let v = v.reshape(&shape)?.transpose_axes(&[0, 2, 1, 3])?;
     let scale = 1.0 / (g.dim as f32 / g.heads as f32).sqrt();
-    let out = if v.dtype() == Dtype::Float32 {
+    let out = if edit {
+        edit_attention(&q, &k, &v, g, cancel)?
+    } else if v.dtype() == Dtype::Float32 {
         attention_fp32(&q, &k, &v, scale, cancel)?
     } else {
         mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None)?
@@ -271,6 +274,7 @@ fn attention(
         .reshape(&[shape[0], shape[1], g.dim])?)
 }
 struct TextBlock {
+    edit_precision: bool,
     n1: Norm,
     n2: Norm,
     qn: Norm,
@@ -284,6 +288,7 @@ struct TextBlock {
 impl TextBlock {
     fn load(w: &Weights, p: &str, g: &Geometry) -> Result<Self> {
         Ok(Self {
+            edit_precision: false,
             n1: Norm::load(w, &format!("{p}.norm1.weight"), g.dim)?,
             n2: Norm::load(w, &format!("{p}.norm2.weight"), g.dim)?,
             qn: Norm::load(w, &format!("{p}.q_norm.weight"), g.dim / g.heads)?,
@@ -302,15 +307,25 @@ impl TextBlock {
         let v = slice_axis(&qkv, 2, 2 * g.dim, g.dim)?;
         let x = add(
             x,
-            self.proj
-                .forward(&attention(&q, &k, &v, rope, g, cancel)?)?,
+            self.proj.forward(&attention(
+                &q,
+                &k,
+                &v,
+                rope,
+                g,
+                cancel,
+                self.edit_precision,
+            )?)?,
         )?;
         let y = self.n2.forward(&x)?;
-        Ok(add(
-            &x,
-            self.down
-                .forward(&situ(&self.up.forward(&y)?, &self.gate.forward(&y)?)?)?,
-        )?)
+        let hidden = self.up.forward(&y)?;
+        let gate = self.gate.forward(&y)?;
+        let activated = if self.edit_precision {
+            edit_situ(&hidden, &gate)?
+        } else {
+            situ(&hidden, &gate)?
+        };
+        Ok(add(&x, self.down.forward(&activated)?)?)
     }
 }
 struct Block {
@@ -369,7 +384,7 @@ impl Block {
         let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?;
         let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?;
         let v = self.projections[2].forward(&y)?;
-        let a = self.projections[3].forward(&attention(&q, &k, &v, rope, g, cancel)?)?;
+        let a = self.projections[3].forward(&attention(&q, &k, &v, rope, g, cancel, false)?)?;
         let x = add(x, multiply(a, m(2)?)?)?;
         let y = add(
             multiply(
@@ -1000,7 +1015,7 @@ impl Block {
         Ok(add(
             x,
             multiply(
-                self.projections[5].forward(&situ(
+                self.projections[5].forward(&edit_situ(
                     &slice_axis(&fused, 2, 0, g.ffn)?,
                     &slice_axis(&fused, 2, g.ffn, g.ffn)?,
                 )?)?,
@@ -1062,6 +1077,37 @@ impl Block {
         Ok(next)
     }
 }
+fn edit_situ(hidden: &Array, gate: &Array) -> Result<Array> {
+    if hidden.dtype() == Dtype::Float32 {
+        return situ(hidden, gate);
+    }
+    // Each source unary op computes in F32 then rounds once. Evaluate at these
+    // boundaries so widened intermediates cannot accumulate across the two branches.
+    let dtype = hidden.dtype();
+    let unary = |x: &Array, operation: &dyn Fn(Array) -> Result<Array>| -> Result<Array> {
+        let widened = x.as_dtype(Dtype::Float32)?;
+        let result = operation(widened)?;
+        let rounded = result.as_dtype(dtype)?;
+        eval([&rounded])?;
+        Ok(rounded)
+    };
+    let divide_then_tanh = |x: &Array, divisor: f32| -> Result<Array> {
+        let divided = unary(x, &|a| Ok(divide(a, constant(divisor, Dtype::Float32)?)?))?;
+        unary(&divided, &|a| Ok(tanh(a)?))
+    };
+    let gated = {
+        let gate_tanh = divide_then_tanh(gate, 4.0)?;
+        let sigmoid = unary(gate, &|a| Ok(sigmoid(a)?))?;
+        let gated = multiply(scale(&gate_tanh, 4.0)?, sigmoid)?;
+        eval([&gated])?;
+        gated
+    };
+    Ok(multiply(
+        gated,
+        scale(&divide_then_tanh(hidden, 25.0)?, 25.0)?,
+    )?)
+}
+
 fn edit_silu(x: &Array) -> Result<Array> {
     // nn.SiLU computes the activation in FP32 then rounds once to the input dtype.
     // The backend's BF16 silu_exact instead preserves eager sigmoid/multiply rounding.
@@ -1078,9 +1124,7 @@ fn edit_attention(
     if v.dtype() == Dtype::Float32 {
         attention_fp32(q, k, v, scale, cancel)
     } else {
-        Ok(mlx_rs::fast::scaled_dot_product_attention(
-            q, k, v, scale, None, None,
-        )?)
+        attention_edit_bf16(q, k, v, cancel)
     }
 }
 impl Transformer {
@@ -1097,6 +1141,7 @@ impl Transformer {
             projection.edit_fused_bias = true;
         }
         for block in &mut self.text_blocks {
+            block.edit_precision = true;
             for projection in [
                 &mut block.qkv,
                 &mut block.proj,
@@ -1492,6 +1537,99 @@ mod edit_fixture_tests {
         array(value)
             .take_axis(Array::from_slice(&indices, &[indices.len() as i32]), 1)
             .unwrap()
+    }
+    #[test]
+    fn edit_bf16_source_leaf_cpu() {
+        const CHILD: &str = "MOSS_EDIT_LEAF_CPU_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transformer::edit_fixture_tests::edit_bf16_source_leaf_cpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "CPU leaf child: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            let fixture: Value = serde_json::from_str(include_str!(
+                "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_edit_precision/leaf_ops.json"
+            )).unwrap();
+            let cancel = CancelFlag::new();
+            for (i, call) in fixture["attention"].as_array().unwrap().iter().enumerate() {
+                let (q, k, v) = (array(&call["q"]), array(&call["k"]), array(&call["v"]));
+                let corrected = attention_edit_bf16(&q, &k, &v, &cancel).unwrap();
+                compare(
+                    &corrected,
+                    &call["output"],
+                    0.0,
+                    &format!("source SDPA {i}"),
+                );
+                let unrounded = attention_fp32(
+                    &q.as_dtype(Dtype::Float32).unwrap(),
+                    &k.as_dtype(Dtype::Float32).unwrap(),
+                    &v.as_dtype(Dtype::Float32).unwrap(),
+                    1.0 / (q.shape()[3] as f32).sqrt(),
+                    &cancel,
+                )
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+                assert_ne!(
+                    logical_f32_readback(&corrected).unwrap(),
+                    logical_f32_readback(&unrounded).unwrap(),
+                    "source SDPA rounding discriminator {i}"
+                );
+                // Repeated independent queries preserve the source output; 17 rows
+                // exercise two complete tiles and a partial tile, with all keys visible.
+                if q.shape()[2] == 8 {
+                    let first = slice_axis(&q, 2, 0, 1).unwrap();
+                    let repeated = concatenate_axis(&[&q, &q, &first], 2).unwrap();
+                    let source = array(&call["output"]);
+                    let first_source = slice_axis(&source, 2, 0, 1).unwrap();
+                    let expected = concatenate_axis(&[&source, &source, &first_source], 2).unwrap();
+                    let actual = attention_edit_bf16(&repeated, &k, &v, &cancel).unwrap();
+                    assert_eq!(actual.shape()[2], 17);
+                    assert_eq!(
+                        logical_f32_readback(&actual).unwrap(),
+                        logical_f32_readback(&expected).unwrap()
+                    );
+                }
+            }
+            for (i, call) in fixture["situ"].as_array().unwrap().iter().enumerate() {
+                let (hidden, gate) = (array(&call["hidden"]), array(&call["gate"]));
+                let corrected = edit_situ(&hidden, &gate).unwrap();
+                compare(
+                    &corrected,
+                    &call["output"],
+                    0.0,
+                    &format!("source SiTU {i}"),
+                );
+                let unrounded = situ(
+                    &hidden.as_dtype(Dtype::Float32).unwrap(),
+                    &gate.as_dtype(Dtype::Float32).unwrap(),
+                )
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+                assert_ne!(
+                    logical_f32_readback(&corrected).unwrap(),
+                    logical_f32_readback(&unrounded).unwrap(),
+                    "source SiTU eager rounding discriminator {i}"
+                );
+            }
+        });
     }
     #[test]
     fn edit_projection_and_reference_coordinates_cpu() {
@@ -2072,6 +2210,11 @@ mod edit_fixture_tests {
                     stage("situ"),
                 );
                 report(
+                    &format!("{prefix}.edit_situ"),
+                    &edit_situ(&array(stage("hidden")), &array(stage("gate"))).unwrap(),
+                    stage("situ"),
+                );
+                report(
                     &format!("{prefix}.finish"),
                     &block
                         .edit_finish(
@@ -2113,7 +2256,7 @@ mod edit_fixture_tests {
             {
                 let (q, k, v) = (array(&call["q"]), array(&call["k"]), array(&call["v"]));
                 report(
-                    &format!("attention.{i}.existing_fast"),
+                    &format!("attention.{i}.edit_candidate"),
                     &edit_attention(&q, &k, &v, &model.g, &cancel).unwrap(),
                     &call["output"],
                 );
@@ -2128,7 +2271,7 @@ mod edit_fixture_tests {
                 let dot = kf
                     .expand_dims(2)
                     .unwrap()
-                    .matmul(&qf.expand_dims(-1).unwrap())
+                    .matmul(qf.expand_dims(-1).unwrap())
                     .unwrap()
                     .squeeze_axes(&[-1])
                     .unwrap();
@@ -2153,7 +2296,7 @@ mod edit_fixture_tests {
                     .unwrap()
                     .expand_dims(2)
                     .unwrap()
-                    .matmul(&operand.expand_dims(-1).unwrap())
+                    .matmul(operand.expand_dims(-1).unwrap())
                     .unwrap()
                     .squeeze_axes(&[-1])
                     .unwrap();
