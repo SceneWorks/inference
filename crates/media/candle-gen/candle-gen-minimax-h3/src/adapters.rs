@@ -223,7 +223,7 @@ fn is_known_non_adapter_module(path: &str) -> bool {
 
 /// What a matched-nothing adapter target means on a given [`AdaLnSurface`] — the typed half of
 /// the strict install's refusal contract (sc-26688), the candle twin of
-/// `mlx_gen_minimax_h3::adapters::UnmatchedTargetClass`. [`unmatched_targets_error`] renders
+/// `mlx_gen_minimax_h3::adapters::UnmatchedTargetClass`. `unmatched_targets_error` renders
 /// these classes; tests assert the classification directly instead of pinning message wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnmatchedTargetClass {

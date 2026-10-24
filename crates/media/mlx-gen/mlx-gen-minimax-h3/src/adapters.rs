@@ -247,7 +247,7 @@ fn is_known_non_adapter_module(path: &str) -> bool {
 }
 
 /// What a matched-nothing adapter target means on a given [`AdaLnSurface`] — the typed half of
-/// the strict install's refusal contract (sc-26688). [`unmatched_targets_error`] renders these
+/// the strict install's refusal contract (sc-26688). `unmatched_targets_error` renders these
 /// classes; tests assert the classification directly instead of pinning message wording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnmatchedTargetClass {
