@@ -1416,6 +1416,47 @@ mod tests {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
     }
 
+    #[test]
+    fn selected_source_partition_is_immune_to_unselected_weights_cache_constructor_and_patch() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::assert_selected_task_contract(
+            root.path(),
+            contract_for,
+            false,
+        );
+    }
+
+    #[test]
+    fn w4a8_constructor_holds_all_original_and_replacement_companions() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, steady, copied) = gen_core_testkit::h3_memory::write_w4a8_component(
+            &root.path().join("transformer"),
+            &[(32, 512), (64, 256), (16, 1024)],
+        );
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        let facts = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        let task = facts.tasks.iter().find(|t| !t.reference_task).unwrap();
+        let workspace = candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64;
+        assert_eq!(
+            task.resident_bytes,
+            steady + workspace,
+            "replacement companions replace their originals in steady residency"
+        );
+        assert_eq!(task.constructor_bytes, source + copied + workspace,
+            "all model-owned relative scales/codebooks coexist with the complete original device map until construction finishes");
+        assert!(
+            copied > 64 * 256 / 16 + 64,
+            "more than a single current projection's replacement allocation"
+        );
+    }
+
     fn candle_backend() -> MemoryBackendRealization {
         MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -3443,6 +3484,7 @@ mod tests {
             .unwrap();
         assert!(native.tasks.iter().all(|t| t.evicted_bytes == 0));
         let rows = candle_gen::gen_core::h3_memory::NativeRows {
+            task: candle_gen::gen_core::h3_memory::NativeTaskSelection::All,
             packed: 17,
             conditioning: 9,
             schedule: 5,

@@ -2111,6 +2111,12 @@ mod tests {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
     }
 
+    #[test]
+    fn selected_source_partition_is_immune_to_unselected_weights_cache_constructor_and_patch() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::assert_selected_task_contract(root.path(), contract_for, true);
+    }
+
     /// AC (SC-22662): the MiniMax-H3 contract publishes the axes of the DiT and video VAE this crate
     /// declares, and passes the shared facts conformance check.
     #[test]
@@ -4804,6 +4810,7 @@ mod tests {
             .unwrap();
         assert!(native.tasks.iter().all(|t| t.evicted_bytes == 0));
         let rows = mlx_gen::gen_core::h3_memory::NativeRows {
+            task: mlx_gen::gen_core::h3_memory::NativeTaskSelection::All,
             packed: 17,
             conditioning: 9,
             schedule: 5,

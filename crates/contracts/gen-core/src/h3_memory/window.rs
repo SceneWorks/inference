@@ -492,6 +492,7 @@ mod tests {
     const BACKEND: NativeBackend = NativeBackend::Mlx { tile_columns: 16 };
     fn rows() -> NativeRows {
         NativeRows {
+            task: super::super::NativeTaskSelection::All,
             packed: 2,
             conditioning: 1,
             schedule: 2,

@@ -9,6 +9,37 @@ pub fn write_native_component(dir: &Path, block_width: u64) -> (u64, Vec<u64>) {
     write_native_component_with_outputs(dir, block_width, 32)
 }
 
+/// Independent source and replacement-buffer sizes for multiple native W4A8 constructors.
+/// Returned tuple is (source payload, steady payload, copied relative-scales/codebooks).
+pub fn write_w4a8_component(dir: &Path, shapes: &[(u64, u64)]) -> (u64, u64, u64) {
+    write_native_component(dir, 2); // Constructor config; replace its tensor inventory below.
+    let mut rows = BTreeMap::new();
+    let mut source = 0;
+    let mut steady = 0;
+    let mut copied = 0;
+    for (i, &(n, k)) in shapes.iter().enumerate() {
+        let base = format!("transformer_blocks.{i}.attn.to_q");
+        let descriptor =
+            br#"{"format":"asym_w4a8_int8","group_size":16,"convrot_groupsize":256}"#.to_vec();
+        rows.insert(format!("{base}.weight"), ("I8", vec![n, k / 2], vec![]));
+        rows.insert(
+            format!("{base}.weight_s_rel"),
+            ("F8_E4M3", vec![n, k / 16], vec![]),
+        );
+        rows.insert(format!("{base}.weight_s_channel"), ("F32", vec![n], vec![]));
+        rows.insert(format!("{base}.weight_codebook"), ("F32", vec![16], vec![]));
+        source += n * k / 2 + n * k / 16 + n * 4 + 64 + descriptor.len() as u64;
+        steady += n * k / 2 + n * k / 16 + n * 4 + 64;
+        copied += n * k / 16 + 64;
+        rows.insert(
+            format!("{base}.comfy_quant"),
+            ("U8", vec![descriptor.len() as u64], descriptor),
+        );
+    }
+    write_rows(dir, rows);
+    (source, steady, copied)
+}
+
 fn write_native_component_with_outputs(dir: &Path, block_width: u64, n: u64) -> (u64, Vec<u64>) {
     let mut rows: BTreeMap<String, (&str, Vec<u64>, Vec<u8>)> = BTreeMap::new();
     let mut resident = 0;
@@ -148,6 +179,154 @@ pub fn write_vae_configs(root: &Path) {
     .unwrap();
 }
 
+/// Price actual asymmetric source partitions through every public admission path. Mutating an
+/// unselected partition must not affect the selected request, including its window/cache/patch.
+pub fn assert_selected_task_contract(
+    root: &Path,
+    contract_for: impl Fn(&gen_core::LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract>,
+    mlx: bool,
+) {
+    use gen_core::h3_memory::NativeAllocationFacts;
+    let base = root.join("transformer");
+    let reference = root.join("transformer_ref");
+    write_w4a8_component(&base, &[(16, 256)]);
+    write_w4a8_component(&reference, &[(64, 1024), (32, 512)]);
+    let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(root.into()));
+    let get = || {
+        contract_for(&spec)
+            .unwrap()
+            .phase_facts
+            .unwrap()
+            .native_quant
+            .unwrap()
+    };
+    let price = |facts: &NativeAllocationFacts,
+                 req: &gen_core::GenerationRequest|
+     -> Result<Vec<u64>, String> {
+        let rows = facts
+            .request_rows(req.into(), 4)
+            .map_err(|e| e.to_string())?;
+        let mut prices = vec![
+            facts.precompute_peak_bytes(rows),
+            facts.denoise_peak_bytes(rows),
+            facts.peak_bytes(rows),
+        ];
+        for window in std::iter::once(None).chain(mlx.then_some(Some(1))) {
+            prices.push(
+                facts
+                    .precompute_peak_bytes_windowed(rows, window)
+                    .map_err(|e| e.to_string())?,
+            );
+            prices.push(
+                facts
+                    .denoise_peak_bytes_windowed(rows, window)
+                    .map_err(|e| e.to_string())?,
+            );
+            prices.push(
+                facts
+                    .resident_peak_bytes_windowed(rows, window)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(prices)
+    };
+    let req = gen_core::GenerationRequest {
+        width: 1344,
+        height: 768,
+        frames: Some(124),
+        ..Default::default()
+    };
+    let original = get();
+    let mut base_only = original.clone();
+    base_only.tasks.retain(|t| !t.reference_task);
+    let expected = price(&base_only, &req);
+    assert!(expected.is_ok());
+    assert_eq!(
+        price(&original, &req),
+        expected,
+        "text/keyframe requests load only the actual base partition"
+    );
+    write_w4a8_component(&reference, &[(128, 2048), (64, 1024), (32, 512)]);
+    let path = reference.join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    cfg["patch_size"] = serde_json::json!([2, 1, 1]);
+    std::fs::write(&path, cfg.to_string()).unwrap();
+    assert_eq!(price(&get(),&req),expected,"unselected constructor, weights, windows and incompatible patch cannot affect base admission");
+    let base_cfg = base.join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_cfg).unwrap()).unwrap();
+    cfg["patch_size"] = serde_json::json!([1, 1, 1]);
+    std::fs::write(&base_cfg, cfg.to_string()).unwrap();
+    let custom = get();
+    let mut custom_only = custom.clone();
+    custom_only.tasks.retain(|t| !t.reference_task);
+    assert_eq!(
+        price(&custom, &req),
+        price(&custom_only, &req),
+        "selected custom patch and actual windows still ignore the unselected partition"
+    );
+    let mut keyframe_req = req.clone();
+    keyframe_req
+        .conditioning
+        .push(gen_core::Conditioning::Keyframe {
+            image: gen_core::Image {
+                width: 1344,
+                height: 768,
+                pixels: vec![],
+            },
+            frame_idx: 0,
+            strength: 1.,
+        });
+    assert_eq!(
+        price(&custom, &keyframe_req),
+        price(&custom_only, &keyframe_req),
+        "keyframes select the same actual base partition"
+    );
+    let mut ref_req = req.clone();
+    ref_req
+        .conditioning
+        .push(gen_core::Conditioning::Reference {
+            image: gen_core::Image {
+                width: 320,
+                height: 576,
+                pixels: vec![],
+            },
+            strength: None,
+        });
+    let mut ref_only = original.clone();
+    ref_only.tasks.retain(|t| t.reference_task);
+    assert!(
+        price(&ref_only, &ref_req).is_ok(),
+        "RefOnly sources support their actual reference route"
+    );
+    assert_eq!(
+        price(&original, &ref_req),
+        price(&ref_only, &ref_req),
+        "reference requests load only the actual reference partition"
+    );
+    assert!(
+        ref_only.request_rows((&req).into(), 4).is_err(),
+        "a missing selected base partition is not zero-priced"
+    );
+    let mut changed_base = original;
+    let task = changed_base
+        .tasks
+        .iter_mut()
+        .find(|t| !t.reference_task)
+        .unwrap();
+    task.resident_bytes = u64::MAX;
+    task.constructor_bytes = u64::MAX;
+    task.table_bytes_per_timestep = u64::MAX;
+    task.patch_size = [0, 0, 0];
+    task.window = None;
+    assert_eq!(
+        price(&changed_base, &ref_req),
+        price(&ref_only, &ref_req),
+        "unselected base geometry/cache/constructor/window cannot poison reference admission"
+    );
+}
+
 /// Dense-only imports must not lose the source-grounded planner simply because they have no
 /// integer descriptor. The native loaders preserve F32 heads and cast only the dense block stack.
 pub fn assert_dense_contract(
@@ -273,6 +452,7 @@ pub fn assert_native_contract(
         "no imaginary dense AdaLN allocation in this source"
     );
     let rows = gen_core::h3_memory::NativeRows {
+        task: gen_core::h3_memory::NativeTaskSelection::All,
         packed: 17,
         conditioning: 9,
         schedule: 5,

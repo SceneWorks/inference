@@ -31,10 +31,30 @@ pub enum RowDomain {
     Schedule,
 }
 
+/// Actual native partition choice. All is an explicit route-independent envelope, never the
+/// result of request resolution; text/keyframes use Base and unpositioned references use Reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeTaskSelection {
+    Base,
+    Reference,
+    All,
+}
+
+impl NativeTaskSelection {
+    fn includes(self, task: &NativeTaskAllocation) -> bool {
+        match self {
+            Self::Base => !task.reference_task,
+            Self::Reference => task.reference_task,
+            Self::All => true,
+        }
+    }
+}
+
 /// Actual rows supplied by the selected request, including reference/audio/text tokens and the
 /// deduplicated precompute schedule. The consumer derives them from H3's existing geometry helpers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeRows {
+    pub task: NativeTaskSelection,
     pub packed: u64,
     pub conditioning: u64,
     pub schedule: u64,
@@ -256,6 +276,12 @@ pub struct NativeAllocationFacts {
 }
 
 impl NativeAllocationFacts {
+    fn selected_tasks(&self, rows: NativeRows) -> impl Iterator<Item = &NativeTaskAllocation> {
+        self.tasks
+            .iter()
+            .filter(move |task| rows.task.includes(task))
+    }
+
     pub fn request_rows(
         &self,
         req: crate::veda::workspace::Request<'_>,
@@ -264,25 +290,19 @@ impl NativeAllocationFacts {
         let rows = request_rows(req, evaluations)?;
         let (target, _) = crate::veda::workspace::h3_visual_grids(req)?;
         let latent = [target[0], target[1] * 2, target[2] * 2];
-        let reference_task = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                crate::Conditioning::Reference { .. }
-                    | crate::Conditioning::MultiReference { .. }
-                    | crate::Conditioning::ReferenceVideo { .. }
-                    | crate::Conditioning::ReferenceAudio { .. }
-            )
-        });
-        for task in self
-            .tasks
-            .iter()
-            .filter(|t| t.resident_bytes > 0 && t.reference_task == reference_task)
-        {
+        let mut found = false;
+        for task in self.selected_tasks(rows).filter(|t| t.resident_bytes > 0) {
+            found = true;
             for (axis, patch) in latent.into_iter().zip(task.patch_size) {
                 if patch == 0 || !axis.is_multiple_of(patch) {
                     return Err(invalid(format!("minimax_h3: target latent {latent:?} is not divisible by source patch {:?}", task.patch_size)));
                 }
             }
+        }
+        if !found {
+            return Err(invalid(
+                "H3 source omits the partition selected by this request",
+            ));
         }
         Ok(rows)
     }
@@ -363,8 +383,7 @@ impl NativeAllocationFacts {
     /// Scalar compatibility helpers fail closed at an unrepresentable bound. Admission uses the
     /// Result-returning methods below, which preserve the actual source/geometry error.
     pub fn precompute_peak_bytes(&self, rows: NativeRows) -> u64 {
-        self.tasks
-            .iter()
+        self.selected_tasks(rows)
             .map(|task| {
                 self.full_precompute(task, Self::task_rows(task, rows))
                     .unwrap_or(u64::MAX)
@@ -373,8 +392,7 @@ impl NativeAllocationFacts {
             .unwrap_or(0)
     }
     pub fn denoise_peak_bytes(&self, rows: NativeRows) -> u64 {
-        self.tasks
-            .iter()
+        self.selected_tasks(rows)
             .map(|task| {
                 self.full_denoise(task, Self::task_rows(task, rows))
                     .unwrap_or(u64::MAX)
@@ -389,12 +407,11 @@ impl NativeAllocationFacts {
         window: Option<u32>,
     ) -> Result<u64> {
         let Some(window) = window else {
-            return self.tasks.iter().try_fold(0u64, |peak, task| {
+            return self.selected_tasks(rows).try_fold(0u64, |peak, task| {
                 Ok(peak.max(self.full_precompute(task, Self::task_rows(task, rows))?))
             });
         };
-        self.tasks
-            .iter()
+        self.selected_tasks(rows)
             .filter(|t| t.resident_bytes > 0)
             .try_fold(0u64, |peak, task| {
                 let profile = task.window.as_ref().ok_or_else(|| {
@@ -415,12 +432,11 @@ impl NativeAllocationFacts {
         window: Option<u32>,
     ) -> Result<u64> {
         let Some(window) = window else {
-            return self.tasks.iter().try_fold(0u64, |peak, task| {
+            return self.selected_tasks(rows).try_fold(0u64, |peak, task| {
                 Ok(peak.max(self.full_denoise(task, Self::task_rows(task, rows))?))
             });
         };
-        self.tasks
-            .iter()
+        self.selected_tasks(rows)
             .filter(|t| t.resident_bytes > 0)
             .try_fold(0u64, |peak, task| {
                 let profile = task.window.as_ref().ok_or_else(|| {
@@ -442,7 +458,7 @@ impl NativeAllocationFacts {
         window: Option<u32>,
     ) -> Result<u64> {
         let Some(window) = window else {
-            return self.tasks.iter().try_fold(0u64, |peak, task| {
+            return self.selected_tasks(rows).try_fold(0u64, |peak, task| {
                 let value = if matches!(self.backend, NativeBackend::Mlx { .. }) {
                     match &task.window {
                         Some(profile) => profile.resident_peak_bytes_full(
@@ -461,8 +477,7 @@ impl NativeAllocationFacts {
                 Ok(peak.max(value))
             });
         };
-        self.tasks
-            .iter()
+        self.selected_tasks(rows)
             .filter(|t| t.resident_bytes > 0)
             .try_fold(0u64, |peak, task| {
                 let profile = task.window.as_ref().ok_or_else(|| {
@@ -491,6 +506,30 @@ pub fn request_rows(
     evaluations: usize,
 ) -> Result<NativeRows> {
     validate_request_geometry(req.width, req.height, u64::from(req.frames), req.count)?;
+    let references = req.conditioning.iter().any(|c| {
+        matches!(
+            c,
+            crate::Conditioning::Reference { .. }
+                | crate::Conditioning::MultiReference { .. }
+                | crate::Conditioning::ReferenceVideo { .. }
+                | crate::Conditioning::ReferenceAudio { .. }
+        )
+    });
+    let keyframes = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, crate::Conditioning::Keyframe { .. }));
+    // Match MiniMaxH3Task::resolve in both native providers. Mixing those carriers is not a task.
+    if references && keyframes {
+        return Err(invalid(
+            "H3 requests cannot mix keyframes and unpositioned references",
+        ));
+    }
+    let task = if references {
+        NativeTaskSelection::Reference
+    } else {
+        NativeTaskSelection::Base
+    };
     let (packed, conditioning) = crate::veda::workspace::h3_row_bound(req)?;
     let schedule = crate::pruned_adaln::SourcePruneSizing::conditioned_timestep_bound(evaluations)
         .map_err(invalid)? as u64;
@@ -508,6 +547,7 @@ pub fn request_rows(
             })?;
     let global = packed.saturating_sub(visual_elements / 4);
     Ok(NativeRows {
+        task,
         packed,
         conditioning,
         schedule,
@@ -619,6 +659,7 @@ pub fn allocation_from_headers(
     let mut native = BTreeSet::new();
     let mut rotations = BTreeSet::new();
     let mut projections = Vec::new();
+    let mut copied_native_companions = 0u64;
     for h in headers {
         for suffix in [
             ".weight_scale",
@@ -699,6 +740,15 @@ pub fn allocation_from_headers(
             let book = get("weight_codebook", Dtype::F32)?;
             let d = W4A8Int8::parse(payload, &w.shape, &rel.shape, &channel.shape, &book.shape)
                 .map_err(invalid)?;
+            if matches!(backend, NativeBackend::Candle { .. }) {
+                // W4A8Linear rebuilds these companions with Tensor::from_vec. Every model-owned
+                // replacement survives while the original complete device map is still held.
+                // This accumulates across projections, unlike the one-current decode tile.
+                copied_native_companions = copied_native_companions
+                    .checked_add(rel.data_bytes)
+                    .and_then(|n| n.checked_add(book.data_bytes))
+                    .ok_or_else(|| invalid("native constructor companion size overflow"))?;
+            }
             (
                 d.out_features,
                 d.in_features,
@@ -873,6 +923,7 @@ pub fn allocation_from_headers(
         })?;
         source
             .checked_add(derived)
+            .and_then(|n| n.checked_add(copied_native_companions))
             .and_then(|n| n.checked_add(resident_bytes - tensor_bytes))
             .ok_or_else(|| invalid("constructor size overflow"))?
     } else {
@@ -1118,6 +1169,7 @@ mod tests {
         workspace_bytes: 32 << 20,
     };
     const ROWS: NativeRows = NativeRows {
+        task: NativeTaskSelection::All,
         packed: 17,
         conditioning: 11,
         schedule: 5,
