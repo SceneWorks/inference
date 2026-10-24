@@ -81,3 +81,67 @@ writing three PNGs and three actual receipts. This explicit terminal test is nev
 run by default. For cancellation, optional `MOSS_NATIVE_TEST_WARM_REENTRY=1` resets
 the cancellation token and executes one native step to latent output through the
 same generator, publishing `warm-reentry.json` only on successful reentry.
+
+## Native editing (sc-26753)
+
+Catalog-loaded `Box<dyn Generator>` exposes `generate_moss_image_edit`,
+`moss_image_edit_request_peak` and `moss_image_edit_execution_report`. Provision the
+exact `chinoll/Moss-Image-Edit@e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11`
+package through `LoadSpec.components[gen_core::moss_image_edit::EDIT_COMPONENT]` as
+a directory containing `adapter_config.json` and `adapter_model.safetensors`.
+Prepared sources need finalized pins for both files. Both complete file SHA256s,
+all 252 rank64 projection configurations, and 504 BF16 A/B tensors are validated.
+The weights license is unspecified; the upstream code's GPL license does not license weights.
+
+`MossImageEditInputs` carries one ordered RGB reference, reference maximum edge
+(default 512), a cache toggle (default true), and the existing advanced embedding,
+mask, negative-batch, FP32 noise and latent-output inputs. Keep generic conditioning
+empty to avoid supplying a reference twice. Edit defaults are 30 steps, CFG 4,
+shift 5 and full-layer unconditional CFG. Width/height remain explicit request fields
+(the product default is 512x512). Nonempty skip layers, SLG and edit+DMD are rejected.
+Ordinary generation and both existing DMD policies retain their prior behavior.
+
+Reference pixels use the frozen Pillow Lanczos/no-crop/aligned resize, deterministic
+VAE posterior mode, channel-major 2x2 packing and FP32 BN normalization. Reference queries
+see only references with timestep 0 and their own reference-index coordinates; text
+and target queries see `[text,reference,target]`. Per-layer reference K/V is request-local,
+shared across CFG branches and steps, and discarded on completion/error/cancellation.
+A cached/uncached primitive comparison also covers four mixed-aspect latent references;
+the public one-reference bound widens in sc-26755.
+
+Admission includes adapter bytes, reference encoding/resampling, reference K/V and
+attention workspace. Call the typed edit peak method before dispatch and serialize
+admission/generation/receipt retrieval. Successful edit receipts include exact adapter
+identity, original/resized/latent reference hashes, effective controls and actual noise
+seeds/digests. Supplied noise records no generated seed. Ordinary receipts are absent
+after an edit, and both receipt kinds clear before any new attempt.
+
+Frozen transformer and VAE numerical fixtures require explicit coordinator-admitted Metal
+execution because the exact fused activation is Metal-only. They are synthetic; no real
+weights are loaded. CPU projection, reference-coordinate, package and byte-exact Pillow
+resize checks run independently. Real-weight quality and product acceptance belong to the
+integrated epic-end campaign.
+
+Before loading a provider, use
+`runtime_macos::providers::moss_image::memory_strategy::edit_request_peak(variant, spec, request, inputs)`
+(or the same path under `mlx_gen_moss_image`). This host-only structural estimate
+validates typed inputs and pinned metadata and includes ordinary residency,
+reference encoder, adapter, reference K/V and geometry-dependent FP32 temporaries.
+It constructs no MLX tensors. The generator's edit estimate uses the same function.
+
+Editing preserves upstream single-rounding biased BF16 projections and SiLU by
+accumulating those operations in FP32 before casting once. FP32 cast weights are
+temporary; the backbone and edit adapter remain BF16. The extra peak derives its
+bound from the largest simultaneously live text-embedding/text-block cast weights
+and request token counts. Reference encoding opts into precise FP32 linear
+accumulation for attention projections and quantization convolution; ordinary
+encoding and decoding retain their existing policy.
+
+The frozen edit numerical gate checks BF16 predictions at every identical source
+sampler input, strict FP32 CFG/Euler (including accumulator-dtype and low-precision
+negative controls), and a complete FP32 represented-weight diagnostic sampler at
+`2e-5` against independently executed source with semantic mutants. FP32 diagnostic
+weights are test-only. A final-latent BF16 ULP bound is not asserted: CFG amplifies
+prediction errors and subsequent network evaluations receive changed states.
+The retained source analysis documents why that former bound did not compose;
+aggregate BF16 drift remains printed rather than treated as identity evidence.

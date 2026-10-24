@@ -20,6 +20,16 @@ use mlx_gen::vae_tiling::{tiled_conv2d_3x3_nhwc, GlobalGroupNorm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+// N=1 dispatch retains FP32 accumulation on NAX; ordinary matrix multiplication
+// may use TF32 despite FP32 storage. The precise encoder opts into this policy.
+fn precise_linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
+    let output = weight.matmul(&x.expand_dims(-1)?)?.squeeze_axes(&[-1])?;
+    Ok(match bias {
+        Some(bias) => add(&output, bias)?,
+        None => output,
+    })
+}
+
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-6;
 const BN_EPS: f32 = 1e-4;
@@ -355,16 +365,32 @@ impl VaeAttention {
 
     /// `x`: NHWC `[B, H, W, C]`. Single-head attention over the H·W positions, residual.
     fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_with_precision(x, false)
+    }
+
+    fn forward_with_precision(&self, x: &Array, precise: bool) -> Result<Array> {
+        let project = |layer: &AdaptableLinear, input: &Array| -> Result<Array> {
+            if precise {
+                let (weight, bias) = layer.dense_weight().ok_or_else(|| {
+                    mlx_gen::Error::Msg(
+                        "precise VAE encoding requires dense encoder weights".into(),
+                    )
+                })?;
+                precise_linear(input, weight, bias)
+            } else {
+                layer.forward(input)
+            }
+        };
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.gn_w, &self.gn_b, GN_GROUPS, GN_EPS)?;
         let to_seq = |a: Array| -> Result<Array> { Ok(a.reshape(&[b, 1, h * w_, c])?) };
-        let q = to_seq(self.q.forward(&y)?)?;
-        let k = to_seq(self.k.forward(&y)?)?;
-        let v = to_seq(self.v.forward(&y)?)?;
+        let q = to_seq(project(&self.q, &y)?)?;
+        let k = to_seq(project(&self.k, &y)?)?;
+        let v = to_seq(project(&self.v, &y)?)?;
         let scale = (c as f32).powf(-0.5);
         let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
-        let o = self.o.forward(&o.reshape(&[b, h, w_, c])?)?;
+        let o = project(&self.o, &o.reshape(&[b, h, w_, c])?)?;
         Ok(add(x, &o)?)
     }
 }
@@ -496,13 +522,13 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, precise: bool) -> Result<Array> {
         let mut x = conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
         for db in &self.down_blocks {
             x = db.forward(&x)?;
         }
         x = self.mid_resnet0.forward(&x)?;
-        x = self.mid_attn.forward(&x)?;
+        x = self.mid_attn.forward_with_precision(&x, precise)?;
         x = self.mid_resnet1.forward(&x)?;
         let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
@@ -808,12 +834,28 @@ impl Flux2Vae {
     /// Encode an image `[B, H, W, 3]` (NHWC, ~`[-1, 1]`) → latent **mean** `[B, H/8, W/8, 32]`.
     /// Mirrors the fork's `encode` (returns the mean; `scaling_factor=1.0, shift_factor=0.0`).
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {
+        self.encode_mean_with_precision(x, false)
+    }
+
+    /// Encode the posterior mean with strict FP32 linear accumulation, avoiding
+    /// NAX TF32 rounding in encoder attention projections and `quant_conv`.
+    /// This opt-in path requires a dense encoder; decoding is unaffected.
+    pub fn encode_mean_precise(&self, x: &Array) -> Result<Array> {
+        self.encode_mean_with_precision(x, true)
+    }
+
+    fn encode_mean_with_precision(&self, x: &Array, precise: bool) -> Result<Array> {
         let x = x.as_dtype(Dtype::Float32)?;
         let (encoder, quant) = self
             .encoder
             .as_ref()
             .ok_or_else(|| mlx_gen::Error::Msg("FLUX.2 VAE was loaded decode-only".into()))?;
-        let moments = linear(&encoder.forward(&x)?, &quant.0, &quant.1)?;
+        let encoded = encoder.forward(&x, precise)?;
+        let moments = if precise {
+            precise_linear(&encoded, &quant.0, Some(&quant.1))?
+        } else {
+            linear(&encoded, &quant.0, &quant.1)?
+        };
         // split (mean, logvar) along channels; keep the mean.
         let c = moments.shape()[3];
         let half = c / 2;

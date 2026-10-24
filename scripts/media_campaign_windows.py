@@ -109,6 +109,13 @@ def _apis():
     kernel.ResumeThread.restype = wintypes.DWORD
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    kernel.IsProcessInJob.restype = wintypes.BOOL
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                  wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
     kernel.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatus)]
     kernel.GlobalMemoryStatusEx.restype = wintypes.BOOL
     kernel.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
@@ -209,6 +216,49 @@ class WindowsJob:
                 raise _failed("QueryInformationJobObject/process-list")
         raise WindowsJobError("owned Job has more than 1024 processes")
 
+    def member_identities(self, observed_pids: list[int]) -> dict:
+        """Bounded diagnostics from retained owned handles; never query argv/env.
+
+        A refreshed PID list alone cannot exclude PID reuse. Validate the opened
+        handle against this Job before querying its creation time or image path.
+        Missing identity metadata is diagnostic, never an ownership/admission grant.
+        """
+        pids = sorted(set(observed_pids))
+        result = {"observedCount": len(pids), "limit": 32, "truncated": len(pids) > 32, "processes": []}
+        for pid in pids[:32]:
+            row = {"pid": pid, "status": "unknown", "path": None, "createdFileTime": None}
+            result["processes"].append(row)
+            if pid not in self.members():
+                row["status"] = "left-job-before-open"
+                continue
+            process = self.kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not process:
+                row["status"] = "open-unavailable"
+                continue
+            try:
+                owned = wintypes.BOOL()
+                if not self.kernel.IsProcessInJob(process, self.handle, ctypes.byref(owned)):
+                    row["status"] = "membership-query-unavailable"
+                    continue
+                if not owned.value:
+                    row["status"] = "opened-handle-not-in-job"
+                    continue
+                row["status"] = "owned-identity-partial"
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if self.kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                                ctypes.byref(kernel), ctypes.byref(user)):
+                    row["createdFileTime"] = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(buffer))
+                if self.kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+                    row["path"] = buffer.value
+                if row["createdFileTime"] is not None and row["path"]:
+                    row["status"] = "owned-identity-resolved"
+            finally:
+                if not self.kernel.CloseHandle(process):
+                    raise _failed("CloseHandle/owned-identity")
+        return result
+
     def footprint_bytes(self) -> int:
         pids = self.members()
         if not pids:
@@ -251,5 +301,6 @@ class WindowsJob:
 
     def close(self) -> None:
         if self.handle:
-            self.kernel.CloseHandle(self.handle)
+            if not self.kernel.CloseHandle(self.handle):
+                raise _failed("CloseHandle/job")
             self.handle = None

@@ -267,21 +267,21 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new(vb: VarBuilder) -> Result<Self> {
-        let conv_in = conv3x3(3, BLOCK_OUT[0], vb.pp("conv_in"))?;
+    fn new(vb: VarBuilder, channels: &[usize; 4]) -> Result<Self> {
+        let conv_in = conv3x3(3, channels[0], vb.pp("conv_in"))?;
 
         // down_blocks iterate block_out forward; resnet 0 of block i bridges the previous block's
         // output channels into block_out[i]. Downsample after every block except the last.
-        let mut down_blocks = Vec::with_capacity(BLOCK_OUT.len());
-        let mut in_c = BLOCK_OUT[0];
-        for (i, &out_c) in BLOCK_OUT.iter().enumerate() {
+        let mut down_blocks = Vec::with_capacity(channels.len());
+        let mut in_c = channels[0];
+        for (i, &out_c) in channels.iter().enumerate() {
             let db = vb.pp("down_blocks").pp(i);
             let mut resnets = Vec::with_capacity(ENCODER_RESNETS);
             for j in 0..ENCODER_RESNETS {
                 let rin = if j == 0 { in_c } else { out_c };
                 resnets.push(Resnet::new(rin, out_c, db.pp("resnets").pp(j))?);
             }
-            let is_final = i == BLOCK_OUT.len() - 1;
+            let is_final = i == channels.len() - 1;
             let downsampler = if is_final {
                 None
             } else {
@@ -294,7 +294,7 @@ impl Encoder {
             in_c = out_c;
         }
 
-        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let top = *channels.last().unwrap(); // 512
         let mid = vb.pp("mid_block");
         let mid_resnet0 = Resnet::new(top, top, mid.pp("resnets").pp("0"))?;
         let mid_attn = MidAttention::new(top, mid.pp("attentions").pp("0"))?;
@@ -370,6 +370,16 @@ impl Flux2Vae {
     }
 
     fn build(vb: VarBuilder, with_encoder: bool, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        Self::build_with_encoder_channels(vb, with_encoder, config, &BLOCK_OUT)
+    }
+    // Private geometry seam for the independent source encoder oracle. Public constructors
+    // retain the frozen standard encoder widths, independently of decoder configuration.
+    fn build_with_encoder_channels(
+        vb: VarBuilder,
+        with_encoder: bool,
+        config: &Flux2VaeDecoderConfig,
+        encoder_channels: &[usize; 4],
+    ) -> Result<Self> {
         config.validate()?;
         // bn stats live at the top level (packed 128-ch space).
         let bn_mean = vb.get(128, "bn.running_mean")?.reshape((1, 128, 1, 1))?;
@@ -412,7 +422,7 @@ impl Flux2Vae {
         let conv_out = conv3x3(prev, 3, dec.pp("conv_out"))?;
 
         let encoder = if with_encoder {
-            let enc = Encoder::new(vb.pp("encoder"))?;
+            let enc = Encoder::new(vb.pp("encoder"), encoder_channels)?;
             let quant_conv = conv1x1(
                 2 * LATENT_CHANNELS,
                 2 * LATENT_CHANNELS,
@@ -747,3 +757,6 @@ mod tests {
         assert_eq!(back.flatten_all().unwrap().to_vec1::<f32>().unwrap(), data);
     }
 }
+
+#[cfg(test)]
+mod moss_edit_encoder_tests;

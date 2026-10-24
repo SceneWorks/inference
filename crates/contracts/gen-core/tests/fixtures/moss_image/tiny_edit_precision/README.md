@@ -1,0 +1,5 @@
+# BF16 edit arithmetic source discriminators
+
+These six independent leaf captures are copied without arithmetic changes from the CPU Torch 2.9.1 three-reference negative trace, SHA256 `730920940f773d38035200977e264c6bc853c5699048c8d1966790a28e4d9d52`. That trace observes the unchanged frozen upstream model, edit wrapper and nonzero adapter functions. It reproduces the original additive three-reference negative golden bit-for-bit, with traced/untraced equality. Full source hashes are embedded in `leaf_ops.json`.
+
+Four attention captures contain the actual source Q/K/V operands and SDPA result (two text blocks, two body blocks). Two SiTU captures contain the actual hidden/gate operands and eager BF16 result. There are no native output inputs, modified weights, replaced historical fixtures, or fitted tolerances. The tests discriminate BF16 exponential rounding from an all-F32 attention result rounded only at output, and eager SiTU from all-F32 arithmetic rounded only at output. These tiny leaf checks are not real-weight or device-peak acceptance.

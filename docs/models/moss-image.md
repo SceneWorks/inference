@@ -64,7 +64,10 @@ CFG is used whenever scale differs from1, including0. CFG=1 plus SLG uses the au
 Preserve text, multilingual content, tag sequences and compact JSON/layout strings as prompt
 content. Layout is text conditioning (`summary.caption`, `items`, `bbox_format:"yxyx"`,
 `bbox_coord_space:"abs_centralized"`), with generation dimensions matching its canvas.
-No reference-image editing or control tensors are exposed by this frozen model.
+The ordinary frozen model API exposes no reference-image editing or control tensors.
+The separate native MLX edit surface uses the pinned chinoll adapter through
+`Generator::generate_moss_image_edit`; see the MLX provider README for its typed inputs,
+package identity, admission and numerical validation. Edit+DMD remains rejected.
 
 The generic request carries prompt/prompt_batch, count, dimensions (positive multiples16),
 seed, steps, guidance/negative prompt and optional typed MOSS controls. The native advanced
