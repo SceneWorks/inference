@@ -23,8 +23,9 @@
 //! 3. **Epilogue** — the S4 `PROJECT` kernel verbatim: `((acc · xs) · s_channel) + bias`, int32
 //!    accumulation, one rounding to the activation dtype at the store.
 //!
-//! The fixture oracle is [`gen_core::w4a8_int8::reference_forward`], shared with the Candle backend,
-//! so this file may not re-derive any of that arithmetic — only schedule it on Metal.
+//! The expected fixture comes from the pinned external comfy-kitchen executable (see the epic
+//! source-of-truth / `local://sc26685-w4a8-primary-evidence.md`), never a host re-derivation; this
+//! file schedules only the dequant + reused S4 quant/GEMM legs — it does not re-implement the oracle.
 //!
 //! # `.weight_s_rel` is loaded as raw E4M3 bytes, not as a float
 //!

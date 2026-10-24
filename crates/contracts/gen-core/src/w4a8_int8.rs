@@ -63,6 +63,39 @@ pub const GROUP_SIZE: usize = 16;
 /// (non-Walsh) Hadamard block of order 256, normalized by `1/16`.
 pub const CONVROT_GROUP: usize = 256;
 
+/// The regular (non-Walsh) `H₄` Hadamard block. **Sign order is load-bearing** — this is the PR#90
+/// "regular" order (rows as `h4_row_dot` in `int8_linear.cu`), not the Sylvester/Walsh order, and it
+/// is the exact basis S4's `candle_gen::quant::regular_hadamard` already proves
+/// (`order4_is_regular_not_sylvester`). The MLX native primitive builds its rotation from
+/// [`regular_hadamard`]; the Candle native primitive reuses S4's builder — the two must never drift.
+pub const H4: [[f32; 4]; 4] = [
+    [1.0, 1.0, 1.0, -1.0],
+    [1.0, 1.0, -1.0, 1.0],
+    [1.0, -1.0, 1.0, 1.0],
+    [-1.0, 1.0, 1.0, 1.0],
+];
+
+/// The dense regular-Hadamard rotation of `order` (a power of four), normalized by `1/√order` —
+/// the Kronecker power of [`H4`] with per-element sign `∏ H4[i_d][j_d]`. This is the **production**
+/// rotation basis: the MLX `W4A8Linear` builds its resident rotation from it (cached through
+/// `Weights::convrot_rotation`), so the packed W4A8 weight and the ConvRot activation leg share one
+/// authority. The activation-side fused CUDA path factors the same product as a radix-4 FHT.
+pub fn regular_hadamard(order: usize) -> Vec<f32> {
+    debug_assert!(order == 1 || (order.is_power_of_two() && order.is_multiple_of(4)));
+    let mut out = Vec::with_capacity(order * order);
+    for idx in 0..order * order {
+        let (mut r, mut c) = (idx / order, idx % order);
+        let mut s = 1.0f32;
+        while r != 0 || c != 0 {
+            s *= H4[r % 4][c % 4];
+            r /= 4;
+            c /= 4;
+        }
+        out.push(s / (order as f32).sqrt());
+    }
+    out
+}
+
 /// Validated logical geometry. The stored weight is `I8 [out, in/2]` (two uint4 codes per byte,
 /// even column in the **low** nibble); `in_features` is the logical (dequantized-int8) width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
