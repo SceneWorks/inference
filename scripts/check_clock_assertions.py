@@ -146,7 +146,7 @@ CLOCK_TOKENS = (
 # accessor recovers the common cases at the cost of some false positives, which is the right trade
 # for a triage aid: a missed clock assertion is worse than a hit a human dismisses.
 DURATION_SHAPED = re.compile(
-    r"\b\w*(?:elapsed|duration|latency|fastest_step|slowest_step|_ms|_secs|_seconds|wall)\w*\b",
+    r"\b\w*(?:elapsed|duration|latency|fastest_step|slowest_step|_ms|_secs|_seconds)\w*\b",
     re.IGNORECASE,
 )
 
@@ -166,8 +166,29 @@ IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MACRO_RE = re.compile(r"\b(" + "|".join(ASSERT_MACROS) + r")!\s*\(")
 
 
+# `wall` must name an identifier component, not occur across two words:
+# Window + Allocation is not a duration, while total + Wall + Time is. Retain
+# wall-prefixed components and common lowercase compounds such as totalwallclock.
+CAMEL_PART_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
+WALL_COMPOUND_RE = re.compile(r"wall(?:clock|time)", re.IGNORECASE)
+
+
+def has_wall_identifier(text: str) -> bool:
+    for identifier in IDENT_RE.findall(text):
+        if WALL_COMPOUND_RE.search(identifier):
+            return True
+        for segment in identifier.split("_"):
+            if any(part.lower().startswith("wall") for part in CAMEL_PART_RE.findall(segment)):
+                return True
+    return False
+
+
 def has_clock_token(text: str) -> bool:
-    return any(tok in text for tok in CLOCK_TOKENS) or bool(DURATION_SHAPED.search(text))
+    return (
+        any(tok in text for tok in CLOCK_TOKENS)
+        or bool(DURATION_SHAPED.search(text))
+        or has_wall_identifier(text)
+    )
 
 
 def names_bound(target: str) -> list[str]:
