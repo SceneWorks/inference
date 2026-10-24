@@ -224,11 +224,11 @@ impl Sources {
     pub(crate) fn is_fixture(&self) -> bool {
         #[cfg(feature = "test-support")]
         {
-            return !self.ordinary.is_empty()
+            !self.ordinary.is_empty()
                 && self
                     .ordinary
                     .iter()
-                    .all(|asset| asset.fixture_digest.is_some());
+                    .all(|asset| asset.fixture_digest.is_some())
         }
         #[cfg(not(feature = "test-support"))]
         {
