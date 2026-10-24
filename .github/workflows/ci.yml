@@ -31,6 +31,16 @@ on:
         type: choice
         options: [all, windows-cuda]
         default: all
+      # sc-26685: explicit operator route for the two synthetic W4A8 external-fixture suites. A
+      # bare dispatch (`lanes: all`) does not run them, and `lanes: windows-cuda` would drag in the
+      # whole manual CUDA lane, so these two commands are selectable on their own. They read only
+      # the committed `tests/fixtures/minimax_h3_w4a8.json` (1 fixture, no weights/Hub) and never
+      # touch a real-weight runner.
+      synthetic_w4a8:
+        description: "none = no synthetic W4A8 lane; cuda = Candle CUDA only; mlx = MLX/Metal only; both = both"
+        type: choice
+        options: [none, cuda, mlx, both]
+        default: none
 
 permissions:
   contents: read
@@ -860,7 +870,9 @@ jobs:
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true'
+    # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
+    # `synthetic-w4a8-mlx` below.
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && inputs.synthetic_w4a8 == 'none'
     runs-on: [self-hosted, macOS, ARM64, nax]
     env:
       MACOSX_DEPLOYMENT_TARGET: "26.2"
@@ -915,6 +927,67 @@ jobs:
         run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
+
+  # sc-26685: synthetic W4A8 native arithmetic on MLX/Metal, dispatch-only via `synthetic_w4a8`.
+  # Ordinary CI compiles these bodies but never executes them (`#[ignore]`), so the only prior
+  # evidence was a host run. The suite reads the committed 2.29 MB
+  # `tests/fixtures/minimax_h3_w4a8.json` through `include_str!` -- no weights, no Hub fetch --
+  # and runs three production-path cases: W4A8 forward vs the external reference, the mixed
+  # W4A8/ConvRot payload, and the loader's refusal cases.
+  #
+  # `rw-llm` is registered only on `nax-macos-2` (see real-weights.yml's weight-set table), unlike
+  # `rw-chroma`, which is registered on both Macs. That keeps this job off the dev Mac's `nax`
+  # listener that `macos-nax` selects.
+  synthetic-w4a8-mlx:
+    name: Synthetic W4A8 native arithmetic (MLX/Metal, manual)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.2"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Record source revision
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "W4A8 MLX checked out \`$actual\` (dispatch ref \`${{ github.ref }}\`, sha \`${{ github.sha }}\`)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "${{ github.sha }}"
+      - name: Toolchain and platform versions
+        run: |
+          sw_vers
+          xcrun metal --version
+          rustc --version
+          cargo --version
+      - name: Fetch prebuilt MLX (sc-21382)
+        # Same contract as the `macos-nax` step of this name.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      # No `save-if: main`: this lane is manual and never runs on `main`. `cache-bin: "false"` is
+      # mandatory on the persistent Mac for the rust-cache/rustup reason documented on `macos-nax`.
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Prove W4A8 native arithmetic against the external fixture
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/w4a8-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration w4a8_compare:: -- --ignored --nocapture 2>&1 | tee "$log"
+          # `pipefail` keeps the Cargo status through `tee`; the summary and per-test-name checks
+          # then fail a run that skipped, filtered, or silently ignored the native bodies.
+          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test w4a8_compare::native_forward_matches_the_external_reference ... ok" "$log"
+          grep -Fq "test w4a8_compare::invalid_operands_are_refused_by_the_published_contract ... ok" "$log"
+          grep -Fq "test w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic ... ok" "$log"
 
   # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
   # the lane.
@@ -1064,7 +1137,9 @@ jobs:
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
     needs: changes
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true'
+    # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
+    # `synthetic-w4a8-cuda` below.
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true' && inputs.synthetic_w4a8 == 'none'
     runs-on: [self-hosted, windows, cuda]
     env:
       # Keep manual runs inside the same per-listener budget as the automatic compile check.
@@ -1147,6 +1222,68 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
+
+  # sc-26685: synthetic W4A8 native arithmetic on CUDA, dispatch-only via `synthetic_w4a8`.
+  # Same committed 2.29 MB fixture as the MLX twin -- no weights, no Hub fetch -- driving two
+  # production-path cases: the W4A8 forward against the external comfy-kitchen reference, and the
+  # mixed W4A8/ConvRot payload. Both are `#[ignore]`d in the test target, so ordinary CI only
+  # compiles them.
+  synthetic-w4a8-cuda:
+    name: Synthetic W4A8 native arithmetic (CUDA, manual)
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true' && (inputs.synthetic_w4a8 == 'cuda' || inputs.synthetic_w4a8 == 'both')
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Record source revision
+        shell: cmd
+        run: |
+          for /f "delims=" %%H in ('git rev-parse HEAD') do set "ACTUAL=%%H"
+          echo W4A8 CUDA checked out %ACTUAL% (dispatch ref ${{ github.ref }}, sha ${{ github.sha }})>>"%GITHUB_STEP_SUMMARY%"
+          if /i not "%ACTUAL%"=="${{ github.sha }}" exit /b 1
+      - name: Isolate persistent-runner HF caches
+        shell: cmd
+        run: |
+          set "HF_OUTER=%RUNNER_TEMP%\inference-ci-w4a8-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
+          if not exist "%HF_OUTER%" mkdir "%HF_OUTER%"
+          if errorlevel 1 exit /b 1
+          echo HF_HOME=%HF_OUTER%\hf-home>>"%GITHUB_ENV%"
+          echo HF_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
+          echo HUGGINGFACE_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
+      # A bare `bash` on these runners is WSL's; the toolchain action shells out with bash.
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # Manual lane: no `save-if: main`; `cache-bin: "false"` per the persistent-box rustup note on
+      # `windows-cuda`.
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Prove W4A8 native arithmetic against the external fixture
+        shell: cmd
+        # Redirect instead of piping (cmd has no pipefail), then fail on Cargo's own status and on
+        # the exact executed-test summary/names, so a filtered or skip-as-pass run cannot go green.
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\w4a8-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration w4a8_compare:: -- --ignored --nocapture >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test w4a8_compare::native_forward_matches_the_external_reference ... ok" "%LOG%" >nul || exit /b 1
+          findstr /C:"test w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic ... ok" "%LOG%" >nul || exit /b 1
 
   supply-chain:
     name: dependency policy + advisories
@@ -1256,8 +1393,10 @@ jobs:
       - candle-cpu-bundles
       - macos-metal
       - macos-nax
+      - synthetic-w4a8-mlx
       - windows-cuda-check
       - windows-cuda
+      - synthetic-w4a8-cuda
       - supply-chain
       - docs
       - release-metadata
