@@ -4105,7 +4105,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4117,6 +4117,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then\n'
             '  python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"\n'
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cpu-fixture" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-metal-fixture" ]]; then\n'
             '  python3 scripts/ci/select_lanes.py --only workspace --github-output "$GITHUB_OUTPUT"\n'
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
         )
@@ -4141,6 +4143,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("macos-nax", macos_jobs)
         for name in macos_jobs:
             with self.subTest(job=name):
+                if name == "moss-metal-fixture":
+                    self.assertEqual(parsed["jobs"][name]["if"],
+                                     "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-metal-fixture'")
+                    continue
                 self.assertIn(
                     "needs.changes.outputs.macos_metal == 'true'",
                     parsed["jobs"][name].get("if", ""),

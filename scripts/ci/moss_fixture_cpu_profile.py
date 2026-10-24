@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hosted-only S4 CPU evidence and actual assertion-killing review mutations.
+"""Hosted manual MOSS CPU/Metal model evidence and S4 assertion mutations.
 
 No device inventory or model downloads. Uses the existing owned CPU supervisor unchanged.
 Compilation has the hosted job/45-minute compiler bound; each test keeps 180s/2GiB.
@@ -35,6 +35,48 @@ CAUSAL_TESTS = {
         "transformer::review_fix_tests::all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward",
     ),
 }
+# MOSS-only manual registrations, not a frozen-corpus population gate.
+CPU_MODEL_TESTS = {
+    'candle': (
+        'tests::exact_author_graph_fp32_bf16_and_ragged_masks',
+        'tests::exact_author_leaf_functions',
+        'tests::exact_unmerged_fp32_residual_and_fixed_noise_recurrence',
+        'tests::mask_and_cancellation_refuse_before_blocks',
+        'tests::ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch',
+        'tests::renderer_off_on_off_never_reuses_modified_backbone',
+        'tests::sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual',
+        'tests::supplied_fp32_conditioning_preserves_precision_until_selected_projection_sc26324',
+        'tests::training_contract_tests::cached_renderer_invalidates_on_adapter_replacement_or_removal',
+        'tests::training_contract_tests::committed_mlx_cpu_adapters_generate_portably',
+        'tests::training_contract_tests::cpu_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload',
+        'tests::training_contract_tests::periodic_and_final_exports_preserve_request_trigger_words',
+        'tests::training_contract_tests::strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow',
+        'tests::training_contract_tests::strict_application_rejects_unscaled_intermediate_overflow_before_success',
+        'tests::training_contract_tests::structured_lokr_matches_independent_f64_kronecker_for_both_orders_and_decompositions',
+        'tests::warm_admission_credits_only_actual_provider_weights',
+    ),
+    'mlx': (
+        'portable_exchange_tests::committed_candle_cpu_adapters_generate_portably',
+        'portable_exchange_tests::cpu_train_export_and_import_portable_adapters',
+        'portable_exchange_tests::periodic_and_final_exports_preserve_request_trigger_words',
+        'portable_exchange_tests::strict_application_rejects_unscaled_intermediate_overflow_before_success',
+        'transformer::review_fix_tests::all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward',
+        'transformer::review_fix_tests::installed_adapter_validation_rejects_finite_sources_that_overflow',
+        'transformer::review_fix_tests::lokr_real_loader_rejects_crossed_axes_unused_factors_and_bad_scaling',
+        'transformer::review_fix_tests::routing_owner_tracks_widening_and_dmd_weight_replacement',
+        'transformer::review_publication_tests::final_optimizer_values_are_validated_before_adapter_file_is_written',
+        'transformer::review_structured_math_tests::raw_structured_full_and_decomposed_factors_match_independent_kronecker_math',
+        'transformer::review_structured_math_tests::real_loader_uses_nondefault_rank_alpha_and_user_strength_on_the_projection',
+        'transformer::training_bf16_cpu_tests::production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload',
+        'transformer::training_graph_tests::cpu_native_backward_updates_only_factors_and_reload_changes_generation',
+        'transformer::training_projection_tests::custom_stack_is_fp32_scaled_and_keeps_dmd_separate',
+    ),
+}
+METAL_MODEL_TESTS = (
+    'transformer::author_fixture_tests::frozen_author_full_graph_ragged_masks_fp32_bf16_and_skipping',
+    'transformer::author_fixture_tests::frozen_reference_unmerged_fp32_projection_and_three_step_dmd',
+)
+METAL_DEVICE_MARKER = "MOSS_METAL_DEFAULT_DEVICE_AND_STREAM=gpu"
 DIAGNOSTIC_BASELINES = ("training_memory::tests::audit_workspace_is_charged_in_checkpoint_and_host_domains",)
 FRACTION_TESTS = tuple("train::memory_budget_tests::" + name for name in (
     "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
@@ -223,7 +265,7 @@ def assertion_red(binary: Path, mutation: dict, log: Path) -> dict:
     owner = fixture.CpuOwner()
     started = time.monotonic()
     try:
-        supervise([str(binary), mutation["test"], "--exact", "--nocapture", "--color", "never", "--test-threads=1"],
+        supervise([str(binary), mutation["test"], "--exact", "--include-ignored", "--nocapture", "--color", "never", "--test-threads=1"],
                   owner, log, deadline=fixture.DEADLINE, rss_cap=fixture.RSS_CAP, env=environment)
     except UnitFailure as error:
         # Deadline, OOM, signal, zero/ignored tests, compile failure and unrelated panic never count.
@@ -239,12 +281,15 @@ def assertion_red(binary: Path, mutation: dict, log: Path) -> dict:
             "configured_rss_cap_bytes": fixture.RSS_CAP, "configured_deadline_seconds": fixture.DEADLINE}
 
 
-def independent_tests(binary: Path, names: list[str], directory: Path, prefix: str) -> list[dict]:
+def independent_tests(binary: Path, names: list[str], directory: Path, prefix: str, *, device_marker: str | None = None) -> list[dict]:
     results = []
     for index, name in enumerate(names):
         log = directory / f"{prefix}-{index}.log"
         try:
-            fixture.execute(binary, name, log)
+            if device_marker is None:
+                fixture.execute(binary, name, log)
+            else:
+                fixture.execute(binary, name, log, device_marker=device_marker)
         except fixture.CaseAssertionFailure:
             pass  # Only exact independently released assertion failures are aggregatable.
         results.append(json.loads(log.with_suffix(".result.json").read_text(encoding="utf-8")))
@@ -270,8 +315,8 @@ def run(backend: str, directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     evidence = {"backend": backend, "head": None, "passed": False,
                 "expected_fixture_tests": [fixture.DEMAND_TEST, fixture.TOKEN_TEST, *fixture.CASES],
-                "expected_review_tests": sorted({m["test"] for m in mutations(backend)} | set(CAUSAL_TESTS[backend]) | set(DIAGNOSTIC_BASELINES)),
-                "causal_controls": list(CAUSAL_TESTS[backend]), "diagnostic_admission_controls":list(DIAGNOSTIC_BASELINES), "mutations": []}
+                "expected_review_tests": sorted({m["test"] for m in mutations(backend)} | set(CAUSAL_TESTS[backend]) | set(CPU_MODEL_TESTS[backend]) | set(DIAGNOSTIC_BASELINES)),
+                "causal_controls": list(CAUSAL_TESTS[backend]), "cpu_model_controls": list(CPU_MODEL_TESTS[backend]), "diagnostic_admission_controls":list(DIAGNOSTIC_BASELINES), "mutations": []}
     baseline = None
     try:
         evidence.update(venue(backend))
@@ -347,12 +392,76 @@ def run(backend: str, directory: Path) -> dict:
     return evidence
 
 
+def run_metal(directory: Path) -> dict:
+    """Only the original default-Metal author proofs; never enables unrelated lanes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    evidence = {"profile": "moss-metal-fixture-v1", "backend": "mlx", "head": None,
+                "passed": False, "expected_tests": list(METAL_MODEL_TESTS),
+                "device_contract": "unchanged MLX default GPU device and GPU stream",
+                "resource_contract": {"owned_child_rss_cap_bytes": fixture.RSS_CAP,
+                                      "child_deadline_seconds": fixture.DEADLINE,
+                                      "compiler_deadline_seconds": 2700,
+                                      "measured_model_peak_bytes": None}}
+    baseline = None
+    try:
+        evidence.update(venue("mlx"))
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        if event.get("inputs", {}).get("lanes") != "moss-metal-fixture":
+            raise UnitFailure("Metal proofs require the narrow explicit manual choice")
+        if not METAL_MODEL_TESTS:
+            raise UnitFailure("no original Metal model proofs registered")
+        evidence["dispatch_lanes"] = event["inputs"]["lanes"]
+        evidence["build_features"] = ["test-support"]
+        baseline = fixture.source_stamp()
+        inputs = ROOT / "crates/contracts/gen-core/tests/fixtures/moss_image/tiny_author"
+        evidence["fixture_inputs"] = {str(path.relative_to(ROOT)): {"bytes": path.stat().st_size,
+                                    "sha256": fixture.file_digest(path)}
+                                     for path in [inputs / "fixture.json", inputs / "dmd_fixture.json"]}
+        binary, evidence["compiler"] = compile_binary("mlx", directory / "baseline.json")
+        owner = fixture.CpuOwner()  # POSIX owned-process/RSS guard; does not select a device.
+        listing = supervise([str(binary), "--list"], owner, directory / "unfiltered-list.log",
+                            deadline=fixture.DEADLINE, rss_cap=fixture.RSS_CAP)
+        names = [line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")]
+        if owner.collect() or len(names) != len(set(names)) or not set(METAL_MODEL_TESTS).issubset(names):
+            raise UnitFailure("Metal proof discovery or owned listing cleanup incomplete")
+        evidence["tests"] = independent_tests(binary, list(METAL_MODEL_TESTS), directory, "metal",
+                                               device_marker=METAL_DEVICE_MARKER)
+        evidence["passed"] = ([r["test"] for r in evidence["tests"]] == list(METAL_MODEL_TESTS)
+                              and all(r["status"] == "passed" and r["owned_released"]
+                                      and r["source"] == baseline
+                                      and r["binary_sha256"] == evidence["compiler"]["binary_sha256"]
+                                      and r["device_contract_observation"] == METAL_DEVICE_MARKER
+                                      for r in evidence["tests"]))
+    except BaseException as error:
+        evidence["fatal_error"] = str(error)
+        raise
+    finally:
+        try:
+            evidence["final_source"] = fixture.source_stamp()
+            evidence["source_restored"] = baseline is not None and evidence["final_source"] == baseline
+        except (OSError, subprocess.SubprocessError) as error:
+            evidence["source_restored"] = False
+            evidence["source_check_error"] = str(error)
+        if not evidence["source_restored"]:
+            evidence["passed"] = False
+        evidence["file_sha256"] = {str(p.relative_to(directory)): fixture.file_digest(p)
+                                    for p in sorted(directory.rglob("*")) if p.is_file() and p.name != "proof.json"}
+        (directory / "proof.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    if not evidence["source_restored"]:
+        raise UnitFailure("Metal proof source identity changed")
+    return evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("backend", choices=tuple(fixture.PACKAGES))
+    parser.add_argument("--metal-only", action="store_true", help="the narrow manual Metal choice only")
     args = parser.parse_args()
+    if args.metal_only and args.backend != "mlx":
+        parser.error("Metal proofs require the MLX backend")
     try:
-        evidence = run(args.backend, Path(os.environ["RUNNER_TEMP"]) / f"moss-cpu-{args.backend}-evidence")
+        evidence = (run_metal(Path(os.environ["RUNNER_TEMP"]) / "moss-metal-evidence") if args.metal_only
+                    else run(args.backend, Path(os.environ["RUNNER_TEMP"]) / f"moss-cpu-{args.backend}-evidence"))
         if not evidence["passed"]:
             print("moss-cpu-profile: FAIL independent baseline/case/mutation failures remain", file=sys.stderr)
             return 1
