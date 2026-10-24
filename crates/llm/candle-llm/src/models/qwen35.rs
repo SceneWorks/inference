@@ -4004,6 +4004,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"]
     fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         // Frozen text encoders may wrap the decoder under language_model.model or language_model.
@@ -4047,6 +4048,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "real model decoder execution; requires explicit manual CI lanes=llm-decoder-fixture"]
     fn headless_checked_callback_cancels_between_layers_and_resets_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let weights = synthetic_weights_with_prefix(&cfg, "language_model");

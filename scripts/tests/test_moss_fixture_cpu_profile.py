@@ -71,7 +71,7 @@ class HostedCpuRoutingTests(unittest.TestCase):
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
         workflow = self.workflow()
         self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["lanes"]["options"],
-                         ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture"])
+                         ["all", "windows-cuda", "moss-cuda-unit", "moss-cpu-fixture", "moss-metal-fixture", "llm-decoder-fixture"])
         self.assertEqual(set(workflow["on"]["workflow_dispatch"]["inputs"]), {"lanes"})
         job = workflow["jobs"]["moss-cpu-fixture"]
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cpu-fixture'")
