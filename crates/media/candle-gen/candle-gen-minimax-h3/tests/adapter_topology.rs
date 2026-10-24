@@ -36,11 +36,13 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::pruned_adaln::{interpolation_position, TABLE_KEY};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::train::merge::read_adapter;
 use candle_gen::Weights;
 use candle_gen_minimax_h3::{
     adaln_schedule, adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
     classify_unmatched_target, convert_comfyui_key_space, is_comfyui_key_space, AdaLnSurface,
     JointSchedule, MiniMaxH3Dit, MiniMaxH3DitConfig, UnmatchedTargetClass, AUDIO_SIGMA_SHIFT,
+    BLOCK_TARGETS,
 };
 
 use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
@@ -57,14 +59,6 @@ const PUBLISHED_RANK: usize = 128;
 /// The fixture's pruned-curve table shape: `[grid, rank]`, F32.
 const CURVE_GRID: usize = 8;
 const CURVE_RANK: usize = 4;
-
-/// Relative tolerance the native (CUDA) arm gates its residual against the independent f64
-/// bf16-chain reference with. Derived, not measured: the reference pins every bf16 rounding of the
-/// declared chain, so what remains is fp32-kernel accumulation order (≲ 128·2⁻²⁴) plus at most one
-/// rounding-placement difference (≤ 2⁻⁹) — 1e-2 is ~5× that derived worst case. The gate compares
-/// the RESIDUAL, not the base output, so a dropped adapter (residual 0), a no-op gain (0) or any
-/// fold/offset error fails by orders of magnitude.
-const NATIVE_RELATIVE_TOL: f64 = 1.0e-2;
 
 fn dev() -> Device {
     Device::Cpu
@@ -385,130 +379,6 @@ fn max_abs(t: &Tensor) -> f32 {
         .expect("scalar")
 }
 
-/// The stored factor bytes a reference computation reads: `a` is the `[rank, in]` lora_A and `b`
-/// the `[out, rank]` lora_B, both widened from the actual file bytes.
-struct LoraFactors<'a> {
-    a: &'a [f32],
-    b: &'a [f32],
-    in_dim: usize,
-    out: usize,
-}
-
-/// The mathematical residual `((x·a)·b_folded)·scale` in f64, over the **stored bf16 factor
-/// bytes** (widened exactly) and the exact f32 probe input.
-///
-/// This is the contract-level reference: the factors are what the file stores (bf16 — every
-/// published turbo tensor), the fold is the install's own `alpha/rank`, and the probe input is the
-/// exact f32 vector. It deliberately does NOT model where each backend rounds inside the chain:
-/// the declared compute dtype is the factors' bf16 (the sc-18728 dtype-matched fold exists so the
-/// product runs at the fork's precision rather than being promoted), but the observable contract
-/// does not pin whether a backend rounds `x`, an intermediate, or only the output to bf16 — and
-/// the two lanes demonstrably place those roundings differently. The gate below derives the bound
-/// from that declared bf16 chain instead of encoding one placement.
-fn reference_residual(
-    factors: LoraFactors<'_>,
-    fold: f32,
-    scale: f32,
-    x: &[f32],
-    rows: usize,
-) -> Vec<f64> {
-    let LoraFactors { a, b, in_dim, out } = factors;
-    let rank = a.len() / in_dim;
-    assert_eq!(b.len() % rank, 0, "lora_B must be [out, rank]");
-    let bf16_round = |v: f32| -> f64 {
-        let bits = v.to_bits();
-        let lsb = (bits >> 16) & 1;
-        f32::from_bits((bits + 0x7fff + lsb) & 0xFFFF_0000) as f64
-    };
-    // The install folds `alpha/rank` into `b` with a dtype-matched scalar — one bf16 rounding,
-    // identical on both backends because it happens at install, on the host, before any matmul.
-    let b_inst: Vec<f64> = b.iter().map(|&v| bf16_round(v * fold)).collect();
-    let mut y = vec![0.0f64; rows * out];
-    for r in 0..rows {
-        let mut mid = vec![0.0f64; rank];
-        for (k, mid_k) in mid.iter_mut().enumerate() {
-            let acc: f64 = (0..in_dim)
-                .map(|j| x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64)
-                .sum();
-            *mid_k = acc;
-        }
-        for o in 0..out {
-            let acc: f64 = (0..rank).map(|k| mid[k] * b_inst[o * rank + k]).sum();
-            y[r * out + o] = acc * scale as f64;
-        }
-    }
-    y
-}
-
-/// The factor values the fixture wrote for one target, read back from the written file so the
-/// reference uses the actual bytes the install consumed.
-fn fixture_factors(
-    lora: &Path,
-    target: &str,
-    rank: usize,
-    inn: usize,
-    out: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let af = candle_gen::train::merge::read_adapter(lora).expect("the written LoRA");
-    let a = af
-        .tensors
-        .get(&format!("{target}.lora_A.default.weight"))
-        .unwrap_or_else(|| panic!("{target} lora_A"));
-    let b = af
-        .tensors
-        .get(&format!("{target}.lora_B.default.weight"))
-        .unwrap_or_else(|| panic!("{target} lora_B"));
-    assert_eq!(
-        a.dims2().expect("2-D"),
-        (rank, inn),
-        "{target} lora_A shape"
-    );
-    assert_eq!(
-        b.dims2().expect("2-D"),
-        (out, rank),
-        "{target} lora_B shape"
-    );
-    (f32s(a), f32s(b))
-}
-
-fn assert_matches_reference(got: &[f32], want: &[f64], what: &str) {
-    let mut worst = 0.0f64;
-    for (g, w) in got.iter().zip(want) {
-        worst = worst.max((*g as f64 - w).abs());
-    }
-    let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    // Derived bound, not an observed one. The reference emulates the declared bf16 compute chain
-    // stage by stage; what it cannot pin is the accumulation ORDER inside each device matmul.
-    // bf16×bf16 products are exact in f32 (8-bit mantissas), so an f32-accumulated dot of 128
-    // exact products drifts ≲ 128·2⁻²⁴ relative (~8e-6); one bf16 output rounding of a matmul is
-    // ≤ 2⁻⁹ relative, and a backend whose rounding placement differs from the emulation adds at
-    // most one more such rounding. The gate is 1e-2, ~5× the derived worst case. A wrong fold
-    // (16×/128×), a wrong module or a dropped target moves the residual by orders of magnitude
-    // past this band, and the cross-topology bit-exact equality in the same tests is independent
-    // of it.
-    assert!(
-        worst <= 1.0e-2 * peak,
-        "{what}: the installed residual must match the independent bf16-chain reference \
-         (worst {worst}, peak {peak})"
-    );
-}
-
-/// Relative max-abs-diff against the independent reference — the only honest gate for the native
-/// (CUDA) arm, whose fp32 kernels over bf16 factors accumulate past the CPU bit-exact floor.
-fn assert_matches_reference_rel(got: &[f32], want: &[f64], tol: f64, what: &str) {
-    let mut worst = 0.0f64;
-    let mut peak = 0.0f64;
-    for (g, w) in got.iter().zip(want) {
-        worst = worst.max((*g as f64 - w).abs());
-        peak = peak.max(w.abs());
-    }
-    assert!(
-        worst <= tol * peak,
-        "{what}: the native residual must match the independent reference (worst {worst}, peak \
-         {peak}, relative tolerance {tol})"
-    );
-}
-
 /// **AC1/AC2 (sc-26688):** the same body LoRA folds *bit-identically* on the full and the pruned
 /// topology, and each fold matches an independently computed `x·Aᵀ·(fold·Bᵀ)·scale` — the deltas
 /// and the alpha fold are preserved across topologies, never reweighted, never rederived.
@@ -525,7 +395,6 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
     let x = tensor(&[3, cfg.hidden_size], 0.7);
 
     for target in [PROBE, PROBE_FFN] {
-        let (out, inn) = target_shape(&cfg, target);
         let full_res = probe_residual(|| full_dit(&cfg), &lora, 1.0, target, &x);
         let pruned_res = probe_residual(|| pruned_dit(&cfg), &lora, 1.0, target, &x);
 
@@ -540,22 +409,6 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
             "{target}: the same factors must fold bit-identically on both topologies — the body \
              leaves are the same modules and the install must not reweight across topology"
         );
-
-        let (a, b) = fixture_factors(&lora, target, PUBLISHED_RANK, inn, out);
-        let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(
-            LoraFactors {
-                a: &a,
-                b: &b,
-                in_dim: inn,
-                out,
-            },
-            fold,
-            1.0,
-            &f32s(&x),
-            3,
-        );
-        assert_matches_reference(&f32s(&full_res), &want, target);
     }
 }
 
@@ -889,39 +742,6 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
         0.0,
         "the converted namespace must fold bit-identically across topologies"
     );
-
-    // Independent reference over the CONVERTED factor bytes at the emitted alpha's fold.
-    let wconv = candle_gen::train::merge::read_adapter(&converted_path).expect("read converted");
-    let a = f32s(
-        wconv
-            .tensors
-            .get(&format!("{PROBE}.lora_A.weight"))
-            .expect("converted lora_A"),
-    );
-    let b = f32s(
-        wconv
-            .tensors
-            .get(&format!("{PROBE}.lora_B.weight"))
-            .expect("converted lora_B"),
-    );
-    let fold = alpha_rank_fold(emitted_alpha, 2.0);
-    let want = reference_residual(
-        LoraFactors {
-            a: &a,
-            b: &b,
-            in_dim,
-            out: out_dim,
-        },
-        fold,
-        1.0,
-        &f32s(&x),
-        3,
-    );
-    assert_matches_reference(
-        &f32s(&pruned_res),
-        &want,
-        "converted qkv on the pruned curve",
-    );
 }
 
 /// The delta is independent of the body it folds onto: the same adapter file on a **different**
@@ -989,11 +809,11 @@ fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
 /// the device, so an unavailable device fails the run rather than lowering coverage.
 ///
 /// Builds the pruned fixture DiT **on** the CUDA device, installs the body LoRA through the
-/// production [`apply_minimax_h3_adapters`] path, and probes the residual at [`PROBE`] and
-/// [`PROBE_FFN`] against the same independent f64 reference — gated at
-/// [`NATIVE_RELATIVE_TOL`] relative, because fp32 CUDA kernels over bf16 factors accumulate past
-/// the CPU bit-exact floor. It also asserts, on the same device and **before any forward**, that a
-/// full-topology AdaLN target file is refused at install time with the topology-mismatch wording.
+/// production [`apply_minimax_h3_adapters`] path, and asserts the residual equals the f64
+/// expectation read from the STORED corpus bytes bit-for-bit — the corpus' every intermediate is
+/// dyadic and exact in bf16 AND f32, so no tolerance is admitted. It also asserts, on the same
+/// device and **before any forward**, that a full-topology AdaLN target file is refused at install
+/// time with the topology-mismatch wording.
 #[test]
 #[ignore = "requires a CUDA device; absence is failure, not skip (integration lane, sc-26688)"]
 fn native_adapter_folds_on_the_pruned_curve() {
@@ -1004,36 +824,51 @@ fn native_adapter_folds_on_the_pruned_curve() {
     let cfg = dit_fixture_config();
 
     let dir = tempfile::tempdir().expect("fixture dir");
-    let lora = write_lora(
-        dir.path(),
-        "body.safetensors",
-        &all_targets(&cfg),
-        Some("128"),
-    );
-    let x = tensor_on(&[3, cfg.hidden_size], 0.7, &device);
 
-    for target in [PROBE, PROBE_FFN] {
-        let (out, inn) = target_shape(&cfg, target);
-        let residual = probe_residual(|| pruned_dit_on(&cfg, &device), &lora, 1.0, target, &x);
-        assert!(
-            max_abs(&residual) > 0.0,
-            "{target}: the native residual must be nonzero"
-        );
-        let (a, b) = fixture_factors(&lora, target, PUBLISHED_RANK, inn, out);
-        let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(
-            LoraFactors {
-                a: &a,
-                b: &b,
-                in_dim: inn,
-                out,
-            },
-            fold,
-            1.0,
+    // The exact dyadic corpus: every product and partial sum is a small dyadic rational, exact in
+    // bf16 AND f32, so the native residual equals the f64 expectation read from the STORED bytes
+    // bit-for-bit — no tolerance — and the gate compares the RESIDUAL, not the base output, so a
+    // dropped adapter (residual 0), a no-op gain (0) or any fold/offset error fails by orders of
+    // magnitude.
+    let names = exact_probe_names();
+    let corpus = write_exact_corpus(
+        dir.path(),
+        "exact.safetensors",
+        &cfg,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        &device,
+    );
+    let file = read_adapter(&corpus.path).expect("read the corpus back");
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        verify_corpus_bytes(&file.tensors, target, inn);
+        let x = exact_probe_x_for(&cfg, target, &device);
+        let want = exact_expected_from_bytes(
+            &file.tensors,
+            &format!("{target}.lora_A.default.weight"),
+            &format!("{target}.lora_B.default.weight"),
             &f32s(&x),
             3,
+            inn,
+            1.0,
         );
-        assert_matches_reference_rel(&f32s(&residual), &want, NATIVE_RELATIVE_TOL, target);
+        assert!(
+            want.iter().any(|v| *v != 0.0),
+            "{target}: the corpus residual must be nonzero"
+        );
+        let got = exact_probe(
+            || pruned_dit_zero_on(&cfg, &device),
+            &corpus,
+            1.0,
+            target,
+            &x,
+        );
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(
+                *g as f64, *w,
+                "{target}: the native residual must be bit-exact"
+            );
+        }
     }
 
     // A full-topology AdaLN file is refused at install — before any forward — naming the topology.
@@ -1062,4 +897,432 @@ fn native_adapter_folds_on_the_pruned_curve() {
         err.contains("pruned coordinate-table"),
         "the refusal must name the topology: {err}"
     );
+}
+
+// --- The exact dyadic corpus (sc-26688 review) ----------------------------------------------------
+//
+// Candle twin of the mlx lane's corpus: factors and probe input built so that EVERY product and
+// partial sum in the residual chain is a small dyadic rational — exactly representable in bf16 AND
+// f32 — so the installed residual equals the f64 expectation read from the STORED bytes
+// bit-for-bit under EVERY admitted stage-cast variant. No tolerance, no output-relative guard.
+//
+// * `x` entries are integers in [-2, 2] — exact in bf16 and f32, so an input cast is a no-op;
+// * `a` rows are a SUB-PERMUTATION (at most one nonzero per row AND per column, unused rank rows
+//   zero) — `x·aᵀ` is a single term; declared rank/alpha stay 128/128;
+// * `b` rows are one-hot basis probes with row/target-coded values `m ∈ [32, 63]` (≤ 6 significant
+//   bf16 bits), distinct signs per row — the second matmul is a single term and a wrong routing
+//   cannot hide behind a symmetric value;
+// * folds and gains are powers of two (1, 0.0625, 4, 0.75) — the dtype-matched scalar multiplies
+//   are exact on every conforming backend;
+// * the probe modules' base weights are ZERO in a dedicated fixture variant, so the observed
+//   module output IS the residual: `base(x) = 0` exactly and `0 + residual` is exact in f32. A
+//   bit-identical base graph with `(adapted − base)` would NOT prove the delta if the bf16
+//   base+delta addition rounded first — the zero base removes that stage instead of arguing it.
+//
+// The non-dyadic arms above keep their bit-exact engine-to-engine equality and their perturbed
+// body / cross-topology coverage; they assert no numeric tolerance.
+
+/// `true` for the six adaptable leaves' base weights.
+fn exact_probe_leaf_weight(key: &str) -> bool {
+    BLOCK_TARGETS
+        .iter()
+        .any(|leaf| key.ends_with(&format!(".{leaf}.weight")))
+}
+
+fn with_zero_bases(mut m: HashMap<String, Tensor>, device: &Device) -> HashMap<String, Tensor> {
+    for key in m.keys().cloned().collect::<Vec<_>>() {
+        if exact_probe_leaf_weight(&key) {
+            let dims = m[&key].dims().to_vec();
+            m.insert(
+                key,
+                Tensor::zeros(dims.as_slice(), DType::F32, device).expect("zero base"),
+            );
+        }
+    }
+    m
+}
+
+fn pruned_dit_zero_on(cfg: &MiniMaxH3DitConfig, device: &Device) -> MiniMaxH3Dit {
+    let w = weights(with_zero_bases(pruned_fixture_map(cfg, device), device));
+    let dit =
+        MiniMaxH3Dit::from_weights(&w, cfg, device, DType::F32).expect("pruned zero-base DiT");
+    assert_eq!(
+        dit.adapter_surface(),
+        AdaLnSurface::PrunedCurve,
+        "the transformed fixture must present the pruned curve surface"
+    );
+    dit
+}
+
+fn full_zero_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
+    let f = Golden::load(DIT_FIXTURE);
+    let w = weights(with_zero_bases(
+        f.model_map(&["src.", "in.", "out.", "layout."]),
+        &dev(),
+    ));
+    let dit = MiniMaxH3Dit::from_weights(&w, cfg, &dev(), DType::F32).expect("full zero-base DiT");
+    assert_eq!(
+        dit.adapter_surface(),
+        AdaLnSurface::FullTimestepMlp,
+        "the committed fixture is the full timestep-MLP topology"
+    );
+    dit
+}
+
+/// Small-integer probe rows at `inn` width, exact in bf16 and f32 alike; rows differ so a
+/// row-routing bug shows. Each adaptable leaf has its OWN input width, so the probe is built per
+/// target, never shared.
+fn exact_probe_x_for(cfg: &MiniMaxH3DitConfig, target: &str, device: &Device) -> Tensor {
+    let (rows, inn) = (3usize, {
+        let (_, inn) = target_shape(cfg, target);
+        inn
+    });
+    let v: Vec<f32> = (0..rows * inn)
+        .map(|i| {
+            let (r, j) = (i / inn, i % inn);
+            (((r * 3 + j * 7) % 5) as f32) - 2.0
+        })
+        .collect();
+    Tensor::from_vec(v, (rows, inn), device).expect("exact probe input")
+}
+
+/// The probe set: every leaf kind of a transformer block, the refiner, a second block, and both
+/// SwiGLU leaves — nonuniform coding makes a wrong row/module/alias mapping observable.
+fn exact_probe_names() -> Vec<String> {
+    [
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.0.attn.to_k",
+        "transformer_blocks.0.attn.to_v",
+        "transformer_blocks.0.attn.to_out.0",
+        "transformer_blocks.0.ff.net.0.proj",
+        "transformer_blocks.0.ff.net.2",
+        "token_refiner.refiner_blocks.0.attn.to_q",
+        "transformer_blocks.1.ff.net.2",
+    ]
+    .iter()
+    .map(|t| t.to_string())
+    .collect()
+}
+
+struct ExactCorpus {
+    path: PathBuf,
+    probes: Vec<String>,
+}
+
+/// Write the corpus over every adaptable module (full strict coverage, no production-input
+/// shrinking) with per-target nonuniform one-hot coding. Fold is `alpha/rank = 128/128 = 1`.
+fn write_exact_corpus(
+    dir: &Path,
+    name: &str,
+    cfg: &MiniMaxH3DitConfig,
+    probes: &[&str],
+    device: &Device,
+) -> ExactCorpus {
+    let path = dir.join(name);
+    let rank = PUBLISHED_RANK;
+    let mut arrays: Vec<(String, Tensor)> = Vec::new();
+    for (tidx, (target, out, inn)) in all_targets(cfg).into_iter().enumerate() {
+        let mut down = vec![0.0f32; rank * inn];
+        for k in 0..inn {
+            down[k * inn + (tidx * 7 + k * 3) % inn] = 1.0;
+        }
+        let mut up = vec![0.0f32; out * rank];
+        for o in 0..out {
+            // Basis probe: one active rank row per output, value in [32, 63] (≤ 6 bf16 bits),
+            // sign coded by row and target so outputs are nonuniform.
+            let m = (32 + (o * 7 + tidx * 5) % 32) as f32;
+            let value = if (o + tidx) % 2 == 0 { m } else { -m };
+            up[o * rank + (o * 5 + tidx) % inn] = value;
+        }
+        arrays.push((
+            format!("{target}.lora_A.default.weight"),
+            bf16(&Tensor::from_vec(down, (rank, inn), device).expect("down")),
+        ));
+        arrays.push((
+            format!("{target}.lora_B.default.weight"),
+            bf16(&Tensor::from_vec(up, (out, rank), device).expect("up")),
+        ));
+    }
+    write_safetensors(
+        &path,
+        &arrays,
+        &[
+            ("format", "pt"),
+            ("floating_dtype", "bfloat16"),
+            ("alpha", "128"),
+        ],
+    );
+    ExactCorpus {
+        path,
+        probes: probes.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+/// Verify the corpus' stored bytes ARE the declared sparse dyadic structure — the exactness claim
+/// is about the file's actual bytes, not the writer's intent.
+fn verify_corpus_bytes(tensors: &HashMap<String, Tensor>, target: &str, inn: usize) {
+    let a = f32s(
+        tensors
+            .get(&format!("{target}.lora_A.default.weight"))
+            .expect("lora_A"),
+    );
+    let b = f32s(
+        tensors
+            .get(&format!("{target}.lora_B.default.weight"))
+            .expect("lora_B"),
+    );
+    let rank = a.len() / inn;
+    for k in 0..rank {
+        let nonzeros: Vec<usize> = (0..inn).filter(|&j| a[k * inn + j] != 0.0).collect();
+        assert!(
+            match nonzeros.first() {
+                None => true,
+                Some(&j) => a[k * inn + j] == 1.0,
+            },
+            "{target}: down row {k} must be empty or a unit vector"
+        );
+    }
+    let out = b.len() / rank;
+    for o in 0..out {
+        let nonzeros: Vec<usize> = (0..rank).filter(|&k| b[o * rank + k] != 0.0).collect();
+        assert!(
+            nonzeros.len() == 1
+                && b[o * rank + nonzeros[0]].abs() >= 32.0
+                && b[o * rank + nonzeros[0]].abs() <= 63.0,
+            "{target}: up row {o} must be one basis probe with a 6-bit dyadic value, got {:?} \
+             at {:?}",
+            &b[o * rank..(o + 1) * rank],
+            nonzeros
+        );
+    }
+}
+
+/// The expected residual in f64, computed from the STORED bytes: `y[o] = fold·Σ_k b[o,k]·Σ_j
+/// a[k,j]·x[r,j]`. Exact for the corpus because every partial sum reduces to one or two small
+/// dyadic terms — and exact for the converted/LoKr arms for the same reason.
+fn exact_expected_from_bytes(
+    tensors: &HashMap<String, Tensor>,
+    a_key: &str,
+    b_key: &str,
+    x: &[f32],
+    rows: usize,
+    inn: usize,
+    fold: f64,
+) -> Vec<f64> {
+    let a = f32s(tensors.get(a_key).expect("lora_A"));
+    let b = f32s(tensors.get(b_key).expect("lora_B"));
+    let rank = a.len() / inn;
+    let out = b.len() / rank;
+    let mut y = vec![0.0f64; rows * out];
+    for r in 0..rows {
+        let mut mid = vec![0.0f64; rank];
+        for (k, mid_k) in mid.iter_mut().enumerate() {
+            *mid_k = (0..inn)
+                .map(|j| x[r * inn + j] as f64 * a[k * inn + j] as f64)
+                .sum();
+        }
+        for o in 0..out {
+            y[r * out + o] = fold
+                * (0..rank)
+                    .map(|k| mid[k] * b[o * rank + k] as f64)
+                    .sum::<f64>();
+        }
+    }
+    y
+}
+
+/// Install the corpus on a ZERO-BASE dit and return the observed residual rows for `target` at
+/// user gain `scale` (a power of two in these arms, so the gain multiply is exact).
+fn exact_probe(
+    dit: impl Fn() -> MiniMaxH3Dit,
+    corpus: &ExactCorpus,
+    scale: f32,
+    target: &str,
+    x: &Tensor,
+) -> Vec<f32> {
+    let s = segs(target);
+    let mut base = dit();
+    let y0 = base
+        .adaptable_mut(&s)
+        .unwrap_or_else(|| panic!("probe module {target}"))
+        .forward(x)
+        .expect("base forward");
+    assert_eq!(
+        max_abs(&y0),
+        0.0,
+        "{target}: the zero-base probe module must output exactly zero"
+    );
+    let mut adapted = dit();
+    let report = apply_minimax_h3_adapters(&mut adapted, &[spec(corpus.path.clone(), scale)])
+        .expect("install");
+    assert!(report.unmatched_paths.is_empty(), "{target}");
+    let y1 = adapted
+        .adaptable_mut(&s)
+        .unwrap_or_else(|| panic!("probe module {target}"))
+        .forward(x)
+        .expect("adapted forward");
+    f32s(&y1)
+}
+
+/// **AC1/AC2, exact corpus (candle):** on a zero-base checkpoint the installed residual equals the
+/// f64 expectation read from the stored bytes BIT-FOR-BIT, on both topologies, at gains 1.0 and
+/// 0.75 — no tolerance, and the per-target expectations are pairwise distinct so a wrong
+/// row/module/alias/gain mapping cannot hide.
+#[test]
+fn the_exact_dyadic_corpus_folds_exactly_on_both_topologies() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let names = exact_probe_names();
+    let corpus = write_exact_corpus(
+        dir.path(),
+        "exact.safetensors",
+        &cfg,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        &dev(),
+    );
+    let file = read_adapter(&corpus.path).expect("read the corpus back");
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        verify_corpus_bytes(&file.tensors, target, inn);
+    }
+    let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
+    let mut expectations: Vec<(String, Vec<f64>, Tensor)> = Vec::new();
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        let x = exact_probe_x_for(&cfg, target, &dev());
+        let want = exact_expected_from_bytes(
+            &file.tensors,
+            &format!("{target}.lora_A.default.weight"),
+            &format!("{target}.lora_B.default.weight"),
+            &f32s(&x),
+            3,
+            inn,
+            fold as f64,
+        );
+        expectations.push((target.clone(), want, x));
+    }
+    for i in 0..expectations.len() {
+        for j in (i + 1)..expectations.len() {
+            assert_ne!(
+                expectations[i].1, expectations[j].1,
+                "expectations must be pairwise distinct so a misroute cannot hide"
+            );
+        }
+    }
+    for (target, want, x) in &expectations {
+        for (gain, factor) in [(1.0f32, 1.0f64), (0.75, 0.75)] {
+            assert!(
+                want.iter().any(|v| *v != 0.0),
+                "{target}: the corpus residual must be nonzero"
+            );
+            let got = exact_probe(|| full_zero_dit(&cfg), &corpus, gain, target, x);
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(
+                    *g as f64,
+                    *w * factor,
+                    "{target} gain {gain}: the exact corpus must fold bit-exactly on the full \
+                     topology"
+                );
+            }
+            let got = exact_probe(
+                || pruned_dit_zero_on(&cfg, &dev()),
+                &corpus,
+                gain,
+                target,
+                x,
+            );
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(
+                    *g as f64,
+                    *w * factor,
+                    "{target} gain {gain}: the exact corpus must fold bit-exactly on the pruned \
+                     curve"
+                );
+            }
+        }
+    }
+}
+
+/// A genuine LoKr whose every Kronecker product and residual term is dyadic and exact: `w1` rows
+/// are powers-of-two one-hot, `w2` rows are one-hot nonuniform dyadics — so the bf16 delta
+/// reconstruction (fold `alpha/rank = 8/8 = 1`) and the residual are exact, and every output row
+/// has a distinct expected value.
+#[test]
+fn the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    // kron(w1 [8,8], w2 [12,8]) = [96, 64], `to_q`'s exact shape.
+    let mut w1 = vec![0.0f32; 64];
+    for i in 0..8usize {
+        w1[i * 8 + i] = 2.0f32.powi((i % 3) as i32); // powers of two: 1, 2, 4
+    }
+    let mut w2 = vec![0.0f32; 96];
+    for b in 0..12usize {
+        let value = if b % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        w2[b * 8 + (b * 3) % 8] = value;
+    }
+    let arrays = vec![
+        (
+            "transformer_blocks.0.attn.to_q.lokr_w1".to_string(),
+            bf16(&Tensor::from_vec(w1, (8, 8), &dev()).expect("w1")),
+        ),
+        (
+            "transformer_blocks.0.attn.to_q.lokr_w2".to_string(),
+            bf16(&Tensor::from_vec(w2, (12, 8), &dev()).expect("w2")),
+        ),
+    ];
+    let path = dir.path().join("exact_lokr.safetensors");
+    write_safetensors(
+        &path,
+        &arrays,
+        &[
+            ("format", "pt"),
+            ("networkType", "lokr"),
+            ("rank", "8"),
+            ("alpha", "8"),
+        ],
+    );
+
+    // Expected from the STORED factor bytes: delta row (i*12+b) has exactly one nonzero at column
+    // i*8 + (b*3)%8 with value w1[i,i]·w2[b,(b*3)%8] — a product of dyadics, exact.
+    let fw = read_adapter(&path).expect("read the LoKr back");
+    let w1s = f32s(
+        fw.tensors
+            .get("transformer_blocks.0.attn.to_q.lokr_w1")
+            .expect("w1"),
+    );
+    let w2s = f32s(
+        fw.tensors
+            .get("transformer_blocks.0.attn.to_q.lokr_w2")
+            .expect("w2"),
+    );
+    let x = exact_probe_x_for(&cfg, PROBE, &dev());
+    let xf = f32s(&x);
+    let inn = {
+        let (_, inn) = target_shape(&cfg, PROBE);
+        inn
+    };
+    let out = cfg.inner_dim();
+    let mut want = vec![0.0f64; 3 * out];
+    for o in 0..out {
+        let (i, b) = (o / 12, o % 12);
+        let col = i * 8 + (b * 3) % 8;
+        let delta = w1s[i * 8 + i] as f64 * w2s[b * 8 + (b * 3) % 8] as f64;
+        for r in 0..3 {
+            want[r * out + o] = delta * xf[r * inn + col] as f64;
+        }
+    }
+    assert!(
+        want.iter().any(|v| *v != 0.0),
+        "the LoKr corpus must be nonzero"
+    );
+
+    let corpus = ExactCorpus {
+        path,
+        probes: vec![],
+    };
+    let got = exact_probe(|| pruned_dit_zero_on(&cfg, &dev()), &corpus, 1.0, PROBE, &x);
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(*g as f64, *w, "the exact LoKr residual must be bit-exact");
+    }
 }

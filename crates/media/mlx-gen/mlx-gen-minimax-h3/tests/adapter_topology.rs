@@ -26,7 +26,7 @@
 
 use crate::common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use mlx_rs::ops::{multiply, subtract};
@@ -40,7 +40,7 @@ use mlx_gen_minimax_h3::adapters::convert_comfyui_key_space;
 use mlx_gen_minimax_h3::{
     adaln_schedule, adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters,
     is_comfyui_key_space, AdaLnSurface, JointSchedule, MiniMaxH3Dit, MiniMaxH3DitConfig,
-    AUDIO_SIGMA_SHIFT, VIDEO_SIGMA_SHIFT,
+    AUDIO_SIGMA_SHIFT, BLOCK_TARGETS, VIDEO_SIGMA_SHIFT,
 };
 
 use common::{dit_fixture_config, DIT_FIXTURE};
@@ -310,112 +310,10 @@ fn max_abs(a: &Array) -> f32 {
         .item::<f32>()
 }
 
-/// Round-to-nearest-even f32 → bf16, matching every published turbo tensor's storage dtype and
-/// the compute dtype the residual chain runs at.
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let lsb = (bits >> 16) & 1;
-    let rounded = (bits + 0x7fff + lsb) & 0xFFFF_0000;
-    f32::from_bits(rounded)
-}
-
-/// The stored factor bytes a reference computation reads: `a` is the `[rank, in]` lora_A and `b`
-/// the `[out, rank]` lora_B, both widened from the actual file bytes.
-struct LoraFactors<'a> {
-    a: &'a [f32],
-    b: &'a [f32],
-    in_dim: usize,
-    out: usize,
-}
-
-/// The mathematical residual `((x·a)·b_folded)·scale` in f64, over the **stored bf16 factor
-/// bytes** (widened exactly) and the exact f32 probe input.
-///
-/// This is the contract-level reference: the factors are what the file stores (bf16 — every
-/// published turbo tensor), the fold is the install's own `alpha/rank`, and the probe input is the
-/// exact f32 vector. It deliberately does NOT model where each backend rounds inside the chain:
-/// the declared compute dtype is the factors' bf16 (the sc-18724 dtype-matched fold exists so the
-/// product runs at the fork's precision rather than being promoted), but the observable contract
-/// does not pin whether a backend rounds `x`, an intermediate, or only the output to bf16 — and
-/// the two lanes demonstrably place those roundings differently. The gate below derives the bound
-/// from that declared bf16 chain instead of encoding one placement.
-fn reference_residual(
-    factors: LoraFactors<'_>,
-    fold: f32,
-    scale: f32,
-    x: &[f32],
-    rows: usize,
-) -> Vec<f64> {
-    let LoraFactors { a, b, in_dim, out } = factors;
-    let rank = a.len() / in_dim;
-    assert_eq!(b.len() % rank, 0, "lora_B must be [out, rank]");
-    // The install folds `alpha/rank` into `b` with a dtype-matched scalar — one bf16 rounding,
-    // identical on both backends because it happens at install, on the host, before any matmul.
-    let b_inst: Vec<f64> = b.iter().map(|&v| bf16_round(v * fold) as f64).collect();
-    let mut y = vec![0.0f64; rows * out];
-    for r in 0..rows {
-        let mut mid = vec![0.0f64; rank];
-        for (k, mid_k) in mid.iter_mut().enumerate() {
-            let acc: f64 = (0..in_dim)
-                .map(|j| x[r * in_dim + j] as f64 * a[k * in_dim + j] as f64)
-                .sum();
-            *mid_k = acc;
-        }
-        for o in 0..out {
-            let acc: f64 = (0..rank).map(|k| mid[k] * b_inst[o * rank + k]).sum();
-            y[r * out + o] = acc * scale as f64;
-        }
-    }
-    y
-}
-
-/// The factor values the fixture wrote for one target, read back from the written file so the
-/// reference uses the actual bytes the install consumed.
-fn fixture_factors(
-    lora: &Path,
-    target: &str,
-    rank: i32,
-    inn: i32,
-    out: i32,
-) -> (Vec<f32>, Vec<f32>) {
-    let w = Weights::from_file(lora).expect("the written LoRA");
-    let a = w
-        .require(&format!("{target}.lora_A.default.weight"))
-        .expect("lora_A");
-    let b = w
-        .require(&format!("{target}.lora_B.default.weight"))
-        .expect("lora_B");
-    assert_eq!(a.shape(), &[rank, inn], "{target} lora_A shape");
-    assert_eq!(b.shape(), &[out, rank], "{target} lora_B shape");
-    (f32s(a), f32s(b))
-}
-
-fn assert_matches_reference(got: &[f32], want: &[f64], what: &str) {
-    let mut worst = 0.0f64;
-    for (g, w) in got.iter().zip(want) {
-        worst = worst.max((*g as f64 - w).abs());
-    }
-    let peak = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    // Derived bound, not an observed one. The reference is the exact f64 residual over the stored
-    // bf16 factor bytes; what it cannot pin is WHERE the declared bf16 chain rounds. Each bf16
-    // rounding of an operand/output is ≤ 2⁻⁹ relative and bf16×bf16 products are exact in f32, so
-    // a chain that rounds `x`, an intermediate, and the output — the declared bf16 compute dtype's
-    // worst placement — errs ≤ 3·2⁻⁹ ≈ 5.9e-3, plus f32 accumulation order (≲ 128·2⁻²⁴). The two
-    // lanes demonstrably place the roundings differently (Metal vs CUDA/CPU gemm internals are
-    // unpinned by the contract), so the gate is the union bound 1e-2, <2× the derived worst case —
-    // NOT a percentage copied from an observed output. A wrong fold (16×/128×), a wrong module or
-    // a dropped target moves the residual by orders of magnitude past this band, and the
-    // cross-topology bit-exact equality in the same tests is independent of it.
-    assert!(
-        worst <= 1.0e-2 * peak,
-        "{what}: the installed residual must match the independent bf16-chain reference \
-         (worst {worst}, peak {peak})"
-    );
-}
-
 /// **AC1/AC2 (sc-26688):** the same body LoRA folds *bit-identically* on the full and the pruned
-/// topology, and each fold matches an independently computed `x·Aᵀ·(fold·Bᵀ)·scale` — the deltas
-/// and the alpha fold are preserved across topologies, never reweighted, never rederived.
+/// topology — the deltas and the alpha fold are preserved across topologies, never reweighted,
+/// never rederived. The numeric-strength proof lives in the exact dyadic corpus below; this
+/// non-dyadic arm pins engine-to-engine equality on realistic bf16 factor shapes.
 #[test]
 fn body_deltas_are_identical_across_full_and_pruned_topologies() {
     let cfg = dit_fixture_config();
@@ -429,7 +327,6 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
     let x = tensor(&[3, cfg.hidden_size], 0.7);
 
     for target in [PROBE, PROBE_FFN] {
-        let (out, inn) = target_shape(&cfg, target);
         let full_res = probe_residual(|| full_dit(&cfg), &lora, 1.0, target, &x);
         let pruned_res = probe_residual(|| pruned_dit(&cfg), &lora, 1.0, target, &x);
 
@@ -444,22 +341,6 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
             "{target}: the same factors must fold bit-identically on both topologies — the body \
              leaves are the same modules and the install must not reweight across topology"
         );
-
-        let (a, b) = fixture_factors(&lora, target, PUBLISHED_RANK, inn, out);
-        let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(
-            LoraFactors {
-                a: &a,
-                b: &b,
-                in_dim: inn as usize,
-                out: out as usize,
-            },
-            fold,
-            1.0,
-            &f32s(&x),
-            3,
-        );
-        assert_matches_reference(&f32s(&full_res), &want, target);
     }
 }
 
@@ -791,35 +672,6 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
         0.0,
         "the converted namespace must fold bit-identically across topologies"
     );
-
-    // Independent reference over the CONVERTED factor bytes at the emitted alpha's fold.
-    let w = Weights::from_file(&converted_path).expect("read converted");
-    let a = f32s(
-        w.require(&format!("{PROBE}.lora_A.weight"))
-            .expect("converted lora_A"),
-    );
-    let b = f32s(
-        w.require(&format!("{PROBE}.lora_B.weight"))
-            .expect("converted lora_B"),
-    );
-    let fold = alpha_rank_fold(emitted_alpha, 2.0);
-    let want = reference_residual(
-        LoraFactors {
-            a: &a,
-            b: &b,
-            in_dim: in_dim as usize,
-            out: out_dim as usize,
-        },
-        fold,
-        1.0,
-        &f32s(&x),
-        3,
-    );
-    assert_matches_reference(
-        &f32s(&pruned_res),
-        &want,
-        "converted qkv on the pruned curve",
-    );
 }
 
 /// The delta is independent of the body it folds onto: the same adapter file on a **different**
@@ -905,7 +757,6 @@ fn native_pruned_turbo_adapter_residual_matches_reference() {
         Some("128"),
     );
     for target in [PROBE, PROBE_FFN] {
-        let (out, inn) = target_shape(&cfg, target);
         let full_res = probe_residual(|| full_dit(&cfg), &body, 1.0, target, &x);
         let pruned_res = probe_residual(|| pruned_dit(&cfg), &body, 1.0, target, &x);
         assert!(max_abs(&pruned_res) > 0.0, "{target}: nonzero residual");
@@ -915,21 +766,6 @@ fn native_pruned_turbo_adapter_residual_matches_reference() {
             0.0,
             "{target}: bit-identical across topologies"
         );
-        let (a, b) = fixture_factors(&body, target, PUBLISHED_RANK, inn, out);
-        let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
-        let want = reference_residual(
-            LoraFactors {
-                a: &a,
-                b: &b,
-                in_dim: inn as usize,
-                out: out as usize,
-            },
-            fold,
-            1.0,
-            &f32s(&x),
-            3,
-        );
-        assert_matches_reference(&f32s(&pruned_res), &want, target);
     }
 
     // 2. Wrong-topology targets refuse BEFORE execution: the install errors without a single
@@ -1086,5 +922,511 @@ fn every_published_turbo_recipe_resolves_its_trained_schedule() {
             timesteps.windows(2).all(|w| w[1] > w[0]),
             "{name}: coordinates ascend across the run"
         );
+    }
+}
+
+// --- The exact dyadic corpus (sc-26688 review) ----------------------------------------------------
+//
+// The numeric-strength proof for the format/topology/partition/gain gates: factors and probe input
+// built so that EVERY product and partial sum in the residual chain is a small dyadic rational —
+// exactly representable in bf16 AND f32 — so the installed residual equals the f64 expectation
+// read from the STORED bytes bit-for-bit under EVERY admitted stage-cast variant. No tolerance, no
+// output-relative guard: every admitted rounding placement is exact, so promotions are irrelevant.
+//
+// * `x` entries are integers in [-2, 2] — exact in bf16 and f32, so an input cast is a no-op;
+// * `a` rows are a SUB-PERMUTATION (at most one nonzero per row AND per column, unused rank rows
+//   zero) — `x·aᵀ` is a single term, no accumulation at all; declared rank/alpha stay 128/128;
+// * `b` rows are one-hot basis probes `e_k` with row/target-coded values `m·2^e`, `m ∈ [32, 63]`
+//   (≤ 6 significant bf16 bits), distinct signs/exponents per row — the second matmul is a single
+//   term and a wrong routing cannot hide behind a symmetric value;
+// * folds and gains are powers of two (1, 0.0625, 4, 0.75) — the dtype-matched scalar multiplies
+//   are exact on every conforming backend;
+// * the probe modules' base weights are ZERO in a dedicated fixture variant, so the observed
+//   module output IS the residual: `base(x) = 0` exactly, and `0 + residual` is exact in f32.
+//   (A bit-identical base graph with `(adapted − base)` would NOT prove the delta if the bf16
+//   base+delta addition rounded first — the zero base removes that stage instead of arguing it.)
+//
+// The non-dyadic arms above keep their bit-exact engine-to-engine equality and their perturbed
+// body / cross-topology / partition coverage; they assert no numeric tolerance.
+
+/// `true` for the six adaptable leaves' base weights.
+fn exact_probe_leaf_weight(key: &str) -> bool {
+    BLOCK_TARGETS
+        .iter()
+        .any(|leaf| key.ends_with(&format!(".{leaf}.weight")))
+}
+
+fn with_zero_bases(mut m: HashMap<String, Array>) -> HashMap<String, Array> {
+    for key in m.keys().cloned().collect::<Vec<_>>() {
+        if exact_probe_leaf_weight(&key) {
+            let shape = m[&key].shape().to_vec();
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            m.insert(key, Array::from_slice(&vec![0.0f32; n], &shape));
+        }
+    }
+    m
+}
+
+fn full_zero_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
+    let full = Weights::from_file(DIT_FIXTURE).expect("the committed DiT fixture");
+    let m: HashMap<String, Array> = full
+        .keys()
+        .map(|k| {
+            (
+                k.to_string(),
+                full.require(k).expect("fixture tensor").clone(),
+            )
+        })
+        .collect();
+    let mut w = Weights::from_map(with_zero_bases(m));
+    let dit = MiniMaxH3Dit::from_weights(&mut w, cfg, Dtype::Float32).expect("full zero DiT");
+    assert_eq!(dit.adapter_surface(), AdaLnSurface::FullTimestepMlp);
+    dit
+}
+
+fn pruned_zero_dit(cfg: &MiniMaxH3DitConfig) -> MiniMaxH3Dit {
+    let mut w = Weights::from_map(with_zero_bases(pruned_fixture_map(cfg)));
+    let dit = MiniMaxH3Dit::from_weights(&mut w, cfg, Dtype::Float32).expect("pruned zero DiT");
+    assert_eq!(dit.adapter_surface(), AdaLnSurface::PrunedCurve);
+    dit
+}
+
+/// Small-integer probe rows at `inn` width, exact in bf16 and f32 alike; rows differ so a
+/// row-routing bug shows. Each adaptable leaf has its OWN input width, so the probe is built per
+/// target, never shared.
+fn exact_probe_x_for(cfg: &MiniMaxH3DitConfig, target: &str) -> Array {
+    let (rows, inn) = (3usize, {
+        let (_, inn) = target_shape(cfg, target);
+        inn as usize
+    });
+    let v: Vec<f32> = (0..rows * inn)
+        .map(|i| {
+            let (r, j) = (i / inn, i % inn);
+            (((r * 3 + j * 7) % 5) as f32) - 2.0
+        })
+        .collect();
+    Array::from_slice(&v, &[rows as i32, inn as i32])
+}
+
+struct ExactCorpus {
+    path: std::path::PathBuf,
+    /// Probed targets, whose stored bytes are structurally verified and whose expected residual is
+    /// computed independently from those bytes.
+    probes: Vec<String>,
+}
+
+/// Write the corpus over every adaptable module (full strict coverage, no production-input
+/// shrinking) with per-target nonuniform one-hot coding. Fold is `alpha/rank = 128/128 = 1`.
+fn write_exact_corpus(
+    dir: &Path,
+    name: &str,
+    cfg: &MiniMaxH3DitConfig,
+    probes: &[&str],
+) -> ExactCorpus {
+    let path = dir.join(name);
+    let rank = PUBLISHED_RANK as usize;
+    let mut arrays: Vec<(String, Array)> = Vec::new();
+    for (tidx, (target, out, inn)) in all_targets(cfg).into_iter().enumerate() {
+        let (out, inn) = (out as usize, inn as usize);
+        // Sub-permutation: row k active only while k < inn (one nonzero per row AND column).
+        let mut down = vec![0.0f32; rank * inn];
+        for k in 0..inn {
+            down[k * inn + (tidx * 7 + k * 3) % inn] = 1.0;
+        }
+        let mut up = vec![0.0f32; out * rank];
+        for o in 0..out {
+            // Basis probe: one active rank row per output, value in [32, 63] (≤ 6 bf16 bits),
+            // sign/exponent coded by row and target so outputs are nonuniform.
+            let m = (32 + (o * 7 + tidx * 5) % 32) as f32;
+            let value = if (o + tidx) % 2 == 0 { m } else { -m };
+            up[o * rank + (o * 5 + tidx) % inn] = value;
+        }
+        arrays.push((
+            format!("{target}.lora_A.default.weight"),
+            bf16(&Array::from_slice(&down, &[rank as i32, inn as i32])),
+        ));
+        arrays.push((
+            format!("{target}.lora_B.default.weight"),
+            bf16(&Array::from_slice(&up, &[out as i32, rank as i32])),
+        ));
+    }
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".into(), "pt".into());
+    meta.insert("floating_dtype".into(), "bfloat16".into());
+    meta.insert("alpha".into(), "128".into());
+    let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(entries, Some(&meta), &path).expect("write the exact corpus");
+    ExactCorpus {
+        path,
+        probes: probes.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+/// Verify the corpus' stored bytes ARE the declared sparse dyadic structure — the exactness claim
+/// is about the file's actual bytes, not the writer's intent.
+fn verify_corpus_bytes(w: &Weights, target: &str, inn: usize) {
+    let a = f32s(
+        w.require(&format!("{target}.lora_A.default.weight"))
+            .expect("lora_A"),
+    );
+    let b = f32s(
+        w.require(&format!("{target}.lora_B.default.weight"))
+            .expect("lora_B"),
+    );
+    let rank = a.len() / inn;
+    for k in 0..rank {
+        let nonzeros: Vec<usize> = (0..inn).filter(|&j| a[k * inn + j] != 0.0).collect();
+        assert!(
+            match nonzeros.first() {
+                None => true,
+                Some(&j) => a[k * inn + j] == 1.0,
+            },
+            "{target}: down row {k} must be empty or a unit vector, got {:?}",
+            &a[k * inn..(k + 1) * inn]
+        );
+    }
+    let out = b.len() / rank;
+    for o in 0..out {
+        let nonzeros: Vec<usize> = (0..rank).filter(|&k| b[o * rank + k] != 0.0).collect();
+        assert!(
+            nonzeros.len() == 1
+                && b[o * rank + nonzeros[0]].abs() >= 32.0
+                && b[o * rank + nonzeros[0]].abs() <= 63.0,
+            "{target}: up row {o} must be one basis probe with a 6-bit dyadic value"
+        );
+    }
+}
+
+/// The expected residual in f64, computed from the STORED bytes: `y[o] = fold·Σ_k b[o,k]·Σ_j
+/// a[k,j]·x[r,j]`. Exact for the corpus because every partial sum reduces to one or two small
+/// dyadic terms — and exact for the converted/LoKr arms for the same reason.
+fn exact_expected_from_bytes(
+    w: &Weights,
+    a_key: &str,
+    b_key: &str,
+    x: &[f32],
+    rows: usize,
+    inn: usize,
+    fold: f64,
+) -> Vec<f64> {
+    let a = f32s(w.require(a_key).expect("lora_A"));
+    let b = f32s(w.require(b_key).expect("lora_B"));
+    let rank = a.len() / inn;
+    let out = b.len() / rank;
+    let mut y = vec![0.0f64; rows * out];
+    for r in 0..rows {
+        let mut mid = vec![0.0f64; rank];
+        for (k, mid_k) in mid.iter_mut().enumerate() {
+            *mid_k = (0..inn)
+                .map(|j| x[r * inn + j] as f64 * a[k * inn + j] as f64)
+                .sum();
+        }
+        for o in 0..out {
+            y[r * out + o] = fold
+                * (0..rank)
+                    .map(|k| mid[k] * b[o * rank + k] as f64)
+                    .sum::<f64>();
+        }
+    }
+    y
+}
+
+/// Install the corpus on a ZERO-BASE dit and return the observed residual rows for `target` at
+/// user gain `scale` (a power of two in these arms, so the gain multiply is exact).
+fn exact_probe(
+    _cfg: &MiniMaxH3DitConfig,
+    dit: impl Fn() -> MiniMaxH3Dit,
+    corpus: &ExactCorpus,
+    scale: f32,
+    target: &str,
+    x: &Array,
+) -> Vec<f32> {
+    let s = segs(target);
+    let mut base = dit();
+    let y0 = base
+        .adaptable_mut(&s)
+        .expect("probe")
+        .forward(x)
+        .expect("base");
+    assert_eq!(
+        max_abs(&y0),
+        0.0,
+        "{target}: the zero-base probe module must output exactly zero"
+    );
+    let mut adapted = dit();
+    let report = apply_minimax_h3_adapters(&mut adapted, &[spec(corpus.path.clone(), scale)])
+        .expect("install");
+    assert!(report.unmatched_paths.is_empty(), "{target}");
+    let y1 = adapted
+        .adaptable_mut(&s)
+        .expect("probe")
+        .forward(x)
+        .expect("adapted");
+    f32s(&y1)
+}
+
+/// The probe set: every leaf kind of a transformer block, the refiner, a second block, and both
+/// SwiGLU leaves — nonuniform coding makes a wrong row/module/alias mapping observable.
+fn exact_probe_targets(cfg: &MiniMaxH3DitConfig) -> Vec<FixtureTarget> {
+    const PROBES: [&str; 8] = [
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.0.attn.to_k",
+        "transformer_blocks.0.attn.to_v",
+        "transformer_blocks.0.attn.to_out.0",
+        "transformer_blocks.0.ff.net.0.proj",
+        "transformer_blocks.0.ff.net.2",
+        "token_refiner.refiner_blocks.0.attn.to_q",
+        "transformer_blocks.1.ff.net.2",
+    ];
+    all_targets(cfg)
+        .into_iter()
+        .filter(|(t, _, _)| PROBES.contains(&t.as_str()))
+        .collect()
+}
+
+/// **AC1/AC2, exact corpus:** on a zero-base checkpoint the installed residual equals the f64
+/// expectation read from the stored bytes BIT-FOR-BIT, on both topologies, at gains 1.0 and 0.75 —
+/// no tolerance, and the per-target expectations are pairwise distinct so a wrong
+/// row/module/alias/gain mapping cannot hide.
+#[test]
+fn the_exact_dyadic_corpus_folds_exactly_on_both_topologies() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let probes = exact_probe_targets(&cfg);
+    let corpus = write_exact_corpus(
+        dir.path(),
+        "exact.safetensors",
+        &cfg,
+        &probes
+            .iter()
+            .map(|(t, _, _)| t.clone())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let file = Weights::from_file(&corpus.path).expect("read the corpus back");
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        verify_corpus_bytes(&file, target, inn as usize);
+    }
+    // The expectations must be pairwise distinct across targets — a shared value would let a
+    // misrouted fold hide.
+    let fold = alpha_rank_fold(128.0, PUBLISHED_RANK as f32);
+    let mut expectations: BTreeMap<String, (Vec<f64>, Array)> = BTreeMap::new();
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        let x = exact_probe_x_for(&cfg, target);
+        let want = exact_expected_from_bytes(
+            &file,
+            &format!("{target}.lora_A.default.weight"),
+            &format!("{target}.lora_B.default.weight"),
+            &f32s(&x),
+            3,
+            inn as usize,
+            fold as f64,
+        );
+        expectations.insert(target.clone(), (want, x));
+    }
+    let values: Vec<&Vec<f64>> = expectations.values().map(|(want, _)| want).collect();
+    for i in 0..values.len() {
+        for j in (i + 1)..values.len() {
+            assert_ne!(
+                values[i], values[j],
+                "expectations must be pairwise distinct so a misroute cannot hide"
+            );
+        }
+    }
+    for target in &corpus.probes {
+        let (want, x) = &expectations[target];
+        for (gain, scale) in [(1.0f32, 1.0f64), (0.75, 0.75)] {
+            let got = exact_probe(&cfg, || full_zero_dit(&cfg), &corpus, gain, target, x);
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(
+                    *g as f64,
+                    *w * scale,
+                    "{target} gain {gain}: the exact corpus must fold bit-exactly on the full \
+                     topology"
+                );
+            }
+            let got = exact_probe(&cfg, || pruned_zero_dit(&cfg), &corpus, gain, target, x);
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(
+                    *g as f64,
+                    *w * scale,
+                    "{target} gain {gain}: the exact corpus must fold bit-exactly on the pruned \
+                     curve"
+                );
+            }
+            assert!(
+                want.iter().any(|v| *v != 0.0),
+                "{target}: the corpus residual must be nonzero"
+            );
+        }
+    }
+}
+
+/// **AC1 (partition selection, exact):** through the production `MiniMaxH3Dit::load(root,
+/// partition, …)` path, two genuinely different pruned partitions fold the corpus to the SAME
+/// exact expectation — the delta is a property of the adapter, not of the partition it lands on.
+#[test]
+fn the_exact_corpus_is_bit_identical_across_partitions() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    stage_partition(
+        dir.path(),
+        "transformer",
+        with_zero_bases(pruned_fixture_map(&cfg)),
+    );
+    stage_partition(
+        dir.path(),
+        "transformer_ref",
+        with_zero_bases(doubled_pruned_map(&cfg)),
+    );
+    let probes = exact_probe_targets(&cfg);
+    let corpus = write_exact_corpus(
+        dir.path(),
+        "exact.safetensors",
+        &cfg,
+        &probes
+            .iter()
+            .map(|(t, _, _)| t.clone())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let file = Weights::from_file(&corpus.path).expect("read the corpus back");
+    for target in &corpus.probes {
+        let (_, inn) = target_shape(&cfg, target);
+        verify_corpus_bytes(&file, target, inn as usize);
+        let x = exact_probe_x_for(&cfg, target);
+        let want = exact_expected_from_bytes(
+            &file,
+            &format!("{target}.lora_A.default.weight"),
+            &format!("{target}.lora_B.default.weight"),
+            &f32s(&x),
+            3,
+            inn as usize,
+            1.0,
+        );
+        for partition in ["transformer", "transformer_ref"] {
+            let mut base = MiniMaxH3Dit::load(dir.path(), partition, Dtype::Float32)
+                .unwrap_or_else(|e| panic!("load {partition}: {e}"));
+            assert_eq!(
+                base.adapter_surface(),
+                AdaLnSurface::PrunedCurve,
+                "{partition}"
+            );
+            let s = segs(target);
+            let y0 = base.adaptable_mut(&s).expect("probe").forward(&x).unwrap();
+            assert_eq!(max_abs(&y0), 0.0, "{partition}: zero-base probe");
+            let mut adapted =
+                MiniMaxH3Dit::load(dir.path(), partition, Dtype::Float32).expect("reload");
+            let report = apply_minimax_h3_adapters(&mut adapted, &[spec(corpus.path.clone(), 1.0)])
+                .unwrap_or_else(|e| panic!("install on {partition}: {e}"));
+            assert_eq!(
+                report.applied,
+                adapter_target_paths(&cfg).len(),
+                "{partition}"
+            );
+            assert!(report.unmatched_paths.is_empty(), "{partition}");
+            let y1 = adapted
+                .adaptable_mut(&s)
+                .expect("probe")
+                .forward(&x)
+                .unwrap();
+            for (g, w) in f32s(&y1).iter().zip(&want) {
+                assert_eq!(
+                    *g as f64, *w,
+                    "{partition}/{target}: the corpus residual must be exact"
+                );
+            }
+        }
+    }
+}
+
+/// A genuine LoKr whose every Kronecker product and residual term is dyadic and exact: `w1` rows
+/// are powers of two one-hot, `w2` rows are one-hot nonuniform dyadics — so `reconstruct_lokr_delta`'s
+/// bf16 reconstruction (with fold `alpha/rank = 8/8 = 1`) and the residual are exact, and a wrong
+/// routing is visible because every output row has a distinct expected value.
+#[test]
+fn the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    // kron(w1 [8,8], w2 [12,8]) = [96, 64], `to_q`'s exact shape.
+    let mut w1 = vec![0.0f32; 64];
+    for i in 0..8usize {
+        w1[i * 8 + i] = 2.0f64.powi((i % 3) as i32) as f32; // powers of two: 1, 2, 4
+    }
+    let mut w2 = vec![0.0f32; 96];
+    for b in 0..12usize {
+        let value = if b % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        w2[b * 8 + (b * 3) % 8] = value;
+    }
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".into(), "pt".into());
+    meta.insert("networkType".into(), "lokr".into());
+    meta.insert("rank".into(), "8".into());
+    meta.insert("alpha".into(), "8".into());
+    let arrays = [
+        (
+            "transformer_blocks.0.attn.to_q.lokr_w1".to_string(),
+            bf16(&Array::from_slice(&w1, &[8, 8])),
+        ),
+        (
+            "transformer_blocks.0.attn.to_q.lokr_w2".to_string(),
+            bf16(&Array::from_slice(&w2, &[12, 8])),
+        ),
+    ];
+    let path = dir.path().join("exact_lokr.safetensors");
+    let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(entries, Some(&meta), &path).expect("write the exact LoKr");
+
+    // Expected from the STORED factor bytes: delta row (i*12+b) has exactly one nonzero at column
+    // i*8 + (b*3)%8 with value w1[i,i]·w2[b,(b*3)%8] — a product of dyadics, exact.
+    let fw = Weights::from_file(&path).expect("read the LoKr back");
+    let w1s = f32s(
+        fw.require("transformer_blocks.0.attn.to_q.lokr_w1")
+            .expect("w1"),
+    );
+    let w2s = f32s(
+        fw.require("transformer_blocks.0.attn.to_q.lokr_w2")
+            .expect("w2"),
+    );
+    let x = exact_probe_x_for(&cfg, PROBE);
+    let xf = f32s(&x);
+    let inn = {
+        let (_, inn) = target_shape(&cfg, PROBE);
+        inn as usize
+    };
+    let out = cfg.inner_dim() as usize;
+    let mut want = vec![0.0f64; 3 * out];
+    for o in 0..out {
+        let (i, b) = (o / 12, o % 12);
+        let col = i * 8 + (b * 3) % 8;
+        let delta = w1s[i * 8 + i] as f64 * w2s[b * 8 + (b * 3) % 8] as f64;
+        for r in 0..3 {
+            want[r * out + o] = delta * xf[r * inn + col] as f64;
+        }
+    }
+    assert!(
+        want.iter().any(|v| *v != 0.0),
+        "the LoKr corpus must be nonzero"
+    );
+
+    let got = exact_probe(
+        &cfg,
+        || pruned_zero_dit(&cfg),
+        &ExactCorpus {
+            path,
+            probes: vec![],
+        },
+        1.0,
+        PROBE,
+        &x,
+    );
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(*g as f64, *w, "the exact LoKr residual must be bit-exact");
     }
 }
