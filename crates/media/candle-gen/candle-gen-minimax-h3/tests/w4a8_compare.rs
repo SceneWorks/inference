@@ -230,7 +230,13 @@ fn mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("mixed.safetensors");
     let p_op = w4a8_operands(w4a8);
-    let codes: Vec<i8> = serde_json::from_value(convrot["weight"].clone()).unwrap();
+    // `TensorView` takes raw little-endian bytes, so the stored I8 codes go in as their byte
+    // patterns (`i8 as u8`), exactly as the S4 loader test writes them.
+    let codes: Vec<u8> = serde_json::from_value::<Vec<i8>>(convrot["weight"].clone())
+        .unwrap()
+        .into_iter()
+        .map(|v| v as u8)
+        .collect();
     let scales: Vec<u8> = floats(&convrot["weightScale"])
         .iter()
         .flat_map(|&v| v.to_le_bytes())
@@ -397,7 +403,7 @@ fn write_case(path: &std::path::Path, prefix: &str, case: &Value) {
 fn convrot_views<'a>(
     prefix: &str,
     convrot: &'a Value,
-    codes: &'a [i8],
+    codes: &'a [u8],
     scales: &'a [u8],
     bias: &'a [u8],
     desc: &'a [u8],

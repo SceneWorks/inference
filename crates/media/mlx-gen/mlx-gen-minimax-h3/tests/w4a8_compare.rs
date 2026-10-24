@@ -78,7 +78,7 @@ fn native_forward_matches_the_external_reference() {
         let file = dir.path().join("w4a8.safetensors");
         Array::save_safetensors(parts.iter().map(|(k, v)| (k.as_str(), v)), None, &file).unwrap();
         let w = Weights::from_file(&file).unwrap();
-        let linear = quant::lin(&w, "p", case.get("bias").map_or(false, |b| !b.is_null())).unwrap();
+        let linear = quant::lin(&w, "p", case.get("bias").is_some_and(|b| !b.is_null())).unwrap();
         assert!(
             linear.w4a8_base().is_some(),
             "case {} must be W4A8",
