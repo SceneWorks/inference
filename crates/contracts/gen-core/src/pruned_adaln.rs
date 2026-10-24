@@ -163,8 +163,23 @@ pub struct SourcePruneSizing {
 }
 
 impl SourcePruneSizing {
-    /// `max_distinct_timesteps` is taken from the provider's longest admitted conditioned schedule,
-    /// not the source grid size: off-grid interpolation can evaluate arbitrarily many distinct t's.
+    /// Upper bound across every admitted H3 scheduler shift. `PackedLayout::row_timesteps`
+    /// contains two generated streams (video, including text, and audio). Conditioned video
+    /// is either an existing video t or the single fixed 0.999 t; conditioned audio is fixed at
+    /// 1.0. Thus at most two new values per evaluation plus two fixed values, irrespective of
+    /// coincidences on any particular grid. The source grid's interpolation row count is unrelated.
+    pub fn conditioned_timestep_bound(max_evaluations: usize) -> Result<usize, String> {
+        if max_evaluations == 0 {
+            return Err("H3 AdaLN sizing: empty admitted schedule".into());
+        }
+        max_evaluations
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| "H3 AdaLN sizing: admitted timestep bound overflows".into())
+    }
+
+    /// `max_distinct_timesteps` bounds the full admitted schedule/shift domain, not one default
+    /// grid: off-grid interpolation can evaluate arbitrarily many distinct t's.
     pub fn for_topology(
         topology: &PrunedAdaLn,
         max_distinct_timesteps: usize,
@@ -462,5 +477,16 @@ mod tests {
         let mut overflow = topology;
         overflow.operands[0].shape = vec![usize::MAX, usize::MAX];
         assert!(SourcePruneSizing::for_topology(&overflow, 17).is_err());
+    }
+    #[test]
+    fn conditioned_timestep_bound_covers_two_streams_and_fixed_conditioning_values() {
+        for evaluations in [1, 2, 19, 200] {
+            assert_eq!(
+                SourcePruneSizing::conditioned_timestep_bound(evaluations).unwrap(),
+                2 * evaluations + 2
+            );
+        }
+        assert!(SourcePruneSizing::conditioned_timestep_bound(0).is_err());
+        assert!(SourcePruneSizing::conditioned_timestep_bound(usize::MAX).is_err());
     }
 }

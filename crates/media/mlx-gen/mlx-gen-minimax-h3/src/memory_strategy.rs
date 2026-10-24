@@ -185,7 +185,7 @@
 //!
 //! `SourcePruneSizing` prices the complete supplied table/reduced projections/folded biases
 //! from canonical headers, preserving source storage widths but charging their once-widened F32
-//! compute set. The longest admitted conditioned schedule bounds F32 block/final outputs and
+//! compute set. The full admitted schedule/shift domain bounds F32 block/final outputs and
 //! interpolation coordinates. Those retained buffers coexist with the reduced operands: unlike
 //! the dense path, nothing is evicted. They are charged once inside the transformer high-water
 //! total, with a `WholeRender` sub-stack and zero eviction credit. Each render constructs only
@@ -841,17 +841,35 @@ fn source_prune_sizing(
         config.hidden_size as usize,
         config.num_layers as usize,
         config.time_embed_dim as usize,
-        |name| headers.get(name).cloned(),
+        |name| {
+            // Match native curve inspection: packed code columns are not reduced coordinates.
+            if let Some(base) = name.strip_suffix(".weight") {
+                if headers.contains_key(&format!("{base}.scales"))
+                    || headers.contains_key(&format!("{base}.comfy_quant"))
+                {
+                    return None;
+                }
+            }
+            headers
+                .get(name)
+                .filter(|(dtype, _)| {
+                    matches!(
+                        dtype,
+                        mlx_gen::gen_core::weightsmeta::Dtype::F16
+                            | mlx_gen::gen_core::weightsmeta::Dtype::BF16
+                            | mlx_gen::gen_core::weightsmeta::Dtype::F32
+                    )
+                })
+                .cloned()
+        },
     )
     .map_err(CoreError::Unsupported)?
     else {
         return Ok(None);
     };
-    let longest = crate::denoise::JointSchedule::new(crate::model::MAX_STEPS as usize + 1)
-        .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-    let schedule = crate::denoise::adaln_schedule(&longest)
-        .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-    SourcePruneSizing::for_topology(&topology, schedule.distinct_timesteps().len())
+    let rows = SourcePruneSizing::conditioned_timestep_bound(crate::model::MAX_STEPS as usize)
+        .map_err(CoreError::Unsupported)?;
+    SourcePruneSizing::for_topology(&topology, rows)
         .map(Some)
         .map_err(CoreError::Unsupported)
 }
@@ -4419,7 +4437,7 @@ mod tests {
         let mut offset = 0u64;
         for header in headers.as_object_mut().unwrap().values_mut() {
             let width = match header["dtype"].as_str().unwrap() {
-                "F32" => 4,
+                "F32" | "U32" => 4,
                 "BF16" | "F16" => 2,
                 _ => unreachable!(),
             };
@@ -4454,24 +4472,14 @@ mod tests {
         bytes
     }
 
-    // Independent of SourcePruneSizing and TimestepSchedule's dedup/modulation accounting:
-    // enumerate the four source row classes at every admitted evaluation and price output shapes.
+    // Independent dtype/shape arithmetic. Two generated streams contribute at most N values each;
+    // conditioned video can add one fixed clamp value and conditioned audio one fixed clean value.
     fn expected_pruning_memory() -> (u64, u64, u64) {
-        let schedule =
-            crate::denoise::JointSchedule::new(crate::model::MAX_STEPS as usize + 1).unwrap();
-        let mut distinct = std::collections::BTreeSet::new();
-        for step in 0..schedule.num_evals() {
-            let video = schedule.video().timesteps()[step];
-            let audio = schedule.audio().timesteps()[step];
-            for t in [video, audio, video.max(0.999), 1.0] {
-                distinct.insert(t.to_bits());
-            }
-        }
         let table = 1025 * 8 * 4;
         let output_width = 256 * (18 * 2 + 2);
         let source = table + output_width * 8 * 2 + output_width * 2;
         let compute = table + output_width * 8 * 4 + output_width * 4;
-        let retained = distinct.len() as u64 * (output_width + 8) * 4;
+        let retained = (2 * crate::model::MAX_STEPS as u64 + 2) * (output_width + 8) * 4;
         (source, compute, retained)
     }
 
@@ -4624,5 +4632,139 @@ mod tests {
         assert!(contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err());
         std::fs::write(dir.join("model.safetensors"), b"broken header").unwrap();
         assert!(contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err());
+    }
+
+    #[test]
+    fn packed_q4_q8_headers_preserve_stock_contract_and_loaded_constructor() {
+        for bits in [4usize, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join(crate::model::BASE_DIT_PARTITION);
+            let mut headers = pruning_memory_headers();
+            headers.as_object_mut().unwrap().remove("adaln_t_table");
+            // Real MLX-affine code-column geometry, not an opaque stand-in. Large payload is
+            // sparse: metadata only, never mapped/evaluated or downloaded by this test.
+            headers["body"]["shape"] = serde_json::json!([3_000_000_000u64]);
+            for layer in 0..2 {
+                let prefix = format!("transformer_blocks.{layer}.adaln_proj.linear");
+                headers[format!("{prefix}.weight")] = serde_json::json!({"dtype":"U32","shape":[18*256,64/(32/bits)],"data_offsets":[0,0]});
+                headers[format!("{prefix}.scales")] =
+                    serde_json::json!({"dtype":"BF16","shape":[18*256,1],"data_offsets":[0,0]});
+            }
+            headers["norm_out.linear.weight"]["shape"] = serde_json::json!([2 * 256, 64]);
+            for leaf in ["linear_1", "linear_2"] {
+                for suffix in ["weight", "bias"] {
+                    headers[format!("time_embedder.{leaf}.{suffix}")] =
+                        serde_json::json!({"dtype":"F32","shape":[1],"data_offsets":[0,0]});
+                }
+            }
+            let stored = write_pruning_memory_headers(&dir, headers);
+            let config_path = dir.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            config["quantization"] = serde_json::json!({"bits":bits,"group_size":64});
+            std::fs::write(config_path, config.to_string()).unwrap();
+            assert!(
+                source_prune_sizing(&dir).unwrap().is_none(),
+                "Q{bits} is full-width packed, not a missing curve table"
+            );
+            let quant = if bits == 4 {
+                mlx_gen::gen_core::Quant::Q4
+            } else {
+                mlx_gen::gen_core::Quant::Q8
+            };
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_quant(quant);
+            let contract = contract_for(&spec).unwrap();
+            assert_eq!(contract.asset_facts.transformer_bytes, stored);
+            let marker = if bits == 4 {
+                ADALN_EVICTED_Q4_BYTES
+            } else {
+                ADALN_EVICTED_Q8_BYTES
+            };
+            let expected = marker.min(
+                (u128::from(ADALN_EVICTED_BYTES) * u128::from(stored) / u128::from(DIT_BF16_BYTES))
+                    as u64,
+            );
+            assert_eq!(contract.resident_components()[0].resident_bytes, expected);
+            assert_eq!(
+                contract.evicted_component_bytes(),
+                expected - ADALN_MODULATION_TABLE_MAX_BYTES
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{:?}",
+                contract.conformance_errors()
+            );
+            for (component, document) in [
+                (crate::model::REFERENCE_DIT_PARTITION, "config.json"),
+                ("text_encoder", "config.json"),
+                ("vae", "config.json"),
+                ("audio_vae", "config.json"),
+                ("tokenizer", "tokenizer.json"),
+                ("FL2VA/audio_vae", "config.json"),
+                ("FL2VA/audio_vae", "config.yaml"),
+                ("FL2VA/audio_vae", "metadata.json"),
+            ] {
+                let directory = root.path().join(component);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join(document), "{}").unwrap();
+                std::fs::write(directory.join("empty.safetensors"), []).unwrap();
+            }
+            std::fs::write(
+                root.path()
+                    .join(crate::model::REFERENCE_DIT_PARTITION)
+                    .join("config.json"),
+                serde_json::json!({"quantization":{"bits":bits,"group_size":64}}).to_string(),
+            )
+            .unwrap();
+            let loaded = crate::model::load(&spec).unwrap();
+            let loaded = loaded.memory_strategy_contract().unwrap();
+            assert_eq!(loaded.asset_facts, contract.asset_facts);
+            assert_eq!(
+                loaded.evicted_component_bytes(),
+                contract.evicted_component_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn source_pruned_retained_bound_covers_nondefault_scheduler_shifts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::model::BASE_DIT_PARTITION);
+        write_pruning_memory_headers(&dir, pruning_memory_headers());
+        let sizing = source_prune_sizing(&dir).unwrap().unwrap();
+        let default =
+            crate::denoise::JointSchedule::new(crate::model::MAX_STEPS as usize + 1).unwrap();
+        let default_rows = crate::denoise::adaln_schedule(&default)
+            .unwrap()
+            .distinct_timesteps()
+            .len();
+        let mut exceeds_default = false;
+        for video_shift in [0.1, 1.0, 5.0, 12.01, 17.0, 100.0] {
+            for audio_shift in [0.125, 3.0, 7.0] {
+                let schedule = crate::denoise::JointSchedule::with_shifts(
+                    crate::model::MAX_STEPS as usize + 1,
+                    video_shift,
+                    audio_shift,
+                )
+                .unwrap();
+                let actual = crate::denoise::adaln_schedule(&schedule).unwrap();
+                let distinct = actual.distinct_timesteps().len();
+                exceeds_default |= distinct > default_rows;
+                let actual_retained = distinct as u64 * (256 * (18 * 2 + 2) + 8) * 4;
+                assert!(actual_retained <= sizing.retained_bytes,
+                    "admitted shifts {video_shift}/{audio_shift}: {distinct} rows must fit the declared F32 cache bound");
+            }
+        }
+        assert!(
+            exceeds_default,
+            "the fixture must discriminate the old default-grid underbound"
+        );
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        assert_eq!(
+            contract.resident_components()[0].resident_bytes,
+            sizing.compute_bytes + sizing.retained_bytes
+        );
+        assert_eq!(contract.evicted_component_bytes(), 0);
     }
 }
