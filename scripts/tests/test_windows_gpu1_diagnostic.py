@@ -197,7 +197,7 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
                 self.assertTrue(job['if'].startswith(guard))
                 mutated = copy.deepcopy(self.workflow)
                 tail = job['if'][len(guard):].removeprefix(' && ')
-                if name in ('moss-edit-metal', 'moss-edit-metal-lease'):
+                if name == 'moss-edit-metal':
                     # Exact manual selectors provide a second independent barrier.
                     # Mutate both barriers to demonstrate actual diagnostic leakage.
                     selector = f"inputs.lanes == '{name}'"
