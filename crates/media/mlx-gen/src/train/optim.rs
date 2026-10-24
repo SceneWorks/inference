@@ -194,6 +194,63 @@ impl TrainOptimizer {
         }
         Ok(())
     }
+    /// Complete-state restore used by MOSS: an intact but incomplete moment map must not
+    /// silently initialize omitted parameters on the next update. Legacy readers stay unchanged.
+    pub fn load_state_checked(
+        &mut self,
+        path: impl AsRef<Path>,
+        params: &LoraParams,
+        updates: u32,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (arrays, _) = Array::load_safetensors_with_metadata(path)?;
+        let mut expected = std::collections::BTreeMap::<String, Vec<i32>>::new();
+        match self {
+            Self::AdamW { .. } => {
+                if updates > 0 {
+                    for (key, value) in params {
+                        for slot in [0, 1] {
+                            expected.insert(format!("{key}.{slot}"), value.shape().to_vec());
+                        }
+                    }
+                }
+            }
+            Self::Rose(_) => {
+                expected.insert("__stateless".into(), vec![1]);
+            }
+            Self::Prodigy(_) => {
+                for key in ["__d", "__d_max", "__d_numerator"] {
+                    expected.insert(key.into(), vec![1]);
+                }
+                if updates > 0 {
+                    for (key, value) in params {
+                        for slot in ["exp_avg", "exp_avg_sq", "s", "p0"] {
+                            expected.insert(format!("{key}::{slot}"), value.shape().to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        if arrays.len() != expected.len() {
+            return Err(crate::Error::Msg(
+                "resume optimizer state population differs".into(),
+            ));
+        }
+        for (key, shape) in expected {
+            let value = arrays.get(&key).ok_or_else(|| {
+                crate::Error::Msg(format!("resume optimizer state missing {key}"))
+            })?;
+            if value.shape() != shape.as_slice()
+                || value.dtype() != mlx_rs::Dtype::Float32
+                || !value.is_finite()?.all(None)?.item::<bool>()
+            {
+                return Err(crate::Error::Msg(format!(
+                    "resume optimizer state invalid {key}"
+                )));
+            }
+        }
+        self.load_state(path)
+    }
 }
 
 /// Stateless Range-Of-Slice Equilibration optimizer (rose-opt). Maintains no per-parameter buffers;
@@ -354,7 +411,10 @@ impl Prodigy {
         // order is unchanged, so the folded sums are bit-identical to the prior per-term host `+=`.
         let mut delta_numerator = c(0.0);
         let mut d_denom = c(0.0);
-        for (k, g) in grads.iter() {
+        // Coupled sums must not depend on a fresh HashMap seed after checkpoint restore.
+        let mut ordered: Vec<_> = grads.iter().collect();
+        ordered.sort_unstable_by_key(|(a, _)| *a);
+        for (k, g) in ordered {
             let Some(p) = params.get(k) else { continue };
             // `Array::zeros` is fallible, so build the initial state with `?` rather than `.unwrap()`
             // in an `or_insert_with` closure — an allocation failure mid-training surfaces as a typed

@@ -37,14 +37,14 @@ exr = { workspace = true }
 # Subject-mask decode for masked-loss training (epic 2123, sc-24828): a mask PNG becomes an `f32`
 # latent weight map in `train::subject_mask`. Pure Rust and tensor-free, so the zero-tensor invariant
 # holds; already in the lock (every backend kit links it).
-image = { workspace = true }
+image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
 # same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
 # Iris training transport sockets plus opt-in H3 process RSS telemetry.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).

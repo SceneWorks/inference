@@ -46,6 +46,8 @@ pub mod audio_generator;
 pub mod audio_transform;
 pub mod captioner;
 pub mod memory_strategy;
+pub mod moss_training_fixture;
+pub mod moss_training_probe;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;

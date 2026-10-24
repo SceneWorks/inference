@@ -19,9 +19,41 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
-    group_norm, linear, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
+    linear, Conv2dConfig, GroupNorm as CandleGroupNorm, Linear, Module, VarBuilder,
 };
 use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
+
+// The normal path delegates to the identical Candle constructor. Test-support keeps only
+// shallow handles to the EXACT parameters handed to that same GroupNorm implementation.
+struct VaeGroupNorm {
+    inner: CandleGroupNorm,
+    #[cfg(feature = "test-support")]
+    parameters: [Tensor; 2],
+}
+impl Module for VaeGroupNorm {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.inner.forward(input)
+    }
+}
+fn group_norm(groups: usize, channels: usize, eps: f64, vb: VarBuilder) -> Result<VaeGroupNorm> {
+    #[cfg(feature = "test-support")]
+    {
+        let weight =
+            vb.get_with_hints(channels, "weight", candle_gen::candle_nn::Init::Const(1.))?;
+        let bias = vb.get_with_hints(channels, "bias", candle_gen::candle_nn::Init::Const(0.))?;
+        let inner = CandleGroupNorm::new(weight.clone(), bias.clone(), channels, groups, eps)?;
+        Ok(VaeGroupNorm {
+            inner,
+            parameters: [weight, bias],
+        })
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        Ok(VaeGroupNorm {
+            inner: candle_gen::candle_nn::group_norm(groups, channels, eps, vb)?,
+        })
+    }
+}
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
@@ -82,9 +114,9 @@ fn conv1x1(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
 
 /// Diffusers ResnetBlock2D (temb-free): `gn→silu→conv1 → gn→silu→conv2 + shortcut`.
 struct Resnet {
-    norm1: GroupNorm,
+    norm1: VaeGroupNorm,
     conv1: Conv2d,
-    norm2: GroupNorm,
+    norm2: VaeGroupNorm,
     conv2: Conv2d,
     shortcut: Option<Conv2d>,
 }
@@ -124,7 +156,7 @@ impl Resnet {
 
 /// Single-head spatial self-attention in the mid block (diffusers `Attention`).
 struct MidAttention {
-    norm: GroupNorm,
+    norm: VaeGroupNorm,
     q: Linear,
     k: Linear,
     v: Linear,
@@ -262,26 +294,26 @@ struct Encoder {
     mid_resnet0: Resnet,
     mid_attn: MidAttention,
     mid_resnet1: Resnet,
-    conv_norm_out: GroupNorm,
+    conv_norm_out: VaeGroupNorm,
     conv_out: Conv2d,
 }
 
 impl Encoder {
-    fn new(vb: VarBuilder) -> Result<Self> {
-        let conv_in = conv3x3(3, BLOCK_OUT[0], vb.pp("conv_in"))?;
+    fn new(vb: VarBuilder, widths: [usize; 4]) -> Result<Self> {
+        let conv_in = conv3x3(3, widths[0], vb.pp("conv_in"))?;
 
         // down_blocks iterate block_out forward; resnet 0 of block i bridges the previous block's
         // output channels into block_out[i]. Downsample after every block except the last.
-        let mut down_blocks = Vec::with_capacity(BLOCK_OUT.len());
-        let mut in_c = BLOCK_OUT[0];
-        for (i, &out_c) in BLOCK_OUT.iter().enumerate() {
+        let mut down_blocks = Vec::with_capacity(widths.len());
+        let mut in_c = widths[0];
+        for (i, &out_c) in widths.iter().enumerate() {
             let db = vb.pp("down_blocks").pp(i);
             let mut resnets = Vec::with_capacity(ENCODER_RESNETS);
             for j in 0..ENCODER_RESNETS {
                 let rin = if j == 0 { in_c } else { out_c };
                 resnets.push(Resnet::new(rin, out_c, db.pp("resnets").pp(j))?);
             }
-            let is_final = i == BLOCK_OUT.len() - 1;
+            let is_final = i == widths.len() - 1;
             let downsampler = if is_final {
                 None
             } else {
@@ -294,7 +326,7 @@ impl Encoder {
             in_c = out_c;
         }
 
-        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let top = *widths.last().unwrap(); // 512
         let mid = vb.pp("mid_block");
         let mid_resnet0 = Resnet::new(top, top, mid.pp("resnets").pp("0"))?;
         let mid_attn = MidAttention::new(top, mid.pp("attentions").pp("0"))?;
@@ -338,12 +370,75 @@ pub struct Flux2Vae {
     mid_attn: MidAttention,
     mid_resnet1: Resnet,
     up_blocks: Vec<UpBlock>,
-    conv_norm_out: GroupNorm,
+    conv_norm_out: VaeGroupNorm,
     conv_out: Conv2d,
     encoder: Option<(Encoder, Conv2d)>, // (encoder, quant_conv 64→64)
 }
 
 impl Flux2Vae {
+    /// Actual loaded frozen tensors, shallow handles only; callers stream bounded host chunks.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn frozen_training_tensors(&self) -> Vec<Tensor> {
+        fn conv(c: &Conv2d, v: &mut Vec<Tensor>) {
+            v.push(c.weight().clone());
+            v.extend(c.bias().cloned());
+        }
+        fn norm(n: &VaeGroupNorm, v: &mut Vec<Tensor>) {
+            v.extend(n.parameters.iter().cloned());
+        }
+        fn resnet(r: &Resnet, v: &mut Vec<Tensor>) {
+            norm(&r.norm1, v);
+            conv(&r.conv1, v);
+            norm(&r.norm2, v);
+            conv(&r.conv2, v);
+            if let Some(c) = &r.shortcut {
+                conv(c, v);
+            }
+        }
+        fn attention(a: &MidAttention, v: &mut Vec<Tensor>) {
+            norm(&a.norm, v);
+            for p in [&a.q, &a.k, &a.v, &a.out] {
+                v.push(p.weight().clone());
+                v.extend(p.bias().cloned());
+            }
+        }
+        let mut values = vec![self.bn_mean.clone(), self.bn_std.clone()];
+        conv(&self.post_quant_conv, &mut values);
+        conv(&self.conv_in, &mut values);
+        resnet(&self.mid_resnet0, &mut values);
+        attention(&self.mid_attn, &mut values);
+        resnet(&self.mid_resnet1, &mut values);
+        for block in &self.up_blocks {
+            for r in &block.resnets {
+                resnet(r, &mut values);
+            }
+            if let Some(u) = &block.upsampler {
+                conv(&u.conv, &mut values);
+            }
+        }
+        norm(&self.conv_norm_out, &mut values);
+        conv(&self.conv_out, &mut values);
+        if let Some((encoder, quant)) = &self.encoder {
+            conv(quant, &mut values);
+            conv(&encoder.conv_in, &mut values);
+            for block in &encoder.down_blocks {
+                for r in &block.resnets {
+                    resnet(r, &mut values);
+                }
+                if let Some(d) = &block.downsampler {
+                    conv(&d.conv, &mut values);
+                }
+            }
+            resnet(&encoder.mid_resnet0, &mut values);
+            attention(&encoder.mid_attn, &mut values);
+            resnet(&encoder.mid_resnet1, &mut values);
+            norm(&encoder.conv_norm_out, &mut values);
+            conv(&encoder.conv_out, &mut values);
+        }
+        values
+    }
+
     /// Build a **decode-only** VAE from a `vae/` VarBuilder (diffusers AutoencoderKLFlux2 keys, f32) —
     /// the txt2img path (no `encoder.*` / `quant_conv` loaded).
     pub fn new(vb: VarBuilder) -> Result<Self> {
@@ -369,7 +464,29 @@ impl Flux2Vae {
         Self::build(vb, true, config)
     }
 
+    /// Full-topology synthetic fixtures only. Not a request/model capability or a runtime profile.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_fixture_widths(
+        vb: VarBuilder,
+        encoder_widths: [usize; 4],
+        decoder: &Flux2VaeDecoderConfig,
+    ) -> Result<Self> {
+        Self::build_profile(vb, true, decoder, encoder_widths)
+    }
     fn build(vb: VarBuilder, with_encoder: bool, config: &Flux2VaeDecoderConfig) -> Result<Self> {
+        Self::build_profile(vb, with_encoder, config, BLOCK_OUT)
+    }
+    fn build_profile(
+        vb: VarBuilder,
+        with_encoder: bool,
+        config: &Flux2VaeDecoderConfig,
+        encoder_widths: [usize; 4],
+    ) -> Result<Self> {
+        Flux2VaeDecoderConfig {
+            block_out_channels: encoder_widths,
+        }
+        .validate()?;
         config.validate()?;
         // bn stats live at the top level (packed 128-ch space).
         let bn_mean = vb.get(128, "bn.running_mean")?.reshape((1, 128, 1, 1))?;
@@ -412,7 +529,7 @@ impl Flux2Vae {
         let conv_out = conv3x3(prev, 3, dec.pp("conv_out"))?;
 
         let encoder = if with_encoder {
-            let enc = Encoder::new(vb.pp("encoder"))?;
+            let enc = Encoder::new(vb.pp("encoder"), encoder_widths)?;
             let quant_conv = conv1x1(
                 2 * LATENT_CHANNELS,
                 2 * LATENT_CHANNELS,

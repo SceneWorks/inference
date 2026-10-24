@@ -5,6 +5,9 @@ pub mod memory_strategy;
 pub mod model;
 mod pipeline;
 mod precision;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod text_encoder;
 pub mod training;
 mod training_memory;
