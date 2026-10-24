@@ -49,6 +49,7 @@ enum Base {
     Packed(QLinear),
     Nvfp4(std::sync::Arc<super::Nvfp4Linear>),
     ConvRot(Arc<super::convrot_int8::ConvRotLinear>),
+    W4A8(Arc<super::w4a8_int8::W4A8Linear>),
     /// Metadata ONLY for a caller-owned strict packed GEMM. This wrapper owns no
     /// base tensor and can apply residuals only to an externally computed output.
     External {
@@ -82,6 +83,7 @@ impl Base {
             Base::Packed(q) => q.forward(x),
             Base::Nvfp4(q) => q.forward(x),
             Base::ConvRot(q) => q.forward(x),
+            Base::W4A8(q) => q.forward(x),
             Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
@@ -105,12 +107,13 @@ impl Base {
             // stored at the activation dtype in the first place), so there is nothing to upcast.
             Base::Nvfp4(q) => q.forward(x),
             Base::ConvRot(q) => q.forward(x),
+            Base::W4A8(q) => q.forward(x),
             Base::External { .. } => Err(external_base_refusal("compute the base forward")),
         }
     }
 
     fn is_packed(&self) -> bool {
-        matches!(self, Base::Packed(_) | Base::ConvRot(_))
+        matches!(self, Base::Packed(_) | Base::ConvRot(_) | Base::W4A8(_))
     }
 
     fn is_nvfp4(&self) -> bool {
@@ -127,6 +130,7 @@ impl Base {
             Base::Packed(_) => None,
             Base::Nvfp4(q) => Some(q.device().clone()),
             Base::ConvRot(q) => Some(q.device().clone()),
+            Base::W4A8(q) => Some(q.device().clone()),
             Base::External { device, .. } => Some(device.clone()),
         }
     }
@@ -859,6 +863,22 @@ impl AdaptLinear {
         matches!(self.base, Base::ConvRot(_))
     }
 
+    /// Packed W4A8 base; residuals remain additive in the original, unrotated input basis.
+    pub fn from_w4a8(base: super::w4a8_int8::W4A8Linear) -> Self {
+        let d = base.descriptor();
+        Self {
+            base: Base::W4A8(Arc::new(base)),
+            in_features: d.in_features,
+            out_features: d.out_features,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// Distinguish native codebook W4A8 from affine Q4 and symmetric ConvRot INT8.
+    pub fn is_w4a8(&self) -> bool {
+        matches!(self.base, Base::W4A8(_))
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
     /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
     /// fixtures.
@@ -1053,14 +1073,22 @@ impl AdaptLinear {
 
     pub fn matmul_strategy(&self) -> Option<super::MatmulStrategy> {
         match &self.base {
-            Base::Dense(_) | Base::Nvfp4(_) | Base::ConvRot(_) | Base::External { .. } => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
             Base::Packed(linear) => linear.matmul_strategy(),
         }
     }
 
     pub fn quant_dtype(&self) -> Option<candle_core::quantized::GgmlDType> {
         match &self.base {
-            Base::Dense(_) | Base::Nvfp4(_) | Base::ConvRot(_) | Base::External { .. } => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
             Base::Packed(linear) => linear.quant_dtype(),
         }
     }
@@ -1076,7 +1104,11 @@ impl AdaptLinear {
     pub fn base_qlinear(&self) -> Option<&QLinear> {
         match &self.base {
             Base::Packed(q) => Some(q),
-            Base::Dense(_) | Base::Nvfp4(_) | Base::ConvRot(_) | Base::External { .. } => None,
+            Base::Dense(_)
+            | Base::Nvfp4(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
         }
     }
 
@@ -1085,7 +1117,19 @@ impl AdaptLinear {
     pub fn base_nvfp4(&self) -> Option<&super::Nvfp4Linear> {
         match &self.base {
             Base::Nvfp4(q) => Some(q),
-            Base::Dense(_) | Base::Packed(_) | Base::ConvRot(_) | Base::External { .. } => None,
+            Base::Dense(_)
+            | Base::Packed(_)
+            | Base::ConvRot(_)
+            | Base::W4A8(_)
+            | Base::External { .. } => None,
+        }
+    }
+
+    /// The native W4A8 base, including its packed residency and transient weight-scratch bound.
+    pub fn base_w4a8(&self) -> Option<&super::w4a8_int8::W4A8Linear> {
+        match &self.base {
+            Base::W4A8(q) => Some(q),
+            _ => None,
         }
     }
 
@@ -1139,6 +1183,9 @@ impl AdaptLinear {
                     .into(),
             )),
             Base::ConvRot(_) => Err(CandleError::Unsupported("ConvRot INT8 base is immutable; install an additive residual instead".into())),
+            Base::W4A8(_) => Err(CandleError::Unsupported(
+                "W4A8 base is immutable; install an additive residual instead".into(),
+            )),
         }
     }
 
@@ -1259,6 +1306,7 @@ impl AdaptLinear {
             Base::Packed(_) => "MLX-packed base",
             Base::Nvfp4(_) => "NVFP4 base",
             Base::ConvRot(_) => "ConvRot INT8 base",
+            Base::W4A8(_) => "W4A8 base",
             Base::External { .. } => "external packed base",
         }
     }
@@ -1414,6 +1462,7 @@ impl AdaptLinear {
             Base::ConvRot(_) => {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1441,6 +1490,7 @@ impl AdaptLinear {
             Base::ConvRot(_) => {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1461,6 +1511,7 @@ impl AdaptLinear {
             Base::ConvRot(_) => {
                 candle_core::bail!("ConvRot INT8 refuses re-quantization to {quant:?}")
             }
+            Base::W4A8(_) => candle_core::bail!("W4A8 refuses re-quantization to {quant:?}"),
             Base::External { .. } => Err(external_base_refusal("re-quantize the base")),
             Base::Dense(l) => {
                 let mut q = QLinear::from_dense(DenseLinear::Linear(l.clone()));
@@ -1514,6 +1565,11 @@ impl AdaptLinear {
                     candle_core::bail!(
                         "ConvRot INT8 refuses cross-device migration of its staged base"
                     );
+                }
+            }
+            Base::W4A8(q) => {
+                if !q.device().same_device(device) {
+                    candle_core::bail!("W4A8 refuses cross-device migration of its packed base");
                 }
             }
         }
