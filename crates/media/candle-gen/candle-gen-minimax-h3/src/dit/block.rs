@@ -564,6 +564,7 @@ mod tests {
     /// The six modulation tables must each own their storage, so the cache's byte accounting
     /// describes six allocations rather than six views of one.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_modulation_tables_are_contiguous() {
         let dev = Device::Cpu;
         let cfg = MiniMaxH3DitConfig {
@@ -605,6 +606,9 @@ mod tests {
         assert!(proj
             .forward(&Tensor::ones(3, DType::F32, &dev).unwrap())
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::block::tests::the_modulation_tables_are_contiguous");
     }
 
     // ─── the packed tier (sc-20267) ─────────────────────────────────────────────────────────────
@@ -650,6 +654,7 @@ mod tests {
     /// relative max-abs. Both sides run the identical `AdaLnProjection::forward`, so this measures
     /// the packed path rather than the modulation split.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_adaln_forward_matches_a_dense_reference() {
         let cfg = packable_cfg();
         let (out, in_) = (cfg.adaln_out_features(), cfg.time_embed_dim);
@@ -714,6 +719,9 @@ mod tests {
                  {drift:.3e}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::block::tests::the_packed_adaln_forward_matches_a_dense_reference");
     }
 
     /// A packed projection whose recovered geometry disagrees with the config is refused by the

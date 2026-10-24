@@ -100,4 +100,8 @@ fn vace_real_forward_matches_diffusers() {
         mean_rel < 6e-2,
         "VACE real forward diverges past the matmul floor: max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED wanvace_real_parity::vace_real_forward_matches_diffusers"
+    );
 }

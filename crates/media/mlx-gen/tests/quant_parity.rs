@@ -65,6 +65,7 @@ fn quantize_packs_identically_to_mflux() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adaptable_linear_quantize_matches_reference() {
     // sc-2604: `AdaptableLinear::quantize` mirrors mflux — it quantizes the **bf16-cast** weight
@@ -93,8 +94,13 @@ fn adaptable_linear_quantize_matches_reference() {
             "q{bits}: AdaptableLinear quantized forward diverged from the bf16 (fork-faithful) reference"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED quant_parity::adaptable_linear_quantize_matches_reference"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn quantized_forward_approximates_dense() {
     // Peak-relative error vs dense: Q8 ≈ 0.4%, Q4 ≈ 6.5% on N(0,1) weights at group_size 64
@@ -124,4 +130,6 @@ fn quantized_forward_approximates_dense() {
             "q{bits}: peak-relative error {rel:.4} exceeds {max_rel}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::quantized_forward_approximates_dense");
 }

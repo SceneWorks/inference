@@ -127,4 +127,6 @@ fn encoder_scope_reports_the_request_peak_effect_without_changing_the_image() {
         unscoped.request as f64 / GIB,
         scoped.request as f64 / GIB
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder_request_peak_real_weights::encoder_scope_reports_the_request_peak_effect_without_changing_the_image");
 }

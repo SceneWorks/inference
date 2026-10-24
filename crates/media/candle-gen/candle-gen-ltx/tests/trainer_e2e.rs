@@ -175,4 +175,7 @@ fn ltx_trainer_round_trips_through_inference_and_changes_render() {
         base, adapted,
         "the trained adapter must have an observable inference effect"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx_trainer_round_trips_through_inference_and_changes_render");
 }

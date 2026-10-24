@@ -269,4 +269,6 @@ fn one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures() {
         TerminalCase::Complete,
     )
     .expect("follow-up after injected provider error");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED request_memory_scope_real_weights::one_loaded_provider_reapplies_a_b_a_and_recovers_after_terminal_failures");
 }

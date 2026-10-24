@@ -76,7 +76,7 @@ impl DenseGroupNorm {
 
 impl Module for DenseGroupNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.inner.forward(xs)
+        __model_proof_output!(self.inner.forward(xs))
     }
 }
 
@@ -169,6 +169,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_unet_matches_stock_forward() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -194,5 +195,8 @@ mod parity_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-5, "vendored UNet diverged from stock by {diff}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::parity_tests::vendored_unet_matches_stock_forward");
     }
 }

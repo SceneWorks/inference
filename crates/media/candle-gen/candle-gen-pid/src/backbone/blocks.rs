@@ -85,14 +85,18 @@ impl RotaryAttention {
 
     /// `x`: `[B, N, dim]`; `cos`/`sin`: `[N, head_dim/2]`.
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (q, k, v) = split_qkv(&self.qkv.forward(x)?, self.heads, self.head_dim)?;
+        let (q, k, v) = split_qkv(
+            &__model_proof_output!(self.qkv.forward(x))?,
+            self.heads,
+            self.head_dim,
+        )?;
         let q = rms(&q, &self.q_norm, RMS_EPS)?;
         let k = rms(&k, &self.k_norm, RMS_EPS)?;
         let (q, k, v) = (to_bhsd(&q)?, to_bhsd(&k)?, to_bhsd(&v)?);
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
         let scale = (self.head_dim as f64).powf(-0.5);
         let o = sdpa(&q, &k, &v, scale)?;
-        Ok(self.proj.forward(&merge_heads(&o)?)?)
+        Ok(__model_proof_output!(self.proj.forward(&merge_heads(&o)?))?)
     }
 }
 
@@ -140,10 +144,18 @@ impl MMDiTJointAttention {
         let ny = y.dim(1)?;
         let nx = x.dim(1)?;
 
-        let (qx, kx, vx) = split_qkv(&self.qkv_x.forward(x)?, self.heads, self.head_dim)?;
+        let (qx, kx, vx) = split_qkv(
+            &__model_proof_output!(self.qkv_x.forward(x))?,
+            self.heads,
+            self.head_dim,
+        )?;
         let qx = rms(&qx, &self.q_norm_x, RMS_EPS)?;
         let kx = rms(&kx, &self.k_norm_x, RMS_EPS)?;
-        let (qy, ky, vy) = split_qkv(&self.qkv_y.forward(y)?, self.heads, self.head_dim)?;
+        let (qy, ky, vy) = split_qkv(
+            &__model_proof_output!(self.qkv_y.forward(y))?,
+            self.heads,
+            self.head_dim,
+        )?;
         let qy = rms(&qy, &self.q_norm_y, RMS_EPS)?;
         let ky = rms(&ky, &self.k_norm_y, RMS_EPS)?;
 
@@ -161,7 +173,10 @@ impl MMDiTJointAttention {
 
         let out_y = merge_heads(&out.narrow(2, 0, ny)?.contiguous()?)?;
         let out_x = merge_heads(&out.narrow(2, ny, nx)?.contiguous()?)?;
-        Ok((self.proj_x.forward(&out_x)?, self.proj_y.forward(&out_y)?))
+        Ok((
+            __model_proof_output!(self.proj_x.forward(&out_x))?,
+            __model_proof_output!(self.proj_y.forward(&out_y))?,
+        ))
     }
 }
 
@@ -205,8 +220,8 @@ impl MMDiTBlockT2I {
         cos_txt: &Tensor,
         sin_txt: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let mx = self.adaln_img.forward(c)?.chunk(6, D::Minus1)?;
-        let my = self.adaln_txt.forward(c)?.chunk(6, D::Minus1)?;
+        let mx = __model_proof_output!(self.adaln_img.forward(c))?.chunk(6, D::Minus1)?;
+        let my = __model_proof_output!(self.adaln_txt.forward(c))?.chunk(6, D::Minus1)?;
 
         let x_norm = modulate(&rms(x, &self.norm_x1, RMS_EPS)?, &mx[1], &mx[0])?;
         let y_norm = modulate(&rms(y, &self.norm_y1, RMS_EPS)?, &my[1], &my[0])?;
@@ -285,23 +300,25 @@ impl PiTBlock {
         l: usize,
     ) -> Result<Tensor> {
         let (bl, p2, _) = x.dims3()?;
-        let cond = self
-            .adaln
-            .forward(s_cond)?
-            .reshape((bl, p2, 6 * self.pixel_dim))?;
+        let cond = __model_proof_output!(self.adaln.forward(s_cond))?.reshape((
+            bl,
+            p2,
+            6 * self.pixel_dim,
+        ))?;
         let m = cond.chunk(6, D::Minus1)?; // shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
         let x_norm = modulate(&rms(x, &self.norm1, RMS_EPS)?, &m[1], &m[0])?;
         let x_flat = x_norm.reshape((bl, p2 * self.pixel_dim))?;
-        let x_comp = self
-            .compress_to_attn
-            .forward(&x_flat)?
-            .reshape((b, l, self.attn_dim))?;
+        let x_comp = __model_proof_output!(self.compress_to_attn.forward(&x_flat))?.reshape((
+            b,
+            l,
+            self.attn_dim,
+        ))?;
         let attn_out = self.attn.forward(&x_comp, cos, sin)?;
-        let attn_exp = self
+        let attn_exp = __model_proof_output!(self
             .expand_from_attn
-            .forward(&attn_out.reshape((b * l, self.attn_dim))?)?
-            .reshape((bl, p2, self.pixel_dim))?;
+            .forward(&attn_out.reshape((b * l, self.attn_dim))?))?
+        .reshape((bl, p2, self.pixel_dim))?;
         let x = gated(x, &m[2], &attn_exp)?;
 
         let mlp_out =

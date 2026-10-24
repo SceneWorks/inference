@@ -100,6 +100,7 @@ fn forward_mem(t: &Flux2Transformer, w: &Weights, mem: &MemoryConfig) -> Array {
     .unwrap()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_graph_eval_cadence_is_bit_identical() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -124,12 +125,15 @@ fn every_graph_eval_cadence_is_bit_identical() {
             "{mem:?} must be bit-identical (max|Δ| {max_abs}, cos {cos})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_chunk_equiv::every_graph_eval_cadence_is_bit_identical");
 }
 
 /// **sc-18317 default preservation, at the request seam.** A request that selects no execution domain
 /// must leave whichever base config the route chose completely alone — the property that makes this
 /// story inert for every existing render. Asserted on the tensor, not only on the config, so a future
 /// overlay bug that silently enables a lever is caught here and not only in `chunk.rs`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_unset_request_selection_is_bit_identical_to_the_route_default() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -145,12 +149,15 @@ fn an_unset_request_selection_is_bit_identical_to_the_route_default() {
             "{base_config:?} perturbed by an unset request"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_chunk_equiv::an_unset_request_selection_is_bit_identical_to_the_route_default");
 }
 
 /// **sc-18317 reach.** A selection made the way the planner makes it — typed fields on
 /// `GenerationMemory` — must arrive at the forward as the corresponding `MemoryConfig`, and the
 /// forward must still be equivalent. This is the link between the request and the consumer that
 /// `chunk.rs`'s unit tests cannot cover on their own (they stop at the config).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_request_selection_reaches_the_forward_and_stays_equivalent() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -171,9 +178,12 @@ fn a_request_selection_reaches_the_forward_and_stays_equivalent() {
         cos >= 0.999_999_9,
         "a request-selected schedule diverged (cos {cos}, max|Δ| {max_abs})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_chunk_equiv::a_request_selection_reaches_the_forward_and_stays_equivalent");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn ffn_seq_chunk_is_numerically_equivalent() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let t = Flux2Transformer::from_weights(&w, &tiny_config()).unwrap();
@@ -208,4 +218,6 @@ fn ffn_seq_chunk_is_numerically_equivalent() {
         cos >= 0.999_999_9,
         "eval + ffn chunk diverged (cos {cos}, max|Δ| {max_abs})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_chunk_equiv::ffn_seq_chunk_is_numerically_equivalent");
 }

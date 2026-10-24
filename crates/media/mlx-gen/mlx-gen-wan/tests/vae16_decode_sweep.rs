@@ -55,6 +55,7 @@ fn wan_z16_vae_decode_sweep() {
         Some(p) => p,
         None => {
             eprintln!("skip: set Z16_VAE to the 14B snapshot's vae.safetensors");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_z16_vae_decode_sweep; see preceding skip diagnostic");
             return;
         }
     };
@@ -160,4 +161,6 @@ fn wan_z16_vae_decode_sweep() {
         peak_bytes as f64 / out_vox as f64,
         peak_bytes as f64 / tile_vox as f64,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae16_decode_sweep::wan_z16_vae_decode_sweep");
 }

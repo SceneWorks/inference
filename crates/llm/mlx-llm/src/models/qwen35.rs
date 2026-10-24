@@ -2743,6 +2743,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn assembled_forward_produces_finite_logits() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
@@ -2757,9 +2758,12 @@ pub(crate) mod tests {
         }
         // The full-attention layer (layer 3) advanced the KV cache to 5 positions.
         assert_eq!(cache.offset(), 5);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::assembled_forward_produces_finite_logits");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn flat_text_and_wrapped_qwen35_match_target_and_mtp() {
         let wrapped_json = cfg_json_mtp();
         let flat_json = wrapped_json["text_config"].clone();
@@ -2807,9 +2811,12 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(values(&wrapped_draft), values(&flat_draft));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::flat_text_and_wrapped_qwen35_match_target_and_mtp");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_loads_all_frozen_components_and_executes() {
         let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -2837,9 +2844,12 @@ pub(crate) mod tests {
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
             assert!(x.is_finite());
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_loads_all_frozen_components_and_executes");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_prefill_projects_only_last_row_and_warm_cache_matches_full() {
         let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -2944,6 +2954,8 @@ pub(crate) mod tests {
             .mtp_step(&next, &previous, &mut warm_mtp_cache, 3)
             .unwrap();
         assert_eq!(as_f32(&warm_next), as_f32(&full_next));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_prefill_projects_only_last_row_and_warm_cache_matches_full");
     }
 
     /// E2 (sc-24432 feature-end review): a config declaring a native head the snapshot stores
@@ -3049,6 +3061,7 @@ pub(crate) mod tests {
     /// signs, one Gated DeltaNet and one attention layer) the fused rotation leaves the prefill
     /// logits bit-identical and the greedy tokens unchanged.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation() {
         use crate::decode::{generate, CancelFlag};
         use crate::primitives::prism::tests::with_unfused_rotation;
@@ -3082,10 +3095,12 @@ pub(crate) mod tests {
                 .count()
         };
         let (fused, fused_routes) = mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            crate::model_inference_device::record_model_inference_device();
             recording_rotation_routes(run)
         });
         let (unfused, unfused_routes) =
             mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+                crate::model_inference_device::record_model_inference_device();
                 recording_rotation_routes(|| with_unfused_rotation(run))
             });
         assert!(
@@ -3111,12 +3126,15 @@ pub(crate) mod tests {
             "fixture must not be degenerate: {:?}",
             fused.2
         );
+
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation");
     }
 
     /// Story sc-24444 AC2 (model level): a companion MTP head attached to a Prism target borrows
     /// the packed embedding and `lm_head`, drafts, and every depth emits exactly the target's
     /// greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens() {
         use crate::decode::{generate, generate_qwen35_mtp, CancelFlag};
 
@@ -3159,12 +3177,15 @@ pub(crate) mod tests {
             assert_eq!(speculative.tokens, plain.tokens, "depth {depth}");
             assert!(stats.proposed > 0, "depth {depth}: the head drafted");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens");
     }
 
     /// Story sc-24444 AC2 / E2: a head whose geometry disagrees with the target is refused with a
     /// reason naming each disagreement, and the target is left exactly as it was — still loaded,
     /// no predictor, same greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact() {
         use crate::decode::{generate, CancelFlag};
 
@@ -3275,6 +3296,8 @@ pub(crate) mod tests {
             err.contains("already carries its own MTP predictor"),
             "{err}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact");
     }
 
     /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
@@ -3312,6 +3335,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mtp_generation_covers_verification_rollback_stop_and_cancel() {
         use crate::decode::{
             generate, generate_qwen35_mtp, generate_speculative, CancelFlag, ConstraintMask,
@@ -3504,9 +3528,12 @@ pub(crate) mod tests {
             "a permissive transactional constraint must preserve stochastic p/q sampling"
         );
         assert_eq!(sampled_constraint.accepted, constrained_sampled.tokens);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::mtp_generation_covers_verification_rollback_stop_and_cancel");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent() {
         use std::time::Instant;
 
@@ -3661,9 +3688,12 @@ pub(crate) mod tests {
                 .any(|(text, fused)| (text - fused).abs() > 1.0e-5),
             "an encoded visual row must change the MTP seed distribution"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::multimodal_mtp_seed_uses_fused_embeddings_and_matches_text_equivalent");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_after_prefill_advances_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3686,6 +3716,8 @@ pub(crate) mod tests {
         for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
             assert!(x.is_finite());
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_after_prefill_advances_cache");
     }
 
     /// The whole Gated DeltaNet layer, validated against a numeric oracle from the exact
@@ -3700,6 +3732,7 @@ pub(crate) mod tests {
     /// oracles (sc-7627); cross-token cache carry by `prefill_equals_stepwise_decode`. Regenerate the
     /// fixture with `/tmp/gen_s1.py` (see story sc-7629).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn deltanet_layer_matches_qwen3_5_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_deltanet_oracle.json")).unwrap();
@@ -3766,6 +3799,8 @@ pub(crate) mod tests {
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s);
         assert!(cache.conv_state.is_some() && cache.ssm_state.is_some());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::deltanet_layer_matches_qwen3_5_reference");
     }
 
     /// A model-level invariant the hybrid cache must satisfy: prefilling a sequence in one pass must
@@ -3774,6 +3809,7 @@ pub(crate) mod tests {
     /// production bf16 path (MLX-vs-MLX, so no f32-GEMM-floor concern) — this is what guarantees the
     /// short conv and delta recurrence resume correctly at decode time on real weights.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn prefill_equals_stepwise_decode() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
@@ -3824,6 +3860,10 @@ pub(crate) mod tests {
             md < 5e-2,
             "prefill vs stepwise last-token logits diverged: max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prefill_equals_stepwise_decode"
+        );
     }
 
     /// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
@@ -3832,8 +3872,10 @@ pub(crate) mod tests {
     /// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
     /// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_the_ops_reference_recurrence() {
         mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), greedy_tokens_match_on_the_gpu);
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::greedy_tokens_match_the_ops_reference_recurrence");
     }
 
     fn greedy_tokens_match_on_the_gpu() {
@@ -3925,6 +3967,8 @@ pub(crate) mod tests {
                 prompt.len()
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        crate::model_inference_device::record_model_inference_device();
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
@@ -4030,6 +4074,7 @@ pub(crate) mod tests {
     /// (Qwen3.5) expert layouts of the same seeded non-zero weights give identical target logits
     /// and identical `mtp_step` logits / hidden state.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
         let fused = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, true));
@@ -4061,6 +4106,8 @@ pub(crate) mod tests {
         assert_eq!(a.0, b.0, "target hidden");
         assert_eq!(a.1, b.1, "MTP hidden");
         assert_eq!(a.2, b.2, "MTP logits");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_moe_mtp_head_runs_identically_in_both_expert_layouts");
     }
 
     /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
@@ -4068,6 +4115,7 @@ pub(crate) mod tests {
     /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
     /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to, at bf16 tolerance.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_mtp_layer_ffn_matches_the_moe_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4146,6 +4194,8 @@ pub(crate) mod tests {
                  exp {exp:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference");
     }
 
     /// The MoE FFN block, validated against a numeric oracle from the exact
@@ -4154,6 +4204,7 @@ pub(crate) mod tests {
     /// as the loader (`experts.gate_up_proj` → stacked gate / up banks). Single token (S=1) so
     /// MLX runs the exact GEMV path and the match is tight; regenerate with `/tmp/gen_moe.py`.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn moe_ffn_matches_qwen3_5_moe_reference() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4217,9 +4268,12 @@ pub(crate) mod tests {
             md < 2e-4,
             "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn moe_model_forward_and_prefill_equals_stepwise() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
         assert!(cfg.moe.is_some());
@@ -4283,6 +4337,8 @@ pub(crate) mod tests {
             md < 5e-2,
             "MoE prefill vs stepwise diverged: max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_model_forward_and_prefill_equals_stepwise");
     }
 
     /// sc-24442 AC2: the Qwen35 hybrid decoder (gated full attention with partial M-RoPE
@@ -4290,6 +4346,7 @@ pub(crate) mod tests {
     /// the pre-sc-24442 one, compared in-process — head dims 8 (unserved), 64 (full kernel) and 256
     /// (vector-only) × GQA 2 / GQA 8 × prompts inside one tile, across tiles, and across many.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
         use crate::primitives::attention::route_override::{
             assert_greedy_matches_pre_sc24442, GreedyComparison,
@@ -4354,6 +4411,8 @@ pub(crate) mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::greedy_tokens_match_pre_sc24442_sdpa_routing");
     }
 
     fn synthetic_model() -> (Qwen35Config, Qwen35Model) {
@@ -4602,6 +4661,7 @@ pub(crate) mod tests {
     /// interleaved M-RoPE collapses to 1D and the embeds path is the same compute. This is the gate
     /// that the multimodal hook doesn't perturb the (verified) text decoder.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_from_embeds_text_only_equals_decode_logits() {
         let (_cfg, model) = synthetic_model();
         let toks = [1i32, 7, 3, 42, 9, 2];
@@ -4636,6 +4696,8 @@ pub(crate) mod tests {
             md == 0.0,
             "embeds text path must equal token-id path bit-for-bit; max abs diff {md}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_from_embeds_text_only_equals_decode_logits");
     }
 
     /// The splice hook overwrites exactly the image-token rows (in order) with the feature rows and
@@ -4681,6 +4743,7 @@ pub(crate) mod tests {
     /// and (b) **differ** from the same prefill with the fusion disabled (empty taps) — proving the
     /// tapped features are consumed in the decoder layers, not computed and dropped.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn deepstack_fused_path_consumes_features_and_differs() {
         let (cfg, model) = synthetic_model();
         let img = 49i32;
@@ -4799,6 +4862,8 @@ pub(crate) mod tests {
             trait_vs_inherent, 0.0,
             "VlmDecode::prefill_with_deepstack must equal the inherent fused path (cache downcast seam)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::deepstack_fused_path_consumes_features_and_differs");
     }
 
     #[test]
@@ -4905,6 +4970,7 @@ pub(crate) mod tests {
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
     /// decode_logits_from_embeds) runs end to end and yields finite `[1, vocab]` logits.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn image_text_decode_from_embeds_runs() {
         let (cfg, model) = synthetic_model();
         let img = 49i32; // within the synthetic vocab (50) so embed gather is in-bounds
@@ -4933,6 +4999,8 @@ pub(crate) mod tests {
             .as_slice::<f32>()
             .iter()
             .all(|x| x.is_finite()));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::image_text_decode_from_embeds_runs");
     }
 
     // ---- The DeltaNet checkpoint ring at the model level (sc-24435). ----
@@ -4967,6 +5035,7 @@ pub(crate) mod tests {
     /// drops the rest by offset — after which the next forward's logits are exactly those of a
     /// cache that never saw the dropped tokens.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_checkpoint_window_over_several_forwards_truncates_to_each_position() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5015,6 +5084,8 @@ pub(crate) mod tests {
         // The kept states came out of a 3-token forward, the reference's out of single-token
         // ones: equal up to the multi-row projection's bf16 rounding.
         assert!(max < 5e-2, "restored-from-verify logits differ by {max}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_checkpoint_window_over_several_forwards_truncates_to_each_position");
     }
 
     /// `truncate` is refused (typed, cache untouched) outside the checkpoint window — with no
@@ -5022,6 +5093,7 @@ pub(crate) mod tests {
     /// next forward records nothing and drops it. `0` is a reset and the current length a no-op,
     /// through the [`KvCache`] trait too.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn truncate_outside_the_checkpoint_window_is_refused_and_closes_it() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5059,12 +5131,15 @@ pub(crate) mod tests {
         assert_eq!(cache.offset(), p + 4);
         KvCache::truncate(&mut cache, 0).unwrap();
         assert_eq!(cache.offset(), 0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::truncate_outside_the_checkpoint_window_is_refused_and_closes_it");
     }
 
     /// sc-24435: a checkpoint window armed for `2` tokens refuses a 3-token forward (typed)
     /// before any layer runs — the offset, every DeltaNet state and the attention KV are as they
     /// were, so the next forward's logits are a never-refused cache's.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_forward_past_the_armed_window_is_refused_untouched() {
         let model = crate::decode::engine::tests::qwen35(false);
         let p = RING_PROMPT.len() as i32;
@@ -5091,6 +5166,8 @@ pub(crate) mod tests {
         let got = step_each(&model, &mut cache, &[4, 11]);
         let want = step_each(&model, &mut prefilled(&model, &RING_PROMPT), &[4, 11]);
         assert_eq!(got, want);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_forward_past_the_armed_window_is_refused_untouched");
     }
 
     /// E7 (sc-24435): the checkpoint ring's resident memory — the window's start state plus every
@@ -5101,6 +5178,7 @@ pub(crate) mod tests {
     /// `truncate(offset())` — closes the window, so the next forward records nothing and releases
     /// the ring.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_checkpoint_ring_footprint_is_what_admission_prices() {
         let model = crate::decode::engine::tests::qwen35(false);
         for width in [1usize, 4, 8] {
@@ -5143,12 +5221,15 @@ pub(crate) mod tests {
             released(&mut cache, live, &format!("verify {width}"));
         }
         assert!(model.checkpoint_ring_bytes(8) > model.checkpoint_ring_bytes(4));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::the_checkpoint_ring_footprint_is_what_admission_prices");
     }
 
     /// sc-20671: stored quantized projections whose `scales`/`biases` are F16 (the mlx-community
     /// convention) must not promote the BF16 activations to F32 — the hidden states and the full-
     /// attention K/V stay in the compute dtype. The BF16-scale twin is the unchanged control.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
         use crate::primitives::quant::QuantizedLinear;
         let mut value = cfg_json();
@@ -5213,5 +5294,7 @@ pub(crate) mod tests {
             }
             assert_eq!(attention_layers, 1);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::stored_quantized_scales_keep_activations_and_kv_in_compute_dtype");
     }
 }

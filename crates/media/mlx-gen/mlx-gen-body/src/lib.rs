@@ -597,3 +597,6 @@ pub fn arm_footprint(cfg: &BodyLossesConfig, arm: BodyArm) -> AuxModelFootprint 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

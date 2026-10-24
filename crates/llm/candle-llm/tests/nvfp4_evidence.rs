@@ -32,6 +32,15 @@
 //! the text's plain encoding (no chat template, no special tokens), teacher-forced through the
 //! decoder in 512-token chunks on one cache (the chunking changes memory, not the math).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -84,7 +93,15 @@ fn tokenizer(snapshot: &Path) -> Tokenizer {
 }
 
 fn render_prompt(snapshot: &Path, user: &str) -> Vec<i32> {
-    let template = match std::fs::read_to_string(snapshot.join("chat_template.jinja")) {
+    let template = match candle_llm::__model_input_reader!(
+std::fs::read_to_string(snapshot.join("chat_template.jinja")),
+"crates/llm/candle-llm/tests/nvfp4_evidence.rs::render_prompt::std::fs::read_to_string@4822",
+Tokenizer,
+snapshot.join("chat_template.jinja"),
+|__model_input_path| std::fs::read_to_string(__model_input_path),
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected,
+when = |__value: &String| !__value.trim().is_empty()
+) {
         Ok(source) if !source.trim().is_empty() => JinjaChatTemplate::new(source),
         _ => JinjaChatTemplate::from_tokenizer_config_file(snapshot.join("tokenizer_config.json"))
             .expect("tokenizer_config.json chat template"),
@@ -140,9 +157,18 @@ fn is_hybrid(config: &Value) -> bool {
 }
 
 fn load(snapshot: &Path, device: &Device, format: Option<&ProjectionFormat>) -> Model {
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json")).unwrap())
-            .unwrap();
+    let config: Value = serde_json::from_str(
+        &candle_llm::__model_input_reader!(
+            std::fs::read_to_string(snapshot.join("config.json")),
+            "crates/llm/candle-llm/tests/nvfp4_evidence.rs::load::std::fs::read_to_string@6735",
+            Configuration,
+            snapshot.join("config.json"),
+            |__model_input_path| std::fs::read_to_string(__model_input_path),
+            origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let weights = Weights::from_dir(snapshot, device).expect("load weights");
     if !is_hybrid(&config) {
         let cfg = candle_llm::config::ModelConfig::from_json(&config).expect("llama-family config");
@@ -327,7 +353,16 @@ fn nvfp4_real_weight_evidence() {
     let device = select_device().expect("device");
     let tok = tokenizer(&snapshot);
     let prompt = render_prompt(&snapshot, FIXTURE_PROMPT);
-    let text_bytes = std::fs::read(&ppl_text_path).expect("read perplexity text");
+    let text_bytes = candle_llm::__model_input_reader!(
+std::fs::read(&ppl_text_path),
+"crates/llm/candle-llm/tests/nvfp4_evidence.rs::nvfp4_real_weight_evidence::std::fs::read@13528",
+Reference,
+&ppl_text_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_llm::model_input_proof::SourceOrigin::ExternalSelected
+)
+    .expect("read perplexity text");
     let text = String::from_utf8(text_bytes.clone()).expect("UTF-8 perplexity text");
     let all_ids: Vec<i32> = tok
         .encode(&text, false)
@@ -455,6 +490,9 @@ fn nvfp4_real_weight_evidence() {
         "provider": provider_row,
     });
     std::fs::write(&output, serde_json::to_string_pretty(&doc).unwrap()).expect("write output");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_real_weight_evidence");
 }
 
 /// AC2 on the real snapshot: run with `CANDLE_LLM_DEVICE=cpu` (the provider's explicit device

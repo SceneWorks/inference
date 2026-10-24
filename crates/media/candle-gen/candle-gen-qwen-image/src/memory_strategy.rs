@@ -528,7 +528,13 @@ pub(crate) fn snapshot_quant_tier(
         WeightsSource::File(_) => return Ok(None),
     };
     let config = root.join("transformer/config.json");
-    let packed = std::fs::read_to_string(&config)
+    let packed = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config),
+"crates/media/candle-gen/candle-gen-qwen-image/src/memory_strategy.rs::snapshot_quant_tier::std::fs::read_to_string@24129",
+ArtifactInput,
+&config,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| candle_gen::quant::PackedConfig::from_config(&value));

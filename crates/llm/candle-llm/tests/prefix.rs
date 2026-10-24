@@ -18,6 +18,15 @@
 //! logits agree within a small tolerance, the greedy first token is identical, and the [`PrefixStats`]
 //! reuse accounting (derived from token ids, not tensors — exactly reproducible) is correct.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -225,6 +234,7 @@ fn build_tiny_llama() -> CausalLm {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn prefix_reuse_is_bit_exact_cpu() {
     let model = build_tiny_llama();
     // A shared "system" prefix, then two suffixes that diverge on their first token.
@@ -232,6 +242,9 @@ fn prefix_reuse_is_bit_exact_cpu() {
     let q1: Vec<i32> = vec![10, 11, 12];
     let q2: Vec<i32> = vec![20, 21, 22];
     run_suite(&model, &sys, &q1, &q2, 12);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prefix_reuse_is_bit_exact_cpu");
 }
 
 /// Regression (sc-12455): on a `MaxTokens` finish `decode_loop` breaks *before* feeding the last
@@ -242,6 +255,7 @@ fn prefix_reuse_is_bit_exact_cpu() {
 /// *query* length, which is a no-op for an extending prompt — re-issuing the same prompt (what the
 /// other tests do) masks the bug.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn budget_finished_entry_supports_extension() {
     let model = build_tiny_llama();
     let prompt: Vec<i32> = vec![1, 2, 3, 4, 5];
@@ -284,6 +298,9 @@ fn budget_finished_entry_supports_extension() {
         s.computed_prefill_tokens,
         prompt.len() + (extended.len() - (prompt.len() + max_new - 1))
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED budget_finished_entry_supports_extension");
 }
 
 // ---- Real-weights variants (#[ignore]) -----------------------------------------------------------
@@ -436,9 +453,14 @@ fn run_real(fx: Fixture) {
 fn prefix_reuse_real_weights_llama() {
     let Some(fx) = load_from("CANDLE_LLM_TEST_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/prefix.rs:439 (prefix_reuse_real_weights_llama): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_real(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prefix_reuse_real_weights_llama");
 }
 
 #[test]
@@ -446,7 +468,12 @@ fn prefix_reuse_real_weights_llama() {
 fn prefix_reuse_real_weights_qwen3() {
     let Some(fx) = load_from("CANDLE_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set CANDLE_LLM_QWEN3_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/prefix.rs:449 (prefix_reuse_real_weights_qwen3): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     run_real(fx);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED prefix_reuse_real_weights_qwen3");
 }

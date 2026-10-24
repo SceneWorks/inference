@@ -87,6 +87,8 @@ fn full_text_encoder_matches_reference() {
         pr_emb < 6e-2,
         "video_embeddings peak_rel {pr_emb:.3e} too high"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::full_text_encoder_matches_reference");
 }
 
 #[test]
@@ -131,4 +133,6 @@ fn full_text_encoder_av_matches_reference() {
     assert!(pr_ve < 6e-2, "video_embeddings peak_rel {pr_ve:.3e}");
     assert!(pr_af < 1.5e-2, "audio_features peak_rel {pr_af:.3e}");
     assert!(pr_ae < 6e-2, "audio_embeddings peak_rel {pr_ae:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::full_text_encoder_av_matches_reference");
 }

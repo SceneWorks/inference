@@ -195,6 +195,8 @@ fn lens_e2e_matches_reference() {
         "decoded image is near-flat (std {got_std:.4} vs ref {want_std:.4}) — not a coherent render"
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::lens_e2e_matches_reference");
 }
 
 /// sc-7305 real-weight smoke: the curated sampler/scheduler knobs actually drive the real Lens DiT.
@@ -288,4 +290,6 @@ fn lens_curated_samplers_drive_the_real_dit() {
         );
     }
     eprintln!("CURATED SMOKE PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::lens_curated_samplers_drive_the_real_dit");
 }

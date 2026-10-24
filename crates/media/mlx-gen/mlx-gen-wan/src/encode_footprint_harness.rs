@@ -234,4 +234,6 @@ fn encode_footprint_harness() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encode_footprint_harness::encode_footprint_harness");
 }

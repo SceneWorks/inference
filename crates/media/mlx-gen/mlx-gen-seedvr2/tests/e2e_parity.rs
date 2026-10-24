@@ -56,6 +56,7 @@ fn report(label: &str, got: &Array, exp: &Array) -> f32 {
     cos
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_e2e_model_path_matches_reference() {
     let dir = golden_dir();
@@ -63,6 +64,7 @@ fn seedvr2_e2e_model_path_matches_reference() {
         eprintln!(
             "SKIP: e2e/dit goldens absent (run tools/dump_seedvr2_goldens.py --component e2e)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_e2e_model_path_matches_reference; see preceding skip diagnostic");
         return;
     }
     let vae_w = Weights::from_file(dir.join("vae_f32.safetensors")).expect("vae weights");
@@ -102,6 +104,8 @@ fn seedvr2_e2e_model_path_matches_reference() {
         .expect("run_model");
     let cos = report("decoded", &decoded, io.require("decoded").unwrap());
     assert!(cos > 0.999, "decoded cosine {cos} too low");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::seedvr2_e2e_model_path_matches_reference");
 }
 
 #[test]

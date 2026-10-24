@@ -291,3 +291,8 @@ pub fn synth_conditioner_lora(tmp: &tempfile::TempDir) -> PathBuf {
     write_raw_safetensors(&path, entries, &[], 0.2);
     path
 }
+
+// Test-only evidence readback; no model/device change, Array evaluation or normal library export.
+#[cfg(target_os = "macos")]
+#[path = "../../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub mod metal_guard;

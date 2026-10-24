@@ -3582,6 +3582,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_peft_transposes_and_folds_alpha() {
         let tmp = tempfile::tempdir().unwrap();
         // base [out=4, in=3]; PEFT lora_A [r=2, in=3], lora_B [out=4, r=2], alpha=4 (rank=2).
@@ -3631,9 +3632,12 @@ mod tests {
         assert!(all_close(&got, &want, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::lora_peft_transposes_and_folds_alpha");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_peft_honors_lora_adapter_metadata_alpha() {
         let tmp = tempfile::tempdir().unwrap();
         // sc-5513: a diffusers / PEFT `save_lora_adapter` file carries NO per-target `.alpha` tensor —
@@ -3709,6 +3713,8 @@ mod tests {
                 .item::<bool>(),
             "metadata alpha must differ from the alpha=rank default"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::lora_peft_honors_lora_adapter_metadata_alpha");
     }
 
     /// sc-5513 **live torch-PEFT A/B** (the epic 3641 / sc-3671 on-device harness; torch IS available
@@ -3740,6 +3746,7 @@ mod tests {
     fn peft_lora_adapter_metadata_ab() {
         let Ok(path) = std::env::var("SC5513_PEFT_ADAPTER") else {
             eprintln!("SC5513_PEFT_ADAPTER unset — skipping live torch A/B");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in peft_lora_adapter_metadata_ab; see preceding skip diagnostic");
             return;
         };
         let w = Weights::from_file(&path).unwrap();
@@ -3796,9 +3803,14 @@ mod tests {
             );
             println!("OK {leaf}: Rust apply matches peft scaling {peft_scale}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::peft_lora_adapter_metadata_ab"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_bf16_scalar_alpha_reads_without_panic() {
         let tmp = tempfile::tempdir().unwrap();
         // sc-2657: real kohya/BFL FLUX LoRAs ship `alpha` as a **bf16 scalar of shape []**. The alpha
@@ -3853,6 +3865,8 @@ mod tests {
         assert!(all_close(&got, &want, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::lora_bf16_scalar_alpha_reads_without_panic");
     }
 
     #[test]
@@ -3871,6 +3885,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_peft_folds_bare_alpha_under_a_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         // Prefixed `lora_A/B` (`transformer.lin.lora_{A,B}.weight`) + a BARE `lin.alpha` — the
@@ -3924,6 +3939,8 @@ mod tests {
                 .item::<bool>(),
             "bare alpha under a prefix was dropped or mis-folded"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::lora_peft_folds_bare_alpha_under_a_prefix");
     }
 
     #[test]
@@ -4352,6 +4369,7 @@ mod tests {
     /// The load-time connector stacks a mixed LoRA + LoKr spec list and is equivalent to calling
     /// the underlying loaders directly, in order.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn apply_specs_stacks_mixed_lora_and_lokr() {
         let tmp = tempfile::tempdir().unwrap();
         // base [out=4, in=2].
@@ -4440,9 +4458,12 @@ mod tests {
         assert!(!all_close(&got, &base, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::apply_specs_stacks_mixed_lora_and_lokr");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn apply_specs_empty_is_noop() {
         let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
         let mut host = OneLinear {
@@ -4457,6 +4478,10 @@ mod tests {
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::apply_specs_empty_is_noop"
+        );
     }
 
     #[test]
@@ -4702,6 +4727,7 @@ mod tests {
     /// provider seam must yield byte-identical adapters — a kohya file is interchangeable with its
     /// PEFT twin. This is the sc-2618 gate at the core level (no model weights needed).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn kohya_equiv_to_peft_bit_exact() {
         let tmp = tempfile::tempdir().unwrap();
         // out=4/in=3 and out=5/in=3, rank=2; alpha=4 (≠ rank → exercises the alpha/rank fold).
@@ -4800,6 +4826,10 @@ mod tests {
                 "adapter at {p} was a no-op"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::kohya_equiv_to_peft_bit_exact"
+        );
     }
 
     /// The flattened stem `blocks_0_feed_forward_w1` must resolve to `blocks.0.feed_forward.w1`
@@ -4877,6 +4907,7 @@ mod tests {
     /// A kohya adapter at `scale = 0` is a bit-exact no-op (the scale-0 invariant), and `is_kohya`
     /// detects the format.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn kohya_scale_zero_is_bit_exact_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
@@ -4911,6 +4942,8 @@ mod tests {
             .forward(&x)
             .unwrap();
         assert!(array_eq(&out, &base, false).unwrap().item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::kohya_scale_zero_is_bit_exact_noop");
     }
 
     // ---- BFL / ComfyUI fused→split LoRA (sc-2743) ----
@@ -5096,6 +5129,7 @@ mod tests {
     /// `is_bfl` detects a BFL file; an off-surface adapter-shaped key is surfaced (not dropped) while a
     /// bundled text-encoder key is ignored; and a scale-0 BFL adapter is a bit-exact no-op.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn bfl_detection_unmatched_and_scale_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let up = Array::from_slice(
@@ -5179,6 +5213,8 @@ mod tests {
             array_eq(&out, &base, false).unwrap().item::<bool>(),
             "scale-0 BFL adapter must be a bit-exact no-op"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::bfl_detection_unmatched_and_scale_zero");
     }
 
     /// sc-3642: a third-party (non-peft / lycoris) LoKr reconstructs the SAME per-module delta the
@@ -5329,6 +5365,7 @@ mod tests {
     /// parse ignores the per-module `.alpha` (and a tucker `lokr_t2`), so it would install the
     /// delta at the wrong scale while reporting success.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty() {
         let tmp = tempfile::tempdir().unwrap();
         // Keys-only LoKr (no `networkType` stamp): w1 full [2,2], w2 decomposed [2,r=2]·[2,2], and
@@ -5397,6 +5434,8 @@ mod tests {
                 .item::<bool>(),
             "the peft-path result must differ (it mis-scales) for this test to discriminate"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED adapters::loader::tests::fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty");
     }
 
     // ---- F-069 format classification --------------------------------------------------------------

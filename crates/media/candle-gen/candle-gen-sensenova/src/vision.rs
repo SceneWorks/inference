@@ -61,7 +61,7 @@ impl NeoVisionEmbedder {
     pub fn forward(&self, pixel_values: &Tensor, grid: &[(usize, usize)]) -> CResult<Tensor> {
         let embed = self.embed_dim;
         // patch_embedding (full-kernel conv == linear over the flat patch) + erf-GELU.
-        let pe = self.patch.forward(pixel_values)?.gelu_erf()?; // [N, embed]
+        let pe = __model_proof_output!(self.patch.forward(pixel_values))?.gelu_erf()?; // [N, embed]
 
         // Interleaved 2D RoPE (f32). Split the embedding in half: first half rotates by abs-x, second
         // by abs-y. The narrowed halves are made contiguous so the per-pair reshape inside the RoPE
@@ -88,8 +88,8 @@ impl NeoVisionEmbedder {
                 .permute((2, 0, 1))? // [embed, h, w]
                 .unsqueeze(0)? // [1, embed, h, w]
                 .contiguous()?;
-            let merged = block.conv2d(&self.dense_w, 0, f, 1, 1)?; // [1, llm, h/f, w/f]
-            let merged = merged.broadcast_add(&dense_b)?;
+            let merged = __model_proof_output!(block.conv2d(&self.dense_w, 0, f, 1, 1))?; // [1, llm, h/f, w/f]
+            let merged = __model_proof_output!(merged.broadcast_add(&dense_b))?;
             let (_, llm, hf, wf) = merged.dims4()?;
             // [1, llm, h/f, w/f] -> [(h/f)·(w/f), llm], row-major.
             let tokens = merged

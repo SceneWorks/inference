@@ -34,6 +34,7 @@ serde = { workspace = true }
 image = { workspace = true, optional = true }
 
 [features]
+model-inference-proof = ["mlx-gen-perceptual?/model-inference-proof", "mlx-gen/model-inference-proof", "mlx-gen-pid/model-inference-proof"]
 # The LoRA/LoKr trainer (`training`) and its training-only deps (perceptual aux losses, dataset
 # image decode). Default-on, so every existing consumer is unchanged; an inference-only graph (the
 # iOS bundle) depends with `default-features = false` and compiles no trainer (sc-26265).

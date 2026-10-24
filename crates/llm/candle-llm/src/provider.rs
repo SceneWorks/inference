@@ -4049,7 +4049,14 @@ fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, b
 ///
 /// BOS/EOS still come from `tokenizer_config.json`; the sidecar carries only the template body.
 fn sidecar_chat_template(dir: &Path) -> Option<JinjaChatTemplate> {
-    let source = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+    let source = crate::__model_input_reader!(
+std::fs::read_to_string(dir.join("chat_template.jinja")),
+"crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409",
+ArtifactInput,
+dir.join("chat_template.jinja"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+    .ok()?;
     if source.trim().is_empty() {
         return None;
     }
@@ -5583,7 +5590,14 @@ pub fn eos_token_ids(dir: &Path) -> Vec<i32> {
 
 /// Read and parse a JSON file in `dir`, or `None` if absent / malformed.
 fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(dir.join(name)),
+        "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613",
+        ArtifactInput,
+        dir.join(name),
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )
+    .ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -7874,6 +7888,7 @@ mod tests {
     /// start — a size-check panic at load (debug) or every expert quantized from the first
     /// expert's rows (release) — until `QuantizedLinear::quantize` compacted its source.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_qwen35_moe_snapshot_loads_q8_and_decodes() {
         use core_llm::{Message, Quantize, Sampling, TextLlm, TextLlmRequest};
         let dir = q8_capable_qwen35_snapshot(true);
@@ -7889,6 +7904,9 @@ mod tests {
         };
         let out = provider.generate(&request, &mut |_| {}).expect("decode");
         assert_eq!(out.usage.generated_tokens, 4);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen35_moe_snapshot_loads_q8_and_decodes");
     }
 
     /// sc-24440: a CUDA load prices the indexed MoE dispatch's expert-address tables — every
@@ -8124,6 +8142,7 @@ mod tests {
     /// by rows at load; a Phi-3 tier prepared before then (dense-rounded weights under a bare
     /// block) still loads quantized.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_phi3_tier_stores_its_fused_projections_as_blocks() {
         use core_llm::Quantize;
         let src = phi3_snapshot();
@@ -8152,6 +8171,9 @@ mod tests {
         );
         let at_load = super::LlamaProvider::load(&spec_at(src.path(), Some(Quantize::Q8))).unwrap();
         assert_eq!(provider_logits(&loaded), provider_logits(&at_load));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_phi3_tier_stores_its_fused_projections_as_blocks");
     }
 
     /// sc-19375: a qwen3_5 tier stores every projection its loader quantizes — the Gated
@@ -8163,6 +8185,7 @@ mod tests {
     /// snapshots with an MTP head (its predictor layer a sparse-MoE block, sc-24438) prepare and
     /// price that head too, in both expert layouts.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_qwen35_tier_stores_its_projections_and_experts_as_blocks() {
         use core_llm::Quantize;
         for (moe, mtp, fused) in [
@@ -8222,6 +8245,9 @@ mod tests {
                 "moe={moe}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen35_tier_stores_its_projections_and_experts_as_blocks");
     }
 
     /// A tiny `qwen3` GGUF (2 layers, hidden 32, vocab 40): Q8_0 matrices, f32 norms, and a
@@ -8446,6 +8472,7 @@ mod tests {
     /// and the geometry for that request charges exactly the ring's bytes — the old start-of-step
     /// checkpoint term is gone (sc-24131).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn qwen35_admission_prices_every_recurrent_state_the_cache_holds() {
         use crate::decode::{StepModel, StepRequest};
         use crate::models::qwen35::{REFERENCE_MAX_CHECKPOINTS, STEP_MAX_CHECKPOINTS};
@@ -8555,6 +8582,9 @@ mod tests {
                 .recurrent_bytes,
             step.recurrent_bytes() as u64
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen35_admission_prices_every_recurrent_state_the_cache_holds");
     }
 
     /// E6 (sc-24134, sc-24140): with the CUDA-graph runner switched on, every request the runner
@@ -8803,6 +8833,7 @@ mod tests {
     /// `off` and prompt lookup at the same depth are admitted. The budget override is process
     /// state, so the check runs in a child process of its own.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_draft_model_request_is_refused_without_room_for_the_draft() {
         use super::DecodeRoute;
         use core_llm::{Sampling, Speculative, SpeculativePlan, SpeculativeProposer, TextLlm};
@@ -8811,12 +8842,21 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let name = std::thread::current().name().unwrap().to_owned();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &name, "--nocapture"])
+                .args(["--exact", &name, "--nocapture", "--include-ignored"])
                 .env(CHILD, "1")
                 .env_remove(core_llm::AVAILABLE_MEMORY_OVERRIDE)
+                .envs(
+                    std::iter::once((
+                        "MODEL_INFERENCE_CASE_FQN",
+                        "provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft#child=0",
+                    ))
+                    .filter(|_| cfg!(feature = "model-inference-proof")),
+                )
                 .status()
                 .unwrap();
             assert!(status.success());
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_PARENT_COMPLETED provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft");
             return;
         }
         let root = tempfile::tempdir().unwrap();
@@ -8885,6 +8925,9 @@ mod tests {
             ProposerKind::DraftModel,
             "with room it runs the draft"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_draft_model_request_is_refused_without_room_for_the_draft#child=0");
     }
 
     /// sc-24446: a load whose steps can ask for hidden rows — a Qwen3.5 snapshot with a native
@@ -9111,6 +9154,7 @@ mod tests {
     /// dedicated MTP embeddings) — loads the target plain with a named `mtp:` load fallback and
     /// MTP unadvertised, and decodes; a PARTIAL `mtp.*` set is still a load error (integrity).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback() {
         use core_llm::{Message, Sampling, TextLlm, TextLlmRequest};
         let variant = |edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>),
@@ -9188,6 +9232,9 @@ mod tests {
             .err()
             .expect("a partial `mtp.*` set fails the load");
         assert!(error.to_string().contains("mtp.fc.weight"), "{error}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback");
     }
 
     /// A tokenizer.json whose vocab is `t0..t{vocab-1}` (whitespace WordLevel), so every id of
@@ -9254,6 +9301,7 @@ mod tests {
     /// the decode report and the load report a product renders — the same record the evidence
     /// harness reads, never a guess.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_load_settles_the_graph_policy_and_the_contract_carries_the_reports() {
         use core_llm::{LoadSpec, Message, ProposerKind, Sampling, TextLlm, TextLlmRequest};
 
@@ -9317,9 +9365,13 @@ mod tests {
         assert_eq!(load.projections.len(), 1, "{:?}", load.projections);
         assert_eq!(load.projections[0].kind, "dense");
         assert!(load.projections[0].count > 0 && load.projections[0].resident_bytes > 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::the_load_settles_the_graph_policy_and_the_contract_carries_the_reports");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain() {
         // AC3 (sc-24130), revised by sc-24433 AC2, weights-free: the synthetic Qwen3.5 decoder
         // written as a snapshot with no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The
@@ -9436,6 +9488,9 @@ mod tests {
         if provider.model.device().is_cpu() {
             assert_eq!(reference.text, out.text, "the same tokens on both loops");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain");
     }
 
     /// A tiny Qwen3 (`qwen3`: the llama-family `CausalLm` with per-head q/k RMSNorm) written as a
@@ -9821,6 +9876,7 @@ mod tests {
     /// every other depth up to the advertised max, and `auto` — runs the engine with prompt
     /// lookup (the report says so) and emits the `off` greedy stream token for token.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture() {
         let (_dir, mut provider) = synthetic_causal_provider();
         let rows = core_llm_testkit::check_speculative_greedy_parity(
@@ -9862,12 +9918,16 @@ mod tests {
             assert_eq!(reference.len(), 24, "{}", prompt.id);
             assert_eq!(reference, engine, "{}: engine off vs reference", prompt.id);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture");
     }
 
     /// sc-24433 AC1 (Qwen35) and AC2: on the qwen3_5 hybrid without a head the same table holds
     /// with `auto` resolving to prompt lookup; with an MTP head `auto` resolves to MTP, and MTP
     /// and prompt lookup are both greedy-exact against `off`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures() {
         use core_llm::{Speculative, SpeculativeProposer};
         use core_llm_testkit::ParityCase;
@@ -9917,6 +9977,9 @@ mod tests {
             .recommended_depth;
         assert!(auto.iter().all(|r| r.report.proposer == ProposerKind::Mtp
             && r.report.draft_tokens == Some(recommended)));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prompt_lookup_and_auto_are_greedy_exact_on_the_qwen35_fixtures");
     }
 
     /// sc-24438 AC1: the advertised max depth is finite and backend-true — the widest verify the
@@ -9925,6 +9988,7 @@ mod tests {
     /// `DecodeReport::fallbacks`, emitting exactly `off`'s stream: prompt lookup on both
     /// families, and MTP (the new option and the legacy field) on the Qwen3.8 head.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp() {
         use core_llm::{MtpMode, Sampling, Speculative, SpeculativeProposer, TextLlm};
         assert_eq!(super::SPECULATIVE_MAX_DEPTH, 7);
@@ -10011,6 +10075,9 @@ mod tests {
             "legacy",
         );
         assert_eq!(fallbacks, clamp("mtp", 40, super::MTP_MAX_DEPTH));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp");
     }
 
     /// sc-24446 (E5): `auto` reaches the engine with its acceptance monitor and an explicit
@@ -10019,6 +10086,7 @@ mod tests {
     /// demoted at the end of its first window and the report says where, while the same proposer
     /// asked for explicitly runs to the end. Both stream exactly `off`'s tokens.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn auto_is_monitored_and_an_explicit_proposer_is_not() {
         use core_llm::{Sampling, Speculative, SpeculativeProposer};
         let dir = q8_capable_qwen35_snapshot(false);
@@ -10055,6 +10123,9 @@ mod tests {
             "{auto:?}"
         );
         assert!(auto.proposed_tokens < asked.proposed_tokens);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::auto_is_monitored_and_an_explicit_proposer_is_not");
     }
 
     /// sc-24438 AC2: a qwen3_5 MoE snapshot carrying an MTP head — its predictor layer a
@@ -10066,6 +10137,7 @@ mod tests {
     /// Under Q8 the head is priced: the estimate equals the copy the load builds, head included,
     /// and exceeds the headless MoE snapshot's.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
         use core_llm::{MtpMode, Quantize, Sampling, Speculative, SpeculativeProposer, TextLlm};
         let estimate = |dir: &tempfile::TempDir| {
@@ -10144,6 +10216,9 @@ mod tests {
                 "{label}: the head is priced"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_moe_snapshot_with_an_mtp_head_runs_mtp");
     }
 
     /// sc-24433 (scope e): on the qwen3_5 hybrid a multimodal request runs prompt lookup over the
@@ -10153,6 +10228,7 @@ mod tests {
     /// does when the model emits it, so lookup over the spliced history is sound (at worst a
     /// rejected draft).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request() {
         use core_llm::{Speculative, SpeculativeProposer};
         use core_llm_testkit::ParityCase;
@@ -10192,6 +10268,9 @@ mod tests {
             ),
         );
         assert!(out.usage.prompt_tokens > 64, "{:?}", out.usage);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request");
     }
 
     /// sc-24446 (epic sc-24432 E1, E8): a Qwen3-VL (generic-causal) multimodal request decodes
@@ -10202,6 +10281,7 @@ mod tests {
     /// resolves to it — runs on the engine over the image-expanded history and emits exactly the
     /// reference stream.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop() {
         use core_llm::{Speculative, SpeculativeProposer};
         use core_llm_testkit::ParityCase;
@@ -10260,12 +10340,16 @@ mod tests {
         assert_eq!(rows.len(), 2 * 4);
         assert!(rows.iter().all(|r| r.report.path == "prompt_lookup"));
         assert_rows_drafted(&rows);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop");
     }
 
     /// sc-24446 (epic sc-24432 E2, E3): the report of a Qwen3-VL multimodal request names the
     /// engine path and the proposer that ran, and no fallback — `auto` runs prompt lookup on the
     /// engine, `off` the engine with no proposer — exactly as the same request text-only does.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback() {
         use core_llm::{Sampling, Speculative};
 
@@ -10292,6 +10376,9 @@ mod tests {
             assert_eq!(off.proposer, ProposerKind::None, "{label}");
             assert!(off.fallbacks.is_empty(), "{label}: {:?}", off.fallbacks);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback");
     }
 
     /// The report the output carries is the record's, with the provider's fallback reasons passed
@@ -10322,6 +10409,7 @@ mod tests {
     /// on the Qwen3 fixture under `off`, prompt lookup and `auto`, and writes one baseline-format
     /// JSON row per (prompt, option) with the report's proposer and accepted length.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model() {
         use core_llm::{Speculative, SpeculativeProposer};
         let (_dir, provider) = synthetic_causal_provider();
@@ -10405,6 +10493,9 @@ mod tests {
             assert_eq!(row["generated_tokens"], 12);
         }
         assert_eq!(rows[1]["proposer"], "prompt_lookup");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model");
     }
 
     /// sc-24134, sc-24139, sc-24140: with the CUDA-graph switch on — the one the provider was
@@ -10414,6 +10505,7 @@ mod tests {
     /// through the runner, and its record says why rather than a bare `graph: none`. With the
     /// switch off neither record shows the runner.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run() {
         use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest};
 
@@ -10477,6 +10569,9 @@ mod tests {
             describe(&mut off),
             "graph: none replayed=0 eager=0 captured=0"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run");
     }
 
     /// sc-24140 (E7): a static KV cache's capacity refusal reaches the contract as the typed
@@ -10528,6 +10623,7 @@ mod tests {
     /// on CUDA the device sampler (zero logits rows copied to the host), on CPU the host reference
     /// and the record says why; every draw is recorded either way.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one() {
         use core_llm::{Message, Sampling, TextLlm, TextLlmRequest};
 
@@ -10568,6 +10664,9 @@ mod tests {
             assert_eq!(record.sampler.label(), "host:device_unavailable");
             assert_eq!(record.sampler.host_draws, draws);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one");
     }
 
     // ---- Prism/Bonsai companion MTP head (epic sc-24432, story sc-24444), Candle twin. ----
@@ -10717,6 +10816,7 @@ mod tests {
     /// `{proposer: mtp}` identical to `off`; without the head neither advertises MTP and the
     /// Prism target decodes the same greedy tokens.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_companion_head_decodes_mtp_with_the_off_tokens() {
         use core_llm::Speculative;
         let prism_head = companion_head(&crate::models::qwen35::tests::prism_text_config());
@@ -10738,6 +10838,9 @@ mod tests {
         let head = companion_head(&dense_text());
         let dense = super::LlamaProvider::load(&with_head(&target, head.path())).unwrap();
         assert_head_decodes_the_off_tokens(&dense, "dense");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_companion_head_decodes_mtp_with_the_off_tokens");
     }
 
     /// Story sc-24444 AC2 / E2 on Candle: through the real load, a head whose geometry does not
@@ -10745,6 +10848,7 @@ mod tests {
     /// no MTP and decodes; a head named for a non-Qwen3.5 target or for a target with its own
     /// predictor is a named fallback too.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure() {
         use core_llm::{Speculative, SpeculativeProposer, TextLlm};
         let target = synthetic_qwen35_snapshot_without_mtp();
@@ -10815,6 +10919,9 @@ mod tests {
             "{fallbacks:?}"
         );
         assert!(mtp_advertised(&native).is_some(), "its own head still runs");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure");
     }
 
     /// Story sc-24444 E7 on Candle: the head's priced bytes are its payload plus what the build
@@ -10947,6 +11054,7 @@ mod tests {
     /// request that leaves the option unset runs whatever the provider's default is — here set to
     /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn an_unset_speculative_option_runs_the_providers_default() {
         let root = tempfile::tempdir().unwrap();
         let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
@@ -10971,6 +11079,9 @@ mod tests {
             prompt,
             8,
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::an_unset_speculative_option_runs_the_providers_default");
     }
 
     /// The cross-turn prefix cache through the provider (sc-24437).
@@ -11075,6 +11186,7 @@ mod tests {
         /// AC1 on the softmax family through the provider: turn 2 restores the shared run of turn
         /// 1's cached `prompt + reply` (N), and decodes exactly what a cold run decodes.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run() {
             let provider = causal_provider();
             let user = Message::user("t3 t9 t4 t11 t3 t9");
@@ -11120,12 +11232,16 @@ mod tests {
             assert_eq!(ids2, run(&causal_provider(), &turn2).1);
             assert_eq!(ids2, reference(causal_provider(), &turn2));
             assert!(provider.prefix_cache_resident_bytes() <= provider.prefix_cache_budget());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run");
         }
 
         /// AC2 through the provider: the hybrid snapshots at the end of turn 1's conversation;
         /// turn 2 and turn 3 restore the recurrent state there (the ring's oldest position) and
         /// match a cold run — plain and with the MTP head resuming from the stored boundary.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run() {
             for speculative in [
                 Speculative::Off,
@@ -11172,10 +11288,14 @@ mod tests {
                     );
                 }
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run");
         }
 
         /// The reference loop (the parity oracle) never reads or feeds the cache, and says so.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn the_reference_loop_prefills_cold_and_names_why() {
             let mut provider = causal_provider();
             provider.set_decode_path(DecodePath::Reference).unwrap();
@@ -11189,6 +11309,9 @@ mod tests {
                 assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
             }
             assert!(provider.prefix_cache().is_empty());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::the_reference_loop_prefills_cold_and_names_why");
         }
 
         /// Sets the operational memory override for one scope (tests run on one thread,
@@ -11278,6 +11401,7 @@ mod tests {
 
         /// A paged KV cache keeps no snapshot and the report says why — not as a failed copy.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn a_paged_cache_names_why_it_keeps_no_snapshot() {
             let model = tiny_causal_from(tiny_llama_parts().0, tiny_llama_parts().1);
             let mut cache = model.new_paged_step_cache(4);
@@ -11296,6 +11420,9 @@ mod tests {
                 prefix_store_reason(&crate::Error::Msg("copy".into())),
                 PREFIX_COPY_FAILED
             );
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_paged_cache_names_why_it_keeps_no_snapshot");
         }
 
         fn required_bytes(provider: &LlamaProvider, req: &TextLlmRequest) -> u64 {
@@ -11315,6 +11442,7 @@ mod tests {
         /// holds the request and the copy; held entries are evicted to make room, and one byte
         /// short of that the request still runs — without keeping anything.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn a_request_keeps_its_snapshot_only_when_admission_holds_it() {
             let req = chat(vec![Message::user("t11 t12 t13 t14")], Speculative::Off);
             let probe = causal_provider();
@@ -11373,6 +11501,9 @@ mod tests {
                     "no room left for its own copy"
                 );
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it");
         }
     }
 }

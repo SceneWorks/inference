@@ -80,6 +80,7 @@ fn argmax(v: &[f32]) -> i32 {
     best as i32
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn ar_runtime_matches_reference() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -179,12 +180,15 @@ fn ar_runtime_matches_reference() {
         gen, want_tokens,
         "generate() must reproduce the greedy stream"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED runtime_parity::ar_runtime_matches_reference");
 }
 
 /// The `_generate_think` rollout: the greedy think loop emits the stream up to and including the
 /// `</think>` token, forwards every emitted token into the cache, then appends `\n\n<img>`. Built on
 /// the already-numerically-validated greedy decode, so this asserts the stop/append control flow and
 /// the temporal/cache bookkeeping against the known greedy stream.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generate_think_stops_and_appends() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -266,4 +270,6 @@ fn generate_think_stops_and_appends() {
     );
     assert_eq!(roll.t_idx, (prefix_len - 1) + append_ids.len() as i32);
     assert_eq!(cache.offset(), prefix_len + append_ids.len() as i32);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED runtime_parity::generate_think_stops_and_appends");
 }

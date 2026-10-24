@@ -799,7 +799,7 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     assert_eq!(permit.basis(), AdmissionBasis::CapturePermit);
     assert_eq!(
         permit.evidence_key(),
-        &evidence_key(&registry, &candidate, DEVICE).unwrap()
+        &capture_evidence_key(&registry, &candidate, DEVICE).unwrap()
     );
     // A permit still refuses what admission would refuse for the request itself.
     let mut wrong = candidate.clone();

@@ -188,8 +188,10 @@ fn dit_inputs(cfg: &DitConfig, edge: i32, ctx: i32) -> (Array, Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_resident_blocks_are_guarded_quanta() {
     if !in_cpu_child("dit_resident_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_resident_blocks_are_guarded_quanta");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -261,12 +263,17 @@ fn dit_resident_blocks_are_guarded_quanta() {
         refused_events.is_empty(),
         "nothing may run past a refusal: {refused_events:?}"
     );
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_resident_blocks_are_guarded_quanta"
+    );
 }
 
 /// The stage-4 golden hook shares `run_blocks`, so its partial stack is guarded per block too.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_partial_stack_hook_is_guarded_per_block() {
     if !in_cpu_child("dit_partial_stack_hook_is_guarded_per_block") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_partial_stack_hook_is_guarded_per_block");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -278,6 +285,7 @@ fn dit_partial_stack_hook_is_guarded_per_block() {
     assert_eq!(f32_bytes(&guarded.unwrap()), host);
     assert_checked_before_synchronized(&events);
     assert_eq!(checked(&events, DIT_BLOCK_QUANTUM), 2);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_partial_stack_hook_is_guarded_per_block");
 }
 
 /// Every tensor `CosmosDiT::from_weights(.., "net", cfg)` reads, written to a temp safetensors so
@@ -393,8 +401,10 @@ fn write_dit_checkpoint_as(
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dit_windowed_blocks_are_guarded_quanta() {
     if !in_cpu_child("dit_windowed_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_windowed_blocks_are_guarded_quanta");
         return;
     }
     let cfg = dit_cfg(3, 2.0);
@@ -463,6 +473,9 @@ fn dit_windowed_blocks_are_guarded_quanta() {
     assert!(refused.is_err());
     assert_eq!(take_refusal().unwrap().label, DIT_EMBED_QUANTUM);
     assert!(refused_events.is_empty(), "{refused_events:?}");
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_windowed_blocks_are_guarded_quanta"
+    );
 }
 
 // ---- Conditioner ---------------------------------------------------------------------------------
@@ -497,8 +510,10 @@ fn conditioner_inputs(cfg: &ConditionerConfig, ss: i32, st: i32) -> (Array, Arra
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn conditioner_blocks_are_guarded_quanta() {
     if !in_cpu_child("conditioner_blocks_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::conditioner_blocks_are_guarded_quanta");
         return;
     }
     let cfg = conditioner_cfg(4.0);
@@ -533,6 +548,9 @@ fn conditioner_blocks_are_guarded_quanta() {
     // after the refused block did.
     let label = assert_refuses_at_first_growth(&events, run);
     assert_eq!(label, CONDITIONER_BLOCK_QUANTUM);
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::conditioner_blocks_are_guarded_quanta"
+    );
 }
 
 // ---- Qwen3 text encoder --------------------------------------------------------------------------
@@ -611,8 +629,10 @@ fn qwen3_inputs(len: i32) -> (Array, Array) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_encoder_layers_are_guarded_quanta() {
     if !in_cpu_child("text_encoder_layers_are_guarded_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::text_encoder_layers_are_guarded_quanta");
         return;
     }
     let cfg = tiny_qwen3_cfg(3);
@@ -643,13 +663,18 @@ fn text_encoder_layers_are_guarded_quanta() {
     assert!(refused.is_err());
     assert_eq!(take_refusal().unwrap().label, TE_EMBED_QUANTUM);
     assert!(refused_events.is_empty(), "{refused_events:?}");
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_encoder_layers_are_guarded_quanta"
+    );
 }
 
 // ---- Scratch geometry ----------------------------------------------------------------------------
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
     if !in_cpu_child("scratch_derives_from_loaded_tensors_and_grows_with_geometry") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::scratch_derives_from_loaded_tensors_and_grows_with_geometry");
         return;
     }
     let scratch_of = |events: &[QuantumEvent], label: &str| {
@@ -860,6 +885,7 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
             &|backend| te.layer(0, 1, 12, 4, backend).1,
         );
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::scratch_derives_from_loaded_tensors_and_grows_with_geometry");
 }
 
 // ---- Pre-load floors -----------------------------------------------------------------------------
@@ -1144,9 +1170,10 @@ fn sdpa_scores_follow_the_metal_kernel_support() {
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dit_formulas_track_the_measured_peak() {
     if !in_cpu_child("dit_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak");
         return;
     }
     let dtype = Dtype::Bfloat16;
@@ -1307,6 +1334,9 @@ fn dit_formulas_track_the_measured_peak() {
             "\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak"
         );
     }
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::dit_formulas_track_the_measured_peak"
+    );
 }
 
 /// Every tensor `AnimaTextConditioner::from_weights(.., "net.llm_adapter", cfg)` reads, at `dtype`.
@@ -1385,9 +1415,10 @@ fn conditioner_weights(cfg: &ConditionerConfig, dtype: Dtype) -> Weights {
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn conditioner_formulas_track_the_measured_peak() {
     if !in_cpu_child("conditioner_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
         return;
     }
     // Production feeds the conditioner the Qwen3 tower's f32 states and runs it at their dtype.
@@ -1465,12 +1496,14 @@ fn conditioner_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::conditioner_formulas_track_the_measured_peak");
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn text_encoder_formulas_track_the_measured_peak() {
     if !in_cpu_child("text_encoder_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
         return;
     }
     // Qwen3-0.6B's proportions in miniature: q (heads x head_dim) twice the hidden width, GQA 2:1,
@@ -1555,6 +1588,7 @@ fn text_encoder_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_encoder_formulas_track_the_measured_peak");
 }
 
 // ---- Phase-boundary materializations -------------------------------------------------------------
@@ -1896,8 +1930,10 @@ fn write_tiny_snapshot(
 /// optimized selection (the cheapest rung-4 selection) and for rung 0 Resident. Text-to-image is
 /// Anima's only route (no encode mode exists).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn ios_pricing_equals_the_checked_quanta_on_the_production_path() {
     if !in_cpu_child("ios_pricing_equals_the_checked_quanta_on_the_production_path") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_tests::ios_pricing_equals_the_checked_quanta_on_the_production_path");
         return;
     }
     use crate::ios_pricing::{
@@ -2017,6 +2053,7 @@ fn ios_pricing_equals_the_checked_quanta_on_the_production_path() {
         println!("{strategy:?}: {pricing:?}");
     }
     crate::loader::FIXTURE_CONFIGS.with(|c| c.set(None));
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::ios_pricing_equals_the_checked_quanta_on_the_production_path");
 }
 
 /// Load floors are single `Checked` events (`before_load*` checks without a synchronized graph);

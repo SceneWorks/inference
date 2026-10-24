@@ -11,6 +11,8 @@
 // --- shared modules (hand-maintained; preserved by regen) ---
 // The SC-20684 receipt contains a deeply nested JSON observation.
 #![recursion_limit = "256"]
+#[path = "common/model_inference_device.rs"]
+pub mod model_inference_device;
 // --- generated modules (do not edit) ---
 
 #[path = "ar_generate.rs"]

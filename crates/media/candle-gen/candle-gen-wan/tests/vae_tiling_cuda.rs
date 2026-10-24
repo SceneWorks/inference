@@ -76,6 +76,8 @@ fn agreement(a: &Tensor, b: &Tensor) -> (f32, f32) {
 fn wan_z48_spatial_tiling_decode() {
     let Some((vae, dev)) = load_vae() else {
         eprintln!("WAN_SNAPSHOT unset — skipping");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-wan/tests/vae_tiling_cuda.rs:79 (wan_z48_spatial_tiling_decode): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
 
@@ -127,4 +129,7 @@ fn wan_z48_spatial_tiling_decode() {
         maxd_small > 0.0,
         "tiny-budget decode_budgeted should have tiled (differ from single-pass)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiling_cuda::wan_z48_spatial_tiling_decode");
 }

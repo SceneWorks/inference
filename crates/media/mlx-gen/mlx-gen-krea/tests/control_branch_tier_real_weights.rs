@@ -232,4 +232,6 @@ fn branch_tier_is_budget_independent_and_within_its_estimate() {
         "the q8-branch estimate must not UNDER-predict the real resident peak (measured \
          {peak_free:.2} GiB > predicted {predicted:.2} GiB) — an under-shoot is an OOM"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_branch_tier_real_weights::branch_tier_is_budget_independent_and_within_its_estimate");
 }

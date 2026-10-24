@@ -289,6 +289,7 @@ fn t2v_5b_offload_drops_the_footprint_and_preserves_output() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_TI2V_5B_MODEL_DIR to a converted TI2V-5B snapshot tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in t2v_5b_offload_drops_the_footprint_and_preserves_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -298,6 +299,8 @@ fn t2v_5b_offload_drops_the_footprint_and_preserves_output() {
     assert_offload_wins("t2v", &res, &seq);
     // sc-12831: on a quantized tier the packed UMT5 TE must have dropped the active peak below ~8 GiB.
     assert_quantized_te_active_peak_floor("t2v", &model_dir, &[&res, &seq]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ti2v_5b_offload_footprint::t2v_5b_offload_drops_the_footprint_and_preserves_output");
 }
 
 #[test]
@@ -307,6 +310,7 @@ fn ti2v_5b_offload_drops_the_footprint_and_preserves_output() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_TI2V_5B_MODEL_DIR to a converted TI2V-5B snapshot tier dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in ti2v_5b_offload_drops_the_footprint_and_preserves_output; see preceding skip diagnostic");
             return;
         }
     };
@@ -323,4 +327,6 @@ fn ti2v_5b_offload_drops_the_footprint_and_preserves_output() {
     assert_offload_wins("ti2v", &res, &seq);
     // sc-12831: on a quantized tier the packed UMT5 TE must have dropped the active peak below ~8 GiB.
     assert_quantized_te_active_peak_floor("ti2v", &model_dir, &[&res, &seq]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ti2v_5b_offload_footprint::ti2v_5b_offload_drops_the_footprint_and_preserves_output");
 }

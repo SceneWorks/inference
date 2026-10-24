@@ -71,6 +71,8 @@ fn qwenimage_loads_and_runs() {
         "sampler.sample ok: shape {:?} max|·|={om:.3e} (clamped [-1,1])",
         out.shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::qwenimage_loads_and_runs");
 }
 
 fn gemma_path() -> String {
@@ -112,4 +114,6 @@ fn gemma2_2b_loads_and_runs() {
     let m = max_abs(&h);
     assert!(m.is_finite(), "gemma output non-finite");
     eprintln!("gemma2.forward ok: shape {:?} max|·|={m:.3e}", h.shape());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::gemma2_2b_loads_and_runs");
 }

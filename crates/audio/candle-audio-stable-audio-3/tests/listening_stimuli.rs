@@ -58,6 +58,16 @@
 //! `scripts/audio/sa3_listening_blind.py assign` to produce the blinded playlist and the private
 //! key; the checkpoint identity of a take never reaches a listener.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -669,6 +679,9 @@ fn generate_the_level_matched_listening_stimulus_set() {
     let manifest_path = out_dir.join("manifest.json");
     std::fs::write(&manifest_path, manifest).expect("write the stimulus manifest");
     eprintln!("stimulus manifest: {}", manifest_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generate_the_level_matched_listening_stimulus_set");
 }
 
 /// Re-read the six pinned `model_config.json` files and check [`DEMO_COND_POOL`] against them.

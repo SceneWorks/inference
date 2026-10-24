@@ -84,4 +84,9 @@ fn mask_conditioning_decode_matches_oracle() {
         (out.object_score - score_want).abs() < 1e-4,
         "object_score mismatch"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED maskcond_parity::mask_conditioning_decode_matches_oracle"
+    );
 }

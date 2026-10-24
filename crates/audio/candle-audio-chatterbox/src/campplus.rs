@@ -260,7 +260,7 @@ impl BnRelu {
         Ok(Self { bn })
     }
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.bn.forward_t(x, false)?.relu()
+        __model_proof_output!(self.bn.forward_t(x, false))?.relu()
     }
 }
 
@@ -334,10 +334,13 @@ impl BasicResBlock {
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // Main path: conv1 strides freq, conv2 does not.
-        let out = subsample_freq(&self.conv1.forward(x)?, self.freq_stride)?;
-        let out = self.bn1.forward_t(&out, false)?.relu()?;
-        let out = self.conv2.forward(&out)?;
-        let out = self.bn2.forward_t(&out, false)?;
+        let out = subsample_freq(
+            &__model_proof_output!(self.conv1.forward(x))?,
+            self.freq_stride,
+        )?;
+        let out = __model_proof_output!(self.bn1.forward_t(&out, false))?.relu()?;
+        let out = __model_proof_output!(self.conv2.forward(&out))?;
+        let out = __model_proof_output!(self.bn2.forward_t(&out, false))?;
         // Residual (the shortcut also strides freq).
         let sc = match &self.shortcut {
             Some((conv, bn)) => {
@@ -410,10 +413,10 @@ impl Fcm {
     /// `[B, F, T]` → `[B, 320, T]` (frequency downsampled ×8, time preserved).
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let x = x.unsqueeze(1)?; // [B, 1, F, T]
-        let mut out = self
+        let mut out = __model_proof_output!(self
             .bn1
-            .forward_t(&self.conv1.forward(&x)?, false)?
-            .relu()?;
+            .forward_t(&__model_proof_output!(self.conv1.forward(&x))?, false))?
+        .relu()?;
         for b in &self.layer1 {
             out = b.forward(&out)?;
         }
@@ -421,8 +424,8 @@ impl Fcm {
             out = b.forward(&out)?;
         }
         // conv2 strides freq ×2.
-        let out = subsample_freq(&self.conv2.forward(&out)?, 2)?;
-        let out = self.bn2.forward_t(&out, false)?.relu()?;
+        let out = subsample_freq(&__model_proof_output!(self.conv2.forward(&out))?, 2)?;
+        let out = __model_proof_output!(self.bn2.forward_t(&out, false))?.relu()?;
         let (b, c, f, t) = out.dims4()?;
         out.reshape((b, c * f, t))
     }
@@ -442,7 +445,8 @@ impl Tdnn {
         Ok(Self { linear, nonlinear })
     }
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.nonlinear.forward(&self.linear.forward(x)?)
+        self.nonlinear
+            .forward(&__model_proof_output!(self.linear.forward(x))?)
     }
 }
 
@@ -477,11 +481,11 @@ impl CamLayer {
     /// `x [B, bn_ch, T]` → `[B, out_ch, T]`. `seg` is the shared segment-pooling operator for the
     /// current time length.
     fn forward(&self, x: &Tensor, seg: &SegPool) -> CandleResult<Tensor> {
-        let y = self.linear_local.forward(x)?; // [B, out, T]
+        let y = __model_proof_output!(self.linear_local.forward(x))?; // [B, out, T]
         let global = x.mean_keepdim(D::Minus1)?; // [B, bn_ch, 1]
         let context = seg.forward(x)?.broadcast_add(&global)?; // [B, bn_ch, T]
-        let context = self.linear1.forward(&context)?.relu()?; // [B, bn_ch/2, T]
-        let m = sigmoid(&self.linear2.forward(&context)?)?; // [B, out, T]
+        let context = __model_proof_output!(self.linear1.forward(&context))?.relu()?; // [B, bn_ch/2, T]
+        let m = sigmoid(&__model_proof_output!(self.linear2.forward(&context))?)?; // [B, out, T]
         y.mul(&m)
     }
 }
@@ -510,7 +514,7 @@ impl DenseTdnnLayer {
     }
     fn forward(&self, x: &Tensor, seg: &SegPool) -> CandleResult<Tensor> {
         let h = self.nonlinear1.forward(x)?;
-        let h = self.linear1.forward(&h)?;
+        let h = __model_proof_output!(self.linear1.forward(&h))?;
         let h = self.nonlinear2.forward(&h)?;
         self.cam.forward(&h, seg)
     }
@@ -562,7 +566,7 @@ impl TransitLayer {
         Ok(Self { nonlinear, linear })
     }
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.linear.forward(&self.nonlinear.forward(x)?)
+        __model_proof_output!(self.linear.forward(&self.nonlinear.forward(x)?))
     }
 }
 
@@ -580,8 +584,8 @@ impl DenseHead {
     }
     /// `stats [B, 2C]` → `[B, out_ch]`.
     fn forward(&self, stats: &Tensor) -> CandleResult<Tensor> {
-        let x = self.linear.forward(&stats.unsqueeze(D::Minus1)?)?; // [B, out, 1]
-        let x = self.bn.forward_t(&x, false)?;
+        let x = __model_proof_output!(self.linear.forward(&stats.unsqueeze(D::Minus1)?))?; // [B, out, 1]
+        let x = __model_proof_output!(self.bn.forward_t(&x, false))?;
         x.squeeze(D::Minus1)
     }
 }
@@ -735,7 +739,7 @@ impl Campplus {
     pub fn spk_embed_flow(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
         let x = self.embed_tensor(samples, sample_rate)?; // [1, 192]
         let x = l2_normalize_tensor(&x)?;
-        let x = self.spk_affine.forward(&x)?; // [1, 80]
+        let x = __model_proof_output!(self.spk_affine.forward(&x))?; // [1, 80]
         Ok(x.flatten_all()?.to_vec1::<f32>()?)
     }
 
@@ -922,6 +926,7 @@ mod tests {
     /// VarBuilder of the real tensor shapes and confirm a 192-d x-vector + an 80-d flow embedding.
     /// Real weights are exercised by the `#[ignore]`d conformance test.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn model_wires_end_to_end_with_synthetic_weights() {
         let device = Device::Cpu;
         let varmap = VarMap::new();
@@ -940,6 +945,9 @@ mod tests {
         let flow = model.spk_embed_flow(&tone, sr).unwrap();
         assert_eq!(flow.len(), SPK_EMBED_DIM);
         assert!(flow.iter().all(|v| v.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED campplus::tests::model_wires_end_to_end_with_synthetic_weights");
     }
 
     /// Materialize every `speaker_encoder.*` + `flow.spk_embed_affine_layer.*` tensor the model

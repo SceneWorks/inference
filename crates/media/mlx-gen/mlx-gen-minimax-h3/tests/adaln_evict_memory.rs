@@ -215,6 +215,7 @@ fn one_forward(c: &MiniMaxH3DitConfig, blocks: &[DitBlock], cache: &AdaLnCache) 
     get_peak_memory()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_evicted_adaln_weights_leave_device_memory() {
     let c = cfg();
@@ -475,4 +476,6 @@ fn the_evicted_adaln_weights_leave_device_memory() {
         .unwrap()
         .item::<f32>()
         .is_finite());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_device_memory");
 }

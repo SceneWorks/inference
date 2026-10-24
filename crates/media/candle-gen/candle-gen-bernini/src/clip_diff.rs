@@ -148,7 +148,9 @@ impl TimestepEmbedder {
     /// (the reference `t_freq.to(t.dtype)`).
     fn forward(&self, t: &Tensor, dtype: DType) -> CResult<Tensor> {
         let freq = timestep_embedding(t, self.freq_size, 10000.0)?.to_dtype(dtype)?;
-        Ok(self.mlp2.forward(&self.mlp0.forward(&freq)?.silu()?)?)
+        Ok(__model_proof_output!(self.mlp2.forward(
+            &__model_proof_output!(self.mlp0.forward(&freq))?.silu()?
+        ))?)
     }
 }
 
@@ -173,14 +175,21 @@ impl ResBlock {
 
     /// `shift,scale,gate = adaLN(silu(y))`; `h = mlp(modulate(LN(x), shift, scale))`; `x + gate·h`.
     fn forward(&self, x: &Tensor, y: &Tensor) -> CResult<Tensor> {
-        let mods = self.adaln.forward(&y.silu()?)?;
+        let mods = __model_proof_output!(self.adaln.forward(&y.silu()?))?;
         let w = mods.dim(D::Minus1)? / 3;
         let shift = mods.narrow(D::Minus1, 0, w)?;
         let scale = mods.narrow(D::Minus1, w, w)?;
         let gate = mods.narrow(D::Minus1, 2 * w, w)?;
-        let h = layer_norm(x, Some(&self.in_ln_w), Some(&self.in_ln_b), LN_EPS)?;
+        let h = __model_proof_output!(layer_norm(
+            x,
+            Some(&self.in_ln_w),
+            Some(&self.in_ln_b),
+            LN_EPS
+        ))?;
         let h = modulate(&h, &shift, &scale)?;
-        let h = self.mlp2.forward(&self.mlp0.forward(&h)?.silu()?)?;
+        let h = __model_proof_output!(self
+            .mlp2
+            .forward(&__model_proof_output!(self.mlp0.forward(&h))?.silu()?))?;
         Ok((x + gate.mul(&h)?)?)
     }
 }
@@ -200,13 +209,13 @@ impl FinalLayer {
 
     /// `shift,scale = adaLN(silu(c))`; `linear(modulate(LN_noaffine(x), shift, scale))`.
     fn forward(&self, x: &Tensor, c: &Tensor) -> CResult<Tensor> {
-        let mods = self.adaln.forward(&c.silu()?)?;
+        let mods = __model_proof_output!(self.adaln.forward(&c.silu()?))?;
         let w = mods.dim(D::Minus1)? / 2;
         let shift = mods.narrow(D::Minus1, 0, w)?;
         let scale = mods.narrow(D::Minus1, w, w)?;
         let h = layer_norm(x, None, None, LN_EPS)?; // norm_final: elementwise_affine=False
         let h = modulate(&h, &shift, &scale)?;
-        Ok(self.linear.forward(&h)?)
+        Ok(__model_proof_output!(self.linear.forward(&h))?)
     }
 }
 
@@ -236,9 +245,9 @@ impl SimpleMlpAdaLn {
 
     /// `x` `[N, in]`, `t` `[N]` (or `[1]`), `c` `[N, z]` → `[N, out]`.
     fn forward(&self, x: &Tensor, t: &Tensor, c: &Tensor) -> CResult<Tensor> {
-        let mut h = self.input_proj.forward(x)?;
+        let mut h = __model_proof_output!(self.input_proj.forward(x))?;
         let te = self.time_embed.forward(t, h.dtype())?;
-        let ce = self.cond_embed.forward(c)?;
+        let ce = __model_proof_output!(self.cond_embed.forward(c))?;
         let y = te.broadcast_add(&ce)?;
         for block in &self.res_blocks {
             h = block.forward(&h, &y)?;

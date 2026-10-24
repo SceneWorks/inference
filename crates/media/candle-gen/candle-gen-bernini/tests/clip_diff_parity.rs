@@ -14,6 +14,7 @@ use candle_gen_bernini::clip_diff::DiffLossFm;
 use candle_gen_bernini::connector::MlpConnector;
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn clip_diff_matches_reference_f32() {
     let dev = Device::Cpu;
     let g = Golden::load("clip_diff_golden");
@@ -62,4 +63,7 @@ fn clip_diff_matches_reference_f32() {
     let (_, s_rel) = errors(&flat_f32(&sample), &g.f32("out.sample"));
     println!("sample rel={s_rel:.3e}");
     assert!(s_rel < 5e-3, "sample rel {s_rel:.3e}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED clip_diff_parity::clip_diff_matches_reference_f32");
 }

@@ -112,7 +112,7 @@ fn ab<F: Fn() -> Array>(label: &str, run: F) -> Dtype {
 }
 
 #[test]
-#[ignore = "needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image-Turbo weights (ZIMAGE_SNAPSHOT or HF cache)"]
 fn zimage_turbo_per_step_compiled_vs_eager() {
     let snap = match snapshot() {
         Some(p) => p,
@@ -141,10 +141,13 @@ fn zimage_turbo_per_step_compiled_vs_eager() {
     // weights stay bf16 — bf16-weight × f32-activation GEMMs). The contract sc-2963 must hold is
     // dtype-*preservation* under compile (compiled==eager dtype), already asserted inside `ab`.
     println!("Z-Image turbo forward output dtype: {dt:?}");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED perf::zimage_turbo_per_step_compiled_vs_eager");
 }
 
 #[test]
-#[ignore = "needs real Z-Image-Turbo + Fun-Controlnet weights (HF cache or env overrides)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image-Turbo + Fun-Controlnet weights (HF cache or env overrides)"]
 fn zimage_control_per_step_compiled_vs_eager() {
     let (snap, ctrl) = match (snapshot(), control_source()) {
         (Some(s), Some(c)) => (s, c),
@@ -180,4 +183,7 @@ fn zimage_control_per_step_compiled_vs_eager() {
         Dtype::Float32,
         "control forward output is f32 (mixed-precision path)"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED perf::zimage_control_per_step_compiled_vs_eager");
 }

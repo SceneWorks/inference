@@ -895,6 +895,7 @@ mod tests {
     /// LoRA factors yields a finite loss and a gradient on **every** adapter `Var` (save the last block's
     /// `to_add_out`, whose text-stream output the image-velocity head discards — see `dit_train`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_lora_factors() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_0001);
@@ -939,11 +940,15 @@ mod tests {
         }
         assert!(saw_nonzero, "backprop is not reaching the adapter factors");
         assert_eq!(set.vars.len(), 4 * 2 * cfg.num_layers); // 4 projections × 2 factors × layers
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_lora_factors");
     }
 
     /// The correctness gate for the gradient-checkpointed backward (the path real training always uses):
     /// it must reproduce the dense `loss.backward()` grads (mod float reassociation) on the tiny DiT.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_and_checkpoint_grads_match() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_0002);
@@ -1013,6 +1018,11 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::dense_and_checkpoint_grads_match"
+        );
     }
 
     /// sc-24828: subject-masked loss on both backward paths. The weight is built on the unpacked
@@ -1020,6 +1030,7 @@ mod tests {
     /// unweighted loss; an all-zero map zeroes the loss AND every adapter gradient (dense and
     /// checkpointed); a half map lands between and matches across paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_0003);
@@ -1088,6 +1099,9 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// sc-24828: the packed weight lines up with the packed latent. A weight whose value encodes its
@@ -1171,6 +1185,7 @@ mod tests {
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
     /// objective end to end through the harness.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_optimizer_step_descends() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_0004);
@@ -1215,6 +1230,9 @@ mod tests {
             loss1 < loss0,
             "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::one_optimizer_step_descends");
     }
 
     /// The trainer resolves through the explicit family registry as the candle Lens
@@ -1236,6 +1254,7 @@ mod tests {
     /// sc-2127: the micro-step reads each cached entry's OWN latent grid, so one run trains across
     /// bucket entries of different grids (here a 2×2 and a 4×2 packed grid) through the same DiT.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn micro_step_uses_each_entrys_grid() {
         let dev = Device::Cpu;
         let mut rng = StdRng::seed_from_u64(0x1e45_0005);
@@ -1276,6 +1295,11 @@ mod tests {
                 "grid {h}x{w}: loss must be finite, got {loss}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::tests::micro_step_uses_each_entrys_grid"
+        );
     }
 
     /// `validate` rejects an empty dataset, zero rank/steps, an unsupported optimizer, and unrecognized
@@ -1449,6 +1473,7 @@ mod tests {
         /// compute the diffusion term unconditionally ⇒ red; drop `aux` in the checkpointed
         /// segment ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1482,12 +1507,16 @@ mod tests {
                     "ckpt={ckpt}: no LoRA B gradient from the depth term"
                 );
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
         /// the model output with the trainer's parameterisation, it matches the step's aux bits.
         /// Mutation: swap the parameterisation in `step_loss` (e.g. `FlowX0MinusNoise`) ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1509,11 +1538,15 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap();
             assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 dense step (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 0.5, false, None);
@@ -1530,11 +1563,15 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         /// `micro_step` (the checkpointed production path) trains an aux-only step at the plan's
         /// remapped `t`. Mutation: drop `t = a.noise_level()` ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn micro_step_trains_at_the_planned_noise_level() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1585,6 +1622,9 @@ mod tests {
                 .micro_step(&f.dit, &f.vars, &cached, &(), &cfg, 2, sample, &Device::Cpu)
                 .unwrap();
             assert_eq!(got.to_bits(), expect.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::micro_step_trains_at_the_planned_noise_level");
         }
 
         fn depth_on() -> TrainingConfig {

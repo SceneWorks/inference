@@ -215,10 +215,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Probe the host (report only)
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 900 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Probe the host (report only)
         run: bash .github/kv-poc/probe.sh
 
   build:
@@ -235,12 +238,15 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
       - name: Put inference and SceneWorks at the frozen SHAs
         run: bash .github/kv-poc/build.sh trees
-      - name: Materialize and verify the pinned snapshots
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 10800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Materialize and verify the pinned snapshots
         run: bash .github/kv-poc/build.sh models
       - name: Build, freeze and seal the campaign binaries
         run: bash .github/kv-poc/build.sh binaries
@@ -249,7 +255,7 @@ jobs:
     name: "A1 dense baseline (sc20671)"
     needs: [config, build]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a1,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a1,')
       && needs.build.result == 'success' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
     # 660 soft + 300 row deadline + 20 (TIMEOUTS above).
@@ -265,10 +271,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run A1
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 58800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run A1
         id: run
         run: bash .github/kv-poc/phase.sh run a1
       - name: Collect A1 evidence
@@ -287,7 +296,7 @@ jobs:
     name: "A3 packed arms, kv-bits ${{ needs.config.outputs.a3_bits }} (sc20676)"
     needs: [config, build, a1]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a3,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a3,')
       && needs.build.result == 'success'
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
@@ -306,10 +315,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run A3
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 26400 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run A3
         id: run
         run: bash .github/kv-poc/phase.sh run a3
       - name: Collect A3 evidence
@@ -328,7 +340,7 @@ jobs:
     name: "A2 compressed ${{ needs.config.outputs.a2_methods }} (sc20671)"
     needs: [config, build, a1, a3]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a2,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a2,')
       && needs.build.result == 'success'
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
       && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true' }}
@@ -348,10 +360,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run A2
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 98400 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run A2
         id: run
         run: bash .github/kv-poc/phase.sh run a2
       - name: Collect A2 evidence
@@ -370,7 +385,7 @@ jobs:
     name: "B KV capture + compare (sc20677)"
     needs: [config, build, a1, a3, a2]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',b,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',b,')
       && needs.build.result == 'success'
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
       && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true'
@@ -388,10 +403,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run B
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 7200 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run B
         id: run
         run: bash .github/kv-poc/phase.sh run b
       - name: Collect B evidence
@@ -410,7 +428,7 @@ jobs:
     name: "NF dense noise floor (sc20671 noise-floor-parent)"
     needs: [config, build, a1, a3, a2, b]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',nf,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',nf,')
       && needs.build.result == 'success'
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
       && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true'
@@ -432,10 +450,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run NF
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 33600 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run NF
         id: run
         run: bash .github/kv-poc/phase.sh run nf
       - name: Collect NF evidence
@@ -465,14 +486,18 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
       - name: Put inference and SceneWorks at the frozen SHAs
         run: bash .github/kv-poc/build.sh trees
-      - name: Check disk, fetch only missing pinned W2 files, verify sha256
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 21600 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Check disk, fetch only missing pinned W2 files, verify sha256
         run: bash .github/kv-poc/build.sh w2-models
-      - name: Assemble the VACE snapshots and materialize the VACE fixtures
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 21600 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Assemble the VACE snapshots and materialize the VACE fixtures
         run: bash .github/kv-poc/build.sh w2-inputs
 
   w2-build:
@@ -499,7 +524,7 @@ jobs:
     name: "C Krea Realtime six-cell (sc20684)"
     needs: [config, w2-build]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',c,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',c,')
       && needs.w2-build.result == 'success' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
     timeout-minutes: 330
@@ -514,10 +539,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run C
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 19800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run C
         id: run
         run: bash .github/kv-poc/phase.sh run c
       - name: Collect C evidence
@@ -536,7 +564,7 @@ jobs:
     name: "D SC-20686 Metal matrix (sc20686)"
     needs: [config, w2-build, c]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d,')
       && needs.w2-build.result == 'success'
       && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
@@ -552,10 +580,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run D
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 27000 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run D
         id: run
         run: bash .github/kv-poc/phase.sh run d
       - name: Collect D evidence
@@ -574,7 +605,7 @@ jobs:
     name: "D-control SC-20686 schedule-control arm"
     needs: [config, w2-build, c, d]
     if: >-
-      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d-control,')
+      ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d-control,')
       && needs.w2-build.result == 'success'
       && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true'
       && (needs.d.result == 'success' || needs.d.result == 'skipped') && needs.d.outputs.stopped != 'true' }}
@@ -591,10 +622,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/ci
           fetch-depth: 1
           persist-credentials: false
-      - name: Precheck and run D-control
+      - shell: python3.12 -I "scripts/ci/inference_metal_launcher.py" --wait-seconds 19800 -- /bin/bash --noprofile --norc -eo pipefail {0}
+        name: Precheck and run D-control
         id: run
         run: bash .github/kv-poc/phase.sh run d-control
       - name: Collect D-control evidence

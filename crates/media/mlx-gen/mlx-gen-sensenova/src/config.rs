@@ -225,8 +225,14 @@ impl NeoChatConfig {
     /// Read and parse `<root>/config.json`.
     pub fn from_dir(root: impl AsRef<Path>) -> Result<Self> {
         let path = root.as_ref().join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("sensenova: reading {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-sensenova/src/config.rs::from_dir::std::fs::read_to_string@10788",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| Error::Msg(format!("sensenova: reading {}: {e}", path.display())))?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("sensenova: parsing {}: {e}", path.display())))?;
         Self::from_config_json(&v)

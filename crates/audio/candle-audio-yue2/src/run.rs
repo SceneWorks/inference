@@ -385,7 +385,14 @@ pub(crate) fn is_nonempty_dir(dir: &Path) -> Result<bool, RunError> {
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value, RunError> {
-    let bytes = fs::read(path).map_err(io(path))?;
+    let bytes = candle_audio::gen_core::__model_input_reader!(
+        fs::read(path),
+        "crates/audio/candle-audio-yue2/src/run.rs::read_json::fs::read@14745",
+        ArtifactInput,
+        path,
+        |__model_input_path| fs::read(__model_input_path)
+    )
+    .map_err(io(path))?;
     serde_json::from_slice(&bytes).map_err(|e| corrupt(path, format!("not JSON: {e}")))
 }
 

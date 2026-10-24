@@ -564,6 +564,9 @@ fn base_preview_frames_evolve_toward_the_final_image() {
         env_u32("ANIMA_PREVIEW_STEPS", 12),
         env_u32("ANIMA_PREVIEW_SIZE", 1024),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::base_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `anima_aesthetic` — the second CFG lane. A separate row rather than an assumption that it follows
@@ -576,6 +579,9 @@ fn aesthetic_preview_frames_evolve_toward_the_final_image() {
         env_u32("ANIMA_PREVIEW_STEPS", 12),
         env_u32("ANIMA_PREVIEW_SIZE", 1024),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::aesthetic_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `anima_turbo` — the merged CFG-free few-step student, so the predict closure runs a **single** DiT
@@ -588,4 +594,7 @@ fn turbo_preview_frames_evolve_toward_the_final_image() {
         env_u32("ANIMA_PREVIEW_TURBO_STEPS", 10),
         env_u32("ANIMA_PREVIEW_SIZE", 1024),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::turbo_preview_frames_evolve_toward_the_final_image");
 }

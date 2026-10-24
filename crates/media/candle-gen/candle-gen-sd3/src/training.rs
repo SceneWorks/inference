@@ -157,7 +157,12 @@ fn packed_component(root: &Path, component: &str) -> Result<bool> {
     };
     let config: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| CandleError::Msg(format!("{LABEL}: parse {}: {error}", path.display())))?;
-    Ok(candle_gen::quant::PackedConfig::from_config(&config).is_some())
+    candle_gen::gen_core::__model_input_result!(
+        Ok(candle_gen::quant::PackedConfig::from_config(&config).is_some()),
+        "candle-gen-sd3::training::packed_component/configuration",
+        Configuration,
+        &[&path]
+    )
 }
 
 fn load_large(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
@@ -731,6 +736,7 @@ mod tests {
     /// sc-2127: one installed adapter set trains on latents of two bucket sizes through the real
     /// MMDiT (the positional table is cropped per forward, so no size is baked in at load).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn one_adapter_set_trains_on_two_bucket_sizes() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -766,6 +772,9 @@ mod tests {
                 "side {side}: the bucket's step must reach the shared adapter"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::one_adapter_set_trains_on_two_bucket_sizes");
     }
 
     #[test]
@@ -829,6 +838,7 @@ mod tests {
     /// sc-24828: the subject-mask weight reaches the trainer's loss. An all-ones map is the unweighted
     /// loss; an all-zero map zeroes the loss AND every adapter gradient; a half map lands between.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_the_step_loss() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -885,6 +895,9 @@ mod tests {
         let half: Vec<f32> = (0..16).map(|i| if i % 4 < 2 { 1.0 } else { 0.0 }).collect();
         let half = run(Some(&map(&half))).to_scalar::<f32>().unwrap();
         assert!(half > 0.0 && half < plain, "{half} vs {plain}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_the_step_loss");
     }
 
     #[test]
@@ -894,6 +907,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_real_mmdit_lora_residuals() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -946,6 +960,9 @@ mod tests {
             2,
             "the one attn2 projection has A/B factors"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::backward_reaches_real_mmdit_lora_residuals");
     }
 
     /// Epic 2123 depth anchoring (sc-24830) on the candle SD3.5 trainer: the tiny MMDiT + a
@@ -1101,6 +1118,7 @@ mod tests {
         /// compute the diffusion term unconditionally ⇒ red; keep the sampled σ in `plan_sigma` on
         /// an aux step ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_only_step_trains_the_adapter_through_depth_alone() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1133,6 +1151,9 @@ mod tests {
                 "no LoRA B gradient from the depth term"
             );
             assert_eq!(plan_sigma(&StepSample::plain(0, 0), 0.3).unwrap().0, 0.3);
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_only_step_trains_the_adapter_through_depth_alone");
         }
 
         /// Epic 2123 E8: a step the alternation claims for a loss that skips the image (no usable
@@ -1173,6 +1194,7 @@ mod tests {
         /// The aux term is the depth loss of THE trainer's x0 estimate `x_t − σ·v`, recomputed
         /// independently. Mutation: `FlowX0MinusNoise` in `step_loss` ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
@@ -1194,11 +1216,15 @@ mod tests {
                 .to_scalar::<f32>()
                 .unwrap();
             assert_eq!(l.aux.unwrap().to_bits(), want.to_bits());
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::aux_term_is_the_depth_loss_of_the_recovered_x0");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 step (reproduced verbatim).
         /// Mutation: perturb the `None` combine ⇒ red.
         #[test]
+        #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
             let f = fixture();
             let (l, g) = run(&f, 0.5, None);
@@ -1216,6 +1242,9 @@ mod tests {
             for v in &f.vars {
                 assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
             }
+
+            #[cfg(feature = "model-inference-proof")]
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::depth_anchoring::depth_off_is_bit_identical_to_the_legacy_step");
         }
 
         fn depth_on() -> TrainingConfig {

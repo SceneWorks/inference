@@ -1,5 +1,14 @@
 //! One explicitly selected real-weight comparison process; missing environment is an error.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 #[test]
 #[ignore = "requires a frozen model and complete BONSAI_COMPARISON_* evidence environment"]
 fn native_comparison() {
@@ -36,4 +45,7 @@ fn native_comparison() {
         || false,
     )
     .expect("complete native comparison evidence");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED native_comparison");
 }

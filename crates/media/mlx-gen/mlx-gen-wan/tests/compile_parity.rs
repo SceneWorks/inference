@@ -38,6 +38,7 @@ fn load(name: &str) -> Weights {
 
 use common::max_abs;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn compiled_glue_bit_identical_to_eager() {
     let w = load("s5_low.safetensors");
@@ -73,4 +74,6 @@ fn compiled_glue_bit_identical_to_eager() {
             "compiled glue diverged from eager on batch element {i}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED compile_parity::compiled_glue_bit_identical_to_eager");
 }

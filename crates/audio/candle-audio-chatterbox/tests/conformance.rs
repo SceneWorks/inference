@@ -49,6 +49,16 @@
 //! [`chatterbox_gates_required_components_at_load`] is a **weights-free** (non-`#[ignore]`d) proof
 //! that a missing/unknown component fails at LOAD.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_chatterbox as cb;
@@ -255,6 +265,9 @@ fn chatterbox_t3_produces_valid_speech_tokens() {
             real.len()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_t3_produces_valid_speech_tokens");
 }
 
 /// T3 stage gate: the LM RESPONDS to the reference voice (different voices → different tokens).
@@ -287,6 +300,9 @@ fn chatterbox_t3_responds_to_the_reference_voice() {
         "different reference voices produced identical speech tokens — T3 ignored the speaker \
          conditioning (the clone would be voice-agnostic)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_t3_responds_to_the_reference_voice");
 }
 
 /// VoiceEmbedding-only conditioning is an honest boundary: `generate()` runs T3 but cannot render a
@@ -319,6 +335,9 @@ fn chatterbox_generate_requires_reference_audio_for_a_full_clone() {
         msg.contains("speech tokens"),
         "the boundary error must report the T3 tokens produced: {msg}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_generate_requires_reference_audio_for_a_full_clone");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -411,6 +430,9 @@ fn s3tokenizer_encodes_a_reference_at_25hz() {
         codes, codes_other,
         "different references produced identical tokens — the encoder ignores content"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED s3tokenizer_encodes_a_reference_at_25hz");
 }
 
 /// A long (>30 s) reference built by concatenating several distinct Kokoro sentences, so the
@@ -522,6 +544,9 @@ fn s3tokenizer_windows_audio_longer_than_30s() {
         "the windowed result diverges from single-pass over the non-boundary interior \
          ({frac:.4}) — the window/merge is not continuous"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED s3tokenizer_windows_audio_longer_than_30s");
 }
 
 /// Provider integration: a `ReferenceAudio` request now derives T3's `cond_prompt_speech_tokens`
@@ -569,6 +594,11 @@ fn chatterbox_reference_audio_fills_the_t3_prompt_tokens() {
             "a ≥6s reference should fill the full 150-token prompt"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_reference_audio_fills_the_t3_prompt_tokens"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,6 +681,9 @@ fn campplus_derives_discriminative_x_vectors() {
         same80 > cross80,
         "flow speaker embedding lost discrimination: same {same80:.4} vs cross {cross80:.4}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED campplus_derives_discriminative_x_vectors");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -766,6 +799,9 @@ fn flow_synthesizes_a_sane_mel_from_speech_tokens() {
         vals, vals2,
         "the flow must be deterministic for a fixed seed"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED flow_synthesizes_a_sane_mel_from_speech_tokens");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -841,6 +877,9 @@ fn hift_vocodes_a_real_mel_to_nonsilent_waveform() {
         wav2.to_vec1::<f32>().unwrap(),
         "the vocoder must be deterministic for a fixed seed"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED hift_vocodes_a_real_mel_to_nonsilent_waveform");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -941,6 +980,9 @@ fn perth_watermark_roundtrips_and_is_imperceptible() {
         snr24 > 12.0,
         "24 kHz watermarked signal too degraded: SNR {snr24:.2} dB"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED perth_watermark_roundtrips_and_is_imperceptible");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1095,6 +1137,9 @@ fn chatterbox_clones_a_reference_voice_end_to_end() {
         .unwrap_or_else(|_| std::env::temp_dir().join("chatterbox_clone_demo.wav"));
     candle_audio::wav::write_wav_pcm16(&out_path, &out).expect("write the demo clone WAV");
     eprintln!("wrote cloned-voice demo WAV: {}", out_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_clones_a_reference_voice_end_to_end");
 }
 
 /// The T3 speech tokens for a `ReferenceAudio` request (a fresh generator so the DoD test's `dyn`

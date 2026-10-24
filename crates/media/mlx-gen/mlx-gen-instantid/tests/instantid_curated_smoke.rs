@@ -43,7 +43,15 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn load_rgb(path: &PathBuf) -> Image {
-    let img = image::open(path)
+    let img = mlx_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/mlx-gen/mlx-gen-instantid/tests/instantid_curated_smoke.rs::load_rgb::image::open@2075",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|e| panic!("open ref {path:?}: {e}"))
         .to_rgb8();
     Image {
@@ -128,4 +136,6 @@ fn curated_samplers_preserve_identity() {
              destabilize InstantID's conditioning"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED instantid_curated_smoke::curated_samplers_preserve_identity");
 }

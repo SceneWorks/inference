@@ -86,6 +86,7 @@ fn run(g: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (GenerationOutput
 fn base_generates_via_registry() {
     let Some(root) = dir("BOOGU_BASE_DIR") else {
         eprintln!("skipping: set BOOGU_BASE_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in base_generates_via_registry; see preceding skip diagnostic");
         return;
     };
     let g = mlx_gen_boogu::provider_registry()
@@ -127,6 +128,8 @@ fn base_generates_via_registry() {
     let (out, max_step, decoding) = run(g.as_ref(), &req);
     assert_image(out, res, max_step, steps, decoding);
     println!("boogu_image: {steps} steps, decoding={decoding} — OK");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator::base_generates_via_registry");
 }
 
 #[test]
@@ -134,6 +137,7 @@ fn base_generates_via_registry() {
 fn turbo_generates_via_registry() {
     let Some(root) = dir("BOOGU_TURBO_DIR") else {
         eprintln!("skipping: set BOOGU_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in turbo_generates_via_registry; see preceding skip diagnostic");
         return;
     };
     let g = mlx_gen_boogu::provider_registry()
@@ -162,6 +166,8 @@ fn turbo_generates_via_registry() {
     let (out, max_step, decoding) = run(g.as_ref(), &req);
     assert_image(out, res, max_step, steps, decoding);
     println!("boogu_image_turbo: {steps} steps — OK");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator::turbo_generates_via_registry");
 }
 
 #[test]
@@ -169,6 +175,7 @@ fn turbo_generates_via_registry() {
 fn edit_generates_via_registry() {
     let Some(root) = dir("BOOGU_EDIT_DIR") else {
         eprintln!("skipping: set BOOGU_EDIT_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in edit_generates_via_registry; see preceding skip diagnostic");
         return;
     };
     let g = mlx_gen_boogu::provider_registry()
@@ -209,4 +216,6 @@ fn edit_generates_via_registry() {
     let (out, max_step, decoding) = run(g.as_ref(), &req);
     assert_image(out, res, max_step, steps, decoding);
     println!("boogu_image_edit: {steps} steps — OK");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator::edit_generates_via_registry");
 }

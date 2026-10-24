@@ -39,6 +39,7 @@ fn load(name: &str) -> Weights {
 
 use common::max_abs;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_packed_matches_dense_forward_for_target_only() {
     let w = load("s5_low.safetensors");
@@ -71,4 +72,6 @@ fn forward_packed_matches_dense_forward_for_target_only() {
         d, 0.0,
         "packed forward must be bit-identical to the dense forward at source_id 0"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bernini_forward_packed::forward_packed_matches_dense_forward_for_target_only");
 }

@@ -89,4 +89,7 @@ fn memory_attention_matches_oracle() {
     let c = cosine(&got, &want);
     println!("memory_attention output (num_obj_ptr={n_optr}): cosine={c:.7}");
     assert!(c > 0.999, "memory_attention cosine {c}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memattn_parity::memory_attention_matches_oracle");
 }

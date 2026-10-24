@@ -927,6 +927,12 @@ mod fp8_view {
             // The lazy Load primitives hold their own shared reference; this handle is done.
             mlx_sys::mlx_io_reader_free(reader);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "mlx-gen::logical_weights::load_with_rewritten_header",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[path],
+        );
         Ok(arrays)
     }
 }

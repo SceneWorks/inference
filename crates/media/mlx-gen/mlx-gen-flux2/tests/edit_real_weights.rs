@@ -108,6 +108,8 @@ fn reference_encoding_matches_fork() {
         mean < 5e-3,
         "reference image_latents diverged: mean_rel={mean}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::reference_encoding_matches_fork");
 }
 
 #[test]
@@ -145,6 +147,8 @@ fn full_edit_generate_matches_fork() {
         px < 25.0,
         "edit generate diverged from the fork composition: {px}% px>8"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::full_edit_generate_matches_fork");
 }
 
 // ---- sc-2645: multi-image (`MultiReference`) edit ---------------------------------------------
@@ -214,6 +218,10 @@ fn multi_reference_encoding_matches_fork() {
     let (peak, mean) = rel(&packed, want);
     println!("flux2 multi-edit reference encoding (2 refs): peak_rel={peak:.4} mean_rel={mean:.4}");
     assert!(mean < 5e-3, "2-ref image_latents diverged: mean_rel={mean}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::multi_reference_encoding_matches_fork"
+    );
 }
 
 /// The public multi-image edit render: `load(quant).generate(MultiReference{images})`.
@@ -259,6 +267,10 @@ fn full_multi_edit_generate_matches_fork() {
         px < 25.0,
         "multi-edit generate diverged from the fork composition: {px}% px>8"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::full_multi_edit_generate_matches_fork"
+    );
 }
 
 /// Gate: the **Q8** 2-ref edit render vs the fork's Q8 render (bounded coherence floor: Rust f32
@@ -280,6 +292,10 @@ fn q8_multi_edit_generate_matches_fork() {
     assert!(
         px < 70.0,
         "Q8 multi-edit generate not coherent: {px}% px>8 (scope/wiring bug?)"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::q8_multi_edit_generate_matches_fork"
     );
 }
 
@@ -315,4 +331,6 @@ fn single_reference_does_not_regress() {
     let px = px_gt8(&images[0], &gimg);
     println!("flux2 single-ref edit (post-multi-wiring) regression: {px:.2}% px>8 vs fork f32");
     assert!(px < 25.0, "single-ref edit regressed: {px}% px>8");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_real_weights::single_reference_does_not_regress");
 }

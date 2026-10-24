@@ -77,4 +77,6 @@ fn kolors_tokenizer_matches_reference() {
         );
         eprintln!("p{i}: byte-identical (input_ids/attention_mask/position_ids)");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tokenizer_parity::kolors_tokenizer_matches_reference");
 }

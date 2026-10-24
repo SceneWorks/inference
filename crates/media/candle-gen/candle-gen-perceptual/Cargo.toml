@@ -14,6 +14,7 @@ candle-gen-face = { path = "../candle-gen-face" }
 candle-gen-body = { path = "../candle-gen-body" }
 
 [features]
+model-inference-proof = ["candle-gen-body/model-inference-proof", "candle-gen-depth/model-inference-proof", "candle-gen-face/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-depth/metal", "candle-gen-face/metal", "candle-gen-body/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-depth/cuda", "candle-gen-face/cuda", "candle-gen-body/cuda"]

@@ -82,4 +82,6 @@ fn vision_encoder_matches_oracle() {
         worst_cos > 0.99,
         "worst FPN cosine {worst_cos:.6} below 0.99"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vision_parity::vision_encoder_matches_oracle");
 }

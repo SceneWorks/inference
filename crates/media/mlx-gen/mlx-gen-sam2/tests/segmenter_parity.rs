@@ -118,4 +118,6 @@ fn segmenter_box_prompt_matches_mlx_reference_large() {
         ref_bin.iter().filter(|&&v| v == 1).count()
     );
     assert!(iou_bin > 0.99, "binary mask IoU {iou_bin:.5}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED segmenter_parity::segmenter_box_prompt_matches_mlx_reference_large");
 }

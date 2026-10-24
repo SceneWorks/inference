@@ -116,4 +116,6 @@ fn memory_conditioning_matches_oracle() {
     // Full bank assembly + 4 stacked memory-attention layers over 5184 tokens; MLX Metal matmul is
     // reduced-precision.
     assert!(c > 0.999, "memory-conditioned feature map cosine {c}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memcond_parity::memory_conditioning_matches_oracle");
 }

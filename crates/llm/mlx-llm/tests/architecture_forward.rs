@@ -608,6 +608,7 @@ fn host(a: &Array) -> Vec<f32> {
 /// building its cases would touch MLX concurrently with this one's forward passes. That is exactly
 /// the kind of contention the precision contract above is about, and there is no reason to invite
 /// it inside our own test binary.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_architecture_forward_matches_the_base_branch() {
     let cases = cases();
@@ -678,6 +679,8 @@ fn every_architecture_forward_matches_the_base_branch() {
         "six fused-SDPA architectures must have their numerics pinned here; the other two are \
          pinned by the candle mirror"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED architecture_forward::every_architecture_forward_matches_the_base_branch");
 }
 
 /// The case list must cover **every** architecture the generic decoder serves, so a newly-added one

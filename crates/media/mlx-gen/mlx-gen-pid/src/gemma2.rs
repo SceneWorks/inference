@@ -607,6 +607,7 @@ mod embedding_tests {
 
     // No real weights and no GPU: isolate the embedding + Gemma normalization from attention.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn packed_embedding_matches_dequantized_rows_in_native_dtype() {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         for prefix in ["", "model."] {
@@ -662,6 +663,8 @@ mod embedding_tests {
                 }
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED gemma2::embedding_tests::packed_embedding_matches_dequantized_rows_in_native_dtype");
     }
 }
 
@@ -791,6 +794,7 @@ mod quantum_proofs {
                 .status()
                 .unwrap();
             assert!(status.success());
+            println!("\nMODEL_INFERENCE_PARENT_COMPLETED gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks");
             return;
         }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
@@ -898,5 +902,8 @@ mod quantum_proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks");
         }
+
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks");
     }
 }

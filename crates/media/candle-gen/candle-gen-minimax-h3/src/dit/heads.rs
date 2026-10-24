@@ -162,7 +162,7 @@ impl LinearBias {
     /// keeps a float32 head from silently running its matmul at the block stack's bfloat16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.to_dtype(self.weight.dtype())?;
-        linear(&x, &self.weight, &self.bias)
+        __model_proof_output!(linear(&x, &self.weight, &self.bias))
     }
 }
 
@@ -657,6 +657,7 @@ mod tests {
     /// Built over a projection whose two halves are trivially distinguishable, so a reversed
     /// reading cannot pass.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn norm_out_modulation_is_shift_then_scale() {
         let dev = Device::Cpu;
         let mut map: HashMap<String, Tensor> = HashMap::new();
@@ -700,6 +701,9 @@ mod tests {
         assert!(n
             .modulation(&Tensor::ones(3, DType::F32, &dev).unwrap())
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::norm_out_modulation_is_shift_then_scale");
     }
 
     // ─── the head set stays dense on every tier (sc-20267) ──────────────────────────────────────

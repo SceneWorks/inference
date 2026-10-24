@@ -234,6 +234,8 @@ fn lens_trainer_trains_and_writes_lora() {
         shift > 1e-3,
         "the trained LoRA must shift the DiT output beyond fp noise (rel-L2 {shift:.5})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_trains_and_writes_lora");
 }
 
 #[test]
@@ -325,6 +327,8 @@ fn lens_trainer_trains_with_gradient_checkpointing() {
         shift > 1e-3,
         "the checkpointed-trained LoRA must shift the DiT output beyond fp noise (rel-L2 {shift:.5})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_trains_with_gradient_checkpointing");
 }
 
 #[test]
@@ -432,6 +436,8 @@ fn lens_trainer_trains_and_reloads_lokr() {
         shift > 1e-3,
         "the trained LoKr must shift the DiT output beyond fp noise (rel-L2 {shift:.5})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_trains_and_reloads_lokr");
 }
 
 /// sc-5637 — preview samples. Proves the Lens render path (install in-progress adapter → norm-rescaled
@@ -510,4 +516,6 @@ fn lens_trainer_emits_preview_samples() {
         "[lens-samples] e2e OK — {} previews: {samples:?}",
         samples.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_emits_preview_samples");
 }

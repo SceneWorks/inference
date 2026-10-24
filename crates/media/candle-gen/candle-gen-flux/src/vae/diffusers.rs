@@ -119,15 +119,15 @@ impl Module for Attention {
         let (b, c, h, w) = xs.dims4()?;
 
         // GroupNorm
-        let xs = xs.apply(&self.group_norm)?;
+        let xs = __model_proof_output!(xs.apply(&self.group_norm))?;
 
         // (B, C, H, W) -> (B, H, W, C) -> (B*H*W, C)
         let xs = xs.permute((0, 2, 3, 1))?.reshape((b * h * w, c))?;
 
         // Linear projections
-        let q = xs.apply(&self.to_q)?; // (B*H*W, C)
-        let k = xs.apply(&self.to_k)?;
-        let v = xs.apply(&self.to_v)?;
+        let q = __model_proof_output!(xs.apply(&self.to_q))?; // (B*H*W, C)
+        let k = __model_proof_output!(xs.apply(&self.to_k))?;
+        let v = __model_proof_output!(xs.apply(&self.to_v))?;
 
         // Reshape for attention: (B*H*W, C) -> (B, H*W, C) -> (B, 1, H*W, C)
         let q = q.reshape((b, h * w, c))?.unsqueeze(1)?;
@@ -141,7 +141,7 @@ impl Module for Attention {
         let xs = xs.squeeze(1)?.reshape((b * h * w, c))?;
 
         // Output projection
-        let xs = xs.apply(&self.to_out)?;
+        let xs = __model_proof_output!(xs.apply(&self.to_out))?;
 
         // (B*H*W, C) -> (B, H, W, C) -> (B, C, H, W)
         let xs = xs.reshape((b, h, w, c))?.permute((0, 3, 1, 2))?;
@@ -204,13 +204,12 @@ impl ResnetBlock2D {
 
 impl Module for ResnetBlock2D {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let h = xs
-            .apply(&self.norm1)?
+        let h = __model_proof_output!(__model_proof_output!(xs.apply(&self.norm1))?
             .apply(&candle_gen::candle_nn::Activation::Swish)?
             .apply(&self.conv1)?
-            .apply(&self.norm2)?
-            .apply(&candle_gen::candle_nn::Activation::Swish)?
-            .apply(&self.conv2)?;
+            .apply(&self.norm2))?
+        .apply(&candle_gen::candle_nn::Activation::Swish)?
+        .apply(&self.conv2)?;
 
         match &self.conv_shortcut {
             Some(conv) => xs.apply(conv)? + h,
@@ -491,8 +490,7 @@ impl Module for Encoder {
         for block in &self.down_blocks {
             h = h.apply(block)?;
         }
-        h.apply(&self.mid_block)?
-            .apply(&self.conv_norm_out)?
+        __model_proof_output!(h.apply(&self.mid_block)?.apply(&self.conv_norm_out))?
             .apply(&candle_gen::candle_nn::Activation::Swish)?
             .apply(&self.conv_out)
     }
@@ -580,7 +578,7 @@ impl Module for Decoder {
         for block in &self.up_blocks {
             h = h.apply(block)?;
         }
-        h.apply(&self.conv_norm_out)?
+        __model_proof_output!(h.apply(&self.conv_norm_out))?
             .apply(&candle_gen::candle_nn::Activation::Swish)?
             .apply(&self.conv_out)
     }
@@ -696,6 +694,7 @@ mod parity_tests {
     use candle_transformers::models::z_image::vae as stock;
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_flux_diffusers_vae_decode_matches_stock() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -720,5 +719,8 @@ mod parity_tests {
             diff < 1e-5,
             "vendored FLUX diffusers VAE decode diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::diffusers::parity_tests::vendored_flux_diffusers_vae_decode_matches_stock");
     }
 }

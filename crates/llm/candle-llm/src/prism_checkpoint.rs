@@ -318,8 +318,14 @@ fn validate_config(config: &Value) -> Result<()> {
 
 fn read_metadata(dir: &Path) -> Result<PrismHadamardMetadata> {
     let path = dir.join("hadamard.json");
-    let value: Value = serde_json::from_slice(&std::fs::read(&path)?)
-        .map_err(|error| Error::Config(format!("parse {}: {error}", path.display())))?;
+    let value: Value = serde_json::from_slice(&crate::__model_input_reader!(
+        std::fs::read(&path),
+        "crates/llm/candle-llm/src/prism_checkpoint.rs::read_metadata::std::fs::read@12764",
+        ArtifactInput,
+        &path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    )?)
+    .map_err(|error| Error::Config(format!("parse {}: {error}", path.display())))?;
     let exact = |key: &str, expected: &str| -> Result<()> {
         if value.get(key).and_then(Value::as_str) == Some(expected) {
             Ok(())
@@ -1043,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn compact_checkpoint_executes_qwen_prefill_and_cached_decode() {
         use crate::models::{Qwen35Config, Qwen35Model};
 
@@ -1169,6 +1176,9 @@ mod tests {
             model.decode_logits(&next, &mut cache, 2).unwrap().dims(),
             &[1, 128]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED prism_checkpoint::tests::compact_checkpoint_executes_qwen_prefill_and_cached_decode");
     }
 
     #[test]

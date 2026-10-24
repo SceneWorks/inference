@@ -32,6 +32,7 @@ fn config_from_meta(g: &Golden) -> QwenVlTextConfig {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn qwen_backbone_matches_reference_f32() {
     let dev = Device::Cpu;
     let g = Golden::load("qwen_backbone_golden");
@@ -74,4 +75,7 @@ fn qwen_backbone_matches_reference_f32() {
     let p2 = backbone.penultimate(&embeds, &position_ids, &mask).unwrap();
     let (_, rel2) = errors(&flat_f32(&p2), &flat_f32(penult));
     assert!(rel2 < 1e-6, "penultimate() == forward()[-2]");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen_backbone_parity::qwen_backbone_matches_reference_f32");
 }

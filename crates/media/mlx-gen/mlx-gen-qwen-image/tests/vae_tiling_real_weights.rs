@@ -131,6 +131,10 @@ fn overlap_96_peak_ab_below_512() {
             "96 reduced the active peak at edge {edge}; revisit the shipped 64-only contract"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae_tiling_real_weights::overlap_96_peak_ab_below_512"
+    );
 }
 
 #[test]
@@ -200,5 +204,9 @@ fn tiled_decode_matches_untiled() {
     assert!(
         enc_max < 3e-2 && enc_mean < 3e-3,
         "encoded-latent tiled decode diverges: max|Δ|={enc_max:.3e} mean|Δ|={enc_mean:.3e}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae_tiling_real_weights::tiled_decode_matches_untiled"
     );
 }

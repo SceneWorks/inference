@@ -713,6 +713,10 @@ mod first_step_repro {
             )
             .map_err(|e| eprintln!("  edge {edge} error: {e}"));
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_memory_sweep"
+        );
     }
 
     /// sc-4941 — block (gradient) checkpointing must not change the math vs the dense path. Same gate
@@ -768,6 +772,8 @@ mod first_step_repro {
         // Recompute fp noise (a few e-3; the 256-token ChatGLM cross-attention accumulates more than
         // SDXL's short prompt). A real bug is orders of magnitude larger.
         assert!(max_rel < 5e-3, "block ckpt must match dense: {max_rel:.2e}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense");
     }
 
     /// The carve-out audit: does the ChatGLM3 context need to stay f32 under bf16, or does the whole
@@ -900,6 +906,8 @@ mod first_step_repro {
             "bf16 must shrink the working set (the resident ChatGLM dilutes the ratio vs SDXL's 57%): \
              f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_direction_and_memory_vs_f32");
     }
 }
 
@@ -1014,6 +1022,7 @@ mod depth_anchoring_tests {
     /// recovery) ⇒ the depth term changes ⇒ the cross-check against an explicitly recovered x0
     /// reds.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         let h = hooks();
         for ckpt in [false, true] {
@@ -1154,6 +1163,8 @@ mod depth_anchoring_tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// E7 for Kolors' own peak curve: the TAESDXL + DA2 footprint is counted on the dense and the

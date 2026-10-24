@@ -98,7 +98,10 @@ fn packed_linear_round_trips(bits: usize) -> Result<()> {
     // (2) the dequant-on-forward is a bounded perturbation of the dense weight.
     let dense_lin = Linear::new(w, None);
     let x = acts(2, 5, in_dim, 11.0);
-    let cos = cosine(&packed.forward(&x)?, &dense_lin.forward(&x)?);
+    let cos = cosine(
+        &packed.forward(&x)?,
+        &__model_proof_output!(dense_lin.forward(&x))?,
+    );
     assert!(
         cos > 0.997,
         "Q{bits}: packed-load forward cosine {cos:.6} vs dense too low"
@@ -108,13 +111,19 @@ fn packed_linear_round_trips(bits: usize) -> Result<()> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn q4_packed_linear_round_trips_through_the_seam() -> Result<()> {
-    packed_linear_round_trips(4)
+    __model_proof_inspect!(packed_linear_round_trips(4), |_| {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_seam::q4_packed_linear_round_trips_through_the_seam");
+    })
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn q8_packed_linear_round_trips_through_the_seam() -> Result<()> {
-    packed_linear_round_trips(8)
+    __model_proof_inspect!(packed_linear_round_trips(8), |_| {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_seam::q8_packed_linear_round_trips_through_the_seam");
+    })
 }
 
 /// A leaf with **no** `.scales` sibling loads dense through the seam (`linear_detect` dense arm) — the
@@ -152,6 +161,7 @@ fn dense_leaf_stays_dense() -> Result<()> {
 /// equal** — otherwise the dense goldens would drift. A rank-3 `[B, S, in]` activation (the attention
 /// case) exercises candle's batched-broadcast `Linear::forward` vs the flattened `linear_nb`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn dense_forward_upcast_is_byte_identical_to_linear_nb() -> Result<()> {
     let (out_dim, in_dim) = (96usize, 128usize);
     let w_bf16 = dense(out_dim, in_dim, 5.0).to_dtype(DType::BF16)?;
@@ -171,5 +181,7 @@ fn dense_forward_upcast_is_byte_identical_to_linear_nb() -> Result<()> {
         d, 0.0,
         "dense forward_upcast must be byte-identical to linear_nb (max|Δ|={d:.3e})"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tier_seam::dense_forward_upcast_is_byte_identical_to_linear_nb");
     Ok(())
 }

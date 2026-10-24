@@ -30,8 +30,10 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.w1.forward(x)?.silu()?;
-        Ok(self.w2.forward(&(gate * self.w3.forward(x)?)?)?)
+        let gate = __model_proof_output!(self.w1.forward(x))?.silu()?;
+        Ok(__model_proof_output!(self.w2.forward(
+            &(gate * __model_proof_output!(self.w3.forward(x))?)?
+        ))?)
     }
 }
 
@@ -50,7 +52,9 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.fc2.forward(&self.fc1.forward(x)?.gelu_erf()?)?)
+        Ok(__model_proof_output!(self.fc2.forward(
+            &__model_proof_output!(self.fc1.forward(x))?.gelu_erf()?
+        ))?)
     }
 }
 
@@ -89,8 +93,8 @@ impl TimestepConditioner {
     /// `t`: `[N]` → `[N, hidden]`.
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
         let emb = timestep_embedding(t, self.freq_size, 10.0)?;
-        let h = self.mlp0.forward(&emb)?.silu()?;
-        Ok(self.mlp2.forward(&h)?)
+        let h = __model_proof_output!(self.mlp0.forward(&emb))?.silu()?;
+        Ok(__model_proof_output!(self.mlp2.forward(&h))?)
     }
 }
 
@@ -116,7 +120,7 @@ impl PatchTokenEmbedder {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.proj.forward(x)?;
+        let x = __model_proof_output!(self.proj.forward(x))?;
         match &self.norm {
             Some(nw) => rms(&x, nw, RMS_EPS),
             None => Ok(x),
@@ -139,7 +143,9 @@ impl FinalLayer {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(self.linear.forward(&rms(x, &self.norm, RMS_EPS)?)?)
+        Ok(__model_proof_output!(self
+            .linear
+            .forward(&rms(x, &self.norm, RMS_EPS)?))?)
     }
 }
 
@@ -257,7 +263,7 @@ impl PixelTokenEmbedder {
         let (hs, ws) = (hh / p, ww / p);
         // [B,C,H,W] -> [B,H,W,C] -> proj -> [B,H,W,D]
         let xt = x.permute((0, 2, 3, 1))?.contiguous()?;
-        let xp = self.proj.forward(&xt)?;
+        let xp = __model_proof_output!(self.proj.forward(&xt))?;
         let pos =
             sincos_2d_pos(self.dim, h, w, x.device())?.reshape((1, hh, ww, self.dim as usize))?;
         let xp = xp.broadcast_add(&pos)?;

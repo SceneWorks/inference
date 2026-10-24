@@ -41,6 +41,7 @@ thiserror = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-audio-yue2/model-inference-proof", "candle-audio/model-inference-proof"]
 default = []
 # Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`. Validated on
 # the CPU only. `provider::Transcriber::load` refuses a Metal device: the ConvNeXt GRN reduction runs

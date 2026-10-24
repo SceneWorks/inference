@@ -680,6 +680,7 @@ pub fn ios_bounder_with_premise(
             request_pricing,
             anchor_inputs.arch.latent_scale,
             states,
+            &mut request_inputs,
         )?;
         for bound in &mut bounds {
             if let IosWindowBound::Transfer {
@@ -760,6 +761,8 @@ fn proven_only_bounds(
 /// Body cancellation requires the SAME actual input dtype/shape and CFG-half/quantum.
 /// A promoted first request can match an anchor's promoted steady epoch, never its F16 body.
 /// Separately owned state/init use native lifetime proof, not guard-upper subtraction.
+/// Different initialization prefixes additionally retain a complete source-derived native upper;
+/// matching a promoted first input to a steady anchor never grants free first-use retirement.
 pub(crate) fn bound_ancestral_forward_windows(
     anchor: &Regime,
     anchor_pricing: &IosPricing,
@@ -767,6 +770,7 @@ pub(crate) fn bound_ancestral_forward_windows(
     request_pricing: &IosPricing,
     latent_scale: i32,
     states: [(Dtype, Dtype); 2],
+    request_inputs: &mut Inputs,
 ) -> Result<Vec<IosWindowBound>> {
     if anchor.sampling.route() != SamplingRoute::Ancestral
         || request.sampling.route() != SamplingRoute::Ancestral
@@ -783,6 +787,11 @@ pub(crate) fn bound_ancestral_forward_windows(
             "sdxl forward transfer has no source-matched execution domain".into(),
         ));
     }
+    let uncancelled = forward_prefix_differs(
+        (anchor.route, anchor.has_init, states[0].0),
+        (request.route, request.has_init, states[1].0),
+    );
+    let mut prefix_by_page = std::collections::BTreeMap::new();
     let mut bounds = Vec::new();
     for requested in request_pricing
         .windows
@@ -854,9 +863,22 @@ pub(crate) fn bound_ancestral_forward_windows(
                     states[1],
                     q::metal_reuse_upper_bytes,
                 )?;
+                let prefix = if uncancelled {
+                    if let Some(&upper) = prefix_by_page.get(&page) {
+                        upper
+                    } else {
+                        let upper =
+                            uncancelled_forward_prefix_upper(request_inputs, request, page)?;
+                        prefix_by_page.insert(page, upper);
+                        upper
+                    }
+                } else {
+                    0
+                };
                 candidates.push(IosAnchorCandidate {
                     anchor_class: anchor_class.into(),
-                    delta_growth_upper: i128::from(request_owned) - i128::from(anchor_owned),
+                    delta_growth_upper: i128::from(prefix) + i128::from(request_owned)
+                        - i128::from(anchor_owned),
                     physical_anchor_lower_bound: None,
                     witnesses: vec![witness],
                 });
@@ -872,6 +894,46 @@ pub(crate) fn bound_ancestral_forward_windows(
         }
     }
     Ok(bounds)
+}
+
+/// Equal forward dtypes do not prove equal initialization/first-use native owners.
+pub(crate) fn forward_prefix_differs(
+    anchor: (Route, bool, Dtype),
+    request: (Route, bool, Dtype),
+) -> bool {
+    anchor != request
+}
+
+pub(crate) fn uncancelled_forward_prefix_upper(
+    inputs: &mut Inputs,
+    request: &Regime,
+    page: u64,
+) -> Result<u64> {
+    native_ledger::uncancelled_forward_prefix_upper(inputs, request, page)
+}
+
+#[test]
+fn equal_forward_dtype_does_not_cancel_a_different_initialization_prefix() {
+    let text = (Route::Text, false, Dtype::Float16);
+    assert!(!forward_prefix_differs(text, text));
+    assert!(forward_prefix_differs(
+        text,
+        (Route::Reference, true, Dtype::Float32)
+    ));
+    assert!(
+        forward_prefix_differs(
+            (Route::Text, false, Dtype::Float32),
+            (Route::Reference, true, Dtype::Float32)
+        ),
+        "even equal first dtypes do not cancel VAE/noising work"
+    );
+    assert!(
+        forward_prefix_differs(
+            (Route::Reference, true, Dtype::Float32),
+            (Route::Mask, true, Dtype::Float32)
+        ),
+        "retained mask/noise work is a different source prefix"
+    );
 }
 
 /// Native body identity. On the ancestral route state dtype IS forward dtype.

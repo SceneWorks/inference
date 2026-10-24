@@ -73,4 +73,8 @@ fn encode_matches_diffusers() {
         peak < 0.10,
         "peak_rel {peak} above the attention-normalizer precision ceiling"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED encode_parity::encode_matches_diffusers");
 }

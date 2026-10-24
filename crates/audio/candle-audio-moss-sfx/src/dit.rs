@@ -41,8 +41,9 @@ impl RmsNormDim {
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
-        x.broadcast_div(&(ms + self.eps)?.sqrt()?)?
-            .broadcast_mul(&self.weight)
+        __model_proof_output!(x
+            .broadcast_div(&(ms + self.eps)?.sqrt()?)?
+            .broadcast_mul(&self.weight))
     }
 }
 
@@ -134,9 +135,13 @@ impl SelfAttention {
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> CandleResult<Tensor> {
-        let q = self.norm_q.forward(&self.q.forward(x)?)?;
-        let k = self.norm_k.forward(&self.k.forward(x)?)?;
-        let v = self.v.forward(x)?;
+        let q = self
+            .norm_q
+            .forward(&__model_proof_output!(self.q.forward(x))?)?;
+        let k = self
+            .norm_k
+            .forward(&__model_proof_output!(self.k.forward(x))?)?;
+        let v = __model_proof_output!(self.v.forward(x))?;
         let q = to_heads(&q, self.num_heads, self.head_dim)?;
         let k = to_heads(&k, self.num_heads, self.head_dim)?;
         let v = to_heads(&v, self.num_heads, self.head_dim)?;
@@ -144,7 +149,7 @@ impl SelfAttention {
         let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
         let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
         let out = attention(&q, &k, &v, self.head_dim)?;
-        self.o.forward(&from_heads(&out)?)
+        __model_proof_output!(self.o.forward(&from_heads(&out)?))
     }
 }
 
@@ -177,15 +182,19 @@ impl CrossAttention {
     /// `x` attends over the (pre-embedded) text context; the context K/V are precomputed once
     /// per denoise run by [`DiT::embed_context`] and reused across steps.
     fn forward(&self, x: &Tensor, ctx_k: &Tensor, ctx_v: &Tensor) -> CandleResult<Tensor> {
-        let q = self.norm_q.forward(&self.q.forward(x)?)?;
+        let q = self
+            .norm_q
+            .forward(&__model_proof_output!(self.q.forward(x))?)?;
         let q = to_heads(&q, self.num_heads, self.head_dim)?;
         let out = attention(&q, ctx_k, ctx_v, self.head_dim)?;
-        self.o.forward(&from_heads(&out)?)
+        __model_proof_output!(self.o.forward(&from_heads(&out)?))
     }
 
     fn context_kv(&self, ctx: &Tensor) -> CandleResult<(Tensor, Tensor)> {
-        let k = self.norm_k.forward(&self.k.forward(ctx)?)?;
-        let v = self.v.forward(ctx)?;
+        let k = self
+            .norm_k
+            .forward(&__model_proof_output!(self.k.forward(ctx))?)?;
+        let v = __model_proof_output!(self.v.forward(ctx))?;
         Ok((
             to_heads(&k, self.num_heads, self.head_dim)?,
             to_heads(&v, self.num_heads, self.head_dim)?,
@@ -246,13 +255,15 @@ impl Block {
             .forward(&input_x, cos, sin)?
             .broadcast_mul(&gate_msa)?)?;
         let x = (&x
-            + self
-                .cross_attn
-                .forward(&self.norm3.forward(&x)?, ctx_k, ctx_v)?)?;
+            + self.cross_attn.forward(
+                &__model_proof_output!(self.norm3.forward(&x))?,
+                ctx_k,
+                ctx_v,
+            )?)?;
         let input_x = modulate(&layer_norm_no_affine(&x, self.eps)?, &shift_mlp, &scale_mlp)?;
-        let ffn = self
+        let ffn = __model_proof_output!(self
             .ffn_out
-            .forward(&self.ffn_in.forward(&input_x)?.gelu()?)?;
+            .forward(&__model_proof_output!(self.ffn_in.forward(&input_x))?.gelu()?))?;
         &x + ffn.broadcast_mul(&gate_mlp)?
     }
 }
@@ -325,9 +336,9 @@ impl DiT {
     /// Linear) and precompute every block's cross-attention K/V — timestep-independent, done
     /// once per prompt per run.
     pub fn embed_context(&self, context: &Tensor) -> CandleResult<ContextKv> {
-        let ctx = self
+        let ctx = __model_proof_output!(self
             .text_emb_2
-            .forward(&self.text_emb_1.forward(context)?.gelu()?)?;
+            .forward(&__model_proof_output!(self.text_emb_1.forward(context))?.gelu()?))?;
         let mut per_block = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             per_block.push(block.cross_attn.context_kv(&ctx)?);
@@ -355,18 +366,17 @@ impl DiT {
         let device = latents.device();
         // Timestep embedding (f64 host math, then the SiLU MLP) + 6-way projection.
         let t_emb = sinusoidal_embedding(self.cfg.freq_dim, timestep, device)?;
-        let t = self
+        let t = __model_proof_output!(self
             .time_emb_2
-            .forward(&self.time_emb_1.forward(&t_emb)?.silu()?)?; // [1, dim]
-        let t_mod = self
-            .time_proj
-            .forward(&t.silu()?)?
-            .reshape((1, 6, self.cfg.dim))?;
+            .forward(&__model_proof_output!(self.time_emb_1.forward(&t_emb))?.silu()?))?; // [1, dim]
+        let t_mod = __model_proof_output!(self.time_proj.forward(&t.silu()?))?.reshape((
+            1,
+            6,
+            self.cfg.dim,
+        ))?;
 
         // Patchify: Conv1d(k=s=patch) then [B, C, F] → [B, F, C].
-        let mut x = self
-            .patch_embedding
-            .forward(latents)?
+        let mut x = __model_proof_output!(self.patch_embedding.forward(latents))?
             .transpose(1, 2)?
             .contiguous()?;
 
@@ -385,7 +395,7 @@ impl DiT {
         let x = modulate(&layer_norm_no_affine(&x, self.cfg.eps)?, &shift, &scale)?;
         // Head projection [B, F, out_dim·p], then unpatchify `b f (p c) -> b c (f p)`
         // (p = 1 for the shipped checkpoint).
-        let x = self.head.forward(&x)?;
+        let x = __model_proof_output!(self.head.forward(&x))?;
         let out = x.transpose(1, 2)?.contiguous()?;
         Ok(Some(out))
     }

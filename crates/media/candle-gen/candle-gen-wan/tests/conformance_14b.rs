@@ -63,4 +63,7 @@ fn wan14b_t2v_conformance() {
         },
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance_14b::wan14b_t2v_conformance");
 }

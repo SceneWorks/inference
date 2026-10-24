@@ -280,6 +280,7 @@ fn probes_of(fixture: &Value, phase: Phase) -> Vec<u32> {
 const SYNTHETIC_ABS: f64 = 2e-5;
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn synthetic_decodes_match_upstream() {
     let fixture: Value =
         serde_json::from_str(include_str!("../tests/fixtures/ar_synthetic.json")).unwrap();
@@ -307,6 +308,9 @@ fn synthetic_decodes_match_upstream() {
     }
     println!("all synthetic cases: {all:?}");
     assert!(all.steps >= 80, "fixture cases went missing: {all:?}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity::synthetic_decodes_match_upstream");
 }
 
 fn sha(values: &[f32]) -> String {
@@ -756,6 +760,9 @@ fn real_weight_decodes_match_upstream() {
         cache_worst <= CACHE_ABS,
         "cache vs recompute {cache_worst:e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED parity::real_weight_decodes_match_upstream");
 }
 
 /// The top-k comparison: top-1 and set membership are exact; an order swap counts only when the

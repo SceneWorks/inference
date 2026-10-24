@@ -715,6 +715,7 @@ mod tests {
     /// the resident load casts those leaves to the compute dtype (`loader::cast_for_load`); on the
     /// host it leaves them stored (sc-26270 E2: host bits unchanged). Either way a streamed block
     /// must come back with its resident twin's dtypes and run the same forward, bit for bit.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block() {
         let _cpu = crate::test_device::cpu_only();
@@ -813,8 +814,18 @@ mod tests {
             let x = ramp(&[1, 16, DIMS], 0.0);
             let memory = ramp(&[1, 7, DIMS], 3.0);
             let plan = crate::plan::SdxlForwardPlan::default();
-            let r = resident.forward_ip(&x, &memory, None, plan).unwrap();
-            let t = streamed.forward_ip(&x, &memory, None, plan).unwrap();
+            let r = (
+                crate::test_device::record_model_inference_device(),
+                resident.forward_ip(&x, &memory, None, plan),
+            )
+                .1
+                .unwrap();
+            let t = (
+                crate::test_device::record_model_inference_device(),
+                streamed.forward_ip(&x, &memory, None, plan),
+            )
+                .1
+                .unwrap();
             // iOS: the f16 leaves keep the window at f16 (on the host the stored leaves decide it,
             // exactly as every release before sc-26268).
             if ios {
@@ -837,6 +848,8 @@ mod tests {
         };
         check(false).unwrap();
         mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || check(true)).unwrap();
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED block_stream::tests::a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block");
     }
 
     /// Captured residual adapters travel onto a materialized block, per block — a LoRA installed on

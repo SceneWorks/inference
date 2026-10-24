@@ -153,4 +153,6 @@ fn pulid_flux_quant_holds_identity() {
         );
         // `model` (and its quantized FLUX backbone) drops here, freeing it before the next quant.
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pulid_flux_quant::pulid_flux_quant_holds_identity");
 }

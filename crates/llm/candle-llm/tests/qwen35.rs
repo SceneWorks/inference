@@ -12,6 +12,15 @@
 //! `qwen3_5`), coherent greedy text on real weights, the thinking / no-think split driven by the
 //! model's own chat template, quantize-on-load, and the full `core-llm-testkit` conformance suite.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::load_for_model;
 use candle_llm::provider::{can_load, PROVIDER_ID};
 use candle_llm::LlamaProvider;
@@ -98,6 +107,9 @@ fn qwen35_resolves_dispatch_and_coherent_text() {
         content.to_lowercase().contains("paris"),
         "greedy answer should be coherent and name Paris, got: {content:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_resolves_dispatch_and_coherent_text");
 }
 
 #[test]
@@ -162,6 +174,9 @@ fn qwen35_thinking_and_nothink() {
         !ncontent.trim().is_empty(),
         "no-think must produce a direct answer"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_thinking_and_nothink");
 }
 
 #[test]
@@ -191,6 +206,9 @@ fn qwen35_quantize_on_load_q8() {
         !content.trim().is_empty(),
         "quantized model must still generate text"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_quantize_on_load_q8");
 }
 
 /// A conformance profile tuned for a strong 27B. The default `cheap()` profile ("Hello", 16 tokens,
@@ -221,4 +239,7 @@ fn qwen35_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load qwen3.6 provider")),
         &qwen35_profile(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen35_passes_core_llm_conformance");
 }

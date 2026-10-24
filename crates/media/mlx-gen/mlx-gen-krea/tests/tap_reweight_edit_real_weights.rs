@@ -242,4 +242,8 @@ fn text_style_gain_edit_sweep() {
         "\nsc-12009 edit OK: g=1.0 no-op (MAD 0), g=1.75 MAD {mad_hi:.3} > g=0.5 MAD {mad_lo:.3} \
          (tap-reweight reaches the grounded image-edit lane)."
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tap_reweight_edit_real_weights::text_style_gain_edit_sweep"
+    );
 }

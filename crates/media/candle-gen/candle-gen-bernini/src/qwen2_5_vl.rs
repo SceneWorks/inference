@@ -225,7 +225,7 @@ impl Qwen25VlText {
             .to_dtype(DType::U32)?
             .to_device(self.embed_tokens.device())?;
         let h = self.embed_tokens.dim(1)?;
-        let g = self.embed_tokens.index_select(&flat, 0)?;
+        let g = __model_proof_output!(self.embed_tokens.index_select(&flat, 0))?;
         Ok(g.reshape((b, l, h))?)
     }
 
@@ -596,6 +596,7 @@ mod tests {
     /// `[-1]`, so skipping them cannot perturb `[-2]`. Checked across a multi-layer stack and the
     /// empty-stack edge (where `[-2]` is `embeds` itself).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn penultimate_matches_forward() {
         let dev = Device::Cpu;
         let l = 6usize;
@@ -632,6 +633,9 @@ mod tests {
         let (embeds, pos, mask) = mk_inputs(&cfg0);
         let got0 = bb0.penultimate(&embeds, &pos, &mask).unwrap();
         assert_eq!(max_abs(&got0, &embeds), 0.0, "empty stack → embeds");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen2_5_vl::tests::penultimate_matches_forward");
     }
 
     // --- sc-11062: packed-detect planner LLM linears --------------------------------------------
@@ -678,6 +682,7 @@ mod tests {
     /// 64, intermediate 128) mirror the real 7B backbone (hidden 3584 = 56·64, intermediate 18944 =
     /// 296·64, kv 512 = 8·64 all group-64-aligned).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn attn_and_mlp_load_packed_when_scales_present() {
         use candle_gen::candle_core::safetensors::MmapedSafetensors;
         let dev = Device::Cpu;
@@ -815,5 +820,8 @@ mod tests {
         assert!(!da.o.is_packed(), "no `.scales` ⇒ dense o");
 
         std::fs::remove_file(&dtmp).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen2_5_vl::tests::attn_and_mlp_load_packed_when_scales_present");
     }
 }

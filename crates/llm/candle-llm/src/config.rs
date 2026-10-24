@@ -1089,7 +1089,13 @@ impl ModelConfig {
         } else {
             dir.to_path_buf()
         };
-        let text = std::fs::read_to_string(&path)?;
+        let text = crate::__model_input_reader!(
+            std::fs::read_to_string(&path),
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697",
+            ArtifactInput,
+            &path,
+            |__model_input_path| std::fs::read_to_string(__model_input_path)
+        )?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
         Self::from_json(&v)

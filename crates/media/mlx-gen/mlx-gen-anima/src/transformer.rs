@@ -1875,6 +1875,7 @@ mod bounded_attention_tests {
 
     /// The plan reaches BOTH DiT attentions, and it really chunks at each of them.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_attention_plan_reaches_both_dit_attentions_and_chunks() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1923,12 +1924,16 @@ mod bounded_attention_tests {
                 "{label}: a tripped cancel must not affect the unbounded (default) forward"
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_attention_plan_reaches_both_dit_attentions_and_chunks");
     }
 
     /// Bounded attention is a memory-shape choice, not a numeric one: a plan that chunks BOTH
     /// attentions must reproduce the unbounded velocity, and the default `forward` must be
     /// **exactly** the explicitly-unbounded one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_chunked_forward_matches_the_unbounded_forward() {
         let cfg = cfg();
         let model = CosmosDiT::synthetic(cfg, 11);
@@ -1966,5 +1971,8 @@ mod bounded_attention_tests {
             )
             .unwrap();
         assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_chunked_forward_matches_the_unbounded_forward");
     }
 }

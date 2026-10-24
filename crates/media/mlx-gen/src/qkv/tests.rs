@@ -727,6 +727,7 @@ fn dense_triple(inp: i32, q_out: i32, kv_out: i32, bias: bool) -> FusedQkvProjec
 /// 3. the packed matrix is a **single** `[q+k+v, in]` array, so the fused arm cannot be reading the
 ///    three bases: they no longer exist on that object.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert() {
     use crate::diagnostics::{
         self, DiagnosticCounter, ToggleDisposition, FUSED_ATTENTION_PRIMITIVES,
@@ -808,6 +809,8 @@ fn fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert() {
             "bias={bias}: both unfused arms must report the P4 toggle Fallback"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert");
 }
 
 /// **The compiled-in default, pinned: fusion is OPT-IN** (Michael, 2026-08-16).
@@ -832,6 +835,7 @@ fn fused_and_unfused_are_bit_exact_and_the_toggle_is_not_inert() {
 /// * [`FusedQkvGuard`] restores the **default**, not `true`, on drop — which is what keeps every
 ///   other test in this file from leaking an opt-in into this one.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn fusion_is_opt_in_so_an_eligible_triple_is_split_by_default() {
     // The harness is single-threaded (`.cargo/config.toml` forces `RUST_TEST_THREADS=1`, so libtest
     // runs every test on this one thread) and nothing in this crate calls `set_fused_qkv` outside a
@@ -901,11 +905,14 @@ fn fusion_is_opt_in_so_an_eligible_triple_is_split_by_default() {
         !fused_qkv(),
         "the guard must restore the opt-in default (off), not leave the thread fused"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::fusion_is_opt_in_so_an_eligible_triple_is_split_by_default");
 }
 
 /// `forward_packed` (the single `[.., q+k+v]` array the primitive's [`QkvSource::Packed`] arm
 /// consumes) must be the concatenation of the three separate forwards, fused or not.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn forward_packed_matches_the_concatenated_separate_forwards() {
     let x = seq(&[1, 5, 32], 0.011, 0.5);
     let unfused = {
@@ -927,6 +934,8 @@ fn forward_packed_matches_the_concatenated_separate_forwards() {
         &reference,
         "forward_packed",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::forward_packed_matches_the_concatenated_separate_forwards");
 }
 
 /// The packed matrix is the SOLE retained copy of the three bases, so `unfuse` must recover them
@@ -934,6 +943,7 @@ fn forward_packed_matches_the_concatenated_separate_forwards() {
 /// after load would silently change the base model. Asserted for dense and for Q4/Q8, where the
 /// row split has to carry `weight`, `scales`, `biases` and the dense `bias` together.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn unfusing_recovers_the_three_bases_exactly() {
     let x = seq(&[1, 4, 128], 0.005, 0.35);
     for quant in [None, Some(4), Some(8)] {
@@ -1027,6 +1037,10 @@ fn unfusing_recovers_the_three_bases_exactly() {
         assert!(exact(&packed.1, &again.1), "quant={quant:?}: k round trip");
         assert!(exact(&packed.2, &again.2), "quant={quant:?}: v round trip");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::unfusing_recovers_the_three_bases_exactly"
+    );
 }
 
 /// **The designed-against failure.** P4 is the first read-side fusion that must consult
@@ -1043,6 +1057,7 @@ fn unfusing_recovers_the_three_bases_exactly() {
 /// Claim 4 is the one that catches a silent drop: without it, a fusion that ignored the adapter
 /// stack would satisfy claims 1–3 by returning the base output twice.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_live_adapter_forces_the_split_backing_and_is_never_dropped() {
     use crate::adapters::Adapter;
 
@@ -1104,12 +1119,15 @@ fn a_live_adapter_forces_the_split_backing_and_is_never_dropped() {
         "an adapter installed at scale 0 is a no-op and must not disable fusion"
     );
     assert!(exact(&proj.forward(&x).unwrap().0, &unadapted));
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::a_live_adapter_forces_the_split_backing_and_is_never_dropped");
 }
 
 /// Quantized fusion must be **bit-exact** and must not change effective bits: the packed matrix
 /// carries the same `bits`/`group_size` and each row keeps the scales it was quantized with, because
 /// the concatenation is on the OUTPUT axis while the affine groups run along the input axis.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn quantized_fusion_is_bit_exact_and_preserves_effective_bits() {
     for bits in [4, 8] {
         let x = seq(&[1, 4, 128], 0.003, 0.25);
@@ -1149,6 +1167,8 @@ fn quantized_fusion_is_bit_exact_and_preserves_effective_bits() {
             "the packed matrix must declare its parts' bits and group size verbatim"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::quantized_fusion_is_bit_exact_and_preserves_effective_bits");
 }
 
 /// **Boogu, at its real numbers.** `mlx-gen-boogu/src/quant.rs` sets `GROUP_SIZE = 32` — explicit
@@ -1162,6 +1182,7 @@ fn quantized_fusion_is_bit_exact_and_preserves_effective_bits() {
 /// to `DEFAULT_GROUP_SIZE = 64`, and nothing in [`FusedQkvProjection`] builds a cross-family matrix
 /// at all.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn boogus_group_32_kv_projections_are_refused_not_papered_over() {
     const GROUP: i32 = 32;
 
@@ -1201,6 +1222,8 @@ fn boogus_group_32_kv_projections_are_refused_not_papered_over() {
     assert_eq!(q.shape(), [1, 2, 3360]);
     assert_eq!(k.shape(), [1, 2, 840]);
     assert_eq!(v.shape(), [1, 2, 840]);
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::boogus_group_32_kv_projections_are_refused_not_papered_over");
 }
 
 /// The remaining refusal reasons, each pinned so a future relaxation is a deliberate edit.
@@ -1427,6 +1450,7 @@ fn every_adopted_family_geometry_is_group_aligned() {
 ///    fusion that never engaged passes claims 1 and 2 trivially -- which is the single most likely
 ///    way this ships broken.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes() {
     for g in ADOPTED {
         for dtype in [Dtype::Float32, Dtype::Bfloat16] {
@@ -1474,6 +1498,8 @@ fn every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes");
 }
 
 /// The same fixture on a **quantized** base at each family's own group size, at both compute
@@ -1484,6 +1510,7 @@ fn every_adopted_family_is_bit_exact_at_production_geometry_in_both_dtypes() {
 /// the arm was not packed and the equality proves nothing. (`anima-cond` is excluded: its
 /// conditioner is dense on every tier, `convert.rs`'s predicate skips `llm_adapter.*` outright.)
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size() {
     for g in ADOPTED.iter().filter(|g| g.family != "anima-cond") {
         for bits in [4, 8] {
@@ -1515,6 +1542,8 @@ fn every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size");
 }
 
 /// **The LoRA-active fixture**, per adopted family, at production width and at both dtypes.
@@ -1527,6 +1556,7 @@ fn every_adopted_family_is_bit_exact_when_quantized_at_its_own_group_size() {
 ///    that silently dropped the residual would satisfy the first one perfectly: both arms would
 ///    return the base output, equal to each other and wrong.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_live_lora_survives_fusion_at_every_adopted_family_geometry() {
     use crate::adapters::Adapter;
 
@@ -1598,6 +1628,8 @@ fn a_live_lora_survives_fusion_at_every_adopted_family_geometry() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qkv::tests::a_live_lora_survives_fusion_at_every_adopted_family_geometry");
 }
 
 // ── the probe/mutate split ───────────────────────────────────────────────────────────────────

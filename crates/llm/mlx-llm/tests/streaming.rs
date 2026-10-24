@@ -99,6 +99,7 @@ fn greedy(max_new_tokens: usize) -> GenerationConfig {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn streams_up_to_max_tokens() {
     let cfg = tiny_config();
@@ -130,8 +131,11 @@ fn streams_up_to_max_tokens() {
             generated: 5
         })
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streaming::streams_up_to_max_tokens");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn generation_is_deterministic_for_fixed_seed() {
     let cfg = tiny_config();
@@ -148,8 +152,13 @@ fn generation_is_deterministic_for_fixed_seed() {
         .tokens
     };
     assert_eq!(run(), run());
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED streaming::generation_is_deterministic_for_fixed_seed"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mid_stream_cancel_stops_early_and_is_partial() {
     let cfg = tiny_config();
@@ -171,8 +180,13 @@ fn mid_stream_cancel_stops_early_and_is_partial() {
     // Stopped promptly: the loop breaks on the next iteration's cancel check.
     assert!(out.tokens.len() <= 3, "got {} tokens", out.tokens.len());
     assert!(out.tokens.len() >= 2);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED streaming::mid_stream_cancel_stops_early_and_is_partial"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn already_cancelled_returns_typed_error() {
     let cfg = tiny_config();
@@ -181,8 +195,11 @@ fn already_cancelled_returns_typed_error() {
     cancel.cancel();
     let res = generate(&model, &[1, 2, 3], &greedy(5), &cancel, &mut |_| {});
     assert!(matches!(res, Err(mlx_llm::Error::Canceled)));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streaming::already_cancelled_returns_typed_error");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn stop_token_halts_before_emitting_it() {
     let cfg = tiny_config();
@@ -216,16 +233,22 @@ fn stop_token_halts_before_emitting_it() {
             generated: 0
         })
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streaming::stop_token_halts_before_emitting_it");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn empty_prompt_errors() {
     let cfg = tiny_config();
     let model = tiny_model(&cfg);
     let res = generate(&model, &[], &greedy(5), &CancelFlag::new(), &mut |_| {});
     assert!(res.is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streaming::empty_prompt_errors");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_trait_object_works() {
     // The loop drives `&dyn Decode`, not a concrete type.
@@ -241,4 +264,6 @@ fn decode_trait_object_works() {
     )
     .unwrap();
     assert_eq!(out.tokens.len(), 3);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED streaming::decode_trait_object_works");
 }

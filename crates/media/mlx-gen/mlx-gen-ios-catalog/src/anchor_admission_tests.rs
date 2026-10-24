@@ -1096,6 +1096,8 @@ fn premise_dependent_bounds_need_explicit_approval_of_every_premise() {
 #[test]
 fn only_providers_exposing_source_bounders_are_registered() {
     for provider in [
+        "sana_1600m",
+        "sana_sprint_1600m",
         crate::sdxl::SDXL_ID,
         crate::zimage::Z_IMAGE_TURBO_ID,
         crate::zimage::Z_IMAGE_TURBO_CONTROL_ID,
@@ -1108,16 +1110,11 @@ fn only_providers_exposing_source_bounders_are_registered() {
             "{provider}"
         );
     }
-    for provider in [
-        "sana_1600m",
-        "sana_sprint_1600m",
-        crate::anima::ANIMA_TURBO_ID,
-    ] {
-        assert!(
-            crate::pricing::provider_bounder(provider).is_none(),
-            "{provider}"
-        );
-    }
+    let provider = crate::anima::ANIMA_TURBO_ID;
+    assert!(
+        crate::pricing::provider_bounder(provider).is_none(),
+        "{provider}"
+    );
 }
 
 /// The synthetic native bounder plus a DECLARED source-derived host-growth upper per class.

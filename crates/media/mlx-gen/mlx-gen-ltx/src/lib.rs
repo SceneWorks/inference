@@ -600,3 +600,6 @@ mod compile_glue_guard_tests {
         set_compile_glue(false);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

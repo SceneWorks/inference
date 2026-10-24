@@ -32,6 +32,12 @@ impl Weights {
         let path = path.as_ref();
         let tensors = candle_core::safetensors::load(path, device)
             .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "candle-llm::primitives::Weights::from_file",
+            crate::model_input_proof::InputRole::ModelWeights,
+            &[path],
+        );
         Ok(Self {
             tensors,
             device: device.clone(),
@@ -57,7 +63,9 @@ impl Weights {
                 dir.display()
             )));
         }
-        shards.sort(); // deterministic merge order
+        shards.sort();
+        #[cfg(feature = "model-inference-proof")]
+        let __input_paths = shards.clone(); // deterministic merge order
         let mut tensors = HashMap::new();
         for shard in shards {
             let read = |e: candle_core::Error| {
@@ -75,6 +83,12 @@ impl Weights {
                 tensors.insert(name, view.load(target).map_err(read)?);
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "candle-llm::primitives::Weights::from_dir",
+            crate::model_input_proof::InputRole::ModelWeights,
+            &__input_paths,
+        );
         Ok(Self {
             tensors,
             device: device.clone(),
@@ -104,7 +118,9 @@ impl Weights {
                 dir.display()
             )));
         }
-        shards.sort(); // deterministic merge order
+        shards.sort();
+        #[cfg(feature = "model-inference-proof")]
+        let __input_paths = shards.clone(); // deterministic merge order
         let mut tensors = HashMap::new();
         for shard in shards {
             // Read the shard onto the host, then hand each tensor to its target device. The host map
@@ -117,6 +133,12 @@ impl Weights {
                 tensors.insert(key, t);
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_input_proof::record_reader_paths(
+            "candle-llm::primitives::Weights::from_dir_sharded",
+            crate::model_input_proof::InputRole::ModelWeights,
+            &__input_paths,
+        );
         Ok(Self { tensors, device })
     }
 

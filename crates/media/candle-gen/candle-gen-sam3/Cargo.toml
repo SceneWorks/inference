@@ -25,6 +25,7 @@ candle-nn = { workspace = true }
 tokenizers = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features cuda`/`metal`
 # selects the matching candle backend everywhere (SAM3 runs f32 for parity; the device follows the
 # build so the worker keeps one device across the person-track pipeline).

@@ -79,7 +79,7 @@ fn max_abs_delta(a: &Array, b: &Array) -> f32 {
 /// non-zero delta here means the streamed and resident stacks are not the same computation — a
 /// tolerance would let that hide.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_streamed_encoder_matches_the_resident_encoder_exactly() {
     let tier = snapshot();
     let dir = te_dir(&tier);
@@ -112,6 +112,9 @@ fn the_streamed_encoder_matches_the_resident_encoder_exactly() {
              stacks are not the same computation"
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::the_streamed_encoder_matches_the_resident_encoder_exactly");
 }
 
 /// A streamable encoder holds **no resident layers** — that is where its saving comes from. So a
@@ -121,7 +124,7 @@ fn the_streamed_encoder_matches_the_resident_encoder_exactly() {
 /// token embedding as `cap_feats`, and the DiT would happily denoise it into a plausible-looking image
 /// that ignored the prompt. No memory assertion and no compile error would catch it — only this.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer() {
     let tier = snapshot();
     let dir = te_dir(&tier);
@@ -169,6 +172,9 @@ fn the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer() {
         "the metric cannot distinguish a full encode from the bare embedding ({dropped:e}) — the \
          assertion above would pass even with every layer skipped"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer");
 }
 
 /// The **policy gate**: only the `Sequential` loader builds a streamable encoder.
@@ -179,7 +185,7 @@ fn the_unscoped_forward_on_a_streamable_encoder_still_runs_every_layer() {
 /// Making the streamable loader unconditional is an easy and completely silent regression: nothing
 /// about the output changes, so only a test that looks at *which loader ran* can catch it.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn only_the_sequential_loader_builds_a_streamable_encoder() {
     let tier = snapshot();
     let resident = mlx_gen_z_image::load_text_encoder(&tier).expect("resident loader");
@@ -194,6 +200,9 @@ fn only_the_sequential_loader_builds_a_streamable_encoder() {
         "the Sequential loader did not build a streamable encoder — rung 4's text-encoder scope \
          would silently never engage"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::only_the_sequential_loader_builds_a_streamable_encoder");
 }
 
 /// **The bound.** Peak active bytes across the conditioning forward, by window size.
@@ -201,7 +210,7 @@ fn only_the_sequential_loader_builds_a_streamable_encoder() {
 /// The resident arm holds all 36 layers; each streamed arm holds `window` at a time. A rung-4
 /// implementation that is correct but saves nothing passes the identity test above and fails here.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_window_bounds_the_conditioning_peak() {
     let tier = snapshot();
     let dir = te_dir(&tier);
@@ -284,6 +293,9 @@ fn the_window_bounds_the_conditioning_peak() {
             gib(pa)
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::the_window_bounds_the_conditioning_peak");
 }
 
 /// Cancellation lands at a window boundary and surfaces as the **typed** error.
@@ -291,7 +303,7 @@ fn the_window_bounds_the_conditioning_peak() {
 /// A stringified cancellation reports a cancelled render as a FAILED job (sc-4481), and the window
 /// boundary is the only place inside a conditioning forward where a cancel can land at all.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn a_cancel_stops_the_streamed_encoder_at_a_window_boundary() {
     let tier = snapshot();
     let dir = te_dir(&tier);
@@ -317,6 +329,9 @@ fn a_cancel_stops_the_streamed_encoder_at_a_window_boundary() {
     assert!(streamed
         .forward_windowed(&input_ids, &attention_mask, 1, &live)
         .is_ok());
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_window_real_weights::a_cancel_stops_the_streamed_encoder_at_a_window_boundary");
 }
 
 /// An encoder built without a re-openable source must **refuse** the rung rather than silently

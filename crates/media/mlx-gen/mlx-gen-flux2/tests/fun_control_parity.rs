@@ -107,6 +107,7 @@ fn mod_pair(w: &Weights, stream: &str) -> [(Array, Array, Array); 2] {
 /// carries the control-branch weights under the checkpoint key names, including the diffusers
 /// `attn.to_out.0` Sequential — so this drives them through the same `attn.to_out.0` → `attn.to_out`
 /// alias the production `load_control_transformer_dev` applies before `from_weights`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_control_hints_match_videox_reference() {
     let cfg = small_cfg();
@@ -161,6 +162,8 @@ fn forward_control_hints_match_videox_reference() {
         "✓ FLUX.2 VACE control hints match VideoX-Fun: 3 × {:?}  worst max|Δ| {worst:.3e}",
         hints[0].shape()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fun_control_parity::forward_control_hints_match_videox_reference");
 }
 
 /// GAP 2: the production packed control context byte-matches the fork's

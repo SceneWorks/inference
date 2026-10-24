@@ -247,10 +247,14 @@ fn backbone_parity_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_streamed_backbone_reproduces_the_resident_one() {
     in_cpu_child(
         "stream_tests::a_streamed_backbone_reproduces_the_resident_one",
-        backbone_parity_body,
+        || {
+            backbone_parity_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::a_streamed_backbone_reproduces_the_resident_one");
+        },
     );
 }
 
@@ -351,10 +355,14 @@ fn tower_parity_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_streamed_text_tower_reproduces_the_resident_one() {
     in_cpu_child(
         "stream_tests::a_streamed_text_tower_reproduces_the_resident_one",
-        tower_parity_body,
+        || {
+            tower_parity_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::a_streamed_text_tower_reproduces_the_resident_one");
+        },
     );
 }
 
@@ -484,10 +492,14 @@ fn generation_parity_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_deferred_generation_reproduces_the_eager_one() {
     in_cpu_child(
         "stream_tests::a_deferred_generation_reproduces_the_eager_one",
-        generation_parity_body,
+        || {
+            generation_parity_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::a_deferred_generation_reproduces_the_eager_one");
+        },
     );
 }
 
@@ -543,10 +555,14 @@ fn downstream_parity_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn deferred_depth_and_restoration_reproduce_the_eager_ones() {
     in_cpu_child(
         "stream_tests::deferred_depth_and_restoration_reproduce_the_eager_ones",
-        downstream_parity_body,
+        || {
+            downstream_parity_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::deferred_depth_and_restoration_reproduce_the_eager_ones");
+        },
     );
 }
 
@@ -683,10 +699,14 @@ fn residency_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_streamed_load_holds_its_skeleton_and_releases_every_window() {
     in_cpu_child(
         "stream_tests::a_streamed_load_holds_its_skeleton_and_releases_every_window",
-        residency_body,
+        || {
+            residency_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::a_streamed_load_holds_its_skeleton_and_releases_every_window");
+        },
     );
 }
 
@@ -1290,9 +1310,13 @@ fn pricing_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_pricing_states_the_largest_check_of_every_phase() {
     in_cpu_child(
         "stream_tests::the_pricing_states_the_largest_check_of_every_phase",
-        pricing_body,
+        || {
+            pricing_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED stream_tests::the_pricing_states_the_largest_check_of_every_phase");
+        },
     );
 }

@@ -64,8 +64,8 @@ impl ClipBlock {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let h = layer_norm(input, &self.ln1w, &self.ln1b, 1e-5)?;
-        let qkv = linear(&h, &self.qkvw, Some(&self.qkvb))?;
+        let h = __model_proof_output!(layer_norm(input, &self.ln1w, &self.ln1b, 1e-5))?;
+        let qkv = __model_proof_output!(linear(&h, &self.qkvw, Some(&self.qkvb)))?;
         let (batch, seq, _) = qkv.dims3()?;
         let head = CLIP_WIDTH / CLIP_HEADS;
         let split = |start| -> Result<Tensor> {
@@ -86,13 +86,14 @@ impl ClipBlock {
         .transpose(1, 2)?
         .contiguous()?
         .reshape((batch, seq, CLIP_WIDTH))?;
-        let residual = (input + linear(&attn, &self.outw, Some(&self.outb))?)?;
-        let mlp = clip_quick_gelu(&linear(
-            &layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5)?,
+        let residual =
+            (input + __model_proof_output!(linear(&attn, &self.outw, Some(&self.outb)))?)?;
+        let mlp = clip_quick_gelu(&__model_proof_output!(linear(
+            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?,
             &self.fcw,
             Some(&self.fcb),
-        )?)?;
-        Ok((&residual + linear(&mlp, &self.projw, Some(&self.projb))?)?)
+        ))?)?;
+        Ok((&residual + __model_proof_output!(linear(&mlp, &self.projw, Some(&self.projb)))?)?)
     }
 }
 
@@ -148,11 +149,11 @@ impl StarVectorClip {
                 .positions
                 .reshape((1, STARVECTOR_IMAGE_TOKENS, CLIP_WIDTH))?,
         )?;
-        h = layer_norm(&h, &self.ln_pre_w, &self.ln_pre_b, 1e-5)?;
+        h = __model_proof_output!(layer_norm(&h, &self.ln_pre_w, &self.ln_pre_b, 1e-5))?;
         for block in &self.blocks {
             h = block.forward(&h)?;
         }
-        layer_norm(&h, &self.ln_out_w, &self.ln_out_b, 1e-5)
+        __model_proof_output!(layer_norm(&h, &self.ln_out_w, &self.ln_out_b, 1e-5))
     }
 }
 
@@ -182,9 +183,9 @@ impl StarVectorAdapter {
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = linear(x, &self.fcw, Some(&self.fcb))?;
+        let h = __model_proof_output!(linear(x, &self.fcw, Some(&self.fcb)))?;
         let h = (&h * candle_nn::ops::sigmoid(&h)?)?;
-        let h = linear(&h, &self.projw, Some(&self.projb))?;
+        let h = __model_proof_output!(linear(&h, &self.projw, Some(&self.projb)))?;
         let (_, tokens, hidden) = h.dims3()?;
         if tokens != STARVECTOR_IMAGE_TOKENS || hidden != STARVECTOR_HIDDEN {
             return Err(Error::Msg("starvector adapter shape mismatch".into()));
@@ -292,8 +293,8 @@ impl BigCodeBlock {
         cache: &mut dyn KvCache,
         layer: usize,
     ) -> Result<Tensor> {
-        let h = layer_norm(input, &self.ln1w, &self.ln1b, 1e-5)?;
-        let qkv = linear(&h, &self.qkvw, Some(&self.qkvb))?;
+        let h = __model_proof_output!(layer_norm(input, &self.ln1w, &self.ln1b, 1e-5))?;
+        let qkv = __model_proof_output!(linear(&h, &self.qkvw, Some(&self.qkvb)))?;
         let (b, s, _) = qkv.dims3()?;
         let q = qkv.narrow(2, 0, geometry.hidden)?.reshape((
             b,
@@ -306,13 +307,14 @@ impl BigCodeBlock {
         let v = qkv.narrow(2, geometry.hidden + head, head)?.contiguous()?;
         let (keys, values) = cache.update(layer, &k.unsqueeze(1)?, &v.unsqueeze(1)?)?;
         let attn = multi_query_attention_split(&q, &keys.squeeze(1)?, &values.squeeze(1)?, past)?;
-        let residual = (input + linear(&attn, &self.outw, Some(&self.outb))?)?;
-        let mlp = gelu(&linear(
-            &layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5)?,
+        let residual =
+            (input + __model_proof_output!(linear(&attn, &self.outw, Some(&self.outb)))?)?;
+        let mlp = gelu(&__model_proof_output!(linear(
+            &__model_proof_output!(layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5))?,
             &self.fcw,
             Some(&self.fcb),
-        )?)?;
-        Ok((&residual + linear(&mlp, &self.projw, Some(&self.projb))?)?)
+        ))?)?;
+        Ok((&residual + __model_proof_output!(linear(&mlp, &self.projw, Some(&self.projb)))?)?)
     }
 }
 
@@ -425,7 +427,7 @@ impl StarVectorDecoder {
         })
     }
     pub fn embeddings(&self, ids: &Tensor) -> Result<Tensor> {
-        crate::primitives::nn::embed(&self.wte, ids)
+        __model_proof_output!(crate::primitives::nn::embed(&self.wte, ids))
     }
     /// The decoder's geometry.
     pub fn geometry(&self) -> StarVectorDecoderGeometry {
@@ -721,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decoder_projection_preserves_published_out_in_layout() {
         let device = Device::Cpu;
         let projection =
@@ -739,9 +742,13 @@ mod tests {
                 .unwrap(),
             vec![vec![1.0, 3.0, 5.0]]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::starvector::tests::decoder_projection_preserves_published_out_in_layout");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tied_token_embedding_projects_without_a_separate_lm_head() {
         let device = Device::Cpu;
         let values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -772,5 +779,8 @@ mod tests {
                 .unwrap(),
             vec![vec![1.0, 3.0, 5.0]]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::starvector::tests::tied_token_embedding_projects_without_a_separate_lm_head");
     }
 }

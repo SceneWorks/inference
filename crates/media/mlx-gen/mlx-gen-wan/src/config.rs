@@ -386,7 +386,13 @@ impl WanModelConfig {
         if !path.exists() {
             return Ok(Self::wan22_ti2v_5b());
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@17510",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("wan: parse config.json: {e}")))?;
         Ok(Self::from_config_json(&v))
@@ -653,14 +659,26 @@ impl WanVaceConfig {
     pub fn from_model_dir(root: &Path) -> Result<Self> {
         let diffusers = root.join("transformer").join("config.json");
         if diffusers.exists() {
-            let text = std::fs::read_to_string(&diffusers)?;
+            let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&diffusers),
+"crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@31041",
+ArtifactInput,
+&diffusers,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
             let v: Value = serde_json::from_str(&text)
                 .map_err(|e| Error::Msg(format!("wan-vace: parse transformer/config.json: {e}")))?;
             return Ok(Self::from_diffusers_json(&v));
         }
         let native = root.join("config.json");
         if native.exists() {
-            let text = std::fs::read_to_string(&native)?;
+            let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&native),
+"crates/media/mlx-gen/mlx-gen-wan/src/config.rs::from_model_dir::std::fs::read_to_string@31397",
+ArtifactInput,
+&native,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
             let v: Value = serde_json::from_str(&text)
                 .map_err(|e| Error::Msg(format!("wan-vace: parse config.json: {e}")))?;
             return Ok(Self::from_config_json(&v));
@@ -717,7 +735,14 @@ impl WanVaceConfig {
 /// `WanVACEPipeline` field; e.g. `0.875` for VACE-Fun-A14B). Returns `None` when the file/field is
 /// absent so the caller falls back to the Wan2.2 A14B default.
 fn read_boundary_ratio(root: &Path) -> Option<f32> {
-    let text = std::fs::read_to_string(root.join("model_index.json")).ok()?;
+    let text = mlx_gen::gen_core::__model_input_choose!(
+        std::fs::read_to_string(root.join("model_index.json")),
+        mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+            root.join("model_index.json"),
+            "mlx-gen-wan::config::read_boundary_ratio"
+        )
+    )
+    .ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     v.get("boundary_ratio")
         .and_then(Value::as_f64)

@@ -22,6 +22,15 @@
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0, ungated.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod config;
 pub mod loader;
 pub mod memory_strategy;

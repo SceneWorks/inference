@@ -110,6 +110,8 @@ fn svd_provider_generates_video() {
         }
         other => panic!("expected Video, got {other:?}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registration::svd_provider_generates_video");
 }
 
 /// Locate the cached SVD checkpoint snapshot dir (shared by the real-weight tests).
@@ -199,6 +201,8 @@ fn svd_request_knobs_drive_generation() {
         4,
         "decode_chunk_size override must keep all frames"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registration::svd_request_knobs_drive_generation");
 }
 
 /// sc-3764: the SVD output/playback fps (`req.fps`) is decoupled from the motion-conditioning fps
@@ -248,4 +252,6 @@ fn svd_output_fps_decoupled_from_conditioning_fps() {
         frames_a[2].pixels != frames_b[2].pixels,
         "conditioning_fps must change the generated motion"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registration::svd_output_fps_decoupled_from_conditioning_fps");
 }

@@ -446,13 +446,14 @@ impl Scail2Dit {
             emb[half + j] = ang.sin() as f32;
         }
         let sin_emb = Tensor::from_vec(emb, (1, freq_dim), dev)?;
-        let e = self
+        let e = __model_proof_output!(self
             .time_embedding_2
-            .forward(&self.time_embedding_0.forward(&sin_emb)?.silu()?)?;
-        let e0 = self
-            .time_projection
-            .forward(&e.silu()?)?
-            .reshape((1, 6, self.cfg.dim))?;
+            .forward(&__model_proof_output!(self.time_embedding_0.forward(&sin_emb))?.silu()?))?;
+        let e0 = __model_proof_output!(self.time_projection.forward(&e.silu()?))?.reshape((
+            1,
+            6,
+            self.cfg.dim,
+        ))?;
         Ok((e, e0))
     }
 
@@ -469,16 +470,16 @@ impl Scail2Dit {
             context.clone()
         };
         let ctx = ctx.reshape((1, text_len, td))?;
-        let h = self.text_embedding_0.forward(&ctx)?.gelu()?;
-        self.text_embedding_2.forward(&h)
+        let h = __model_proof_output!(self.text_embedding_0.forward(&ctx))?.gelu()?;
+        __model_proof_output!(self.text_embedding_2.forward(&h))
     }
 
     /// CLIP features `[1, 257, 1280]` → image context `[1, 257, dim]` via the MLPProj
     /// (LayerNorm → Linear → exact-GELU → Linear → LayerNorm).
     fn embed_img(&self, clip_fea: &Tensor) -> Result<Tensor> {
         let h = ln_affine(clip_fea, &self.img_ln0_w, &self.img_ln0_b, IMG_LN_EPS)?;
-        let h = self.img_emb_1.forward(&h)?.gelu_erf()?;
-        let h = self.img_emb_3.forward(&h)?;
+        let h = __model_proof_output!(self.img_emb_1.forward(&h))?.gelu_erf()?;
+        let h = __model_proof_output!(self.img_emb_3.forward(&h))?;
         ln_affine(&h, &self.img_ln4_w, &self.img_ln4_b, IMG_LN_EPS)
     }
 
@@ -490,7 +491,7 @@ impl Scail2Dit {
         let shift = m.narrow(1, 0, 1)?;
         let scale = m.narrow(1, 1, 1)?;
         let x_mod = modulate(&ln_no_affine(x, self.cfg.eps)?, &scale, &shift)?;
-        self.head.forward(&x_mod)
+        __model_proof_output!(self.head.forward(&x_mod))
     }
 
     /// One denoise-step velocity prediction → `[16, T, H, W]` (single sample).
@@ -543,12 +544,12 @@ impl Scail2Dit {
         let refvid = Tensor::cat(&[&ref20, &x20], 1)?; // [20, 1+T, H, W]
         let (rv_tok, _) = patchify(&refvid, ps)?;
         let (rm_tok, _) = patchify(inp.ref_masks, ps)?;
-        let refvid_emb = (self.patch_embedding.forward(&rv_tok)?
-            + self.patch_embedding_mask.forward(&rm_tok)?)?;
+        let refvid_emb = (__model_proof_output!(self.patch_embedding.forward(&rv_tok))?
+            + __model_proof_output!(self.patch_embedding_mask.forward(&rm_tok))?)?;
         let (pose_tok, _) = patchify(&pose20, ps)?;
         let (dm_tok, _) = patchify(inp.driving_masks, ps)?;
-        let pose_emb = (self.patch_embedding_pose.forward(&pose_tok)?
-            + self.patch_embedding_mask.forward(&dm_tok)?)?;
+        let pose_emb = (__model_proof_output!(self.patch_embedding_pose.forward(&pose_tok))?
+            + __model_proof_output!(self.patch_embedding_mask.forward(&dm_tok))?)?;
 
         // --- assemble packed tokens: [additional_ref | ref | video | pose] ---
         // The per-chunk RoPE is step-invariant (fixed patch geometry), so it is cached per render /
@@ -570,8 +571,8 @@ impl Scail2Dit {
             )?;
             let (ar_tok, _) = patchify(&ar20, ps)?;
             let (arm_tok, _) = patchify(arm, ps)?;
-            let ar_emb = (self.patch_embedding.forward(&ar_tok)?
-                + self.patch_embedding_mask.forward(&arm_tok)?)?;
+            let ar_emb = (__model_proof_output!(self.patch_embedding.forward(&ar_tok))?
+                + __model_proof_output!(self.patch_embedding_mask.forward(&arm_tok))?)?;
             addref_count = ar_n;
             tok_list.push(ar_emb);
         }
@@ -813,6 +814,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_and_q8_forwards_consume_additional_references_without_dense_fallback() {
         let dev = Device::Cpu;
         for (bits, quant) in [(4usize, Quant::Q4), (8usize, Quant::Q8)] {
@@ -885,5 +887,8 @@ mod tests {
                 "Q{bits} additional reference must change the real output (saw {difference})"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::q4_and_q8_forwards_consume_additional_references_without_dense_fallback");
     }
 }

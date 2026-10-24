@@ -66,3 +66,6 @@ core-llm = { workspace = true, features = ["test-clock"] }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["core-llm/model-inference-proof"]

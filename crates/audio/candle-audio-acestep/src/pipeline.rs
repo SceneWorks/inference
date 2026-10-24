@@ -176,8 +176,14 @@ impl AceStepPipeline {
         let config = SnapshotConfig::from_snapshot(root)?;
 
         let tokenizer_path = root.join("tokenizer/tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
+        let tokenizer = candle_audio::gen_core::__model_input_reader!(
+            Tokenizer::from_file(&tokenizer_path),
+            "candle-audio-acestep::pipeline::AceStepPipeline::from_snapshot/tokenizer",
+            Tokenizer,
+            &tokenizer_path,
+            |path| Tokenizer::from_file(path)
+        )
+        .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
 
         let te_shards = safetensors_shards(&root.join("text_encoder"), "model")?;
         let text_encoder = Qwen3Encoder::new(&config.text_encoder, mmap_vb(&te_shards, device)?)

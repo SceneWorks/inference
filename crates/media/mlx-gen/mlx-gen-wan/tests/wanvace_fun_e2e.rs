@@ -97,6 +97,7 @@ fn wan_vace_fun_dual_expert_generate_smoke() {
             "skipping: no VACE-Fun snapshot (set WANVACE_FUN_DIR or populate the HF cache with \
              linoyts transformers + a SceneWorks/wan2.2-*-a14b-mlx base)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_vace_fun_dual_expert_generate_smoke; see preceding skip diagnostic");
         return;
     };
     eprintln!("wan_vace_fun e2e: snapshot = {}", dir.display());
@@ -169,5 +170,9 @@ fn wan_vace_fun_dual_expert_generate_smoke() {
     eprintln!(
         "wan_vace_fun dual-expert e2e ok: {} frames @ {w}x{h}, pixel mean {mean:.1}",
         frames.len()
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED wanvace_fun_e2e::wan_vace_fun_dual_expert_generate_smoke"
     );
 }

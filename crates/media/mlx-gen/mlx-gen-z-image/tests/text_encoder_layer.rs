@@ -45,6 +45,7 @@ fn rope_cos_sin_matches_fork() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn encoder_layer_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let (_h, nh, nkv, hd, _i, _seq, eps, _theta) = cfg(&w);
@@ -64,4 +65,7 @@ fn encoder_layer_matches_fork() {
         close(&out, w.require("out").unwrap()),
         "EncoderLayer forward diverged from the fork"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_layer::encoder_layer_matches_fork");
 }

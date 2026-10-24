@@ -158,11 +158,14 @@ fn assert_vec(name: &str, got: &[f32], want: &[f32], tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn flow_loss_matches_rectified_flow() {
-    cpu_process(
-        "train_parity::flow_loss_matches_rectified_flow",
-        flow_loss_matches_rectified_flow_body,
-    );
+    cpu_process("train_parity::flow_loss_matches_rectified_flow", || {
+        flow_loss_matches_rectified_flow_body();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train_parity::flow_loss_matches_rectified_flow"
+        );
+    });
 }
 
 fn flow_loss_matches_rectified_flow_body() {
@@ -317,11 +320,14 @@ fn full_case(kind: OptimizerKind, tag: &str, rel_tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn full_training_adamw_matches_upstream() {
-    cpu_process(
-        "train_parity::full_training_adamw_matches_upstream",
-        full_training_adamw_matches_upstream_body,
-    );
+    cpu_process("train_parity::full_training_adamw_matches_upstream", || {
+        full_training_adamw_matches_upstream_body();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train_parity::full_training_adamw_matches_upstream"
+        );
+    });
 }
 
 fn full_training_adamw_matches_upstream_body() {
@@ -329,11 +335,14 @@ fn full_training_adamw_matches_upstream_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn full_training_muon_matches_upstream() {
-    cpu_process(
-        "train_parity::full_training_muon_matches_upstream",
-        full_training_muon_matches_upstream_body,
-    );
+    cpu_process("train_parity::full_training_muon_matches_upstream", || {
+        full_training_muon_matches_upstream_body();
+        eprintln!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train_parity::full_training_muon_matches_upstream"
+        );
+    });
 }
 
 fn full_training_muon_matches_upstream_body() {
@@ -450,11 +459,12 @@ fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_adamw_matches_oracle() {
-    cpu_process(
-        "train_parity::lora_adamw_matches_oracle",
-        lora_adamw_matches_oracle_body,
-    );
+    cpu_process("train_parity::lora_adamw_matches_oracle", || {
+        lora_adamw_matches_oracle_body();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lora_adamw_matches_oracle");
+    });
 }
 
 fn lora_adamw_matches_oracle_body() {
@@ -462,11 +472,12 @@ fn lora_adamw_matches_oracle_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lora_muon_matches_oracle() {
-    cpu_process(
-        "train_parity::lora_muon_matches_oracle",
-        lora_muon_matches_oracle_body,
-    );
+    cpu_process("train_parity::lora_muon_matches_oracle", || {
+        lora_muon_matches_oracle_body();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lora_muon_matches_oracle");
+    });
 }
 
 fn lora_muon_matches_oracle_body() {
@@ -474,11 +485,12 @@ fn lora_muon_matches_oracle_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lokr_adamw_matches_oracle() {
-    cpu_process(
-        "train_parity::lokr_adamw_matches_oracle",
-        lokr_adamw_matches_oracle_body,
-    );
+    cpu_process("train_parity::lokr_adamw_matches_oracle", || {
+        lokr_adamw_matches_oracle_body();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lokr_adamw_matches_oracle");
+    });
 }
 
 fn lokr_adamw_matches_oracle_body() {
@@ -486,11 +498,12 @@ fn lokr_adamw_matches_oracle_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lokr_muon_matches_oracle() {
-    cpu_process(
-        "train_parity::lokr_muon_matches_oracle",
-        lokr_muon_matches_oracle_body,
-    );
+    cpu_process("train_parity::lokr_muon_matches_oracle", || {
+        lokr_muon_matches_oracle_body();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lokr_muon_matches_oracle");
+    });
 }
 
 fn lokr_muon_matches_oracle_body() {

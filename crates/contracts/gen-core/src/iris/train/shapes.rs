@@ -363,11 +363,21 @@ pub fn preprocess_file_to_shape(
     path: &std::path::Path,
     policy: &ShapePolicy,
 ) -> Result<ShapedImage> {
-    let img = image::open(path)
-        .map_err(|e| Error::Msg(format!("iris training: decode {}: {e}", path.display())))?
-        .to_rgb8();
+    let img = crate::__model_input_result!(
+        image::open(path),
+        "crates/contracts/gen-core/src/iris/train/shapes.rs::preprocess_file_to_shape/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| Error::Msg(format!("iris training: decode {}: {e}", path.display())))?
+    .to_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
-    preprocess_to_shape(img.as_raw(), w, h, policy)
+    crate::__model_input_result!(
+        preprocess_to_shape(img.as_raw(), w, h, policy),
+        "gen-core::iris::train::shapes::preprocess_file_to_shape",
+        Reference,
+        &[path]
+    )
 }
 
 // =============================================================================================

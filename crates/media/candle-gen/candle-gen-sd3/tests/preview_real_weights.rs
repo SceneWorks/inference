@@ -766,6 +766,9 @@ fn large_preview_frames_evolve_toward_the_final_image() {
         &LARGE,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::large_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `sd3_5_large_turbo` — the guidance-distilled few-step student, so the predict closure runs a
@@ -784,6 +787,9 @@ fn turbo_preview_frames_evolve_toward_the_final_image() {
         &TURBO,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::turbo_preview_frames_evolve_toward_the_final_image");
 }
 
 /// `sd3_5_medium` — the second true-CFG lane. A separate row rather than an assumption that it follows
@@ -803,6 +809,9 @@ fn medium_preview_frames_evolve_toward_the_final_image() {
         &MEDIUM,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::medium_preview_frames_evolve_toward_the_final_image");
 }
 
 /// The **second lane** every route has: img2img / `Reference`, which forks the denoise at a later σ
@@ -855,6 +864,9 @@ fn img2img_preview_frames_evolve_from_the_forked_latent() {
         &IMG2IMG,
         &|_| {},
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::img2img_preview_frames_evolve_from_the_forked_latent");
 }
 
 /// **One frame per outer step on a multi-eval solver**, proven non-vacuous first.
@@ -900,6 +912,9 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
         "a multi-eval solver must still emit exactly one frame per outer step ({evaluations} \
          evaluations)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }
 
 // ── The σ convention, measured on the committed constants alone ───────────────────────────────────

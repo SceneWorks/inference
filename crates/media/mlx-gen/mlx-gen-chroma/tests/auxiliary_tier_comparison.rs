@@ -233,4 +233,6 @@ fn compare_auxiliary_widths() {
         );
     }
     println!("\nPNGs written to {}", out.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED auxiliary_tier_comparison::compare_auxiliary_widths");
 }

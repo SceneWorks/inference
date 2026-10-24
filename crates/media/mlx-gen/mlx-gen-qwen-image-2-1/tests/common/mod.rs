@@ -86,9 +86,14 @@ pub const TURBO_SAMPLE_SIGMAS: [f64; 8] = [
 ];
 
 fn rewrite_json(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).unwrap_or_else(|e| panic!("{path:?}: {e}")))
-            .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read(path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_bytes(path)
+        )
+        .unwrap_or_else(|e| panic!("{path:?}: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("{path:?}: {e}"));
     edit(&mut value);
     std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 }

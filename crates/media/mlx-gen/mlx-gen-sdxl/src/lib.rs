@@ -67,6 +67,11 @@ pub mod vision_encoder;
 /// following test in the same (single-threaded) binary is unaffected.
 #[cfg(test)]
 pub(crate) mod test_device {
+    pub(crate) fn record_model_inference_device() {
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+    }
+
     pub(crate) struct DeviceGuard(mlx_rs::Device);
 
     impl Drop for DeviceGuard {

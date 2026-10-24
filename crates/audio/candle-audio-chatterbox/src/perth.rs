@@ -128,7 +128,7 @@ impl ConvBlock {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let x = self.conv.forward(x)?;
+        let x = __model_proof_output!(self.conv.forward(x))?;
         if self.act {
             // LeakyReLU: max(x, slope·x).
             x.maximum(&x.affine(LRELU_SLOPE, 0.0)?)
@@ -478,6 +478,7 @@ mod tests {
     /// reconstruction: the embed plumbing is correct and the DSP roundtrip is high-SNR
     /// (imperceptibility floor of the identity path).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embed_with_zero_encoder_is_dsp_identity_high_snr() {
         let wm = zero_watermarker();
         let x = test_signal_32k(1.0);
@@ -488,12 +489,16 @@ mod tests {
         let guard = N_FFT;
         let snr = snr_db(&x[guard..n - guard], &y[guard..n - guard]);
         assert!(snr > 40.0, "DSP identity SNR too low: {snr} dB");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED perth::tests::embed_with_zero_encoder_is_dsp_identity_high_snr");
     }
 
     /// The full embed→detect pipeline runs end-to-end on synthetic weights and stays finite/bounded:
     /// shapes, the multi-scale resamples, masked-mean and softmax combine, and the `[0,1]` clamp all
     /// wire up. (A random model gives no *meaningful* detection — that is the real-weights gate.)
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embed_and_detect_plumbing_is_finite_and_bounded() {
         let device = Device::Cpu;
         // Small non-zero weights so every branch produces finite activations.
@@ -507,11 +512,15 @@ mod tests {
             (0.0..=1.0).contains(&conf),
             "confidence out of range: {conf}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED perth::tests::embed_and_detect_plumbing_is_finite_and_bounded");
     }
 
     /// Resampling paths: a 24 kHz input (Chatterbox's output rate) is embedded and returned at 24
     /// kHz, and detection runs at 24 kHz through the internal resample to/from 32 kHz.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embed_accepts_24k_and_returns_same_rate() {
         let wm = zero_watermarker();
         // 24 kHz version of the same tones.
@@ -532,6 +541,9 @@ mod tests {
         );
         let conf = wm.get_watermark(&y, 24_000).unwrap();
         assert!(conf.is_finite() && (0.0..=1.0).contains(&conf));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED perth::tests::embed_accepts_24k_and_returns_same_rate");
     }
 
     #[test]

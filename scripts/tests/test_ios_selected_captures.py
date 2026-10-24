@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("ios_selected_captures", ROOT / "scripts/ci/ios_selected_captures.py")
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
+POLICY_SPEC = importlib.util.spec_from_file_location("capture_source_policy", ROOT / "scripts/check_model_inference_policy.py")
+source_policy = importlib.util.module_from_spec(POLICY_SPEC)
+POLICY_SPEC.loader.exec_module(source_policy)
 
 
 class SelectedCaptures(unittest.TestCase):
@@ -166,20 +169,33 @@ class SelectedCaptures(unittest.TestCase):
             markers.update(re.findall(r'IOS_CAPTURE_BODY_COMPLETED ([\w:]+)', path.read_text(encoding='utf-8')))
         self.assertEqual(markers, {row['fqn'] for row in runner.REGISTRY})
 
-    def test_cheap_guards_remain_ordinary(self):
+    def test_non_inference_guards_remain_ordinary(self):
         rows = [("mlx-gen-iris/src/quantum_proofs.rs", "proof_policy_cannot_be_disabled_by_print_only"),
                 ("mlx-gen-iris/src/anchor_tests.rs", "missing_phase_is_not_a_zero_or_a_skipped_assertion"),
                 ("mlx-gen-sdxl/src/quantum_tests.rs", "measured_lower_bound_is_hard_and_overpricing_is_report_only"),
                 ("mlx-gen-sdxl/src/quantum_tests.rs", "ios_boundary_preserves_actual_operand_dtype_and_values"),
-                ("mlx-gen-sdxl/src/quantum_tests_additivity.rs", "optimized_bf16_img2img_preserves_full_request_rgb"),
                 ("mlx-gen-sdxl/src/text_encoder.rs", "final_pool_prices_live_eos_and_native_fallback_scalar_operands"),
                 ("mlx-gen-sdxl/src/ios_pricing.rs", "ancestral_body_matching_preserves_precision_and_cfg_coordinates"),
                 ("mlx-gen-z-image/src/quantum_tests.rs", "streamed_read_capacity_distinguishes_dtype_and_each_page_boundary"),
                 ("mlx-gen-lens/src/registry.rs", "sparse_footprint_growth_rewrites_the_exact_payload_extent"),
                 ("mlx-gen-anima/src/quantum_tests.rs", "sdpa_scores_follow_the_metal_kernel_support")]
         for rel, name in rows:
-            text = (ROOT / 'crates/media/mlx-gen' / rel).read_text(encoding='utf-8').split('fn ' + name + '()')[0]
-            self.assertNotIn('#[ignore', text[text.rfind('#[test]'):])
+            source = (ROOT / 'crates/media/mlx-gen' / rel).read_text(encoding='utf-8')
+            self.assertIn('fn ' + name + '()', source, rel)
+            matches = [item for item in source_policy.functions(source) if item['name'] == name]
+            self.assertEqual(len(matches), 1, rel)
+            self.assertFalse(matches[0]['ignored'], rel)
+
+    def test_full_request_rgb_witness_is_preserved_as_a_manual_model_proof(self):
+        name = "optimized_bf16_img2img_preserves_full_request_rgb"
+        path = "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_additivity.rs"
+        functions = source_policy.functions((ROOT / path).read_text(encoding="utf-8"))
+        test = next(item for item in functions if item["name"] == name)
+        self.assertTrue(test["ignored"])
+        self.assertTrue(test["canonical"])
+        rows = json.loads((ROOT / "scripts/ci/model-inference-proofs.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(row["package"] == "mlx-gen-sdxl" and row["source"] == path
+                            and row["fqn"].endswith("::" + name) for row in rows))
 
     def test_profile_specific_selection_preserves_the_legacy_compile_binding(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/real-weights.yml').read_text(encoding='utf-8'))

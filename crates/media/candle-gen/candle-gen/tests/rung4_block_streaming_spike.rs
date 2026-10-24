@@ -731,6 +731,8 @@ fn overlap_prefetch() -> Result<()> {
          co-resident), so on this backend it worsens the very quantity rung 4 exists to bound.",
         pre_peak as f64 / seq_peak as f64
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_streaming_spike::overlap_prefetch");
     Ok(())
 }
 
@@ -983,6 +985,8 @@ fn release_semantics() -> Result<()> {
          closest thing to the untested configuration and should be treated as unproven until \
          SC-15792 covers it."
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_streaming_spike::release_semantics");
     Ok(())
 }
 
@@ -1089,6 +1093,10 @@ fn packed_quant_per_block() -> Result<()> {
     );
     drop(b2);
     drop(view2);
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_streaming_spike::packed_quant_per_block"
+    );
     Ok(())
 }
 
@@ -1367,6 +1375,8 @@ fn device_format_sidecars_before_after() -> Result<()> {
             );
         }
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_streaming_spike::device_format_sidecars_before_after");
     Ok(())
 }
 
@@ -1520,6 +1530,8 @@ fn device_format_window_time_interleaved() -> candle_gen::Result<()> {
             total = deltas.len(),
         );
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED rung4_block_streaming_spike::device_format_window_time_interleaved");
     Ok(())
 }
 

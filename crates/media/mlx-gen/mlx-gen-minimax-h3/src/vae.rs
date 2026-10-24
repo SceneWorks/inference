@@ -214,7 +214,11 @@ impl MiniMaxH3VideoVae {
     pub fn load(root: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
         let dir = root.as_ref().join("vae");
         let config_path = dir.join("config.json");
-        let text = std::fs::read_to_string(&config_path).map_err(|e| {
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&config_path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&config_path)
+        )
+        .map_err(|e| {
             Error::Msg(format!(
                 "minimax-h3 vae: reading {}: {e}",
                 config_path.display()

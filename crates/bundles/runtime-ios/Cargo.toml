@@ -32,6 +32,7 @@ mlx-gen-ios-catalog = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
+model-inference-proof = ["mlx-llm/model-inference-proof", "mlx-gen-ios-catalog?/model-inference-proof"]
 # The iOS product is the image lane, so it is on by default, as `media` is on runtime-macos. An
 # LLM-only product disables default features and does not compile the image graph at all.
 default = ["media"]

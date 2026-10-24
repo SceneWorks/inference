@@ -231,7 +231,7 @@ fn host_banner() -> String {
 /// future change that made the window matter would fail the flatness check — which is the right
 /// failure, because the published domain would then need to widen.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn the_window_sweep_bounds_the_denoise_peak() {
     /// The declaration under test: at most this many blocks are ever held. Anything the sweep shows
     /// to be indistinguishable from it is not a separate candidate.
@@ -409,6 +409,9 @@ fn the_window_sweep_bounds_the_denoise_peak() {
         gib(declared.decode_bytes),
         binding.0.to_uppercase(),
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::the_window_sweep_bounds_the_denoise_peak");
 }
 
 /// **AC: output numerically identical to the resident path on real weights.**
@@ -416,7 +419,7 @@ fn the_window_sweep_bounds_the_denoise_peak() {
 /// Whole-request identity at the production window, at the same seed. The image is the contract's
 /// output; the assertion is on it, not on an intermediate.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn the_windowed_render_matches_the_resident_render() {
     println!(
         "\n== rung-4 identity — tier {} — {}",
@@ -437,6 +440,9 @@ fn the_windowed_render_matches_the_resident_render() {
              byte-identical to its resident twin"
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::the_windowed_render_matches_the_resident_render");
 }
 
 /// **AC: cancellation mid-window and an injected error leave no residual cache growth across
@@ -459,7 +465,7 @@ fn the_windowed_render_matches_the_resident_render() {
 /// printed but not asserted on — with its measured spread, so the choice is visible rather than
 /// tuned-until-green.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
     use mlx_gen::gen_core::MemoryPhase;
     use mlx_rs::memory::get_active_memory;
@@ -585,6 +591,9 @@ fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
             );
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::a_canceled_or_errored_windowed_run_leaves_no_residual_cache");
 }
 
 /// **AC: composition with `Residency::run_staged` pinned by a test.**
@@ -593,7 +602,7 @@ fn a_canceled_or_errored_windowed_run_leaves_no_residual_cache() {
 /// rung 4 bounds residency *within* the DiT phase. The observable consequence is that the staged
 /// maximum stops being the denoise phase.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn rung_four_composes_inside_staged_residency_and_moves_the_binding_phase() {
     println!(
         "\n== rung 4 x rung 1 — tier {} — {}",
@@ -636,6 +645,9 @@ fn rung_four_composes_inside_staged_residency_and_moves_the_binding_phase() {
         .to_string();
     assert!(err.contains("Sequential"), "{err}");
     println!("  Resident load correctly refuses rung 4: {err}");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::rung_four_composes_inside_staged_residency_and_moves_the_binding_phase");
 }
 
 /// **AC: whether q8 fits an 8 GB budget is answered with measurement, not inference.**
@@ -645,7 +657,7 @@ fn rung_four_composes_inside_staged_residency_and_moves_the_binding_phase() {
 /// evidence for SC-15611 / SC-15614, and a hard assertion here would encode a policy this story does
 /// not own.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn the_eight_gb_verdict_with_the_full_ladder() {
     const BUDGET_GIB: f64 = 8.0;
     const RESERVE_GIB: f64 = 2.0;
@@ -700,6 +712,9 @@ fn the_eight_gb_verdict_with_the_full_ladder() {
          so what decides the render is the reserve policy and admission arithmetic (SC-15611 / \
          SC-15614)."
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::the_eight_gb_verdict_with_the_full_ladder");
 }
 
 /// **SC-15510 AC: production tile/chunk/block-window candidate ranges are exposed to the harness** —
@@ -715,7 +730,7 @@ fn the_eight_gb_verdict_with_the_full_ladder() {
 /// The exact seven-point domain is asserted as well as swept so the test cannot go green by silently
 /// narrowing the production ladder. See [`DECODE_TILE_EDGES`] for the measured table.
 #[test]
-#[ignore = "needs a real Z-Image snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image snapshot + Apple/Metal GPU"]
 fn every_declared_decode_candidate_runs_and_preserves_the_image() {
     use mlx_gen_z_image::memory_strategy::{DECODE_OVERLAP, DECODE_TILE_EDGE, DECODE_TILE_EDGES};
 
@@ -803,4 +818,7 @@ fn every_declared_decode_candidate_runs_and_preserves_the_image() {
         gib(largest),
         gib(exact.decode_bytes)
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::every_declared_decode_candidate_runs_and_preserves_the_image");
 }

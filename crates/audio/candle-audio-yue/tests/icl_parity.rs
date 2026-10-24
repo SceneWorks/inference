@@ -45,6 +45,16 @@
 //!   cargo test --locked -p candle-audio-yue --test icl_parity -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_yue::candle_audio::candle_core::{Device, Tensor};
@@ -236,6 +246,7 @@ fn max_rel(got: &[f32], want: &[f32]) -> f64 {
 /// Measured on CPU f32: HuBERT mean 1.2e-6, semantic 9.2e-7, acoustic 1.2e-6, `fc_prior` 8.4e-7
 /// relative (bounds 1e-5, ~8× headroom); codes 51/51 exact.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tiny_encode_half_matches_the_reference_stage_by_stage() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/yue_icl_tiny_reference.safetensors");
@@ -269,6 +280,11 @@ fn tiny_encode_half_matches_the_reference_stage_by_stage() {
     let mut bad = want_codes.clone();
     bad[7] = (bad[7] + 1) % 1024;
     assert_ne!(codes, bad, "a mutated code golden passed");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tiny_encode_half_matches_the_reference_stage_by_stage"
+    );
 }
 
 /// torchaudio's resampler, measured against the native port: max |Δ| 6.0e-8 … 1.2e-7 over the four
@@ -564,4 +580,7 @@ fn icl_prompt_ids_match_the_reference_token_for_token() {
         );
         assert_eq!(got.ids, want, "{name}: windowed ICL ids");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED icl_prompt_ids_match_the_reference_token_for_token");
 }

@@ -25,6 +25,7 @@ serde_json = "1"
 safetensors = "0.7"
 
 [features]
+model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-pid/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-pid/cuda"]

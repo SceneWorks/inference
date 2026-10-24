@@ -261,10 +261,14 @@ fn grads_under(model: &TrainModel, params: &Params, ac: AcPolicy) -> Params {
 /// Activation checkpointing (MLX's checkpoint transform per region) leaves every gradient equal to
 /// the plain graph's — and to upstream's — for the full model.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     crate::common::cpu_process(
         "curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph",
-        activation_checkpointing_gradients_equal_the_plain_graph_body,
+        || {
+            activation_checkpointing_gradients_equal_the_plain_graph_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph");
+        },
     );
 }
 
@@ -334,10 +338,14 @@ fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
 /// trainers carry: the same step-1 loss bit for bit, and per trained tensor a checkpointed gradient
 /// no further from the f32 gradient than the plain bf16 gradient is.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_bf16_gradients_add_no_error_of_their_own() {
     crate::common::cpu_process(
         "curricula_parity::activation_checkpointing_bf16_gradients_add_no_error_of_their_own",
-        activation_checkpointing_bf16_gradients_add_no_error_of_their_own_body,
+        || {
+            activation_checkpointing_bf16_gradients_add_no_error_of_their_own_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::activation_checkpointing_bf16_gradients_add_no_error_of_their_own");
+        },
     );
 }
 
@@ -375,10 +383,14 @@ fn activation_checkpointing_bf16_gradients_add_no_error_of_their_own_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn non_square_bucket_steps_match_upstream_under_both_rope_laws() {
     crate::common::cpu_process(
         "curricula_parity::non_square_bucket_steps_match_upstream_under_both_rope_laws",
-        non_square_bucket_steps_match_upstream_under_both_rope_laws_body,
+        || {
+            non_square_bucket_steps_match_upstream_under_both_rope_laws_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::non_square_bucket_steps_match_upstream_under_both_rope_laws");
+        },
     );
 }
 
@@ -453,10 +465,14 @@ fn tiny_teacher(g: &Weights, name: &str, registers: usize) -> Teacher {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
     crate::common::cpu_process(
         "curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream",
-        repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream_body,
+        || {
+            repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream");
+        },
     );
 }
 
@@ -624,10 +640,14 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_register_teacher_resizes_its_position_table_with_antialias() {
     crate::common::cpu_process(
         "curricula_parity::the_register_teacher_resizes_its_position_table_with_antialias",
-        the_register_teacher_resizes_its_position_table_with_antialias_body,
+        || {
+            the_register_teacher_resizes_its_position_table_with_antialias_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_register_teacher_resizes_its_position_table_with_antialias");
+        },
     );
 }
 
@@ -646,10 +666,14 @@ fn the_register_teacher_resizes_its_position_table_with_antialias_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_frozen_holdout_grid_matches_upstreams_val_loss() {
     crate::common::cpu_process(
         "curricula_parity::the_frozen_holdout_grid_matches_upstreams_val_loss",
-        the_frozen_holdout_grid_matches_upstreams_val_loss_body,
+        || {
+            the_frozen_holdout_grid_matches_upstreams_val_loss_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_frozen_holdout_grid_matches_upstreams_val_loss");
+        },
     );
 }
 
@@ -692,7 +716,12 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
     // FP32 parity (the CPU stream's f32 GEMM), in a CPU-default child: no op reaches the GPU.
     crate::common::cpu_process(
         "curricula_parity::the_release_teacher_matches_upstream_on_real_weights",
-        release_teacher_body,
+        || {
+            release_teacher_body();
+            #[cfg(target_os = "macos")]
+            crate::common::metal_guard::record_model_inference_device();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_parity::the_release_teacher_matches_upstream_on_real_weights");
+        },
     );
 }
 

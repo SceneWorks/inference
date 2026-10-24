@@ -15,6 +15,8 @@
 #[path = "../../tests/support/atomic_cache.rs"]
 #[allow(dead_code)] // not every module assembles symlink components
 mod atomic_cache;
+#[path = "common/model_inference_device.rs"]
+pub mod model_inference_device;
 // --- generated modules (do not edit) ---
 
 #[path = "adapter_real_weights.rs"]

@@ -112,7 +112,15 @@ fn real_weight_adaln_evict_releases_26_gb() {
     let root = snapshot();
     let dir = root.join("transformer");
     let cfg = MiniMaxH3DitConfig::from_diffusers_json(
-        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/tests/adaln_evict_real_weights.rs::real_weight_adaln_evict_releases_26_gb::std::fs::read_to_string@5087",
+Configuration,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap(),
     )
     .unwrap();
     assert_eq!(cfg, MiniMaxH3DitConfig::default());
@@ -299,6 +307,8 @@ fn real_weight_adaln_evict_releases_26_gb() {
         gb(cache.bytes()),
         cache.schedule().num_distinct_timesteps()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_evict_real_weights::real_weight_adaln_evict_releases_26_gb");
 }
 
 /// One block forward at the published geometry against the cached table, evaluated.

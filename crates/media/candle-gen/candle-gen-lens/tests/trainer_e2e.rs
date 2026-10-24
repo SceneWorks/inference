@@ -272,6 +272,9 @@ fn lens_trainer_lora_trains_reloads_and_renders() {
     assert_reloads(&out.adapter_path, AdapterKind::Lora);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
     println!("[lens-lora] e2e OK — {n} targets reload + merge, image renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_lora_trains_reloads_and_renders");
 }
 
 /// LoKr: trains + converges (slower Kronecker reparam ⇒ more steps), writes a LoKr adapter with
@@ -293,6 +296,9 @@ fn lens_trainer_lokr_trains_reloads_and_renders() {
     assert_reloads(&out.adapter_path, AdapterKind::Lokr);
     render_finite_with_adapter(&out.adapter_path, AdapterKind::Lokr);
     println!("[lens-lokr] e2e OK — {n} targets reload + merge, image renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_lokr_trains_reloads_and_renders");
 }
 
 /// Launch-portable determinism: the same seed produces the same adapter, run to run.
@@ -329,6 +335,11 @@ fn lens_trainer_same_seed_is_reproducible() {
         );
     }
     println!("[lens-det] e2e OK — same seed reproduces the adapter bit-for-bit");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_same_seed_is_reproducible"
+    );
 }
 
 /// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
@@ -340,6 +351,8 @@ fn lens_trainer_same_seed_is_reproducible() {
 fn lens_trainer_emits_preview_samples() {
     if !snapshot().exists() {
         eprintln!("skipping: set LENS_BASE_SNAPSHOT (or populate the HF cache)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/trainer_e2e.rs:341 (lens_trainer_emits_preview_samples): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     }
     let tmp_guard = tempfile::tempdir().unwrap();
@@ -414,4 +427,7 @@ fn lens_trainer_emits_preview_samples() {
             img.width, img.height
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_emits_preview_samples");
 }

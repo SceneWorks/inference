@@ -79,7 +79,13 @@ fn text_encoder_storage(root: &Path) -> Result<TextEncoderStorage> {
     }
 
     let config_path = root.join("text_encoder").join("config.json");
-    let bytes = match std::fs::read(&config_path) {
+    let bytes = match mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&config_path),
+"crates/media/mlx-gen/mlx-gen-lens/src/registry.rs::text_encoder_storage::std::fs::read@3688",
+ArtifactInput,
+&config_path,
+|__model_input_path| std::fs::read(__model_input_path)
+) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(TextEncoderStorage::Unknown)
@@ -1248,6 +1254,8 @@ mod tests {
             window_peak <= unscoped_peak + unscoped_peak / 20,
             "the measurement path unexpectedly raised Q4 request peak by more than 5%"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED registry::tests::q4_request_non_improvement_remains_reproducible_but_unadvertised");
     }
 
     fn window_request(

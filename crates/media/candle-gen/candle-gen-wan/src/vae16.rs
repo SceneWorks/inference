@@ -98,7 +98,8 @@ impl SpatialDown {
         let padded = merged.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
         // im2col-chunked (stride-2): a hi-res I2V conditioning frame's first spatial down (96-ch 3×3 at
         // 720×1280 ⇒ ~199M-elem im2col) would otherwise hit candle's conv2d corruption band (sc-12773).
-        let y = chunked_conv2d(&padded, &self.w, 0, 2)?.broadcast_add(&self.b)?;
+        let y =
+            __model_proof_output!(chunked_conv2d(&padded, &self.w, 0, 2)?.broadcast_add(&self.b))?;
         let (_, oc, oh, ow) = y.dims4()?;
         y.reshape((b, t, oc, oh, ow))?
             .permute((0, 2, 1, 3, 4))?

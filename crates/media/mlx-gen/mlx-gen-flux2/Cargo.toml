@@ -47,3 +47,6 @@ path = "tests/main.rs"
 [[example]]
 name = "sc20686_flux2_edit"
 test = true
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-llm/model-inference-proof"]

@@ -174,7 +174,7 @@ impl Block {
         let (seq, dim) = x.dims2()?;
         let hd = dim / nh;
 
-        let qkv = self.qkv.forward(x)?.reshape((seq, 3, nh, hd))?;
+        let qkv = __model_proof_output!(self.qkv.forward(x))?.reshape((seq, 3, nh, hd))?;
         let q = qkv.narrow(1, 0, 1)?.reshape((seq, nh, hd))?;
         let k = qkv.narrow(1, 1, 1)?.reshape((seq, nh, hd))?;
         let v = qkv.narrow(1, 2, 1)?.reshape((seq, nh, hd))?;
@@ -198,12 +198,13 @@ impl Block {
             .permute((1, 0, 2))?
             .contiguous()?
             .reshape((seq, dim))?;
-        Ok(self.proj.forward(&out)?)
+        Ok(__model_proof_output!(self.proj.forward(&out))?)
     }
 
     fn mlp(&self, x: &Tensor) -> CResult<Tensor> {
-        let gated = (self.gate.forward(x)?.silu()? * self.up.forward(x)?)?;
-        Ok(self.down.forward(&gated)?)
+        let gated = (__model_proof_output!(self.gate.forward(x))?.silu()?
+            * __model_proof_output!(self.up.forward(x))?)?;
+        Ok(__model_proof_output!(self.down.forward(&gated))?)
     }
 
     fn forward(
@@ -240,8 +241,8 @@ impl Merger {
     /// `x` `[seq, context_dim]` → `[merged, out_hidden]` (`merged = seq / merge_unit`).
     fn forward(&self, x: &Tensor, merged: usize, merge_dim: usize) -> CResult<Tensor> {
         let x = rms_norm(x, &self.ln_q, RMS_EPS)?.reshape((merged, merge_dim))?;
-        let x = self.mlp0.forward(&x)?.gelu_erf()?;
-        Ok(self.mlp2.forward(&x)?)
+        let x = __model_proof_output!(self.mlp0.forward(&x))?.gelu_erf()?;
+        Ok(__model_proof_output!(self.mlp2.forward(&x))?)
     }
 }
 
@@ -470,7 +471,7 @@ impl VisionTower {
         let pixel_values = pixel_values.to_dtype(self.dtype)?;
 
         // Patch embed, then reorder hidden + rope by the window permutation (merge-unit granularity).
-        let h = self.patch_embed.forward(&pixel_values)?; // [seq, dim]
+        let h = __model_proof_output!(self.patch_embed.forward(&pixel_values))?; // [seq, dim]
         let h = h
             .reshape((merged, mu, dim))?
             .index_select(&plan.window_index, 0)?

@@ -55,6 +55,7 @@ fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {
     (max_abs, sum_abs / sum_ref.max(1e-9))
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_t2v_pipeline_matches_reference() {
     let w = fixture();
@@ -120,6 +121,8 @@ fn wan_t2v_pipeline_matches_reference() {
         "frame tensor [F,H,W,3]"
     );
     assert_eq!(frames.dtype(), mlx_rs::Dtype::Uint8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s4_parity::wan_t2v_pipeline_matches_reference");
 }
 
 fn prepend1(shape: &[i32]) -> Vec<i32> {

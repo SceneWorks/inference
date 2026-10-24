@@ -78,7 +78,12 @@ impl KokoroConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
-        Self::from_json_str(&text)
+        candle_audio::gen_core::__model_input_result!(
+            Self::from_json_str(&text),
+            "candle-audio-kokoro::config::KokoroConfig::from_file",
+            Configuration,
+            &[path]
+        )
     }
 
     /// Parse the configuration from raw JSON text (unit-testable without a snapshot).

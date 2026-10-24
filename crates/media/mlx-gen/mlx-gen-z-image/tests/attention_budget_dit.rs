@@ -96,6 +96,7 @@ fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
 const TOLERANCE: f32 = 1e-3;
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn base_dit_chunked_forward_matches_the_unbounded_forward() {
     let w = Weights::from_file(BASE_FIXTURE).unwrap();
     let model = ZImageTransformer::from_weights(&w, "w", base_cfg()).unwrap();
@@ -133,9 +134,13 @@ fn base_dit_chunked_forward_matches_the_unbounded_forward() {
         model.forward_budgeted(x, 0.7, cap, plan).is_ok(),
         "a tripped cancel must not affect the unbounded (default) forward"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED attention_budget_dit::base_dit_chunked_forward_matches_the_unbounded_forward");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn control_dit_chunked_forward_matches_the_unbounded_forward() {
     let w = Weights::from_file(CONTROL_FIXTURE).unwrap();
     let base = ZImageTransformer::from_weights(&w, "w", control_cfg()).unwrap();
@@ -186,11 +191,15 @@ fn control_dit_chunked_forward_matches_the_unbounded_forward() {
             other.map(|v| v.shape().to_vec())
         ),
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED attention_budget_dit::control_dit_chunked_forward_matches_the_unbounded_forward");
 }
 
 /// The default forward is byte-identical to the pre-SC-15615 one: `forward` and an explicitly
 /// UNBOUNDED `forward_budgeted` must agree **exactly**, not within a tolerance.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_default_forward_is_exactly_the_unbounded_forward() {
     let w = Weights::from_file(BASE_FIXTURE).unwrap();
     let model = ZImageTransformer::from_weights(&w, "w", base_cfg()).unwrap();
@@ -202,4 +211,7 @@ fn the_default_forward_is_exactly_the_unbounded_forward() {
         .forward_budgeted(x, 0.7, cap, AttentionPlan::UNBOUNDED)
         .unwrap();
     assert_eq!(peak_relative_delta(&implicit, &explicit), 0.0);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED attention_budget_dit::the_default_forward_is_exactly_the_unbounded_forward");
 }

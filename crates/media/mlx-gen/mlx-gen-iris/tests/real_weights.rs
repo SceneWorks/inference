@@ -163,6 +163,10 @@ fn real_conditioning_and_forward_match_upstream() {
     // port), a chaotic regime where bf16 rounding flips the trajectory. The trajectory is gated in
     // FP32 by `real_backbone_matches_upstream_in_fp32_on_cpu`, and a real render at a
     // supported size by `provider_renders_a_real_image`.
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_conditioning_and_forward_match_upstream");
 }
 
 /// The structural gate on the REAL 3B backbone: FP32 on the MLX CPU stream (true f32), fed the
@@ -173,7 +177,12 @@ fn real_conditioning_and_forward_match_upstream() {
 fn real_backbone_matches_upstream_in_fp32_on_cpu() {
     cpu_process(
         "real_weights::real_backbone_matches_upstream_in_fp32_on_cpu",
-        real_backbone_matches_upstream_in_fp32_on_cpu_body,
+        || {
+            real_backbone_matches_upstream_in_fp32_on_cpu_body();
+            #[cfg(target_os = "macos")]
+            crate::common::metal_guard::record_model_inference_device();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_backbone_matches_upstream_in_fp32_on_cpu");
+        },
     );
 }
 
@@ -314,6 +323,10 @@ fn provider_renders_a_real_image() {
     let mean = img.pixels.iter().map(|&p| p as f32).sum::<f32>() / img.pixels.len() as f32;
     eprintln!("wrote {} (mean pixel {mean:.1})", path.display());
     assert!(mean > 5.0 && mean < 250.0, "degenerate image (mean {mean})");
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::provider_renders_a_real_image");
 }
 
 fn save_png(img: &mlx_gen::Image, path: &std::path::Path) {
@@ -474,6 +487,12 @@ fn real_lora_trains_exports_and_renders() {
         t.elapsed().as_secs_f32()
     );
     assert!(diff > 0.0, "the adapter changed nothing");
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_lora_trains_exports_and_renders"
+    );
 }
 
 /// sc-25681: the production path with every non-default upstream control at once — a two-prompt
@@ -588,5 +607,11 @@ fn provider_renders_with_non_default_controls() {
     assert_ne!(
         images[0].pixels, images[1].pixels,
         "the two prompts rendered the same image"
+    );
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::provider_renders_with_non_default_controls"
     );
 }

@@ -74,8 +74,8 @@ impl CausalConv2d {
         if self.pad_left + self.pad_right > 0 {
             x = x.pad_with_zeros(3, self.pad_left, self.pad_right)?;
         }
-        let y = x.conv2d(&self.w, 0, 1, 1, 1)?;
-        y.broadcast_add(&self.b)
+        let y = __model_proof_output!(x.conv2d(&self.w, 0, 1, 1, 1))?;
+        __model_proof_output!(y.broadcast_add(&self.b))
     }
 }
 

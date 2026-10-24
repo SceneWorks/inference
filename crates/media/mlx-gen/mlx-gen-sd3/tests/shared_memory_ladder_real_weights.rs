@@ -237,6 +237,8 @@ fn full_ladder_executes_single_reference_img2img() {
         "RESULT status=pass provider=sd3_5_large route=single-reference-img2img ladder=full staged_peak_gib={:.3} full_peak_gib={:.3} max_delta={max} mean_delta={mean_delta:.6} output_mean={mean:.3}",
         gib(staged_peak), gib(full_peak)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_ladder_executes_single_reference_img2img");
 }
 
 #[test]
@@ -334,6 +336,8 @@ fn full_shared_ladder_reduces_peak_and_preserves_output() {
         decode_max,
         decode_mean,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::full_shared_ladder_reduces_peak_and_preserves_output");
 }
 
 /// SC-18606: the same resident-versus-selected evidence for the two variants that had no rung-4
@@ -351,6 +355,7 @@ fn structurally_admitted_variants_reduce_peak_and_preserve_output() {
     for (provider, variable) in lanes {
         let Some(root) = optional_snapshot(variable) else {
             println!("RESULT status=skip provider={provider} reason={variable}-unset");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in structurally_admitted_variants_reduce_peak_and_preserve_output; see preceding skip diagnostic");
             continue;
         };
         collected += 1;
@@ -401,4 +406,6 @@ fn structurally_admitted_variants_reduce_peak_and_preserve_output() {
         collected > 0,
         "set SD3_TURBO_LADDER_SNAPSHOT and/or SD3_MEDIUM_LADDER_SNAPSHOT to collect this evidence"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::structurally_admitted_variants_reduce_peak_and_preserve_output");
 }

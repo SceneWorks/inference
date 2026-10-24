@@ -843,6 +843,41 @@ impl ArtifactSeal {
     }
 }
 
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn record_sealed_input_read<'a>(
+    reader: &str,
+    pins: impl IntoIterator<Item = &'a ArtifactSeal>,
+) {
+    record_sealed_input_read_with_role(
+        reader,
+        crate::model_input_proof::InputRole::ArtifactInput,
+        pins,
+    );
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn record_sealed_input_read_with_role<'a>(
+    reader: &str,
+    role: crate::model_input_proof::InputRole,
+    pins: impl IntoIterator<Item = &'a ArtifactSeal>,
+) {
+    if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_none() {
+        return;
+    }
+    let identities: Vec<_> = pins
+        .into_iter()
+        .map(|pin| {
+            crate::model_input_proof::InputIdentity::validated(
+                pin.loader_path(),
+                *pin.content_sha256(),
+                "gen-core::ArtifactSeal",
+                "existing retained seal, actual read and pre/post path checks; not an opened-handle or ABA guarantee",
+            )
+        })
+        .collect();
+    crate::model_input_proof::record_inputs(reader, role, &identities);
+}
+
 fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hash = Sha256::new();
@@ -1940,7 +1975,12 @@ impl LoadSpec {
         E: From<crate::Error>,
     {
         match self.prepared_file_pin_for(path.as_ref()).map_err(E::from)? {
-            Some(prepared) => prepared.read_unchanged(read),
+            Some(prepared) => __observe_input_success!(prepared.read_unchanged(read), |_| {
+                record_sealed_input_read(
+                    "gen-core::LoadSpec::read_file_unchanged_if_prepared",
+                    std::iter::once(prepared),
+                );
+            }),
             None => read(path.as_ref()),
         }
     }
@@ -1978,6 +2018,10 @@ impl LoadSpec {
         let result = read();
         for pin in &pins {
             pin.verify_unchanged().map_err(E::from)?;
+        }
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            record_sealed_input_read("gen-core::LoadSpec::read_files_unchanged", pins.iter());
         }
         result
     }
@@ -2154,6 +2198,13 @@ impl LoadSpec {
         }
         if let Some(guard) = &self.source_inventory {
             guard.verify_unchanged().map_err(E::from)?;
+        }
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            record_sealed_input_read(
+                "gen-core::LoadSpec::read_prepared_files_unchanged",
+                pins.iter().copied(),
+            );
         }
         result
     }

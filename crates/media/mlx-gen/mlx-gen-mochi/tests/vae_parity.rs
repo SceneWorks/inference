@@ -154,6 +154,7 @@ fn synthetic_weights(cfg: &MochiVaeConfig) -> Weights {
     w
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn synthetic_decode_shape_and_determinism() {
     let cfg = tiny_cfg();
@@ -175,6 +176,8 @@ fn synthetic_decode_shape_and_determinism() {
         max_abs(&v1).is_finite(),
         "decode produced non-finite values"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::synthetic_decode_shape_and_determinism");
 }
 
 // ------------------------------------------------------------- real-weight golden gate
@@ -226,4 +229,6 @@ fn vae_decode_matches_golden() {
         "VAE mean pixel error {mean_px:.3e} too high"
     );
     assert!(max_px < 5e-2, "VAE max pixel error {max_px:.3e} too high");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::vae_decode_matches_golden");
 }

@@ -441,7 +441,13 @@ fn save_safetensors(tensors: &HashMap<String, Tensor>, path: &Path) -> Result<()
 }
 
 fn read_json(path: &Path) -> Result<Json> {
-    let text = std::fs::read_to_string(path)?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(path),
+        "crates/llm/candle-llm/src/prepare.rs::read_json::std::fs::read_to_string@20434",
+        ArtifactInput,
+        path,
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )?;
     serde_json::from_str(&text)
         .map_err(|e| Error::Config(format!("prepare: parse {}: {e}", path.display())))
 }

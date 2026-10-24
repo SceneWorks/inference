@@ -164,7 +164,13 @@ fn load_resume_inner(
     opt: &mut TrainOptimizer,
     identity: Option<ResumeIdentity<'_>>,
 ) -> Result<(LoraParams, ResumeMeta)> {
-    let (tensors, meta) = Array::load_safetensors_with_metadata(snapshot)?;
+    let (tensors, meta) = gen_core::__model_input_reader!(
+Array::load_safetensors_with_metadata(snapshot),
+"crates/media/mlx-gen/src/train/checkpoint.rs::load_resume_inner::Array::load_safetensors_with_metadata@7568",
+TensorInput,
+snapshot,
+|__model_input_path| Array::load_safetensors_with_metadata(__model_input_path)
+)?;
     if let Some(identity) = identity {
         check_resume_fingerprints(&meta, identity.config, identity.request_fingerprint)?;
     }

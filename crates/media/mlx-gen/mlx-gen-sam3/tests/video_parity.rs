@@ -76,4 +76,6 @@ fn video_pcs_matches_oracle() {
     }
     println!("worst per-object mask cosine = {worst:.7}");
     assert!(worst > 0.999, "video PCS mask cosine {worst}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_parity::video_pcs_matches_oracle");
 }

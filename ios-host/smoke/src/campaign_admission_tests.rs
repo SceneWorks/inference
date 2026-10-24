@@ -140,7 +140,7 @@ fn zimage_fixture(root: &Path, bits: Option<u32>) {
     std::fs::write(root.join("vae/config.json"), config).unwrap();
     gen_core_testkit::write_encoder_contract_fixture_with_quant(
         &root.join("text_encoder"),
-        runtime_ios::media::zimage::ENCODER_CONTRACT,
+        mlx_gen_z_image::test_support::active_encoder_contract(),
         bits.map(|bits| bits as i32),
     )
     .unwrap();
@@ -727,6 +727,7 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
 /// tier is not the case's is a typed artifact refusal.
 #[test]
 fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
+    let _encoder_scope = mlx_gen_z_image::test_support::scoped_encoder_contract();
     let catalog = runtime_ios::catalog().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let slot = temp.path().join("z_image_turbo/q4");
@@ -856,6 +857,7 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
 /// non-first tile; a token outside the space is a typed strategy refusal.
 #[test]
 fn campaign_cells_execute_their_own_declared_selection() {
+    let _encoder_scope = mlx_gen_z_image::test_support::scoped_encoder_contract();
     let catalog = runtime_ios::catalog().unwrap();
     let discovered = surfaces(catalog.media()).unwrap();
     // The provider's declared space for `provider/tier/rung`, quality first.
@@ -998,4 +1000,55 @@ fn the_campaign_states_its_listener_callback_host_bound() {
         panic!("Bounded");
     };
     assert_eq!(longer_fixed - fixed_bytes, "_restore".len() as u64);
+}
+
+#[test]
+fn compact_zimage_contract_is_thread_local_nested_and_restores_production() {
+    use mlx_gen_z_image::{test_support, ENCODER_CONTRACT};
+    assert_eq!(test_support::active_encoder_contract(), ENCODER_CONTRACT);
+    {
+        let _outer = test_support::scoped_encoder_contract();
+        let compact = test_support::encoder_contract();
+        compact.validate_definition().unwrap();
+        assert_eq!(compact.hidden_size, ENCODER_CONTRACT.hidden_size);
+        assert_eq!(compact.output_width, ENCODER_CONTRACT.output_width);
+        assert_eq!(
+            compact.selected_hidden_layers,
+            &[compact.loaded_hidden_layers - 1]
+        );
+        assert_eq!(test_support::active_encoder_contract(), compact);
+        for (actual, production) in compact
+            .tokenizer
+            .required_tokens
+            .iter()
+            .zip(ENCODER_CONTRACT.tokenizer.required_tokens)
+        {
+            assert_eq!(actual.literal, production.literal);
+            assert_eq!(actual.role, production.role);
+            assert!((actual.id as usize) < compact.vocab_size);
+        }
+        {
+            let _inner = test_support::scoped_encoder_contract();
+            assert_eq!(test_support::active_encoder_contract(), compact);
+        }
+        assert_eq!(test_support::active_encoder_contract(), compact);
+        std::thread::spawn(|| {
+            assert_eq!(test_support::active_encoder_contract(), ENCODER_CONTRACT)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            mlx_gen_z_image::model::descriptor().encoder_contract,
+            Some(compact)
+        );
+        let config = mlx_gen_z_image::text_encoder::ZTextEncoderConfig::z_image();
+        assert_eq!(config.hidden_size as usize, compact.hidden_size);
+        assert_eq!(config.vocab_size as usize, compact.vocab_size);
+        assert_eq!(config.n_layers, compact.loaded_hidden_layers);
+    }
+    assert_eq!(test_support::active_encoder_contract(), ENCODER_CONTRACT);
+    assert_eq!(
+        mlx_gen_z_image::model::descriptor().encoder_contract,
+        Some(ENCODER_CONTRACT)
+    );
 }

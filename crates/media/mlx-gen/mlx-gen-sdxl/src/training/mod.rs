@@ -596,7 +596,11 @@ mod first_step_repro {
         tag: &str,
     ) -> Result<(f32, f64)> {
         let img = center_crop_square(&swatch(edge));
-        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge)?;
+        let x0 = (
+            crate::test_device::record_model_inference_device(),
+            encode_init_latents(&trainer.vae, &img, edge, edge),
+        )
+            .1?;
         let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1)?))?;
         let time_ids = text_time_ids(1);
         eval([&x0, &noise]).unwrap();
@@ -696,7 +700,8 @@ mod first_step_repro {
     /// (cond/pooled cast to match). These measured points are the basis of the `projected_dense_peak_gb`
     /// guard fit — refit the constants if this prints materially different numbers.
     #[test]
-    #[ignore = "needs real SDXL weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "needs real SDXL weights; run as its own process"]
     fn first_step_memory_sweep() {
         let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
         eprintln!("[sc-4941] SDXL dense f32 first-step sweep:");
@@ -754,17 +759,27 @@ mod first_step_repro {
             .map_err(|e| eprintln!("  edge {edge} CATCHABLE error: {e}"));
         }
         eprintln!("[sc-4941] sweep complete");
+
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_memory_sweep"
+        );
     }
 
     /// sc-4941 — always-bit-identical: the SDPA-segment checkpoint (opt-in) must not change grads vs
     /// the retained backward. Same decomposed attention, recomputed instead of retained.
     #[test]
-    #[ignore = "needs real SDXL weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "needs real SDXL weights; run as its own process"]
     fn attn_ckpt_grads_match_retained() {
         let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
         let edge = 256u32;
         let img = center_crop_square(&swatch(edge));
-        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let x0 = (
+            crate::test_device::record_model_inference_device(),
+            encode_init_latents(&trainer.vae, &img, edge, edge),
+        )
+            .1
+            .unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
         let time_ids = text_time_ids(1);
@@ -801,18 +816,26 @@ mod first_step_repro {
             max_rel < 1e-5,
             "attention-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained");
     }
 
     /// sc-4941 — block (gradient) checkpointing must not change the math: the per-block checkpointed
     /// forward+grads must match the dense path within fp tolerance (it reuses the same install + block
     /// forward, recompute-only). This is the correctness gate for the `gradient_checkpointing` lever.
     #[test]
-    #[ignore = "needs real SDXL weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "needs real SDXL weights; run as its own process"]
     fn block_ckpt_grads_match_dense() {
         let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
         let edge = 256u32; // math is resolution-agnostic; small enough that the dense path is cheap
         let img = center_crop_square(&swatch(edge));
-        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let x0 = (
+            crate::test_device::record_model_inference_device(),
+            encode_init_latents(&trainer.vae, &img, edge, edge),
+        )
+            .1
+            .unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
         let time_ids = text_time_ids(1);
@@ -856,6 +879,8 @@ mod first_step_repro {
             max_rel < 5e-3,
             "block checkpointing must match the dense grads: max rel {max_rel:.2e}"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense");
     }
 
     /// sc-4941 — bf16 is mixed precision, NOT bit parity: assert the bf16 grads point the same way as
@@ -863,14 +888,20 @@ mod first_step_repro {
     /// f32 re-promotion in the forward would pass the cosine check while saving nothing — the memory
     /// ratio IS the dtype assertion). Runs f32 first (the cast is destructive), then casts to bf16.
     #[test]
-    #[ignore = "needs real SDXL weights; run as its own process"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "needs real SDXL weights; run as its own process"]
     fn bf16_grads_direction_and_memory_vs_f32() {
         let (mut trainer, adapter, params, cond, pooled) = build_trainer_and_adapter();
 
         // Grad reference at 256 in f32.
         let edge = 256u32;
         let img = center_crop_square(&swatch(edge));
-        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let x0 = (
+            crate::test_device::record_model_inference_device(),
+            encode_init_latents(&trainer.vae, &img, edge, edge),
+        )
+            .1
+            .unwrap();
         let noise =
             random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
         let time_ids = text_time_ids(1);
@@ -986,6 +1017,8 @@ mod first_step_repro {
             bf16_peak < 0.70 * f32_peak,
             "bf16 must materially shrink the working set: f32 {f32_peak:.2} GB vs bf16 {bf16_peak:.2} GB"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_grads_direction_and_memory_vs_f32");
     }
 }
 
@@ -1135,21 +1168,25 @@ mod depth_anchoring_tests {
         ckpt: Option<Vec<String>>,
     ) -> (StepLosses, LoraParams) {
         let schedule = single_bucket(cache.len());
-        let (l, g) = run_train_step(
-            hooks,
-            unet,
-            params,
-            adapter,
-            cfg,
-            cache,
-            &schedule,
-            path,
-            n,
-            false,
-            Dtype::Float32,
-            ckpt,
+        let (l, g) = (
+            crate::test_device::record_model_inference_device(),
+            run_train_step(
+                hooks,
+                unet,
+                params,
+                adapter,
+                cfg,
+                cache,
+                &schedule,
+                path,
+                n,
+                false,
+                Dtype::Float32,
+                ckpt,
+            ),
         )
-        .unwrap();
+            .1
+            .unwrap();
         eval(g.values()).unwrap();
         (l, g)
     }
@@ -1214,6 +1251,7 @@ mod depth_anchoring_tests {
     /// LoRA-B gradient — and a diffusion step carries no depth term. Mutation: force
     /// `diffusion_on = true` in `compute_step_loss_grads` ⇒ the depth step reports a diffusion term
     /// ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn depth_step_trains_the_lora_through_depth_only() {
         let h = hooks();
@@ -1264,6 +1302,8 @@ mod depth_anchoring_tests {
             let gb = abs_sum(&g, ".lora_b");
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B |Σ| = {gb}");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// Epic 2123 E8 (the Candle `a_reverted_aux_step_trains_at_the_remapped_level` twin): a step the
@@ -1271,6 +1311,7 @@ mod depth_anchoring_tests {
     /// `StepPlan::without_skipped` — and still trains at the plan's remapped timestep, never the raw
     /// sampled one; an unclaimed diffusion step keeps the sampled timestep exactly. Mutation: remap
     /// only `if !plan.diffusion` (the pre-fix code) ⇒ the reverted step trains at the raw `t` ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn a_reverted_aux_step_trains_at_the_remapped_level() {
         use mlx_gen::gen_core::train::plan_step;
@@ -1302,11 +1343,14 @@ mod depth_anchoring_tests {
             trained_timestep(&h, raw, &diffusion).unet_time(),
             raw.unet_time()
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::a_reverted_aux_step_trains_at_the_remapped_level");
     }
 
     /// The aux step trains at the remapped timestep (window `[0.6, 0.8]` ⇒ index ∈ [600, 800]),
     /// with that timestep's `ᾱ` — the step equals a direct `compute_step_loss_grads` at
     /// `timestep_at(plan.noise_level)`. Mutation: keep the sampled `t` on an aux step ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn aux_step_trains_at_the_remapped_timestep() {
         let h = hooks();
@@ -1360,31 +1404,37 @@ mod depth_anchoring_tests {
         )
         .unwrap();
         let c = &cache[0];
-        let (expected, _) = compute_step_loss_grads(
-            &h,
-            &mut unet,
-            &params,
-            &adapter,
-            cfg.alpha,
-            cfg.rank as f32,
-            &c.x0,
-            &c.cond,
-            &c.pooled,
-            &c.time_ids,
-            t,
-            &noise,
-            false,
-            None,
-            Dtype::Float32,
-            None,
-            Some(AuxStep {
-                path: d.path(),
-                plan: &plan,
-                entry: 0,
-            }),
+        let (expected, _) = (
+            crate::test_device::record_model_inference_device(),
+            compute_step_loss_grads(
+                &h,
+                &mut unet,
+                &params,
+                &adapter,
+                cfg.alpha,
+                cfg.rank as f32,
+                &c.x0,
+                &c.cond,
+                &c.pooled,
+                &c.time_ids,
+                t,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+                None,
+                Some(AuxStep {
+                    path: d.path(),
+                    plan: &plan,
+                    entry: 0,
+                }),
+            ),
         )
-        .unwrap();
+            .1
+            .unwrap();
         assert_eq!(depth, expected);
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_step_trains_at_the_remapped_timestep");
     }
 
     /// sc-2124: the ε family's aux term carries the gain `min(1, √ᾱ/√(1−ᾱ)) = min(1, 1/σ_ve)`. On an
@@ -1392,6 +1442,7 @@ mod depth_anchoring_tests {
     /// the ungained depth loss of the recovered x0 times the gain, and every adapter gradient is the
     /// ungained term's gradient times the same gain. Mutation: drop the gain in
     /// `compute_step_loss_grads` (or make `aux_gain` return `1`) ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn epsilon_aux_term_and_gradient_carry_the_inverse_sigma_gain() {
         let h = hooks();
@@ -1423,30 +1474,34 @@ mod depth_anchoring_tests {
             random::normal::<f32>(&[1, 6, 4, 4], None, None, Some(&random::key(9).unwrap()))
                 .unwrap();
         let c = &cache[0];
-        let (got, g) = compute_step_loss_grads(
-            &h,
-            &mut unet,
-            &params,
-            &adapter,
-            cfg.alpha,
-            cfg.rank as f32,
-            &c.x0,
-            &c.cond,
-            &c.pooled,
-            &c.time_ids,
-            t,
-            &noise,
-            false,
-            None,
-            Dtype::Float32,
-            None,
-            Some(AuxStep {
-                path: d.path(),
-                plan: &plan,
-                entry: 0,
-            }),
+        let (got, g) = (
+            crate::test_device::record_model_inference_device(),
+            compute_step_loss_grads(
+                &h,
+                &mut unet,
+                &params,
+                &adapter,
+                cfg.alpha,
+                cfg.rank as f32,
+                &c.x0,
+                &c.cond,
+                &c.pooled,
+                &c.time_ids,
+                t,
+                &noise,
+                false,
+                None,
+                Dtype::Float32,
+                None,
+                Some(AuxStep {
+                    path: d.path(),
+                    plan: &plan,
+                    entry: 0,
+                }),
+            ),
         )
-        .unwrap();
+            .1
+            .unwrap();
         eval(g.values()).unwrap();
 
         // The ungained term, recomputed independently on the same forward.
@@ -1456,8 +1511,11 @@ mod depth_anchoring_tests {
         let (alpha, rank) = (cfg.alpha, cfg.rank as f32);
         let ungained = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
             adapter_ref.install_as(unet_ref, &p, alpha, rank, None, Dtype::Float32)?;
-            let eps = unet_ref
-                .forward(&noisy, t.unet_time(), &cond, &pooled, &ids)
+            let eps = (
+                crate::test_device::record_model_inference_device(),
+                unet_ref.forward(&noisy, t.unet_time(), &cond, &pooled, &ids),
+            )
+                .1
                 .map_err(|e| Exception::custom(e.to_string()))?;
             let x0 = Parameterization::Epsilon { alpha_bar: ab }
                 .recover_x0(&noisy, &eps)
@@ -1493,6 +1551,8 @@ mod depth_anchoring_tests {
             }
         }
         assert!(material > 0, "no material aux gradient to compare");
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::epsilon_aux_term_and_gradient_carry_the_inverse_sigma_gain");
     }
 
     /// Interleaved alternation through the real step seam (sc-2124): with N = 2 images and
@@ -1500,6 +1560,7 @@ mod depth_anchoring_tests {
     /// depth step within 3 epochs, and with gradient accumulation 2 both micro-steps of a window
     /// share one kind. Mutations: key the plan on the bare global step (no period) ⇒ image 0 never
     /// trains depth ⇒ red; build the alternation with accumulation 1 ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn alternation_interleaves_per_window() {
         let h = hooks();
@@ -1547,6 +1608,8 @@ mod depth_anchoring_tests {
             }
             assert_eq!(d.path().reference_computations(), cache.len());
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::alternation_interleaves_per_window");
     }
 
     /// sc-2127 integration: with two resolution buckets (item-major cache, different latent sizes)
@@ -1555,6 +1618,7 @@ mod depth_anchoring_tests {
     /// stays keyed on the step's window. Mutations: key the reference / plan on the item instead of
     /// the entry in `run_train_step` ⇒ a depth step on bucket 1 compares against bucket 0's
     /// reference (shape mismatch) or the counter stops at the item count ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn two_buckets_keep_per_entry_references() {
         let h = hooks();
@@ -1604,32 +1668,39 @@ mod depth_anchoring_tests {
         let steps = 2 * schedule.epoch_len() as u32;
         let mut depth_on_bucket1 = false;
         for n in 1..=steps {
-            let (l, _) = run_train_step(
-                &h,
-                &mut unet,
-                &params,
-                &adapter,
-                &cfg,
-                &cache,
-                &schedule,
-                Some(&mut d),
-                n,
-                false,
-                Dtype::Float32,
-                None,
+            let (l, _) = (
+                crate::test_device::record_model_inference_device(),
+                run_train_step(
+                    &h,
+                    &mut unet,
+                    &params,
+                    &adapter,
+                    &cfg,
+                    &cache,
+                    &schedule,
+                    Some(&mut d),
+                    n,
+                    false,
+                    Dtype::Float32,
+                    None,
+                ),
             )
-            .unwrap();
+                .1
+                .unwrap();
             let entry = schedule.cache_index((n - 1) as usize);
             depth_on_bucket1 |= l.aux.is_some() && entry % 2 == 1;
         }
         assert!(depth_on_bucket1, "no depth step on the second bucket");
         assert_eq!(d.path().reference_computations(), cache.len());
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::two_buckets_keep_per_entry_references");
     }
 
     /// E1: with depth off nothing is loaded, the estimate adds nothing, and the step is
     /// bit-identical to the pre-epic-2123 closure (reproduced here verbatim); a diffusion-only step
     /// of an enabled path is bit-identical too. Mutation: always add the aux output (e.g. a
     /// 0-weighted copy) into the total, or reorder the reduction ⇒ red.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path("sdxl", &TrainingConfig::default())
@@ -1672,8 +1743,11 @@ mod depth_anchoring_tests {
         let adapter_ref = &adapter;
         let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
             adapter_ref.install_as(unet_ref, &p, 4.0, 4.0, None, Dtype::Float32)?;
-            let eps = unet_ref
-                .forward(&noisy, t.unet_time(), &cond, &pooled, &ids)
+            let eps = (
+                crate::test_device::record_model_inference_device(),
+                unet_ref.forward(&noisy, t.unet_time(), &cond, &pooled, &ids),
+            )
+                .1
                 .map_err(|e| Exception::custom(e.to_string()))?;
             let diff = eps.subtract(&noise)?;
             Ok(vec![
@@ -1719,6 +1793,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_none1 {
             assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: depth anchoring grows the estimate by the TAESDXL + DA2 footprint (more for Large), and

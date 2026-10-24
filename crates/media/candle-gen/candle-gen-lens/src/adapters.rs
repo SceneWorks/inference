@@ -1023,6 +1023,7 @@ mod tests {
     /// effective alpha/rank — so the packed additive path and the dense fold path agree to f32 tolerance
     /// (the parity the ~1-ULP Lens sampler sensitivity needs).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lora_matches_fold_on_dense() {
         use candle_gen::candle_nn::Linear;
         use candle_gen::quant::AdaptLinear;
@@ -1072,6 +1073,11 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(d < 1e-4, "resolved additive != folded (max diff {d})");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lora_matches_fold_on_dense"
+        );
     }
 
     /// A **LoHa** file (`hada_*`) and an untagged third-party **LyCORIS LoKr** (`lokr_*`, no

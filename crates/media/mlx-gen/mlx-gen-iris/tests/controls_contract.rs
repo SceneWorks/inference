@@ -70,10 +70,14 @@ fn images(g: &dyn Generator, req: &GenerationRequest) -> Vec<Image> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn every_advertised_control_changes_the_render() {
     cpu_process(
         "controls_contract::every_advertised_control_changes_the_render",
-        every_advertised_control_changes_the_render_body,
+        || {
+            every_advertised_control_changes_the_render_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::every_advertised_control_changes_the_render");
+        },
     );
 }
 
@@ -172,12 +176,16 @@ fn every_advertised_control_changes_the_render_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_prompt_batch_renders_one_image_per_prompt_per_count() {
     // FP32 compute, so the batched solve is compared with the single renders at f32 rounding rather
     // than at bf16's batch-size-dependent GEMM rounding.
     cpu_process(
         "controls_contract::a_prompt_batch_renders_one_image_per_prompt_per_count",
-        batch_case,
+        || {
+            batch_case();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::a_prompt_batch_renders_one_image_per_prompt_per_count");
+        },
     );
 }
 
@@ -239,10 +247,14 @@ fn batch_case() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn caption_overflow_policies_are_honoured() {
     cpu_process(
         "controls_contract::caption_overflow_policies_are_honoured",
-        caption_overflow_policies_are_honoured_body,
+        || {
+            caption_overflow_policies_are_honoured_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::caption_overflow_policies_are_honoured");
+        },
     );
 }
 
@@ -287,10 +299,14 @@ fn caption_overflow_policies_are_honoured_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn previews_stream_the_patch_pooled_clean_image_every_step() {
     cpu_process(
         "controls_contract::previews_stream_the_patch_pooled_clean_image_every_step",
-        previews_stream_the_patch_pooled_clean_image_every_step_body,
+        || {
+            previews_stream_the_patch_pooled_clean_image_every_step_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::previews_stream_the_patch_pooled_clean_image_every_step");
+        },
     );
 }
 
@@ -356,10 +372,14 @@ fn previews_stream_the_patch_pooled_clean_image_every_step_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn adapters_load_through_the_catalog_and_report_provenance() {
     cpu_process(
         "controls_contract::adapters_load_through_the_catalog_and_report_provenance",
-        adapters_load_through_the_catalog_and_report_provenance_body,
+        || {
+            adapters_load_through_the_catalog_and_report_provenance_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED controls_contract::adapters_load_through_the_catalog_and_report_provenance");
+        },
     );
 }
 

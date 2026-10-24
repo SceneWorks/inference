@@ -76,12 +76,24 @@ impl ClipBpeTokenizer {
     pub fn from_files(vocab_path: impl AsRef<Path>, merges_path: impl AsRef<Path>) -> Result<Self> {
         Self::from_readers(
             || {
-                std::fs::read_to_string(vocab_path.as_ref())
-                    .map_err(|e| Error::Msg(format!("sdxl tokenizer: read vocab.json: {e}")))
+                mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(vocab_path.as_ref()),
+"crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3322",
+ArtifactInput,
+vocab_path.as_ref(),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+                .map_err(|e| Error::Msg(format!("sdxl tokenizer: read vocab.json: {e}")))
             },
             || {
-                std::fs::read_to_string(merges_path.as_ref())
-                    .map_err(|e| Error::Msg(format!("sdxl tokenizer: read merges.txt: {e}")))
+                mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(merges_path.as_ref()),
+"crates/media/mlx-gen/mlx-gen-sdxl/src/tokenizer.rs::from_files::std::fs::read_to_string@3509",
+ArtifactInput,
+merges_path.as_ref(),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+                .map_err(|e| Error::Msg(format!("sdxl tokenizer: read merges.txt: {e}")))
             },
             || Ok(()),
         )

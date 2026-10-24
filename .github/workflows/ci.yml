@@ -216,7 +216,9 @@ jobs:
       # which needs numpy. Leaving this after the discover step would turn that gate into an import
       # error rather than a check (sc-17285).
       - name: Install pinned tooling test dependencies
-        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0
+        run: python3 -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0 PyYAML==6.0.2
+      - name: Enforce model-free ordinary CI and registered explicit proofs
+        run: python3 -I scripts/check_model_inference_policy.py
       - name: Test repository tooling
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Test Mage oracle provisioning failures
@@ -249,7 +251,7 @@ jobs:
           --all-targets -- -D warnings
       - name: Test contracts
         run: >-
-          cargo test --locked
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
@@ -284,7 +286,7 @@ jobs:
       # Just the testkit: the Linux `contracts` job above owns clippy and the whole contracts
       # package set. This lane is here only for the assertions that need a real NTFS volume.
       - name: Test contracts testkit on NTFS
-        run: cargo test --locked -p sceneworks-gen-core-testkit
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -p sceneworks-gen-core-testkit
 
   # THE LINUX CPU LANE, SPLIT ACROSS FOUR RUNNERS. This was one `candle-cpu` job running every step
   # in sequence at a ~40-minute median. Nothing was dropped: the four jobs below carry the same
@@ -337,6 +339,12 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          --features candle-audio/testkit
+          --all-targets -- -D warnings
+      - name: Compile and lint Candle CPU model-proof hooks (no model execution)
+        run: >-
+          python3 -I scripts/ci/compile_model_proof_targets.py --lane cpu -- cargo clippy --locked
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
           --features candle-audio/testkit
           --all-targets -- -D warnings
@@ -401,7 +409,7 @@ jobs:
         # `candle-gen*` moved to its own invocation below because it was the group that had no
         # `--tests` runner anywhere.
         run: >-
-          cargo test --locked --lib -j 1
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib -j 1
           -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu
       # sc-19447. Until this step existed, `candle-gen*`'s 176 integration targets executed in NO
       # lane that runs automatically: this job was `--lib` only, `candle-cpu-lint` compiles them
@@ -483,7 +491,7 @@ jobs:
       #     (or to split across runners) if the candle lane's cost is ever questioned.
       - name: Test Candle gen packages and integration targets
         run: >-
-          cargo test --locked --lib --tests -j 1
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib --tests -j 1
           -p 'candle-gen*'
 
   candle-cpu-conformance:
@@ -500,14 +508,14 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test Candle LLM conformance
-        run: cargo test --locked -j 1 -p candle-llm --test conformance
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -j 1 -p candle-llm --test conformance
       - name: Test Stable Audio 3 weight-free quality gates
         # Every integration target with a non-ignored case must be named in this command.
         # scripts/tests/test_sa3_ci_target_coverage.py enforces that executable invariant.
         # Rationale, real-weight exclusions, and historical mutation evidence live in the
         # SC_14545 through SC_14550 migration records and SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md.
         run: >-
-          cargo test --locked -j 1
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -j 1
           -p candle-audio-stable-audio-3
           --test provider --test dtype_policy --test variant_quality --test conformance
           --test sampler_oracle --test same_oracle --test primitive_oracle
@@ -533,15 +541,15 @@ jobs:
       # is why they cost ~7m combined even when they ran straight after it. Grouping them keeps that
       # feature thrash on one runner instead of spreading it.
       - name: Test LLM-only CPU bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-cpu
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CPU bundle
-        run: cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
       # The fourth documented profile (audio-backend-strategy.md feature matrix): media without
       # the audio lane must keep composing — one lane covers it, on the cheapest platform.
       - name: Test media-only CPU bundle
-        run: cargo test --locked --no-default-features --features media --lib -p runtime-cpu
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features media --lib -p runtime-cpu
 
   macos-metal:
     name: MLX + Candle Metal packages (macOS)
@@ -763,7 +771,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --lib --tests
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --lib --tests
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
@@ -784,7 +792,7 @@ jobs:
           && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
-        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
       # The non-default `device-capture` surface (`media::capture_permit`), which only the device
       # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
       - name: Test runtime-ios device-capture surface
@@ -805,7 +813,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --lib -p runtime-ios --features device-capture
       - name: Test iOS catalog device-capture unit tests
         if: >-
@@ -815,7 +823,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast
           --lib -p mlx-gen-ios-catalog --features device-capture
       # The compile_fail doctests that keep `capture_permit` out of a product build (and the
       # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
@@ -858,7 +866,7 @@ jobs:
           && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
-        run: python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
       # sc-19556: this is the step that ran the runner out of disk on all three 2026-08-19 attempts,
       # so the probe runs even when it fails — that is the reading we did not have. Diagnostics
       # only; never fails the job.
@@ -891,6 +899,17 @@ jobs:
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
+      - name: Compile and lint Candle Metal model-proof hooks (no model execution)
+        if: >-
+          ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'
+          && steps.mlx_versions.outcome == 'success' && steps.mlx_metal.outcome == 'success'
+          && steps.mlx_rust.outcome == 'success' && steps.mlx_prebuilt.outcome == 'success'
+          && steps.mlx_setup.outcome == 'success'
+          && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
+        run: >-
+          python3 scripts/ci/run_ci_collection.py -- python3.12 -I scripts/ci/compile_model_proof_targets.py --lane metal -- cargo clippy --locked --keep-going
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
+          --all-targets --features metal -- -D warnings
       # The only Candle tests any lane RUNS on a Metal device. The vendored candle-metal-kernels
       # carries upstream's rank > 4 strided-reduce fix (huggingface/candle#3873; its VENDORED.md);
       # these two weights-free pins are what reds a re-vendor that drops it: the 312-case kernel
@@ -907,7 +926,7 @@ jobs:
           && steps.mlx_setup.outcome == 'success'
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
-          python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
       # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
       # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
@@ -1060,6 +1079,9 @@ jobs:
           cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features zimage --all-targets -- -D warnings
 
   macos-nax:
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
     if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true'
@@ -1105,7 +1127,7 @@ jobs:
           # until something reinstalls rustup. Harmless on ephemeral runners; not here.
           cache-bin: "false"
       - name: Exercise MLX engine and complete runtime catalog on NAX
-        run: cargo test --locked --lib -p mlx-llm -p runtime-macos
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib -p mlx-llm -p runtime-macos
       # SC-18318 acceptance is correctness-only: exercise the focused synthetic
       # request-scoped exact-epilogue equality/receipt suite on a live Metal
       # device. The p3_ filter is intentionally narrow and invokes no timing,
@@ -1114,9 +1136,9 @@ jobs:
         env:
           MLX_ENABLE_TF32: "1"
           SCENEWORKS_REQUIRE_NAX: "1"
-        run: cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib -p mlx-gen p3_ -- --test-threads=1
       - name: Exercise LLM-only runtime catalog on NAX
-        run: cargo test --locked --no-default-features --lib -p runtime-macos
+        run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-macos
 
   # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
   # the lane.
@@ -1225,12 +1247,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
       - name: Execute weights-free CUDA catalog conformance (no GPU required)
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact
       # The lint twin of the compile check above. The `candle-cpu` lane already Clippies this same
       # package set with --all-targets, but it has no CUDA toolkit and so cannot pass --features cuda:
       # every `#[cfg(feature = "cuda")]` target is invisible to it and reaches main unlinted. That is
@@ -1245,6 +1267,11 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
+      - name: Compile and lint Candle CUDA model-proof hooks (no model execution)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -1309,19 +1336,19 @@ jobs:
           REQUIRE_SM120: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --no-default-features --lib -p runtime-cuda
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-cuda
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CUDA bundle
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
+          python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
   supply-chain:
     name: dependency policy + advisories

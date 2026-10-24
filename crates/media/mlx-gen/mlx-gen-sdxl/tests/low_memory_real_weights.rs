@@ -138,7 +138,12 @@ fn test_image(edge: i32) -> Array {
 fn quadrant_latent(vae: &Autoencoder, edge: i32) -> Array {
     let image = test_image(edge);
     if edge <= 512 {
-        let latent = vae.encode_mean(&image).unwrap();
+        let latent = (
+            crate::common::record_model_inference_device(),
+            vae.encode_mean(&image),
+        )
+            .1
+            .unwrap();
         latent.eval().unwrap();
         return latent;
     }
@@ -156,7 +161,12 @@ fn quadrant_latent(vae: &Autoencoder, edge: i32) -> Array {
                 2,
             )
             .unwrap();
-        let latent = vae.encode_mean(&tile).unwrap();
+        let latent = (
+            crate::common::record_model_inference_device(),
+            vae.encode_mean(&tile),
+        )
+            .1
+            .unwrap();
         latent.eval().unwrap();
         mlx_rs::memory::clear_cache();
         latent
@@ -245,7 +255,8 @@ fn parity_diagnostic_selection_preserves_both_widths_and_default_coverage() {
 /// counter and a cleared cache, and the run stops at the first decode over the bound. Every row is
 /// printed before anything is asserted, so one failing edge never hides the others.
 #[test]
-#[ignore = "real weights + Apple GPU: set SDXL_VAE_FP16_FIX_DIR"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "real weights + Apple GPU: set SDXL_VAE_FP16_FIX_DIR"]
 fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
     let size = std::env::var("SDXL_VAE_PARITY_SIZE").ok().map(|v| {
         v.parse::<i32>()
@@ -283,14 +294,26 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
     let mut over_bound = false;
     'edges: for (edge, tiles) in cases {
         let latent = quadrant_latent(&full, edge);
-        let (reference, ref_peak) = bounded_decode(|| full.decode_evaluated(&latent));
+        let (reference, ref_peak) = bounded_decode(|| {
+            (
+                crate::common::record_model_inference_device(),
+                full.decode_evaluated(&latent),
+            )
+                .1
+        });
         let mut decodes: Vec<Decode<'_>> = Vec::new();
         if tile.is_none() {
             decodes.push((
                 format!("{edge}² fp16 untiled"),
                 FP16_MAX_PIXEL_DELTA,
                 FP16_MEAN_PIXEL_DELTA,
-                Box::new(|| half.decode_evaluated(&latent)),
+                Box::new(|| {
+                    (
+                        crate::common::record_model_inference_device(),
+                        half.decode_evaluated(&latent),
+                    )
+                        .1
+                }),
             ));
         }
         for tile in &tiles {
@@ -303,13 +326,25 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
                 format!("{edge}² f32 tile {tile}"),
                 F32_TILED_MAX_PIXEL_DELTA,
                 F32_TILED_MEAN_PIXEL_DELTA,
-                Box::new(move || full.decode_tiled(latent, &tiling, None)),
+                Box::new(move || {
+                    (
+                        crate::common::record_model_inference_device(),
+                        full.decode_tiled(latent, &tiling, None),
+                    )
+                        .1
+                }),
             ));
             decodes.push((
                 format!("{edge}² fp16 tile {tile}"),
                 FP16_MAX_PIXEL_DELTA,
                 FP16_MEAN_PIXEL_DELTA,
-                Box::new(move || half.decode_tiled(latent, &t2, None)),
+                Box::new(move || {
+                    (
+                        crate::common::record_model_inference_device(),
+                        half.decode_tiled(latent, &t2, None),
+                    )
+                        .1
+                }),
             ));
         }
         eprintln!("[sc-26268 parity] {edge}² f32 untiled reference: peak {ref_peak:.2} GiB");
@@ -366,10 +401,13 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
         expected,
         "every selected comparison must be measured"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED low_memory_real_weights::fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode");
 }
 
 #[test]
-#[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL, SDXL_LADDER_ILLUSTRIOUS_XL_V2, SDXL_VAE_FP16_FIX_DIR"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL, SDXL_LADDER_ILLUSTRIOUS_XL_V2, SDXL_VAE_FP16_FIX_DIR"]
 fn low_memory_compositions_q4() {
     let fix = WeightsSource::Dir(env_path("SDXL_VAE_FP16_FIX_DIR"));
     let tiled = GenerationMemory {
@@ -427,4 +465,8 @@ fn low_memory_compositions_q4() {
         // 154-row kernels rounding differently, amplified by CFG × 7 and the ancestral noise.
         assert_eq!(max, 0, "{entry}: sequential CFG changed the image");
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED low_memory_real_weights::low_memory_compositions_q4"
+    );
 }

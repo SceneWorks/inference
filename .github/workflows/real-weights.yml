@@ -126,15 +126,6 @@ name: Real-weight validation
 # Python consumer that runs before that path is resolved.
 
 on:
-  schedule:
-    # 02:00 UTC Monday = 22:00 EDT Sunday. The macOS jobs are split across two self-hosted Metal
-    # runners by the labels above, but each box still runs its own share one at a time, so this run
-    # wants a whole night rather than a Sunday-morning start that bleeds into the working day.
-    # Cron is always UTC and does not
-    # follow US daylight time, so this lands at 21:00 EST once the clocks go back — still Sunday
-    # night, which is what matters. GitHub's scheduler also drifts under load (2026-08-02 the old
-    # cron fired ~2h late), so treat the start time as approximate.
-    - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
       qwen_image_2_1_lora_runner:
@@ -149,6 +140,9 @@ on:
         required: false
         default: full
         options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
+      # GitHub caps workflow_dispatch at 25 inputs. For profile=all ONLY, explicitly set
+      # this existing JSON input to {"confirm_all": true}; no extra keys are accepted.
+      # Every other profile, including the iOS profiles, retains its existing meaning/default.
       ios_pricing_compile_binding:
         description: 'ios-selected-captures: JSON selection (all/family/exact package/FQN), omitted defaults iris. ios-pricing-compile-only: owner-bound JSON exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe'
         type: string
@@ -158,10 +152,10 @@ on:
         description: Real-weight profile to run
         type: choice
         required: true
-        default: all
+        default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [ios-selected-captures, ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
+        options: ["", model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -353,6 +347,9 @@ permissions:
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' &&
+        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures') &&
+        format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) ||
+        github.event_name == 'workflow_dispatch' &&
         inputs.profile == 'qwen-image-2-1-lora-mlx' &&
         inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&
         'inference-real-weights-qwen21-primary-mac' || 'inference-real-weights-physical-host' }}
@@ -391,14 +388,26 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
 
 jobs:
+  validate-selection:
+    name: Require an intentional model profile selection
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Reject an empty profile or an unconfirmed aggregate
+        env:
+          MODEL_PROFILE: ${{ inputs.profile }}
+          MODEL_SELECTION_BINDING: ${{ inputs.profile == 'all' && inputs.ios_pricing_compile_binding || '' }}
+        run: python3.12 scripts/check_model_inference_policy.py --validate-selection
+
   # Dispatch-only: no schedule/all path, models, provisioning, GPU or test bodies.
   ios-selected-captures:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-selected-captures'
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
     timeout-minutes: 360
-    concurrency:
-      group: ios-selected-captures-nax-macos-2
-      cancel-in-progress: false
     env:
       IOS_CAPTURE_BINDING: ${{ inputs.ios_pricing_compile_binding }}
       CARGO_BUILD_JOBS: '4'
@@ -418,7 +427,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Run only registered ignored fixture captures
-        shell: bash
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash --noprofile --norc -eo pipefail {0}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ios-selected-target-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3.12 -I scripts/ci/ios_selected_captures.py --binding "$IOS_CAPTURE_BINDING"
@@ -431,6 +440,7 @@ jobs:
           if-no-files-found: error
 
   ios-pricing-compile-only:
+    needs: validate-selection
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-pricing-compile-only'
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
     concurrency:
@@ -473,6 +483,10 @@ jobs:
   # explicit mode of the same green lane; it fails closed on the expected current Hub revision and
   # runner-local HF auth.
   mlx-chroma-auxiliary:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: Chroma packed auxiliaries (${{ matrix.model }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -496,7 +510,8 @@ jobs:
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
     steps:
-      - name: Validate publication authorization
+      - shell: bash
+        name: Validate publication authorization
         if: inputs.publish_chroma_artifacts && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
         env:
           CHROMA_PUBLISH_CONFIRMATION: ${{ inputs.chroma_publish_confirmation }}
@@ -540,6 +555,9 @@ jobs:
   # receives q4+q8 in one parent-guarded commit. A retry explicitly verifies an already-published
   # repo byte-for-byte and treats it as success, making a cross-repository partial run resumable.
   mlx-chroma-publish:
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: Publish Chroma packed auxiliaries (${{ matrix.model }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-auxiliary' && inputs.publish_chroma_artifacts && inputs.chroma_model == 'all'
     needs: mlx-chroma-auxiliary
@@ -564,7 +582,8 @@ jobs:
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
     steps:
-      - name: Validate publication authorization
+      - shell: bash
+        name: Validate publication authorization
         env:
           CHROMA_PUBLISH_CONFIRMATION: ${{ inputs.chroma_publish_confirmation }}
         run: |
@@ -606,6 +625,10 @@ jobs:
   # or create calibration/performance data; the collector rejects every field outside the semantic
   # latent/output SHA + max-RGB allowlist before sealing ABI-2 policy rows.
   mlx-decode-quality-kolors:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 43200 -- /bin/bash -e {0}
     name: Decode quality admission (Kolors ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-kolors'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -664,6 +687,10 @@ jobs:
             ${{ runner.temp }}/decode-quality-v2-kolors-kolors-${{ matrix.candidate.geometry }}-policies.json
 
   mlx-decode-quality-sdxl:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 43200 -- /bin/bash -e {0}
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-sdxl'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -757,6 +784,10 @@ jobs:
             ${{ runner.temp }}/decode-quality-v2-sdxl-${{ matrix.model.id }}-${{ matrix.candidate.geometry }}-policies.json
 
   mlx-decode-quality-chroma:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 43200 -- /bin/bash -e {0}
     name: Decode quality admission (${{ matrix.model.id }} ${{ matrix.candidate.geometry }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-quality-chroma'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -877,6 +908,10 @@ jobs:
   # test. A filter that matches nothing makes libtest print "0 passed" and cargo exit 0, which is
   # the silent green this lane exists to prevent — the same guard the qwen-image and krea lanes use.
   mlx-chroma-memory-ladder:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: Chroma memory ladder (${{ matrix.model }})
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'chroma-memory-ladder'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -947,6 +982,10 @@ jobs:
   # immutable Mage snapshot consumed by the lifecycle test itself, so an unrelated oracle-cache
   # miss cannot suppress the real-Apple seam gate.
   mlx-request-memory-scope:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX request-memory scope real weights
     if: inputs.profile == 'request-memory-scope'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
@@ -998,6 +1037,10 @@ jobs:
   # forwards per 1024² render) and the two tests render ~27 images with a fresh model load per
   # measured row, which is hours on `rw-mage` hardware — the sc-16981 head-of-line shape.
   mlx-sana-drift-ceiling:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: MLX SANA drift ceiling real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'sana-drift-ceiling'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
@@ -1061,6 +1104,10 @@ jobs:
             ${{ runner.temp }}/sana-drift-ceiling/renders
 
   mlx-memory-evidence-v1:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 10800 -- /bin/bash -e {0}
     name: MLX memory evidence V1 real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'memory-evidence-v1'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
@@ -1076,7 +1123,8 @@ jobs:
       # byte-exactness on every run.
       INFERENCE_REVISION: ${{ github.sha }}
     steps:
-      - name: Validate SceneWorks revision input
+      - shell: bash
+        name: Validate SceneWorks revision input
         env:
           REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
         run: |
@@ -1165,6 +1213,10 @@ jobs:
   # consumes. They are dispatch-only and serialize Candle after MLX, so shared physical runners
   # cannot overlap an 8B Metal load with authoritative CUDA evidence.
   starvector-terminal-mlx:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 10800 -- /bin/bash -e {0}
     name: StarVector terminal native-provider preflight (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'starvector-terminal'
     runs-on: [self-hosted, macOS, ARM64, rw-starvector]
@@ -1255,6 +1307,10 @@ jobs:
   # SC-23942 is dispatch-only. These jobs serialize MLX then CUDA and launch prebuilt native test
   # executables directly, giving the sampler exact process ownership for RSS/GPU evidence.
   qwen38-bonsai-mlx:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: Qwen3.8/Bonsai matched diagnostics (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen38-bonsai'
     runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
@@ -1274,7 +1330,8 @@ jobs:
       CARGO_TARGET_DIR: /Volumes/Models/Codex-builds/sc-23935/ci-${{ github.run_id }}-${{ github.run_attempt }}/cargo-target
       TMPDIR: /Volumes/Models/Codex-builds/sc-23935/ci-${{ github.run_id }}-${{ github.run_attempt }}/tmp
     steps:
-      - name: Prepare external campaign storage
+      - shell: bash
+        name: Prepare external campaign storage
         # A pending macOS volume permission must not consume the model-test budget.
         timeout-minutes: 2
         run: |
@@ -1575,8 +1632,12 @@ jobs:
           retention-days: 30
 
   mlx-llm:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX LLM real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
+    if: inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
     timeout-minutes: 120
     env:
@@ -1627,8 +1688,12 @@ jobs:
   # artifacts out of the directory `clean: true` wipes; the 2m17s is now a first-run figure, and
   # this budget is loose by that margin until sc-17057 re-sizes it from a warm run.
   mlx-llm-joycaption:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 10800 -- /bin/bash -e {0}
     name: MLX JoyCaption VLM real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm' || inputs.profile == 'llm-joycaption'
+    if: inputs.profile == 'all' || inputs.profile == 'llm' || inputs.profile == 'llm-joycaption'
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
     timeout-minutes: 180
     env:
@@ -1689,8 +1754,12 @@ jobs:
         run: source scripts/ci/real-weights/mlx-llm-joycaption/run-joycaption-real-weight-vlm-gates.sh
 
   mlx-media:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX media real weights (${{ matrix.mage_seed_slot }})
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    if: inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 120
     strategy:
@@ -1949,7 +2018,7 @@ jobs:
 
   mage-seed-promotion-gate:
     name: Mage seed promotion receipts
-    if: always() && (github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media')
+    if: always() && (inputs.profile == 'all' || inputs.profile == 'media')
     needs: mlx-media
     runs-on: ubuntu-latest
     steps:
@@ -2011,8 +2080,12 @@ jobs:
   # set onto its own `rw-qwen` label is a one-line change here plus an org-settings change, and is
   # the right move the moment the disk budget wants these bytes on the other box.
   mlx-qwen-image:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 5400 -- /bin/bash -e {0}
     name: MLX Qwen-Image real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'qwen-image'
+    if: inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'qwen-image'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     # MEASURED 2026-08-04 on an M5 Max with the weight set already resident, per test:
     #   control        3 + 3 + 3 + 15 =  24s      sampler       31 + 30       =  61s
@@ -2265,8 +2338,12 @@ jobs:
   # failure, not a silent skip — but it is also why this lane must set PID_QWEN_SAFETENSORS and
   # PID_FLUX_SAFETENSORS explicitly at the published re-hosts rather than relying on any default.
   mlx-qwen-image-pid:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 3600 -- /bin/bash -e {0}
     name: MLX Qwen-Image / FLUX.1-dev PiD decode real weights
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'qwen-image-pid'
+    if: inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'qwen-image-pid'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     # MEASURED 2026-08-04 on an M5 Max, weight set resident: Qwen 2s + 23s + 205s, FLUX 35s + 83s =
     # 348s wall clock. Same warm-cache caveat as the job above, and this one can additionally have to
@@ -2324,6 +2401,10 @@ jobs:
   # `preview::RGB_FACTORS` unchanged and fails on the same floor, so it is a drift gate on constants
   # every live preview reads, not just a producer of a paste-ready block.
   mlx-qwen-image-producers:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 3600 -- /bin/bash -e {0}
     name: MLX Qwen-Image real-weight producers (operator dispatch)
     if: inputs.profile == 'qwen-image-producers'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
@@ -2369,12 +2450,16 @@ jobs:
   # multi-GB golden cache, an operator seed dir) that a video smoke needs none of, and because a 20 GB
   # tier fetch should be able to fail without taking the image lane's oracle work with it.
   mlx-krea-realtime:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX Krea Realtime video real weights
     # `krea-realtime` is selectable on its own so the 20 GB tier fetch does not require running the
     # Mage-oracle job that shares the `media` profile. `krea-kv-cache` runs only the two count-pinned
     # KV acceptance tests below, so an unrelated blanket e2e or LoRA failure cannot hide their
     # verdict (sc-17894).
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime' || inputs.profile == 'krea-kv-cache'
+    if: inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'krea-realtime' || inputs.profile == 'krea-kv-cache'
     runs-on: [self-hosted, macOS, ARM64, rw-krea]
     timeout-minutes: 120
     env:
@@ -2521,6 +2606,10 @@ jobs:
   # run covers the normal native-default seam and a 768 px run forces multiple 512/64 decode tiles;
   # the uploaded images remain available for the acceptance criterion's artifact inspection.
   mlx-krea-alternate-decoder:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX Krea alternate decoder correctness (operator dispatch)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-alternate-decoder'
     runs-on: [self-hosted, macOS, ARM64, nax, rw-sa3]
@@ -2609,6 +2698,10 @@ jobs:
   # So: DISPATCH THIS when the thing it measures changes — the AR rollout, `local_attn_size`/`sink_size`,
   # the sigma schedule across chunks, the VAE decode path — or before closing sc-15571. Not on a date.
   mlx-krea-realtime-s18-sweep:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 28800 -- /bin/bash -e {0}
     name: MLX Krea Realtime S18 coherence sweep (operator dispatch)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'krea-s18-sweep'
     runs-on: [self-hosted, macOS, ARM64, rw-krea]
@@ -2789,10 +2882,14 @@ jobs:
   # from the Hub on either box. The three diffusers/conditioner reference artifacts do NOT — see
   # the steps that require them.
   mlx-minimax-h3:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
     name: MLX MiniMax-H3 real weights
     # Selectable on its own so the 70.21 GB fetch does not require running the Mage-oracle job that
     # shares the `media` profile — the same split `krea-realtime` gets, for the same reason.
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    if: inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     # 60 -> 150 (sc-19438). The 60 was sized for an 11.638 GB first transfer plus nine gates; this
     # lane now also materializes the 58.568 GB text-encoder row and runs two more, one of which maps
@@ -3051,8 +3148,12 @@ jobs:
   # from nothing, in either profile. The workflow-level `CARGO_TARGET_DIR` above ends that, so the
   # budgets here are loose by one cold build on top of the debug-vs-release margin already noted.
   candle-audio-kokoro:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 1800 -- /bin/bash -e {0}
     name: Candle audio real weights (Kokoro TTS)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-kokoro'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-kokoro'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 30
     env:
@@ -3116,8 +3217,12 @@ jobs:
   # smaller number here is precisely the sc-16981 mistake (a 120-min cap that would have failed a
   # slow-but-passing job every week).
   candle-audio-moss-sfx:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 18000 -- /bin/bash -e {0}
     name: Candle audio real weights (MOSS SoundEffect)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-sfx'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-sfx'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 300
     env:
@@ -3154,8 +3259,12 @@ jobs:
           cargo test --locked --release -p candle-audio-moss-sfx --test conformance moss_sfx_wav_conformance -- --ignored --nocapture
 
   candle-audio-acestep:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
     name: Candle audio real weights (ACE-Step music)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-acestep'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-acestep'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 150
     env:
@@ -3190,8 +3299,12 @@ jobs:
         run: source scripts/ci/real-weights/candle-audio-acestep/run-provider-conformance.sh
 
   candle-audio-voice:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 1800 -- /bin/bash -e {0}
     name: Candle audio real weights (voice embed + conversion)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-voice'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-voice'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 30
     env:
@@ -3229,8 +3342,12 @@ jobs:
         run: source scripts/ci/real-weights/candle-audio-voice/run-provider-conformance.sh
 
   candle-audio-chatterbox:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Candle audio real weights (Chatterbox clone-TTS)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-chatterbox'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-chatterbox'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 120
     env:
@@ -3270,8 +3387,12 @@ jobs:
   # Provisional budget: neither of these families reached the runner before the 2026-08-02 cancel,
   # so there is no measured wall time for them yet. Revisit once a full weekly run completes.
   candle-audio-asr:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 3600 -- /bin/bash -e {0}
     name: Candle audio real weights (Whisper ASR + CLAP)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-asr'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-asr'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 60
     env:
@@ -3308,8 +3429,12 @@ jobs:
         run: source scripts/ci/real-weights/candle-audio-asr/run-provider-conformance.sh
 
   candle-audio-moss-tts:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Candle audio real weights (MOSS-TTSD dialogue)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-tts'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-tts'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 120
     env:
@@ -3381,8 +3506,12 @@ jobs:
   # PROVISIONAL instead of being rewritten every time someone re-runs them on a different load.
   # Re-size from the first weekly that executes this lane (sc-17057's scope).
   candle-audio-moss-tts-realtime:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Candle audio real weights (MOSS-TTS-Realtime streaming)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-tts-realtime'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'audio-moss-tts-realtime'
     runs-on: [self-hosted, macOS, ARM64, rw-audio]
     timeout-minutes: 120
     env:
@@ -3430,8 +3559,12 @@ jobs:
         run: source scripts/ci/real-weights/candle-audio-moss-tts-realtime/run-moss-tts-realtime-provider-conformance.sh
 
   same-l-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: SAME-L real weights (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3456,8 +3589,12 @@ jobs:
         run: source scripts/ci/real-weights/same-l-metal/measure-literal-380-second-and-exact-max-same-l-roundtrips-o.sh
 
   same-chunked-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: SAME outer chunking real weights (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-chunked'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3483,8 +3620,12 @@ jobs:
         run: source scripts/ci/real-weights/same-chunked-metal/measure-and-verify-120-second-direct-versus-chunked-resource.sh
 
   sa3-small-music-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Stable Audio 3 small-music provider (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3512,8 +3653,12 @@ jobs:
         run: source scripts/ci/real-weights/sa3-small-music-metal/render-a-real-30-second-eight-step-metal-wav.sh
 
   sa3-small-sfx-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Stable Audio 3 small-sfx provider (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3551,8 +3696,12 @@ jobs:
         run: source scripts/ci/real-weights/sa3-small-sfx-metal/render-a-real-30-second-eight-step-sfx-metal-wav.sh
 
   sa3-medium-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Stable Audio 3 medium provider (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3608,8 +3757,12 @@ jobs:
         run: source scripts/ci/real-weights/sa3-medium-metal/render-a-real-30-second-eight-step-medium-metal-wav.sh
 
   sa3-base-identity-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Stable Audio 3 base/post-trained identity matrix (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3647,8 +3800,12 @@ jobs:
         run: source scripts/ci/real-weights/sa3-base-identity-metal/prove-the-load-time-adapter-fold-on-all-six-checkpoints.sh
 
   sa3-small-base-metal:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: Stable Audio 3 small base providers (Metal)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, macOS, ARM64, rw-sa3]
     timeout-minutes: 120
     env:
@@ -3676,8 +3833,9 @@ jobs:
         run: source scripts/ci/real-weights/sa3-small-base-metal/render-both-base-wavs-at-the-variants-own-defaults.sh
 
   same-l-cuda:
+    needs: validate-selection
     name: SAME-L real weights (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'same-l'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -3737,8 +3895,9 @@ jobs:
         run: . ./scripts/ci/real-weights/same-l-cuda/measure-literal-380-second-and-exact-max-same-l-roundtrips-a.ps1
 
   sa3-small-music-cuda:
+    needs: validate-selection
     name: Stable Audio 3 small-music provider (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-music'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -3790,8 +3949,9 @@ jobs:
         run: . ./scripts/ci/real-weights/sa3-small-music-cuda/render-a-real-30-second-eight-step-cuda-wav.ps1
 
   sa3-small-sfx-cuda:
+    needs: validate-selection
     name: Stable Audio 3 small-sfx provider (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-sfx'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -3856,8 +4016,9 @@ jobs:
         run: . ./scripts/ci/real-weights/sa3-small-sfx-cuda/render-a-real-30-second-eight-step-sfx-cuda-wav.ps1
 
   sa3-medium-cuda:
+    needs: validate-selection
     name: Stable Audio 3 medium provider (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-medium'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4050,8 +4211,9 @@ jobs:
         run: . ./scripts/ci/real-weights/sa3-medium-cuda/render-a-real-30-second-eight-step-medium-cuda-wav.ps1
 
   sa3-base-identity-cuda:
+    needs: validate-selection
     name: Stable Audio 3 base/post-trained identity matrix (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-base-identity'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4134,8 +4296,9 @@ jobs:
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\prove-the-load-time-adapter-fold-on-all-six-checkpoints.cmd
 
   sa3-small-base-cuda:
+    needs: validate-selection
     name: Stable Audio 3 small base providers (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
+    if: inputs.profile == 'all' || inputs.profile == 'audio' || inputs.profile == 'sa3-small-base'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4184,8 +4347,9 @@ jobs:
         run: . ./scripts/ci/real-weights/sa3-small-base-cuda/render-both-base-cuda-wavs-at-the-variants-own-defaults.ps1
 
   candle-llm:
+    needs: validate-selection
     name: Candle LLM real weights (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'llm'
+    if: inputs.profile == 'all' || inputs.profile == 'llm'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4224,6 +4388,7 @@ jobs:
   # of another arm of `media`: every rung needs a fresh CUDA process, while the unrelated media
   # matrix can occupy both real-weight hosts for hours. Catalog calibration remains entry-owned.
   candle-mage-memory-ladder:
+    needs: validate-selection
     name: Candle Mage memory ladder (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'mage-memory-ladder'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -4267,6 +4432,7 @@ jobs:
           if-no-files-found: error
 
   candle-scail2-shared:
+    needs: validate-selection
     name: SCAIL-2 shared bf16 package (CUDA)
     # This 47.2 GB package is an explicit release/admission calibration, not part of the weekly
     # `all` sweep. Dispatch `profile=scail2` on the exact inference head being qualified.
@@ -4358,7 +4524,7 @@ jobs:
 
   candle-media:
     name: Candle media real weights (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    if: inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     needs: [mlx-media, mage-seed-promotion-gate]
@@ -4422,8 +4588,9 @@ jobs:
         run: call scripts\ci\real-weights\candle-media\run-provider-conformance.cmd
 
   candle-sdxl:
+    needs: validate-selection
     name: Candle SDXL real weights (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media'
+    if: inputs.profile == 'all' || inputs.profile == 'media'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4484,12 +4651,13 @@ jobs:
         run: call scripts\ci\real-weights\candle-sdxl\run-sdxl-real-weight-renders.cmd
 
   candle-mmaudio:
+    needs: validate-selection
     name: Candle mmaudio real weights (CUDA)
     # mmaudio video->audio runs under the `audio` profile (on the CUDA runner — candle is CUDA/CPU).
     # The MMAudio DiT/VAE (CC-BY-NC-4.0) + DFN5B-CLIP (Apple ML Research License) are research/non-
     # commercial; SceneWorks is non-commercial and surfaces these licenses to the user (epic-12833
     # decision), so running them in the regression guard is in-policy.
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'audio'
+    if: inputs.profile == 'all' || inputs.profile == 'audio'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 120
     env:
@@ -4679,8 +4847,9 @@ jobs:
   #     `the_adaln_projections_are_the_documented_twenty_six_gigabytes` — header-only, but they need
   #     the 62 GB `transformer/` component, which the `minimax-h3` row deliberately does not fetch.
   candle-minimax-h3:
+    needs: validate-selection
     name: Candle MiniMax-H3 real weights (CUDA)
-    if: github.event_name == 'schedule' || inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
+    if: inputs.profile == 'all' || inputs.profile == 'media' || inputs.profile == 'minimax-h3'
     runs-on: [self-hosted, windows, cuda, real-weights]
     # There is no "house value" to appeal to and an earlier version of this comment invented one:
     # of the 42 jobs in this file, 26 carry 120 and 16 do not (2x30, 4x60, 90, 150, 2x180, 300,
@@ -4967,6 +5136,7 @@ jobs:
   # tokens x 40 steps; the ten-reference edit recomputes a ~41k-token prefix per step, which is why
   # it runs two). Re-size it DOWN from the first run that completes.
   candle-qwen-image-2-1:
+    needs: validate-selection
     name: Candle Qwen-Image 2.1 real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5084,6 +5254,7 @@ jobs:
   # Turbo q8/q4 tier directory (`qwen_image_2_1_turbo_tier_snapshot`; unpublished, so no manifest
   # row); otherwise the lane warns and leaves a NOT-RUN marker. Re-size it from the first run.
   candle-qwen-image-2-1-turbo:
+    needs: validate-selection
     name: Candle Qwen-Image 2.1 Turbo real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-turbo'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5167,6 +5338,7 @@ jobs:
   # `src/training.rs`. Only the bf16 snapshot is needed. Same box, labels, toolchain and sccache
   # rule as `candle-qwen-image-2-1` above.
   candle-qwen-image-2-1-train:
+    needs: validate-selection
     name: Candle Qwen-Image 2.1 training peaks (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-train'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5241,6 +5413,10 @@ jobs:
   # total RAM: the ~65 GB peak measured on CUDA + 20 GB headroom); the run is
   # wrapped in an external phys_footprint guard (SIGTERM at 80 GB or 20 min) that prints the peak.
   mlx-iris-depth-train:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
     name: MLX Iris-3B depth full fine-tune (real weights)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-depth-train-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -5316,6 +5492,7 @@ jobs:
   # line into the evidence artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
   # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.
   candle-iris:
+    needs: validate-selection
     name: Candle Iris-3B real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5416,6 +5593,7 @@ jobs:
   # `timeout-minutes: 600` is a runaway guard, not a budget: two cold `--release --features cuda`
   # builds, then every row's runs back to back. Re-size it from the first campaign that completes.
   candle-decode-speedups-bench:
+    needs: validate-selection
     name: Decode-speedups benchmark campaign (Candle/CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5530,6 +5708,10 @@ jobs:
   # themselves are estimated at ~60-90 min (the two-reference edit training step attends over
   # ~9k tokens). Re-size it DOWN from the first run that completes.
   mlx-qwen-image-2-1:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 18000 -- /bin/bash -e {0}
     name: MLX Qwen-Image 2.1 LoRA/LoKr real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'
     # Terminal recovery may select the primary Mac's unique rw-starvector label. Both Macs
@@ -5757,6 +5939,10 @@ jobs:
   # The test binary builds into a run-scoped CARGO_TARGET_DIR with unstripped proc-macros
   # (rust-lang/rust#157750).
   mlx-iris-restore-train:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 10800 -- /bin/bash -e {0}
     name: MLX Iris-3B restoration training real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-restore-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -5818,6 +6004,10 @@ jobs:
   # builds into a run-scoped CARGO_TARGET_DIR with the release profile unstripped
   # (rust-lang/rust#157750).
   mlx-iris-curricula-train:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 14400 -- /bin/bash -e {0}
     name: MLX Iris-3B curricula real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-curricula-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -5875,6 +6065,10 @@ jobs:
   # footprint and are classified by scripts/ci/iris_memory_probe_row.py (decimal GB throughout).
   # Run-scoped CARGO_TARGET_DIR, release profile unstripped (rust-lang/rust#157750).
   mlx-iris-memory-probe:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 3600 -- /bin/bash -e {0}
     name: MLX Iris-3B full fine-tune memory probes
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-memory-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -5933,6 +6127,10 @@ jobs:
   # failed / guard-stopped render or a cell without both result.json files. Run-scoped
   # CARGO_TARGET_DIR, release profile unstripped (rust-lang/rust#157750).
   mlx-veda:
+    needs: validate-selection
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 25200 -- /bin/bash -e {0}
     name: MLX Veda sparse attention device gate and A/B
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-chroma]
@@ -5995,6 +6193,7 @@ jobs:
   # test prints the driver pool's USED/RESERVED high-water marks next to the polled device peak;
   # rows are classified by scripts/ci/iris_memory_probe_row.py (a CUDA OOM = "exceeds this card").
   candle-iris-memory-probe:
+    needs: validate-selection
     name: Candle Iris-3B full fine-tune memory probes (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-memory-cuda'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -6077,6 +6276,7 @@ jobs:
   # official curriculum on real weights (`stage1_256` + REPA → `stage2_512` new phase, batch 1, four
   # steps). Logs, per-check VRAM lines and the curriculum's metrics go in the evidence artifact.
   candle-iris-curricula:
+    needs: validate-selection
     name: Candle Iris-3B curricula + distributed (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-curricula-cuda'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -6148,6 +6348,7 @@ jobs:
           retention-days: 30
 
   veda-s3-cuda:
+    needs: validate-selection
     name: Veda S3 bounded native kernel validation (CUDA only)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-s3-cuda'
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
@@ -6199,4 +6400,171 @@ jobs:
         with:
           name: veda-s3-cuda-${{ github.sha }}
           path: ${{ runner.temp }}/veda-s3-cuda-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+
+  # Pre-main proof bridge: existing default-branch workflow identity, exact feature ref.
+  model-proof-plan:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'model-inference-proofs'
+    name: Validate exact model-proof request (no model execution)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      backend: ${{ steps.plan.outputs.backend }}
+      request: ${{ steps.plan.outputs.request }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned uv on Linux
+        if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install managed CPython 3.12 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uv python install 3.12.10 --managed-python --no-bin --no-config
+          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
+          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+      - name: Validate registered cases and explicit resource policy
+        id: plan
+        env:
+          MODEL_PROOF_BINDING: ${{ inputs.ios_pricing_compile_binding }}
+        run: |
+          "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
+            --binding-env MODEL_PROOF_BINDING \
+            --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
+          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\nbackend="+p["backend"]+"\nrequest="+json.dumps(p["request"],separators=(",",":"))+"\n")'
+
+  model-proof-execute:
+    name: Explicit ${{ needs.model-proof-plan.outputs.backend }} model tests
+    needs: model-proof-plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.model-proof-plan.outputs.matrix) }}
+    env:
+      MODEL_PROOF_BACKEND: ${{ needs.model-proof-plan.outputs.backend }}
+      MODEL_PROOF_REQUEST: ${{ needs.model-proof-plan.outputs.request }}
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      CARGO_BUILD_JOBS: '4'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_STRIP: 'false'
+      CARGO_PROFILE_TEST_STRIP: 'false'
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP: none
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_STRIP: none
+      CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select Git Bash on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned uv on Windows
+        if: runner.os == 'Windows'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      - name: Install pinned uv on Linux
+        if: runner.os == 'Linux'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.3'
+          enable-cache: false
+      - name: Install managed CPython 3.12 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uv python install 3.12.10 --managed-python --no-bin --no-config
+          PYTHON="$(uv python find 3.12.10 --managed-python --no-project --no-config)"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:3] == (3,12,10), sys.version'
+          printf 'REVIEWED_PYTHON=%s\n' "$PYTHON" >> "$GITHUB_ENV"
+      - name: Set owned proof paths and actual runner environment
+        shell: bash
+        env:
+          OWNED_PROOF_EVIDENCE: ${{ runner.temp }}/model-proof-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          ACTUAL_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          printf 'MODEL_PROOF_EVIDENCE=%s\n' "$OWNED_PROOF_EVIDENCE" >> "$GITHUB_ENV"
+          printf 'MODEL_PROOF_RUNNER_ENVIRONMENT=%s\n' "$ACTUAL_RUNNER_ENVIRONMENT" >> "$GITHUB_ENV"
+      - name: Select Rustup proxies on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+          for tool in cargo rustc rustup; do test -x "$RUSTUP_BIN/$tool"; done
+          printf '%s\n' "$RUSTUP_BIN" >> "$GITHUB_PATH"
+      - name: Select Rustup proxies on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%\.cargo"
+          for %%T in (cargo rustc rustup) do if not exist "%CARGO_HOME%\bin\%%T.exe" exit /b 1
+          echo %CARGO_HOME%\bin>>"%GITHUB_PATH%"
+      - name: Report actual host and pinned toolchain (no model execution)
+        shell: bash
+        run: |
+          rustup show
+          cargo --version
+          rustc --version
+          hostname
+          df -h .
+      - name: Require Python 3.12 on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: command -v python3.12
+      - name: Run exact registered model tests under external guards (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
+          "$PYTHON" -I scripts/ci/model_inference_proofs.py \
+            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
+            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+      - name: Run exact registered model tests under external guards (Windows CUDA)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          if not defined REVIEWED_PYTHON (
+            echo A reviewed absolute Python 3.12 interpreter must be provisioned.
+            exit /b 1
+          )
+          set "RUSTC_WRAPPER="
+          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
+      - name: Validate owned evidence tree before any upload
+        id: evidence
+        if: always()
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
+          "$PYTHON" -I scripts/ci/model_inference_proofs.py --verify-artifacts \
+            --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
+            --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
+      - name: Upload exact case evidence, safe generated outputs, logs and summary
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: model-proof-${{ github.sha }}-${{ needs.model-proof-plan.outputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MODEL_PROOF_EVIDENCE }}
           if-no-files-found: error

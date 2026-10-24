@@ -56,7 +56,7 @@ const COND_B_KEY: &str = "diffusion_model.llm_adapter.blocks.0.self_attn.q_proj.
 /// leg does one model load + one injection, then `clear_cache()`s before the next, exactly like
 /// `real_weights.rs::generate_all_three_variants_1024`'s back-to-back loads.
 #[test]
-#[ignore = "needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
+#[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima + Anima-Official-LoRAs snapshots"]
 fn scale_convention_dit_and_conditioner() {
     let tmp = tempfile::tempdir().unwrap();
     // ---------------------------------------------------------------------------------------------
@@ -205,4 +205,9 @@ fn scale_convention_dit_and_conditioner() {
         );
     }
     mlx_rs::memory::clear_cache();
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED scale_convention::scale_convention_dit_and_conditioner"
+    );
 }

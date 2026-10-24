@@ -423,6 +423,9 @@ fn assert_lane_previews_converge(
 #[ignore = "needs the Kolors snapshot + a CUDA GPU; run with --features cuda --ignored"]
 fn kolors_native_preview_frames_evolve_toward_the_final_image() {
     assert_lane_previews_converge("kolors-native-euler", None, 12, 1024);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::kolors_native_preview_frames_evolve_toward_the_final_image");
 }
 
 /// The registered route's curated lane: `run_curated_sampler` over the Kolors `DiscreteModelSampling`,
@@ -431,6 +434,9 @@ fn kolors_native_preview_frames_evolve_toward_the_final_image() {
 #[ignore = "needs the Kolors snapshot + a CUDA GPU; run with --features cuda --ignored"]
 fn kolors_curated_preview_frames_evolve_toward_the_final_image() {
     assert_lane_previews_converge("kolors-curated-ddim", Some("ddim"), 12, 1024);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::kolors_curated_preview_frames_evolve_toward_the_final_image");
 }
 
 /// Exactly one frame per **outer** step on a multi-eval solver, with the guard made non-vacuous
@@ -448,4 +454,7 @@ fn a_multi_eval_solver_emits_one_frame_per_outer_step() {
         "heun must evaluate more than once per outer step or this row proves nothing about the \
          preview counter's dedup ({events} events for {steps} steps)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::a_multi_eval_solver_emits_one_frame_per_outer_step");
 }

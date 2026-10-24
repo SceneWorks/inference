@@ -118,6 +118,7 @@ fn host_stats(a: &Array) -> (bool, f32, f32) {
     (finite, mean, var.sqrt())
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_forward_square_grid_shape_and_finite() {
     let arch = tiny_arch();
@@ -133,8 +134,13 @@ fn tiny_forward_square_grid_shape_and_finite() {
         "predicted latent is finite (mean={mean}, std={std})"
     );
     assert!(std > 0.0, "predicted latent is not degenerate (std={std})");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED transformer::tiny_forward_square_grid_shape_and_finite"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
     let arch = tiny_arch();
@@ -144,6 +150,8 @@ fn tiny_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
     assert_eq!(shape, vec![1, arch.out_channels as i32, 8, 16]);
     assert!(finite, "non-square predicted latent is finite");
     assert!(std > 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::tiny_forward_nonsquare_grid_exercises_centered_pos_embed_crop");
 }
 
 /// Inference [`Sd3Transformer::forward`] must run **f32 activations regardless of the base weight
@@ -159,6 +167,7 @@ fn tiny_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
 ///   2. it DIFFERS from the explicit-bf16 seam `forward_with(.., Bfloat16)` by the bf16-rounding
 ///      magnitude — proving the body really would have changed had it followed the weight dtype (so
 ///      the pin is meaningful, not vacuous).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn inference_forward_is_f32_pinned_regardless_of_weight_dtype() {
     use mlx_rs::Dtype;
@@ -238,8 +247,11 @@ fn inference_forward_is_f32_pinned_regardless_of_weight_dtype() {
         d_bf16 > 0.0,
         "bf16-activation forward must differ from f32 (else the f32 pin is vacuous) (max_abs={d_bf16})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::inference_forward_is_f32_pinned_regardless_of_weight_dtype");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn pos_embed_grid_exceeding_max_size_errors() {
     let arch = tiny_arch(); // pos_embed_max_size = 12
@@ -258,6 +270,10 @@ fn pos_embed_grid_exceeding_max_size_errors() {
             .forward(&latent, &context, &pooled, &timestep)
             .is_err(),
         "a patch grid larger than pos_embed_max_size must be rejected"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED transformer::pos_embed_grid_exceeding_max_size_errors"
     );
 }
 
@@ -337,6 +353,8 @@ fn real_weight_forward_shape_finite_stats() {
         std > 1e-3 && std < 1e3,
         "real-weight predicted latent has a sane spread (std={std})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::real_weight_forward_shape_finite_stats");
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -376,6 +394,8 @@ fn numeric_parity_vs_diffusers() {
         cos >= 0.99,
         "predicted noise cosine vs diffusers {cos} < 0.99"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer::numeric_parity_vs_diffusers");
 }
 
 /// Flattened cosine similarity between two arrays (computed host-side).

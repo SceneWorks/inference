@@ -121,6 +121,7 @@ fn frac_diff(a: &Image, b: &Image) -> f32 {
 fn default_sampler_equals_explicit_euler() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set BOOGU_BASE_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in default_sampler_equals_explicit_euler; see preceding skip diagnostic");
         return;
     };
     let default = render(&root, None, None);
@@ -138,6 +139,8 @@ fn default_sampler_equals_explicit_euler() {
          (frac {eul_frac:.4}) well past the run-to-run noise floor (frac {det_frac:.4}); a silent \
          sampler mismatch?"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::default_sampler_equals_explicit_euler");
 }
 
 /// N2: a curated named sampler renders a coherent image that genuinely differs from Euler.
@@ -146,6 +149,7 @@ fn default_sampler_equals_explicit_euler() {
 fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set BOOGU_BASE_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in named_sampler_dpmpp_2m_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     let euler = render(&root, Some("euler"), None);
@@ -160,6 +164,8 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
         frac > 0.01,
         "dpmpp_2m must differ from euler (a real solver swap, not a silent fallback); differ {frac}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::named_sampler_dpmpp_2m_is_coherent_and_distinct");
 }
 
 /// Scheduler axis: a curated scheduler re-shapes the σ schedule (shift-aware, `mu = 1.15`) and renders a
@@ -171,6 +177,7 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
 fn scheduler_karras_is_coherent_and_distinct() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set BOOGU_BASE_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in scheduler_karras_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     let native = render(&root, None, None);
@@ -185,4 +192,6 @@ fn scheduler_karras_is_coherent_and_distinct() {
         frac > 0.01,
         "karras must re-shape the schedule vs the native default; differ {frac}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::scheduler_karras_is_coherent_and_distinct");
 }

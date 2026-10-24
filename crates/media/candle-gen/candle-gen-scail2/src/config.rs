@@ -101,7 +101,13 @@ impl Scail2Config {
         let mut cfg = Self::scail2_14b();
         let path = root.join("config.json");
         if path.exists() {
-            let text = std::fs::read_to_string(&path)
+            let text = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-scail2/src/config.rs::from_model_dir::std::fs::read_to_string@4095",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
                 .map_err(|e| CandleError::Msg(format!("scail2: read config.json: {e}")))?;
             let v: Value = serde_json::from_str(&text)
                 .map_err(|e| CandleError::Msg(format!("scail2: parse config.json: {e}")))?;

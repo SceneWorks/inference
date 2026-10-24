@@ -343,4 +343,6 @@ fn bounded_window_is_distinct_from_the_unbounded_stream_control() {
         candidate.arm,
         resident.elapsed_secs + previous.elapsed_secs + unbounded_stream.elapsed_secs + windows.iter().map(|run| run.elapsed_secs).sum::<f64>(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::bounded_window_is_distinct_from_the_unbounded_stream_control");
 }

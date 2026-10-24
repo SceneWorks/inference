@@ -173,4 +173,7 @@ fn real_weight_turbo_img2img() {
     );
 
     println!("z_image_turbo img2img validation PASS ✅ (eyeball the PPMs for edit quality)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_img2img_validate::real_weight_turbo_img2img");
 }

@@ -79,8 +79,14 @@ pub struct T5GemmaEncoderConfig {
 
 impl T5GemmaEncoderConfig {
     pub fn from_path(path: &Path) -> AudioResult<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
+        let text = candle_audio::gen_core::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/audio/candle-audio-stable-audio-3/src/t5gemma.rs::from_path::std::fs::read_to_string@2629",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
         let outer: T5GemmaFileConfig = serde_json::from_str(&text)
             .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display())))?;
         if !outer.is_encoder_decoder || outer.pad_token_id != 0 || outer.torch_dtype != "bfloat16" {
@@ -172,7 +178,7 @@ impl T5RmsNorm {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        t5_rms_norm(x, &self.weight, self.eps, true)
+        __model_proof_output!(t5_rms_norm(x, &self.weight, self.eps, true))
     }
 }
 
@@ -322,24 +328,36 @@ impl SelfAttention {
         sin: &Tensor,
     ) -> CandleResult<Tensor> {
         let q = apply_rope(
-            &to_heads(&self.q.forward(x)?, self.heads, self.head_dim)?,
+            &to_heads(
+                &__model_proof_output!(self.q.forward(x))?,
+                self.heads,
+                self.head_dim,
+            )?,
             cos,
             sin,
         )?;
         let k = apply_rope(
-            &to_heads(&self.k.forward(x)?, self.heads, self.head_dim)?,
+            &to_heads(
+                &__model_proof_output!(self.k.forward(x))?,
+                self.heads,
+                self.head_dim,
+            )?,
             cos,
             sin,
         )?;
-        let v = to_heads(&self.v.forward(x)?, self.heads, self.head_dim)?;
-        self.out.forward(&from_heads(&scaled_attention(
+        let v = to_heads(
+            &__model_proof_output!(self.v.forward(x))?,
+            self.heads,
+            self.head_dim,
+        )?;
+        __model_proof_output!(self.out.forward(&from_heads(&scaled_attention(
             &q,
             &k,
             &v,
             mask,
             self.scale_denominator,
             Some(self.softcap),
-        )?)?)
+        )?)?))
     }
 }
 
@@ -374,9 +392,10 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = self.gate.forward(x)?.gelu()?;
-        self.down
-            .forward(&gate.broadcast_mul(&self.up.forward(x)?)?)
+        let gate = __model_proof_output!(self.gate.forward(x))?.gelu()?;
+        __model_proof_output!(self
+            .down
+            .forward(&gate.broadcast_mul(&__model_proof_output!(self.up.forward(x))?)?))
     }
 }
 
@@ -533,7 +552,9 @@ impl Projection {
     fn forward(&self, raw: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Identity => Ok(raw.clone()),
-            Self::Linear { layer, dtype } => layer.forward(&raw.to_dtype(*dtype)?),
+            Self::Linear { layer, dtype } => {
+                __model_proof_output!(layer.forward(&raw.to_dtype(*dtype)?))
+            }
         }
     }
 }
@@ -688,8 +709,14 @@ impl T5GemmaConditioner {
                 config.max_length
             )));
         }
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
+        let tokenizer = candle_audio::gen_core::__model_input_reader!(
+Tokenizer::from_file(tokenizer_path),
+"crates/audio/candle-audio-stable-audio-3/src/t5gemma.rs::load::Tokenizer::from_file@23831",
+Tokenizer,
+tokenizer_path,
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
         let encoder = T5GemmaEncoder::load(text_config, text_vb)?;
         let projection = if text_config.hidden_size != output_dim || config.project_out {
             Projection::Linear {
@@ -859,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn all_padding_and_projection_branches_preserve_operation_order() {
         let device = Device::Cpu;
         let raw = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &device).unwrap();
@@ -892,6 +920,9 @@ mod tests {
         assert_eq!(zero.to_vec3::<f32>().unwrap()[0][1], vec![0.0, 0.0]);
         assert_eq!(learned.to_vec3::<f32>().unwrap()[0][0], vec![3.0, 5.0]);
         assert_eq!(learned.to_vec3::<f32>().unwrap()[0][1], vec![9.0, 8.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED t5gemma::tests::all_padding_and_projection_branches_preserve_operation_order");
     }
 
     #[test]

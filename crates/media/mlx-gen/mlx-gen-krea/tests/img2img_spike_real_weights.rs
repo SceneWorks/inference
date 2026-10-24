@@ -130,6 +130,7 @@ fn img2img_strength_sweep_maps_usable_window() {
         eprintln!(
             "skipping: no KREA_TURBO_DIR and no cached SceneWorks/krea-2-turbo-mlx q8 turnkey"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in img2img_strength_sweep_maps_usable_window; see preceding skip diagnostic");
         return;
     };
     eprintln!("loading Krea 2 Turbo (q8) from {}", root.display());
@@ -209,6 +210,8 @@ fn img2img_strength_sweep_maps_usable_window() {
         is_coherent(&hi),
         "strength 0.9 img2img must remain a coherent image, not mush/noise"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED img2img_spike_real_weights::img2img_strength_sweep_maps_usable_window");
 }
 
 /// **sc-8589 run #2 — people / pose probe.** Can img2img take a person reference, keep the POSE, and
@@ -223,6 +226,7 @@ fn img2img_strength_sweep_maps_usable_window() {
 fn people_pose_identity_style_probe() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no Krea Turbo snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in people_pose_identity_style_probe; see preceding skip diagnostic");
         return;
     };
     eprintln!("loading Krea 2 Turbo (q8) from {}", root.display());
@@ -253,4 +257,6 @@ fn people_pose_identity_style_probe() {
          A usable mid-strength band = img2img covers it; if pose only holds when identity/style does \
          NOT change → pose-locked identity swap needs epic 8459 (ControlNet), not img2img."
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED img2img_spike_real_weights::people_pose_identity_style_probe");
 }

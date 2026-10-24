@@ -17,6 +17,15 @@
 //! tiling; see [`video`] + [`pipeline`]). 7B + int8/int4 quant is sc-5927; worker wiring/gating is
 //! sc-5928. `backend = "candle"`, `mac_only = false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod color;
 pub mod config;
 pub mod conv3d;

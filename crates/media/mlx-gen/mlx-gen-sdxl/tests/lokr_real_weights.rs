@@ -52,7 +52,13 @@ fn render(spec: &LoadSpec, g: &Weights) -> Image {
         guidance: Some(g.metadata("cfg").unwrap().parse().unwrap()),
         ..Default::default()
     };
-    match model.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
     }
@@ -84,7 +90,8 @@ fn lokr_merge_count() {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LoKr golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LoKr golden"]
 fn lokr_render_matches_reference() {
     let g = golden("sdxl_lokr_fp16_golden.safetensors");
     let s = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![spec(
@@ -119,10 +126,13 @@ fn lokr_render_matches_reference() {
         "SDXL LoKr render diverged beyond the cross-build residual: {:.3}% px>8",
         p * 100.0
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED lokr_real_weights::lokr_render_matches_reference");
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LoKr golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LoKr golden"]
 fn scale_zero_lokr_is_bit_exact_noop() {
     let g = golden("sdxl_lokr_fp16_golden.safetensors");
     let base = render(&LoadSpec::new(WeightsSource::Dir(snapshot())), &g);
@@ -146,10 +156,15 @@ fn scale_zero_lokr_is_bit_exact_noop() {
         "scale-0 LoKr must be a bit-exact no-op ({differ} px differ)"
     );
     println!("✓ scale-0 LoKr is a bit-exact no-op");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED lokr_real_weights::scale_zero_lokr_is_bit_exact_noop"
+    );
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LCM-LoRA + stacked golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LCM-LoRA + stacked golden"]
 fn lora_plus_lokr_stacks() {
     let g = golden("sdxl_lokr_stacked_fp16_golden.safetensors");
     // Spec order matches the dump: LCM-LoRA merged first (515), then the LoKr (16).
@@ -191,4 +206,6 @@ fn lora_plus_lokr_stacks() {
         "stacked LoRA+LoKr render diverged: {:.3}% px>8",
         p * 100.0
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED lokr_real_weights::lora_plus_lokr_stacks");
 }

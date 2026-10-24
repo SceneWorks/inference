@@ -35,6 +35,7 @@ mlx-gen-sdxl = { path = "../mlx-gen-sdxl", default-features = false }
 mlx-gen-z-image = { path = "../mlx-gen-z-image", default-features = false }
 
 [features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-sana/model-inference-proof", "mlx-gen-anima/model-inference-proof", "mlx-gen-iris/model-inference-proof", "mlx-gen-sdxl/model-inference-proof", "mlx-gen-z-image/model-inference-proof"]
 # The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only
 # `runtime-ios/device-capture`, which only the device harness (`ios-host/smoke`) enables, turns it on.
 device-capture = []

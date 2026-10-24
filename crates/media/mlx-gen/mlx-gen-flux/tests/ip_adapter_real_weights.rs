@@ -159,4 +159,6 @@ fn flux_ip_adapter_modules_on_real_weights() {
             .item::<f32>()
     };
     println!("[flux-ip] tokens[1,4,4096] + 19 block residuals OK; block0 residual rms={rms:.4}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_adapter_real_weights::flux_ip_adapter_modules_on_real_weights");
 }

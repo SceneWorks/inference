@@ -35,4 +35,7 @@ fn flux2_klein_9b_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_flux2::load_klein(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::flux2_klein_9b_conformance");
 }

@@ -18,6 +18,16 @@
 //! cargo test --locked -p candle-audio-mmaudio --test parity_reference_44k -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 mod common;
 
 use candle_audio_mmaudio::candle_audio::candle_core::Device;
@@ -109,4 +119,7 @@ fn assembly_44k_matches_reference_waveform() {
         "assembled candle 44k pipeline waveform relative max-abs-diff {rel:.2e} exceeds \
          {MAX_RELATIVE_DIFF:.0e} — the waveform is mis-scaled even if its shape matches"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED assembly_44k_matches_reference_waveform");
 }

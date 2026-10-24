@@ -144,6 +144,7 @@ mod tests {
     /// base string, `to_out.0` must load `Packed`, the dense sibling stays `Dense`, and the packed
     /// biased forward must reproduce the affine grid (+ bias) bit-exactly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -199,6 +200,8 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged");
         Ok(())
     }
 
@@ -206,6 +209,7 @@ mod tests {
     /// Chroma itself is group 64, but the seam must not hard-code 64). A group-32 packed triple round-
     /// trips through the packed forward, proving the group size is honored end to end.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_gs_threads_group_size() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -265,6 +269,10 @@ mod tests {
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_gs_threads_group_size"
+        );
         Ok(())
     }
 }

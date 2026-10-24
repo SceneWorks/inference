@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false }
 tokenizers = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-wan/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-wan/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]

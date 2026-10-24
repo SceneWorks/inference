@@ -126,6 +126,8 @@ fn img2img_encode_matches_fork() {
     let (peak, mean) = rel_errors(&clean, want);
     println!("img2img encode (clean latents): peak-rel {peak:.3e}  mean-rel {mean:.3e}");
     assert!(mean < 3e-2, "VAE-encode clean latents mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_encode_matches_fork");
 }
 
 /// Gate D: the noise blend `(1-σ)·clean + σ·noise` at σ = sigmas[init_step]. Blends the **fork's**
@@ -235,6 +237,10 @@ fn full_pipeline_matches_fork(golden_path: &str, quant: Option<Quant>, max_px_fr
 #[ignore = "needs real Qwen-Image weights + local img2img golden"]
 fn img2img_full_pipeline_matches_fork() {
     full_pipeline_matches_fork(GOLDEN, None, 0.05);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_full_pipeline_matches_fork"
+    );
 }
 
 /// The Q8 integration proof: same public path with `spec.with_quant(Q8)` (transformer-only, the
@@ -243,4 +249,6 @@ fn img2img_full_pipeline_matches_fork() {
 #[ignore = "needs real Qwen-Image weights + local Q8 img2img golden (QUANTIZE=8 dump_qwen_image_img2img_golden.py)"]
 fn img2img_q8_full_pipeline_matches_fork() {
     full_pipeline_matches_fork(Q8_GOLDEN, Some(Quant::Q8), 0.05);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_q8_full_pipeline_matches_fork");
 }

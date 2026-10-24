@@ -105,7 +105,8 @@ fn one_image(out: GenerationOutput) -> Image {
 }
 
 #[test]
-#[ignore = "needs an SDXL-family snapshot + converted sdxl PiD checkpoint + gemma-2-2b-it"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs an SDXL-family snapshot + converted sdxl PiD checkpoint + gemma-2-2b-it"]
 fn sdxl_pid_decode_vs_vae() {
     let size: u32 = std::env::var("SDXL_PID_SIZE")
         .ok()
@@ -138,7 +139,14 @@ fn sdxl_pid_decode_vs_vae() {
     };
 
     let t = Instant::now();
-    let vae_img = one_image(model.generate(&base, &mut |_| {}).expect("vae generate"));
+    let vae_img = one_image(
+        (
+            crate::common::record_model_inference_device(),
+            model.generate(&base, &mut |_| {}),
+        )
+            .1
+            .expect("vae generate"),
+    );
     let vae_dt = t.elapsed().as_secs_f32();
     let (vlo, vhi, vmu) = stats(&vae_img);
     eprintln!(
@@ -152,7 +160,14 @@ fn sdxl_pid_decode_vs_vae() {
         ..base.clone()
     };
     let t = Instant::now();
-    let pid_img = one_image(model.generate(&pid_req, &mut |_| {}).expect("pid generate"));
+    let pid_img = one_image(
+        (
+            crate::common::record_model_inference_device(),
+            model.generate(&pid_req, &mut |_| {}),
+        )
+            .1
+            .expect("pid generate"),
+    );
     let pid_dt = t.elapsed().as_secs_f32();
     let (plo, phi, pmu) = stats(&pid_img);
     eprintln!(
@@ -174,10 +189,13 @@ fn sdxl_pid_decode_vs_vae() {
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::sdxl_pid_decode_vs_vae");
 }
 
 #[test]
-#[ignore = "needs an SDXL-family snapshot + converted sdxl PiD checkpoint + gemma-2-2b-it"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs an SDXL-family snapshot + converted sdxl PiD checkpoint + gemma-2-2b-it"]
 fn sdxl_pid_from_ldm_early_stop() {
     // sc-8049: the **integrated** from_ldm early-stop for the SDXL variance-preserving space (the VP
     // sibling of the qwenimage/flux flow-match gates, and the epic's strongest go/no-go). Same model +
@@ -224,8 +242,11 @@ fn sdxl_pid_from_ldm_early_stop() {
     // Clean σ=0 PiD decode (full ancestral denoise) for the side-by-side.
     let t = Instant::now();
     let clean = one_image(
-        model
-            .generate(&base, &mut |_| {})
+        (
+            crate::common::record_model_inference_device(),
+            model.generate(&base, &mut |_| {}),
+        )
+            .1
             .expect("clean pid generate"),
     );
     let clean_dt = t.elapsed().as_secs_f32();
@@ -237,8 +258,11 @@ fn sdxl_pid_from_ldm_early_stop() {
     };
     let t = Instant::now();
     let early = one_image(
-        model
-            .generate(&early_req, &mut |_| {})
+        (
+            crate::common::record_model_inference_device(),
+            model.generate(&early_req, &mut |_| {}),
+        )
+            .1
             .expect("from_ldm pid generate"),
     );
     let early_dt = t.elapsed().as_secs_f32();
@@ -265,10 +289,15 @@ fn sdxl_pid_from_ldm_early_stop() {
         &format!("{dir}/sdxl_pid_fromldm_{}.png", early.width),
     );
     eprintln!("wrote {dir}/sdxl_pid_clean_*.png + sdxl_pid_fromldm_*.png");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::sdxl_pid_from_ldm_early_stop"
+    );
 }
 
 #[test]
-#[ignore = "needs an SDXL-family snapshot (no PiD weights) — proves the error path"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs an SDXL-family snapshot (no PiD weights) — proves the error path"]
 fn use_pid_without_loaded_pid_errors() {
     // Loading WITHOUT spec.pid, then requesting use_pid, must error clearly (not silently VAE-decode).
     let spec = LoadSpec::new(WeightsSource::Dir(sdxl_dir()));
@@ -284,9 +313,14 @@ fn use_pid_without_loaded_pid_errors() {
         use_pid: true,
         ..Default::default()
     };
-    let err = model
-        .generate(&req, &mut |_| {})
+    let err = (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
         .expect_err("use_pid without loaded PiD must error")
         .to_string();
     assert!(err.contains("no PiD decoder is loaded"), "got: {err}");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::use_pid_without_loaded_pid_errors");
 }

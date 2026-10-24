@@ -59,7 +59,13 @@ pub fn packed_quant_bits(root: &Path, component: &str) -> Result<Option<i32>> {
 /// offline pre-quantize converters, which are handed `…/transformer` directly).
 pub fn packed_quant_bits_at(component_dir: &Path) -> Result<Option<i32>> {
     let config_path = component_dir.join("config.json");
-    let bytes = match std::fs::read(&config_path) {
+    let bytes = match gen_core::__model_input_reader!(
+        std::fs::read(&config_path),
+        "crates/media/mlx-gen/src/quant.rs::packed_quant_bits_at::std::fs::read@3186",
+        ArtifactInput,
+        &config_path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    ) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return packed_bits_from_headers(component_dir)
@@ -186,7 +192,13 @@ pub fn packed_bits_from_headers(component_dir: &Path) -> Result<Option<i32>> {
 /// manifests from failing later inside `quantized_matmul` with an opaque backend error.
 pub fn packed_quant_group_size_at(component_dir: &Path) -> Result<Option<i32>> {
     let config_path = component_dir.join("config.json");
-    let bytes = match std::fs::read(&config_path) {
+    let bytes = match gen_core::__model_input_reader!(
+        std::fs::read(&config_path),
+        "crates/media/mlx-gen/src/quant.rs::packed_quant_group_size_at::std::fs::read@8611",
+        ArtifactInput,
+        &config_path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    ) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -538,7 +550,14 @@ pub const TURNKEY_ASSET_FILES: &[&str] = &[
 pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
     let src_cfg = src.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?).map_err(|e| {
+        serde_json::from_str(&gen_core::__model_input_reader!(
+std::fs::read_to_string(&src_cfg),
+"crates/media/mlx-gen/src/quant.rs::write_quantized_config::std::fs::read_to_string@25585",
+ArtifactInput,
+&src_cfg,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?)
+        .map_err(|e| {
             crate::Error::Msg(format!("quant convert: parse {}: {e}", src_cfg.display()))
         })?
     } else {

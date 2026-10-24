@@ -119,6 +119,9 @@ fn real_weight_memory_rung() {
         crate::memory_strategy::CALIBRATION_FINGERPRINT,
         started.elapsed().as_millis()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED validate::real_weight_memory_rung");
 }
 
 /// Mean absolute per-byte difference between two equal-size renders (the injection-changes-output sanity).
@@ -343,4 +346,7 @@ fn real_weight_pulid() {
         "id vs no-id pixel diff too small ({diff}) — injection had no effect"
     );
     eprintln!("PuLID-FLUX validation PASS ✅ (eyeball pulid_id.ppm vs pulid_no_id.ppm)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED validate::real_weight_pulid");
 }

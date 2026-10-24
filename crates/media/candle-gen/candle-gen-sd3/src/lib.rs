@@ -26,6 +26,15 @@
 //! modulation apply order (`x·(1+scale)+shift`, with the correct chunk split) is the documented bug
 //! magnet; see [`transformer`].
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod clip_tokenizer;
 pub mod conditioning;

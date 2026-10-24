@@ -67,14 +67,17 @@ fn lr_frame(w: u32, h: u32, t: u32) -> Image {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn seedvr2_video_model_path_matches_golden() {
     let (Some(raw), gdir) = (raw_dir(), golden_dir()) else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_video_model_path_matches_golden; see preceding skip diagnostic");
         return;
     };
     if !gdir.join("video_io_f32.safetensors").exists() {
         eprintln!("SKIP: video golden absent (run dump_seedvr2_goldens.py --component video)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_video_model_path_matches_golden; see preceding skip diagnostic");
         return;
     }
     let pipe = Seedvr2Pipeline::load(
@@ -106,12 +109,18 @@ fn seedvr2_video_model_path_matches_golden() {
         decoded.shape()
     );
     assert!(cos > 0.999, "multi-frame model path diverged: {cos}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED video_parity::seedvr2_video_model_path_matches_golden"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn seedvr2_generate_video_runs_end_to_end() {
     let Some(raw) = raw_dir() else {
         eprintln!("SKIP: raw checkpoint absent");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in seedvr2_generate_video_runs_end_to_end; see preceding skip diagnostic");
         return;
     };
     let pipe = Seedvr2Pipeline::load(
@@ -146,5 +155,9 @@ fn seedvr2_generate_video_runs_end_to_end() {
     eprintln!(
         "generate_video ok: {} frames @ 96x96 (2-chunk overlap blend)",
         out.len()
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED video_parity::seedvr2_generate_video_runs_end_to_end"
     );
 }

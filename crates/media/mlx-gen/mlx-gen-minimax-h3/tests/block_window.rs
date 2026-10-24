@@ -142,6 +142,7 @@ fn a_deferred_load_materializes_no_blocks() {
 /// Reachability is asserted from the plan rather than inferred: at window 1 over a 2-block stack the
 /// driver must run two windows, and a plan that collapsed to one would make the equivalence above
 /// trivially true with the streaming gone.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn windowed_and_resident_stacks_agree() {
     let staged = tempfile::tempdir().unwrap();
@@ -270,6 +271,8 @@ fn windowed_and_resident_stacks_agree() {
         short_delta > 1e-4,
         "mutation check: running one fewer block moved the metric only {short_delta:e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::windowed_and_resident_stacks_agree");
 }
 
 /// A stack cannot be both resident and streamed, and neither can it be neither.
@@ -295,6 +298,7 @@ fn the_two_residency_modes_are_mutually_exclusive() {
 /// per-step trunk walk, while here the once-per-request projection pass is the larger residency and
 /// has to be windowed too. Compared table by table against `AdaLnCache::precompute`, which is the
 /// shipped resident path.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_windowed_adaln_precompute_matches_the_resident_one() {
     let staged = tempfile::tempdir().unwrap();
@@ -361,6 +365,8 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::the_windowed_adaln_precompute_matches_the_resident_one");
 }
 
 /// **Every window must get its own view.** A stream that cached one and handed it out repeatedly
@@ -405,6 +411,7 @@ fn every_window_opens_an_independent_view() {
 /// Window sizes cover AC5's floor (1), a ragged tail (3 over 4 tapped layers), and the
 /// all-covering plan (4), so the boundary bookkeeping of `run_layers`' carried activation is
 /// exercised at every plan shape the scheduler can produce.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
     use mlx_gen_minimax_h3::text_encoder::MiniMaxH3TextEncoder;
@@ -455,6 +462,8 @@ fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
         MiniMaxH3TextEncoder::from_dir_deferred(staged.path(), "language_model", &cfg).unwrap();
     let err = deferred.forward(&ids, &mask).unwrap_err().to_string();
     assert!(err.contains("set_block_window"), "{err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_window::the_windowed_te_matches_the_resident_one_on_the_fixture");
 }
 
 /// **`from_dir_deferred` must MATERIALIZE the token table, not merely map it** (sc-17153).

@@ -69,6 +69,7 @@ fn build(w: &Weights, shape: MageVaeShape, fold: bool) -> MageVae {
 }
 
 /// The end-to-end gate: a full decode of the tiny model must match the reference's.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_decode_matches_the_torch_reference() {
     let w = fixture();
@@ -94,6 +95,8 @@ fn tiny_decode_matches_the_torch_reference() {
         err < 2e-3,
         "tiny decode max_abs {err} vs the torch reference"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::tiny_decode_matches_the_torch_reference");
 }
 
 /// The CoD decoder alone, so an `AttnBlock` / `ResnetBlock` / GroupNorm fault localises there
@@ -101,6 +104,7 @@ fn tiny_decode_matches_the_torch_reference() {
 ///
 /// The tiny latent is 6×6 against a 4×4 attention tile, so this is also the **replicate-padding**
 /// gate: a zero-padded or unpadded implementation fails here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiny_cod_decoder_matches_the_torch_reference() {
     let w = fixture();
@@ -127,10 +131,13 @@ fn tiny_cod_decoder_matches_the_torch_reference() {
     assert_eq!(got.shape(), want.shape(), "cond geometry");
     let err = max_abs(&got, want);
     assert!(err < 5e-4, "CoD decoder max_abs {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::tiny_cod_decoder_matches_the_torch_reference");
 }
 
 /// A wrong attention tile changes the result — proof the padding/tiling assertion above
 /// discriminates rather than passing on any implementation.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_wrong_attention_tile_is_rejected() {
     let w = fixture();
@@ -162,6 +169,10 @@ fn a_wrong_attention_tile_is_rejected() {
         8,
         shape.attn_tile
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::a_wrong_attention_tile_is_rejected"
+    );
 }
 
 /// Constant-folding adaLN at `t = 0` must not change the answer.
@@ -170,6 +181,7 @@ fn a_wrong_attention_tile_is_rejected() {
 /// must agree with the live-MLP model built from the same weights. A fold that mis-ordered the six
 /// chunks, applied one block's modulation to all of them, or folded at the wrong timestep would
 /// still produce a plausible image.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adaln_constant_folding_is_numerically_identical() {
     let w = fixture();
@@ -196,10 +208,13 @@ fn adaln_constant_folding_is_numerically_identical() {
         err < 1e-5,
         "algebraically folded and unfolded decode differ by max_abs {err}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::adaln_constant_folding_is_numerically_identical");
 }
 
 /// The `t = 0` timestep embedding and the six adaLN vectors each block folds, against the
 /// reference's own values — so a fold that is self-consistent but wrong is still caught.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adaln_folded_values_match_the_torch_reference() {
     let w = fixture();
@@ -237,6 +252,8 @@ fn adaln_folded_values_match_the_torch_reference() {
         spread > 1e-2,
         "shift_msa and scale_msa differ by only {spread} — the chunk-order check is vacuous"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::adaln_folded_values_match_the_torch_reference");
 }
 
 /// The DCT position code — pinned against the reference at both the tiny and the **published**
@@ -311,6 +328,7 @@ fn published_shape_is_the_documented_one() {
 }
 
 /// A latent whose channel count or rank is wrong is a typed error, not a panic or a wrong image.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_rejects_a_malformed_latent() {
     let w = fixture();
@@ -323,6 +341,10 @@ fn decode_rejects_a_malformed_latent() {
 
     let wrong_rank = mlx_rs::ops::zeros_dtype(&[shape.bottleneck, 4, 4], Dtype::Float32).unwrap();
     assert!(vae.decode(&wrong_rank).is_err(), "wrong rank");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::decode_rejects_a_malformed_latent"
+    );
 }
 
 /// **The non-square + asymmetric-padding gate.** Two distinct faults hide behind square inputs:
@@ -336,6 +358,7 @@ fn decode_rejects_a_malformed_latent() {
 /// passed it — as it passed every real-weights geometry too, since 256² and 768×1280 pad `(16,16)`
 /// and 1024²/2048/512×2048 pad nothing. `768x1152` is the only real-weights geometry that catches
 /// it. The epic's native-resolution range admits aspects up to 4:1, so this is supported surface.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn non_square_decode_matches_the_torch_reference() {
     let w = fixture();
@@ -362,10 +385,13 @@ fn non_square_decode_matches_the_torch_reference() {
 
     let err = max_abs(&got, want);
     assert!(err < 2e-3, "non-square decode max_abs {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::non_square_decode_matches_the_torch_reference");
 }
 
 /// The CoD decoder alone on the non-square latent, so an asymmetric-padding fault in `AttnBlock`
 /// localises there rather than surfacing only as a wrong image.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn non_square_cod_decoder_matches_the_torch_reference() {
     let w = fixture();
@@ -392,6 +418,8 @@ fn non_square_cod_decoder_matches_the_torch_reference() {
     assert_eq!(got.shape(), want.shape(), "non-square cond geometry");
     let err = max_abs(&got, want);
     assert!(err < 5e-4, "non-square CoD decoder max_abs {err}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::non_square_cod_decoder_matches_the_torch_reference");
 }
 
 /// sc-19753 — the **bounded** decode must reproduce the dense decode.
@@ -405,6 +433,7 @@ fn non_square_cod_decoder_matches_the_torch_reference() {
 /// The 2e-4 tolerance below is meaningful because
 /// `per_crop_whole_decode_tiling_is_observably_wrong` executes the retired shape on this same
 /// fixture and lands orders of magnitude outside it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_decode_reproduces_the_dense_decode() {
     let w = fixture();
@@ -444,10 +473,13 @@ fn tiled_decode_reproduces_the_dense_decode() {
             "fold={fold}: bounded decode diverged from dense by max_abs {err}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::tiled_decode_reproduces_the_dense_decode");
 }
 
 /// A tiling request too wide to split this latent must fall through to the exact single-pass
 /// decode rather than assembling a one-tile plan.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_untiled_request_falls_through_to_the_dense_decode() {
     let w = fixture();
@@ -466,9 +498,12 @@ fn an_untiled_request_falls_through_to_the_dense_decode() {
     let dense = vae.decode(&latent).unwrap();
     let passthrough = vae.decode_tiled(&latent, &cfg, None).unwrap();
     assert_eq!(max_abs(&dense, &passthrough), 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::an_untiled_request_falls_through_to_the_dense_decode");
 }
 
 /// A pre-tripped cancel is observed before any tensor work.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_decode_honors_a_pretripped_cancel() {
     let w = fixture();
@@ -480,6 +515,8 @@ fn tiled_decode_honors_a_pretripped_cancel() {
     let cfg = mlx_gen::tiling::TilingConfig::spatial_only(4 * shape.patch, 0);
     let result = vae.decode_tiled(&latent, &cfg, Some(&cancel));
     assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::tiled_decode_honors_a_pretripped_cancel");
 }
 
 /// The **executed** defect control for `tiled_decode_reproduces_the_dense_decode` (sc-19753).
@@ -490,6 +527,7 @@ fn tiled_decode_honors_a_pretripped_cancel() {
 /// whole-extent squeeze-and-excite gates in each DiCo block.
 ///
 /// Without this the bounded-vs-dense tolerance would be a bound any implementation satisfies.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn per_crop_whole_decode_tiling_is_observably_wrong() {
     let w = fixture();
@@ -519,4 +557,6 @@ fn per_crop_whole_decode_tiling_is_observably_wrong() {
         "per-crop whole-decode tiling must be observably different from the dense decode, else the \
          bounded-decode tolerance proves nothing: max_abs {err}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::per_crop_whole_decode_tiling_is_observably_wrong");
 }

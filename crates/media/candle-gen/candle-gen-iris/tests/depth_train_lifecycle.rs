@@ -178,6 +178,7 @@ fn tensors_of(path: &Path) -> Vec<(String, Vec<f32>)> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gen_core_trainer_conformance_checks() {
     use gen_core_testkit::trainer as kit;
     let data = tempfile::tempdir().unwrap();
@@ -209,9 +210,13 @@ fn gen_core_trainer_conformance_checks() {
     req.config.full_finetune = true;
     req.items.clear();
     assert!(t.validate(&req).is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::gen_core_trainer_conformance_checks");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_and_resume_reproduce_the_uninterrupted_run() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -258,9 +263,13 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run() {
     assert_eq!(sa, sb);
     let model = |d: &Path| d.join("depth").join("model.safetensors");
     assert_eq!(tensors_of(&model(a.path())), tensors_of(&model(b.path())));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn invalid_examples_follow_the_policy() {
     let data = tempfile::tempdir().unwrap();
     let mut items = dataset(data.path());
@@ -279,6 +288,9 @@ fn invalid_examples_follow_the_policy() {
     cfg.steps = 2;
     options(&mut cfg, json!({"invalid_examples": "skip"}));
     assert_eq!(run(&items, cfg, out.path(), "s.safetensors", None), 2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::invalid_examples_follow_the_policy");
 }
 
 fn estimate(dir: &Path, image: &Image) -> Vec<f32> {
@@ -294,7 +306,13 @@ fn estimate(dir: &Path, image: &Image) -> Vec<f32> {
 }
 
 fn rgb_image(item: &TrainingItem) -> Image {
-    let img = image::open(&item.image_path).unwrap().to_rgb8();
+    let img = candle_gen::gen_core::__model_input_reader!(
+        image::open(&item.image_path),
+        "crates/media/candle-gen/candle-gen-iris/tests/depth_train_lifecycle.rs::rgb_image/image::open",
+        Reference,
+        &item.image_path,
+        |__model_input_path| image::open(__model_input_path)
+    ).unwrap().to_rgb8();
     Image {
         width: img.width(),
         height: img.height(),
@@ -316,6 +334,7 @@ fn target_error(pred: &[f32], item: &TrainingItem) -> f64 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn overfit_export_and_load_in_the_estimator() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -402,9 +421,13 @@ fn overfit_export_and_load_in_the_estimator() {
         ),
         Err(CoreError::Unsupported(_))
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::overfit_export_and_load_in_the_estimator");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn parent_init_from_a_file_or_the_text_encoder() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -445,11 +468,15 @@ fn parent_init_from_a_file_or_the_text_encoder() {
     assert!(registry
         .load_trainer(ID, &LoadSpec::new(WeightsSource::Dir(tiny_backbone())))
         .is_err());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::parent_init_from_a_file_or_the_text_encoder");
 }
 
 /// sc-25690: a checkpointed depth run is the plain run (f32): the trainer wires
 /// `gradient_checkpointing` into its step and the export moves by rounding only.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_leaves_the_run_unchanged() {
     use candle_gen_iris::train::model::checkpointed_regions;
     let (data, a, b) = (
@@ -480,4 +507,7 @@ fn activation_checkpointing_leaves_the_run_unchanged() {
     }
     eprintln!("depth: activation checkpointing vs plain: max |Δ| = {worst:.3e}");
     assert!(worst <= 1e-5, "{worst}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged");
 }

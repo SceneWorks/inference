@@ -52,7 +52,8 @@ fn save_evidence(frames: &[mlx_gen::PreviewFrame], final_image: &mlx_gen::Image)
 }
 
 #[test]
-#[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
 fn registered_ancestral_route_emits_one_numbered_frame_per_step() {
     let snapshot = PathBuf::from(std::env::var("SDXL_SNAPSHOT").expect("set SDXL_SNAPSHOT"));
     let generator = mlx_gen_sdxl::provider_registry()
@@ -72,7 +73,12 @@ fn registered_ancestral_route_emits_one_numbered_frame_per_step() {
         preview: PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
         ..Default::default()
     };
-    let output = generator.generate(&request, &mut |_| {}).unwrap();
+    let output = (
+        crate::common::record_model_inference_device(),
+        generator.generate(&request, &mut |_| {}),
+    )
+        .1
+        .unwrap();
     let final_image = match output {
         GenerationOutput::Images(images) => images.into_iter().next().unwrap(),
         other => panic!("expected image output, got {other:?}"),
@@ -84,10 +90,13 @@ fn registered_ancestral_route_emits_one_numbered_frame_per_step() {
         assert_eq!((frame.image.width, frame.image.height), (64, 64));
     }
     save_evidence(&frames, &final_image);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::registered_ancestral_route_emits_one_numbered_frame_per_step");
 }
 
 #[test]
-#[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs real SDXL weights and a Metal-capable macOS host"]
 fn registered_curated_route_keeps_the_first_frame_off_the_rails() {
     let snapshot = PathBuf::from(std::env::var("SDXL_SNAPSHOT").expect("set SDXL_SNAPSHOT"));
     let generator = mlx_gen_sdxl::provider_registry()
@@ -108,7 +117,12 @@ fn registered_curated_route_keeps_the_first_frame_off_the_rails() {
         preview: PreviewSink::new(move |frame| captured.lock().unwrap().push(frame)),
         ..Default::default()
     };
-    let output = generator.generate(&request, &mut |_| {}).unwrap();
+    let output = (
+        crate::common::record_model_inference_device(),
+        generator.generate(&request, &mut |_| {}),
+    )
+        .1
+        .unwrap();
     let final_image = match output {
         GenerationOutput::Images(images) => images.into_iter().next().unwrap(),
         other => panic!("expected image output, got {other:?}"),
@@ -127,4 +141,6 @@ fn registered_curated_route_keeps_the_first_frame_off_the_rails() {
         "corrected curated first frame still clips {rail_fraction:.3} of RGB values"
     );
     save_evidence(&frames, &final_image);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::registered_curated_route_keeps_the_first_frame_off_the_rails");
 }

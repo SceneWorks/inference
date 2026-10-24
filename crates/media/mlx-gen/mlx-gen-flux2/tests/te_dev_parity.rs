@@ -38,6 +38,7 @@ fn tiny_dev_config() -> Qwen3TextEncoderConfig {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mistral_dev_text_encoder_matches_reference() {
     let w = Weights::from_file(FIXTURE).unwrap();
@@ -57,5 +58,9 @@ fn mistral_dev_text_encoder_matches_reference() {
     assert!(
         close(&out, want, 1e-2, 1e-2),
         "Mistral (dev) prompt_embeds diverged from the PyTorch reference"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED te_dev_parity::mistral_dev_text_encoder_matches_reference"
     );
 }

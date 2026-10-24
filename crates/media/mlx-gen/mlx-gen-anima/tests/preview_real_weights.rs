@@ -66,7 +66,7 @@ fn save_strip(path: &Path, frames: &[PreviewFrame]) {
 }
 
 #[test]
-#[ignore = "needs ANIMA_SNAPSHOT pointing at a real split_files directory and a Metal device"]
+#[ignore = "model inference; explicit model-proof workflow; needs ANIMA_SNAPSHOT pointing at a real split_files directory and a Metal device"]
 fn turbo_generator_emits_numbered_developing_frame_strip() {
     let root = PathBuf::from(std::env::var_os("ANIMA_SNAPSHOT").expect("set ANIMA_SNAPSHOT"));
     let artifact_dir = artifact_dir();
@@ -174,4 +174,7 @@ fn turbo_generator_emits_numbered_developing_frame_strip() {
         load_seconds,
         render_seconds,
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::turbo_generator_emits_numbered_developing_frame_strip");
 }

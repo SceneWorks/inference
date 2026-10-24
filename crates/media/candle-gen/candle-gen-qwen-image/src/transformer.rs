@@ -881,7 +881,7 @@ impl QwenTransformer {
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
         let hidden = self.img_in.forward(hidden_states)?;
-        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let encoder = __model_proof_output!(self.txt_norm.forward(encoder_hidden_states))?;
         let encoder = self.txt_in.forward(&encoder)?;
         let txt_seq = encoder.dim(1)?;
         let (img_cos, img_sin, txt_cos, txt_sin) =
@@ -924,7 +924,7 @@ impl QwenTransformer {
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
         let mut hidden = self.img_in.forward(hidden_states)?;
-        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let encoder = __model_proof_output!(self.txt_norm.forward(encoder_hidden_states))?;
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let txt_seq = encoder.dim(1)?;
@@ -1024,7 +1024,7 @@ impl QwenTransformer {
     ) -> candle_gen::Result<Tensor> {
         let img_seq = hidden_states.dim(1)?;
         let hidden = self.img_in.forward(hidden_states)?;
-        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let encoder = __model_proof_output!(self.txt_norm.forward(encoder_hidden_states))?;
         let encoder = self.txt_in.forward(&encoder)?;
         let txt_seq = encoder.dim(1)?;
 
@@ -1258,7 +1258,7 @@ impl QwenTransformer {
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
         let mut hidden = self.img_in.forward(hidden_states)?;
-        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
+        let encoder = __model_proof_output!(self.txt_norm.forward(encoder_hidden_states))?;
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let txt_seq = encoder.dim(1)?;
@@ -1478,6 +1478,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_transformer_matches_resident_with_ragged_window_and_cancels() {
         use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
         use candle_gen::gen_core::CancelFlag;
@@ -1525,12 +1526,16 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, candle_gen::CandleError::Canceled));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::streamed_transformer_matches_resident_with_ragged_window_and_cancels");
     }
 
     /// scale=0 (and `control = None`) reproduce the plain base forward **byte-exact** — the zero-init
     /// `after_proj` plus the `+0` injection means the control branch contributes nothing. This is the
     /// load-bearing parity guarantee (the base T2I/Edit path is untouched by the new lane).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn fun_control_scale_zero_is_byte_exact_base() {
         let cfg = tiny_cfg();
         let dev = Device::Cpu;
@@ -1595,6 +1600,9 @@ mod tests {
             b.iter().zip(&s1).any(|(x, y)| (x - y).abs() > 1e-6),
             "control_scale=1 must change the output (branch must be wired)"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::fun_control_scale_zero_is_byte_exact_base");
     }
 
     /// **Forward-time additive install wiring (sc-11091).** A LoRA over two real Lightning projections
@@ -1606,6 +1614,7 @@ mod tests {
     /// packed-footprint / stays-packed property is proven at the `AdaptLinear` unit level
     /// (`candle-gen/src/quant/adapt.rs`); the real q4/q8 GPU render is the offload re-measure follow-up.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_additive_applies_shifts_and_zero_is_noop() {
         use candle_gen::candle_core::safetensors::save;
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
@@ -1761,6 +1770,9 @@ mod tests {
         .to_string()
         .contains("declared LoKr"));
         std::fs::remove_file(&miss).ok();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::install_additive_applies_shifts_and_zero_is_noop");
     }
 
     /// The branch wiring: 2 control layers → 2 hints, injected at base blocks `[0, 2]` (and only there).

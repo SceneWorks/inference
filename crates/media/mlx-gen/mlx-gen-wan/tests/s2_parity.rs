@@ -39,6 +39,7 @@ fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {
     (max_abs, sum_abs / sum_ref.max(1e-9))
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_vae_decode_matches_reference() {
     let w = fixture();
@@ -58,8 +59,11 @@ fn wan_vae_decode_matches_reference() {
         mean_rel < 1e-3,
         "decode diverged from reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s2_parity::wan_vae_decode_matches_reference");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_vae_encode_matches_reference() {
     let w = fixture();
@@ -79,6 +83,8 @@ fn wan_vae_encode_matches_reference() {
         mean_rel < 1e-3,
         "encode diverged from reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s2_parity::wan_vae_encode_matches_reference");
 }
 
 /// `encode_sample` (the `.sample()` path used by Bernini's video `get_vae_features`) reduces to
@@ -86,6 +92,7 @@ fn wan_vae_encode_matches_reference() {
 /// `normalize(mean)`. This gates that the sample path shares the (already-parity'd) chunked encoder
 /// and that the reparameterize plumbing is a no-op at `eps = 0`. The clamp/exp/std·eps formula itself
 /// is unit-tested in `vae.rs` (`reparameterize_matches_closed_form`).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_vae_encode_sample_eps0_equals_mode() {
     let w = fixture();
@@ -102,4 +109,6 @@ fn wan_vae_encode_sample_eps0_equals_mode() {
         max_abs < 1e-6,
         "encode_sample(eps=0) must equal encode (mode): max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s2_parity::wan_vae_encode_sample_eps0_equals_mode");
 }

@@ -90,7 +90,7 @@ fn bench_ops_micro() {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights"]
 fn bench_generate_wall_clock() {
     let g = mlx_gen_z_image::provider_registry()
         .unwrap()
@@ -131,10 +131,13 @@ fn bench_generate_wall_clock() {
             fmt3(&times)
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bench_z_image::bench_generate_wall_clock");
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights"]
 fn bench_denoise_per_step() {
     let snap = snapshot();
     // Encode the prompt once — content doesn't affect DiT step time, only the (fixed) cap shape.
@@ -191,4 +194,7 @@ fn bench_denoise_per_step() {
             fmt3(&step_times)
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bench_z_image::bench_denoise_per_step");
 }

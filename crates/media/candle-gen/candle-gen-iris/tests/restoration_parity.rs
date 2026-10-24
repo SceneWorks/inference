@@ -69,6 +69,7 @@ fn rgb8(t: &Tensor) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn restoration_matches_upstream_end_to_end_in_fp32() {
     let restorer = fp32_restorer();
     let g = fixture("iris_restoration_golden.safetensors");
@@ -157,9 +158,13 @@ fn restoration_matches_upstream_end_to_end_in_fp32() {
         eprintln!("{name}: RGB8 max|Δ|={max}");
         assert!(max <= 1, "{name}: RGB8 differs by {max}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::restoration_matches_upstream_end_to_end_in_fp32");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_between_tiles_is_typed_and_yields_no_image() {
     let restorer = fp32_restorer();
     let cancel = CancelFlag::new();
@@ -190,6 +195,9 @@ fn cancel_between_tiles_is_typed_and_yields_no_image() {
         "{err:?}"
     );
     assert_eq!(steps, 2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::cancel_between_tiles_is_typed_and_yields_no_image");
 }
 
 /// sc-25690 I11: a cancel that arrives after the last tile — at the post-processing marker — is
@@ -197,6 +205,7 @@ fn cancel_between_tiles_is_typed_and_yields_no_image() {
 /// colour fix (the longest post-processing) and without either.
 /// MUTATION: drop the post-processing cancel checks in `gen_core::iris::restoration` — RED.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {
     let restorer = fp32_restorer();
     for (width, height, color_fix) in [(12u32, 8u32, true), (40, 24, false)] {
@@ -229,6 +238,9 @@ fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {
         );
         assert_eq!(steps, plan.forward_count(), "every tile ran first");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_parity::cancel_after_the_last_tile_is_typed_and_yields_no_image");
 }
 
 #[test]

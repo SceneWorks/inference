@@ -35,6 +35,7 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
 
 [features]
+model-inference-proof = []
 # Test-only `template::with_template_clock`: lets a dependent's tests mock the date `strftime_now`
 # renders. Never enabled by a production build.
 test-clock = []

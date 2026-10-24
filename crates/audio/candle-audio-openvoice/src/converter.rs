@@ -81,7 +81,7 @@ impl Wn {
     fn forward(&self, x: &Tensor, g: &Tensor) -> Result<Tensor> {
         let mut x = x.clone();
         let mut output: Option<Tensor> = None;
-        let g = self.cond_layer.forward(g)?; // [1, 2·hidden·n_layers, 1]
+        let g = __model_proof_output!(self.cond_layer.forward(g))?; // [1, 2·hidden·n_layers, 1]
         for i in 0..self.n_layers {
             let x_in = self.in_layers[i].forward(&x)?; // [1, 2·hidden, T]
             let offset = i * 2 * self.hidden;
@@ -151,9 +151,9 @@ impl PosteriorEncoder {
     /// `spec: [1, spec_channels, T]`, `g: [1, gin, 1]` (zeros under zero_g), `noise: [1, inter, T]`
     /// standard-Gaussian samples → latent `z = m + noise·τ·exp(logs)` `[1, inter, T]`.
     pub fn forward(&self, spec: &Tensor, g: &Tensor, tau: f32, noise: &Tensor) -> Result<Tensor> {
-        let x = self.pre.forward(spec)?;
+        let x = __model_proof_output!(self.pre.forward(spec))?;
         let x = self.enc.forward(&x, g)?;
-        let stats = self.proj.forward(&x)?;
+        let stats = __model_proof_output!(self.proj.forward(&x))?;
         let m = stats.i((.., ..self.out_channels, ..))?;
         let logs = stats.i((.., self.out_channels.., ..))?;
         let z = (&m + ((noise * tau as f64)? * logs.exp()?)?)?;
@@ -204,9 +204,9 @@ impl ResidualCouplingLayer {
     }
 
     fn mean(&self, x0: &Tensor, g: &Tensor) -> Result<Tensor> {
-        let h = self.pre.forward(x0)?;
+        let h = __model_proof_output!(self.pre.forward(x0))?;
         let h = self.enc.forward(&h, g)?;
-        Ok(self.post.forward(&h)?)
+        Ok(__model_proof_output!(self.post.forward(&h))?)
     }
 
     fn forward(&self, x: &Tensor, g: &Tensor) -> Result<Tensor> {
@@ -315,9 +315,9 @@ impl ResBlock1 {
         let mut x = x.clone();
         for (c1, c2) in self.convs1.iter().zip(&self.convs2) {
             let xt = ops::leaky_relu(&x, config::LRELU_SLOPE)?;
-            let xt = c1.forward(&xt)?;
+            let xt = __model_proof_output!(c1.forward(&xt))?;
             let xt = ops::leaky_relu(&xt, config::LRELU_SLOPE)?;
-            let xt = c2.forward(&xt)?;
+            let xt = __model_proof_output!(c2.forward(&xt))?;
             x = (xt + x)?;
         }
         Ok(x)
@@ -419,8 +419,8 @@ impl Generator {
     /// `x: [1, inter, T]`, `g: [1, gin, 1]` (zeros under zero_g — `cond` contributes only its bias)
     /// → waveform `[1, 1, T·∏upsample_rates]`.
     pub fn forward(&self, x: &Tensor, g: &Tensor) -> Result<Tensor> {
-        let mut x = self.conv_pre.forward(x)?;
-        x = x.broadcast_add(&self.cond.forward(g)?)?;
+        let mut x = __model_proof_output!(self.conv_pre.forward(x))?;
+        x = x.broadcast_add(&__model_proof_output!(self.cond.forward(g))?)?;
         for i in 0..self.ups.len() {
             x = ops::leaky_relu(&x, config::LRELU_SLOPE)?;
             x = self.ups[i].forward(&x)?;
@@ -436,7 +436,7 @@ impl Generator {
         }
         // Final activation uses torch's DEFAULT leaky-relu slope (0.01), not LRELU_SLOPE.
         x = ops::leaky_relu(&x, 0.01)?;
-        x = self.conv_post.forward(&x)?;
+        x = __model_proof_output!(self.conv_post.forward(&x))?;
         Ok(x.tanh()?)
     }
 }

@@ -636,4 +636,5 @@ fn fit_preview_rgb_factors() {
          every live preview is being projected through a stale fit. Paste the block printed above \
          into src/preview.rs"
     );
+    crate::model_inference_device::record_model_inference_device();
 }

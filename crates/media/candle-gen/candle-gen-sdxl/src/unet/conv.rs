@@ -82,7 +82,7 @@ impl Conv2d {
 
 impl Module for Conv2d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut y = self.inner.forward(x)?;
+        let mut y = __model_proof_output!(self.inner.forward(x))?;
         if self.residuals.is_empty() {
             return Ok(y);
         }
@@ -103,7 +103,7 @@ impl Module for Conv2d {
             }
             let down = candle_nn::Conv2d::new(r.down.to_dtype(xd)?, None, self.cfg);
             let up = candle_nn::Conv2d::new(r.up.to_dtype(xd)?, None, up_cfg);
-            let res = up.forward(&down.forward(x)?)?;
+            let res = __model_proof_output!(up.forward(&__model_proof_output!(down.forward(x))?))?;
             y = (y + (res * r.scale)?)?;
         }
         Ok(y)
@@ -139,6 +139,7 @@ mod tests {
     /// parity, tight in f32). This is what lets the dense conv base stay an unmutated mmap (residual) yet
     /// render exactly like the fold.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_conv_matches_folded() {
         let dev = Device::Cpu;
         let (out_c, in_c, rank, k) = (6usize, 4usize, 2usize, 3usize);
@@ -170,7 +171,7 @@ mod tests {
         let folded = candle_nn::Conv2d::new((base_w + delta).unwrap(), None, cfg);
 
         let x = Tensor::randn(0f32, 1f32, (1usize, in_c, 8, 8), &dev).unwrap();
-        let dmax = (c.forward(&x).unwrap() - folded.forward(&x).unwrap())
+        let dmax = (c.forward(&x).unwrap() - __model_proof_output!(folded.forward(&x)).unwrap())
             .unwrap()
             .abs()
             .unwrap()
@@ -205,11 +206,17 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(z0, 0.0, "a scale-0 conv residual must be an exact no-op");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED unet::conv::tests::additive_conv_matches_folded"
+        );
     }
 
     /// sc-15444: zero dose is a control-plane off switch, so its factors must never be evaluated.
     /// Poisoned factors make the test fail if the early skip is removed (`NaN * 0` is still `NaN`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn zero_scale_conv_skips_poisoned_factors_exactly() {
         let dev = Device::Cpu;
         let cfg = Conv2dConfig {
@@ -240,5 +247,8 @@ mod tests {
             expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             "zero-scale poisoned factors must preserve the exact base output"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::conv::tests::zero_scale_conv_skips_poisoned_factors_exactly");
     }
 }

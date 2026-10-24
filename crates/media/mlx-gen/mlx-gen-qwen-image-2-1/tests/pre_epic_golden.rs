@@ -82,6 +82,7 @@ fn read_adapter(path: &Path) -> HashMap<String, (Vec<i64>, Vec<f32>)> {
         .collect()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn everything_off_trains_the_pre_epic_adapter() {
     let _cpu = CpuDevice::new();
@@ -164,4 +165,6 @@ fn everything_off_trains_the_pre_epic_adapter() {
         worst.0
     );
     assert!(trained_b, "the golden carries no trained up factor");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pre_epic_golden::everything_off_trains_the_pre_epic_adapter");
 }

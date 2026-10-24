@@ -184,6 +184,9 @@ fn linked_and_managed_copies_share_one_plan_and_one_render() {
         a, b,
         "linked vs managed fixed-seed renders must be byte-identical"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED klein_single_file_real_weights::linked_and_managed_copies_share_one_plan_and_one_render");
 }
 
 /// Deterministic tiny LoRA over two NVFP4-packed projections (a double-block `to_q` and the fused
@@ -339,4 +342,7 @@ fn adapter_inheritance_composes_over_the_packed_projections() {
         "the LoRA and LoKr arms must not collapse onto one render — that would mean neither \
          residual is actually keyed to its own factors"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED klein_single_file_real_weights::adapter_inheritance_composes_over_the_packed_projections");
 }

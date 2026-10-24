@@ -771,6 +771,7 @@ mod tests {
     /// loop plumbing (scheduler / expert switch / per-step `vit_one_step` / flow step); the per-step
     /// math is validated in slices A/B and the e2e coherence in sc-5145.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn denoise_wvitcfg_runs_and_keeps_shape() {
         let w = load("s5_low.safetensors");
         let cfg = tiny_cfg();
@@ -827,6 +828,10 @@ mod tests {
             out.shape(),
             noisy.shape(),
             "loop preserves spatial latent shape"
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::denoise_wvitcfg_runs_and_keeps_shape"
         );
     }
 }

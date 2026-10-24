@@ -97,22 +97,16 @@ impl Layer {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let residual = x;
-        let h = self.input_layernorm.forward(x)?;
-        let q = self
-            .q_proj
-            .forward(&h)?
+        let h = __model_proof_output!(self.input_layernorm.forward(x))?;
+        let q = __model_proof_output!(self.q_proj.forward(&h))?
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k = self
-            .k_proj
-            .forward(&h)?
+        let k = __model_proof_output!(self.k_proj.forward(&h))?
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let v = self
-            .v_proj
-            .forward(&h)?
+        let v = __model_proof_output!(self.v_proj.forward(&h))?
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -141,15 +135,15 @@ impl Layer {
             att.matmul(&v)?
                 .transpose(1, 2)?
                 .reshape((b, l, self.num_heads * self.head_dim))?;
-        let attn_out = self.o_proj.forward(&out)?;
+        let attn_out = __model_proof_output!(self.o_proj.forward(&out))?;
         let x = (residual + attn_out)?;
 
         // SwiGLU MLP.
         let residual = &x;
-        let h = self.post_attention_layernorm.forward(&x)?;
-        let gate = self.gate_proj.forward(&h)?.silu()?;
-        let up = self.up_proj.forward(&h)?;
-        let mlp = self.down_proj.forward(&(gate * up)?)?;
+        let h = __model_proof_output!(self.post_attention_layernorm.forward(&x))?;
+        let gate = __model_proof_output!(self.gate_proj.forward(&h))?.silu()?;
+        let up = __model_proof_output!(self.up_proj.forward(&h))?;
+        let mlp = __model_proof_output!(self.down_proj.forward(&(gate * up)?))?;
         residual + mlp
     }
 }
@@ -194,11 +188,11 @@ impl Perceiver {
     /// `AttentionBlock2.forward(x1, x2)`: q from norm(x1), k/v from norm(x2), attention, proj_out,
     /// residual on x1.
     fn attn_block(&self, x1: &Tensor, x2: &Tensor) -> CandleResult<Tensor> {
-        let x1n = self.norm.forward(x1)?;
-        let x2n = self.norm.forward(x2)?;
-        let q = self.split(&self.to_q.forward(&x1n)?)?;
-        let k = self.split(&self.to_k.forward(&x2n)?)?;
-        let v = self.split(&self.to_v.forward(&x2n)?)?;
+        let x1n = __model_proof_output!(self.norm.forward(x1))?;
+        let x2n = __model_proof_output!(self.norm.forward(x2))?;
+        let q = self.split(&__model_proof_output!(self.to_q.forward(&x1n))?)?;
+        let k = self.split(&__model_proof_output!(self.to_k.forward(&x2n))?)?;
+        let v = self.split(&__model_proof_output!(self.to_v.forward(&x2n))?)?;
         let hd = self.channels / self.num_heads;
         let scale = (hd as f64).powf(-0.5);
         let att = softmax_last_dim(&(q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?)?;
@@ -207,7 +201,7 @@ impl Perceiver {
             .matmul(&v)?
             .transpose(1, 2)?
             .reshape((b, l1, self.channels))?;
-        let h = self.proj_out.forward(&out)?;
+        let h = __model_proof_output!(self.proj_out.forward(&out))?;
         x1 + h
     }
 
@@ -297,19 +291,20 @@ impl T3 {
             (1, self.cfg.speaker_embed_size),
             &self.device,
         )?;
-        let cond_spkr = self.spkr_enc.forward(&spk)?.reshape((1, 1, h))?;
+        let cond_spkr = __model_proof_output!(self.spkr_enc.forward(&spk))?.reshape((1, 1, h))?;
 
         let mut parts = vec![cond_spkr];
         if !cond.cond_prompt_speech_tokens.is_empty() {
             let n = cond.cond_prompt_speech_tokens.len();
             let ids =
                 Tensor::from_vec(cond.cond_prompt_speech_tokens.clone(), (1, n), &self.device)?;
-            let prompt_emb = self.speech_emb.forward(&ids)?; // [1, n, dim]
+            let prompt_emb = __model_proof_output!(self.speech_emb.forward(&ids))?; // [1, n, dim]
             let resampled = self.perceiver.forward(&prompt_emb)?; // [1, 32, dim]
             parts.push(resampled);
         }
         let emo = Tensor::from_vec(vec![cond.emotion_adv], (1, 1), &self.device)?;
-        let cond_emotion = self.emotion_adv_fc.forward(&emo)?.reshape((1, 1, h))?;
+        let cond_emotion =
+            __model_proof_output!(self.emotion_adv_fc.forward(&emo))?.reshape((1, 1, h))?;
         parts.push(cond_emotion);
 
         let refs: Vec<&Tensor> = parts.iter().collect();
@@ -333,7 +328,7 @@ impl T3 {
         for layer in &mut self.layers {
             h = layer.forward(&h, &self.cos, &self.sin, offset, mask.as_ref())?;
         }
-        self.norm.forward(&h)
+        __model_proof_output!(self.norm.forward(&h))
     }
 
     /// Autoregressively decode speech tokens for `text_tokens` (already SOT/EOT-wrapped) under the
@@ -365,7 +360,7 @@ impl T3 {
         // Text embeddings + learned positions. For CFG the uncond row zeroes the text embeddings.
         let text_ids =
             Tensor::from_vec(text_tokens.to_vec(), (1, text_tokens.len()), &self.device)?;
-        let mut text_emb = self.text_emb.forward(&text_ids)?; // [1, T, dim]
+        let mut text_emb = __model_proof_output!(self.text_emb.forward(&text_ids))?; // [1, T, dim]
         let text_pos = self
             .text_pos_emb
             .narrow(0, 0, text_tokens.len())?
@@ -375,9 +370,7 @@ impl T3 {
         // Initial speech token: a single start-of-speech, position 0.
         let start = self.cfg.start_speech_token;
         let bos_ids = Tensor::from_vec(vec![start], (1, 1), &self.device)?;
-        let bos_emb = self
-            .speech_emb
-            .forward(&bos_ids)?
+        let bos_emb = __model_proof_output!(self.speech_emb.forward(&bos_ids))?
             .broadcast_add(&self.speech_pos_emb.narrow(0, 0, 1)?.unsqueeze(0)?)?;
 
         // Assemble the per-row prefix and stack into the CFG batch.
@@ -406,7 +399,7 @@ impl T3 {
             offset += inputs.dim(1)?;
             // Logits of the last position for each CFG row.
             let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?; // [batch, 1, dim]
-            let logits = self.speech_head.forward(&last)?.squeeze(1)?; // [batch, V]
+            let logits = __model_proof_output!(self.speech_head.forward(&last))?.squeeze(1)?; // [batch, V]
 
             let combined = if use_cfg {
                 let condl = logits.narrow(0, 0, 1)?;
@@ -440,7 +433,7 @@ impl T3 {
             // Next-token embedding at fixed position `step + 1`.
             let nid = Tensor::from_vec(vec![next], (1, 1), &self.device)?;
             let pos = self.speech_pos_emb.narrow(0, step + 1, 1)?.unsqueeze(0)?;
-            let ne = self.speech_emb.forward(&nid)?.broadcast_add(&pos)?; // [1,1,dim]
+            let ne = __model_proof_output!(self.speech_emb.forward(&nid))?.broadcast_add(&pos)?; // [1,1,dim]
             inputs = if use_cfg {
                 Tensor::cat(&[&ne, &ne], 0)?
             } else {

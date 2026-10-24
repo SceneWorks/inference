@@ -219,6 +219,7 @@ const TAIL_RADIUS_MID_PX: f32 = 12.25;
 /// fixture and would otherwise plan a single tile — breaks the identity: max|Δ| = **9.909301e-1** and
 /// the `== 0.0` guard fires.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn head_tail_decomposition_is_the_single_pass_decode() {
     let dev = Device::Cpu;
     let vae = decoder(&dev);
@@ -236,6 +237,9 @@ fn head_tail_decomposition_is_the_single_pass_decode() {
          `decode` took some other route and every tiling comparison here measures the wrong \
          reference; max|Δ|={delta:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode_parity::head_tail_decomposition_is_the_single_pass_decode");
 }
 
 /// sc-19753 — the **mechanism** proof behind this crate's `LOCAL_ONLY` audit verdict: the tail is
@@ -263,6 +267,7 @@ fn head_tail_decomposition_is_the_single_pass_decode() {
 ///  - Drop the global op — delete `h = self.mid_attn.forward(&h)?;` from `decode_mid`: the head's
 ///    column-0 residual becomes **0.00e0** and the "no safe interior" guard fires.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn decode_tail_is_crop_decomposable_but_decode_mid_is_not() {
     let dev = Device::Cpu;
     let vae = decoder(&dev);
@@ -309,6 +314,9 @@ fn decode_tail_is_crop_decomposable_but_decode_mid_is_not() {
          column 0 — the column farthest from the crop boundary. Contamination there is what proves \
          the divergence is the global softmax and not padding; max|Δ|={head_col0:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode_parity::decode_tail_is_crop_decomposable_but_decode_mid_is_not");
 }
 
 /// sc-19753 — the **executed defect control**: the shipped tail-only tiling tracks the single-pass
@@ -337,6 +345,7 @@ fn decode_tail_is_crop_decomposable_but_decode_mid_is_not() {
 /// to **6.11 dB** (the defect arm moves to 18.30 dB, since the mutation degrades every arm), firing
 /// both the `>= 40.0` floor and the `>= 20.0` gap guard.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tail_only_tiling_tracks_the_single_pass_decode_but_whole_decoder_tiling_does_not() {
     let dev = Device::Cpu;
     let vae = decoder(&dev);
@@ -392,4 +401,7 @@ fn tail_only_tiling_tracks_the_single_pass_decode_but_whole_decoder_tiling_does_
         "the head/tail split must buy a large margin over whole-decoder tiling; \
          shipped={shipped_psnr:.2} dB defect={defect_psnr:.2} dB"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode_parity::tail_only_tiling_tracks_the_single_pass_decode_but_whole_decoder_tiling_does_not");
 }

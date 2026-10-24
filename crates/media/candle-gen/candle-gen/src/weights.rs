@@ -62,6 +62,12 @@ impl Weights {
         for (k, v) in raw {
             map.insert(k, coerce_float(v, dtype)?);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "candle-gen::Weights::from_file",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[path],
+        );
         Ok(Self { map })
     }
 
@@ -79,9 +85,13 @@ impl Weights {
     /// [`crate::loader::sorted_safetensors`]); this is the shard-aware path for snapshots that
     /// ship the checkpoint across multiple `*.safetensors` instead of a single file (F-037, sc-9021).
     pub fn from_files(files: &[impl AsRef<Path>], device: &Device, dtype: DType) -> Result<Self> {
+        #[cfg(feature = "model-inference-proof")]
+        let mut __input_paths = Vec::with_capacity(files.len());
         let mut map = HashMap::new();
         for path in files {
             let path = path.as_ref();
+            #[cfg(feature = "model-inference-proof")]
+            __input_paths.push(path);
             let raw = cst::load(path, device)?;
             for (k, v) in raw {
                 let v = coerce_float(v, dtype)?;
@@ -96,6 +106,12 @@ impl Weights {
                 }
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "candle-gen::Weights::from_files",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &__input_paths,
+        );
         Ok(Self { map })
     }
 
@@ -127,6 +143,12 @@ impl Weights {
             let v = coerce_float(st.load(&k, device)?, dtype)?;
             map.insert(k, v);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "candle-gen::Weights::from_file_filtered",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[path],
+        );
         Ok(Self { map })
     }
 
@@ -143,9 +165,13 @@ impl Weights {
         dtype: DType,
         prefixes: &[&str],
     ) -> Result<Self> {
+        #[cfg(feature = "model-inference-proof")]
+        let mut __input_paths = Vec::with_capacity(files.len());
         let mut map = HashMap::new();
         for path in files {
             let path = path.as_ref();
+            #[cfg(feature = "model-inference-proof")]
+            __input_paths.push(path);
             // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
             // behind the mapping — the standard candle weight-loading invariant.
             let st = unsafe { MmapedSafetensors::new(path)? };
@@ -165,6 +191,12 @@ impl Weights {
                 }
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "candle-gen::Weights::from_files_filtered",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &__input_paths,
+        );
         Ok(Self { map })
     }
 

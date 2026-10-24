@@ -280,6 +280,8 @@ fn dev_control_pose_steers_render() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
     assert_mode_steers("pose", synthetic_pose(size), ControlKind::Pose, 2.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_real_weights::dev_control_pose_steers_render");
 }
 
 /// CANNY smoke — sparse bright contours through the same input-agnostic VAE-encoded control path.
@@ -291,6 +293,10 @@ fn dev_control_canny_steers_render() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
     assert_mode_steers("canny", synthetic_canny(size), ControlKind::Canny, 1.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED control_real_weights::dev_control_canny_steers_render"
+    );
 }
 
 /// DEPTH smoke — a dense continuous-gradient field through the same input-agnostic control path.
@@ -302,4 +308,8 @@ fn dev_control_depth_steers_render() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
     assert_mode_steers("depth", synthetic_depth(size), ControlKind::Depth, 1.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED control_real_weights::dev_control_depth_steers_render"
+    );
 }

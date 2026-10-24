@@ -284,3 +284,6 @@ mod explicit_registry_tests {
             .any(|registration| registration.provider_id == super::FLUX2_KLEIN_9B_KV_EDIT_ID));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

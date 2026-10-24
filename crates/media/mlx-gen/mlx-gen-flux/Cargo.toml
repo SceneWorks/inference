@@ -48,3 +48,6 @@ image = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-sdxl/model-inference-proof"]

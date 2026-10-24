@@ -341,7 +341,7 @@ fn save_artifacts(dir: &Path, split: &str, index: usize, pair: &Pair, coef: &[[f
 }
 
 #[test]
-#[ignore = "needs real Z-Image-Turbo weights and a Metal-capable macOS host"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image-Turbo weights and a Metal-capable macOS host"]
 fn fit_preview_rgb() {
     mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
     let components = Components::load(&snapshot());
@@ -443,4 +443,7 @@ fn fit_preview_rgb() {
         }
         std::fs::write(dir.join("fit_report.txt"), report).unwrap();
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED fit_preview_rgb::fit_preview_rgb");
 }

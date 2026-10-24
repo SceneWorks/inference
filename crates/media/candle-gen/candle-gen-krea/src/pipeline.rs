@@ -3323,6 +3323,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn request_scoped_residencies_keep_multiphase_on_the_pinned_native_loader() {
         use candle_gen::gen_core::{AdapterKind, GenerationPhase, PhaseAdapter};
         use std::collections::HashMap;
@@ -3581,6 +3582,9 @@ mod tests {
             assert!(after_owner_drop.contains(&"drop-text"));
             assert!(after_owner_drop.contains(&"drop-heavy"));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::request_scoped_residencies_keep_multiphase_on_the_pinned_native_loader");
     }
 
     #[test]

@@ -91,7 +91,13 @@ fn render(sampler: Option<&str>, scheduler: Option<&str>) -> Option<Image> {
         scheduler: scheduler.map(Into::into),
         ..Default::default()
     };
-    match generator.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        generator.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => Some(v.pop().unwrap()),
         other => panic!("expected Images, got {other:?}"),
     }
@@ -109,18 +115,24 @@ fn frac_diff(a: &Image, b: &Image) -> f32 {
 
 /// N1: the bespoke ancestral default renders a coherent image (the legacy loop, unchanged).
 #[test]
-#[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
 fn default_ancestral_is_coherent() {
     let Some(img) = render(None, None) else {
         eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
         return;
     };
     assert_coherent(&img, "default");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::default_ancestral_is_coherent"
+    );
 }
 
 /// N2: a curated named sampler renders a coherent image that genuinely differs from the default.
 #[test]
-#[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
 fn curated_dpmpp_2m_is_coherent_and_distinct() {
     let (Some(default), Some(dpmpp)) = (render(None, None), render(Some("dpmpp_2m"), None)) else {
         eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
@@ -137,16 +149,21 @@ fn curated_dpmpp_2m_is_coherent_and_distinct() {
         "dpmpp_2m must differ from the ancestral default (a real curated solver, not a fallback); \
          differ {frac}"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::curated_dpmpp_2m_is_coherent_and_distinct");
 }
 
 /// Scheduler axis: the curated `karras` σ schedule (with the curated `euler` sampler) renders a
 /// coherent image — proving `req.scheduler` flows through `schedule_sigmas`/`run_curated_sampler`.
 #[test]
-#[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real stabilityai/stable-diffusion-xl-base-1.0 snapshot (set SDXL_SNAPSHOT)"]
 fn curated_karras_scheduler_is_coherent() {
     let Some(karras) = render(Some("euler"), Some("karras")) else {
         eprintln!("skipping: no SDXL snapshot (set SDXL_SNAPSHOT)");
         return;
     };
     assert_coherent(&karras, "euler+karras");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::curated_karras_scheduler_is_coherent");
 }

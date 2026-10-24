@@ -418,6 +418,7 @@ mod tests {
     /// Mutations (each run): swap the interleave channel index → red; drop the clamp → red
     /// (upstream is clamped and ~10% of the raw waveform exceeds ±1); emit planar instead of interleaved → red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn production_decode_matches_upstream_pipeline_for_both_decoders() {
         let r = reference();
         let l = latents();
@@ -443,12 +444,16 @@ mod tests {
             assert!(err < TOL, "{v:?}: {err}");
             assert!(out.samples().iter().all(|s| s.is_finite()));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::production_decode_matches_upstream_pipeline_for_both_decoders");
     }
 
     /// Clamping: every output sample is in [-1, 1], the count of clamped samples equals the raw
     /// decoder's out-of-range count, and clamped samples sit exactly at ±1 with the raw sign
     /// (mutation: clamp to [-0.99, 0.99] or skip counting → red).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn output_is_clamped_to_unit_range() {
         let l = latents();
         for v in [VaeVariant::Standard, VaeVariant::Legacy] {
@@ -477,11 +482,15 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::output_is_clamped_to_unit_range");
     }
 
     /// Channel order: `channel(0)` is the decoder's output channel 0 (left) and `channel(1)` its
     /// channel 1, and the two differ (mutation: `skip(1 - channel)` → red).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn channel_accessor_preserves_left_right_order() {
         let l = latents();
         let vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
@@ -502,11 +511,15 @@ mod tests {
             assert_eq!(out.channel(c), want, "channel {c}");
         }
         assert!(max_abs(&out.channel(0), &out.channel(1)) > 0.1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::channel_accessor_preserves_left_right_order");
     }
 
     /// Tiled production decode and the full reference decode agree (the full FP32 path stays
     /// selectable for fidelity validation); metadata names the mode.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiled_and_full_reference_paths_agree() {
         let l = latents();
         for v in [VaeVariant::Standard, VaeVariant::Legacy] {
@@ -525,6 +538,11 @@ mod tests {
             assert_eq!(tiled_out.metadata().to_json()["vae_halo_frames"], json!(16));
         }
         assert_eq!(DecodeOptions::default(), DecodeOptions::production());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::tiled_and_full_reference_paths_agree"
+        );
     }
 
     /// The budget rule honours the budget it is given. At 8, 12, 16 and 24 GiB the estimated
@@ -581,6 +599,7 @@ mod tests {
     /// latent identity is the one that was decoded (mutation: record the other decoder's identity,
     /// or a fresh latent identity → red).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn metadata_preserves_decoder_and_latent_identity() {
         let l = latents();
         let std_vae = tiny(VaeVariant::Standard, VaeParts::DecoderOnly);
@@ -612,6 +631,9 @@ mod tests {
         assert_eq!(j["channels"], 2);
         assert_eq!(j["vae_dtype"], "float32");
         assert_eq!(a.metadata().sample_rate, 48_000);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::metadata_preserves_decoder_and_latent_identity");
     }
 
     /// Switching decoder reuses the persisted, verified latents: one saved artifact is loaded and
@@ -619,6 +641,7 @@ mod tests {
     /// the same latent identity, and each output equals decoding the in-memory latents directly —
     /// no planning, semantic or synthesis input exists on the decode path.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decoder_switch_reuses_verified_cached_latents() {
         let dir = tempfile::tempdir().unwrap();
         let original = latents();
@@ -644,6 +667,9 @@ mod tests {
         // Switching back to the standard decoder reproduces its first output exactly.
         assert_eq!(outputs[0], outputs[2]);
         assert!(max_abs(outputs[0].samples(), outputs[1].samples()) > 0.1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::decoder_switch_reuses_verified_cached_latents");
     }
 
     /// Latents whose content no longer matches their identity are refused before decoding.
@@ -683,6 +709,7 @@ mod tests {
 
     /// Cancellation surfaces from both modes; progress reaches the caller.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancellation_and_progress_propagate() {
         let l = latents();
         let vae = tiny(VaeVariant::Legacy, VaeParts::DecoderOnly);
@@ -696,5 +723,10 @@ mod tests {
         let mut seen = Vec::new();
         decode_latents(&vae, &l, &tiled(), &|| false, &mut |c, t| seen.push((c, t))).unwrap();
         assert_eq!(seen, vec![(1, 3), (2, 3), (3, 3)]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED decode::tests::cancellation_and_progress_propagate"
+        );
     }
 }

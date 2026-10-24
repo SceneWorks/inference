@@ -379,17 +379,20 @@ impl DenseLinear {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Linear(l) => l.forward(x),
+            Self::Linear(l) => __model_proof_output!(l.forward(x)),
             Self::Transposed { weight_t, bias } => {
                 let (in_dim, out_dim) = (weight_t.dim(0)?, weight_t.dim(1)?);
                 let dims = x.dims().to_vec();
                 let lead: usize = dims[..dims.len() - 1].iter().product();
-                let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(weight_t)?;
+                let y = __model_proof_output!(x
+                    .contiguous()?
+                    .reshape((lead, in_dim))?
+                    .matmul(weight_t))?;
                 let mut out_shape = dims[..dims.len() - 1].to_vec();
                 out_shape.push(out_dim);
                 let y = y.reshape(out_shape)?;
                 match bias {
-                    Some(b) => y.broadcast_add(b),
+                    Some(b) => __model_proof_output!(y.broadcast_add(b)),
                     None => Ok(y),
                 }
             }
@@ -414,7 +417,7 @@ impl DenseLinear {
             Self::Transposed { weight_t, bias } => {
                 let weight_t = weight_t.to_dtype(dt)?;
                 let bias = bias.as_ref().map(|b| b.to_dtype(dt)).transpose()?;
-                Self::Transposed { weight_t, bias }.forward(x)
+                __model_proof_output!(Self::Transposed { weight_t, bias }.forward(x))
             }
         }
     }
@@ -622,7 +625,7 @@ impl QLinear {
     /// candle's `QMatMul::forward` (with per-site leading-dim flatten / dtype cast-back).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(l) => l.forward(x),
+            Self::Dense(l) => __model_proof_output!(l.forward(x)),
             Self::Quantized {
                 weight: QuantWeight::Dequant(weight),
                 bias,
@@ -634,7 +637,7 @@ impl QLinear {
                     Some(b) => Some(b.to_dtype(in_dtype)?),
                     None => None,
                 };
-                Linear::new(w, bias).forward(x)
+                __model_proof_output!(Linear::new(w, bias).forward(x))
             }
             Self::Quantized {
                 weight: QuantWeight::Matmul(matmul),
@@ -650,20 +653,20 @@ impl QLinear {
                         .reshape((lead, in_features))?
                         .to_dtype(DType::F32)?
                         .contiguous()?;
-                    let y2 = matmul.forward(&xf)?; // [lead, out]
+                    let y2 = __model_proof_output!(matmul.forward(&xf))?; // [lead, out]
                     let out_features = y2.dim(1)?;
                     let mut out_shape = dims;
                     *out_shape.last_mut().unwrap() = out_features;
                     (y2, Some(out_shape))
                 } else {
                     let xf = x.to_dtype(DType::F32)?.contiguous()?;
-                    (matmul.forward(&xf)?, None)
+                    (__model_proof_output!(matmul.forward(&xf))?, None)
                 };
                 if let Some(shape) = out_shape {
                     y = y.reshape(shape)?;
                 }
                 if let Some(b) = bias {
-                    y = y.broadcast_add(b)?;
+                    y = __model_proof_output!(y.broadcast_add(b))?;
                 }
                 if fwd.cast_back {
                     y = y.to_dtype(in_dtype)?;
@@ -1067,7 +1070,7 @@ impl QEmbedding {
     /// positions. Its result has exactly the dense embedding shape and dtype.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(e) => e.forward(indexes),
+            Self::Dense(e) => __model_proof_output!(e.forward(indexes)),
             Self::Quantized {
                 row_data,
                 vocab_size,
@@ -1481,6 +1484,7 @@ mod tests {
     /// A packed-loaded `QLinear` forward matches a *dense* linear built from the SAME affine grid the
     /// pack represents — bit-exact (the repack is lossless, and both forwards dequant-to-dense-matmul).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qlinear_forward_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64, 128);
@@ -1496,6 +1500,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
         assert!(cos > 0.99999, "packed vs dense-grid cosine {cos:.6}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qlinear_forward_matches_dense_grid");
         Ok(())
     }
 
@@ -1505,6 +1511,7 @@ mod tests {
     /// [`MatmulStrategy::DequantDense`] path (dequant-on-matmul, not int8-fast), and it approximates the
     /// dense weight it was quantized from (Q4_K tolerance). The resident-not-dense guarantee at the core.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn from_qtensor_dequant_keeps_kquant_resident_and_forwards() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 256usize); // Q4_K needs `in` a multiple of 256.
@@ -1532,14 +1539,17 @@ mod tests {
         // The dequant-on-forward output approximates the dense weight it was quantized from + bias.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let dense = Linear::new(w, Some(bias));
-        let cos = cosine(&ql.forward(&x)?, &dense.forward(&x)?);
+        let cos = cosine(&ql.forward(&x)?, &__model_proof_output!(dense.forward(&x))?);
         assert!(cos > 0.99, "Q4_K dequant-forward vs dense cosine {cos:.5}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::from_qtensor_dequant_keeps_kquant_resident_and_forwards");
         Ok(())
     }
 
     /// A packed-loaded `QEmbedding` reproduces the affine grid rows exactly (index-select over the
     /// dequantized table == the dense grid table).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (32, 128);
@@ -1556,6 +1566,10 @@ mod tests {
         let (p, d) = (packed.forward(&idx)?, dense.forward(&idx)?);
         let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "packed embedding deviates from dense grid");
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_matches_dense_grid"
+        );
         Ok(())
     }
 
@@ -1597,6 +1611,7 @@ mod tests {
     /// Packed lookup dequantizes only the distinct selected rows, then uses its inverse map to
     /// restore repeated tokens and the dense embedding's arbitrary index shape exactly.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_deduplicates_rows_and_restores_duplicates() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (256, 128);
@@ -1628,6 +1643,8 @@ mod tests {
             0.0,
             "row selection must restore every duplicate at its original position"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_deduplicates_rows_and_restores_duplicates");
         Ok(())
     }
 
@@ -1652,6 +1669,7 @@ mod tests {
     /// The already-device-format sidecar route (used by Krea) takes the same row-selective path as
     /// an MLX affine triple, rather than silently retaining the old whole-table dequantization.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn qtensor_qembedding_deduplicates_rows_with_dense_parity() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (128, 128);
@@ -1676,6 +1694,8 @@ mod tests {
             (got.sub(&expected)?).abs()?.max_all()?.to_scalar::<f32>()?,
             0.0
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::qtensor_qembedding_deduplicates_rows_with_dense_parity");
         Ok(())
     }
 
@@ -1684,6 +1704,7 @@ mod tests {
     /// The dense path here goes through the same VarBuilder-detect loader (`embedding`), so it holds
     /// the `[base].weight` in the vb's bf16 dtype exactly as a real bf16 text-encoder would.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_qembedding_forward_dtype_matches_dense() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (32, 128);
@@ -1716,8 +1737,8 @@ mod tests {
         assert!(!dense.is_quantized(), "no `.scales` ⇒ dense embedding");
 
         let idx = Tensor::from_vec(vec![0u32, 5, 31, 12, 5], (5,), &dev)?;
-        let p = packed.forward(&idx)?;
-        let d = dense.forward(&idx)?;
+        let p = __model_proof_output!(packed.forward(&idx))?;
+        let d = __model_proof_output!(dense.forward(&idx))?;
         assert_eq!(d.dtype(), DType::BF16, "dense bf16 embedding yields bf16");
         assert_eq!(
             p.dtype(),
@@ -1725,6 +1746,8 @@ mod tests {
             "packed embedding forward dtype must match the dense path (dtype parity)"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qembedding_forward_dtype_matches_dense");
         Ok(())
     }
 
@@ -1733,6 +1756,7 @@ mod tests {
     /// `quantize` is a no-op on an already-packed `QLinear` — it must NOT re-quantize (double-quantize)
     /// a weight that loaded packed. The stored `Q4_1` weight and the forward stay unchanged.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_is_noop_on_packed() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64, 128);
@@ -1761,6 +1785,8 @@ mod tests {
         let after = packed.forward(&x)?;
         let dev_max = (before.sub(&after)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "no-op quantize changed the forward");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::quantize_is_noop_on_packed");
         Ok(())
     }
 
@@ -1774,6 +1800,7 @@ mod tests {
     /// the matching chunk of the dense fused weight (Q8, near-lossless) — chunks 1/2 fail without
     /// the guard, chunk 0 (offset 0) vacuously passes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn fold_materializes_offset_views() -> Result<()> {
         let dev = Device::Cpu;
         let (d, in_dim) = (64usize, 32usize);
@@ -1787,7 +1814,7 @@ mod tests {
                 view.is_contiguous(),
                 "narrow must look contiguous (the trap)"
             );
-            let dense_ref = Linear::new(view.copy()?, None).forward(&x)?;
+            let dense_ref = __model_proof_output!(Linear::new(view.copy()?, None).forward(&x))?;
             for (label, onto) in [("quantize", false), ("quantize_onto", true)] {
                 let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(view.clone(), None)));
                 if onto {
@@ -1803,6 +1830,8 @@ mod tests {
                 );
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::fold_materializes_offset_views");
         Ok(())
     }
 
@@ -1824,6 +1853,7 @@ mod tests {
     /// arm `quantize_onto` uses, and its `Q4_0`/`Q8_0` blocks (and thus forward) must be bit-identical
     /// to the in-place [`QLinear::quantize`] fold of the same weight.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_dequant_onto_is_dequant_dense_and_matches_in_place() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64, 32);
@@ -1858,6 +1888,8 @@ mod tests {
                 );
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::quantize_dequant_onto_is_dequant_dense_and_matches_in_place");
         Ok(())
     }
 
@@ -2019,6 +2051,7 @@ mod tests {
     /// `Q4_0` `QLinear` built via the load-time `quantize` covers the packed forward too. Skips on
     /// CPU (the int8 MMVQ/MMQ path is CUDA-only).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_packed_forward_survives_outlier_activations() -> Result<()> {
         use candle_core::quantized::QMatMul;
         let dev = match crate::default_device() {
@@ -2027,6 +2060,8 @@ mod tests {
                 eprintln!(
                     "SKIP q4_packed_forward_survives_outlier_activations: needs a CUDA device"
                 );
+                #[cfg(feature = "model-inference-proof")]
+                crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen/src/quant/mod.rs:2030 (q4_packed_forward_survives_outlier_activations): Selected learned GPU/real-weight case exits normally when its required device or model artifact is unavailable; downstream learned forward/matrix comparison is omitted.");
                 return Ok(());
             }
         };
@@ -2080,6 +2115,8 @@ mod tests {
             dq > q8 + 0.05,
             "vacuous test: the raw int8 path ({q8:.4}) did not degrade vs dequant ({dq:.4})"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q4_packed_forward_survives_outlier_activations");
         Ok(())
     }
 
@@ -2088,6 +2125,7 @@ mod tests {
     /// A dense [`DenseLinear::Linear`] forward equals a plain `candle_nn::Linear` exactly (the Lens /
     /// FLUX.2 dense layout is a pass-through).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_linear_layout_equals_plain_linear() -> Result<()> {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32, 64);
@@ -2097,11 +2135,15 @@ mod tests {
         let ql = QLinear::Dense(DenseLinear::Linear(plain.clone()));
 
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let dev_max = (ql.forward(&x)?.sub(&plain.forward(&x)?)?)
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let dev_max = (ql
+            .forward(&x)?
+            .sub(&__model_proof_output!(plain.forward(&x))?)?)
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "Dense(Linear) must equal plain Linear");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::dense_linear_layout_equals_plain_linear");
         Ok(())
     }
 
@@ -2109,6 +2151,7 @@ mod tests {
     /// already matches the activation dtype — the inertness guarantee every existing call site relies
     /// on (FLUX / Chroma / SDXL / Lens / SAM3 …). Covers both dense layouts, biased and bias-less.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_upcast_is_inert_at_matching_dtype() -> Result<()> {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32, 48);
@@ -2143,6 +2186,8 @@ mod tests {
                 "{name}: forward_upcast must be inert at matching dtype"
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::forward_upcast_is_inert_at_matching_dtype");
         Ok(())
     }
 
@@ -2150,6 +2195,7 @@ mod tests {
     /// T5 regime) — where plain `forward` would fail on the dtype mismatch — and agrees with the
     /// all-f32 result to bf16's own rounding.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn forward_upcast_runs_f32_acts_over_bf16_weights() -> Result<()> {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32, 48);
@@ -2182,6 +2228,8 @@ mod tests {
             dev_max, 0.0,
             "bf16-resident + f32-compute must equal the bf16-rounded weight materialized at f32"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::forward_upcast_runs_f32_acts_over_bf16_weights");
         Ok(())
     }
 
@@ -2189,6 +2237,7 @@ mod tests {
     /// `[out,in]` `candle_nn::Linear` result over a rank-3 activation — the flatten-GEMM path is
     /// numerically the same `x·Wᵀ + b`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn dense_transposed_layout_matches_linear_on_nd() -> Result<()> {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32, 48);
@@ -2203,10 +2252,12 @@ mod tests {
         // rank-3 activation (the SeedVR2/SAM3 case that goes through the leading-dim flatten).
         let x = Tensor::randn(0f32, 1f32, (2usize, 5usize, in_dim), &dev)?;
         let got = transposed.forward(&x)?;
-        let want = plain.forward(&x)?;
+        let want = __model_proof_output!(plain.forward(&x))?;
         assert_eq!(got.dims(), want.dims());
         let cos = cosine(&got, &want);
         assert!(cos > 0.99999, "transposed vs linear cosine {cos:.6}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::dense_transposed_layout_matches_linear_on_nd");
         Ok(())
     }
 
@@ -2214,6 +2265,7 @@ mod tests {
     /// near-losslessly at Q8, and reports [`MatmulStrategy::Int8Fast`] — the FLUX.2 / SAM3 / SeedVR2
     /// strategy, kept distinct from the dequant-dense (Lens) path.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn int8_fast_fold_quantizes_and_reports_strategy() -> Result<()> {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32, 64);
@@ -2236,6 +2288,8 @@ mod tests {
         assert_eq!(q.dims(), dense.dims());
         let cos = cosine(&dense, &q);
         assert!(cos > 0.999, "int8-fast Q8 cosine {cos:.5}");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::int8_fast_fold_quantizes_and_reports_strategy");
         Ok(())
     }
 

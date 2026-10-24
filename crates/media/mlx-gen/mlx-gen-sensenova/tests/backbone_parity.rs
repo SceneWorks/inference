@@ -74,6 +74,7 @@ fn check(name: &str, got: &Array, want: &Array) {
 /// F-138: a tied-embedding NEO checkpoint has no `lm_head` tensor (config + `expected_keys` already
 /// model this). The backbone must reuse `embed_tokens` as the output projection rather than failing
 /// at construction. Mirror the fixture with its `lm_head` removed and check both branches.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tied_embeddings_build_without_lm_head() {
     const LM_HEAD: &str = "language_model.lm_head.weight";
@@ -117,8 +118,13 @@ fn tied_embeddings_build_without_lm_head() {
         .unwrap();
     let logits = model.lm_head(&hidden).unwrap();
     assert_eq!(*logits.shape().last().unwrap(), vocab);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED backbone_parity::tied_embeddings_build_without_lm_head"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn backbone_matches_reference_both_paths() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -149,5 +155,9 @@ fn backbone_matches_reference_both_paths() {
         "gen.logits",
         &model.lm_head(&gen_hidden).unwrap(),
         w.require("gen.logits").unwrap(),
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED backbone_parity::backbone_matches_reference_both_paths"
     );
 }

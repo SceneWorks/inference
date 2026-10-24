@@ -105,7 +105,15 @@ fn ip_image_encoder_runs_on_real_weights() {
 
     // Optional torch golden.
     if let Ok(ref_path) = std::env::var("CLIP_VIT_L_REF_EMBEDS") {
-        let bytes = std::fs::read(&ref_path).expect("CLIP_VIT_L_REF_EMBEDS file");
+        let bytes = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&ref_path),
+"crates/media/mlx-gen/mlx-gen-flux/tests/ip_image_encoder_real_weights.rs::ip_image_encoder_runs_on_real_weights::std::fs::read@4392",
+TensorInput,
+&ref_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("CLIP_VIT_L_REF_EMBEDS file");
         let refv: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -119,10 +127,20 @@ fn ip_image_encoder_runs_on_real_weights() {
         assert!(cos >= 0.999, "cosine vs torch golden {cos} < 0.999");
         assert!(maxd < 5e-2, "max|Δ| vs torch golden {maxd} too large");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_image_encoder_real_weights::ip_image_encoder_runs_on_real_weights");
 }
 
 fn read_f32_le(path: &str) -> Vec<f32> {
-    std::fs::read(path)
+    mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/mlx-gen/mlx-gen-flux/tests/ip_image_encoder_real_weights.rs::read_f32_le::std::fs::read@5388",
+TensorInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|_| panic!("missing {path}"))
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -171,4 +189,6 @@ fn ip_image_embeds_torch_parity() {
     // a ~19-norm vector — not a structural mismatch (the checkpoint + both sides are f32).
     assert!(cos >= 0.9999, "cosine vs torch {cos} < 0.9999");
     assert!(maxd < 5e-2, "max|Δ| vs torch {maxd} too large");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_image_encoder_real_weights::ip_image_embeds_torch_parity");
 }

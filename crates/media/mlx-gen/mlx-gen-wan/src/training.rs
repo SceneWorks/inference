@@ -1646,8 +1646,13 @@ fn preflight_projection(cfg: &WanModelConfig, edges: &[u32], n_experts: usize) -
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-wan/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -2165,16 +2170,22 @@ mod first_step_repro {
     #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
     fn attn_ckpt_grads_match_retained_t2v() {
         check_attn_ckpt(Variant::T2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained_t2v");
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process"]
     fn attn_ckpt_grads_match_retained_i2v() {
         check_attn_ckpt(Variant::I2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained_i2v");
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
     fn attn_ckpt_grads_match_retained_ti2v_5b() {
         check_attn_ckpt(Variant::Ti2v5b);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::attn_ckpt_grads_match_retained_ti2v_5b");
     }
 
     /// sc-4942/sc-4972 — block (gradient) checkpointing must match the dense path within fp tolerance
@@ -2199,16 +2210,22 @@ mod first_step_repro {
     #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process"]
     fn block_ckpt_grads_match_dense_t2v() {
         check_block_ckpt(Variant::T2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense_t2v");
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process"]
     fn block_ckpt_grads_match_dense_i2v() {
         check_block_ckpt(Variant::I2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense_i2v");
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
     fn block_ckpt_grads_match_dense_ti2v_5b() {
         check_block_ckpt(Variant::Ti2v5b);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_grads_match_dense_ti2v_5b");
     }
 
     /// sc-4942/sc-4972 — first-step peak sweep (attention-segment checkpointing on), plus block-ckpt
@@ -2244,16 +2261,26 @@ mod first_step_repro {
     #[ignore = "needs the converted Wan2.2-T2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
     fn first_step_peak_sweep_t2v() {
         run_peak_sweep(Variant::T2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_peak_sweep_t2v"
+        );
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-I2V-A14B bf16 checkpoint; run as its own process (may SIGKILL)"]
     fn first_step_peak_sweep_i2v() {
         run_peak_sweep(Variant::I2v);
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_peak_sweep_i2v"
+        );
     }
     #[test]
     #[ignore = "needs the converted Wan2.2-TI2V-5B bf16 checkpoint; run as its own process"]
     fn first_step_peak_sweep_ti2v_5b() {
         run_peak_sweep(Variant::Ti2v5b);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::first_step_peak_sweep_ti2v_5b");
     }
 
     /// sc-4942 — the empirical fit must reproduce the measured A14B peak (the basis of the pre-flight
@@ -2330,6 +2357,8 @@ mod first_step_repro {
             ckpt_peak < dense_peak,
             "block checkpointing must reduce the first-step peak: dense {dense_peak:.2} vs ckpt {ckpt_peak:.2}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::block_ckpt_reduces_peak_vs_dense");
     }
 }
 
@@ -2429,6 +2458,7 @@ mod subject_mask_tests {
     /// map is the plain loss, an all-background map zeroes the loss and every adapter grad, a half
     /// map lies strictly between and agrees across paths.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let path = format!(
             "{}/tests/fixtures/s5_low.safetensors",
@@ -2535,6 +2565,8 @@ mod subject_mask_tests {
             (dense - ckpt).abs() <= 1e-4 * dense.abs().max(1.0),
             "dense {dense} vs checkpointed {ckpt}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::subject_mask_tests::subject_mask_weight_reaches_both_backward_paths");
     }
 }
 
@@ -2704,6 +2736,7 @@ mod depth_anchoring_tests {
     /// nonzero finite gradient; a diffusion step (key 1) carries no depth term. Mutation: force
     /// `diffusion_on = true` in `compute_step_loss_grads` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
         let d = aux_driver(
@@ -2757,12 +2790,15 @@ mod depth_anchoring_tests {
             let gb = abs_sum(&g, ".lora_b");
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): with depth off the step is bit-identical to the pre-epic-2123 step (its loss
     /// closure reproduced verbatim), and a diffusion-only step of an enabled path takes the same
     /// graph. Mutation: scale the diffusion reduction (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(
             load_perceptual_path(&TrainingConfig::default(), &tiny_cfg())
@@ -2833,6 +2869,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_off {
             assert_eq!(bits(v), bits(&g_on[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// Each expert trains its aux steps only inside its own noise band: with the depth window
@@ -2844,6 +2882,7 @@ mod depth_anchoring_tests {
     /// high expert gets a depth step at 0.2–0.6 ⇒ red; pass `t` instead of `u` to the claim ⇒ the
     /// low-band aux level leaves the window's interpolation ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn aux_steps_stay_inside_each_experts_band() {
         let f = fixture();
         let entry = [(f.clean.clone(), vec![], None)];
@@ -2904,6 +2943,8 @@ mod depth_anchoring_tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_steps_stay_inside_each_experts_band");
     }
 
     /// With the dual MoE and gradient accumulation 2, every expert's optimizer window (its own
@@ -2912,6 +2953,7 @@ mod depth_anchoring_tests {
     /// window with `accum` alone (not `accum · n_experts`) in `aux_driver` ⇒ an expert's window
     /// mixes kinds ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn every_experts_update_window_is_one_step_kind() {
         let f = fixture();
         let items = 3;
@@ -2955,6 +2997,8 @@ mod depth_anchoring_tests {
                 "expert {ei}: two aux-only updates in a row {updates:?}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::every_experts_update_window_is_one_step_kind");
     }
 
     /// AC (d), E7: depth anchoring grows the estimate by the TAEHV + DA2 footprint (more for

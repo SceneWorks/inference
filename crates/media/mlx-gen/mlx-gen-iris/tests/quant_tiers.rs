@@ -109,6 +109,7 @@ fn backbone(quant: Option<Quant>) -> IrisDiT {
 /// padding the 170-wide projections (q4 resident below the padded pricing); forgetting the input
 /// padding in the forward (a shape error); packing at the wrong width (bytes).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_backbone_holds_packed_projections_at_each_tier() {
     cpu_process(
         "quant_tiers::the_backbone_holds_packed_projections_at_each_tier",
@@ -191,6 +192,7 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
                 let min_cos = if tier == "q8" { 0.99 } else { 0.90 };
                 assert!(cos >= min_cos, "{tier}: cos {cos} < {min_cos}");
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_backbone_holds_packed_projections_at_each_tier");
         },
     );
 }
@@ -236,6 +238,7 @@ fn lora_on_an_unaligned_projection(root: &Path) -> PathBuf {
 /// dropping its adapter stack when the padded base is rebuilt (the image equals the stack without
 /// that module); handing the residuals the padded input (a shape error).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn an_adapted_load_holds_the_packed_model_at_a_tier() {
     cpu_process(
         "quant_tiers::an_adapted_load_holds_the_packed_model_at_a_tier",
@@ -350,6 +353,7 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
                 from_without_w2 > 0.0,
                 "the padded projection's residual did not reach the q4 image"
             );
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::an_adapted_load_holds_the_packed_model_at_a_tier");
         },
     );
 }
@@ -544,6 +548,7 @@ fn the_text_tower_quantizes_on_the_stored_grid() {
 /// *Mutations that red this:* loading dense at a quantized tier; counting the tied head twice;
 /// quantizing the embedding (pricing mismatch); a wrong group size (pricing mismatch).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_text_tower_holds_packed_projections_at_each_tier() {
     cpu_process(
         "quant_tiers::the_text_tower_holds_packed_projections_at_each_tier",
@@ -589,6 +594,7 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
                 }
                 other => panic!("expected a typed refusal, got {:?}", other.err()),
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_text_tower_holds_packed_projections_at_each_tier");
         },
     );
 }
@@ -605,6 +611,7 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
 /// the way to both component loaders (the q4 render would equal the dense one byte for byte —
 /// asserted unequal). Which component a tier reaches is gated by the two tests above.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_catalog_renders_at_each_tier() {
     cpu_process("quant_tiers::the_catalog_renders_at_each_tier", || {
         let scratch = tempfile::tempdir().unwrap();
@@ -656,5 +663,6 @@ fn the_catalog_renders_at_each_tier() {
                 );
             }
         }
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_catalog_renders_at_each_tier");
     });
 }

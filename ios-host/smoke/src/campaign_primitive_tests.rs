@@ -245,8 +245,7 @@ fn probe_touches_no_model_files_and_is_not_a_catalog_case() {
 }
 
 #[cfg(target_os = "macos")]
-#[path = "../../../crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
-mod metal_guard;
+use crate::model_inference_device as metal_guard;
 
 /// The REAL primitive on the MLX CPU device (Metal trapped), through the engine's guard API with
 /// deterministic fixture headroom: exactly-required runs and promotes; one byte short allocates

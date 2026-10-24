@@ -139,7 +139,13 @@ pub(crate) fn weight_shards(dir: &Path, untied_head: bool) -> Result<Vec<std::pa
         return Ok(vec![dir.join("model.safetensors")]);
     };
     let index = dir.join("model.safetensors.index.json");
-    let text = std::fs::read_to_string(&index)
+    let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&index),
+"crates/media/mlx-gen/mlx-gen-iris/src/text_encoder.rs::weight_shards::std::fs::read_to_string@6583",
+ArtifactInput,
+&index,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", index.display())))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| Error::Msg(format!("iris: parsing {}: {e}", index.display())))?;
@@ -763,7 +769,12 @@ impl IrisTextEncoder {
             }
         };
         drop(weights);
-        Self::assemble(dir, cfg, Tower::Resident(Box::new(lm)))
+        mlx_gen::gen_core::__model_input_result!(
+            Self::assemble(dir, cfg, Tower::Resident(Box::new(lm))),
+            "mlx-gen-iris::IrisTextEncoder::load_quantized",
+            ModelWeights,
+            &files
+        )
     }
 
     /// Rung 4 (bounded transformer residency): the tower with its embedding and final norm
@@ -837,6 +848,8 @@ impl IrisTextEncoder {
             }
         }
         let missing = |key: &str| Error::MissingTensor(key.to_owned());
+        #[cfg(feature = "model-inference-proof")]
+        let input_files = files.clone();
         let tower = StreamedTower {
             rope: model_cfg.build_rope(),
             embed: embed.ok_or_else(|| missing(&embed_key))?,
@@ -847,7 +860,12 @@ impl IrisTextEncoder {
             reads,
             stored_quant,
         };
-        Self::assemble(dir, cfg, Tower::Streamed(Box::new(tower)))
+        mlx_gen::gen_core::__model_input_result!(
+            Self::assemble(dir, cfg, Tower::Streamed(Box::new(tower))),
+            "mlx-gen-iris::IrisTextEncoder::load_streamed",
+            ModelWeights,
+            &input_files
+        )
     }
 
     fn assemble(dir: &Path, cfg: &TextEncoderConfig, tower: Tower) -> Result<Self> {

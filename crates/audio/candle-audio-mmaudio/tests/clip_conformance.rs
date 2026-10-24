@@ -27,6 +27,16 @@
 //! Set `DFN_CLIP_SNAPSHOT` to an `open_clip_pytorch_model.bin` file (or a dir containing it), or
 //! leave unset to resolve the pinned checkpoint via the audio lane's F-029 hub path.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use candle_audio_mmaudio as m;
 use candle_audio_mmaudio::candle_audio::candle_core::{Device, Tensor};
 use candle_audio_mmaudio::clip;
@@ -117,7 +127,15 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn read_f32(path: &std::path::Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bytes = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read(path),
+        "crates/audio/candle-audio-mmaudio/tests/clip_conformance.rs::read_f32::std::fs::read@5773",
+        TensorInput,
+        path,
+        |__model_input_path| std::fs::read(__model_input_path),
+        origin = candle_audio::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+    )
+    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -168,6 +186,9 @@ fn dfn_clip_visual_shape_finite_deterministic() {
     // Auxiliary per-token surface has the expected shape.
     let toks = enc.encode_image_tokens(&pixels).expect("tokens");
     assert_eq!(toks.dims(), &[2, clip::NUM_PATCHES, clip::VISION_WIDTH]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dfn_clip_visual_shape_finite_deterministic");
 }
 
 #[test]
@@ -205,6 +226,9 @@ fn dfn_clip_text_shape_finite_deterministic() {
     let cos = cosine(&v[d..2 * d], &v[per_prompt + d..per_prompt + 2 * d]);
     eprintln!("dfn-clip text: shape=(2,77,1024) cos(prompt0_t1,prompt1_t1)={cos:.4}");
     assert!(cos < 0.9999, "different prompts must differ");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dfn_clip_text_shape_finite_deterministic");
 }
 
 #[test]
@@ -232,6 +256,9 @@ fn tokenize_str_to_encode_text_end_to_end() {
     let s: f32 = v[0..d].iter().map(|x| x * x).sum();
     assert!((s.sqrt() - 1.0).abs() < 1e-3, "per-token unit-norm");
     eprintln!("tokenize_str -> encode_text end-to-end: shape=(2,77,1024) ok");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tokenize_str_to_encode_text_end_to_end");
 }
 
 #[test]
@@ -241,6 +268,8 @@ fn dfn_clip_matches_open_clip_reference() {
         Ok(d) => std::path::PathBuf::from(d),
         Err(_) => {
             eprintln!("DFN_CLIP_PARITY_DIR unset; skipping parity");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/audio/candle-audio-mmaudio/tests/clip_conformance.rs:244 (dfn_clip_matches_open_clip_reference): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         }
     };
@@ -270,7 +299,15 @@ fn dfn_clip_matches_open_clip_reference() {
     assert!(img_mad < 0.02, "image max-abs-diff {img_mad} too large");
 
     // ---- text parity: feed the EXACT token ids the reference used ----
-    let tok_bytes = std::fs::read(dir.join("tokens_i64.bin")).unwrap();
+    let tok_bytes = candle_audio::gen_core::__model_input_reader!(
+std::fs::read(dir.join("tokens_i64.bin")),
+"crates/audio/candle-audio-mmaudio/tests/clip_conformance.rs::dfn_clip_matches_open_clip_reference::std::fs::read@13001",
+TensorInput,
+dir.join("tokens_i64.bin"),
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_audio::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap();
     let ids_i64: Vec<i64> = tok_bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
@@ -296,4 +333,7 @@ fn dfn_clip_matches_open_clip_reference() {
     eprintln!("PARITY text : cos={txt_cos:.6} max|Δ|={txt_mad:.6} (B={b}, per-token 1024)");
     assert!(txt_cos > 0.999, "text cosine {txt_cos} must exceed 0.999");
     assert!(txt_mad < 0.02, "text max-abs-diff {txt_mad} too large");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dfn_clip_matches_open_clip_reference");
 }

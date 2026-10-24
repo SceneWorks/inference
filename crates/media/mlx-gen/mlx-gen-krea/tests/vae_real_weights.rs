@@ -72,4 +72,6 @@ fn vae_decode_matches_real_reference() {
     // the looser peak tolerates the few pixels that diverge in f32 after upsample+conv.
     assert!(mean < 2e-3, "VAE decode mean-rel regressed: {mean:.3e}");
     assert!(peak < 1.5e-2, "VAE decode peak-rel regressed: {peak:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::vae_decode_matches_real_reference");
 }

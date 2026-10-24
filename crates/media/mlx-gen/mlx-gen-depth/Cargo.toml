@@ -12,3 +12,6 @@ categories = ["science"]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
+
+[features]
+model-inference-proof = ["mlx-gen/model-inference-proof"]

@@ -57,6 +57,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt()).max(1e-12)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_decode_matches_reference() {
     let w = fixture();
@@ -76,10 +77,13 @@ fn vae22_decode_matches_reference() {
         mean_rel < 1e-3,
         "decode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_decode_matches_reference");
 }
 
 /// SC-18309 N1: the z48 adapter must preserve the historical de-normalize/decode exactly and only
 /// relayout the vendored channels-last `[B,T,H,W,3]` result to the generic NCTHW contract.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_video_adapter_is_byte_exact_to_legacy_route() {
     let w = fixture();
@@ -96,6 +100,8 @@ fn vae22_video_adapter_is_byte_exact_to_legacy_route() {
         seam.reshape(&[-1]).unwrap().as_slice::<f32>(),
         legacy.reshape(&[-1]).unwrap().as_slice::<f32>()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_video_adapter_is_byte_exact_to_legacy_route");
 }
 
 /// A valid z48 latent and valid spatial policy prove pre-cancellation on both an actually-firing
@@ -160,6 +166,7 @@ fn vae22_precancel_wins_before_malformed_input_validation() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_bf16_decode_is_finite_and_close_to_f32() {
     // sc-5039: a bf16 decode (weights + activations cast to bf16, keeping the f32 RMS_norm reduction
@@ -184,8 +191,13 @@ fn vae22_bf16_decode_is_finite_and_close_to_f32() {
     let cos = cosine(g, f);
     println!("[vae22 bf16 decode] cosine(bf16, f32) = {cos:.6}");
     assert!(cos > 0.99, "bf16 decode cosine {cos:.4} too low vs f32");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_bf16_decode_is_finite_and_close_to_f32"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_encode_single_frame_matches_reference() {
     // T=1 single-image encode (the TI2V conditioning path) — distinct chunking from the T=5 case.
@@ -204,8 +216,13 @@ fn vae22_encode_single_frame_matches_reference() {
         mean_rel < 1e-3,
         "T=1 encode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_encode_single_frame_matches_reference"
+    );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_encode_matches_reference() {
     let w = fixture();
@@ -225,6 +242,8 @@ fn vae22_encode_matches_reference() {
         mean_rel < 1e-3,
         "encode diverged: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_encode_matches_reference");
 }
 
 /// sc-19753 — the z48 bounded decode keeps the decoder's **middle-block attention** whole.
@@ -243,6 +262,7 @@ fn vae22_encode_matches_reference() {
 /// smoothness, so each tile's causal convolutions zero-padding at their crop boundary dominates the
 /// absolute error for any tiling policy. Both sides here carry that identical conv seam; only the
 /// retired side additionally aggregates attention per crop.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_bounded_decode_is_closer_to_dense_than_whole_decoder_tiling() {
     use mlx_gen::tiling::{SpatialTiling, TilingConfig};
@@ -323,10 +343,13 @@ fn vae22_bounded_decode_is_closer_to_dense_than_whole_decoder_tiling() {
         }
         Err(e) => panic!("legacy-shape reconstruction failed: {e}"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_bounded_decode_is_closer_to_dense_than_whole_decoder_tiling");
 }
 
 /// The z48 head/tail split must be an exact decomposition — a bounded decode that does not actually
 /// tile must equal the single-pass decode.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae22_untiled_request_falls_through_to_the_dense_decode() {
     use mlx_gen::tiling::{SpatialTiling, TilingConfig};
@@ -351,4 +374,6 @@ fn vae22_untiled_request_falls_through_to_the_dense_decode() {
         max_abs, 0.0,
         "a non-firing request must be the exact decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae22_parity::vae22_untiled_request_falls_through_to_the_dense_decode");
 }

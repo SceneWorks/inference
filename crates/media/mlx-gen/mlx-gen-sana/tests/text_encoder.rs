@@ -167,6 +167,10 @@ fn caption_encoding_matches_reference() {
         cos > 0.998,
         "caption_embs cosine={cos} — forward divergence (ids matched exactly)"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::caption_encoding_matches_reference");
 }
 
 #[test]
@@ -208,4 +212,8 @@ fn caption_feeds_trunk_cross_attn() {
         "TE [1,300,2304] accepted by trunk cross-attn → {:?}",
         out.shape()
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::caption_feeds_trunk_cross_attn");
 }

@@ -487,6 +487,7 @@ fn no_phase_holds_the_previous_phases_weights() {
         gb(process),
         gb(resident_sum)
     );
+    crate::model_inference_device::record_model_inference_device();
 }
 
 /// The same gates over a **bounded slab** of the same two components — cheap enough to re-run under

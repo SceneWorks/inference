@@ -168,12 +168,16 @@ fn verify_quant(quant: Quant, bits: i32) {
 #[ignore = "needs real FLUX.1 weights + bf16 Q8 golden (QUANTIZE=8)"]
 fn e2e_q8_matches_fork() {
     verify_quant(Quant::Q8, 8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_q8_matches_fork");
 }
 
 #[test]
 #[ignore = "needs real FLUX.1 weights + bf16 Q4 golden (QUANTIZE=4)"]
 fn e2e_q4_matches_fork() {
     verify_quant(Quant::Q4, 4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_q4_matches_fork");
 }
 
 /// Which FLUX.1 variant this run targets: `FLUX_VARIANT=dev` → dev, else schnell. The golden file
@@ -330,6 +334,8 @@ fn e2e_t5_prompt_embeds_match_golden() {
     // Bit-exact vs the bf16 fork (T5 runs f32 internally via T5LayerNorm's f32 upcast; sc-2787).
     assert!(pr < 1e-4, "T5 prompt_embeds diverged: peak_rel {pr:.3e}");
     println!("✓ T5 prompt_embeds match the fork golden");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_t5_prompt_embeds_match_golden");
 }
 
 #[test]
@@ -352,6 +358,8 @@ fn e2e_clip_pooled_matches_golden() {
         "CLIP pooled diverged from the fork: peak_rel {pr:.3e}"
     );
     println!("✓ CLIP pooled matches the fork golden");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_clip_pooled_matches_golden");
 }
 
 #[test]
@@ -387,6 +395,8 @@ fn e2e_transformer_v0_matches_golden() {
         "transformer single forward diverged: peak_rel {pr:.3e}"
     );
     println!("✓ transformer single forward matches golden");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_transformer_v0_matches_golden");
 }
 
 #[test]
@@ -421,6 +431,8 @@ fn e2e_vae_decode_matches_golden() {
         differ < img.pixels.len() / 50,
         "too many VAE pixel diffs: {differ}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_vae_decode_matches_golden");
 }
 
 #[test]
@@ -449,6 +461,10 @@ fn e2e_transformer_substages_match_golden() {
             println!("substage {name}: (no golden) shape={:?}", arr.shape());
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_transformer_substages_match_golden"
+    );
 }
 
 #[test]
@@ -593,6 +609,8 @@ fn e2e_denoise_loop_matches_golden() {
          pipeline adds Rust's f32 T5/CLIP vs fork's bf16)",
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_denoise_loop_matches_golden");
 }
 
 #[test]
@@ -635,6 +653,10 @@ fn e2e_single_stack_injected_matches_golden() {
     println!(
         "single stack (injected): peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
         out.shape()
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_single_stack_injected_matches_golden"
     );
 }
 
@@ -737,4 +759,6 @@ fn e2e_full_pipeline_matches_fork() {
         variant_slug(),
         frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_full_pipeline_matches_fork");
 }

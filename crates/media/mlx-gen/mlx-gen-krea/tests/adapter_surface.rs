@@ -127,6 +127,7 @@ fn wide_surface_routes_beyond_attention() {
 /// The install is a live **additive** residual over an untouched base: a nonzero LoRA on the front-end
 /// `img_in` (which feeds the whole net) shifts the DiT velocity. Proves the widened leaves actually drive
 /// the forward — not merely accept an adapter record (candle-gen `install_additive_drives_lora_*`).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn additive_lora_on_frontend_drives_forward() {
     let w = load();
@@ -169,6 +170,10 @@ fn additive_lora_on_frontend_drives_forward() {
     assert!(
         delta > 1e-3,
         "front-end LoRA did not move the velocity (max_abs_diff {delta:e}) — additive residual is inert"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adapter_surface::additive_lora_on_frontend_drives_forward"
     );
 }
 

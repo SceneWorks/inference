@@ -49,6 +49,7 @@ fn fixture() -> Weights {
     Weights::from_file(format!("{dir}/pidnet_tiny.safetensors")).unwrap()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn lq_projection_features_match() {
     let w = fixture();
@@ -67,8 +68,11 @@ fn lq_projection_features_match() {
         eprintln!("lq_feat_{i}: max|Δ|={d:.3e} peak-rel={rel:.3e}");
         assert!(rel < 2e-2, "lq_feat_{i} peak-rel={rel} (max|Δ|={d})");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lq_parity::lq_projection_features_match");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn sigma_gate_matches() {
     let w = fixture();
@@ -85,8 +89,11 @@ fn sigma_gate_matches() {
     eprintln!("sigma gate: max|Δ|={d:.3e} peak-rel={rel:.3e}");
     // pure elementwise (one Linear + sigmoid) — gate tight.
     assert!(rel < 5e-3, "sigma gate peak-rel={rel} (max|Δ|={d})");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lq_parity::sigma_gate_matches");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn pidnet_forward_matches() {
     let w = fixture();
@@ -110,4 +117,6 @@ fn pidnet_forward_matches() {
         rel < 2e-2,
         "PidNet output peak-rel={rel} (max|Δ|={d}) — structural divergence in the gate-injected path"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lq_parity::pidnet_forward_matches");
 }

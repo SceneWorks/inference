@@ -56,6 +56,9 @@ fn split_components() -> Option<(PathBuf, Option<tempfile::TempDir>)> {
         Some(d) => d,
         None => {
             eprintln!("skip: set LTX25_VAE_DIR to a directory holding {CONV_VAE} and {AUDIO_VAE}");
+            crate::model_inference_device::record_model_inference_prerequisite_missing(
+                "required work unavailable in split_components; see preceding skip diagnostic",
+            );
             return None;
         }
     };
@@ -202,6 +205,8 @@ fn conv_vae_round_trips_at_trainer_geometry_and_a_sceneworks_bucket() {
             "{w}x{h}x{frames}: round-trip PSNR {psnr:.2} dB is too low for a working VAE"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_vae_real_weights::conv_vae_round_trips_at_trainer_geometry_and_a_sceneworks_bucket");
 }
 
 #[test]
@@ -294,6 +299,8 @@ fn audio_vae_and_vocoder_produce_correct_length_stereo_audio() {
         amplitude.is_finite() && amplitude > 1e-4 && amplitude <= 1.5,
         "vocoder waveform is not a sane audio signal (max|v| = {amplitude})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_vae_real_weights::audio_vae_and_vocoder_produce_correct_length_stereo_audio");
 }
 
 /// The DiffVAE file's conv encoder loads through the same port at `latent_log_var: constant`, and
@@ -305,11 +312,13 @@ fn audio_vae_and_vocoder_produce_correct_length_stereo_audio() {
 fn diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_weights() {
     let Some(src) = vae_dir() else {
         eprintln!("skip: set LTX25_VAE_DIR to a directory holding the LTX-2.5 VAE components");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_weights; see preceding skip diagnostic");
         return;
     };
     let diff = src.join("ltx-2.5-video-vae-bf16.safetensors");
     if !diff.is_file() {
         eprintln!("skip: {} not cached", diff.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_weights; see preceding skip diagnostic");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -377,4 +386,6 @@ fn diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_
         "the two log-variance modes must yield bit-identical means — they differ only in the \
          discarded tail"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_vae_real_weights::diffvae_encoder_loads_at_constant_logvar_and_the_mode_is_checked_against_the_weights");
 }

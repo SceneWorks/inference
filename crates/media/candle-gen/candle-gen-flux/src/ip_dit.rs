@@ -415,8 +415,8 @@ impl SelfAttention {
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?;
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?;
-        let q = q.apply(&self.norm.query_norm)?;
-        let k = k.apply(&self.norm.key_norm)?;
+        let q = __model_proof_output!(q.apply(&self.norm.query_norm))?;
+        let k = __model_proof_output!(k.apply(&self.norm.key_norm))?;
         Ok((q, k, v))
     }
 }
@@ -500,14 +500,14 @@ impl DoubleStreamBlock {
     ) -> candle_gen::Result<(Tensor, Tensor)> {
         let (img_mod1, img_mod2) = self.img_mod.forward(vec_)?; // shift, scale, gate
         let (txt_mod1, txt_mod2) = self.txt_mod.forward(vec_)?; // shift, scale, gate
-        let img_modulated = img.apply(&self.img_norm1)?;
+        let img_modulated = __model_proof_output!(img.apply(&self.img_norm1))?;
         let img_modulated = img_mod1.scale_shift(&img_modulated)?;
         let (img_q, img_k, img_v) = self.img_attn.qkv(&img_modulated)?;
         // The IP query is captured here — post-QkNorm, pre-RoPE — before `img_q` is consumed by the
         // text concat below. Cloned only when an injector is present (otherwise zero overhead).
         let ip_img_q = ip.map(|_| img_q.clone());
 
-        let txt_modulated = txt.apply(&self.txt_norm1)?;
+        let txt_modulated = __model_proof_output!(txt.apply(&self.txt_norm1))?;
         let txt_modulated = txt_mod1.scale_shift(&txt_modulated)?;
         let (txt_q, txt_k, txt_v) = self.txt_attn.qkv(&txt_modulated)?;
 
@@ -523,7 +523,7 @@ impl DoubleStreamBlock {
         let img = (&img
             + img_mod2.gate(
                 &img_mod2
-                    .scale_shift(&img.apply(&self.img_norm2)?)?
+                    .scale_shift(&__model_proof_output!(img.apply(&self.img_norm2))?)?
                     .apply(&self.img_mlp)?,
             )?)?;
 
@@ -542,7 +542,7 @@ impl DoubleStreamBlock {
         let txt = (&txt
             + txt_mod2.gate(
                 &txt_mod2
-                    .scale_shift(&txt.apply(&self.txt_norm2)?)?
+                    .scale_shift(&__model_proof_output!(txt.apply(&self.txt_norm2))?)?
                     .apply(&self.txt_mlp)?,
             )?)?;
 
@@ -592,7 +592,7 @@ impl SingleStreamBlock {
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<Tensor> {
         let mod_ = self.modulation.forward(vec_)?;
-        let x_mod = mod_.scale_shift(&xs.apply(&self.pre_norm)?)?;
+        let x_mod = mod_.scale_shift(&__model_proof_output!(xs.apply(&self.pre_norm))?)?;
         let x_mod = self.linear1.forward(&x_mod)?;
         let qkv = x_mod.narrow(D::Minus1, 0, 3 * self.h_sz)?;
         let (b, l, _khd) = qkv.dims3()?;
@@ -601,8 +601,8 @@ impl SingleStreamBlock {
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?;
         let mlp = x_mod.narrow(D::Minus1, 3 * self.h_sz, self.mlp_sz)?;
-        let q = q.apply(&self.norm.query_norm)?;
-        let k = k.apply(&self.norm.key_norm)?;
+        let q = __model_proof_output!(q.apply(&self.norm.query_norm))?;
+        let k = __model_proof_output!(k.apply(&self.norm.key_norm))?;
         let attn = attention_planned(&q, &k, &v, pe, attention_plan)?;
         let output = self
             .linear2
@@ -633,8 +633,7 @@ impl LastLayer {
     fn forward(&self, xs: &Tensor, vec: &Tensor) -> Result<Tensor> {
         let chunks = vec.silu()?.apply(&self.ada_ln_modulation)?.chunk(2, 1)?;
         let (shift, scale) = (&chunks[0], &chunks[1]);
-        let xs = xs
-            .apply(&self.norm_final)?
+        let xs = __model_proof_output!(xs.apply(&self.norm_final))?
             .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&shift.unsqueeze(1)?)?;
         self.linear.forward(&xs)
@@ -1491,6 +1490,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streamed_window_one_preserves_injector_indices_and_control_order() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1554,6 +1554,9 @@ mod tests {
         // blocks 0/1 use residual 0 and block 2 uses residual 1. Exact resident parity above is the
         // mutation guard for applying control before the injector or resetting indices per window.
         assert_eq!(control_residual_interval(3, 2), 2);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_dit::tests::streamed_window_one_preserves_injector_indices_and_control_order");
     }
 
     /// The FLUX DiT `img`/`img_ids`/`txt`/`txt_ids`/`timesteps`/`y` inputs for a tiny 2×2-token image and
@@ -1580,6 +1583,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1676,6 +1680,9 @@ mod tests {
             .is_err());
         prepared.device = candle_core::DeviceLocation::Cuda { gpu_id: 7 };
         assert!(prepared.validate(&img, &img_ids, &txt, &txt_ids).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_dit::tests::prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards");
     }
 
     /// sc-9003 / F-023: the three public forwards were consolidated onto one `forward_core`. Each is a
@@ -1683,6 +1690,7 @@ mod tests {
     /// byte-identical — the documented invariant (`forward_control(.., None) ≡ forward_injected(.., None)
     /// ≡ forward(.., None)`). This locks that the consolidation didn't perturb the shared body.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn wrappers_agree_when_all_injectors_none() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1748,5 +1756,8 @@ mod tests {
             )
             .expect("forward_control empty residuals");
         assert_close(&base, &control_empty);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_dit::tests::wrappers_agree_when_all_injectors_none");
     }
 }

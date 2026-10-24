@@ -27,6 +27,7 @@ use crate::common::{assert_close, fixture, meta_f32, meta_str, meta_usize, tiny_
 const LATENT_TOL: f32 = 2.5e-2;
 const IMAGE_TOL: f32 = 1e-2;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn denoise_trajectory_and_rgba_image_match_upstream() {
     let w = fixture("qwen21_pipeline.safetensors");
@@ -147,4 +148,6 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
             IMAGE_TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_parity::denoise_trajectory_and_rgba_image_match_upstream");
 }

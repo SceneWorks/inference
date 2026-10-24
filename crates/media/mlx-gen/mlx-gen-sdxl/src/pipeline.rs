@@ -1747,19 +1747,23 @@ mod tests {
         let tokens = ip_tokens.cloned();
         let ip = tokens.as_ref().map(|t| (t, 0.7_f32));
         let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
-        let (text, neg) = guided_eps_pair(
-            unet,
-            &x,
-            500.0,
-            &conditioning,
-            &pooled,
-            &time_ids,
-            &[],
-            &conditioning,
-            ip,
-            plan,
+        let (text, neg) = (
+            crate::test_device::record_model_inference_device(),
+            guided_eps_pair(
+                unet,
+                &x,
+                500.0,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                &[],
+                &conditioning,
+                ip,
+                plan,
+            ),
         )
-        .unwrap();
+            .1
+            .unwrap();
         assert_eq!(text.shape(), x.shape());
         assert_eq!(neg.shape(), x.shape());
         (bits(&text), bits(&neg))
@@ -1776,6 +1780,7 @@ mod tests {
     /// ran a `[1, K]` (and 77-row) product where the batched pair ran `[2, K]` (154 rows): ~1e-6 of
     /// peak on the CPU at f32, ~3e-3 at f16 on Metal — which CFG × 7 and the ancestral noise grew
     /// into a 255/255 pixel on the real SDXL q4 render (`low_memory_compositions_q4`).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn sequential_cfg_is_byte_identical_to_the_batched_guided_pair() {
         for (cpu, dtype) in cfg_identity_cells() {
@@ -1796,11 +1801,14 @@ mod tests {
                 );
             });
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_is_byte_identical_to_the_batched_guided_pair");
     }
 
     /// The same identity with the **IP-Adapter** decoupled cross-attention installed: its
     /// `to_k_ip`/`to_v_ip` over the `[image tokens, zeros]` pair are conditioning-only projections
     /// too, and a sequential half must run them at the pair's batch as well.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn sequential_cfg_is_byte_identical_with_the_ip_adapter() {
         use crate::test_support::TINY_CONTEXT_DIM;
@@ -1862,11 +1870,14 @@ mod tests {
                 assert!(plain.0 != batched.0, "the IP branch must change the output");
             });
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_is_byte_identical_with_the_ip_adapter");
     }
 
     /// The whole ancestral denoise loop under sequential CFG reproduces the batched loop's final
     /// latent **byte for byte** — the production route (`denoise_core`) actually consumes the
     /// plan's batching, and the identity survives the guidance combine and the ancestral noise.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn sequential_cfg_denoise_is_byte_identical_to_the_batched_denoise() {
         for (cpu, dtype) in cfg_identity_cells() {
@@ -1886,17 +1897,21 @@ mod tests {
                     let sampler = AncestralEuler::new(&inner, 2, inner.max_time()).unwrap();
                     let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
                     let d = Denoiser::with_plan(&unet, &sampler, plan);
-                    let out = denoise(
-                        &d,
-                        x.clone(),
-                        &conditioning,
-                        &pooled,
-                        &time_ids,
-                        5.0,
-                        &CancelFlag::new(),
-                        &mut |_| {},
+                    let out = (
+                        crate::test_device::record_model_inference_device(),
+                        denoise(
+                            &d,
+                            x.clone(),
+                            &conditioning,
+                            &pooled,
+                            &time_ids,
+                            5.0,
+                            &CancelFlag::new(),
+                            &mut |_| {},
+                        ),
                     )
-                    .unwrap();
+                        .1
+                        .unwrap();
                     bits(&out)
                 };
                 let batched = run(gen_core::CfgBatching::Batched);
@@ -1906,6 +1921,8 @@ mod tests {
                 assert_cfg_identity(&label, dtype, exact, &batched, &sequential);
             });
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::sequential_cfg_denoise_is_byte_identical_to_the_batched_denoise");
     }
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ

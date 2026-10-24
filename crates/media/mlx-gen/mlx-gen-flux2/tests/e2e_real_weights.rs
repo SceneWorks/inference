@@ -101,6 +101,8 @@ fn step0_velocity_matches_fork() {
     let (peak, mean) = rel(&v, g.require("v0").unwrap());
     println!("flux2 e2e v0 (real-weights transformer): peak_rel={peak:.4} mean_rel={mean:.4}");
     assert!(mean < 1e-2, "step-0 velocity diverged: mean_rel={mean}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::step0_velocity_matches_fork");
 }
 
 #[test]
@@ -134,5 +136,9 @@ fn full_generate_matches_fork_composition() {
     assert!(
         px < 25.0,
         "full generate diverged from the fork composition: {px}% px>8"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::full_generate_matches_fork_composition"
     );
 }

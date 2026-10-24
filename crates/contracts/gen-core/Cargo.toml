@@ -12,6 +12,10 @@ categories = ["science"]
 # Neutral import path: `use gen_core::…` regardless of the (unique, publishable) package name.
 name = "gen_core"
 
+[features]
+# Manual source-bound model input receipts; no ordinary runtime/read behavior changes.
+model-inference-proof = ["core-llm/model-inference-proof"]
+
 [dependencies]
 # Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
 # depends on NOTHING tensor-related — thiserror (error), tokenizers (text), and core-llm.

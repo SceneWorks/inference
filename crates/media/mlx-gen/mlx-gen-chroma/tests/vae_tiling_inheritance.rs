@@ -127,6 +127,7 @@ fn decode_via_seam(vae: &Vae, packed: &Array, tiling: Option<&TilingConfig>) -> 
 /// each 1-latent-px crop its own GroupNorm statistics, which on this position-dependent fixture moves
 /// the comparison by 1.851e0 (the pre-fix control below runs exactly that route). Measured here:
 /// 1.073e-6 — two orders below the 1e-4 bound and six below the defect signal.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn chroma_bounded_decode_tracks_the_dense_decode() {
     let (vae, latent) = fixture_vae();
@@ -149,6 +150,8 @@ fn chroma_bounded_decode_tracks_the_dense_decode() {
          z-image decoder is no longer normalization-correct under tiling, or Chroma stopped routing \
          to it"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::chroma_bounded_decode_tracks_the_dense_decode");
 }
 
 /// The defect control — the **pre-sc-19753 route**, reconstructed from public API and executed on
@@ -156,6 +159,7 @@ fn chroma_bounded_decode_tracks_the_dense_decode() {
 /// crop (`Decoder::forward_upsample_tail`), so every crop's GroupNorm statistics reduce only its own
 /// window. Without this the tolerance above could be satisfied by a decoder with no global
 /// normalization at all; with it, the pair pins "bounded and correct" apart from "bounded per crop".
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_pre_fix_whole_tail_route_is_observably_wrong_against_the_dense_decode() {
     let (vae, latent) = fixture_vae();
@@ -171,11 +175,14 @@ fn the_pre_fix_whole_tail_route_is_observably_wrong_against_the_dense_decode() {
          fixture (max|Δ|={delta:.3e}) — the bounded-vs-dense tolerance above no longer \
          discriminates and this fixture must be replaced with a position-dependent one"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::the_pre_fix_whole_tail_route_is_observably_wrong_against_the_dense_decode");
 }
 
 /// The tiling control. The bounded request must genuinely partition this geometry, and a request too
 /// wide to tile must be the *exact* single-pass decode — otherwise the tracking assertion could be
 /// passing against an untiled fall-through and prove nothing.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_bounded_request_actually_tiles_and_the_wide_request_does_not() {
     let (vae, latent) = fixture_vae();
@@ -205,6 +212,8 @@ fn the_bounded_request_actually_tiles_and_the_wide_request_does_not() {
         0.0,
         "a request too wide to tile must be the exact single-pass decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::the_bounded_request_actually_tiles_and_the_wide_request_does_not");
 }
 
 /// A pre-tripped cancel must be observed before any tensor work on the Chroma seam too.

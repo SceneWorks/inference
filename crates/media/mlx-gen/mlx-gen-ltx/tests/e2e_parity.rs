@@ -144,6 +144,8 @@ fn tokenizer_matches_reference() {
         valid, nonzero,
         "attention mask marks exactly the non-pad tokens"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::tokenizer_matches_reference");
 }
 
 /// The full 2-stage e2e gate for one quantized checkpoint at one activation precision (sc-2686).
@@ -308,6 +310,8 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder"]
 fn e2e_frames_match_reference() {
     run_e2e_gate(&base_dir(), GOLDEN, false);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_frames_match_reference");
 }
 
 /// **Q8**, bf16 native production regime ([`Precision::quant_bf16`] DiT + bf16 upsampler/statistics)
@@ -318,6 +322,8 @@ fn e2e_frames_match_reference() {
 #[ignore = "needs ltx_2_3_base_q8 transformer (~20 GB) + upsampler + vae_decoder"]
 fn e2e_frames_match_reference_bf16() {
     run_e2e_gate(&base_dir(), GOLDEN_BF16, true);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_frames_match_reference_bf16");
 }
 
 /// **Q4**, f32 quality regime — the sc-2686 acceptance. `eros` (the deployed production model) is Q4,
@@ -327,6 +333,8 @@ fn e2e_frames_match_reference_bf16() {
 #[ignore = "needs ltx_2_3_base_q4 transformer (~11 GB) + upsampler + vae_decoder"]
 fn e2e_frames_match_reference_q4() {
     run_e2e_gate(&base_q4_dir(), GOLDEN_Q4, false);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_frames_match_reference_q4");
 }
 
 /// **Q4**, bf16 native production regime — the sc-2686 acceptance at production precision.
@@ -334,6 +342,8 @@ fn e2e_frames_match_reference_q4() {
 #[ignore = "needs ltx_2_3_base_q4 transformer (~11 GB) + upsampler + vae_decoder"]
 fn e2e_frames_match_reference_q4_bf16() {
     run_e2e_gate(&base_q4_dir(), GOLDEN_Q4_BF16, true);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_parity::e2e_frames_match_reference_q4_bf16");
 }
 
 /// Load a VAE `per_channel_statistics.{mean,std}` at `dt` (the upsampler's latent norm). f32 for the

@@ -109,8 +109,9 @@ pub(crate) fn measure(spec: &LoadSpec, req: &GenerationRequest) -> Row {
     reset_peak_memory();
     let mut active_at_last_step = 0;
     let mut active_at_decode = 0;
-    let out = model
-        .generate(req, &mut |progress: Progress| match progress {
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |progress: Progress| match progress {
             Progress::Step { current, total } if current == total => {
                 active_at_last_step = get_active_memory();
             }
@@ -118,7 +119,9 @@ pub(crate) fn measure(spec: &LoadSpec, req: &GenerationRequest) -> Row {
                 active_at_decode = get_active_memory();
             }
             _ => {}
-        })
+        }),
+    )
+        .1
         .expect("generate must succeed");
     let peak = get_peak_memory();
     let pixels = match out {
@@ -140,7 +143,8 @@ pub(crate) fn measure(spec: &LoadSpec, req: &GenerationRequest) -> Row {
 /// Report-only: the comparison is across commits, so there is nothing to assert in one run beyond
 /// valid accounting.
 #[test]
-#[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL and SDXL_LADDER_ILLUSTRIOUS_XL_V2"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL and SDXL_LADDER_ILLUSTRIOUS_XL_V2"]
 fn q4_staged_request_peak() {
     for (entry, var) in ENTRIES {
         let spec = q4_spec(&q4_dir(var));
@@ -156,12 +160,17 @@ fn q4_staged_request_peak() {
             row.unet_bytes as f64 / GIB,
         );
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED low_memory_peak_real_weights::q4_staged_request_peak"
+    );
 }
 
 /// The AC's memory probe on real weights: by the time a staged request's decode starts, at least
 /// 90% of the U-Net's resident bytes have been released.
 #[test]
-#[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL and SDXL_LADDER_ILLUSTRIOUS_XL_V2"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "real weights + Apple GPU: set SDXL_LADDER_SDXL and SDXL_LADDER_ILLUSTRIOUS_XL_V2"]
 fn staged_decode_does_not_hold_the_unet() {
     for (entry, var) in ENTRIES {
         let spec = q4_spec(&q4_dir(var));
@@ -182,4 +191,6 @@ fn staged_decode_does_not_hold_the_unet() {
             row.active_at_decode as f64 / GIB,
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED low_memory_peak_real_weights::staged_decode_does_not_hold_the_unet");
 }

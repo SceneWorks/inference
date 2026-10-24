@@ -866,9 +866,10 @@ fn failures(verdicts: &[(String, Verdict)]) -> Vec<String> {
 /// [`packed_tier_matrix`].
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_mode_is_derivable_from_the_text_anchor() {
     if !in_cpu_child("every_mode_is_derivable_from_the_text_anchor") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor");
         return;
     }
     let _completion = CpuChildCompletion;
@@ -882,15 +883,17 @@ fn every_mode_is_derivable_from_the_text_anchor() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor");
 }
 
 /// [`every_mode_is_derivable_from_the_text_anchor`] on the packed tiers (the DiT stored at q4 and at
 /// q8). ~15 min on the CPU fixture.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "the q4/q8 additivity matrix (~15 min of CPU): run with --ignored"]
+#[ignore = "model inference; explicit model-proof workflow; the q4/q8 additivity matrix (~15 min of CPU): run with --ignored"]
 fn packed_tier_matrix() {
     if !in_cpu_child("packed_tier_matrix") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::packed_tier_matrix");
         return;
     }
     let _completion = CpuChildCompletion;
@@ -902,6 +905,7 @@ fn packed_tier_matrix() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::packed_tier_matrix");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::packed_tier_matrix");
 }
 
 /// The proof has teeth: a derivation that forgets the control route's extra components in its
@@ -909,9 +913,10 @@ fn packed_tier_matrix() {
 /// priced at the text anchor's denoise residency) goes red at the optimized selection. Dense tier.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dropping_the_control_components_breaks_the_proof() {
     if !in_cpu_child("dropping_the_control_components_breaks_the_proof") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::dropping_the_control_components_breaks_the_proof");
         return;
     }
     let _completion = CpuChildCompletion;
@@ -953,6 +958,7 @@ fn dropping_the_control_components_breaks_the_proof() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED ios_additivity_tests::dropping_the_control_components_breaks_the_proof");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::dropping_the_control_components_breaks_the_proof");
 }
 
 /// The ORIGINAL legal intermediate, NOT a resident endpoint: Sequential+Deferred, explicit no
@@ -1008,9 +1014,10 @@ fn deferred_full_cover_unstaged(provider: &str, tier: &Tier) -> (GenerationMemor
 /// law and cover every request repeat overall and in every phase. One CPU intermediate regression,
 /// not a third device anchor or a measured geometry grid.
 #[test]
-#[ignore = "CPU intermediate regression; run explicitly after native-test admission"]
+#[ignore = "model inference; explicit model-proof workflow; CPU intermediate regression; run explicitly after native-test admission"]
 fn q8_deferred_full_cover_unstaged_control_conditioning_regression() {
     if !in_cpu_child("q8_deferred_full_cover_unstaged_control_conditioning_regression") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::q8_deferred_full_cover_unstaged_control_conditioning_regression");
         return;
     }
     let _completion = CpuChildCompletion;
@@ -1068,6 +1075,7 @@ fn q8_deferred_full_cover_unstaged_control_conditioning_regression() {
         failures.is_empty(),
         "original intermediate remains underderived: {failures:#?}"
     );
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::q8_deferred_full_cover_unstaged_control_conditioning_regression");
 }
 
 /// Allocation diagnostics for the ORIGINAL q8 deferred/full-cover unstaged Control discrepancy.
@@ -1077,9 +1085,10 @@ fn q8_deferred_full_cover_unstaged_control_conditioning_regression() {
 /// term (already visible before TE_EMBED) from a transient within a layer. Runs the production
 /// quantum observer but does not nest `measure_phases` (that would replace this observer).
 #[test]
-#[ignore = "CPU allocation diagnostic; run explicitly with --ignored --nocapture"]
+#[ignore = "model inference; explicit model-proof workflow; CPU allocation diagnostic; run explicitly with --ignored --nocapture"]
 fn q8_deferred_full_cover_unstaged_conditioning_allocations() {
     if !in_cpu_child("q8_deferred_full_cover_unstaged_conditioning_allocations") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::q8_deferred_full_cover_unstaged_conditioning_allocations");
         return;
     }
     let _completion = CpuChildCompletion;
@@ -1155,6 +1164,7 @@ fn q8_deferred_full_cover_unstaged_conditioning_allocations() {
             );
         }
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::q8_deferred_full_cover_unstaged_conditioning_allocations");
 }
 
 /// Positive allocation-event capacity for the ORIGINAL pre-TE_EMBED fixture prefix only.
@@ -2189,9 +2199,10 @@ mod original_pre_embed_capacity {
         }
 
         #[test]
-        #[ignore = "original q8 point-only native baseline: explicit CPU admission required"]
+        #[ignore = "model inference; explicit model-proof workflow; original q8 point-only native baseline: explicit CPU admission required"]
         fn original_q8_before_te_embed_matches_source_prefix_capacity() {
             if !in_strict_cpu_child() {
+                eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::original_pre_embed_capacity::actual_native_point::original_q8_before_te_embed_matches_source_prefix_capacity");
                 return;
             }
             let mut completion: Option<Completion> = None;
@@ -2247,6 +2258,7 @@ mod original_pre_embed_capacity {
                 "original point requires actual Text2 then Control2 completion"
             );
             let _ = completion.replace(Completion);
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::original_pre_embed_capacity::actual_native_point::original_q8_before_te_embed_matches_source_prefix_capacity");
         }
     }
 }
@@ -2916,10 +2928,11 @@ mod three_root_point_lower {
         true
     }
     #[test]
-    #[ignore = "six actual CPU source-point captures; explicit finite admission required"]
+    #[ignore = "model inference; explicit model-proof workflow; six actual CPU source-point captures; explicit finite admission required"]
     fn actual_three_root_lower_at_original_and_control_optimized_points() {
         let mut completion: Option<LowerCompletion> = None;
         if !strict_three_root_cpu_child() {
+            eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_additivity_tests::three_root_point_lower::actual_three_root_lower_at_original_and_control_optimized_points");
             return;
         }
         let mut mask = 0u8;
@@ -2964,6 +2977,7 @@ mod three_root_point_lower {
             }
         }
         let _ = completion.replace(LowerCompletion { mask });
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_additivity_tests::three_root_point_lower::actual_three_root_lower_at_original_and_control_optimized_points");
     }
 
     /// Private original-caller mechanism. A source inventory/correspondence candidate is not an

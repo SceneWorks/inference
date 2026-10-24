@@ -1033,8 +1033,13 @@ fn intermediate_filename(file_name: &str, step: u32) -> String {
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-anima/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1959,6 +1964,7 @@ mod tests {
     /// always-on analogue of z-image's `#[ignore]`d `checkpointed_grads_match_dense`. Also asserts the
     /// conditioner actually receives gradient (the encoder path is live) in both legs.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn checkpointed_grads_match_dense_dit_and_conditioner() {
         let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
         // Hold every SDPA-segment flag OFF so the ONLY difference between the two legs is whole-block
@@ -2012,6 +2018,9 @@ mod tests {
             dit_lora_b_grad(&g_ckpt) > 1e-6,
             "DiT must receive gradient (checkpointed)"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::checkpointed_grads_match_dense_dit_and_conditioner");
     }
 
     /// Grad-parity in the EXACT production combined config (sc-10576). `train_impl` runs a checkpointed
@@ -2026,6 +2035,7 @@ mod tests {
     /// to capture `encoder` collapses the conditioner grad to zero and reddens this test (verified by
     /// temporarily routing `compute_loss_grads` through `_encoder_captured`).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn production_combined_config_grads_match_dense() {
         let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
         let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
@@ -2081,11 +2091,15 @@ mod tests {
             dit_lora_b_grad(&g_prod) > 1e-6,
             "DiT must receive gradient in the production combined config"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::production_combined_config_grads_match_dense");
     }
 
     /// SDPA-segment checkpointing (the dense/LoKr path) must not change grads either: dense grads with
     /// segment ckpt ON == OFF, to fp tolerance.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn sdpa_segment_checkpoint_grads_match_retained() {
         let (mut dit, mut cond, params, adapter, _tp, _blocks) = tiny_model_and_adapter();
         let (x0, source, t5_ids, noise) = tiny_inputs(&tiny_dit_cfg(), &tiny_cond_cfg(), 32);
@@ -2121,6 +2135,9 @@ mod tests {
             max_rel < 1e-3,
             "SDPA-segment checkpointing must not change grads: max rel {max_rel:.2e}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::sdpa_segment_checkpoint_grads_match_retained");
     }
 
     /// The sc-10522 trap made executable: threading `encoder` keeps the conditioner live; CAPTURING it
@@ -2129,6 +2146,7 @@ mod tests {
     /// production forward regressed to capturing `encoder`, `checkpointed_grads_match_dense_…` would go
     /// red here (conditioner grad ≈ 0 ≠ the dense non-zero).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn captured_encoder_zeros_conditioner_grad_mutation() {
         let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
         dit.set_sdpa_checkpoint(false);
@@ -2177,6 +2195,9 @@ mod tests {
             dit_bad > 1e-6,
             "captured encoder still trains the DiT — that is why the bug is silent"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::captured_encoder_zeros_conditioner_grad_mutation");
     }
 
     /// sc-24828: the subject-mask weight reaches BOTH backward paths (dense + DiT block-checkpointed,
@@ -2186,6 +2207,7 @@ mod tests {
     /// between and agrees across paths. The latent is `[1, C, 1, H, W]` (frame axis 1), so the weight
     /// is the cached latent's shape — no packing.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         use mlx_gen::train::loss::subject_mask_weight;
         let (mut dit, mut cond, params, adapter, _tp, blocks) = tiny_model_and_adapter();
@@ -2265,6 +2287,9 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// Compute grads via the deliberately-wrong `encoder`-captured checkpoint forward (mutation test).
@@ -2440,6 +2465,7 @@ mod tests {
     ///   - live == render_latent_with_enc(live enc) ⇒ the conditioner is the sole live-dependent input,
     ///     so the first assertion can't pass for a spurious reason.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn preview_samples_conditioner_through_live_graph() {
         let (mut dit, mut cond, params0, adapter, _tp, _blocks) = tiny_model_and_adapter();
         // `tiny_inputs` returns (x0, source, t5_ids, noise); the noise is the preview's starting latent.
@@ -2530,6 +2556,9 @@ mod tests {
             "render_preview_latent's only live input is the conditioner: feeding the live enc must \
              reproduce the preview (max abs diff {live_vs_ctrl:.3e})"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::preview_samples_conditioner_through_live_graph");
     }
 
     // -------- real-weights measurement + validation (sc-10576), #[ignore]d + snapshot-gated --------
@@ -2660,7 +2689,7 @@ mod tests {
     /// 512/768/1024 to fit `projected_dense_peak_gb`. Prints measured vs. projected — refit the
     /// `ANIMA_PEAK_*` constants if these move materially.
     #[test]
-    #[ignore = "needs the circlestone-labs/Anima snapshot; measures GPU peak (sc-10576 calibration)"]
+    #[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; measures GPU peak (sc-10576 calibration)"]
     fn first_step_dense_peak_sweep() {
         let split = anima_split().expect("set ANIMA_SNAPSHOT to the Anima split_files/ dir");
         let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
@@ -2673,13 +2702,16 @@ mod tests {
                 projected_dense_peak_gb(s, true)
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::first_step_dense_peak_sweep");
     }
 
     /// sc-10576 VALIDATION: (1) a direct measured A/B at 1024² (both fit) proving whole-block
     /// checkpointing reduces the first-step peak, then (2) the 1536² criterion — checkpointing makes
     /// the step fit, while the dense projection is refused by the pre-flight guard.
     #[test]
-    #[ignore = "needs the circlestone-labs/Anima snapshot; SLOW (2B DiT steps at 1024²/1536²)"]
+    #[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; SLOW (2B DiT steps at 1024²/1536²)"]
     fn first_step_1536_checkpointed_vs_dense() {
         let split = anima_split().expect("set ANIMA_SNAPSHOT to the Anima split_files/ dir");
         let (mut dit, mut cond, _vae) = load_real_dit_cond(&split);
@@ -2713,6 +2745,9 @@ mod tests {
             refused,
             "dense 1536 (projected {dense_proj:.0} GB) must be refused by the pre-flight guard"
         );
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::first_step_1536_checkpointed_vs_dense");
     }
 
     // ==============================================================================================
@@ -3083,6 +3118,7 @@ mod depth_anchoring_tests {
     /// LoRA-B factors get a nonzero finite gradient through the decoded x0; a diffusion step
     /// (key 1) carries no depth term. Mutation: force `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
         let d = aux_driver(
@@ -3142,12 +3178,16 @@ mod depth_anchoring_tests {
                 "ckpt={ckpt}: cond LoRA-B {cond_b}"
             );
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 step (its closure reproduced), and a
     /// diffusion-only step of an enabled path takes the same graph. Mutation: scale the diffusion
     /// reduction (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -3213,6 +3253,9 @@ mod depth_anchoring_tests {
         for (k, v) in &g_off {
             assert_eq!(bits(v), bits(&g_on[k]), "{k}");
         }
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// With two resolution buckets (item-major cache, seeded shuffle) the optimizer windows
@@ -3221,6 +3264,7 @@ mod depth_anchoring_tests {
     /// once per entry. Mutation: key the alternation per epoch (`AuxAlternation::new(1, epoch_len)`
     /// in `AuxDriver::prepare_keyed`) ⇒ a depth run ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn two_buckets_interleave_with_per_entry_references() {
         let f = fixture();
         let items = 2usize;
@@ -3260,6 +3304,9 @@ mod depth_anchoring_tests {
             );
         }
         assert_eq!(d.path().reference_computations(), cache.len());
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::two_buckets_interleave_with_per_entry_references");
     }
 
     /// AC (d), E7: depth grows the estimate by TAEW2.1 + DA2 (more for Large) and the guard counts

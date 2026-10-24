@@ -40,9 +40,15 @@ fn env_dir(name: &str) -> PathBuf {
 /// Crops of the repository photo: three squares, one 16:9 and one 9:16.
 fn dataset(out: &Path) -> Vec<TrainingItem> {
     let photo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../_vendor/mage_flow/assets/dog.jpg");
-    let rgb = image::open(photo)
-        .expect("the repo photo decodes")
-        .to_rgb8();
+    let rgb = mlx_gen::gen_core::__model_input_reader!(
+        image::open(photo),
+        "crates/media/mlx-gen/mlx-gen-iris/tests/curricula_real_weights.rs::dataset/image::open",
+        Reference,
+        photo,
+        |__model_input_path| image::open(__model_input_path)
+    )
+    .expect("the repo photo decodes")
+    .to_rgb8();
     let (w, h) = rgb.dimensions();
     let side = w.min(h);
     let dir = out.join("train-data");
@@ -204,4 +210,8 @@ fn real_stage_presets_resume_256_to_512_with_repa() {
     )
     .unwrap();
     eprintln!("[[IRIS_CURRICULA_REAL]] stage1 {stage1_secs:.1}s, stage2 {stage2_secs:.1}s");
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa");
 }

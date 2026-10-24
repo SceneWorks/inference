@@ -62,7 +62,13 @@ fn write_npy(path: &Path, h: usize, w: usize, f: impl Fn(usize, usize) -> f32) {
 fn example(dir: &Path, size: usize) -> (TrainingItem, Image) {
     let photo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg");
-    let rgb = image::open(photo)
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+        image::open(photo),
+        "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::example/image::open",
+        Reference,
+        photo,
+        |__model_input_path| image::open(__model_input_path)
+    )
         .expect("the repo photo decodes")
         .to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -232,4 +238,7 @@ fn real_depth_full_finetune_trains_exports_and_estimates() {
         err_after < err_before,
         "the trained export must move toward the target"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates");
 }

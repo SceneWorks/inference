@@ -58,6 +58,7 @@ fn prepend1(shape: &[i32]) -> Vec<i32> {
     s
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_moe_denoise_matches_reference() {
     let low_w = load("s5_low.safetensors");
@@ -124,6 +125,8 @@ fn wan_moe_denoise_matches_reference() {
     // bf16 DiT cross-build envelope (see S4); a routing/boundary bug gives mean_rel ~O(1).
     assert!(la_mr < 2e-2, "moe latents diverged: mean_rel={la_mr:.3e}");
     assert!(vid_mr < 2e-2, "moe video diverged: mean_rel={vid_mr:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s5_parity::wan_moe_denoise_matches_reference");
 }
 
 /// sc-5551 — `denoise_moe` must honor the engine cancel flag mid-loop (the video sibling of chroma's
@@ -132,6 +135,7 @@ fn wan_moe_denoise_matches_reference() {
 /// Deterministic (the flag is tripped from the callback, not a timer) and reuses the tiny S5 fixture,
 /// so it runs in CI without real weights. The per-step `eval` is what makes the check effective —
 /// without it MLX's lazy graph would defer all compute to VAE decode and the check would never fire.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn wan_moe_denoise_honors_midloop_cancel() {
     let low_w = load("s5_low.safetensors");
@@ -191,4 +195,6 @@ fn wan_moe_denoise_honors_midloop_cancel() {
         steps_seen, 1,
         "cancel tripped after step 1 must abort at the top of step 2, before all 4 steps run"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED s5_parity::wan_moe_denoise_honors_midloop_cancel");
 }

@@ -40,6 +40,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []

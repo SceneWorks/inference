@@ -143,6 +143,10 @@ fn kolors_ip_components_match_reference() {
         "resampler tokens peak_rel {rp:.3e} exceeds 5e-3 (dim/heads/dim_head wrong?)"
     );
     println!("✓ Kolors IP-Adapter components (preprocess + ViT-L-336 encoder + Resampler) match the reference");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED ip_adapter_parity::kolors_ip_components_match_reference"
+    );
 }
 
 #[test]
@@ -235,4 +239,6 @@ fn kolors_ip_scale0_is_base() {
         "degenerate IP-Adapter render"
     );
     println!("✓ Kolors IP-Adapter (scale>0) perturbs the output and renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ip_adapter_parity::kolors_ip_scale0_is_base");
 }

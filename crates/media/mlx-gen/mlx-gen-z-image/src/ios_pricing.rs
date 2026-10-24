@@ -4393,16 +4393,24 @@ mod load_quantization_header_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn vae_histories_match_native_ordered_remap_conversion_and_forward() {
         const CHILD: &str = "ZIMAGE_VAE_HISTORY_CPU_CHILD";
         const FQN: &str = "ios_pricing::load_quantization_header_tests::vae_histories_match_native_ordered_remap_conversion_and_forward";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", FQN, "--nocapture", "--test-threads=1"])
+                .args([
+                    "--include-ignored",
+                    "--exact",
+                    FQN,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .env(CHILD, "1")
                 .status()
                 .unwrap();
             assert!(status.success(), "VAE history CPU child failed");
+            eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing::load_quantization_header_tests::vae_histories_match_native_ordered_remap_conversion_and_forward");
             return;
         }
         // BEFORE any fixture/Array: the installed CPU device AND native default CPU stream,
@@ -4568,6 +4576,7 @@ mod load_quantization_header_tests {
             "VAE CPU synchronization after owners/Scope drop failed"
         );
         eprintln!("ZIMAGE_VAE_HISTORY_NATIVE_BODY_COMPLETED_V1 mechanisms=8 fixture_owners_dropped=1 cpu_sync=0");
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing::load_quantization_header_tests::vae_histories_match_native_ordered_remap_conversion_and_forward");
     }
 
     #[test]

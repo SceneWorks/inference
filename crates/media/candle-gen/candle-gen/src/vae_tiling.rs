@@ -571,15 +571,22 @@ mod global_group_norm_tests {
     /// deliberately the strictest form the arithmetic admits: any reassociation reintroduced into
     /// `apply` reds this test directly, at its source, rather than in a downstream consumer.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn whole_activation_matches_candle_group_norm() {
         let (b, c, h, w, groups) = (2, 8, 5, 7, 4);
         let x = activation(b, c, h, w);
         let weight = ramp(c, 0.7, 0.013);
         let bias = ramp(c, -0.04, 0.011);
-        let dense = candle_nn::GroupNorm::new(weight.clone(), bias.clone(), c, groups, 1e-6)
-            .unwrap()
-            .forward(&x)
-            .unwrap();
+        let dense = __model_proof_output!(candle_nn::GroupNorm::new(
+            weight.clone(),
+            bias.clone(),
+            c,
+            groups,
+            1e-6
+        )
+        .unwrap()
+        .forward(&x))
+        .unwrap();
         let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
         let got = global.apply(&x).unwrap();
         assert_eq!(got.dims(), dense.dims());
@@ -589,12 +596,16 @@ mod global_group_norm_tests {
             "the whole-activation apply must BE candle's GroupNorm, not merely approximate it: \
              max|delta|={delta:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiling::global_group_norm_tests::whole_activation_matches_candle_group_norm");
     }
 
     /// The layer-wise pair — global statistics plus halo/core convolution tiling — must track the
     /// dense `GroupNorm → SiLU → 3×3 conv` layer. Mutation-discriminating: normalizing each crop
     /// against itself (the defect) moves this comparison by orders of magnitude.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn global_stat_tiled_conv_tracks_the_dense_layer() {
         let (b, c, h, w, groups) = (1, 8, 7, 9, 4);
         let out_c = 3;
@@ -621,9 +632,10 @@ mod global_group_norm_tests {
 
         let norm =
             candle_nn::GroupNorm::new(weight.clone(), bias.clone(), c, groups, 1e-6).unwrap();
-        let dense = conv
-            .forward(&candle_nn::ops::silu(&norm.forward(&x).unwrap()).unwrap())
-            .unwrap();
+        let dense = __model_proof_output!(conv.forward(
+            &candle_nn::ops::silu(&__model_proof_output!(norm.forward(&x)).unwrap()).unwrap()
+        ))
+        .unwrap();
 
         let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
         let tiled = tiled_conv2d_3x3_nchw(
@@ -631,7 +643,7 @@ mod global_group_norm_tests {
             5,
             None,
             |tile| Ok(candle_nn::ops::silu(&global.apply(tile)?)?),
-            |tile| Ok(conv.forward(tile)?),
+            |tile| Ok(__model_proof_output!(conv.forward(tile))?),
         )
         .unwrap();
         assert_eq!(tiled.dims(), dense.dims());
@@ -651,13 +663,16 @@ mod global_group_norm_tests {
                 let local = GlobalGroupNorm::new(tile, &weight, &bias, groups, 1e-6)?;
                 Ok(candle_nn::ops::silu(&local.apply(tile)?)?)
             },
-            |tile| Ok(conv.forward(tile)?),
+            |tile| Ok(__model_proof_output!(conv.forward(tile))?),
         )
         .unwrap();
         assert!(
             max_abs(&per_crop, &dense) > 1e-3,
             "per-crop normalization must be observably different from the dense layer"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiling::global_group_norm_tests::global_stat_tiled_conv_tracks_the_dense_layer");
     }
 
     /// A pre-tripped cancel is observed on both the tiled and the single-tile fall-through path.

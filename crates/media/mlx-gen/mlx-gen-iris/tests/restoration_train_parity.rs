@@ -119,10 +119,14 @@ fn exc(e: mlx_gen::Error) -> mlx_rs::error::Exception {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lpips_vgg_matches_the_lpips_package() {
     crate::common::cpu_process(
         "restoration_train_parity::lpips_vgg_matches_the_lpips_package",
-        lpips_vgg_matches_the_lpips_package_body,
+        || {
+            lpips_vgg_matches_the_lpips_package_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::lpips_vgg_matches_the_lpips_package");
+        },
     );
 }
 
@@ -149,10 +153,14 @@ fn lpips_vgg_matches_the_lpips_package_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn critic_trunk_features_match_hypirs_visual_forward() {
     crate::common::cpu_process(
         "restoration_train_parity::critic_trunk_features_match_hypirs_visual_forward",
-        critic_trunk_features_match_hypirs_visual_forward_body,
+        || {
+            critic_trunk_features_match_hypirs_visual_forward_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::critic_trunk_features_match_hypirs_visual_forward");
+        },
     );
 }
 
@@ -180,10 +188,14 @@ fn critic_trunk_features_match_hypirs_visual_forward_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_generator_term_and_its_gradient_match() {
     crate::common::cpu_process(
         "restoration_train_parity::the_generator_term_and_its_gradient_match",
-        the_generator_term_and_its_gradient_match_body,
+        || {
+            the_generator_term_and_its_gradient_match_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_generator_term_and_its_gradient_match");
+        },
     );
 }
 
@@ -225,10 +237,14 @@ fn the_generator_term_and_its_gradient_match_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_critic_step_matches_power_iterations_losses_grads_and_adamw() {
     crate::common::cpu_process(
         "restoration_train_parity::the_critic_step_matches_power_iterations_losses_grads_and_adamw",
-        the_critic_step_matches_power_iterations_losses_grads_and_adamw_body,
+        || {
+            the_critic_step_matches_power_iterations_losses_grads_and_adamw_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_critic_step_matches_power_iterations_losses_grads_and_adamw");
+        },
     );
 }
 
@@ -347,10 +363,14 @@ fn the_critic_step_matches_power_iterations_losses_grads_and_adamw_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_generator_loss_terms_and_gradients_match_optimize_generator() {
     crate::common::cpu_process(
         "restoration_train_parity::the_generator_loss_terms_and_gradients_match_optimize_generator",
-        the_generator_loss_terms_and_gradients_match_optimize_generator_body,
+        || {
+            the_generator_loss_terms_and_gradients_match_optimize_generator_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_parity::the_generator_loss_terms_and_gradients_match_optimize_generator");
+        },
     );
 }
 

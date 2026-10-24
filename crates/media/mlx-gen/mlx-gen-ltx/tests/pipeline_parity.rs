@@ -195,4 +195,6 @@ fn pipeline_matches_reference() {
         "frames px>8 {:.4}% above the low-res F32Q8 floor",
         px * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_parity::pipeline_matches_reference");
 }

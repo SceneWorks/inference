@@ -557,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn controlnet_forward_residual_shapes_and_scale() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -608,6 +609,9 @@ mod tests {
             assert_eq!(maxabs(d), 0.0);
         }
         assert_eq!(maxabs(&z.mid), 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED unet::controlnet::tests::controlnet_forward_residual_shapes_and_scale");
     }
 
     #[test]

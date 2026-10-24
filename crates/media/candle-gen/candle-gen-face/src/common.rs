@@ -92,9 +92,9 @@ impl Conv {
     }
 
     pub fn forward(&self, x: &Tensor, stride: usize, padding: usize) -> Result<Tensor> {
-        let y = x.conv2d(&self.w, padding, stride, 1, 1)?;
+        let y = __model_proof_output!(x.conv2d(&self.w, padding, stride, 1, 1))?;
         let b = self.b.reshape((1, self.b.elem_count(), 1, 1))?;
-        Ok(y.broadcast_add(&b)?)
+        Ok(__model_proof_output!(y.broadcast_add(&b))?)
     }
 
     /// Biased conv → ReLU.
@@ -118,6 +118,6 @@ impl ConvW {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.conv2d(&self.w, 0, 1, 1, 1)?)
+        Ok(__model_proof_output!(x.conv2d(&self.w, 0, 1, 1, 1))?)
     }
 }

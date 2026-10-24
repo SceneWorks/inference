@@ -105,8 +105,14 @@ impl MageTextEncoder {
         } else {
             None
         };
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| Error::Msg(format!("mage: load text_encoder/tokenizer.json: {e}")))?;
+        let tokenizer = candle_gen::gen_core::__model_input_reader!(
+            Tokenizer::from_file(dir.join("tokenizer.json")),
+            "candle-gen-mage::text_encoder::MageTextEncoder::load_inner/tokenizer",
+            Tokenizer,
+            dir.join("tokenizer.json"),
+            |actual_path| Tokenizer::from_file(actual_path)
+        )
+        .map_err(|e| Error::Msg(format!("mage: load text_encoder/tokenizer.json: {e}")))?;
         Ok(Self {
             model,
             tokenizer,

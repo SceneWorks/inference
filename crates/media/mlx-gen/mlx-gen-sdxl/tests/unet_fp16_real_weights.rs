@@ -33,7 +33,8 @@ fn f32v(a: &Array) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + fp16 U-Net golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + fp16 U-Net golden"]
 fn unet_single_forward_matches_vendored_fp16() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let timestep: f32 = g.metadata("timestep").unwrap().parse().unwrap();
@@ -62,8 +63,11 @@ fn unet_single_forward_matches_vendored_fp16() {
         .unwrap();
 
     let unet = load_unet_dtype(&snapshot(), Dtype::Float16).unwrap();
-    let eps = unet
-        .forward(&latents, timestep, &conditioning, &pooled, &time_ids)
+    let eps = (
+        crate::common::record_model_inference_device(),
+        unet.forward(&latents, timestep, &conditioning, &pooled, &time_ids),
+    )
+        .1
         .unwrap();
 
     let golden = g.require("eps").unwrap();
@@ -94,4 +98,6 @@ fn unet_single_forward_matches_vendored_fp16() {
         "fp16 U-Net forward diverged badly: peak_rel {:.3e}",
         max_diff / peak
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED unet_fp16_real_weights::unet_single_forward_matches_vendored_fp16");
 }

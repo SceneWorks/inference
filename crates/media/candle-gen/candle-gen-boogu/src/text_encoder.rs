@@ -484,6 +484,7 @@ mod tests {
     /// goes RED — it is not a tautology that passes with the win ripped out. CPU-runnable precisely
     /// because the compute never leaves f32.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_last_hidden_is_bit_identical_to_f32_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_boogu_te_map();
@@ -522,6 +523,9 @@ mod tests {
         assert_eq!(w_f32.get(q).unwrap().dtype(), DType::F32);
 
         let _ = std::fs::remove_dir_all(&dir);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::bf16_store_last_hidden_is_bit_identical_to_f32_store");
     }
 
     /// The **image-grounded edit** path (`last_hidden_with_images`) is bit-identical under the bf16
@@ -530,6 +534,7 @@ mod tests {
     /// regression the text-path test can't see), so this pins it: same bf16 disk, f32 vs bf16 store,
     /// bit-identical grounded context.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn bf16_store_grounded_is_bit_identical_to_f32_store() {
         let tmp = tempfile::tempdir().unwrap();
         let (map, cfg) = tiny_boogu_te_map();
@@ -569,5 +574,8 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::bf16_store_grounded_is_bit_identical_to_f32_store");
     }
 }

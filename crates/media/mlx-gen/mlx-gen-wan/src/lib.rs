@@ -724,3 +724,6 @@ mod explicit_registry_tests {
         assert_eq!(peak(super::MODEL_ID, 9), Some(126_812_160));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

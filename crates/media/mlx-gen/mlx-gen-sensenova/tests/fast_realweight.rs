@@ -56,6 +56,7 @@ fn fast_realweight_matches_reference() {
             snap.display(),
             fix.display()
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in fast_realweight_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -128,6 +129,8 @@ fn fast_realweight_matches_reference() {
         "fast trajectory final step ({last}): cosine={c:.5} (compounding precision chaos; \
          weight-level merge fidelity gated by distill_merge_realweight)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fast_realweight::fast_realweight_matches_reference");
 }
 
 #[test]
@@ -136,6 +139,7 @@ fn fast_registry_renders_coherently() {
     let snap = snapshot_dir();
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in fast_registry_renders_coherently; see preceding skip diagnostic");
         return;
     }
     // `load_fast` resolves + merges the distill LoRA (asserting coverage) and applies the distilled
@@ -168,4 +172,6 @@ fn fast_registry_renders_coherently() {
         "degenerate render"
     );
     println!("✓ sensenova_u1_8b_fast registry render coherent (distilled 8-step defaults)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED fast_realweight::fast_registry_renders_coherently");
 }

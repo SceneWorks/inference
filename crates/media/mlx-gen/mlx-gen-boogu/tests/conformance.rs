@@ -46,4 +46,8 @@ fn boogu_image_turbo_satisfies_gen_core_contract() {
         // DMD loop resolves `req.steps` verbatim, so Step.total == 2.
         &Profile::cheap(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED conformance::boogu_image_turbo_satisfies_gen_core_contract"
+    );
 }

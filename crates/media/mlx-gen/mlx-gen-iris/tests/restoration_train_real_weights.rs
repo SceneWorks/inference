@@ -115,6 +115,10 @@ fn real_lpips_and_critic_trunk_match_the_reference() {
         &host_f32(req(&g, "clip/feat3")),
         METAL,
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_lpips_and_critic_trunk_match_the_reference");
 }
 
 fn save_png(img: &Image, path: &Path) {
@@ -128,7 +132,13 @@ fn save_png(img: &Image, path: &Path) {
 fn dataset(out: &Path) -> Vec<TrainingItem> {
     let photo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg");
-    let rgb = image::open(photo)
+    let rgb = mlx_gen::gen_core::__model_input_reader!(
+        image::open(photo),
+        "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs::dataset/image::open",
+        Reference,
+        photo,
+        |__model_input_path| image::open(__model_input_path)
+    )
         .expect("the repo photo decodes")
         .to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -156,9 +166,16 @@ fn dataset(out: &Path) -> Vec<TrainingItem> {
 /// The ×4 restoration case: the repository photo downscaled to 64x48 (the input) and the same
 /// photo at 256x192 (the reference a restoration is scored against).
 fn restore_case() -> (Image, image::RgbImage) {
-    let photo = image::open(
+    let photo = mlx_gen::gen_core::__model_input_reader!(
+        image::open(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg"),
+    ),
+        "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_real_weights.rs::restore_case/image::open",
+        Reference,
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg"),
+        |__model_input_path| image::open(__model_input_path)
     )
     .unwrap();
     let lq = photo
@@ -331,6 +348,10 @@ fn real_restoration_trains_exports_and_restores() {
             ..Default::default()
         },
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_restoration_trains_exports_and_restores");
 }
 
 /// The paper's recipe — a FULL fine-tune of the 3B generator (`recipe_training_config`: AdamW,
@@ -348,4 +369,8 @@ fn real_restoration_full_finetune_trains_exports_and_restores() {
     config.seed = 5;
     config.train_dtype = "bf16".into();
     train_export_and_restore("full", config);
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_restoration_full_finetune_trains_exports_and_restores");
 }

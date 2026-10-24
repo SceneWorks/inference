@@ -778,6 +778,7 @@ mod tests {
     /// several seeds — across a stop-token end (a stop the run itself emits), a budget end, the
     /// zero budget (the prefill's token is still drawn) and the public `HARMONY_RETURN` entry points.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn reasoner_engine_decode_matches_the_pre_engine_loops() {
         let m = tiny_reasoner();
         let prompt = [3, 17, 42, 8, 30, 11, 5];
@@ -837,11 +838,14 @@ mod tests {
             m.generate_sampled(&prompt, 12, &params, 9, None).unwrap(),
             reference_sampled(&m, &prompt, 12, HARMONY_RETURN, &params, 9, None).unwrap()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED reasoner::tests::reasoner_engine_decode_matches_the_pre_engine_loops");
     }
 
     /// A cancel stays typed and lands where the pre-engine loop checked it: never before the
     /// prefill's token, before every later one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn reasoner_cancel_is_checked_before_every_token_after_the_first() {
         let m = tiny_reasoner();
         let prompt = [3, 17, 42, 8];
@@ -877,12 +881,15 @@ mod tests {
                 .unwrap(),
             reference_sampled(&m, &prompt, 1, -1, &params, 1, Some(&cancel)).unwrap()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED reasoner::tests::reasoner_cancel_is_checked_before_every_token_after_the_first");
     }
 
     /// A cancel set mid-decode is bridged onto the engine's flag: the engine finishes `Cancelled`
     /// right after the token it was emitting, and the decode returns the typed [`Error::Canceled`]
     /// (greedy and sampled).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_mid_run_cancel_ends_the_decode_typed() {
         let m = tiny_reasoner();
         let prompt = [3, 17, 42, 8, 30, 11, 5];
@@ -912,5 +919,7 @@ mod tests {
                 "sampled {sampled}: cancelled after the third token"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED reasoner::tests::a_mid_run_cancel_ends_the_decode_typed");
     }
 }

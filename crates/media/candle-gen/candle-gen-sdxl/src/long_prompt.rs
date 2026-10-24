@@ -522,6 +522,7 @@ mod encoder_tests {
     /// to the pre-sc-20528 encode (tokenizer ids right-padded, one forward). Exact `f32` equality —
     /// not a cosine, which is scale-invariant and would pass on a genuinely different embedding.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn short_prompt_conditioning_is_byte_identical_to_the_legacy_encode() {
         let tower = tiny_tower();
         let plan = plan();
@@ -543,12 +544,16 @@ mod encoder_tests {
             bytes(&legacy),
             "a prompt inside the CLIP context must encode byte-identically to the legacy path"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED long_prompt::encoder_tests::short_prompt_conditioning_is_byte_identical_to_the_legacy_encode");
     }
 
     /// AC1/AC2: an over-long prompt encodes to `[1, n·window, embed]` — the windows concatenated on
     /// the **sequence** axis — and window 0 of that concatenation is exactly the standalone encode of
     /// window 0, i.e. the leading tokens keep the conditioning the old code would have produced.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn long_prompt_concatenates_windows_on_the_sequence_axis() {
         let tower = tiny_tower();
         let plan = plan();
@@ -574,12 +579,16 @@ mod encoder_tests {
             bytes(&per_window[0]),
             "window 0 of the concatenation is the standalone encode of window 0"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED long_prompt::encoder_tests::long_prompt_concatenates_windows_on_the_sequence_axis");
     }
 
     /// AC3: the negative prompt takes the same path. A short negative aligned to a long positive's
     /// window count yields the SAME sequence length, so the `[uncond, cond]` batch stack the pipeline
     /// builds still concatenates — this is the shape failure a naive per-text chunking would hit.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn negative_prompt_aligns_to_the_positive_window_count() {
         let tower = tiny_tower();
         let plan = plan();
@@ -609,5 +618,8 @@ mod encoder_tests {
         // The batch stack the pipeline hands the UNet: `[uncond, cond]`.
         let batched = Tensor::cat(&[uncond, cond], 0).unwrap();
         assert_eq!(batched.dims(), &[2, chunks * WINDOW, 32]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED long_prompt::encoder_tests::negative_prompt_aligns_to_the_positive_window_count");
     }
 }

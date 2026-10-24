@@ -82,4 +82,8 @@ fn kolors_unet_single_forward_matches_diffusers() {
     println!(
         "✓ Kolors U-Net single forward matches diffusers (encoder_hid_proj + 5632 add_embedding)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED unet_parity::kolors_unet_single_forward_matches_diffusers"
+    );
 }

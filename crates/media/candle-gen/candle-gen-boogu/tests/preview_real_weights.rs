@@ -14,6 +14,15 @@
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -86,7 +95,15 @@ fn collecting_sink() -> (PreviewSink, Arc<Mutex<Vec<PreviewFrame>>>) {
 }
 
 fn read_reference(path: &Path) -> Image {
-    let rgb = image::open(path)
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-boogu/tests/preview_real_weights.rs::read_reference::image::open@3576",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
         .unwrap_or_else(|error| panic!("open reference {}: {error}", path.display()))
         .to_rgb8();
     Image {
@@ -352,6 +369,9 @@ fn base_lane(label: &'static str, sampler: Option<&'static str>, steps: u32) -> 
 #[ignore = "one-time CUDA acceptance only; not a CI job"]
 fn base_default_lane_emits_a_converging_strip() {
     run_lane(base_lane("boogu-base-default", None, 8), Vec::new());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED base_default_lane_emits_a_converging_strip");
 }
 
 #[test]
@@ -366,6 +386,9 @@ fn base_heun_emits_once_per_outer_step() {
         lane.steps
     );
     assert_eq!(frames.len(), lane.steps as usize);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED base_heun_emits_once_per_outer_step");
 }
 
 #[test]
@@ -383,6 +406,9 @@ fn turbo_native_lane_is_decorative_and_converges() {
         },
         Vec::new(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED turbo_native_lane_is_decorative_and_converges");
 }
 
 #[test]
@@ -404,4 +430,7 @@ fn edit_default_lane_emits_a_converging_strip() {
             strength: None,
         }],
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_default_lane_emits_a_converging_strip");
 }

@@ -40,6 +40,15 @@
 //! [`load_understanding_with_spec`]). The worker never receives the raw model, so route/geometry,
 //! request memory, lifecycle cleanup, and checkpoint identity remain one operation.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 mod config;
 mod distill;
 mod fm;

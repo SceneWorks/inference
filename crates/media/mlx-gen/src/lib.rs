@@ -156,3 +156,6 @@ pub use transform::{
     InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
     TransformRequest,
 };
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

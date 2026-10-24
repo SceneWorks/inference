@@ -24,6 +24,7 @@ use crate::common::{assert_close, device, host_f32, tiny_snapshot, Fixture};
 const TOL: f32 = 1e-5;
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn template_ids_drop_count_layers_and_embeddings_match_upstream() {
     let w = Fixture::open("qwen21_text_encoder.safetensors");
     let root = tiny_snapshot();
@@ -77,4 +78,7 @@ fn template_ids_drop_count_layers_and_embeddings_match_upstream() {
             TOL,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_parity::template_ids_drop_count_layers_and_embeddings_match_upstream");
 }

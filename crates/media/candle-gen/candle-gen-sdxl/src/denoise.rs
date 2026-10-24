@@ -670,6 +670,7 @@ mod tests {
     /// the latent shape, stays finite, is deterministic for a fixed seed, differs with CFG on vs off,
     /// and honors a pre-cancelled flag.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn denoise_loop_no_control() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -743,6 +744,9 @@ mod tests {
             &c.text,
         );
         assert!(matches!(err, Err(CandleError::Canceled)));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED denoise::tests::denoise_loop_no_control");
     }
 
     /// The denoise loop WITH a single ControlNet branch whose geometry matches the UNet (same block
@@ -750,6 +754,7 @@ mod tests {
     /// output vs `scale = 0` (the residuals actually reach the UNet). This is the CPU guard for the
     /// ControlNet→UNet residual integration before the GPU/real-weight validation (phase 5).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn denoise_loop_with_controlnet() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -820,6 +825,9 @@ mod tests {
                 .any(|(x, y)| (x - y).abs() > 1e-4),
             "a positive ControlNet scale must change the denoise output"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED denoise::tests::denoise_loop_with_controlnet");
     }
 
     /// The curated conditioned denoise (sc-7297): drive a `DiscreteModelSampling` over a tiny σ schedule
@@ -828,6 +836,7 @@ mod tests {
     /// (the residuals reach the UNet through the curated path too). The CPU guard for the
     /// `run_curated_sampler` wiring before the GPU/real-weight smoke (phase 5).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn denoise_curated_loop_with_controlnet() {
         use candle_gen::gen_core::sampling::{AlphaSchedule, DiscreteModelSampling};
 
@@ -900,11 +909,17 @@ mod tests {
                 .any(|(x, y)| (x - y).abs() > 1e-4),
             "a positive ControlNet scale must change the curated denoise output"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED denoise::tests::denoise_curated_loop_with_controlnet"
+        );
     }
 
     /// A pre-cancelled flag stops the curated denoise before any model eval (the driver bridges
     /// `gen_core::Error::Canceled` ⇄ `CandleError::Canceled`).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn denoise_curated_honors_cancel() {
         use candle_gen::gen_core::sampling::{AlphaSchedule, DiscreteModelSampling};
 
@@ -941,5 +956,8 @@ mod tests {
             &c.text,
         );
         assert!(matches!(err, Err(CandleError::Canceled)));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED denoise::tests::denoise_curated_honors_cancel");
     }
 }

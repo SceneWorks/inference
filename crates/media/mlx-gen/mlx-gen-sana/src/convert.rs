@@ -461,6 +461,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn converter_embedding_is_consumed_by_gemma_at_both_packed_tiers() {
         // The default device is process-wide: switching it to the CPU in the shared test process
         // leaked into every later test (`a_single_query_row_chunk_is_not_bit_exact…` then ran on
@@ -469,6 +470,7 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "convert::tests::converter_embedding_is_consumed_by_gemma_at_both_packed_tiers",
                     "--nocapture",
@@ -480,6 +482,8 @@ mod tests {
             return;
         }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
         for bits in [4, 8] {
             let source = Array::from_slice(
                 &(0..5 * 128).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
@@ -531,6 +535,8 @@ mod tests {
                 "converter/loader embedding q{bits} mismatch"
             );
         }
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED convert::tests::converter_embedding_is_consumed_by_gemma_at_both_packed_tiers");
     }
 
     #[test]

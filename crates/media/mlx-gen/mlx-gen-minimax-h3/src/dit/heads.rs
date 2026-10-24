@@ -613,6 +613,7 @@ mod tests {
     /// Built over a projection whose two halves are trivially distinguishable, so a reversed
     /// reading cannot pass.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn norm_out_modulation_is_shift_then_scale() {
         // A 1-row temb of width 1 projected to [shift = 5, scale = 0.5] by an identity-ish linear.
         let mut w = Weights::empty();
@@ -649,5 +650,7 @@ mod tests {
         n.apply(&x, &m, &Array::from_slice(&[0i32], &[1])).unwrap();
         assert!(n.apply(&x, &m, &Array::from_slice(&[1i32], &[1])).is_err());
         assert!(n.apply(&x, &m, &Array::from_slice(&[-1i32], &[1])).is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::norm_out_modulation_is_shift_then_scale");
     }
 }

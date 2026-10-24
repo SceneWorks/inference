@@ -69,6 +69,7 @@ fn read_adapter(path: &Path) -> HashMap<String, (Vec<i64>, Vec<f32>)> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn everything_off_trains_the_pre_epic_adapter() {
     let tmp = tempfile::Builder::new()
         .prefix(&format!("qwen21_pre_epic_golden_{}_", std::process::id()))
@@ -149,4 +150,7 @@ fn everything_off_trains_the_pre_epic_adapter() {
         worst.0
     );
     assert!(trained_b, "the golden carries no trained up factor");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pre_epic_golden::everything_off_trains_the_pre_epic_adapter");
 }

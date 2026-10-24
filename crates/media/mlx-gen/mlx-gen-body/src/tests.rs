@@ -494,6 +494,7 @@ fn each_body_loss_is_zero_without_a_detected_person() {
 /// The restricted normal loss refuses a reference without a mask instead of silently averaging
 /// over the whole frame, and the mask changes the loss. Mutation: ignore `r.mask` in
 /// `NormalLoss::loss` ⇒ the two losses match ⇒ red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     let w = fixture();
@@ -512,6 +513,8 @@ fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     let a = scalar(&restricted.loss(&live, r_masked.as_ref()).unwrap());
     let b = scalar(&plain.loss(&live, r_plain.as_ref()).unwrap());
     assert!((a - b).abs() > 1e-5, "masked {a} vs full {b}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::the_subject_restricted_normal_loss_needs_and_uses_the_mask");
 }
 
 /// E7: the MLX arm footprints are the backend-neutral split (ViTPose once). Mutation: drop the
@@ -570,6 +573,8 @@ fn real_dir() -> (std::path::PathBuf, Weights) {
 #[ignore = "needs the real vitpose-plus-base snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
 fn real_vitpose_matches_the_reference_implementation() {
     on_cpu(|| {
+        crate::model_inference_device::record_model_inference_device();
+
         let (root, r) = real_dir();
         let img = nhwc(&r, "input.a");
         let pose = VitPose::from_dir(root.join("vitpose"), VitPoseConfig::plus_base()).unwrap();
@@ -591,6 +596,9 @@ fn real_vitpose_matches_the_reference_implementation() {
             2e-3,
         );
     });
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tests::real_vitpose_matches_the_reference_implementation"
+    );
 }
 
 /// AC2 at real scale: the re-hosted HybrIK ResNet-34 vs upstream's encoder on the original `.pth`.
@@ -598,6 +606,8 @@ fn real_vitpose_matches_the_reference_implementation() {
 #[ignore = "needs the real HybrIK snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
 fn real_hybrik_matches_the_reference_implementation() {
     on_cpu(|| {
+        crate::model_inference_device::record_model_inference_device();
+
         let (root, r) = real_dir();
         let img = nhwc(&r, "input.a");
         let bbox_v = t(&r, "input.person_bbox");
@@ -622,6 +632,9 @@ fn real_hybrik_matches_the_reference_implementation() {
             1e-3,
         );
     });
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tests::real_hybrik_matches_the_reference_implementation"
+    );
 }
 
 /// AC2 at real scale: the re-hosted Sapiens normal 0.3B vs upstream's estimator on the `.pth`.
@@ -629,6 +642,8 @@ fn real_hybrik_matches_the_reference_implementation() {
 #[ignore = "needs the real Sapiens snapshot + --real outputs (SCENEWORKS_BODY_LOSS_REAL)"]
 fn real_sapiens_matches_the_reference_implementation() {
     on_cpu(|| {
+        crate::model_inference_device::record_model_inference_device();
+
         let (root, r) = real_dir();
         let img = nhwc(&r, "input.a");
         let sap =
@@ -652,6 +667,9 @@ fn real_sapiens_matches_the_reference_implementation() {
             5e-3,
         );
     });
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tests::real_sapiens_matches_the_reference_implementation"
+    );
 }
 
 /// sc-24832: the subject-restricted normal comparison ignores the normal error outside the mask —
@@ -815,9 +833,12 @@ fn no_person_gate_averages_every_ratio_in_use() {
 /// reference betas come from the `int()`-truncated crop while the stored live crop is the rounded
 /// one; the normal reference is the native-letterbox `encode_pixels`. Mutations: compute the
 /// reference betas on `crop_for` ⇒ red; compute the reference normals with `forward_pixels` ⇒ red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn reference_paths_follow_upstream_encode() {
     on_cpu(|| {
+        crate::model_inference_device::record_model_inference_device();
+
         let w = fixture();
         let clean = nhwc(&w, "input.a");
         let bx = person_pose()
@@ -850,4 +871,5 @@ fn reference_paths_follow_upstream_encode() {
             1e-6,
         );
     });
+    println!("MODEL_INFERENCE_BODY_COMPLETED tests::reference_paths_follow_upstream_encode");
 }

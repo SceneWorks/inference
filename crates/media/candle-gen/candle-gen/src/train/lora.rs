@@ -1712,6 +1712,7 @@ mod tests {
     /// optimizer update to B must make the next loss reach A. This pins the distinction between the
     /// inference residual fast path and the trainable `AdaptLinear` residual seam.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn adapt_linear_zero_init_lora_trains_across_optimizer_steps() {
         let device = Device::Cpu;
         let base = Linear::new(Tensor::zeros((3, 4), DType::F32, &device).unwrap(), None);
@@ -1785,6 +1786,9 @@ mod tests {
                 .unwrap()
                 > 0.0
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::adapt_linear_zero_init_lora_trains_across_optimizer_steps");
     }
 
     /// `build_adapt_lokr_targets_peft` trains PEFT's factor surface — a low-rank `w2_a·w2_b` below
@@ -1792,6 +1796,7 @@ mod tests {
     /// LyCORIS delta, every factor reached by the loss, optimizer updates observed without a
     /// reinstall, and a frozen projection building no graph to the leaves (sc-24160).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn adapt_lokr_peft_surface_low_rank_and_full_train_and_freeze() {
         let device = Device::Cpu;
         // [out=16, in=16]: auto factorization (4, 4) per side, so `use_w2` flips at rank 2.
@@ -1906,6 +1911,9 @@ mod tests {
                 .unwrap();
             assert!(set.vars.iter().all(|v| grads.get(v.as_tensor()).is_some()));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::adapt_lokr_peft_surface_low_rank_and_full_train_and_freeze");
     }
 
     fn deterministic_lora_weight(out_f: usize, in_f: usize) -> Tensor {
@@ -1951,6 +1959,7 @@ mod tests {
     /// residual addition instead of delegating to `AdaptLinear`. Both its trainable and inference
     /// additive LoRA arms must skip a zero-strength residual without evaluating poisoned factors.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_linear_scale_zero_skips_trainable_and_additive_residuals_exactly() {
         let (out_f, in_f, rank) = (16usize, 32usize, 2usize);
         let x = deterministic_lora_input(2, in_f, DType::F32);
@@ -2034,12 +2043,16 @@ mod tests {
             &expected,
             "additive structured LoKr scale=0",
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::lora_linear_scale_zero_skips_trainable_and_additive_residuals_exactly");
     }
 
     /// sc-15444 bypass audit: the SDXL `LoraLinear` path must follow its quantized host's f32 output
     /// dtype rather than the activation dtype when adding either residual form. f64 is the CPU-executable
     /// proxy for production bf16 input because Candle CPU has no bf16 matmul.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_linear_quantized_hosts_cast_live_residuals_to_output_dtype_exactly() {
         let (out_f, in_f, rank) = (32usize, 32usize, 2usize);
         let x = deterministic_lora_input(2, in_f, DType::F64);
@@ -2079,6 +2092,9 @@ mod tests {
                 "quantized additive live adapter",
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::lora_linear_quantized_hosts_cast_live_residuals_to_output_dtype_exactly");
     }
 
     // ---- packed base (sc-9416) ---------------------------------------------------------------
@@ -2113,6 +2129,7 @@ mod tests {
     /// A `LoraLinear` wrapping a **packed** `QLinear` base (sc-9416) reports `is_packed()`, and with no
     /// adapter its forward is exactly the packed base's — the inference path a packed SDXL tier takes.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_base_forwards_as_qlinear() {
         let dev = Device::Cpu;
         let (out_f, in_f) = (64usize, 128usize);
@@ -2137,6 +2154,11 @@ mod tests {
             dmax, 0.0,
             "packed LoraLinear base must equal its QLinear forward"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::packed_base_forwards_as_qlinear"
+        );
     }
 
     /// A dense base reports `!is_packed()` (the training default) — the byte-identical pre-sc-9416 path.
@@ -2152,6 +2174,7 @@ mod tests {
     /// residual is an exact no-op. This is the SDXL packed-tier distill-LoRA path's core property — the
     /// additive residual is added *over* the packed weight, never folded into a re-quantized dense one.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_lora_on_packed_base_adds_exact_residual_and_scale0_noop() {
         let dev = Device::Cpu;
         let (out_f, in_f, rank) = (64usize, 128usize, 4usize);
@@ -2210,6 +2233,9 @@ mod tests {
             zero_dev, 0.0,
             "a scale-0 additive residual must be an exact no-op"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::additive_lora_on_packed_base_adds_exact_residual_and_scale0_noop");
     }
 
     /// sc-11103: the additive residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with
@@ -2217,6 +2243,7 @@ mod tests {
     /// f32). This is the acceptance parity the packed path relies on: pushing the residual equals what the
     /// dense tier folds, so a distill LoRA renders the same on q4/q8 (up to the base's own quant error).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_lora_matches_dense_fold() {
         let dev = Device::Cpu;
         let (out_f, in_f, rank) = (48usize, 64usize, 4usize);
@@ -2236,7 +2263,7 @@ mod tests {
         let delta = ((up.matmul(&down).unwrap()) * (ratio * user_scale)).unwrap();
         let folded = Linear::new((w + delta).unwrap(), None);
         let x = Tensor::randn(0f32, 1f32, (3usize, in_f), &dev).unwrap();
-        let dmax = (lin.forward(&x).unwrap() - folded.forward(&x).unwrap())
+        let dmax = (lin.forward(&x).unwrap() - __model_proof_output!(folded.forward(&x)).unwrap())
             .unwrap()
             .abs()
             .unwrap()
@@ -2245,11 +2272,17 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(dmax < 1e-4, "additive vs folded deviates by {dmax}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::additive_lora_matches_dense_fold"
+        );
     }
 
     /// An explicit two-stage adapter must change the actual forward residual when the LTX pipeline
     /// moves from stage one to stage two; merely accepting `[1.0, 0.4]` at load time is insufficient.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn additive_lora_selects_the_requested_distilled_pass_scale() {
         let dev = Device::Cpu;
         let base = Linear::new(Tensor::zeros((1, 1), DType::F32, &dev).unwrap(), None);
@@ -2278,11 +2311,15 @@ mod tests {
             lin.forward(&x).unwrap().to_vec2::<f32>().unwrap(),
             vec![vec![2.0]]
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::additive_lora_selects_the_requested_distilled_pass_scale");
     }
 
     /// A trainable residual is legal over an immutable packed base: the packed weights remain frozen
     /// and only the independent f32 factors participate in autograd (the LTX q4 trainer path).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn install_lora_on_packed_base_applies_residual() {
         let dev = Device::Cpu;
         let (out_f, in_f) = (64usize, 128usize);
@@ -2294,12 +2331,16 @@ mod tests {
         ll.install_lora(down, up, 1.0);
         let x = Tensor::ones((1, in_f), DType::F32, &dev).unwrap();
         assert!(ll.forward(&x).is_ok());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::install_lora_on_packed_base_applies_residual");
     }
 
     /// Backprop through a later packed projection must reach an adapter installed on an earlier
     /// packed projection. This is the minimal two-block analogue of the LTX DiT: the second frozen
     /// q4 base needs an input gradient even though none of its own packed weights are trainable.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn sequential_packed_bases_backprop_to_early_lora() {
         let dev = Device::Cpu;
         let width = 64usize;
@@ -2344,6 +2385,9 @@ mod tests {
                 "early {name} gradient through later packed base was {max}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::sequential_packed_bases_backprop_to_early_lora");
     }
 
     /// `lora_linear_detect` / `lora_linear_no_bias_detect` route to the packed base when the `.scales`
@@ -2386,6 +2430,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn no_adapter_is_base_linear() {
         let lin = fixed_linear(&[1.0, 0.0, 0.0, 1.0], 2, 2);
         let x = Tensor::from_vec(vec![3.0f32, 5.0], (1, 2), &Device::Cpu).unwrap();
@@ -2397,9 +2442,13 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(y, vec![3.0, 5.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::no_adapter_is_base_linear");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn zero_b_residual_is_identity() {
         let mut lin = fixed_linear(&[1.0, 0.0, 0.0, 1.0], 2, 2);
         let down = Tensor::from_vec(vec![0.5f32, -0.3, 0.1, 0.2], (2, 2), &Device::Cpu).unwrap();
@@ -2414,9 +2463,15 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(y, vec![3.0, 5.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::zero_b_residual_is_identity"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_residual_math() {
         let mut lin = fixed_linear(&[0.0, 0.0, 0.0, 0.0], 2, 2);
         let down = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), &Device::Cpu).unwrap();
@@ -2431,9 +2486,13 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(y, vec![6.0, 10.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::lora_residual_math");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_factors() {
         let w = Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap();
         let mut lin = LoraLinear::from_linear(Linear::new(w, None), 2, 2, "t".into());
@@ -2457,9 +2516,13 @@ mod tests {
             grads.get(up.as_tensor()).is_some(),
             "B factor must receive a gradient"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::backward_reaches_factors");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn optimizer_update_seen_without_reinstall() {
         let w = Tensor::zeros((1, 1), DType::F32, &Device::Cpu).unwrap();
         let mut lin = LoraLinear::from_linear(Linear::new(w, None), 1, 1, "t".into());
@@ -2487,6 +2550,9 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap()[0];
         assert_eq!(y1, 6.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::optimizer_update_seen_without_reinstall");
     }
 
     #[test]
@@ -2508,6 +2574,7 @@ mod tests {
     /// A zero second Kronecker leg ⇒ zero delta ⇒ the LoKr adapter is the identity over the base at
     /// init (the property training relies on), same as LoRA's `B = 0`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lokr_zero_init_is_identity() {
         let mut lin = fixed_linear(&[1.0, 0.0, 0.0, 1.0], 2, 2);
         let w1 = Tensor::from_vec(vec![0.3f32, -0.1, 0.2, 0.4], (2, 2), &Device::Cpu).unwrap();
@@ -2522,6 +2589,9 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(y, vec![3.0, 5.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::lokr_zero_init_is_identity");
     }
 
     /// sc-5179 — the native LoKr init must match PEFT `LoKrConfig(init_weights=True)`'s
@@ -2594,6 +2664,7 @@ mod tests {
     /// LoKr residual on a 1×1 base: out=in=1 factor as (1,1)⊗(1,1); ΔW = scale·(w1·w2). base 0,
     /// w1=2, w2=3, scale=1, x=5 ⇒ y = 5·(2·3) = 30.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lokr_residual_math() {
         let mut lin = fixed_linear(&[0.0], 1, 1);
         let w1 = Tensor::from_vec(vec![2.0f32], (1, 1), &Device::Cpu).unwrap();
@@ -2608,6 +2679,9 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap()[0];
         assert_eq!(y, 30.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::lokr_residual_math");
     }
 
     /// The train→infer round-trip guarantee for LoRA: the weight delta the inference loader merges
@@ -2615,6 +2689,7 @@ mod tests {
     /// `forward(x) - W·x` is the residual; reconstructing the delta and applying `x·ΔWᵀ` must match —
     /// proving the merged-weight forward `(W+ΔW)·x` reproduces the trained adapter.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn reconstruct_lora_delta_matches_forward_residual() {
         let w = Tensor::from_vec(
             vec![0.5f32, -0.2, 0.1, 0.3, -0.4, 0.6],
@@ -2650,11 +2725,15 @@ mod tests {
             diff < 1e-5,
             "reconstruct_lora_delta diverged from forward residual: {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::reconstruct_lora_delta_matches_forward_residual");
     }
 
     /// The train→infer round-trip guarantee for LoKr: [`reconstruct_lokr_delta`] must equal the
     /// residual the LoKr forward adds. 2×2 base factored `1×1 ⊗ 2×2`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn reconstruct_lokr_delta_matches_forward_residual() {
         let w = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], (2, 2), &Device::Cpu).unwrap();
         let w1 = Tensor::from_vec(vec![2.0f32], (1, 1), &Device::Cpu).unwrap(); // [out_a=1, in_a=1]
@@ -2691,6 +2770,9 @@ mod tests {
             diff < 1e-5,
             "reconstruct_lokr_delta diverged from forward residual: {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::lora::tests::reconstruct_lokr_delta_matches_forward_residual");
     }
 
     #[test]

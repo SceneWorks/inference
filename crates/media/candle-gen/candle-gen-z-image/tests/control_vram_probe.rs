@@ -209,4 +209,9 @@ fn measure_z_image_base_control_tier() {
         .save(&output_path)
         .expect("write probe image");
     eprintln!("ZIMAGE_CONTROL_OUT {}", output_path.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED control_vram_probe::measure_z_image_base_control_tier"
+    );
 }

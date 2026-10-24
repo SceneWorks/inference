@@ -58,10 +58,10 @@ impl ClipLayer {
     }
 
     fn forward(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let y = layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps)?;
+        let y = __model_proof_output!(layer_norm(x, &self.ln1_w, &self.ln1_b, self.eps))?;
         let y = self.attention(&y, mask)?;
         let x = x.broadcast_add(&y)?;
-        let y = layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps)?;
+        let y = __model_proof_output!(layer_norm(&x, &self.ln2_w, &self.ln2_b, self.eps))?;
         let y = self.fc1.forward(&y)?.gelu_erf()?;
         let y = self.fc2.forward(&y)?;
         Ok(x.broadcast_add(&y)?)
@@ -143,9 +143,7 @@ impl Sam3TextEncoder {
 
         // token + position embeddings
         let ids_flat = ids.reshape(b * n)?;
-        let tok = self
-            .token_embedding
-            .index_select(&ids_flat, 0)?
+        let tok = __model_proof_output!(self.token_embedding.index_select(&ids_flat, 0))?
             .reshape((b, n, dim))?;
         // The position-embedding table has only `max_position_embeddings` rows; the tokenizer pads to
         // that, but a direct `forward` with a longer sequence would index it out of bounds. Reject it
@@ -166,7 +164,8 @@ impl Sam3TextEncoder {
         for layer in &self.layers {
             x = layer.forward(&x, &mask)?;
         }
-        let last_hidden_state = layer_norm(&x, &self.final_ln_w, &self.final_ln_b, self.eps)?;
+        let last_hidden_state =
+            __model_proof_output!(layer_norm(&x, &self.final_ln_w, &self.final_ln_b, self.eps))?;
         // SAM3 projection: every token 1024 → 256.
         self.proj.forward(&last_hidden_state)
     }
@@ -211,8 +210,14 @@ pub struct Sam3Tokenizer {
 impl Sam3Tokenizer {
     /// Load from the `facebook/sam3` `tokenizer.json`.
     pub fn from_file(tokenizer_json: impl AsRef<Path>, cfg: &Sam3TextConfig) -> Result<Self> {
-        let inner = Tokenizer::from_file(tokenizer_json.as_ref())
-            .map_err(|e| CandleError::Msg(format!("sam3 tokenizer: {e}")))?;
+        let inner = candle_gen::gen_core::__model_input_reader!(
+            Tokenizer::from_file(tokenizer_json.as_ref()),
+            "candle-gen-sam3::text::Sam3Tokenizer::from_file/tokenizer",
+            Tokenizer,
+            tokenizer_json.as_ref(),
+            |actual_path| Tokenizer::from_file(actual_path)
+        )
+        .map_err(|e| CandleError::Msg(format!("sam3 tokenizer: {e}")))?;
         Ok(Self {
             inner,
             max_length: cfg.max_position_embeddings,

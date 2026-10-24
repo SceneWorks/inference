@@ -27,6 +27,198 @@ bounded capture of a Z-Image campaign case (`IOS_SMOKE_ZIMAGE_CASE`, default
 `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit`) through the same capture permit — there is
 no unadmitted Z-Image loader.
 
+## Model execution policy: ordinary CI versus explicit proofs
+
+The canonical rule lives in `AGENTS.md`: normal PR and `main` CI compiles/lints
+all applicable test targets but **never executes learned model/module/layer
+forward or backward, generation or training**, even on tiny synthetic weights.
+Raw matmul/conv/SDPA/norm/allocator kernels, metadata/schema/math/tokenizers,
+mocks and cheap constructor/load-only checks remain ordinary. Model source may
+land on `main`; ignored model tests retain their complete bodies/assertions and
+are registered in `scripts/ci/model-inference-proofs.json`.
+
+`model-inference-proofs.yml` is a **separate, workflow-dispatch-only** execution
+path. Nothing automatically runs a model because a PR merges, a pin changes, or
+an epic reaches its end. The workflow takes only `backend` and `request` inputs;
+request JSON contains a registered selection and an explicit existing-supervisor
+resource policy. There are no hidden RAM defaults, free Cargo arguments, or
+unfiltered parameter/measurement grids. Obtain execution authorization and use
+approved caps/reserves/deadlines before dispatch; no dispatch is recorded here.
+
+For source-conditional SD35 cases, optional request `configuration` selects only a
+name declared in that case's fixed `configurations` map; omission selects its explicit
+`default_configuration`. One canonical case identity is retained. Each recipe binds
+its source identity, exact set/UNSET values for the source-read SD35 controls,
+per-recipe Cargo features, backend/device set, scope, and required source work.
+Inherited recipe flags are not authority: declared null values explicitly remove
+them. Asset paths and optional tolerance controls remain separate source controls;
+recipes cannot set credentials, child selectors, device-authority flags, or arbitrary
+environment/argv. Unknown names and incompatible execution lanes fail before work.
+
+The three ordinary SD35 component-parity variants default to full F32/CPU encoder
+and DiT work. The `sd35_bigg_pad_token_ab` source default instead covers only CPU
+encoder-conditioning A/B; its CUDA recipe additionally requires both DiT forwards.
+Do not interpret that encoder-only result as full parity. CPU recipes do not inherit
+a CUDA build merely because another recipe supports CUDA. The plan, effective flag
+record, case declaration, and summary identify the exact selected scope and work;
+missing required work still rejects acceptance under the existing completion protocol.
+
+Source-bound `configuration_kind: "feature-only"` recipes use empty controls and
+`environment: {}`; they select only declared Cargo feature graphs, never request
+provided environment or argv. If the ordinary source-default graph compiles the
+case out or returns before learned work, `default_configuration: null`,
+`backend: null`, and `expected_devices: []` explicitly mean **no runnable NN default**.
+A named supported recipe is required. Exact, package, and `all` selectors refuse
+that unresolved case rather than silently omitting it or claiming partial coverage.
+The packed CPU reference-pair case retains its genuine CPU source-default recipe.
+
+A recipe may separately declare `execution_lane` for its required compile/resource
+host. For example, the Qwen2.1 miniature block-0 comparison retains its original
+CUDA-or-Metal file gate but actually evaluates learned models on CPU. Its declared
+CUDA/Metal build recipes therefore require the corresponding host while keeping
+`backend` and the observed/expected NN device set **CPU only**. A GPU-compatible
+build host or conservative physical lease is not a GPU-model PASS. Impossible
+lane/feature/device combinations and undeclared lane overrides reject; absent
+`execution_lane` preserves legacy routing.
+
+`configuration_kind: "source-controls"` adds only source-declared fixed control
+names and literal values/UNSET from each canonical recipe. Requests still select a
+registered name; they cannot supply environment, Cargo arguments, or lane overrides.
+The declared names must match every recipe's settings exactly. Source presence
+semantics are preserved: an empty string or `"0"` is still SET, not a boolean false.
+Source-default recipes explicitly UNSET inherited controls; optional stream, device,
+precision, rung, and fixture branches run only as declared, not as an automatic grid.
+
+Process/toolchain variables, credentials, child selectors, permits, physical CUDA
+visibility/order, lease descriptors, and external asset-path/required-asset bindings
+are not injectable recipe controls. A source logical-device selector such as
+`CANDLE_LLM_DEVICE` cannot replace controller-approved visibility or observed NN
+device evidence. Required external assets/gates remain separate; a fixed recipe
+neither invents mandatory environment names nor retargets source cache fallbacks.
+
+```sh
+# Inspect fixed source-defined bindings; this does not run models.
+python3.12 -I -c 'import json; print(json.dumps(json.load(open("scripts/ci/model-inference-proofs.json", encoding="utf-8")), indent=2))'
+# Prepare request JSON with selection + the existing supervisor's complete policy schema.
+# MODEL_PROOF_POLICY points to the independently approved resource policy, not a checkpoint.
+jq --arg selection 'mlx-gen-sdxl/quantum_tests::pricing::additivity::optimized_bf16_img2img_preserves_full_request_rgb' \
+  --slurpfile policy "$MODEL_PROOF_POLICY" '{selection:$selection,policy:$policy[0]}' \
+  > /tmp/model-proof-request.json
+# Exact completed source revision; this command is an example, not approval to execute.
+gh workflow run model-inference-proofs.yml --repo SceneWorks/inference \
+  --ref "$COMPLETED_SOURCE_REF" -f backend=mlx -f request="$(cat /tmp/model-proof-request.json)"
+```
+
+Before the new workflow exists on the default branch, dispatch through the **existing**
+`real-weights.yml` workflow identity at the exact feature ref. GitHub does not make a
+brand-new workflow dispatchable merely because its file is in a feature branch. The
+bridge uses the same canonical runner, retains the existing 25-input schema, and does
+not alter the frozen `ios-pricing-compile-only` profile or its JSON default:
+
+```sh
+jq --arg backend mlx --slurpfile request /tmp/model-proof-request.json \
+  '{backend:$backend,request:$request[0]}' > /tmp/model-proof-binding.json
+gh workflow run real-weights.yml --repo SceneWorks/inference \
+  --ref "$COMPLETED_SOURCE_REF" -f profile=model-inference-proofs \
+  -f ios_pricing_compile_binding="$(cat /tmp/model-proof-binding.json)"
+```
+
+Host platform/runner and actual test compute-device SET are recorded separately.
+A CPU child on a Mac is **not** Metal model evidence. Each executed work scope
+reports its actual selected device before context restoration; default/global
+context is not unioned into used devices. Mixed-device comparisons must report
+all actual scopes without creating a GPU stream or rerendering for telemetry.
+The proof runner requires exact nonzero discovery, full-body completion, all
+source-declared root/CPU-child/rank successful-summary cardinalities, preserved
+expected-fault assertions, and actual in-scope device observations.
+Missing assets/dependencies, skipped/ignored bodies and partial workers fail
+proof acceptance; compile/source/discovery success is never a runtime PASS.
+
+Evidence contains exact source/fixture-model identity, backend/configuration,
+pass/body counts, existing computed outputs/metrics, bounded redacted logs and
+duration, plus a workflow summary. Only regular, bounded, explicitly known files
+from the owned workflow output tree can be uploaded. Checkpoints, HF caches,
+credentials and user-reference files are never collected; no model is rerun to
+create evidence. Fast tests that end between GPU sampling ticks record an
+unknown GPU-memory peak, not a zero measurement or a capacity/admission proof.
+
+Actual external inputs require successful, scope-bound `MODEL_INFERENCE_INPUT_USED`
+receipts covering every source-declared required slot, API reader/role, and complete
+selected collection. A source descriptor or empty environment summary is not actual
+external input identity. Synthetic/source-defined fixtures retain their source binding;
+unknown external slot coverage refuses before NN execution, rather than inventing paths
+or mandatory environment. Optional external overrides bind the **actually consumed**
+source branch; a committed/generated/in-memory default creates no external obligation.
+A relative, checkout, or cache default path is not thereby source-defined.
+
+A source-declared `requirement_bundles` list expresses alternatives of complete AND
+requirements, in addition to common `requirements`. Each bundle has a source identity;
+its optional `additional_observed_readers` lists exact reader/role pairs for original
+optional or attempted reads, never a wildcard or a substitute for required work. Every
+observation retains its scope and provenance grade. Positive mode-specific observations
+must be explained by the same complete bundle: an ordinary-directory subset cannot hide
+Hadamard inputs from an incomplete Prism bundle. A single GGUF collection may represent
+its original embedded model/config/tokenizer bundle without inventing three receipts.
+`input_requirement_bundles` reports observation compatibility, not a selected model type,
+source predicate, or successful template parse. No request can select or override these
+source-fixed bundles, reader roles, or branch predicates.
+
+Conditional defaults use an explicit positive source-defined branch contract plus the
+separately verified completed immutable body. `source_origin_basis` distinguishes that
+derivation (`source-defined-branch-contract`) from an observed `actual-reader-tag`;
+no default read event is fabricated. External cases may use such optional-slot defaults,
+but every complete bundle must retain unconditional external input requirements; this
+never makes the whole external case a source-defined/no-input default.
+Logical source obligations that share one observable reader/role collection are retained
+losslessly in source facts rather than converted into guessed distinct-file, shard, or
+invocation counts. Such lower bounds do not independently attest every named component.
+
+Input provenance remains graded: `validated-content` reuses an existing retained
+consumption receipt; `same-read-buffer` digests only bytes the original reader already
+naturally consumed; `successful-reader-binding` records the actual resolved input set
+with `content_integrity: not_attested`. The last grade proves only labelled source-bound
+case execution, never checkpoint-byte integrity, a verified named revision, or terminal
+model evidence. Existing stronger checksum/pin requirements remain stronger. No eager
+mapped-page scans, extra Tensor evaluation, duplicate payload reads, or path/mtime hashes
+are introduced. Physical completion, artifact validation, and workflow summaries preserve
+`acceptance_scope`, `input_grade`, and claim limits; `accepted: true` alone is not a stronger
+input or checkpoint claim.
+
+The source sharding case that actually uses CUDA ordinals 0 and 1 additionally requires
+an explicit ordered request `cuda_device_uuids: [role0UUID, role1UUID]` and one full
+`additional_cuda_policies` entry for role 1. The existing primary policy binds role 0.
+Both UUIDs must be distinct and explicitly approved, with identical host/tree/log/deadline
+settings and independently declared GPU caps/reserves. CVD follows **source role order**;
+UUID sorting is lock order only. Both leases, admission baselines, fresh ordinal-to-UUID
+recheck, bounded per-UUID live/owned-descendant monitoring, and every post-idle check must
+complete before sealing. Failure on either device rejects the whole case; missing peak
+samples remain unknown, never fabricated zeros. Other handles or streams are not extra
+GPUs, and no idle-device discovery, physical-index guess, or source retarget is authorized.
+
+Dispatches queue without cancelling running inference or replacing older pending
+proofs. Per-run execution remains serialized on compatible physical resources.
+Provisioned Mac launches additionally hold the shared cooperative POSIX lease
+`/Users/Shared/SceneWorks/gpu-locks/apple-metal.lock` through the owned child tree;
+CUDA uses the existing `%PUBLIC%/SceneWorks/gpu-locks/<physical-UUID>.lock` byte-lock
+protocol for the explicitly approved UUID, never a different idle GPU. The Iris
+sharing/refusal case preserves its original child's `CUDA_VISIBLE_DEVICES=0` reset.
+That value names a CUDA ordinal under the effective `CUDA_DEVICE_ORDER`, **not an
+NVML physical index**. While holding the approved UUID lease, the controller runs
+the verified context-free driver metadata primitive in a fresh process with that
+exact child-effective visibility/order and requires ordinal 0's UUID to match the
+leased UUID. Missing, ambiguous, mismatched, or unverified mappings reject before
+model launch; neither source controls nor the approved device are retargeted. This
+metadata is resource-binding evidence, never learned-model device/runtime proof.
+Runner labels and unique Actions concurrency keys are not device mutexes. Cooperating launchers in
+both repositories/direct-local wrappers use the same namespace. Unwrapped user apps
+or other local processes still require the existing physical census/operator
+coordination; the lease does not claim universal exclusion. No GPU kill behavior is
+added by this coordination.
+
+Normal PR CI retains its separate superseded-run cancellation rule because it
+contains no model execution. This policy does not waive epic/device acceptance
+requirements or renew/retire runtime measurements when a pin changes.
+
 ## Explicit CPU fixture captures (not phone anchors)
 
 The `real-weights.yml` **`ios-selected-captures` profile** runs only registered

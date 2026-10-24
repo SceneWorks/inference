@@ -42,4 +42,8 @@ fn loads_converted_checkpoint_and_segments() {
         "converted-checkpoint segment OK: {fg} foreground px of {}",
         vals.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED weights_load::loads_converted_checkpoint_and_segments"
+    );
 }

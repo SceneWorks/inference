@@ -368,6 +368,8 @@ const GOLDEN_FAR_LEVELS: u8 = 32;
 /// pre-epic revision had no cache — so a golden with a cached render is a usage error and panics
 /// at once.
 fn compare_with_golden(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: candle_gen::gen_core::model_input_proof::SourceOrigin,
     golden: Option<&Path>,
     out_dir: &Path,
     file_name: &str,
@@ -382,7 +384,15 @@ fn compare_with_golden(
          run with QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill"
     );
     let path = golden.join(file_name);
-    let (line, failure) = match std::fs::read(&path) {
+    let (line, failure) = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::compare_with_golden::std::fs::read@18439",
+TensorInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = golden_origin
+) {
         Err(e) => {
             let failure = format!(
                 "{file_name}: {RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",
@@ -549,6 +559,8 @@ fn validation_render_default_preset() {
     // Prefill by default: this is the pre-epic render the published floors were derived for.
     let cache = prefix_kv_cache_override().unwrap_or(PrefixKvCacheMode::Prefill);
     validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
         snapshot(),
         &out_dir(),
         (width, height),
@@ -556,11 +568,16 @@ fn validation_render_default_preset() {
         cache,
         render_golden().as_deref(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_default_preset");
 }
 
 /// [`validation_render_default_preset`]'s body at an explicit snapshot, output directory, size,
 /// step count and cache mode — free of the environment, so the dry run below drives it.
 fn validation_render_at(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: candle_gen::gen_core::model_input_proof::SourceOrigin,
     root: PathBuf,
     out_dir: &Path,
     (width, height): (u32, u32),
@@ -618,7 +635,15 @@ fn validation_render_at(
         height,
         image::ColorType::Rgb8,
     );
-    let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image.pixels, cache);
+    let golden_failure = compare_with_golden(
+        #[cfg(feature = "model-inference-proof")]
+        golden_origin,
+        golden,
+        out_dir,
+        &file_name,
+        &image.pixels,
+        cache,
+    );
     assert_not_band_corrupted("default_preset", &image.pixels, width, height);
     assert_golden_clean(golden_failure.as_slice());
     eprintln!(
@@ -718,6 +743,11 @@ fn turbo_validation_render_default_preset() {
         .ok()
         .map(|s| s.parse().unwrap());
     turbo_validation_renders(&[steps]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_render_default_preset"
+    );
 }
 
 /// The Turbo **step sweep** (sc-25902): the default 1:1 2048×2048 preset, the prompt and seed of
@@ -746,6 +776,11 @@ fn turbo_validation_render_step_sweep() {
         Err(_) => vec![Some(4), Some(6), Some(12), Some(16)],
     };
     turbo_validation_renders(&steps);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_render_step_sweep"
+    );
 }
 
 /// One default-preset Turbo render per entry of `steps`, all from one loaded generator; a `None`
@@ -1030,7 +1065,15 @@ fn references(
                 .split_once('x')
                 .unwrap_or_else(|| panic!("{}: a WxH.rgb name", path.display()));
             let (w, h): (u32, u32) = (w.parse().unwrap(), h.parse().unwrap());
-            let pixels = std::fs::read(&path).unwrap();
+            let pixels = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::references::std::fs::read@46156",
+Reference,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap();
             assert_eq!(
                 pixels.len(),
                 (w as usize) * (h as usize) * 3,
@@ -1260,6 +1303,9 @@ fn validation_render_reference_edit() {
         false,
         golden.as_deref(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_reference_edit");
 }
 
 /// The Turbo twin of [`validation_render_reference_edit`] (sc-25902), through the
@@ -1348,6 +1394,11 @@ fn turbo_validation_render_reference_edit() {
         ],
         true,
         None,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_render_reference_edit"
     );
 }
 
@@ -1733,6 +1784,9 @@ fn turbo_validation_prefix_kv_cache_velocity() {
         );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_prefix_kv_cache_velocity");
 }
 
 /// How many times the one-ulp control's gap a cached evaluation's velocity may sit from the
@@ -1907,6 +1961,7 @@ fn block0_target_gaps(
 /// *Mutations that red this:* [`block0_target_gaps`] reading the first `target` rows; the seam
 /// tracing past block 0 or stopping before it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture() {
     use candle_gen_qwen_image_2_1::{joint_images, load_transformer, JointLayout, Segment};
 
@@ -1979,6 +2034,9 @@ fn the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture() {
         let worst = gaps.iter().map(|(_, rel, _, _)| *rel).fold(0.0, f64::max);
         assert!(worst > CACHED_BLOCK0_REL_BAR, "worst {worst:.3e}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture");
 }
 
 /// `worst = max(worst, x)`, except that a NaN `x` replaces it (`f64::max` would drop it).
@@ -2160,16 +2218,15 @@ fn gemm_row_probe(
             .to_dtype(DType::BF16)
             .unwrap();
         let linear = candle_nn::Linear::new(w, None);
-        let full = linear.forward(&x).unwrap();
+        let full = __model_proof_output!(linear.forward(&x)).unwrap();
         let full_rows = full.narrow(1, total - target, target).unwrap();
-        let alone = linear
-            .forward(
-                &x.narrow(1, total - target, target)
-                    .unwrap()
-                    .contiguous()
-                    .unwrap(),
-            )
-            .unwrap();
+        let alone = __model_proof_output!(linear.forward(
+            &x.narrow(1, total - target, target)
+                .unwrap()
+                .contiguous()
+                .unwrap(),
+        ))
+        .unwrap();
         let (gap, max_abs, differing) = velocity_gap(&alone, &full_rows);
         eprintln!(
             "[gemm] {label}: {k}->{n} over M={total} vs M={target}: {differing} of {} target \
@@ -2235,6 +2292,8 @@ fn reference_edit_renders(
         }
     }
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
         target,
         &out_dir(),
         references,
@@ -2379,6 +2438,8 @@ fn the_same_picture_difference_tolerates_a_shift_and_rejects_another_picture() {
 /// first `count` of them in order.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_in(
+    #[cfg(feature = "model-inference-proof")]
+    golden_origin: candle_gen::gen_core::model_input_proof::SourceOrigin,
     target: &Target,
     out_dir: &std::path::Path,
     references: ReferenceSource,
@@ -2476,7 +2537,15 @@ fn reference_edit_renders_in(
             height,
             image::ColorType::Rgb8,
         );
-        let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image.pixels, cache);
+        let golden_failure = compare_with_golden(
+            #[cfg(feature = "model-inference-proof")]
+            golden_origin,
+            golden,
+            out_dir,
+            &file_name,
+            &image.pixels,
+            cache,
+        );
         let mut picture_failures: Vec<String> = band_failure(&label, &image.pixels, width, height)
             .into_iter()
             .collect();
@@ -2637,6 +2706,7 @@ const MAX_REFERENCES: usize = candle_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES;
 /// returning early (the inverted golden passes); the installed-tier body loading without the
 /// quantize selector (refused).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -2656,6 +2726,8 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     // `the_observed_cache_delta_is_bounded_by_the_priced_cache`.
     // Rendered references, so the in-run reference renders are driven too (64² on the fixture).
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &target,
         out.path(),
         ReferenceSource::Rendered { edge: 64 },
@@ -2683,6 +2755,8 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     }
     let mixed = Target::dense(id, turbo.path().to_path_buf(), "dry_run_mixed");
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &mixed,
         out.path(),
         ReferenceSource::Synthetic,
@@ -2750,8 +2824,19 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
         ]
     };
     let base_edit = Target::dense("qwen_image_2_1", base.clone(), "qwen_image_2_1_candle");
-    validation_render_at(base.clone(), golden.path(), (64, 64), 3, prefill, None);
+    validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+        base.clone(),
+        golden.path(),
+        (64, 64),
+        3,
+        prefill,
+        None,
+    );
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &base_edit,
         golden.path(),
         ReferenceSource::Synthetic,
@@ -2762,6 +2847,8 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
         false,
     );
     validation_render_at(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         base.clone(),
         checked.path(),
         (64, 64),
@@ -2770,6 +2857,8 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
         Some(golden.path()),
     );
     reference_edit_renders_in(
+        #[cfg(feature = "model-inference-proof")]
+        candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
         &base_edit,
         checked.path(),
         ReferenceSource::Synthetic,
@@ -2789,7 +2878,16 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     std::fs::write(inverted.path().join(name), bytes).unwrap();
     let render_against = |dir: &Path, mode| {
         catch_unwind(AssertUnwindSafe(|| {
-            validation_render_at(base.clone(), checked.path(), (64, 64), 3, mode, Some(dir));
+            validation_render_at(
+                #[cfg(feature = "model-inference-proof")]
+                candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
+                base.clone(),
+                checked.path(),
+                (64, 64),
+                3,
+                mode,
+                Some(dir),
+            );
         }))
     };
     assert!(
@@ -2822,6 +2920,8 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
             reference_edit_renders_in(
+                #[cfg(feature = "model-inference-proof")]
+                candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
                 &base_edit,
                 rechecked.path(),
                 ReferenceSource::Synthetic,
@@ -2853,6 +2953,9 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
         rechecked.path().join(ten_refs).is_file(),
         "and its render written"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture");
 }
 
 /// The edit body asserts **once**, after its last case: with its real-weight checks armed
@@ -2865,6 +2968,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
 /// reference's, an edit output's [`mosaic_failure`], a twin's [`observed_cache_delta_failures`]
 /// or same-picture bar) asserting in place — the ten-reference files are then never written.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -2882,6 +2986,8 @@ fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
     MOSAIC_BAR.with(|bar| bar.set(0.0));
     let err = catch_unwind(AssertUnwindSafe(|| {
         reference_edit_renders_in(
+            #[cfg(feature = "model-inference-proof")]
+            candle_gen::gen_core::model_input_proof::SourceOrigin::SourceDefinedDefault,
             &target,
             out.path(),
             ReferenceSource::Rendered { edge: 64 },
@@ -2909,6 +3015,9 @@ fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
             "the one failure carries the {count}-reference case's check:\n{message}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::the_edit_body_collects_every_check_and_asserts_after_its_last_case");
 }
 
 fn turbo_tier_snapshot() -> PathBuf {
@@ -2971,6 +3080,9 @@ fn turbo_validation_render_installed_tiers() {
             edge: REFERENCE_EDGE,
         },
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_render_installed_tiers");
 }
 
 /// [`turbo_validation_render_installed_tiers`]'s body over an explicit tier directory, size,
@@ -3046,6 +3158,8 @@ fn turbo_installed_tier_renders_in(
         assert_not_degenerate(&target.stem, &image.pixels);
         drop(generator);
         reference_edit_renders_in(
+            #[cfg(feature = "model-inference-proof")]
+            candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected,
             &target,
             out_dir,
             references,
@@ -3078,7 +3192,15 @@ fn transparent_reference(
     stem: &str,
 ) -> candle_gen::gen_core::RgbaImage {
     if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
-        let rgba = image::open(&path)
+        let rgba = candle_gen::gen_core::__model_input_reader!(
+image::open(&path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs::transparent_reference::image::open@137967",
+Reference,
+&path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
             .to_rgba8();
         return candle_gen::gen_core::RgbaImage {
@@ -3197,6 +3319,9 @@ fn validation_render_transparency() {
         candle_gen_qwen_image_2_1::DEFAULT_STEPS,
         Some(8),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_transparency");
 }
 
 /// The Turbo twin of [`validation_render_transparency`] (sc-25902), through the
@@ -3227,6 +3352,11 @@ fn turbo_validation_render_transparency() {
         "turbo_",
         saved,
         None,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_validation_render_transparency"
     );
 }
 
@@ -3453,4 +3583,9 @@ fn validation_render_installed_tiers() {
             render_started.elapsed().as_secs_f32()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::validation_render_installed_tiers"
+    );
 }

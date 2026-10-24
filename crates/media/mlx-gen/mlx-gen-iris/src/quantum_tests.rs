@@ -74,7 +74,14 @@ fn in_cpu_child(test: &str, body: fn()) {
     let done = tempfile::tempdir().unwrap();
     let marker = done.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--include-ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
         .env(DONE, &marker)
         .status()
@@ -439,18 +446,26 @@ fn allocation_region_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn allocation_regions_refuse_before_native_constructor_buffers() {
     in_cpu_child(
         "quantum_tests::allocation_regions_refuse_before_native_constructor_buffers",
-        allocation_region_body,
+        || {
+            allocation_region_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::allocation_regions_refuse_before_native_constructor_buffers");
+        },
     );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn backbone_blocks_are_guarded_byte_identical_and_refuse_before_construction() {
     in_cpu_child(
         "quantum_tests::backbone_blocks_are_guarded_byte_identical_and_refuse_before_construction",
-        dit_forward_guarded_body,
+        || {
+            dit_forward_guarded_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::backbone_blocks_are_guarded_byte_identical_and_refuse_before_construction");
+        },
     );
 }
 
@@ -623,10 +638,10 @@ fn text_encoder_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_encoder_layers_are_guarded_byte_identical_and_refuse_before_construction() {
     in_cpu_child(
-        "quantum_tests::text_encoder_layers_are_guarded_byte_identical_and_refuse_before_construction",
-        text_encoder_body,
+        "quantum_tests::text_encoder_layers_are_guarded_byte_identical_and_refuse_before_construction", || { text_encoder_body(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_encoder_layers_are_guarded_byte_identical_and_refuse_before_construction"); },
     );
 }
 
@@ -699,10 +714,14 @@ fn depth_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn depth_forward_is_guarded_byte_identical_and_refuses_before_construction() {
     in_cpu_child(
         "quantum_tests::depth_forward_is_guarded_byte_identical_and_refuses_before_construction",
-        depth_body,
+        || {
+            depth_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::depth_forward_is_guarded_byte_identical_and_refuses_before_construction");
+        },
     );
 }
 
@@ -796,10 +815,10 @@ fn restoration_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn restoration_tiles_are_guarded_byte_identical_and_refuse_before_construction() {
     in_cpu_child(
-        "quantum_tests::restoration_tiles_are_guarded_byte_identical_and_refuse_before_construction",
-        restoration_body,
+        "quantum_tests::restoration_tiles_are_guarded_byte_identical_and_refuse_before_construction", || { restoration_body(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::restoration_tiles_are_guarded_byte_identical_and_refuse_before_construction"); },
     );
 }
 
@@ -909,10 +928,14 @@ fn generation_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn generation_is_guarded_byte_identical_and_refuses_before_construction() {
     in_cpu_child(
         "quantum_tests::generation_is_guarded_byte_identical_and_refuses_before_construction",
-        generation_body,
+        || {
+            generation_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::generation_is_guarded_byte_identical_and_refuses_before_construction");
+        },
     );
 }
 
@@ -1042,10 +1065,14 @@ fn text_only_shards_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_only_loads_neither_read_nor_price_the_vision_tower() {
     in_cpu_child(
         "quantum_tests::text_only_loads_neither_read_nor_price_the_vision_tower",
-        text_only_shards_body,
+        || {
+            text_only_shards_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::text_only_loads_neither_read_nor_price_the_vision_tower");
+        },
     );
 }
 

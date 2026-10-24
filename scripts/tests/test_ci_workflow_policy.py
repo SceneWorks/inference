@@ -290,22 +290,25 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
         for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
             for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
                 primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
+                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
                             ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
                             ("5", "e" * 40, "diagnostic"), ("6", "f" * 40, "q4-numeric")) if primary else (("1", "a" * 40, "probe"),)
                 for run_id, sha, phase in variants:
+                    if proof_dispatch:
+                        expected = f"inference-model-proof-{run_id}-1"
                     values = {"github.event_name": event, "inputs.profile": profile,
                               "inputs.qwen_image_2_1_lora_runner": runner,
                               "inputs.qwen_image_2_1_lora_phase": phase,
-                              "github.run_id": run_id, "github.sha": sha}
+                              "github.run_id": run_id, "github.run_attempt": "1", "github.sha": sha}
                     rendered = expression
                     for name in sorted(values, key=len, reverse=True):
                         rendered = rendered.replace(name, repr(values[name]))
                     rendered = rendered.replace("&&", " and ").replace("||", " or ")
                     try:
-                        actual = eval(f"({rendered})", {"__builtins__": {}}, {})
+                        actual = eval(f"({rendered})", {"__builtins__": {}}, {"format": lambda template, *args: template.format(*args)})
                     except (NameError, SyntaxError, AttributeError) as error:
                         return [*errors, f"unsupported group expression: {error}"]
                     if actual != expected:
@@ -1048,6 +1051,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         command = " ".join(run.split())
         self.assertIn("--features metal --test integration --", command)
         # The collector's separator is not the test-binary argument separator.
+        command = command.removeprefix("python3 -I scripts/ci/check_compiled_model_ignores.py -- ")
         command = command.removeprefix("python3 scripts/ci/run_ci_collection.py -- ")
         filters = command.split(" -- ", 1)[1].split()
         self.assertEqual(sorted(filters), sorted(f"{name}::" for name in self.CANDLE_METAL_PINS))
@@ -5086,8 +5090,12 @@ class WorkflowFileSizeTests(unittest.TestCase):
             if path.is_file()
         )
         self.assertTrue(references)
-        self.assertEqual(len(references), len(set(references)), "a step body is shared")
-        self.assertEqual(sorted(references), on_disk, "orphaned or missing step body")
+        # The reviewed CPython bootstrap is deliberately reused by the pre-main proof bridge.
+        # Every extracted workload body remains unique; do not fork this trusted installer.
+        reusable = {"scripts/ci/real-weights/candle-llm/install-reviewed-cpython-3-12.cmd"}
+        self.assertEqual(len([ref for ref in references if ref not in reusable]),
+                         len({ref for ref in references if ref not in reusable}), "a workload body is shared")
+        self.assertEqual(sorted(set(references)), on_disk, "orphaned or missing step body")
         self.assertEqual(
             set(yaml.safe_load(real_weights_inline_text())["jobs"]),
             set(yaml.safe_load(workflow_text)["jobs"]),

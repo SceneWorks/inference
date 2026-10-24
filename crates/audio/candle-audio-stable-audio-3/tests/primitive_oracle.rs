@@ -1,5 +1,15 @@
 //! Actual-checkpoint parity against the independently locked sc-14536 primitive oracle.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
@@ -83,6 +93,7 @@ fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn frozen_upstream_missing_branches_match() {
     let expected = oracle();
 
@@ -251,6 +262,9 @@ fn frozen_upstream_missing_branches_match() {
     assert!(values[0][2].is_infinite() && values[0][2].is_sign_negative());
     assert_eq!(values[1][0..3], [0.0, 0.0, 0.0]);
     assert!(values[3][1].is_infinite() && values[3][1].is_sign_negative());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED frozen_upstream_missing_branches_match");
 }
 
 #[test]
@@ -563,4 +577,7 @@ fn actual_checkpoints_match_locked_primitive_oracle() {
             1e-6,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED actual_checkpoints_match_locked_primitive_oracle");
 }

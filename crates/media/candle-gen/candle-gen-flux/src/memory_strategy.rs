@@ -110,7 +110,13 @@ pub(crate) fn provider_contract(
 /// "not packed" here, because this seam prices bytes and the loader itself is the one that must
 /// fail loudly on a corrupt snapshot.
 fn uses_diffusers_layout(root: &std::path::Path, variant: crate::Variant) -> bool {
-    let packed = std::fs::read_to_string(root.join("transformer").join("config.json"))
+    let packed = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(root.join("transformer").join("config.json")),
+"crates/media/candle-gen/candle-gen-flux/src/memory_strategy.rs::uses_diffusers_layout::std::fs::read_to_string@4995",
+ArtifactInput,
+root.join("transformer").join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| candle_gen::quant::PackedConfig::from_config(&value))
@@ -513,7 +519,13 @@ pub(crate) fn snapshot_quant_tier(
         }
     };
     let config = root.join("transformer/config.json");
-    let packed = std::fs::read_to_string(&config)
+    let packed = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config),
+"crates/media/candle-gen/candle-gen-flux/src/memory_strategy.rs::snapshot_quant_tier::std::fs::read_to_string@25464",
+ArtifactInput,
+&config,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| candle_gen::quant::PackedConfig::from_config(&value));

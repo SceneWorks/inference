@@ -875,6 +875,7 @@ mod tests {
         }
         let _restore = Restore(mlx_rs::Device::try_default().unwrap());
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         let x = Array::from_slice(
             &(0..9 * 11 * 4).map(|i| (i % 7) as f32).collect::<Vec<_>>(),
             &[1, 9, 11, 4],
@@ -1194,6 +1195,7 @@ mod tests {
         }
         let _restore = Restore(mlx_rs::Device::try_default().expect("default device"));
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         // Magnitudes past 256 square beyond f16's 65 504 ceiling: an in-place f16 variance would be
         // inf. Every row-chunk size — one row, a ragged split, the whole activation — must land on
         // the f32 reference statistics, and `apply` must hand the crop back at f16.
@@ -1674,6 +1676,7 @@ mod tests {
             return;
         }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
         let (denorm, plan, axes) = ragged_video_plan();
         let tiles = plan.t.len() * plan.h.len() * plan.w.len();
@@ -2247,6 +2250,7 @@ mod tests {
         use mlx_rs::Dtype::{Float16 as H, Float32 as F};
         let silu = |t: &Array| -> Result<Array> { Ok(multiply(t, mlx_rs::ops::sigmoid(t)?)?) };
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
         let rnd = |shape: &[i32], seed: u64, dtype: mlx_rs::Dtype| {
             let a = mlx_rs::random::normal::<f32>(

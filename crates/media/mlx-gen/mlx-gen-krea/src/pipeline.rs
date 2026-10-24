@@ -2369,6 +2369,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn all_four_velocity_seams_execute_cfg_and_non_cfg_in_resident_and_windowed_modes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2692,6 +2693,8 @@ mod tests {
                 bounded_attention(),
             )
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED pipeline::tests::all_four_velocity_seams_execute_cfg_and_non_cfg_in_resident_and_windowed_modes");
     }
 
     #[test]

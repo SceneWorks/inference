@@ -430,10 +430,14 @@ fn identity_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_dense_artifact_requested_at_a_packed_tier_publishes_no_identity() {
     in_cpu_child(
         "packed_tests::a_dense_artifact_requested_at_a_packed_tier_publishes_no_identity",
-        identity_body,
+        || {
+            identity_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tests::a_dense_artifact_requested_at_a_packed_tier_publishes_no_identity");
+        },
     );
 }
 

@@ -1224,6 +1224,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn hosted_q4_q8_scail2_block_keys_load_as_quantized_without_dense_staging() {
         for (bits, quant) in [(4, Quant::Q4), (8, Quant::Q8)] {
             let tmp = tempfile::tempdir().unwrap();
@@ -1279,6 +1280,9 @@ mod tests {
                 &[1, cfg.dim]
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::hosted_q4_q8_scail2_block_keys_load_as_quantized_without_dense_staging");
     }
 
     #[test]
@@ -1863,6 +1867,9 @@ mod tests {
             report.peak_gb,
             source_dtypes.join(";"),
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak");
     }
 
     #[test]

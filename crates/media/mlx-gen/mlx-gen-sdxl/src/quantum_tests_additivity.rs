@@ -154,7 +154,12 @@ fn pricing(s: &Snapshot, regime: &Regime) -> IosPricing {
 
 /// One request of `regime.route` on `files`: the production lifecycle (see the module docs).
 fn run(files: &Files, regime: &Regime, memory: &GenerationMemory) -> Result<()> {
-    run_image(files, regime, memory).map(|_| ())
+    (
+        crate::test_device::record_model_inference_device(),
+        run_image(files, regime, memory),
+    )
+        .1
+        .map(|_| ())
 }
 
 #[derive(Clone, Default)]
@@ -234,7 +239,11 @@ fn run_image(
     regime: &Regime,
     memory: &GenerationMemory,
 ) -> Result<mlx_gen::media::Image> {
-    run_image_traced(files, regime, memory, None)
+    (
+        crate::test_device::record_model_inference_device(),
+        run_image_traced(files, regime, memory, None),
+    )
+        .1
 }
 
 fn run_image_traced(
@@ -294,7 +303,11 @@ fn run_image_traced(
             } else {
                 ids.index((0..1, ..))
             };
-            crate::pipeline::encode_conditioning(&text.0, &text.1, &ids)
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::encode_conditioning(&text.0, &text.1, &ids),
+            )
+                .1
         },
         |enc| match enc {
             Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
@@ -302,18 +315,22 @@ fn run_image_traced(
         },
         |heavy: &crate::model::SdxlHeavyOwned, (cond, pooled), _| {
             crate::model::collect_serial_latents(regime.count, 16774, |seed, finals| {
-                let latents = denoise(
-                    heavy,
-                    route,
-                    &regime.sampling,
-                    staged,
-                    plan,
-                    tiling.as_ref(),
-                    &cond,
-                    &pooled,
-                    trace,
-                    seed,
-                )?;
+                let latents = (
+                    crate::test_device::record_model_inference_device(),
+                    denoise(
+                        heavy,
+                        route,
+                        &regime.sampling,
+                        staged,
+                        plan,
+                        tiling.as_ref(),
+                        &cond,
+                        &pooled,
+                        trace,
+                        seed,
+                    ),
+                )
+                    .1?;
                 mlx_gen::sampler::diagnostic_sampling_tensor(
                     "sdxl",
                     "serial-final-latent",
@@ -329,13 +346,19 @@ fn run_image_traced(
         |view, latents, _| {
             let mut images = Vec::with_capacity(latents.len());
             for latent in &latents {
-                images.push(crate::pipeline::decode_image_tiled(
-                    view.vae_for_test(),
-                    latent,
-                    None,
-                    tiling.as_ref(),
-                    None,
-                )?);
+                images.push(
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        crate::pipeline::decode_image_tiled(
+                            view.vae_for_test(),
+                            latent,
+                            None,
+                            tiling.as_ref(),
+                            None,
+                        ),
+                    )
+                        .1?,
+                );
             }
             Ok(images.remove(0))
         },
@@ -406,14 +429,20 @@ fn denoise(
     );
     if sampling.route().is_curated() {
         let init = if true_init {
-            Some(crate::pipeline::encode_init_latents_tiled(
-                vae,
-                &image(PX, PX, 3),
-                PX as u32,
-                PX as u32,
-                tiling,
-                None,
-            )?)
+            Some(
+                (
+                    crate::test_device::record_model_inference_device(),
+                    crate::pipeline::encode_init_latents_tiled(
+                        vae,
+                        &image(PX, PX, 3),
+                        PX as u32,
+                        PX as u32,
+                        tiling,
+                        None,
+                    ),
+                )
+                    .1?,
+            )
         } else {
             None
         };
@@ -432,44 +461,52 @@ fn denoise(
         let control = control.as_slice();
         let preview = mlx_gen::PreviewSink::default();
         return if matches!(sampling.route(), crate::sampling::SamplingRoute::CfgPp(_)) {
-            crate::pipeline::denoise_cfgpp_with_preview(
-                unet,
-                Some(sampling.sampler_name()),
-                &ms,
-                &sigmas,
-                latents,
-                cond,
-                pooled,
-                &ids,
-                cfg,
-                &cancel,
-                &mut |_| {},
-                &preview,
-                control,
-                ip,
-                None,
-                plan,
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_cfgpp_with_preview(
+                    unet,
+                    Some(sampling.sampler_name()),
+                    &ms,
+                    &sigmas,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    &cancel,
+                    &mut |_| {},
+                    &preview,
+                    control,
+                    ip,
+                    None,
+                    plan,
+                ),
             )
+                .1
         } else {
-            crate::pipeline::denoise_curated_with_preview(
-                unet,
-                Some(sampling.sampler_name()),
-                &ms,
-                &sigmas,
-                latents,
-                cond,
-                pooled,
-                &ids,
-                cfg,
-                seed,
-                &cancel,
-                &mut |_| {},
-                &preview,
-                control,
-                ip,
-                None,
-                plan,
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_curated_with_preview(
+                    unet,
+                    Some(sampling.sampler_name()),
+                    &ms,
+                    &sigmas,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    seed,
+                    &cancel,
+                    &mut |_| {},
+                    &preview,
+                    control,
+                    ip,
+                    None,
+                    plan,
+                ),
             )
+                .1
         };
     }
     let acceleration = if sampling.route().is_acceleration() {
@@ -498,14 +535,18 @@ fn denoise(
         let noise = mlx_rs::random::normal::<f32>(&[1, LATENT, LATENT, 4], None, None, None)?;
         sampler.scale_initial_noise(&noise)?
     } else if matches!(route, Route::Reference | Route::Mask) {
-        let init = crate::pipeline::encode_init_latents_tiled(
-            vae,
-            &image(PX, PX, 3),
-            PX as u32,
-            PX as u32,
-            tiling,
-            None,
-        )?;
+        let init = (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::encode_init_latents_tiled(
+                vae,
+                &image(PX, PX, 3),
+                PX as u32,
+                PX as u32,
+                tiling,
+                None,
+            ),
+        )
+            .1?;
         let noise = rnd(init.shape(), 5, 1.0);
         let x_t = euler.add_noise_with(&init, &noise, start_time)?;
         if route == Route::Mask {
@@ -563,41 +604,74 @@ fn denoise(
     };
     let d = crate::pipeline::Denoiser::with_plan(unet, driver, plan);
     let denoised = match route {
-        Route::Control => crate::pipeline::denoise_control(
-            &d,
-            latents,
-            cond,
-            pooled,
-            &ids,
-            cfg,
-            &cancel,
-            &mut |_| {},
-            control.as_ref().expect("control context"),
-        ),
-        Route::IpAdapter => crate::pipeline::denoise_ip(
-            &d,
-            latents,
-            cond,
-            pooled,
-            &ids,
-            cfg,
-            &cancel,
-            &mut |_| {},
-            ip_tokens.as_ref().expect("IP tokens"),
-            0.6,
-        ),
-        Route::Mask => crate::pipeline::denoise_inpaint(
-            &d,
-            latents,
-            cond,
-            pooled,
-            &ids,
-            cfg,
-            &cancel,
-            &mut |_| {},
-            blend.as_ref().expect("inpaint blend"),
-        ),
-        _ => crate::pipeline::denoise(&d, latents, cond, pooled, &ids, cfg, &cancel, &mut |_| {}),
+        Route::Control => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_control(
+                    &d,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    &cancel,
+                    &mut |_| {},
+                    control.as_ref().expect("control context"),
+                ),
+            )
+                .1
+        }
+        Route::IpAdapter => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_ip(
+                    &d,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    &cancel,
+                    &mut |_| {},
+                    ip_tokens.as_ref().expect("IP tokens"),
+                    0.6,
+                ),
+            )
+                .1
+        }
+        Route::Mask => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_inpaint(
+                    &d,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    &cancel,
+                    &mut |_| {},
+                    blend.as_ref().expect("inpaint blend"),
+                ),
+            )
+                .1
+        }
+        _ => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise(
+                    &d,
+                    latents,
+                    cond,
+                    pooled,
+                    &ids,
+                    cfg,
+                    &cancel,
+                    &mut |_| {},
+                ),
+            )
+                .1
+        }
     };
     drop(init_latent);
     denoised
@@ -770,6 +844,7 @@ fn observe_actual_marks<T>(
 
 /// Actual Control merge/cast barriers and IP token owners matched to their coincident LOGICAL
 /// ledger. No measured/process subtraction, fresh-backing certificate or empirical offset is used.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn control_ip_coincident_logical_windows_follow_actual_barriers() {
     if !cpu_child(
@@ -840,8 +915,11 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
                 let mut files = Files::of(&snap);
                 files.streamed = false;
                 let text = files.text()?;
-                let (conditioning, pooled) =
-                    crate::pipeline::encode_conditioning(&text.0, &text.1, &ids())?;
+                let (conditioning, pooled) = (
+                    crate::test_device::record_model_inference_device(),
+                    crate::pipeline::encode_conditioning(&text.0, &text.1, &ids()),
+                )
+                    .1?;
                 let (unet, controls, _vae, _ip) = files.heavy(Route::Control)?;
                 let extra = crate::loader::load_controlnet_with(
                     &mlx_gen::WeightsSource::File(
@@ -883,18 +961,22 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
                         }
                     },
                     || {
-                        crate::pipeline::guided_eps_pair(
-                            &unet,
-                            &state,
-                            1.0,
-                            &conditioning,
-                            &pooled,
-                            &time_ids,
-                            &contexts,
-                            &conditioning,
-                            None,
-                            crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching),
-                        )?;
+                        (
+                            crate::test_device::record_model_inference_device(),
+                            crate::pipeline::guided_eps_pair(
+                                &unet,
+                                &state,
+                                1.0,
+                                &conditioning,
+                                &pooled,
+                                &time_ids,
+                                &contexts,
+                                &conditioning,
+                                None,
+                                crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching),
+                            ),
+                        )
+                            .1?;
                         Ok(())
                     },
                 )?;
@@ -1001,7 +1083,13 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
         (p.price(&ip).unwrap().0, p.price(&text).unwrap().0)
     });
     let (result, observation) = observe_actual_marks(|| {
-        with_cpu_diagnostic_headroom(PLENTY, || run_image(&Files::of(&snap), &ip, &memory))
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            (
+                crate::test_device::record_model_inference_device(),
+                run_image(&Files::of(&snap), &ip, &memory),
+            )
+                .1
+        })
     });
     result.unwrap();
     assert!(
@@ -1041,11 +1129,14 @@ fn control_ip_coincident_logical_windows_follow_actual_barriers() {
         token_bytes,
         "persistent IP tokens must not vanish from forward ownership"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::control_ip_coincident_logical_windows_follow_actual_barriers");
 }
 
 /// Exercise every served factory through the existing loaded tiny-model lifecycle, not a
 /// metadata replay or a sigma-only substitute. This checks logical owner/guard bindings only:
 /// allocator/process conversion, physical disjointness and anchor transfer remain unproved.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn served_sampler_factories_bind_actual_model_callbacks_and_owners() {
     let Some(mut completion) = completed_cpu_child(
@@ -1067,19 +1158,26 @@ fn served_sampler_factories_bind_actual_model_callbacks_and_owners() {
             files.streamed = false;
             let (unet, _, _, _) = files.heavy(Route::Text)?;
             let (te1, te2) = files.text()?;
-            let (cond, pooled) =
-                crate::pipeline::encode_conditioning(&te1, &te2, &ids().index((0..1, ..)))?;
+            let (cond, pooled) = (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::encode_conditioning(&te1, &te2, &ids().index((0..1, ..))),
+            )
+                .1?;
             let x = rnd(&[1, LATENT, LATENT, 4], 7, 1.0).as_dtype(crate::model::DTYPE)?;
-            let eps = unet.forward_planned(
-                &x,
-                1.0,
-                &cond,
-                &pooled,
-                &crate::pipeline::text_time_ids(1),
-                None,
-                None,
-                crate::plan::SdxlForwardPlan::UNBOUNDED,
-            )?;
+            let eps = (
+                crate::test_device::record_model_inference_device(),
+                unet.forward_planned(
+                    &x,
+                    1.0,
+                    &cond,
+                    &pooled,
+                    &crate::pipeline::text_time_ids(1),
+                    None,
+                    None,
+                    crate::plan::SdxlForwardPlan::UNBOUNDED,
+                ),
+            )
+                .1?;
             eps.eval()?;
             Ok(mlx_gen::sampler::sampling_dtype_code(eps.dtype()))
         })
@@ -1229,7 +1327,13 @@ fn served_sampler_factories_bind_actual_model_callbacks_and_owners() {
             with_cpu_diagnostic_headroom(PLENTY, || {
                 with_cpu_diagnostic_observer(
                     move |event| sink.borrow_mut().push(event.clone()),
-                    || run_image_traced(&Files::of(snapshot), &r, &memory, Some(&trace)),
+                    || {
+                        (
+                            crate::test_device::record_model_inference_device(),
+                            run_image_traced(&Files::of(snapshot), &r, &memory, Some(&trace)),
+                        )
+                            .1
+                    },
                 )
             })
         });
@@ -1513,11 +1617,14 @@ fn served_sampler_factories_bind_actual_model_callbacks_and_owners() {
         eprintln!("SERVED ACTUAL {sampler}/{scheduler}/{method} tier={tier} guidance={guidance} batching={batching:?} route={route:?} count={count} metadata={} checks={}",observation.metadata.len(),observation.checks.len());
     }
     completion.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::served_sampler_factories_bind_actual_model_callbacks_and_owners");
 }
 
 /// Actual native acceleration factories versus the old literal affine update, using epsilon
 /// from the loaded tiny model. Three 3-step trajectories plus ONE Hyper repeated transition:
 /// no 51-step model campaign, requested-MAX schedule or physical alias claim from c_in==1.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
     let Some(mut completion) = completed_cpu_child(
@@ -1533,7 +1640,7 @@ fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
         files.streamed = false;
         let (unet, _, _, _) = files.heavy(Route::Text)?;
         let (te1, te2) = files.text()?;
-        let (cond, pooled) = crate::pipeline::encode_conditioning(&te1,&te2,&ids().index((0..1,..)))?;
+        let (cond, pooled) = (crate::test_device::record_model_inference_device(), crate::pipeline::encode_conditioning(&te1,&te2,&ids().index((0..1,..)))).1?;
         let memory = GenerationMemory::default();
         let config = crate::config::DiffusionConfig::sdxl_base();
         let alpha = mlx_gen::AlphaSchedule::scaled_linear(config.num_train_steps,config.beta_start,config.beta_end);
@@ -1551,7 +1658,7 @@ fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
             for (step, epoch) in epochs[..transitions].iter().enumerate() {
                 let c = epoch.coefficients;
                 let scaled = sampler.scale_model_input(&x,step)?;
-                let epsilon = unet.forward_planned(&scaled,sampler.timestep(step),&cond,&pooled,&crate::pipeline::text_time_ids(1),None,None,crate::plan::SdxlForwardPlan::UNBOUNDED)?;
+                let epsilon = (crate::test_device::record_model_inference_device(), unet.forward_planned(&scaled,sampler.timestep(step),&cond,&pooled,&crate::pipeline::text_time_ids(1),None,None,crate::plan::SdxlForwardPlan::UNBOUNDED)).1?;
                 let actual = sampler.step(&epsilon,&x,step)?;
                 // Complete the actual model/update first. This separate numerical test is NOT a
                 // liveness capture; build/read every oracle only after that actual completion.
@@ -1599,6 +1706,8 @@ fn acceleration_transitions_bind_actual_model_epsilon_and_factory() {
         Ok(())
     }).unwrap();
     completion.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::acceleration_transitions_bind_actual_model_epsilon_and_factory");
 }
 
 /// The shared production serial owner versus its frozen old inline seed/Vec loop, with native
@@ -1668,6 +1777,7 @@ fn actual_serial_owner_preserves_seed_retention_and_error_scopes() {
 /// Pure-header CLIP pack points versus actual shared-policy owners/guards, including native
 /// per-projection transient checks. Logical slot replacement is NEVER subtracted from a physical
 /// demand; native growth is compared only against its own checked actual pre-projection baseline.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn actual_text_finalize_points_match_headers_and_native_transients() {
     let Some(mut completion) = completed_cpu_child(
@@ -1785,7 +1895,7 @@ fn actual_text_finalize_points_match_headers_and_native_transients() {
             let actual_load=ledger.iter().filter(|point|point.phase==IosPhase::Load).take(expected_load.len()).map(|point|(point.label,point.resident,point.scratch)).collect::<Vec<_>>();
             assert_eq!(actual_load,expected_load,"actual pricing load ledger retains raw TE1 for TE2, each coincident pack owner, and finalized text beside heavy load bits={bits:?} stored={stored}");
             let predicted=priced.price_text_conditioning(2,&mut quanta)?;
-            let (conditioning,pooled)=crate::pipeline::encode_conditioning(&te1,&te2,&ids())?;
+            let (conditioning,pooled)=(crate::test_device::record_model_inference_device(), crate::pipeline::encode_conditioning(&te1,&te2,&ids())).1?;
             mlx_rs::transforms::eval([&conditioning,&pooled])?;
             assert_eq!((conditioning.dtype(),pooled.dtype(),conditioning.shape().to_vec(),pooled.shape().to_vec()),(predicted.0,predicted.1,vec![2,TOKENS,snapshot.context],vec![2,snapshot.te2.projection_dim.unwrap()]),"actual post-pack CLIP conditioning dtype/layout follows actual models, never tier-fixed bits={bits:?} stored={stored}");
             // Negative admission must occur before the refused projection is changed. A packed
@@ -1856,11 +1966,14 @@ fn actual_text_finalize_points_match_headers_and_native_transients() {
         }).unwrap();
     }
     completion.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::actual_text_finalize_points_match_headers_and_native_transients");
 }
 
 /// The actual shared finalize policy versus the frozen old inline pair walk, throughout loaded
 /// tiny CLIP→U-Net→VAE execution. No tolerance or sampler-precision change hides promotion; both
 /// runs use the SAME iOS boundary policy and only the finalize wrapper differs.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn actual_text_finalize_preserves_pipeline_rgb_and_dtype() {
     let Some(mut completion) = completed_cpu_child(
@@ -1885,20 +1998,33 @@ fn actual_text_finalize_preserves_pipeline_rgb_and_dtype() {
             actual_files.text_ldm = fused;
             let mut reference = actual_files.clone();
             reference.text_finalize_reference = true;
-            let expected =
-                with_cpu_diagnostic_headroom(PLENTY, || run_image(&reference, &r, &memory))
-                    .unwrap();
-            let actual =
-                with_cpu_diagnostic_headroom(PLENTY, || run_image(&actual_files, &r, &memory))
-                    .unwrap();
+            let expected = with_cpu_diagnostic_headroom(PLENTY, || {
+                (
+                    crate::test_device::record_model_inference_device(),
+                    run_image(&reference, &r, &memory),
+                )
+                    .1
+            })
+            .unwrap();
+            let actual = with_cpu_diagnostic_headroom(PLENTY, || {
+                (
+                    crate::test_device::record_model_inference_device(),
+                    run_image(&actual_files, &r, &memory),
+                )
+                    .1
+            })
+            .unwrap();
             assert_eq!((actual.width,actual.height,actual.pixels),(expected.width,expected.height,expected.pixels),"actual shared CLIP finalize preserves full tiny-pipeline RGB without relaxed dtype/tolerance bits={bits:?} stored={stored} fused={fused}");
         }
     }
     completion.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::actual_text_finalize_preserves_pipeline_rgb_and_dtype");
 }
 
 /// Record actual first/steady/zero-step state types and Denoise growth bindings from a real
 /// pre-load native baseline. Scalar observation cannot make an Array non-donatable.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn actual_sampler_epochs_and_denoise_peak_bindings() {
     let Some(mut completion) =
@@ -1987,7 +2113,13 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
                             }
                             _ => {}
                         },
-                        || run_image_traced(&Files::of(snap), &r, &memory, Some(&trace)),
+                        || {
+                            (
+                                crate::test_device::record_model_inference_device(),
+                                run_image_traced(&Files::of(snap), &r, &memory, Some(&trace)),
+                            )
+                                .1
+                        },
                     )
                 })
             });
@@ -2163,9 +2295,40 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
                         .max()
                         .expect("request model peak");
                     let measured_excess = request_peak.saturating_sub(base_peak);
-                    let bound = excess + trace.fixed_inputs.saturating_sub(base.fixed_inputs);
+                    let (anchor_regime, _) = baseline_profile.as_ref().unwrap();
+                    let page = observation
+                        .metadata
+                        .iter()
+                        .find(|mark| mark.provider == "mlx" && mark.kind == "allocation-scope")
+                        .and_then(|mark| mark.fields.get("page_bytes"))
+                        .copied()
+                        .expect("actual allocation-scope page witness");
+                    let source_prefix = if crate::ios_pricing::forward_prefix_differs(
+                        (
+                            anchor_regime.route,
+                            anchor_regime.has_init,
+                            anchor_regime.initial_state_dtype(),
+                        ),
+                        (r.route, r.has_init, r.initial_state_dtype()),
+                    ) {
+                        crate::ios_pricing::uncancelled_forward_prefix_upper(
+                            &mut endpoint_inputs(snap, &r),
+                            &r,
+                            page,
+                        )
+                        .unwrap()
+                    } else {
+                        0
+                    };
+                    assert!(
+                        source_prefix > 0,
+                        "image initialization requires actual source-prefix allocation work"
+                    );
+                    let bound = source_prefix
+                        + excess
+                        + trace.fixed_inputs.saturating_sub(base.fixed_inputs);
                     assert!(bound >= measured_excess,
-                        "{tier} {route:?} {batching:?}: matched-epoch owners {bound} below actual binding excess {measured_excess}");
+                        "{tier} {route:?} {batching:?}: source prefix + matched-epoch owners {bound} below actual binding excess {measured_excess}");
                     eprintln!("MATCHED INPUT BOUND {tier} {route:?} {batching:?} schedule={schedule:?}: forward_excess={excess} fixed={} measured_excess={measured_excess}", trace.fixed_inputs);
                     // Exercise the SAME source callback the public provider bounder uses, over
                     // real public pricing windows. No ad hoc input formula is substituted for
@@ -2196,6 +2359,7 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
                         &request_profile,
                         VAE_SCALE,
                         states,
+                        &mut endpoint_inputs(snap, &r),
                     )
                     .unwrap();
                     let model_windows = request_profile
@@ -2266,6 +2430,8 @@ fn actual_sampler_epochs_and_denoise_peak_bindings() {
         }
     }
     completion.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::actual_sampler_epochs_and_denoise_peak_bindings");
 }
 
 /// Prove endpoint ownership on the actual loader, while the loaded UNet is still held. An
@@ -2335,7 +2501,8 @@ fn endpoints_use_literal_resident_and_streamed_load_ownership() {
 /// Complete certified derivation over real text-anchor marks, every declared additive mode,
 /// both literal load endpoints and all served storage tiers. No uncertified fallback is accepted.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_additive_mode_is_derived_from_the_text_anchor() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor",
@@ -2418,12 +2585,15 @@ fn every_additive_mode_is_derived_from_the_text_anchor() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::every_additive_mode_is_derived_from_the_text_anchor");
 }
 
 /// Count two retains the real first latent while executing the second output, not a batch-one
 /// assertion relabeled as batching. Production request reconstruction rejects mismatched geometry.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn serial_count_two_uses_real_geometry_and_complete_native_bounds() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds",
@@ -2545,12 +2715,15 @@ fn serial_count_two_uses_real_geometry_and_complete_native_bounds() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::serial_count_two_uses_real_geometry_and_complete_native_bounds");
 }
 
 /// Payload-free source replay resolves the same work as the actual text request, but never
 /// manufactures observations. Actual captured marks are retained unchanged for certification.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn payload_free_text_anchor_replay_preserves_native_certificates() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates",
@@ -2679,6 +2852,8 @@ fn payload_free_text_anchor_replay_preserves_native_certificates() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_text_anchor_replay_preserves_native_certificates");
 }
 
 /// Every listed exception is a mode key this crate prices.
@@ -2697,7 +2872,8 @@ fn every_listed_non_additive_mode_is_a_priced_mode() {
 /// Honest Control certifies; deleting its actual resident component from C_req must fail
 /// source-profile validation rather than manufacture a lower certified demand.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dropping_the_controlnet_from_c_req_fails_the_proof() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof",
@@ -2769,6 +2945,8 @@ fn dropping_the_controlnet_from_c_req_fails_the_proof() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::dropping_the_controlnet_from_c_req_fails_the_proof");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2929,6 +3107,7 @@ fn the_five_sdxl_routes_share_one_architecture() {
 /// mean 0.25/255. The corresponding pre-RGB VAE tensor thresholds are 6/255 and 0.5/255,
 /// because RGB = (decoded + 1)/2. There is NO universal latent-space equivalent: the decoder
 /// is nonlinear, so testing only latent rounding error cannot prove this requirement.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn ios_init_cast_preserves_decoded_rgb() {
     if !cpu_child("pricing::additivity::ios_init_cast_preserves_decoded_rgb") {
@@ -2938,9 +3117,12 @@ fn ios_init_cast_preserves_decoded_rgb() {
     let files = Files::of(&snap);
     let (_, _, vae, _) = files.heavy(Route::Text).unwrap();
     let img = image(PX, PX, 3);
-    let original =
-        crate::pipeline::encode_init_latents_tiled(&vae, &img, PX as u32, PX as u32, None, None)
-            .unwrap();
+    let original = (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::encode_init_latents_tiled(&vae, &img, PX as u32, PX as u32, None, None),
+    )
+        .1
+        .unwrap();
     let cast = with_cpu_diagnostic_headroom(PLENTY, || crate::pipeline::ios_unet_input(&original))
         .unwrap();
     assert_eq!(cast.dtype(), original.dtype());
@@ -2949,8 +3131,14 @@ fn ios_init_cast_preserves_decoded_rgb() {
         bits(&original),
         "boundary preserves actual init values, not just RGB tolerance"
     );
-    let decode =
-        |z: &Array| crate::pipeline::decode_image_tiled(&vae, z, None, None, None).unwrap();
+    let decode = |z: &Array| {
+        (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::decode_image_tiled(&vae, z, None, None, None),
+        )
+            .1
+            .unwrap()
+    };
     let (a, b) = (decode(&original), decode(&cast));
     let differences: Vec<f64> = a
         .pixels
@@ -2962,12 +3150,15 @@ fn ios_init_cast_preserves_decoded_rgb() {
     let mean = differences.iter().sum::<f64>() / differences.len() as f64;
     eprintln!("iOS init cast decoded RGB: max {max} mean {mean}");
     assert!(max <= 3.0 / 255.0 && mean <= 0.25 / 255.0);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::ios_init_cast_preserves_decoded_rgb");
 }
 
 /// Real-request coverage of every checked execution quantum, including upstream lazy allocations
 /// it materializes. The stalled isolated proofs remain the stronger bound on individual kernels.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn every_guard_covers_its_real_request_quantum() {
     if !cpu_child("pricing::additivity::every_guard_covers_its_real_request_quantum") {
         return;
@@ -3040,11 +3231,14 @@ fn every_guard_covers_its_real_request_quantum() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::every_guard_covers_its_real_request_quantum");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::every_guard_covers_its_real_request_quantum");
 }
 
 /// The exact native CI regression: bf16 / optimized / img2img. Keep this single production
 /// lifecycle comparison ordinary even though the full 48-lifecycle matrix is selected-only.
 /// It exercises real init encode, sampler, U-Net forward and RGB decode, not a cast-array proxy.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn optimized_bf16_img2img_preserves_full_request_rgb() {
     if !cpu_child("pricing::additivity::optimized_bf16_img2img_preserves_full_request_rgb") {
@@ -3055,8 +3249,20 @@ fn optimized_bf16_img2img_preserves_full_request_rgb() {
     let (sel, memory) = selection(&sp, Selection::Optimized);
     let r = regime(&sp, &MemoryMode::ImageToImage, &sel, &memory);
     let files = Files::of(&snap);
-    let host = run_image(&files, &r, &memory).unwrap();
-    let ios = with_cpu_diagnostic_headroom(PLENTY, || run_image(&files, &r, &memory)).unwrap();
+    let host = (
+        crate::test_device::record_model_inference_device(),
+        run_image(&files, &r, &memory),
+    )
+        .1
+        .unwrap();
+    let ios = with_cpu_diagnostic_headroom(PLENTY, || {
+        (
+            crate::test_device::record_model_inference_device(),
+            run_image(&files, &r, &memory),
+        )
+            .1
+    })
+    .unwrap();
     assert_eq!(
         (host.width, host.height, host.pixels.len()),
         (ios.width, ios.height, ios.pixels.len())
@@ -3074,13 +3280,16 @@ fn optimized_bf16_img2img_preserves_full_request_rgb() {
         max <= 3.0 / 255.0 && mean <= 0.25 / 255.0,
         "bf16 Optimized image_to_image: max {max}, mean {mean}"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::optimized_bf16_img2img_preserves_full_request_rgb");
 }
 
 /// Full request output parity, not just cast-array error: init/noise/inpaint and ControlNet residual
 /// casts must keep the decoded RGB image within max 3/255 and mean .25/255 of the unchanged host
 /// path. The nonlinear VAE has no universal latent-error equivalent of an RGB error bound.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn ios_boundary_casts_preserve_full_request_rgb() {
     if !cpu_child("pricing::additivity::ios_boundary_casts_preserve_full_request_rgb") {
         return;
@@ -3096,9 +3305,20 @@ fn ios_boundary_casts_preserve_full_request_rgb() {
                 let (sel, memory) = selection(&sp, which);
                 let r = regime(&sp, &mode, &sel, &memory);
                 let files = Files::of(&snap);
-                let host = run_image(&files, &r, &memory).unwrap();
-                let ios = with_cpu_diagnostic_headroom(PLENTY, || run_image(&files, &r, &memory))
+                let host = (
+                    crate::test_device::record_model_inference_device(),
+                    run_image(&files, &r, &memory),
+                )
+                    .1
                     .unwrap();
+                let ios = with_cpu_diagnostic_headroom(PLENTY, || {
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        run_image(&files, &r, &memory),
+                    )
+                        .1
+                })
+                .unwrap();
                 let diffs: Vec<f64> = host
                     .pixels
                     .iter()
@@ -3123,12 +3343,15 @@ fn ios_boundary_casts_preserve_full_request_rgb() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::ios_boundary_casts_preserve_full_request_rgb");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::ios_boundary_casts_preserve_full_request_rgb");
 }
 
 /// Recorded IP source facts travel with payload-free catalog anchors. The same real
 /// capture is used on both sides; replay never synthesizes execution observations.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn payload_free_ip_anchor_replay_preserves_native_certificates() {
     let Some(mut completion) = completed_cpu_child(
         "pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates",
@@ -3251,4 +3474,6 @@ fn payload_free_ip_anchor_replay_preserves_native_certificates() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::additivity::payload_free_ip_anchor_replay_preserves_native_certificates");
 }

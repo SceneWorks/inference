@@ -139,8 +139,10 @@ impl GroupNormW {
         let xn = xn.reshape(dims.clone())?.to_dtype(in_dtype)?;
         let mut wshape = vec![1usize; dims.len()];
         wshape[1] = c;
-        xn.broadcast_mul(&self.weight.reshape(wshape.clone())?)?
-            .broadcast_add(&self.bias.reshape(wshape)?)
+        __model_proof_output!(__model_proof_output!(
+            xn.broadcast_mul(&self.weight.reshape(wshape.clone())?)
+        )?
+        .broadcast_add(&self.bias.reshape(wshape)?))
     }
 }
 
@@ -172,8 +174,14 @@ impl Conv2dW {
 
     /// `x`: `[N, C, H, W]`.
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.conv2d(&self.w, self.pad, self.stride, 1, 1)?
-            .broadcast_add(&self.b)
+        __model_proof_output!(__model_proof_output!(x.conv2d(
+            &self.w,
+            self.pad,
+            self.stride,
+            1,
+            1
+        ))?
+        .broadcast_add(&self.b))
     }
 }
 
@@ -323,15 +331,15 @@ impl VaeAttention {
         let y = self.gn.forward(x)?;
         // [B, C, H, W] → [B, H·W, C] sequence for the Linear projections.
         let seq = y.reshape((b, c, h * w))?.transpose(1, 2)?.contiguous()?;
-        let q = self.q.forward(&seq)?; // [B, HW, C]
-        let k = self.k.forward(&seq)?;
-        let v = self.v.forward(&seq)?;
+        let q = __model_proof_output!(self.q.forward(&seq))?; // [B, HW, C]
+        let k = __model_proof_output!(self.k.forward(&seq))?;
+        let v = __model_proof_output!(self.v.forward(&seq))?;
         let scale = (c as f64).powf(-0.5);
         // Single head: scores [B, HW, HW] → softmax → out [B, HW, C].
         let scores = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * scale)?;
         let probs = softmax_last_dim(&scores)?;
         let o = probs.matmul(&v)?; // [B, HW, C]
-        let o = self.out.forward(&o)?;
+        let o = __model_proof_output!(self.out.forward(&o))?;
         // [B, HW, C] → [B, C, H, W]
         let o = o.transpose(1, 2)?.reshape((b, c, h, w))?;
         x + o
@@ -649,9 +657,7 @@ impl SvdVae {
         let (b, c, h, w) = m.dims4()?;
         // quant_conv (1×1) over channels: [B, C, h, w] → [B, h·w, C] → Linear → [B, C, h, w].
         let seq = m.reshape((b, c, h * w))?.transpose(1, 2)?.contiguous()?;
-        let moments = self
-            .quant
-            .forward(&seq)?
+        let moments = __model_proof_output!(self.quant.forward(&seq))?
             .transpose(1, 2)?
             .reshape((b, c, h, w))?;
         // `DiagonalGaussian.mode()` = the mean = the first half of the channel axis.

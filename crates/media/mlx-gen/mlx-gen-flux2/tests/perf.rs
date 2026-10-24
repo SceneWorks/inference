@@ -72,6 +72,7 @@ fn flux2_per_step_compiled_vs_eager() {
             eprintln!(
                 "skip: set MLX_GEN_FLUX2_SNAPSHOT or populate the HF cache for FLUX.2-klein-9b"
             );
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in flux2_per_step_compiled_vs_eager; see preceding skip diagnostic");
             return;
         }
     };
@@ -163,4 +164,6 @@ fn flux2_per_step_compiled_vs_eager() {
          (max|Δ|={max_diff:e} / max|out|={max_out:e}) exceeds \
          {COMPILED_GLUE_F32_REAL_FWD_REL_TOL:e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::flux2_per_step_compiled_vs_eager");
 }

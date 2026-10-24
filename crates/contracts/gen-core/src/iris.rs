@@ -310,7 +310,12 @@ impl IrisConfig {
         let path = dir.join(BACKBONE_CONFIG_FILE);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| Error::Msg(format!("iris: read {}: {e}", path.display())))?;
-        Self::parse(&text).map_err(|e| Error::Msg(format!("iris: {}: {e}", path.display())))
+        crate::__model_input_result!(
+            Self::parse(&text).map_err(|e| Error::Msg(format!("iris: {}: {e}", path.display()))),
+            "gen-core::iris::IrisConfig::from_dir",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Parse the YAML text. Keys absent from the file take upstream's structured defaults (the

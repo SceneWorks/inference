@@ -439,10 +439,8 @@ impl Qwen3Backbone {
         // the whole embedding path's dtype boundary, and it is exact (bf16 → f32 widening loses
         // nothing). Widening the table first would allocate the full 2.5 GB f32 copy for the same
         // numbers. A no-op `Arc` clone when the store is already f32.
-        let g = self
-            .embed_tokens
-            .index_select(&idx, 0)?
-            .to_dtype(DType::F32)?; // [s, hidden]
+        let g =
+            __model_proof_output!(self.embed_tokens.index_select(&idx, 0))?.to_dtype(DType::F32)?; // [s, hidden]
         let h = self.embed_tokens.dim(1)?;
         g.reshape((1, s, h))
     }

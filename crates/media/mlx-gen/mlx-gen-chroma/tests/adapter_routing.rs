@@ -92,6 +92,7 @@ fn adaptable_paths_all_resolve() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn scale_zero_is_base_and_nonzero_differs() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -140,4 +141,8 @@ fn scale_zero_is_base_and_nonzero_differs() {
         .unwrap()
         .item::<f32>();
     assert!(d1 > 1e-4, "scale=1 LoRA must change the output (got {d1})");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED adapter_routing::scale_zero_is_base_and_nonzero_differs"
+    );
 }

@@ -94,6 +94,16 @@
 //! (`build_schedule`/`initialize_latents`) the sampler's own oracles take over. See
 //! `docs/migration/SC_14547_REFERENCE_AUDIO_RESTYLE.md`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 pub use candle_audio;
 pub use candle_audio::gen_core;
 

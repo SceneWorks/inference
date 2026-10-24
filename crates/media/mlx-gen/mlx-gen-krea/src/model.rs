@@ -3382,6 +3382,8 @@ mod tests {
                 "render differs from the pixel sha rendered on the pinned revision"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::variant5_native_file_render_fixed_seed_sha");
     }
 
     #[test]

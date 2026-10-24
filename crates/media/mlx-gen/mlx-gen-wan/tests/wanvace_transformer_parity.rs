@@ -85,6 +85,7 @@ fn load_golden() -> Weights {
     g
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vace_forward_matches_diffusers_golden() {
     let g = load_golden();
@@ -148,6 +149,8 @@ fn vace_forward_matches_diffusers_golden() {
         bad_rel > 2e-2,
         "negative control too weak ({bad_rel:.3e}) — the gate would not catch a hint-scale bug"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_transformer_parity::vace_forward_matches_diffusers_golden");
 }
 
 /// Stage bisection (sc-3388 S1) — localizes a full-forward gap to the first diverging stage. Reads
@@ -196,4 +199,6 @@ fn vace_stage_bisection() {
             arr.shape()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_transformer_parity::vace_stage_bisection");
 }

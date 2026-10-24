@@ -92,6 +92,8 @@ fn nvfp4_device() -> Option<Device> {
         Ok(d @ Device::Cuda(_)) => d,
         _ => {
             eprintln!("[sc-12110] no CUDA device; skipping");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:95 (nvfp4_device): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
             return None;
         }
     };
@@ -109,6 +111,8 @@ fn nvfp4_device() -> Option<Device> {
                 "[sc-12110] device not sm_120 ({:?}); skipping — NVFP4 is Blackwell-only (SC#4)",
                 lt.compute_cap().ok()
             );
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:107 (nvfp4_device): Implicit None on ineligible/error capability probe silently bypasses selected learned GPU cases just like explicit no-device return.");
             None
         }
     }
@@ -440,7 +444,11 @@ fn median_ms(per_step: &[f64]) -> f64 {
 #[test]
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:443 (nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let root = bf16_root();
     assert_exclusive_gpu("SC#1 throughput");
 
@@ -561,6 +569,9 @@ fn nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4() {
             .any(|(_, _, lane)| lane.contains('/') && !lane.starts_with("0/")),
         "no NVFP4 regime lit a single FP4 layer — the table would be meaningless"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_sc1_throughput_bf16_vs_w4a16_vs_w4a4");
 }
 
 // ==============================================================================================
@@ -600,7 +611,11 @@ fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
     use candle_gen::gen_core::ExecutionRepresentation;
     use candle_gen_krea::native_mapping::DeclaredLogicalShapes;
 
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:603 (nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let root = bf16_root();
     let nvfp4_file =
         PathBuf::from(std::env::var("KREAMANIA_VARIANT7").expect(
@@ -687,6 +702,9 @@ fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
          (median over {E9_MEASURE_STEPS} steps), below the {E9_STEP_SPEED_FLOOR}x floor. This \
          failure is the product-decision trigger; do not soften the bar"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16");
 }
 
 // ==============================================================================================
@@ -758,7 +776,11 @@ fn nvfp4_krea_dit_e9_median_step_speed_floor_vs_bf16() {
 #[test]
 #[ignore = "real-weight GPU test: needs BOTH the Krea 2 Turbo bf16 and q4 snapshots + an sm_120 device"]
 fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:761 (nvfp4_krea_dit_sc2_parity_vs_q4_tier): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let bf16 = bf16_root();
     let q4 = q4_root();
 
@@ -917,6 +939,11 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
          tensors; per-layer output error 8/8) says NVFP4's format is MORE faithful than int4 at equal \
          bits."
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_sc2_parity_vs_q4_tier"
+    );
 }
 
 // ==============================================================================================
@@ -944,7 +971,11 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
 #[test]
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_real_activation_outlier_sparsity() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:947 (nvfp4_krea_dit_real_activation_outlier_sparsity): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let root = bf16_root();
 
     let ctx = encode_context(&root, &dev);
@@ -1057,6 +1088,9 @@ fn nvfp4_krea_dit_real_activation_outlier_sparsity() {
         violations.len(),
         violations
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_real_activation_outlier_sparsity");
 }
 
 // ==============================================================================================
@@ -1202,7 +1236,11 @@ fn nvfp4_krea_dit_sc6_resident_vram_per_regime() {
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
     use candle_gen::candle_core::cuda_backend::cudarc::driver::result as cuda;
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:1205 (nvfp4_krea_dit_sc6_cublaslt_workspace_gap): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let root = bf16_root();
 
     /// `CublasLt::WORKSPACE` — the predicted per-handle cost this regression must recover as its slope.
@@ -1433,6 +1471,9 @@ fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
         mib(warm_slope),
         mib(cold_slope)
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_sc6_cublaslt_workspace_gap");
 }
 
 // ==============================================================================================
@@ -1447,7 +1488,11 @@ fn nvfp4_krea_dit_sc6_cublaslt_workspace_gap() {
 #[test]
 #[ignore = "real-weight GPU test: needs the Krea 2 Turbo bf16 snapshot + an sm_120 device"]
 fn nvfp4_krea_dit_sc3_no_nan_across_full_denoise() {
-    let Some(dev) = nvfp4_device() else { return };
+    let Some(dev) = nvfp4_device() else {
+        #[cfg(feature = "model-inference-proof")]
+                                          crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs:1450 (nvfp4_krea_dit_sc3_no_nan_across_full_denoise): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
+        return;
+    };
     let root = bf16_root();
 
     let ctx = encode_context(&root, &dev);
@@ -1485,6 +1530,9 @@ fn nvfp4_krea_dit_sc3_no_nan_across_full_denoise() {
             "{tag}: latent collapsed to a constant (std {std:.6})"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_krea_dit_gpu::nvfp4_krea_dit_sc3_no_nan_across_full_denoise");
 }
 
 // ==============================================================================================

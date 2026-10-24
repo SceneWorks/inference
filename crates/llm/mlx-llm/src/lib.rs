@@ -44,6 +44,13 @@
 //! MLX's default Metal device is single-threaded; engine instances hold MLX `Array`s and are
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
 
+#[path = "../../../contracts/gen-core/src/model_input_macros.rs"]
+mod model_input_macros;
+
+#[cfg(feature = "model-inference-proof")]
+#[path = "../../../contracts/gen-core/src/model_input_proof.rs"]
+pub mod model_input_proof;
+
 pub mod campaign;
 pub mod campaign_supervisor;
 pub mod config;
@@ -218,3 +225,6 @@ mod explicit_registry_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

@@ -38,7 +38,8 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + text-encoder golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + text-encoder golden"]
 fn dual_clip_conditioning_matches_vendored() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let input_ids = g.require("input_ids").unwrap();
@@ -46,8 +47,18 @@ fn dual_clip_conditioning_matches_vendored() {
 
     let te1 = load_text_encoder_1(&snap).unwrap();
     let te2 = load_text_encoder_2(&snap).unwrap();
-    let o1 = te1.forward(input_ids).unwrap();
-    let o2 = te2.forward(input_ids).unwrap();
+    let o1 = (
+        crate::common::record_model_inference_device(),
+        te1.forward(input_ids),
+    )
+        .1
+        .unwrap();
+    let o2 = (
+        crate::common::record_model_inference_device(),
+        te2.forward(input_ids),
+    )
+        .1
+        .unwrap();
 
     // hidden_states[-2] (penultimate encoder layer, before final LN).
     let h1 = &o1.hidden_states[o1.hidden_states.len() - 2];
@@ -75,4 +86,6 @@ fn dual_clip_conditioning_matches_vendored() {
     assert!(pr_pool < 5e-4, "pooled diverged: {pr_pool:.3e}");
 
     println!("✓ dual-CLIP conditioning + pooled match the vendored reference (f32)");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_real_weights::dual_clip_conditioning_matches_vendored");
 }

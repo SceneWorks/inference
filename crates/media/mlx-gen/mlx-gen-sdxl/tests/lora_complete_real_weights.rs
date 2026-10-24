@@ -385,7 +385,8 @@ fn complete_scale_zero_is_bit_exact_noop() {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
 fn complete_render_differs_from_vendored_and_is_sane() {
     let req = GenerationRequest {
         prompt: "a red fox in a forest, highly detailed".into(),
@@ -410,7 +411,13 @@ fn complete_render_differs_from_vendored_and_is_sane() {
             .unwrap()
             .load("sdxl", &spec)
             .unwrap();
-        let img = match model.generate(&req, &mut |_| {}).unwrap() {
+        let img = match (
+            crate::common::record_model_inference_device(),
+            model.generate(&req, &mut |_| {}),
+        )
+            .1
+            .unwrap()
+        {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),
         };
@@ -441,6 +448,8 @@ fn complete_render_differs_from_vendored_and_is_sane() {
         "complete coverage must change the render (the extra mid_block/ff signal is applied)"
     );
     println!("✓ complete vs vendored render differs at {diff} px (>8) — mid/ff signal is live");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_complete_real_weights::complete_render_differs_from_vendored_and_is_sane");
 }
 
 /// Eyeball helper (not a parity gate): render the SAME prompt/seed at vendored (515) vs complete
@@ -448,7 +457,8 @@ fn complete_render_differs_from_vendored_and_is_sane() {
 /// look at what signal the vendored path drops. Config overridable via `SDXL_{PROMPT,W,H,STEPS,CFG,SEED}`.
 /// Run: cargo test -p mlx-gen-sdxl --release --test integration -- --ignored --nocapture lora_complete_real_weights::dump_vendored_vs_complete_pngs
 #[test]
-#[ignore = "needs the real SDXL snapshot + LCM-LoRA — writes comparison PNGs"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LCM-LoRA — writes comparison PNGs"]
 fn dump_vendored_vs_complete_pngs() {
     let env = |k: &str| std::env::var(k).ok();
     let prompt = env("SDXL_PROMPT").unwrap_or_else(|| {
@@ -483,7 +493,13 @@ fn dump_vendored_vs_complete_pngs() {
             .unwrap()
             .load("sdxl", &spec)
             .unwrap();
-        let img = match model.generate(&req, &mut |_| {}).unwrap() {
+        let img = match (
+            crate::common::record_model_inference_device(),
+            model.generate(&req, &mut |_| {}),
+        )
+            .1
+            .unwrap()
+        {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),
         };
@@ -541,4 +557,6 @@ fn dump_vendored_vs_complete_pngs() {
         vend.pixels.len(),
         100.0 * n as f32 / vend.pixels.len() as f32
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_complete_real_weights::dump_vendored_vs_complete_pngs");
 }

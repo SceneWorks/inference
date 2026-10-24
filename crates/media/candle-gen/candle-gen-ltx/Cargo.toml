@@ -41,6 +41,7 @@ safetensors = "0.7"
 image = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 default = []
 # The LLM crate's backend features must move in lock-step with candle-gen's, or the Gemma 4 decoder
 # would be built for a different device than the rest of the pipeline.

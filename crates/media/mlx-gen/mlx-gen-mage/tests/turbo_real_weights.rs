@@ -85,6 +85,8 @@ fn registered_turbo_renders_1024_at_exact_four_step_defaults() {
         repeated_rows < 102,
         "Turbo render has {repeated_rows} repeated adjacent rows"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_real_weights::registered_turbo_renders_1024_at_exact_four_step_defaults");
 }
 
 #[test]
@@ -115,4 +117,6 @@ fn cfg_one_never_encodes_or_uses_the_negative_prompt() {
         second.as_slice::<u8>(),
         "cfg=1 changed when only the negative prompt changed"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED turbo_real_weights::cfg_one_never_encodes_or_uses_the_negative_prompt");
 }

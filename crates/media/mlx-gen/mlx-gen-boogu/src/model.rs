@@ -884,6 +884,7 @@ mod tests {
     /// The negative fixture expands `SYSTEM_PROMPT_DROP`; grounded Edit remains below 8192 while its
     /// ordinary CFG-negative crosses 1280, independently discriminating that leg.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ordinary_text_preflight_precedes_every_registered_component_route() {
         let positive_root = tempfile::tempdir().unwrap();
         write_tiny_tokenizer(positive_root.path(), false);
@@ -935,9 +936,12 @@ mod tests {
                 .to_string();
             assert!(error.contains("max_text_tokens=1280"), "{error}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::ordinary_text_preflight_precedes_every_registered_component_route");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ordinary_text_preflight_admits_exactly_1280_on_every_positive_route() {
         let root = tempfile::tempdir().unwrap();
         write_tiny_tokenizer(root.path(), false);
@@ -971,6 +975,8 @@ mod tests {
                 "exactly 1280 must pass admission: {error}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::ordinary_text_preflight_admits_exactly_1280_on_every_positive_route");
     }
 
     #[test]
@@ -1083,6 +1089,7 @@ mod tests {
     /// sequential component loader. The snapshot contains only a tokenizer: reaching the MLX tower
     /// or VAE loader would therefore replace the declared budget error with a missing-weight error.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn edit_overbudget_preflight_never_enters_tower_or_vae_loaders() {
         let root = tempfile::tempdir().unwrap();
         write_tiny_edit_tokenizer(root.path());
@@ -1120,6 +1127,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("max_edit_tokens=8192"), "{error}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED model::tests::edit_overbudget_preflight_never_enters_tower_or_vae_loaders");
     }
 
     #[test]

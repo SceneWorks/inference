@@ -644,6 +644,7 @@ mod tests {
     /// Validates the `quantized_matmul` arg order + transpose flag + output shape without needing a
     /// quantized Gemma snapshot (the e2e TE-quant gate, which does, is surfaced on the story).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quant_linear_matches_dequantized_dense() {
         // A Gemma-shaped projection: out=64 (÷64), in=128 (2 groups of 64) — quantizable by mlx.
         let wv: Vec<f32> = (0..64 * 128).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -679,6 +680,10 @@ mod tests {
             diff / denom < 1e-2,
             "quant forward rel {:.3e}",
             diff / denom
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED gemma::tests::quant_linear_matches_dequantized_dense"
         );
     }
 }
@@ -836,6 +841,7 @@ pub(crate) mod hidden_state_pinning_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
         for num_layers in [1usize, 2, 3, 5] {
             let cfg = tiny_cfg(num_layers);
@@ -853,9 +859,12 @@ pub(crate) mod hidden_state_pinning_tests {
                  smoke render"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::forward_returns_exactly_num_layers_plus_one_hidden_states");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn hidden_state_zero_is_exactly_the_scaled_embedding_lookup() {
         let cfg = tiny_cfg(2);
         let w = tiny_weights(&cfg, 6, 0.0);
@@ -884,9 +893,12 @@ pub(crate) mod hidden_state_pinning_tests {
             max_abs_diff(&hiddens[0], &want) < 5e-3,
             "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::hidden_state_zero_is_exactly_the_scaled_embedding_lookup");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn only_the_last_hidden_state_carries_the_final_norm() {
         // Two models identical except `norm.weight` (the FINAL norm, applied once after the last
         // layer). If it's wired to exactly one slot (the last), perturbing it must change
@@ -927,5 +939,7 @@ pub(crate) mod hidden_state_pinning_tests {
             max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
             "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED gemma::hidden_state_pinning_tests::only_the_last_hidden_state_carries_the_final_norm");
     }
 }

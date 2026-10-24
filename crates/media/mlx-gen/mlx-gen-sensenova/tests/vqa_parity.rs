@@ -53,6 +53,7 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
     NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vqa_greedy_matches_reference() {
     let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
@@ -98,4 +99,6 @@ fn vqa_greedy_matches_reference() {
         got, want,
         "image-conditioned greedy stream must match the reference"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vqa_parity::vqa_greedy_matches_reference");
 }

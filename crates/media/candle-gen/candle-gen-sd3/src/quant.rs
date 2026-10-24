@@ -231,13 +231,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_is_near_lossless() {
         quant_roundtrip(Quant::Q8, 0.999);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q8_is_near_lossless");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q4_stays_coherent() {
         quant_roundtrip(Quant::Q4, 0.95);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::q4_stays_coherent");
     }
 
     /// `quantize` is idempotent — a second call on an already-quantized linear is a no-op, not a panic
@@ -380,6 +388,7 @@ mod tests {
     /// dense sibling with no `.scales` stays `Dense`. The packed forward matches a dense linear built
     /// from the exact affine grid the packed parts represent.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_detect_fires_on_sd3_layout_and_leaves_dense_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -422,12 +431,15 @@ mod tests {
         let ref_lin = Linear::new(w_ref, Some(bias));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev).unwrap();
         let packed_out = lin.forward(&x).unwrap();
-        let ref_out = ref_lin.forward(&x).unwrap();
+        let ref_out = __model_proof_output!(ref_lin.forward(&x)).unwrap();
         let cos = cosine(&ref_out, &packed_out);
         assert!(
             cos > 0.9999,
             "packed forward must reproduce the affine grid it repacks (cosine {cos:.6})"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_detect_fires_on_sd3_layout_and_leaves_dense_unchanged");
     }
 
     /// **The post-load fold pass is a no-op on a packed projection** (sc-9414): a packed-loaded
@@ -467,6 +479,7 @@ mod tests {
     /// (so the modulation linear stays a dense-typed, chaos-safe leaf); its forward matches the exact
     /// affine grid the parts represent. Absent `.scales` it is a plain dense read.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_dense_dequantizes_packed_to_dense() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -487,8 +500,8 @@ mod tests {
         let w_ref = Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap();
         let ref_lin = Linear::new(w_ref, Some(bias));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev).unwrap();
-        let got = lin.forward(&x).unwrap();
-        let want = ref_lin.forward(&x).unwrap();
+        let got = __model_proof_output!(lin.forward(&x)).unwrap();
+        let want = __model_proof_output!(ref_lin.forward(&x)).unwrap();
         let cos = cosine(&want, &got);
         assert!(
             cos > 0.9999,
@@ -508,5 +521,8 @@ mod tests {
         let vb2 = vb_from_map(&tmp, "adaln_dense", map);
         let lin2 = linear_detect_dense(in_dim, out_dim, &vb2, "d", true).unwrap();
         assert_eq!(lin2.weight().dims(), &[out_dim, in_dim]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::linear_detect_dense_dequantizes_packed_to_dense");
     }
 }

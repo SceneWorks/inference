@@ -170,7 +170,13 @@ impl VitPose {
         let b = x.dim(0)?;
         let (gh, gw) = c.grid();
         let xc = x.permute([0, 3, 1, 2])?.contiguous()?;
-        let y = conv2d(&xc, &self.proj_w, Some(&self.proj_b), c.patch_size, 2)?; // [B, C, gh, gw]
+        let y = __model_proof_output!(conv2d(
+            &xc,
+            &self.proj_w,
+            Some(&self.proj_b),
+            c.patch_size,
+            2
+        ))?; // [B, C, gh, gw]
         let t = y.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
         let mut t = t.broadcast_add(&self.pos)?;
         for l in &self.layers {

@@ -603,7 +603,17 @@ fn fixed_q4_numeric_diagnostic() {
         images.push(image);
         facts.push(fact);
     }
-    let read_png = |file: &str| image::open(replay.join(file)).unwrap().to_rgb8().into_raw();
+    let read_png = |file: &str| {
+        mlx_gen::gen_core::__model_input_reader!(
+image::open(replay.join(file)),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/q4_diagnostic.rs::fixed_q4_numeric_diagnostic::image::open@26444",
+TensorInput,
+replay.join(file),
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap().to_rgb8().into_raw()
+    };
     let replay_base = images[0].pixels == read_png("q4_edit_base.png");
     let replay_structured = images[1].pixels == read_png("q4_edit_mlx_lokr.png");
     let zero = images[0].pixels == images[3].pixels;
@@ -707,4 +717,6 @@ fn fixed_q4_numeric_diagnostic() {
                 && c["completeDeltaBF16RoundPass"] == true)),
         "scalar complete-delta BF16 reconstruction or honest-report contract failure retained"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED q4_diagnostic::fixed_q4_numeric_diagnostic");
 }

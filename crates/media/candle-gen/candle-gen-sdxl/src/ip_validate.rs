@@ -316,4 +316,7 @@ fn real_weight_ip_adapter() {
     );
     assert!(out_ip.width == 1024 && out_ip.height == 1024);
     println!("SDXL IP-Adapter validation PASS ✅");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_validate::real_weight_ip_adapter");
 }

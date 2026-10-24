@@ -1791,6 +1791,7 @@ mod tests {
     /// dense fold (the accuracy bar the packed base's own quant already accepts). Also the guardrail: the
     /// base stays **packed** (footprint survives) and the residual actually shifts the output.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_additive_install_matches_dense_fold_and_stays_packed() {
         let tmp = tempfile::tempdir().unwrap();
         let dev = Device::Cpu;
@@ -1846,6 +1847,9 @@ mod tests {
             max_abs_diff(&packed_y, &bare.forward(&x).unwrap()) > 1e-3,
             "the additive residual must shift the packed forward"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::packed_additive_install_matches_dense_fold_and_stays_packed");
     }
 
     /// sc-24163 review: the packed tiers' overlay is priced at what `install_additive` holds. A LoRA
@@ -1857,6 +1861,7 @@ mod tests {
     /// *Mutations that red this:* `memory_strategy::ADAPTER_LORA_COPY` set to
     /// `UpcastLoraCopy::Cached`, or pricing LoKr tensors per stored element.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_overlay_price_matches_the_installed_residuals() {
         use candle_gen::gen_core::{
             adapter_stack_upcast_resident_bytes, AdapterResidencyMode::Additive,
@@ -1928,6 +1933,9 @@ mod tests {
                 specs[0].kind
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::the_packed_overlay_price_matches_the_installed_residuals");
     }
 
     #[test]
@@ -2122,6 +2130,7 @@ mod tests {
     /// effective alpha/rank, reproduce the folded `x·(W + δ)ᵀ` on a dense base — so the packed-additive
     /// and dense-fold paths agree to f32 tolerance at the resolver level.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn resolve_lora_matches_fold_on_dense() {
         let dev = Device::Cpu;
         let (out_dim, in_dim, rank) = (16usize, 12usize, 3usize);
@@ -2169,6 +2178,11 @@ mod tests {
         assert!(
             max_abs_diff(&additive.forward(&x).unwrap(), &folded.forward(&x).unwrap()) < 1e-4,
             "resolved additive != folded"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::resolve_lora_matches_fold_on_dense"
         );
     }
 

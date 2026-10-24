@@ -1497,6 +1497,16 @@ fn t2i_lora_trains_reloads_and_moves_every_tier() {
         }
     }
     assert_preflight_covers_step("t2i lora", &trained);
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::t2i_lora_trains_reloads_and_moves_every_tier");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::t2i_lora_trains_reloads_and_moves_every_tier");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 // ── 2. instruction-edit LoKr on two references ───────────────────────────────────────────────────
@@ -1693,6 +1703,16 @@ fn edit_lokr_trains_and_moves_two_reference_edits_every_tier() {
         assert_overlay_not_underpredicted(tier, &case["base"], &case["adapted"]);
     }
     assert_preflight_covers_step("edit lokr", &trained);
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::edit_lokr_trains_and_moves_two_reference_edits_every_tier");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::edit_lokr_trains_and_moves_two_reference_edits_every_tier");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 // ── 3. two stacked adapters, independent strengths ───────────────────────────────────────────────
@@ -1867,6 +1887,16 @@ fn stacked_adapters_apply_with_independent_weights() {
              its strength did not reach the render"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::stacked_adapters_apply_with_independent_weights");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::stacked_adapters_apply_with_independent_weights");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 // ── 4. a public third-party 2.1 LoRA ─────────────────────────────────────────────────────────────
@@ -1954,6 +1984,16 @@ fn third_party_lora_applies_strictly_and_moves_every_tier() {
         );
         assert_overlay_not_underpredicted(tier, &case["base"], &case["adapted"]);
     }
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::third_party_lora_applies_strictly_and_moves_every_tier");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::third_party_lora_applies_strictly_and_moves_every_tier");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 /// Hash-pinned CUDA LoRA/LoKr and the completed MLX 1000-step LoRA must install and move BOTH
@@ -1966,7 +2006,15 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
         std::env::var("QWEN_IMAGE_2_1_IMPORT_MANIFEST")
             .expect("set QWEN_IMAGE_2_1_IMPORT_MANIFEST to the materialized hash-pinned manifest"),
     );
-    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&manifest_path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::imported_adapters_move_t2i_and_two_reference_edit_every_tier::std::fs::read@91036",
+Configuration,
+&manifest_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap()).unwrap();
     let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
     let entries = manifest["adapters"].as_array().unwrap();
     assert_eq!(
@@ -2115,6 +2163,16 @@ fn imported_adapters_move_t2i_and_two_reference_edit_every_tier() {
                 "{label}: the preserved 1000-step adapter must still move toward its learned palette");
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::imported_adapters_move_t2i_and_two_reference_edit_every_tier");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::imported_adapters_move_t2i_and_two_reference_edit_every_tier");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 /// Fixed style-protocol diagnosis: six renders, no training or terminal acceptance.
@@ -2127,7 +2185,15 @@ fn diagnostic_reused_t2i_style_direction() {
         std::env::var("QWEN_IMAGE_2_1_IMPORT_MANIFEST")
             .expect("exact hash-pinned original donor manifest required"),
     );
-    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&manifest_path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::diagnostic_reused_t2i_style_direction::std::fs::read@98814",
+Configuration,
+&manifest_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap()).unwrap();
     let directory = PathBuf::from(manifest["directory"].as_str().unwrap());
     assert!(directory.is_absolute() && directory.is_dir());
     let entries = manifest["adapters"].as_array().unwrap();
@@ -2296,6 +2362,16 @@ fn diagnostic_reused_t2i_style_direction() {
             "{label}: original style donor must move toward its frozen training palette"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::diagnostic_reused_t2i_style_direction");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::diagnostic_reused_t2i_style_direction");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 /// A fixed 19-render investigation reuses completed training from the rejected candidate.
@@ -2315,7 +2391,15 @@ fn diagnostic_reused_edit_adapter_semantics() {
         std::env::var("QWEN_IMAGE_2_1_DIAGNOSTIC_MANIFEST")
             .expect("exact hash-pinned diagnostic manifest required"),
     );
-    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&manifest_path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs::diagnostic_reused_edit_adapter_semantics::std::fs::read@108368",
+Configuration,
+&manifest_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap()).unwrap();
     assert_eq!(manifest["purpose"], "DIAGNOSTIC_ONLY");
     assert_eq!(manifest["acceptanceEvidence"], false);
     assert_eq!(
@@ -2537,6 +2621,16 @@ fn diagnostic_reused_edit_adapter_semantics() {
         failures.is_empty(),
         "DIAGNOSTIC_ONLY failures retained: {failures:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    match module_path!() {
+        "integration::lora_real_weights" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::diagnostic_reused_edit_adapter_semantics");
+        }
+        "mlx_gen_qwen_image_2_1::q4_real_weights_support" => {
+            println!("\nMODEL_INFERENCE_BODY_COMPLETED q4_real_weights_support::diagnostic_reused_edit_adapter_semantics");
+        }
+        other => panic!("unregistered model-proof module: {other}"),
+    }
 }
 
 fn diagnostic_render_checks(

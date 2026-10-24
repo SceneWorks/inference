@@ -417,6 +417,13 @@ impl SourceInventory {
         self.verify_unchanged_with_capacity(next).map_err(E::from)?;
         let result = read(next);
         self.verify_unchanged_with_capacity(next).map_err(E::from)?;
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            crate::runtime::record_sealed_input_read(
+                "gen-core::SourceInventory::read_unchanged_with_capacity",
+                self.pins.iter(),
+            );
+        }
         result
     }
 
@@ -633,6 +640,13 @@ impl SourceInventory {
         self.verify_unchanged().map_err(E::from)?;
         let result = read();
         self.verify_unchanged().map_err(E::from)?;
+        #[cfg(feature = "model-inference-proof")]
+        if result.is_ok() {
+            crate::runtime::record_sealed_input_read(
+                "gen-core::SourceInventory::read_unchanged",
+                self.pins.iter(),
+            );
+        }
         result
     }
 }

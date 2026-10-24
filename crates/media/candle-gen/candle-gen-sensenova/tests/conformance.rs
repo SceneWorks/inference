@@ -40,4 +40,7 @@ fn sensenova_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_sensenova::load(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::sensenova_conformance");
 }

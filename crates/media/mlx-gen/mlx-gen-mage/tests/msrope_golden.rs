@@ -68,6 +68,8 @@ fn msrope_matches_the_reference_table() {
     );
     assert!(cos_abs < 1e-5, "msrope cos diverged: max_abs {cos_abs}");
     assert!(sin_abs < 1e-5, "msrope sin diverged: max_abs {sin_abs}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED msrope_golden::msrope_matches_the_reference_table");
 }
 
 /// The counter-probe: rotating the duplicated **unconditional** branch at frame **0** — the
@@ -123,6 +125,8 @@ fn rotating_the_uncond_branch_at_frame_zero_does_not_match_the_golden() {
         spatial_abs < 1e-5,
         "the frame index must not touch the height/width lanes (max_abs {spatial_abs})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED msrope_golden::rotating_the_uncond_branch_at_frame_zero_does_not_match_the_golden");
 }
 
 /// The layout this crate builds for a fused-CFG forward must reproduce the reference's packing

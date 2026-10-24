@@ -188,4 +188,6 @@ fn kolors_img2img_matches_diffusers() {
         (mean_r - mean_g).abs()
     );
     println!("✓ Kolors img2img full pipeline renders coherently (cross-backend px delta is chaos-limited)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED img2img_parity::kolors_img2img_matches_diffusers");
 }

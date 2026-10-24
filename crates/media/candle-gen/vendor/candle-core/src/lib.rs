@@ -49,6 +49,36 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+#[path = "../../../../../contracts/gen-core/src/model_input_macros.rs"]
+mod model_input_macros;
+#[cfg(feature = "model-inference-proof")]
+#[path = "../../../../../contracts/gen-core/src/model_input_proof.rs"]
+pub mod model_input_proof;
+#[cfg(feature = "model-inference-proof")]
+macro_rules! __model_input_inspect {
+    ($value:expr, $observe:expr) => {
+        ($value).inspect($observe)
+    };
+}
+#[cfg(not(feature = "model-inference-proof"))]
+macro_rules! __model_input_inspect {
+    ($value:expr, $observe:expr) => {
+        ($value)
+    };
+}
+#[cfg(feature = "model-inference-proof")]
+macro_rules! __model_input_select {
+    ($original:expr, $observed:expr) => {
+        ($observed)
+    };
+}
+#[cfg(not(feature = "model-inference-proof"))]
+macro_rules! __model_input_select {
+    ($original:expr, $observed:expr) => {
+        ($original)
+    };
+}
+
 pub mod backend;
 pub mod backprop;
 pub mod conv;

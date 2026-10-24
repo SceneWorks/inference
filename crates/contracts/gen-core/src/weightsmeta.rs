@@ -245,7 +245,12 @@ pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<Stri
     })?;
     let mut header = vec![0_u8; header_len];
     file.read_exact(&mut header)?;
-    safetensors_metadata_from_json(path, &header)
+    crate::__model_input_result!(
+        safetensors_metadata_from_json(path, &header),
+        "gen-core::weightsmeta::safetensors_file_metadata",
+        Configuration,
+        &[path]
+    )
 }
 
 /// The metadata parser shared by file reads and guarded consumers of an already-held header.
@@ -798,12 +803,17 @@ fn file_tensor_locations_impl(
             expected_start - data_start
         )));
     }
-    Ok(SafetensorsFileLayout {
-        header_json: header,
-        data_start,
-        file_len,
-        tensors,
-    })
+    crate::__model_input_result!(
+        Ok(SafetensorsFileLayout {
+            header_json: header,
+            data_start,
+            file_len,
+            tensors,
+        }),
+        "gen-core::weightsmeta::file_tensor_locations_impl",
+        Configuration,
+        &[path]
+    )
 }
 
 /// The file-level `__metadata__._quantization_metadata` string of one safetensors file, if it

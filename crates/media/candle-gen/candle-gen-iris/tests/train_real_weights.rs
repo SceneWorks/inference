@@ -56,7 +56,13 @@ fn dataset(out: &Path) -> Vec<TrainingItem> {
         Err(_) => {
             let photo = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/_vendor/mage_flow/assets/dog.jpg");
-            let rgb = image::open(photo)
+            let rgb = candle_gen::gen_core::__model_input_reader!(
+                image::open(photo),
+                "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::dataset/image::open",
+                Reference,
+                photo,
+                |__model_input_path| image::open(__model_input_path)
+            )
                 .expect("the repo photo decodes")
                 .to_rgb8();
             let (w, h) = rgb.dimensions();
@@ -282,5 +288,10 @@ fn real_lora_trains_exports_and_renders() {
     assert!(
         max_abs(&preview, &after) <= 2,
         "the provider-loaded adapter must render the trainer's (EMA) preview"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED train_real_weights::real_lora_trains_exports_and_renders"
     );
 }

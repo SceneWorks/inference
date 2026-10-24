@@ -147,13 +147,27 @@ impl SdxlConditioner {
 
         let tok_l_file = resolve_tokenizer_file(tokenizer_clip_l);
         let tok_g_file = resolve_tokenizer_file(tokenizer_clip_bigg);
-        let tok_l = Tokenizer::from_file(&tok_l_file).map_err(|e| {
+        let tok_l = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(&tok_l_file),
+"crates/media/candle-gen/candle-gen-sdxl/src/conditioning.rs::load::Tokenizer::from_file@7400",
+Tokenizer,
+&tok_l_file,
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| {
             CandleError::Msg(format!(
                 "sdxl: load CLIP-L tokenizer from {}: {e}",
                 tok_l_file.display()
             ))
         })?;
-        let tok_g = Tokenizer::from_file(&tok_g_file).map_err(|e| {
+        let tok_g = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(&tok_g_file),
+"crates/media/candle-gen/candle-gen-sdxl/src/conditioning.rs::load::Tokenizer::from_file@7631",
+Tokenizer,
+&tok_g_file,
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| {
             CandleError::Msg(format!(
                 "sdxl: load CLIP-bigG tokenizer from {}: {e}",
                 tok_g_file.display()
@@ -306,6 +320,7 @@ mod tests {
     /// `pool_eos` gathers the per-row EOS hidden and projects it — shape `[B, out]`, and it actually
     /// selects the EOS row (not row 0). Synthetic `final_g` with a distinctive EOS-position vector.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn pool_eos_gathers_eos_and_projects() {
         let dev = Device::Cpu;
         // B=1, S=4, H=3. EOS at index 2 (token ids put the max there).
@@ -324,5 +339,8 @@ mod tests {
         assert_eq!(pooled.dims(), &[1, 3]);
         let v = pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v, vec![2.0, 2.0, 2.0]); // the EOS-position (index 2) hidden, projected by identity
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conditioning::tests::pool_eos_gathers_eos_and_projects");
     }
 }

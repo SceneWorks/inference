@@ -186,3 +186,6 @@ tempfile = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[features]
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof"]

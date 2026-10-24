@@ -2910,7 +2910,8 @@ mod tests {
     }
 }
 #[test]
-#[ignore = "real fused SDXL checkpoint + Metal; set SDXL_LDM_CHECKPOINT and SDXL_TOKENIZER_ROOT"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "real fused SDXL checkpoint + Metal; set SDXL_LDM_CHECKPOINT and SDXL_TOKENIZER_ROOT"]
 fn fused_ldm_real_weight_render_is_nonconstant() {
     let checkpoint = std::env::var_os("SDXL_LDM_CHECKPOINT")
         .map(std::path::PathBuf::from)
@@ -2920,8 +2921,9 @@ fn fused_ldm_real_weight_render_is_nonconstant() {
         .expect("set SDXL_TOKENIZER_ROOT");
     let spec = LoadSpec::new(WeightsSource::File(checkpoint));
     let generator = load_from_ldm_file(&spec, &tokenizer_root).expect("load fused SDXL");
-    let output = generator
-        .generate(
+    let output = (
+        crate::test_device::record_model_inference_device(),
+        generator.generate(
             &GenerationRequest {
                 prompt: "a red fox in a snowy forest, cinematic photograph".into(),
                 negative_prompt: Some("blurry, low quality".into()),
@@ -2933,7 +2935,9 @@ fn fused_ldm_real_weight_render_is_nonconstant() {
                 ..Default::default()
             },
             &mut |_| {},
-        )
+        ),
+    )
+        .1
         .expect("render fused SDXL");
     let GenerationOutput::Images(images) = output else {
         panic!("SDXL returned non-image output");
@@ -2943,6 +2947,8 @@ fn fused_ldm_real_weight_render_is_nonconstant() {
     let min = *image.pixels.iter().min().expect("pixels");
     let max = *image.pixels.iter().max().expect("pixels");
     assert!(max.saturating_sub(min) > 32, "render is nearly constant");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED model::fused_ldm_real_weight_render_is_nonconstant");
 }
 
 pub(crate) fn reference_inputs(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {

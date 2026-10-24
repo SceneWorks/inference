@@ -168,6 +168,7 @@ fn assert_vec(name: &str, got: &[f32], want: &[f32], tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn flow_loss_matches_rectified_flow() {
     let g = fixture(GOLDEN);
     let (model, params) = full_model();
@@ -198,6 +199,9 @@ fn flow_loss_matches_rectified_flow() {
         g.require("loss_v"),
         1e-6,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::flow_loss_matches_rectified_flow");
 }
 
 #[test]
@@ -308,13 +312,21 @@ fn full_case(kind: OptimizerKind, tag: &str, rel_tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn full_training_adamw_matches_upstream() {
     full_case(OptimizerKind::AdamW, "adamw", 2e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::full_training_adamw_matches_upstream");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn full_training_muon_matches_upstream() {
     full_case(OptimizerKind::Muon, "muon", 5e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::full_training_muon_matches_upstream");
 }
 
 /// The adapter run on the miniature backbone: the model, its factor `Var`s at the oracle's
@@ -530,23 +542,39 @@ fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_adamw_matches_oracle() {
     adapter_case("lora", OptimizerKind::AdamW, 2e-3);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lora_adamw_matches_oracle");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lora_muon_matches_oracle() {
     adapter_case("lora", OptimizerKind::Muon, 5e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lora_muon_matches_oracle");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lokr_adamw_matches_oracle() {
     adapter_case("lokr", OptimizerKind::AdamW, 2e-3);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lokr_adamw_matches_oracle");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn lokr_muon_matches_oracle() {
     adapter_case("lokr", OptimizerKind::Muon, 6e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::lokr_muon_matches_oracle");
 }
 
 /// The step's `GradStore` holds a gradient for every trainable `Var` and for nothing else: the
@@ -573,6 +601,7 @@ fn assert_store_is_exactly_the_trainables(
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn backward_stores_gradients_only_for_trainable_tensors() {
     let g = fixture(GOLDEN);
     for kind_name in ["lora", "lokr"] {
@@ -581,4 +610,7 @@ fn backward_stores_gradients_only_for_trainable_tensors() {
     }
     let (model, params) = full_model();
     assert_store_is_exactly_the_trainables("full", &model, &params, &g);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_parity::backward_stores_gradients_only_for_trainable_tensors");
 }

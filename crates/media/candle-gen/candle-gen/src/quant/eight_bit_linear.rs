@@ -60,7 +60,7 @@ impl Fp8Linear {
             .matmul_fp8(&self.w_fp8, self.scale_w, &qx.q, qx.scale)?;
         let y = restore(y)?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
             None => Ok(y),
         }
     }
@@ -191,7 +191,7 @@ impl Int8Linear {
         };
         let y = restore(y)?;
         match &self.bias {
-            Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),
+            Some(b) => __model_proof_output!(y.broadcast_add(&b.to_dtype(y.dtype())?)),
             None => Ok(y),
         }
     }

@@ -805,7 +805,7 @@ impl Linear {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = self.w.materialize(x.dtype(), x.device())?;
-        affine(x, &w, Some(&self.b))
+        __model_proof_output!(affine(x, &w, Some(&self.b)))
     }
 
     fn out_features(&self) -> usize {

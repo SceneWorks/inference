@@ -31,6 +31,7 @@ mlx-sys = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 
 [features]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof"]
 # The three trainers (`training`: generation, depth, restoration) and their training-only deps —
 # MLX distributed + the JACCL link (`build.rs`), dataset image validation, checkpoint state.
 # Default-on, so every existing consumer is unchanged; an inference-only graph (the iOS bundle)

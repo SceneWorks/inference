@@ -161,7 +161,13 @@ fn clip_eos_id(tok: &Tokenizer) -> CandleResult<u32> {
 fn resolve_clip_pad_id(dir: &Path, tok: &Tokenizer, eos_id: u32) -> CandleResult<u32> {
     // `tokenizer_config.json` -> `pad_token` (a string, e.g. "!" or "<|endoftext|>"); map to its id.
     let cfg = dir.join("tokenizer_config.json");
-    let config = match std::fs::read_to_string(&cfg) {
+    let config = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&cfg),
+"crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::resolve_clip_pad_id::std::fs::read_to_string@8591",
+ArtifactInput,
+&cfg,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(config) => config,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(eos_id),
         Err(error) => {
@@ -285,8 +291,14 @@ impl Sd3TextEncoders {
         let pad_l = resolve_clip_pad_id(&root.join("tokenizer"), &tok_l, eos_l)?;
         let pad_g = resolve_clip_pad_id(&root.join("tokenizer_2"), &tok_g, eos_g)?;
         // T5 ships its own `tokenizer.json` in a stock snapshot (out of scope for sc-8500).
-        let tok_t5 = Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
+        let tok_t5 = candle_gen::gen_core::__model_input_reader!(
+Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json")),
+"crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::Tokenizer::from_file@15308",
+Tokenizer,
+root.join("tokenizer_3/tokenizer.json"),
+|__model_input_path| Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
 
         let l_file = artifacts.clip_l;
         let g_file = artifacts.clip_g;
@@ -298,9 +310,14 @@ impl Sd3TextEncoders {
         // T5-XXL (`text_encoder_3/`, sharded; config.json alongside).
         let t5_dir = root.join("text_encoder_3");
         let t5_cfg: T5Config = {
-            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
-                CandleError::Msg(format!("sd3: read text_encoder_3/config.json: {e}"))
-            })?;
+            let cfg = candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(t5_dir.join("config.json")),
+"crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::std::fs::read_to_string@16073",
+ArtifactInput,
+t5_dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+            .map_err(|e| CandleError::Msg(format!("sd3: read text_encoder_3/config.json: {e}")))?;
             serde_json::from_str(&cfg)
                 .map_err(|e| CandleError::Msg(format!("sd3: parse T5 config.json: {e}")))?
         };
@@ -349,7 +366,7 @@ impl Sd3TextEncoders {
         // `forward_until_encoder_layer(.., -2)` → (final-norm hidden, penultimate hidden).
         let (final_hidden, penult) = clip.forward_until_encoder_layer(&input, usize::MAX, -2)?;
         let pooled_eos = pool_hidden_at_eos(&final_hidden, &ids, eos_id)?; // [1, embed]
-        let pooled = proj.forward(&pooled_eos)?;
+        let pooled = __model_proof_output!(proj.forward(&pooled_eos))?;
         Ok((penult.to_dtype(self.dtype)?, pooled.to_dtype(self.dtype)?))
     }
 
@@ -371,7 +388,7 @@ impl Sd3TextEncoders {
         t5_ids.truncate(self.t5_seq_len);
         t5_ids.resize(self.t5_seq_len, T5_PAD_TOKEN_ID);
         let t5_input = Tensor::new(t5_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-        let t5_hidden = self.t5.forward(&t5_input)?.to_dtype(self.dtype)?; // [1, t5_seq_len, 4096]
+        let t5_hidden = __model_proof_output!(self.t5.forward(&t5_input))?.to_dtype(self.dtype)?; // [1, t5_seq_len, 4096]
 
         Ok(EncoderOutputs {
             clip_l_hidden,
@@ -412,7 +429,7 @@ impl Sd3TextEncoders {
         t5_ids.truncate(self.t5_seq_len);
         t5_ids.resize(self.t5_seq_len, T5_PAD_TOKEN_ID);
         let t5_input = Tensor::new(t5_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-        let t5_hidden = self.t5.forward(&t5_input)?.to_dtype(self.dtype)?;
+        let t5_hidden = __model_proof_output!(self.t5.forward(&t5_input))?.to_dtype(self.dtype)?;
 
         Ok(EncoderOutputs {
             clip_l_hidden,

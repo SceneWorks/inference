@@ -111,4 +111,6 @@ fn encoder_matches_mlx_reference_large() {
         g.require("ref_vision_features").unwrap(),
         "vision_features",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encoder_parity::encoder_matches_mlx_reference_large");
 }

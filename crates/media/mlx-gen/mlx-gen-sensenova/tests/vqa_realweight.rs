@@ -34,6 +34,7 @@ fn vqa_realweight_matches_reference() {
         eprintln!(
             "skipping: snapshot or golden missing — see tools/dump_sensenova_vqa_realweight.py"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in vqa_realweight_matches_reference; see preceding skip diagnostic");
         return;
     }
 
@@ -132,6 +133,8 @@ fn vqa_realweight_matches_reference() {
         .expect("vqa");
     println!("  vqa(): {answer:?}");
     assert!(!answer.is_empty(), "vqa returned empty answer");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vqa_realweight::vqa_realweight_matches_reference");
 }
 
 /// sc-3905 regression: with a *small* token budget, [`T2iModel::vqa`] must still return an answer —
@@ -145,6 +148,7 @@ fn vqa_primes_no_think_on_small_budget() {
     let snap = snapshot_dir();
     if !snap.exists() {
         eprintln!("skipping: snapshot missing at {}", snap.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in vqa_primes_no_think_on_small_budget; see preceding skip diagnostic");
         return;
     }
     let cfg = NeoChatConfig::from_dir(&snap).expect("config");
@@ -171,4 +175,6 @@ fn vqa_primes_no_think_on_small_budget() {
         !answer.contains("<think>"),
         "no-think prime should suppress the reasoning block, got: {answer:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vqa_realweight::vqa_primes_no_think_on_small_budget");
 }

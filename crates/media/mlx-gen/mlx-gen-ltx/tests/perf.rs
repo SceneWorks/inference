@@ -90,6 +90,7 @@ fn ltx_video_per_step_compiled_vs_eager() {
         eprintln!(
             "skip: set LTX_BASE_DIR (and/or LTX_BASE_Q4_DIR) or install the prod LTX model dirs"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in ltx_video_per_step_compiled_vs_eager; see preceding skip diagnostic");
         return;
     }
     // (label, frames, height, width) in LATENT/patch units: 512²×129f and 1280×720.
@@ -167,6 +168,8 @@ fn ltx_video_per_step_compiled_vs_eager() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::ltx_video_per_step_compiled_vs_eager");
 }
 
 #[test]
@@ -181,6 +184,7 @@ fn ltx_av_compiled_vs_eager() {
         Some((_, d)) => d.clone(),
         None => {
             eprintln!("skip: need an LTX model dir for the AvDiT audio-path parity check");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in ltx_av_compiled_vs_eager; see preceding skip diagnostic");
             return;
         }
     };
@@ -226,4 +230,6 @@ fn ltx_av_compiled_vs_eager() {
         da, 0.0,
         "LTX AvDiT audio glue diverged from eager on real weights"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::ltx_av_compiled_vs_eager");
 }

@@ -130,6 +130,10 @@ fn quantized_segmenter_stays_close_to_dense() {
             dense.len()
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED quant_smoke::quantized_segmenter_stays_close_to_dense"
+    );
 }
 
 #[test]

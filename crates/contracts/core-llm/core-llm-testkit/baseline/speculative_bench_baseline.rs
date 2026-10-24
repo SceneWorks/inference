@@ -818,4 +818,9 @@ fn speculative_bench_baseline_writes_the_document() {
         .and_then(|()| file.write_all(b"\n"))
         .unwrap_or_else(|e| panic!("write {}: {e}", output.display()));
     println!("wrote {} ({n} rows)", output.display());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED baseline::speculative_bench_baseline_writes_the_document"
+    );
 }

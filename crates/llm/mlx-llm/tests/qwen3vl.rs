@@ -52,10 +52,12 @@ fn snapshot_dir() -> Option<PathBuf> {
 /// generate coherent, reproducible text. "The capital of France is" → must mention Paris — a tight
 /// end-to-end grounding check (if the weight prefix, the norm convention (standard RMSNorm), or the
 /// RoPE were wrong, the model could not answer).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen3vl_text_decoder_loads_and_generates_coherently() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_text_decoder_loads_and_generates_coherently; see preceding skip diagnostic");
         return;
     };
 
@@ -119,14 +121,18 @@ fn qwen3vl_text_decoder_loads_and_generates_coherently() {
         text.to_lowercase().contains("paris"),
         "coherent answer must name Paris, got: {text:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_text_decoder_loads_and_generates_coherently");
 }
 
 /// The full `core-llm` contract path: load via the registry by id (`mlx-llama`), confirm the loaded
 /// descriptor reports the Qwen3-VL family + 256K context, and stream a coherent reply.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_round_trips_through_core_llm_contract() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_round_trips_through_core_llm_contract; see preceding skip diagnostic");
         return;
     };
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
@@ -172,13 +178,21 @@ fn qwen3vl_round_trips_through_core_llm_contract() {
         "coherent contract answer must name Paris, got: {:?}",
         out.text
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_round_trips_through_core_llm_contract"
+    );
 }
 
 /// A mid-stream cancel on the real decoder stops promptly with a partial result.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen3vl_mid_stream_cancel() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in qwen3vl_mid_stream_cancel; see preceding skip diagnostic",
+        );
         return;
     };
     let cfg = ModelConfig::from_dir(&dir).unwrap();
@@ -218,6 +232,8 @@ fn qwen3vl_mid_stream_cancel() {
     .unwrap();
     assert_eq!(out.finish_reason, mlx_llm::decode::FinishReason::Cancelled);
     assert!(out.tokens.len() <= 6, "cancel should stop promptly");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_mid_stream_cancel");
 }
 
 // =============================================================================================
@@ -285,9 +301,11 @@ fn run_vision(p: &dyn TextLlm, req: &TextLlmRequest) -> (String, core_llm::Usage
 /// dominant color exercises the whole fused stack (preprocess → ViT → DeepStack → merger → splice →
 /// interleaved M-RoPE → decode); a break anywhere keeps it from naming the color reliably.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_vision_grounds_single_image_via_core_llm() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_vision_grounds_single_image_via_core_llm; see preceding skip diagnostic");
         return;
     };
 
@@ -335,6 +353,8 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_vision_grounds_single_image_via_core_llm");
 }
 
 /// **sc-8077 (the story-D gap, closed):** model-first **vision-required** routing must resolve the
@@ -349,9 +369,11 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
 /// vision-required load now resolves to `mlx-llama` (NOT a misrouted JoyCaption/LLaVA provider) and,
 /// loaded, grounds on an image.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_vision_required_routing_resolves_via_core_llm() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_vision_required_routing_resolves_via_core_llm; see preceding skip diagnostic");
         return;
     };
     let spec = LoadSpec::dense(dir.to_str().unwrap());
@@ -393,6 +415,8 @@ fn qwen3vl_vision_required_routing_resolves_via_core_llm() {
         content.to_lowercase().contains("red"),
         "vision-required-resolved provider must ground on the image, got: {content:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_vision_required_routing_resolves_via_core_llm");
 }
 
 /// **sc-8076 AC #2:** a 2-image prompt works end-to-end. Two solid-color images are interleaved with
@@ -400,9 +424,11 @@ fn qwen3vl_vision_required_routing_resolves_via_core_llm() {
 /// order). This exercises multi-image preprocessing, per-image patch-count placeholder expansion,
 /// feature concatenation, and the interleaved M-RoPE position assignment across two images.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_vision_grounds_two_images_via_core_llm() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_vision_grounds_two_images_via_core_llm; see preceding skip diagnostic");
         return;
     };
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
@@ -435,6 +461,10 @@ fn qwen3vl_vision_grounds_two_images_via_core_llm() {
         lc.find("red") < lc.find("blue"),
         "multi-image answer must name the images in order (red before blue), got: {content:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_vision_grounds_two_images_via_core_llm"
+    );
 }
 
 /// **sc-8076 AC #4 — q4/q8 import path verified.** Load the Qwen3-VL snapshot with on-load `Q4` then
@@ -448,10 +478,12 @@ fn qwen3vl_vision_grounds_two_images_via_core_llm() {
 /// quantized decoder + dense vision encoder. That is sufficient for the import/serve path this AC
 /// requires and is verified here against the real snapshot. A fully-quantized ViT (and loading a
 /// snapshot whose ViT weights are pre-quantized) is a separate enhancement, tracked as a follow-up.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen3vl_vision_q4_q8_import_path() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_vision_q4_q8_import_path; see preceding skip diagnostic");
         return;
     };
     let source = dir.to_str().unwrap().to_string();
@@ -498,6 +530,8 @@ fn qwen3vl_vision_q4_q8_import_path() {
             "{label}: quantized greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_vision_q4_q8_import_path");
 }
 
 // =============================================================================================
@@ -526,9 +560,11 @@ fn solid_video(colors: &[[u8; 3]], fps: f32) -> VideoRef {
 /// axis → DeepStack fusion → decode) is what lets the model order the frames; a break anywhere makes
 /// the temporal answer unreliable. The model's exact phrasing is logged.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_video_grounds_temporal_order_via_core_llm; see preceding skip diagnostic");
         return;
     };
     let provider = load_for_model_with(
@@ -592,6 +628,8 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
         );
         assert!(r < b, "temporally-grounded answer must name the starting color (red) before the ending color (blue), got: {content:?}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_video_grounds_temporal_order_via_core_llm");
 }
 
 /// **sc-8081 — temporal grounding on a second, independent video (order reversed).** A
@@ -601,9 +639,11 @@ fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
 /// answer names blue before green. Exercises the same Text–Timestamp-Alignment path on different
 /// content. The model's exact phrasing is logged.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn qwen3vl_video_temporal_order_reversed_via_core_llm() {
     let Some(dir) = snapshot_dir() else {
         eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in qwen3vl_video_temporal_order_reversed_via_core_llm; see preceding skip diagnostic");
         return;
     };
     let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
@@ -643,6 +683,8 @@ fn qwen3vl_video_temporal_order_reversed_via_core_llm() {
         );
         assert!(b < g, "temporally-grounded answer must name the starting color (blue) before the ending color (green), got: {content:?}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl::qwen3vl_video_temporal_order_reversed_via_core_llm");
 }
 
 /// **sc-8081 AC #2 (representation sanity) — the descriptor advertises video and a video request is

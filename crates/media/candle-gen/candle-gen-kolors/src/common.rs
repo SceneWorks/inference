@@ -106,9 +106,9 @@ pub(crate) fn decode(
             )?;
             pid.decode(latents)?
         }
-        None => {
-            candle_gen::bounded_kl_decode(&VAE_DECODER, &(latents / VAE_SCALE)?, |l| vae.decode(l))?
-        }
+        None => candle_gen::bounded_kl_decode(&VAE_DECODER, &(latents / VAE_SCALE)?, |l| {
+            __model_proof_output!(vae.decode(l))
+        })?,
     };
     to_image(&img)
 }

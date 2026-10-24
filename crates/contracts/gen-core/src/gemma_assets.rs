@@ -172,8 +172,20 @@ impl GemmaAssets {
                     ))
                 })
         };
-        let config_json = std::fs::read_to_string(find("config.json")?)?;
-        let tokenizer_json = std::fs::read(find("tokenizer.json")?)?;
+        let config_json = crate::__model_input_reader!(
+            std::fs::read_to_string(find("config.json")?),
+            "gen-core::gemma_assets::GemmaAssets::from_root/config.json",
+            Configuration,
+            find("config.json")?,
+            |__model_input_path| std::fs::read_to_string(__model_input_path)
+        )?;
+        let tokenizer_json = crate::__model_input_reader!(
+            std::fs::read(find("tokenizer.json")?),
+            "gen-core::gemma_assets::GemmaAssets::from_root/tokenizer.json",
+            Tokenizer,
+            find("tokenizer.json")?,
+            |__model_input_path| std::fs::read(__model_input_path)
+        )?;
 
         let mut sidecars: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for path in &files {
@@ -190,7 +202,42 @@ impl GemmaAssets {
             if !is_sidecar || sidecars.contains_key(name) {
                 continue;
             }
-            sidecars.insert(name.to_string(), std::fs::read(path)?);
+            sidecars.insert(name.to_string(), crate::__model_input_choose!(
+                    std::fs::read(path),
+                    std::fs::read(path).inspect(|_| {
+                        match name {
+                            "tokenizer_config.json" => {
+                                crate::model_input_proof::record_reader_paths(
+                                    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/tokenizer_config.json",
+                                    crate::model_input_proof::InputRole::Configuration,
+                                    &[path],
+                                );
+                            }
+                            "processor_config.json" => {
+                                crate::model_input_proof::record_reader_paths(
+                                    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/processor_config.json",
+                                    crate::model_input_proof::InputRole::Configuration,
+                                    &[path],
+                                );
+                            }
+                            "chat_template.jinja" => {
+                                crate::model_input_proof::record_reader_paths(
+                                    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/chat_template.jinja",
+                                    crate::model_input_proof::InputRole::Configuration,
+                                    &[path],
+                                );
+                            }
+                            "generation_config.json" => {
+                                crate::model_input_proof::record_reader_paths(
+                                    "gen-core::gemma_assets::GemmaAssets::from_root/sidecar/generation_config.json",
+                                    crate::model_input_proof::InputRole::Configuration,
+                                    &[path],
+                                );
+                            }
+                            _ => {}
+                        }
+                    })
+                )?);
         }
 
         let assets = Self {
@@ -398,6 +445,52 @@ impl SafetensorsHeader {
                 },
             );
         }
+        #[cfg(feature = "model-inference-proof")]
+        {
+            if metadata.contains_key("gemma_config") {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/gemma_config",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            if metadata.contains_key("tokenizer_config.json")
+                && !assets.contains_key("hf_asset__tokenizer_config.json")
+            {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/tokenizer_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            if metadata.contains_key("processor_config.json")
+                && !assets.contains_key("hf_asset__processor_config.json")
+            {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/processor_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            if metadata.contains_key("chat_template.jinja")
+                && !assets.contains_key("hf_asset__chat_template.jinja")
+            {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/chat_template.jinja",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            if metadata.contains_key("generation_config.json")
+                && !assets.contains_key("hf_asset__generation_config.json")
+            {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read/metadata/generation_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+        }
         Ok(Self {
             data_base,
             file_len,
@@ -495,6 +588,45 @@ impl SafetensorsHeader {
                 path.display()
             ))
         })?;
+        #[cfg(feature = "model-inference-proof")]
+        match key {
+            "tokenizer_json" => {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read_asset/tokenizer_json",
+                    crate::model_input_proof::InputRole::Tokenizer,
+                    &[path],
+                );
+            }
+            "hf_asset__tokenizer_config.json" => {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__tokenizer_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            "hf_asset__processor_config.json" => {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__processor_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            "hf_asset__chat_template.jinja" => {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__chat_template.jinja",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            "hf_asset__generation_config.json" => {
+                crate::model_input_proof::record_reader_paths(
+                    "gen-core::gemma_assets::SafetensorsHeader::read_asset/hf_asset__generation_config.json",
+                    crate::model_input_proof::InputRole::Configuration,
+                    &[path],
+                );
+            }
+            _ => {}
+        }
         if width == 1 {
             return Ok(raw);
         }

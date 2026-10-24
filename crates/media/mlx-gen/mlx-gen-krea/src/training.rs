@@ -1038,8 +1038,13 @@ fn resolve_target_paths(transformer: &Krea2Transformer, cfg: &TrainingConfig) ->
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-krea/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1614,6 +1619,7 @@ mod tests {
     /// all-ones map equals the unweighted loss; an all-zero map gives loss exactly 0 and all-zero
     /// adapter grads on both paths; a half map lands strictly between and agrees across paths.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         use mlx_gen::train::loss::subject_mask_weight;
         use mlx_gen::weights::Weights;
@@ -1739,6 +1745,8 @@ mod tests {
             (dense - ckpt).abs() < 1e-4,
             "dense {dense} vs checkpoint {ckpt}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 }
 
@@ -1901,6 +1909,8 @@ mod real_weight_repro {
             rel < 1e-3,
             "checkpointed grads must match dense within tolerance: max rel {rel:.2e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::real_weight_repro::checkpointed_grads_match_dense");
     }
 }
 
@@ -2069,6 +2079,7 @@ mod depth_anchoring_tests {
     /// gradient; a diffusion step (key 1) carries no depth term. Mutation: force
     /// `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only_on_both_paths() {
         let mut f = fixture();
         let d = aux_driver(
@@ -2117,12 +2128,15 @@ mod depth_anchoring_tests {
                 .sum();
             assert!(gb > 0.0 && gb.is_finite(), "ckpt={ckpt}: LoRA-B grad {gb}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only_on_both_paths");
     }
 
     /// AC (c): depth off ⇒ bit-identical to the pre-epic-2123 step (its closure reproduced), and a
     /// diffusion-only step of an enabled path takes the same graph. Mutation: scale the diffusion
     /// reduction (×1.0001) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -2177,6 +2191,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_off {
             assert_eq!(bits(v), bits(&g_on[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// With two resolution buckets (item-major cache, seeded shuffle) the optimizer windows
@@ -2185,6 +2201,7 @@ mod depth_anchoring_tests {
     /// once per entry. Mutation: key the alternation per epoch (`AuxAlternation::new(1, epoch_len)`
     /// in `AuxDriver::prepare_keyed`) ⇒ a depth run ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn two_buckets_interleave_with_per_entry_references() {
         let f = fixture();
         let items = 2usize;
@@ -2224,6 +2241,8 @@ mod depth_anchoring_tests {
             );
         }
         assert_eq!(d.path().reference_computations(), cache.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::two_buckets_interleave_with_per_entry_references");
     }
 
     /// AC (d), E7: depth grows the estimate by TAEW2.1 + DA2 (more for Large) and the guard counts

@@ -147,4 +147,6 @@ fn kolors_inference_lora_scale0_is_base_and_scale1_has_effect() {
         d1 > 0.0,
         "scale=1 trained LoRA must change the forward output"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lora_parity::kolors_inference_lora_scale0_is_base_and_scale1_has_effect");
 }

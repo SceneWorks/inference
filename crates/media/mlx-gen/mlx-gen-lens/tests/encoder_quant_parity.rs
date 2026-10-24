@@ -109,6 +109,8 @@ fn encoder_q8_matches_reference() {
         "Q8 worst cosine {worst:.5} ≤ 0.995 — quant degraded well past the bf16 floor {DENSE_FLOOR_COS}"
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encoder_quant_parity::encoder_q8_matches_reference");
 }
 
 #[test]
@@ -122,4 +124,6 @@ fn encoder_q4_matches_reference() {
         "Q4 worst cosine {worst:.5} ≤ 0.95 — not a coherent quantization"
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED encoder_quant_parity::encoder_q4_matches_reference");
 }

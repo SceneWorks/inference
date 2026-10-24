@@ -123,7 +123,7 @@ impl PatchConv {
 
     /// NCHW `[1, channels, H, W]` -> `[grid_h * grid_w, hidden]` in row-major order.
     fn forward(&self, image: &Tensor) -> CandleResult<Tensor> {
-        let y = self.conv.forward(image)?;
+        let y = __model_proof_output!(self.conv.forward(image))?;
         let (batch, hidden, grid_h, grid_w) = y.dims4()?;
         if batch != 1 {
             return Err(Error::Msg(format!(
@@ -152,8 +152,10 @@ impl PixtralMlp {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = self.gate.forward(x)?.silu()?;
-        self.down.forward(&(gate * self.up.forward(x)?)?)
+        let gate = __model_proof_output!(self.gate.forward(x))?.silu()?;
+        __model_proof_output!(self
+            .down
+            .forward(&(gate * __model_proof_output!(self.up.forward(x))?)?))
     }
 }
 
@@ -196,9 +198,17 @@ impl PixtralAttention {
         cu: &[usize],
     ) -> CandleResult<Tensor> {
         let seq = x.dim(0)?;
-        let q = apply_rope(&self.to_heads(&self.q.forward(x)?)?, cos, sin)?;
-        let k = apply_rope(&self.to_heads(&self.k.forward(x)?)?, cos, sin)?;
-        let v = self.to_heads(&self.v.forward(x)?)?;
+        let q = apply_rope(
+            &self.to_heads(&__model_proof_output!(self.q.forward(x))?)?,
+            cos,
+            sin,
+        )?;
+        let k = apply_rope(
+            &self.to_heads(&__model_proof_output!(self.k.forward(x))?)?,
+            cos,
+            sin,
+        )?;
+        let v = self.to_heads(&__model_proof_output!(self.v.forward(x))?)?;
 
         let mut windows = Vec::with_capacity(cu.len().saturating_sub(1));
         for bounds in cu.windows(2) {
@@ -229,7 +239,7 @@ impl PixtralAttention {
             .transpose(0, 1)?
             .contiguous()?
             .reshape((seq, self.num_heads * self.head_dim))?;
-        self.out.forward(&merged)
+        __model_proof_output!(self.out.forward(&merged))
     }
 }
 
@@ -280,9 +290,9 @@ impl PixtralBlock {
         sin: &Tensor,
         cu: &[usize],
     ) -> CandleResult<Tensor> {
-        let normed = self.attention_norm.forward(x)?;
+        let normed = __model_proof_output!(self.attention_norm.forward(x))?;
         let hidden = (x + self.attention.forward(&normed, cos, sin, cu)?)?;
-        let normed = self.ffn_norm.forward(&hidden)?;
+        let normed = __model_proof_output!(self.ffn_norm.forward(&hidden))?;
         &hidden + self.feed_forward.forward(&normed)?
     }
 }
@@ -353,7 +363,7 @@ impl PixtralVisionTower {
             let refs: Vec<&Tensor> = patches.iter().collect();
             Tensor::cat(&refs, 0)?
         };
-        x = self.ln_pre.forward(&x)?;
+        x = __model_proof_output!(self.ln_pre.forward(&x))?;
 
         let (cos, sin) = rope_2d(
             grids,
@@ -494,11 +504,11 @@ impl Mistral3Projector {
                 self.vision_hidden
             )));
         }
-        let normed = self.norm.forward(image_features)?;
+        let normed = __model_proof_output!(self.norm.forward(image_features))?;
         let merged = patch_merge(&normed, grids, self.spatial_merge)?;
-        let hidden = self.merging_layer.forward(&merged)?;
-        let hidden = self.linear_1.forward(&hidden)?.gelu_erf()?;
-        self.linear_2.forward(&hidden)
+        let hidden = __model_proof_output!(self.merging_layer.forward(&merged))?;
+        let hidden = __model_proof_output!(self.linear_1.forward(&hidden))?.gelu_erf()?;
+        __model_proof_output!(self.linear_2.forward(&hidden))
     }
 }
 
@@ -844,6 +854,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_tower_runs_multiple_images_and_checks_geometry() {
         let device = Device::Cpu;
         let tower =
@@ -863,6 +874,9 @@ mod tests {
             .forward(&[&first], &[(1, 2)], &CancelFlag::default())
             .unwrap_err();
         assert!(error.to_string().contains("expected [1, 3, 2, 4]"));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::tiny_tower_runs_multiple_images_and_checks_geometry");
     }
 
     #[test]
@@ -878,6 +892,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_projector_loads_exact_prefix_and_returns_expected_shape() {
         let device = Device::Cpu;
         let projector =
@@ -885,5 +900,8 @@ mod tests {
         let features = Tensor::ones((8, 4), DType::F32, &device).unwrap();
         let projected = projector.forward(&features, &[(2, 2), (2, 2)]).unwrap();
         assert_eq!(projected.dims2().unwrap(), (2, 6));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vision::tests::tiny_projector_loads_exact_prefix_and_returns_expected_shape");
     }
 }

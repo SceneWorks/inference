@@ -110,7 +110,13 @@ pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
 /// [`load_lm_dir`]; `streamed` (the LM block stream will be armed) leaves the decoder layers lazy.
 fn load_lm_dir_with(dir: &Path, streamed: bool) -> Result<Qwen3VlTextEncoder> {
     let config_path = dir.join("config.json");
-    let published = std::fs::read_to_string(&config_path).map_err(|e| {
+    let published = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config_path),
+"crates/media/mlx-gen/mlx-gen-mage/src/text_encoder/load.rs::load_lm_dir_with::std::fs::read_to_string@5702",
+ArtifactInput,
+&config_path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).map_err(|e| {
         Error::Msg(format!(
             "mage_flow text encoder: read {}: {e}",
             config_path.display()

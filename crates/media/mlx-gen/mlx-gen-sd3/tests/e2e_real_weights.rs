@@ -189,6 +189,8 @@ fn run_smoke(label: &str, w: u32, h: u32, steps: u32, quant: Quant, guidance: f3
 #[ignore = "needs the SD3.5-Large snapshot (set SD3_LARGE_SNAPSHOT) + Metal"]
 fn e2e_large_1024_q8() {
     run_smoke("1024_q8", 1024, 1024, 28, Quant::Q8, 3.5);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_large_1024_q8");
 }
 
 /// Faster correctness pre-check at a smaller resolution / fewer steps (Q4) — proves the path before
@@ -197,4 +199,6 @@ fn e2e_large_1024_q8() {
 #[ignore = "needs the SD3.5-Large snapshot (set SD3_LARGE_SNAPSHOT) + Metal"]
 fn e2e_large_512_q4_quick() {
     run_smoke("512_q4", 512, 512, 20, Quant::Q4, 3.5);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::e2e_large_512_q4_quick");
 }

@@ -150,6 +150,8 @@ fn caption_encoding_matches_reference() {
     // --- numeric parity vs the SANA reference (optional golden) ---
     let Some(golden) = std::env::var_os("SANA_CAPTION_GOLDEN") else {
         eprintln!("SANA_CAPTION_GOLDEN unset — shape + length asserted; skipping numeric parity");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-sana/tests/text_encoder.rs:153 (caption_encoding_matches_reference): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let golden = candle_gen::Weights::from_file(std::path::Path::new(&golden), &device, DType::F32)
@@ -193,4 +195,7 @@ fn caption_encoding_matches_reference() {
         cos > 0.998,
         "caption_embs cosine={cos} — forward divergence (ids matched exactly)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::caption_encoding_matches_reference");
 }

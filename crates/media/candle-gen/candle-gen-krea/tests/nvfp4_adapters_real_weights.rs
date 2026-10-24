@@ -154,6 +154,9 @@ fn nvfp4_lora_render_differs_and_zero_scale_restores_the_base_exactly() {
         "a strength-0 adapter must leave the packed base output byte-identical — a difference \
          means installing the adapter perturbed the base"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_adapters_real_weights::nvfp4_lora_render_differs_and_zero_scale_restores_the_base_exactly");
 }
 
 /// **AC#2 on real weights.** Installing a real LoRA must not move a single projection out of the

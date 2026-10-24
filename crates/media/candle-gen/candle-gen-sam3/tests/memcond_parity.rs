@@ -125,4 +125,7 @@ fn memory_conditioning_matches_oracle() {
     let c = cosine(&got, &want);
     println!("conditioned feature map: cosine={c:.7}");
     assert!(c > 0.999, "memory-conditioned feature map cosine {c}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memcond_parity::memory_conditioning_matches_oracle");
 }

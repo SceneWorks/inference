@@ -131,3 +131,6 @@ mod explicit_registry_tests {
         assert_eq!(explicit, ["sensenova_u1_8b", "sensenova_u1_8b_fast"]);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

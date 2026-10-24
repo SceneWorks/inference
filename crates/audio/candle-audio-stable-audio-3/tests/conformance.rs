@@ -1,5 +1,15 @@
 //! Real-weight gen-core conformance and request-local RNG isolation for every registered variant.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -148,72 +158,112 @@ fn run_rng_isolation(case: &Case) {
 #[ignore = "requires the pinned 3.45 GB small-music snapshot"]
 fn registered_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[0]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registered_provider_passes_full_audio_conformance");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-music snapshot"]
 fn concurrent_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[0]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-sfx snapshot"]
 fn registered_sfx_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[1]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED registered_sfx_provider_passes_full_audio_conformance"
+    );
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-sfx snapshot"]
 fn concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[1]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_sfx_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 #[test]
 #[ignore = "requires the pinned 10.4 GB medium snapshot"]
 fn registered_medium_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[2]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED registered_medium_provider_passes_full_audio_conformance"
+    );
 }
 
 #[test]
 #[ignore = "requires the pinned 10.4 GB medium snapshot"]
 fn concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[2]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_medium_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-music-base snapshot"]
 fn registered_music_base_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[3]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registered_music_base_provider_passes_full_audio_conformance");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-music-base snapshot"]
 fn concurrent_music_base_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[3]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_music_base_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-sfx-base snapshot"]
 fn registered_sfx_base_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[4]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registered_sfx_base_provider_passes_full_audio_conformance");
 }
 
 #[test]
 #[ignore = "requires the pinned 3.45 GB small-sfx-base snapshot"]
 fn concurrent_sfx_base_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[4]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_sfx_base_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 #[test]
 #[ignore = "requires the pinned 10.4 GB medium-base snapshot"]
 fn registered_medium_base_provider_passes_full_audio_conformance() {
     run_conformance(&CASES[5]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED registered_medium_base_provider_passes_full_audio_conformance");
 }
 
 #[test]
 #[ignore = "requires the pinned 10.4 GB medium-base snapshot"]
 fn concurrent_medium_base_requests_are_deterministic_and_do_not_share_rng_state() {
     run_rng_isolation(&CASES[5]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED concurrent_medium_base_requests_are_deterministic_and_do_not_share_rng_state");
 }
 
 /// The advertised cap must be the one the adapted geometry can actually serve, and it must be a

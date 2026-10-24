@@ -76,6 +76,7 @@ fn get(f: &Weights, key: &str) -> Array {
 
 /// The bare encoder stack: `conv_in → down_blocks → norm_out → silu → conv_out`, at `T = 5` so
 /// the frame-isolated GroupNorm and the temporal strides are both live.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encoder_stack_matches_the_reference() {
     let f = fixture();
@@ -99,6 +100,8 @@ fn encoder_stack_matches_the_reference() {
     );
     assert_parity(&got, &want, TOL, "encoder stack");
     assert!(std_dev(&want) > 1e-4, "a ~constant golden is a false green");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encoder_stack_matches_the_reference");
 }
 
 /// The spatial compression really is `patch_size`, with **no cropping**. A downsampler that
@@ -123,6 +126,7 @@ fn the_encoder_halves_rather_than_crops() {
 }
 
 /// `_encode_clip` untiled — the encoder followed by `quant_conv`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encode_clip_matches_the_reference_untiled() {
     let f = fixture();
@@ -146,6 +150,8 @@ fn encode_clip_matches_the_reference_untiled() {
         TOL,
         "encode_clip at the shipped tile size",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encode_clip_matches_the_reference_untiled");
 }
 
 /// **The tiled encode**, at the fixture's shrunk tile geometry — the blend, the round-robin slack
@@ -154,6 +160,7 @@ fn encode_clip_matches_the_reference_untiled() {
 /// This is the convention most likely to ship unimplemented, because the shipped VAE turns tiling
 /// on in `__init__` rather than through `enable_tiling()`, so a port written from the class body
 /// alone would never see it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_encode_matches_the_reference() {
     let f = fixture();
@@ -184,6 +191,8 @@ fn tiled_encode_matches_the_reference() {
          tile blend"
     );
     const { assert!(ENCODER_TILING_IS_ON_BY_DEFAULT) };
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::tiled_encode_matches_the_reference");
 }
 
 /// **The keyframe path.** A single frame short-circuits the temporal chunking and produces
@@ -192,6 +201,7 @@ fn tiled_encode_matches_the_reference() {
 /// Padding it up to `clip_length` by repetition instead — the obvious implementation — would run
 /// the temporal path over 17 copies of the image and return `17 / 4 - 3` latent frames, a
 /// plausible tensor of the wrong shape carrying conditioning the model was never trained on.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_keyframe_encodes_to_exactly_one_latent_frame() {
     let f = fixture();
@@ -219,11 +229,14 @@ fn a_keyframe_encodes_to_exactly_one_latent_frame() {
         std_dev(&want_std) > 1e-6,
         "a constant posterior std would make the sample seed inert"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::a_keyframe_encodes_to_exactly_one_latent_frame");
 }
 
 /// The chunked video path — 17 frames is exactly one clip, and `token_drop` trims the tail. Kept
 /// alongside the keyframe golden so the two paths gate each other rather than only one being
 /// exercised.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn chunked_encode_matches_the_reference() {
     let f = fixture();
@@ -247,6 +260,8 @@ fn chunked_encode_matches_the_reference() {
     let single = v.encode(&get(&f, "in.encode_single.pixels")).unwrap();
     assert_eq!(single.mean().shape()[2], 1);
     assert!(posterior.mean().shape()[2] > 1);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::chunked_encode_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -258,6 +273,7 @@ fn chunked_encode_matches_the_reference() {
 ///
 /// This is why the parity goldens above are dumped at `T = 5` and `T = 17`. Written as a direct
 /// comparison rather than through the encoder, so it measures the convention itself.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn groupnorm_is_frame_isolated() {
     let cfg = encode_fixture_config(3);
@@ -328,6 +344,8 @@ fn groupnorm_is_frame_isolated() {
         delta > MUTATION_FLOOR,
         "a global GroupNorm gives the same answer ({delta:.3e}); this probe cannot gate isolation"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::groupnorm_is_frame_isolated");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,6 +355,7 @@ fn groupnorm_is_frame_isolated() {
 /// Perturb one encoder tensor and confirm the encode moves. Each row proves the corresponding
 /// golden actually depends on that tensor — most importantly `conv_shortcut`, which a loader could
 /// omit entirely and still produce a plausible latent.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encoder_weights_are_all_load_bearing() {
     let f = fixture();
@@ -385,10 +404,13 @@ fn encoder_weights_are_all_load_bearing() {
             "perturbing `{key}` moved the encode by only {peak:.3e} — the golden does not gate it"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encoder_weights_are_all_load_bearing");
 }
 
 /// The tiled golden depends on the tile geometry: encoding at a different tile size must give a
 /// different answer, or the "tiled" test is silently running the untiled path.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_tile_geometry_changes_the_result() {
     let f = fixture();
@@ -431,6 +453,8 @@ fn the_tile_geometry_changes_the_result() {
         "a min_overlap the slack has already absorbed must give the identical plan, got \
          {odelta:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_tile_geometry_changes_the_result");
 }
 
 /// Malformed encode inputs are typed errors, not silent reshapes.
@@ -448,6 +472,7 @@ fn the_tile_geometry_changes_the_result() {
 /// Naming the guard's own message is what makes each of these bite: delete the matching arm of
 /// `MiniMaxH3VideoVae::encode` and the input still errors, but with a different string, and the
 /// assertion goes red.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn encode_rejects_malformed_input() {
     let v = vae(3);
@@ -493,10 +518,15 @@ fn encode_rejects_malformed_input() {
         msg.contains("at least one frame"),
         "the frame-count guard must be what rejects this, not the reflect pad: {msg}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::encode_rejects_malformed_input"
+    );
 }
 
 /// The posterior sample is `mean + std · noise`, and the noise is genuinely load-bearing — a
 /// sampler that quietly returned the mean would pass any test that only inspects shapes.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_posterior_sample_depends_on_its_noise() {
     let f = fixture();
@@ -542,6 +572,8 @@ fn the_posterior_sample_depends_on_its_noise() {
     );
     let _ = DiagonalGaussian::from_parameters(&Array::from_slice(&[0.0f32, 0.0], &[1, 2, 1, 1, 1]))
         .unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_encode_parity::the_posterior_sample_depends_on_its_noise");
 }
 
 /// The shipped tile constants are the reference's, and the fixture's are deliberately NOT.

@@ -22,6 +22,15 @@
 
 #![cfg(feature = "cuda")]
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_core::{DType, Device, Tensor};
 use candle_llm::models::Qwen35Config;
 use candle_llm::primitives::{
@@ -219,10 +228,13 @@ fn compare(
 /// AC1: GEMV vs the dequantize-then-matmul reference on every 27B projection shape (and the edge
 /// shapes) for rows 1..=8, under the declared tolerance; the cuBLASLt delta is recorded alongside.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
         candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/nvfp4_gemv.rs:226 (gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     device.set_seed(24_136).unwrap();
@@ -343,15 +355,21 @@ fn gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape() {
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
         eprintln!("[nvfp4_gemv parity] wrote {path}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape");
 }
 
 /// The dispatch rule, visible in telemetry: ≤ 8 bf16 rows → GEMV; more rows (a prefill), an f32
 /// activation or the switch off → cuBLASLt with the reason. The outputs agree either way.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
         candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/nvfp4_gemv.rs:355 (dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let (n, k) = (256, 512);
@@ -405,15 +423,21 @@ fn dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly() {
             .unwrap())
     .sqrt();
     assert!(rel < 0.2, "gemv vs cuBLASLt rel {rel}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly");
 }
 
 /// The GEMV is compiled through the shared nvrtc seam, once per device, however many NVFP4
 /// projections and row counts use it.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemv_compiles_once_per_device_through_the_seam() {
     let _guard = lock();
     let Some((device, format)) = nvfp4() else {
         candle_quant_kernels::skip_without_sm120("no sm_120 CUDA device");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/nvfp4_gemv.rs:417 (gemv_compiles_once_per_device_through_the_seam): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let Device::Cuda(dev) = &device else {
@@ -429,6 +453,9 @@ fn gemv_compiles_once_per_device_through_the_seam() {
     set_nvfp4_gemv(None);
     assert_eq!(NVFP4_GEMV_SRC.compile_attempts(dev), 1);
     assert!(matches!(NVFP4_GEMV_SRC.cached(dev), Some(Ok(_))));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemv_compiles_once_per_device_through_the_seam");
 }
 
 fn time_us(device: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
@@ -513,4 +540,7 @@ fn nvfp4_gemv_microbench() {
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
         eprintln!("[nvfp4_gemv bench] wrote {path}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED nvfp4_gemv_microbench");
 }

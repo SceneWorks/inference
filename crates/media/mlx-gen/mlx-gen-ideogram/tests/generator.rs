@@ -119,4 +119,6 @@ fn generates_via_registry() {
         "wrote {} — {steps} steps (max progress {max_step}), decoding={decoding_seen}",
         out_path.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED generator::generates_via_registry");
 }

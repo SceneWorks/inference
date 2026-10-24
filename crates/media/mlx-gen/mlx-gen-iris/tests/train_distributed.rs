@@ -468,11 +468,21 @@ fn shared_run(
 /// The host TCP transport and MLX's `ring` backend (2 processes on loopback) reduce to the same
 /// DDP run, bit for bit — trainable, EMA, optimizer state and export.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit() {
     cpu_process(
         "train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit",
-        ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body,
+        || {
+            ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref()
+        != Ok("train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit")
+    {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit");
+    }
 }
 
 fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body() {
@@ -541,11 +551,21 @@ fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
     cpu_process(
         "train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp",
-        fsdp_full_and_grad_op_sharding_reproduce_ddp_body,
+        || {
+            fsdp_full_and_grad_op_sharding_reproduce_ddp_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref()
+        != Ok("train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp")
+    {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp");
+    }
 }
 
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp_body() {
@@ -598,11 +618,21 @@ fn fsdp_full_and_grad_op_sharding_reproduce_ddp_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     cpu_process(
         "train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp",
-        hybrid_sharding_over_four_ranks_reproduces_ddp_body,
+        || {
+            hybrid_sharding_over_four_ranks_reproduces_ddp_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref()
+        != Ok("train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp")
+    {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp");
+    }
 }
 
 fn hybrid_sharding_over_four_ranks_reproduces_ddp_body() {
@@ -633,6 +663,7 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp_body() {
 /// still ends in a clean cancel with a checkpoint and an export on every rank (no peer gives up
 /// at the grace, rank 0 sees no lost rank).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
     let (data, scratch, out) = (tmp(), tmp(), tmp());
     write_dataset(data.path());
@@ -662,12 +693,17 @@ fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
     let s = read_checkpoint_state(&latest(out.path())).unwrap();
     assert_eq!(s.step, 2);
     assert!(ok(&res[0]).is_file(), "the export was written");
+
+    eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports");
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports");
 }
 
 /// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a
 /// storage rank 1 cannot see: one output directory per rank) refuse typed on every rank instead of
 /// resuming at different steps and silently averaging diverged replicas.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn ranks_that_see_different_checkpoints_refuse_to_resume() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
@@ -714,14 +750,28 @@ fn ranks_that_see_different_checkpoints_refuse_to_resume() {
             .unwrap_or_else(|| panic!("an untyped outcome: {r}"));
         assert!(typed.starts_with("SplitWorld"), "{typed}");
     }
+
+    eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume");
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     cpu_process(
         "train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards",
-        a_sharded_checkpoint_resumes_exactly_and_reshards_body,
+        || {
+            a_sharded_checkpoint_resumes_exactly_and_reshards_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref()
+        != Ok("train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards")
+    {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards");
+    }
 }
 
 fn a_sharded_checkpoint_resumes_exactly_and_reshards_body() {
@@ -995,11 +1045,21 @@ fn a_rank_that_exits_inside_an_mlx_collective_fails_the_survivor_typed() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_rank_that_exits_mid_run_fails_the_survivor_typed() {
     cpu_process(
         "train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed",
-        a_rank_that_exits_mid_run_fails_the_survivor_typed_body,
+        || {
+            a_rank_that_exits_mid_run_fails_the_survivor_typed_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref()
+        != Ok("train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed")
+    {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed");
+    }
 }
 
 fn a_rank_that_exits_mid_run_fails_the_survivor_typed_body() {
@@ -1007,11 +1067,17 @@ fn a_rank_that_exits_mid_run_fails_the_survivor_typed_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout() {
     cpu_process(
         "train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout",
-        a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body,
+        || {
+            a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout");
+        },
     );
+
+    if std::env::var("IRIS_TEST_CPU_CHILD").as_deref() != Ok("train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout") { eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout"); }
 }
 
 fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body() {

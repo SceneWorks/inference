@@ -54,6 +54,7 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
         .item::<f32>()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn sample_and_whole_image_tiled_are_element_equal() {
     let w = fixture();
@@ -84,8 +85,11 @@ fn sample_and_whole_image_tiled_are_element_equal() {
         0.0,
         "sample vs whole-image sample_tiled must be element-equal (shared RNG draw)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED hotpath_equivalence::sample_and_whole_image_tiled_are_element_equal");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn capture_failure_does_not_panic_mid_decode() {
     let w = fixture();
@@ -124,4 +128,6 @@ fn capture_failure_does_not_panic_mid_decode() {
     );
 
     std::env::remove_var("PID_CAPTURE_LATENT");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED hotpath_equivalence::capture_failure_does_not_panic_mid_decode");
 }

@@ -29,6 +29,15 @@
 //! conditioner targets folded at load, stacked + mixed, strict routing — [`adapters`]). Q4/Q8 candle
 //! quant tiers are the counterpart of MLX sc-10517 (see the `quant` gap note in [`loader`]).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapt;
 pub mod adapters;
 pub mod conditioner;

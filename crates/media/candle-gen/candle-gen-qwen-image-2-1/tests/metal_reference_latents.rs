@@ -93,6 +93,7 @@ fn compare(got: &[f32], want: &[f32]) -> (usize, f32, f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn reference_vae_latents_on_metal_match_cpu_after_the_text_encoder() {
     let metal = reference_latents(&Device::new_metal(0).unwrap(), true);
     let cpu = reference_latents(&Device::Cpu, false).remove(0);
@@ -115,4 +116,7 @@ fn reference_vae_latents_on_metal_match_cpu_after_the_text_encoder() {
              peak {peak:.3e} (bound {bound:.1e} of the peak)"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED metal_reference_latents::reference_vae_latents_on_metal_match_cpu_after_the_text_encoder");
 }

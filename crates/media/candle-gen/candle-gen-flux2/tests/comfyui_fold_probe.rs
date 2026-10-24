@@ -115,6 +115,8 @@ fn comfyui_fold_probe() -> Result<()> {
         Ok(d) if !matches!(d, Device::Cpu) => d,
         _ => {
             eprintln!("SKIP comfyui_fold_probe: needs a CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-flux2/tests/comfyui_fold_probe.rs:118 (comfyui_fold_probe): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
             return Ok(());
         }
     };
@@ -123,6 +125,8 @@ fn comfyui_fold_probe() -> Result<()> {
     let tier_path = std::env::var(TIER_FILE_ENV).unwrap_or_else(|_| TIER_FILE_DEFAULT.into());
     if !std::path::Path::new(&comfyui_path).exists() || !std::path::Path::new(&tier_path).exists() {
         eprintln!("SKIP comfyui_fold_probe: weights not found ({comfyui_path} / {tier_path})");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-flux2/tests/comfyui_fold_probe.rs:124 (comfyui_fold_probe): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return Ok(());
     }
     // SAFETY: read-only mmaps of local weight files.
@@ -251,5 +255,7 @@ fn comfyui_fold_probe() -> Result<()> {
         "sc-11028 probe divergences:\n{}",
         failures.join("\n")
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED comfyui_fold_probe::comfyui_fold_probe");
     Ok(())
 }

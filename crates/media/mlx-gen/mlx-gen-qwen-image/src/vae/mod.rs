@@ -679,6 +679,7 @@ mod quantum_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_stages_are_guarded_quanta() {
         if !in_cpu_child("decode_stages_are_guarded_quanta") {
             return;
@@ -724,9 +725,14 @@ mod quantum_tests {
         assert_eq!((refusal.label, refusal.scratch_bytes), all[index].clone());
         assert_checked_before_synchronized(&partial);
         assert_eq!(partial.len(), 2 * index, "{partial:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::decode_stages_are_guarded_quanta"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_decode_tiles_are_guarded_quanta() {
         if !in_cpu_child("tiled_decode_tiles_are_guarded_quanta") {
             return;
@@ -765,9 +771,12 @@ mod quantum_tests {
         assert!(refused.is_err());
         assert_eq!(take_refusal().unwrap().label, DECODE_HEAD_QUANTUM);
         assert!(refused_events.is_empty(), "{refused_events:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::tiled_decode_tiles_are_guarded_quanta");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_scratch_grows_with_latent_extent_and_loaded_width() {
         if !in_cpu_child("decode_scratch_grows_with_latent_extent_and_loaded_width") {
             return;
@@ -799,11 +808,14 @@ mod quantum_tests {
             up.quantum_bytes([1, 8, 1, 4, 4], 4)
         );
         assert!(first(8, 8, DECODE_ATTENTION_QUANTUM) > first(8, 4, DECODE_ATTENTION_QUANTUM));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::decode_scratch_grows_with_latent_extent_and_loaded_width");
     }
 
     /// The shape-only decode-quantum predictor matches what a decode actually checks: the exact
     /// sequence for a single-pass decode, and every label's largest check for a tiled one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_quanta_predicts_the_checked_scratch() {
         if !in_cpu_child("decode_quanta_predicts_the_checked_scratch") {
             return;
@@ -847,6 +859,8 @@ mod quantum_tests {
                 "{label}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::decode_quanta_predicts_the_checked_scratch");
     }
 
     /// MLX's peak while `body` runs, above what was live before it (inputs pre-materialized):
@@ -951,12 +965,15 @@ mod quantum_tests {
         );
         assert_eq!(ratios.borrow().len(), 8);
         eprintln!("IOS_CAPTURE_BODY_COMPLETED vae::quantum_tests::decode_stage_formulas_track_the_measured_peak");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::decode_stage_formulas_track_the_measured_peak");
     }
 
     /// The query-chunked mid-block attention computes the same attention as the historical single
     /// call (each query row's softmax is over every key either way), checked on CPU; the unbounded
     /// plan IS the historical single call, and a decode off device takes it.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn chunked_decode_attention_matches_the_single_call() {
         if !in_cpu_child("chunked_decode_attention_matches_the_single_call") {
             return;
@@ -1030,6 +1047,8 @@ mod quantum_tests {
             .fold(0f32, f32::max);
         println!("iOS (chunked) vs host decode at 72x72 latent: max |delta| {max_abs:e}");
         assert!(max_abs <= 1e-4, "max |delta| {max_abs}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::quantum_tests::chunked_decode_attention_matches_the_single_call");
     }
 
     /// The tile fold and the final normalization are the shared tiling loop's own quanta: each is

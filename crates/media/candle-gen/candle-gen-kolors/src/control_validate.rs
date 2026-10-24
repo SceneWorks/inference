@@ -171,4 +171,7 @@ fn real_weight_control() {
         "control vs no-control mean diff {diff:.2} too small — control may not be wired"
     );
     println!("Kolors ControlNet validation PASS ✅ (eyeball the PPMs for pose adherence)");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_validate::real_weight_control");
 }

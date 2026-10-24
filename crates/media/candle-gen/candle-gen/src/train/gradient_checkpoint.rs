@@ -249,6 +249,7 @@ mod tests {
     /// pass-through cotangent threading were wrong, `Ws`'s gradient (reachable *only* via the skip)
     /// would be wrong.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn matches_monolithic_backward_with_skip() {
         let x = t(&[1.0, -2.0, 0.5, 3.0], (1, 4));
         // Shared trainable factors, built once and used by both the monolithic and segmented passes.
@@ -310,6 +311,9 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::gradient_checkpoint::tests::matches_monolithic_backward_with_skip");
     }
 
     /// [`checkpointed_backward_with_input_grad`]'s returned input cotangent must equal the monolithic
@@ -318,6 +322,7 @@ mod tests {
     /// the boundary cotangent must still be the full gradient (the leaf-`Var` wrapping inside the
     /// harness keeps the frozen-base branch live).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn input_cotangent_matches_monolithic_input_grad() {
         // x is a Var ONLY in the monolithic reference so we can read dL/dx; the checkpointed pass
         // treats it as a plain input tensor and recovers the same gradient via the returned cotangent.
@@ -365,10 +370,14 @@ mod tests {
                 "input cotangent mismatch: monolithic {dldx_mono:?} vs checkpointed {dldx_ckpt:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::gradient_checkpoint::tests::input_cotangent_matches_monolithic_input_grad");
     }
 
     /// A degenerate single-segment chain must equal a direct `loss.backward()`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn single_segment_matches_direct_backward() {
         let x = t(&[2.0, -1.0], (1, 2));
         let w = var(&[0.5, 0.1, -0.3, 0.2], (2, 2));
@@ -398,6 +407,9 @@ mod tests {
         for (x, y) in a.iter().zip(b.iter()) {
             assert!((x - y).abs() < 1e-6, "grad mismatch: {a:?} vs {b:?}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::gradient_checkpoint::tests::single_segment_matches_direct_backward");
     }
 
     /// The final segment must produce a single scalar-loss tensor.

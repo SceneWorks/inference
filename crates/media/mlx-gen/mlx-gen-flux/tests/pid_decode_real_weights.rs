@@ -150,6 +150,8 @@ fn flux_dev_pid_decode_vs_vae() {
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::flux_dev_pid_decode_vs_vae");
 }
 
 #[test]
@@ -245,4 +247,8 @@ fn flux_dev_pid_from_ldm_early_stop() {
         &format!("{dir}/flux_pid_fromldm_{}.png", early.width),
     );
     eprintln!("wrote {dir}/flux_pid_clean_*.png + flux_pid_fromldm_*.png");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::flux_dev_pid_from_ldm_early_stop"
+    );
 }

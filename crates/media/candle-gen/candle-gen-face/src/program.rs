@@ -130,7 +130,7 @@ impl Program {
                     groups,
                 } => {
                     let b = bias.as_ref().map(|b| self.param(b)).transpose()?;
-                    conv2d(
+                    __model_proof_output!(conv2d(
                         &first()?,
                         self.param(weight)?,
                         b,
@@ -138,14 +138,14 @@ impl Program {
                         *padding,
                         *dilation,
                         *groups,
-                    )?
+                    ))?
                 }
                 Op::Prelu { slope } => {
                     let x = first()?;
                     let s = self.param(slope)?;
                     let s = s.reshape((1, s.elem_count(), 1, 1))?;
                     let pos = x.relu()?;
-                    pos.broadcast_add(&(&x - &pos)?.broadcast_mul(&s)?)?
+                    __model_proof_output!(pos.broadcast_add(&(&x - &pos)?.broadcast_mul(&s)?))?
                 }
                 Op::Relu => first()?.relu()?,
                 Op::Sigmoid => sigmoid(&first()?)?,

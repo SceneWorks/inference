@@ -34,6 +34,7 @@ tempfile = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 
 [features]
+model-inference-proof = ["candle-gen-sdxl/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
 # Pass the backend selection through to the core + sdxl crates so a downstream `--features cuda`/`metal`
 # on this crate selects the matching candle backend everywhere (the embedder runs f32, but the device
 # follows the build so the worker's dataset-analysis job keeps one device).

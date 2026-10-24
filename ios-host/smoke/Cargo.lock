@@ -549,6 +549,7 @@ dependencies = [
  "libc",
  "mlx-gen",
  "mlx-gen-sana",
+ "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "runtime-ios",
  "sceneworks-gen-core-testkit",
@@ -737,8 +738,34 @@ name = "mlx-gen-anima"
 version = "0.0.0"
 dependencies = [
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
+name = "mlx-gen-body"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
+name = "mlx-gen-depth"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
+name = "mlx-gen-face"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
  "pmetal-mlx-rs",
  "serde_json",
 ]
@@ -767,6 +794,17 @@ dependencies = [
  "pmetal-mlx-rs",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mlx-gen-perceptual"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-body",
+ "mlx-gen-depth",
+ "mlx-gen-face",
+ "pmetal-mlx-rs",
 ]
 
 [[package]]
@@ -804,6 +842,7 @@ name = "mlx-gen-sdxl"
 version = "0.0.0"
 dependencies = [
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
@@ -816,6 +855,7 @@ name = "mlx-gen-wan"
 version = "0.0.0"
 dependencies = [
  "mlx-gen",
+ "mlx-gen-perceptual",
  "pmetal-mlx-rs",
  "serde_json",
  "unicode-normalization",
@@ -826,6 +866,8 @@ name = "mlx-gen-z-image"
 version = "0.0.0"
 dependencies = [
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",

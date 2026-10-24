@@ -1287,29 +1287,21 @@ impl DeviceProvider<'_> {
             classify(&mut self.refusal_kind, error)
         })?;
         let configured = snapshot(&self.root, c)?;
-        let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
-        let spec = runtime_ios::media::configured_load_form(
-            self.registry,
-            &c.provider,
-            &configured,
-            strategy,
-        )
-        .map_err(|error| classify(&mut self.refusal_kind, error))?;
         // A control / IP-Adapter case without its provisioned component would silently run as
         // another route: a provisioning failure, never admission or refusal evidence.
         if ((c.provider == "sdxl" && c.mode == "control")
             || runtime_ios::media::control_required(&c.provider))
-            && spec.control.is_none()
+            && configured.control.is_none()
         {
             return Err(format!("{} {} case needs a provisioned `control` component (components.json); not admission/refusal evidence", c.provider, c.mode).into());
         }
-        if c.mode == "ip_adapter" && spec.ip_adapter.is_none() {
+        if c.mode == "ip_adapter" && configured.ip_adapter.is_none() {
             return Err("IP-Adapter case needs a provisioned `ip_adapter` component (components.json); not admission/refusal evidence".into());
         }
         // Z-Image Turbo's stored-tier artifact policy runs before its contract reads any header (the
         // provider's own tier guard would otherwise surface it as an untyped backend failure).
         if runtime_ios::media::zimage::is_z_image(&c.provider) {
-            match runtime_ios::media::zimage::check_artifact(&c.provider, &spec) {
+            match runtime_ios::media::zimage::check_artifact(&c.provider, &configured) {
                 Ok(()) => {}
                 Err(Error::Unsupported(reason)) => {
                     self.refusal_kind = Some("artifact");
@@ -1318,6 +1310,14 @@ impl DeviceProvider<'_> {
                 Err(e) => return Err(e.to_string().into()),
             }
         }
+        let strategy = MemoryStrategy::ALL[usize::from(c.rung)];
+        let spec = runtime_ios::media::configured_load_form(
+            self.registry,
+            &c.provider,
+            &configured,
+            strategy,
+        )
+        .map_err(|error| classify(&mut self.refusal_kind, error))?;
         let contract = self
             .registry
             .memory_strategy_contract(&c.provider, &spec)

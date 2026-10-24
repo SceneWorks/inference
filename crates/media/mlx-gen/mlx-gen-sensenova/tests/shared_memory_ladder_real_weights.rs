@@ -321,4 +321,6 @@ fn serial_resident_attention_and_rung4() {
         fault_floor.0,
         fault_floor.1,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::serial_resident_attention_and_rung4");
 }

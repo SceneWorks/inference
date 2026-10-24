@@ -132,6 +132,7 @@ fn honors_request_stop_strings_on_real_model() {
 /// delivery: the run stops on token 1 with no discarded look-ahead. When token 0 is delivered,
 /// the loop pipelines from step 2 and a stop on token 2 discards the look-ahead behind it.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_held_back_first_token_keeps_the_look_ahead_out_of_the_way() {
     use core_llm::Speculative;
     use mlx_llm::switches::PIPELINING;
@@ -192,4 +193,6 @@ fn a_held_back_first_token_keeps_the_look_ahead_out_of_the_way() {
         1,
         "pipelined from step 2: token 2's look-ahead is discarded"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED stop_strings::a_held_back_first_token_keeps_the_look_ahead_out_of_the_way");
 }

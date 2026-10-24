@@ -229,13 +229,36 @@ impl TaskExport {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        Ok(Self {
-            task,
-            dir: dir.to_path_buf(),
-            config,
-            settings,
-            config_sha256,
-        })
+        crate::__model_input_choose!(
+            Ok(Self {
+                task,
+                dir: dir.to_path_buf(),
+                config,
+                settings,
+                config_sha256,
+            }),
+            (Ok(Self {
+                task,
+                dir: dir.to_path_buf(),
+                config,
+                settings,
+                config_sha256,
+            }))
+            .inspect(|observed: &Self| {
+                if let Some(sha256) =
+                    crate::model_input_proof::sha256_from_hex(&observed.config_sha256)
+                {
+                    crate::model_input_proof::record_inputs(
+                        "gen-core::iris::downstream::TaskExport::from_dir_impl",
+                        crate::model_input_proof::InputRole::Configuration,
+                        &[crate::model_input_proof::InputIdentity::same_read_buffer(
+                            Some(&config_path),
+                            sha256,
+                        )],
+                    );
+                }
+            })
+        )
     }
 
     pub fn weights_path(&self) -> PathBuf {
@@ -407,11 +430,16 @@ impl EmptyPrompt {
                 path.display()
             )));
         }
-        Ok(Self {
-            embeddings,
-            shape: want,
-            mask,
-        })
+        crate::__model_input_result!(
+            Ok(Self {
+                embeddings,
+                shape: want,
+                mask,
+            }),
+            "gen-core::iris::downstream::EmptyPrompt::read",
+            TensorInput,
+            &[path]
+        )
     }
 
     /// Write the export layout (`embeddings` F32 `[1, T, L, D]`, `mask` BOOL `[1, T]`) to `path`

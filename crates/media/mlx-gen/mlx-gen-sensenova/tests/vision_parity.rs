@@ -47,6 +47,7 @@ fn errors(a: &Array, b: &Array) -> (f32, f32) {
     (max_diff, max_diff / peak)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vision_embedder_matches_reference() {
     let w = Weights::from_file(FIXTURE).expect("load fixture");
@@ -72,4 +73,6 @@ fn vision_embedder_matches_reference() {
     );
     assert_eq!(got.shape(), want.shape());
     assert!(rel < 5e-3, "vision peak-rel {rel:.3e} exceeds 5e-3");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vision_parity::vision_embedder_matches_reference");
 }

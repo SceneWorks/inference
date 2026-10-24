@@ -750,7 +750,12 @@ pub fn load_pth_f32_filtered(
             }
         }
     }
-    Ok(out)
+    gen_core::__model_input_result!(
+        Ok(out),
+        "mlx-gen::pth::load_pth_f32_filtered",
+        ModelWeights,
+        &[path]
+    )
 }
 
 #[cfg(test)]

@@ -121,6 +121,7 @@ fn render_gain(gen: &dyn mlx_gen::Generator, gain: Option<f32>) -> Image {
 fn text_style_gain_sweep_1024() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in text_style_gain_sweep_1024; see preceding skip diagnostic");
         return;
     };
 
@@ -203,5 +204,9 @@ fn text_style_gain_sweep_1024() {
     eprintln!(
         "\nsc-11884 OK: g=1.0 no-op (MAD 0), g=1.75 MAD {mad_hi:.3} > g=0.5 MAD {mad_lo:.3} \
          (early-tap emphasis dominates — parity with the candle A/B)."
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED tap_reweight_real_weights::text_style_gain_sweep_1024"
     );
 }

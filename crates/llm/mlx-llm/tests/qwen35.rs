@@ -217,6 +217,8 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
         error.to_string().contains("exceeds context window 512"),
         "{error}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen35::frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp");
 }
 
 #[test]
@@ -250,6 +252,8 @@ fn qwen35_dispatch_and_coherent_text() {
         content.to_lowercase().contains("paris"),
         "greedy answer should be coherent and name Paris, got: {content:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen35::qwen35_dispatch_and_coherent_text");
 }
 
 #[test]
@@ -314,6 +318,8 @@ fn qwen35_thinking_and_nothink() {
         !ncontent.trim().is_empty(),
         "no-think must produce a direct answer"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen35::qwen35_thinking_and_nothink");
 }
 
 #[test]
@@ -344,4 +350,6 @@ fn qwen35_quantize_on_load_q8() {
         !content.trim().is_empty(),
         "quantized model must still generate text"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen35::qwen35_quantize_on_load_q8");
 }

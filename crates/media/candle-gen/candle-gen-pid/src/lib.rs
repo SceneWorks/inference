@@ -21,6 +21,15 @@
 //! PiD weights are NVIDIA NSCLv1 (non-commercial). The NC restriction flows to PiD-decoded output —
 //! it must be surfaced/labeled as research/evaluation-only at the worker/web layer (Phase 3).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod backbone;
 pub mod budget;
 pub mod caption;

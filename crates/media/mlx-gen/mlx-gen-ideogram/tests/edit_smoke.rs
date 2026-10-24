@@ -128,6 +128,8 @@ fn img2img_smoke() {
         "img2img strength {strength} @ {h}x{w}/{steps} → wrote {}",
         out.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_smoke::img2img_smoke");
 }
 
 /// Mask inpaint (Edit): an all-black mask keeps the whole image pinned to the source (≈ VAE
@@ -196,4 +198,6 @@ fn inpaint_mask_routes_keep_vs_repaint() {
             .unwrap();
         println!("wrote {}", out.display());
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_smoke::inpaint_mask_routes_keep_vs_repaint");
 }

@@ -43,6 +43,16 @@
 //! prediction is compared against three named mis-wirings of the same two branches, so it fails on
 //! each of them.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::{Path, PathBuf};
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor, D};
@@ -392,6 +402,9 @@ fn negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agree
     // ...and the guided renders must differ from the unguided ones, or the guidance scale itself is
     // not reaching the model.
     assert!(max_abs_diff(&guided_without, &unguided_without) > floor);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED negative_prompt_divergence_at_the_base_default_exceeds_the_frozen_torch_agreement_floor");
 }
 
 /// The gate that a mis-wired-but-non-zero negative branch cannot pass.
@@ -570,6 +583,9 @@ fn the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branche
              {bound} numerics bound — this gate cannot tell it apart from the correct wiring"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED the_guided_latents_are_exactly_the_cfg_recomposition_of_their_own_two_branches");
 }
 
 /// The same two facts, end to end through the registered provider and on decoded PCM.
@@ -643,6 +659,9 @@ fn the_request_negative_prompt_is_inert_at_guidance_one_and_material_at_the_base
     // The discriminating control the byte-identity assertion needs: this generator is not simply
     // returning the same buffer for every request.
     assert_ne!(unguided_without, guided_without);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED the_request_negative_prompt_is_inert_at_guidance_one_and_material_at_the_base_default");
 }
 
 /// Where `50` and `7.0` come from, read out of the pinned snapshots themselves.

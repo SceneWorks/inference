@@ -1192,6 +1192,7 @@ mod moe_grouped_tests {
     /// itself reduced-precision on Metal (~1e-3, per the crate tolerance convention), so the observed
     /// peak_rel ≈ 1.8e-3 is the kernel-tiling floor — well inside the crate's ~1e-2 parity bar.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gathered_matches_dense_reference_f32() {
         mlx_rs::random::seed(7).unwrap();
         let (e, k, hidden, inter) = (8, 2, 64, 128);
@@ -1209,11 +1210,14 @@ mod moe_grouped_tests {
                 bb * ll
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::gathered_matches_dense_reference_f32");
     }
 
     /// Same at bf16 (the encoder's production dtype) — looser, since bf16 gather vs matmul differ at
     /// the 8-bit mantissa.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gathered_matches_dense_reference_bf16() {
         mlx_rs::random::seed(11).unwrap();
         let (e, k, hidden, inter) = (8, 2, 64, 128);
@@ -1231,11 +1235,14 @@ mod moe_grouped_tests {
                 bb * ll
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::gathered_matches_dense_reference_bf16");
     }
 
     /// Q8 / Q4 gathered `gather_qmm` ≡ per-expert `quantized_matmul` loop over the same packs (f32
     /// activations isolate the gather kernel from bf16 rounding).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gathered_quant_matches_perexpert_loop() {
         for (bits, tol) in [(8, 3e-3f32), (4, 3e-2f32)] {
             mlx_rs::random::seed(3).unwrap();
@@ -1261,6 +1268,8 @@ mod moe_grouped_tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::gathered_quant_matches_perexpert_loop");
     }
 
     /// Device `route` reproduces `torch.topk`'s descending / tie-by-lower-index selection AND the
@@ -1302,6 +1311,7 @@ mod moe_grouped_tests {
 
     /// Shape coverage: n=1 (decode), k=E (all experts), B>1 — output `[B, L, hidden]`, finite.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn shapes_decode_all_experts_batched() {
         mlx_rs::random::seed(5).unwrap();
         let (e, hidden, inter) = (8, 32, 64);
@@ -1316,6 +1326,8 @@ mod moe_grouped_tests {
                 "non-finite (B{bb} L{ll} k{k})"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::shapes_decode_all_experts_batched");
     }
 
     /// Resolve the SceneWorks Lens-Turbo **q4** text-encoder safetensors (the real Q4-packed gpt-oss
@@ -1379,6 +1391,8 @@ mod moe_grouped_tests {
                 "real-weight Q4 {dtype:?} peak_rel {worst:.3e} exceeds {tol:.0e}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::real_weight_gathered_matches_dense_loop_q4");
     }
 
     /// sc-9500 Phase 5 — real-weight MoE perf (single layer). Times the new grouped-GEMM forward
@@ -1417,5 +1431,7 @@ mod moe_grouped_tests {
                 old_ms / new_ms
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::gpt_oss::moe_grouped_tests::real_weight_moe_perf_q4");
     }
 }

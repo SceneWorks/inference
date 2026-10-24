@@ -144,6 +144,7 @@ mod tests {
     /// 1.008 with the halves exchanged), but a whole-model failure does not *name* the mistake.
     /// This pins it directly, with hand-computable numbers.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_head_chunks_scale_first_then_shift() {
         let dim = 2;
         let mut w = Weights::empty();
@@ -184,6 +185,8 @@ mod tests {
                 got[i]
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED final_layer::tests::the_head_chunks_scale_first_then_shift");
     }
 
     /// sc-14057: both head projections are adapter targets, addressed by their **absolute**

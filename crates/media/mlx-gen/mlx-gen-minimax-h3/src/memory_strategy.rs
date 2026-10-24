@@ -1249,7 +1249,13 @@ fn resolved_dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3D
         _ => mlx_gen::architecture_facts::materialized_root(spec)?
             .join(crate::model::BASE_DIT_PARTITION),
     };
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let text = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(dir.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::resolved_dit_config::std::fs::read_to_string@76461",
+ArtifactInput,
+dir.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+).ok()?;
     crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
 }
 
@@ -1273,7 +1279,13 @@ fn vae_config(spec: &LoadSpec) -> Option<crate::config::MiniMaxH3VaeConfig> {
     let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
         return Some(crate::config::MiniMaxH3VaeConfig::default());
     };
-    let Ok(text) = std::fs::read_to_string(root.join("vae").join("config.json")) else {
+    let Ok(text) = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(root.join("vae").join("config.json")),
+"crates/media/mlx-gen/mlx-gen-minimax-h3/src/memory_strategy.rs::vae_config::std::fs::read_to_string@78050",
+ArtifactInput,
+root.join("vae").join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) else {
         return Some(crate::config::MiniMaxH3VaeConfig::default());
     };
     crate::config::MiniMaxH3VaeConfig::from_diffusers_json(&text).ok()

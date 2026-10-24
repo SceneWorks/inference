@@ -474,6 +474,9 @@ fn real_weight_decode_produces_a_plausible_video() {
         spread > 1e-3,
         "the decode is ~constant ({spread:.3e}); real weights would not produce that"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_decode_produces_a_plausible_video");
 }
 
 /// **The gate a self-generated checksum cannot be.** Decode the *same latent* the official
@@ -541,6 +544,9 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
         std_dev(&want) > 1e-3,
         "the reference decode is ~constant; it would gate nothing"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_decode_matches_the_official_diffusers_vae");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -729,6 +735,9 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
     println!(
         "real-weight encode: worst peak-relative {worst:.3e} (bound {REAL_WEIGHT_ENCODE_TOL:.0e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_encode_matches_the_official_diffusers_vae");
 }
 
 /// **Spatial tiling is not free on the real stack.** The keyframe reference is 320 px, so the
@@ -791,6 +800,11 @@ fn real_weight_tiling_changes_the_encode() {
         peak < REAL_WEIGHT_ENCODE_TOL,
         "the TILED encode is the one the reference produced, but it differs by {peak:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiling_changes_the_encode"
+    );
 }
 
 /// The multi-chunk path runs on real weights: 12 tokens span two chunks joined by the 5-frame
@@ -839,6 +853,9 @@ fn real_weight_multi_chunk_decode_blends_the_seam() {
         "the chunk seam ({seam:.4}) is an order louder than ordinary frame-to-frame motion \
          ({interior:.4}); the cross-fade is mis-aligned"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_multi_chunk_decode_blends_the_seam");
 }
 
 // =============================================================================================
@@ -1006,6 +1023,9 @@ fn real_weight_audio_decode_produces_a_plausible_stereo_track() {
         gap > 1e-3,
         "the two decoded channels are near-identical ({gap:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_audio_decode_produces_a_plausible_stereo_track");
 }
 
 /// The Kaiser-sinc taps the port DERIVES must reproduce the ones the real checkpoint STORES.
@@ -1408,6 +1428,9 @@ fn real_weight_tiled_decode_matches_the_official_diffusers_vae() {
         std_dev(&want) > 1e-3,
         "the reference decode is ~constant; it would gate nothing"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiled_decode_matches_the_official_diffusers_vae");
 }
 
 /// The mirror assertion, on real weights: **below one tile the tiled and untiled paths agree
@@ -1467,4 +1490,9 @@ fn real_weight_tiling_is_inert_below_one_tile() {
     let (peak, _) = rel(&tiled, &want);
     println!("real-weight SUB-TILE parity: rel-max-abs={peak:.3e} (tiling inert, delta 0)");
     assert!(peak < 2e-2, "the sub-tile decode diverges by {peak:.3e}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiling_is_inert_below_one_tile"
+    );
 }

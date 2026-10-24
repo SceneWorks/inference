@@ -682,7 +682,7 @@ impl RmsNorm {
 
     /// `weight · x / sqrt(mean(x²) + eps)` over the last axis.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        rms_weighted(x, &self.weight, self.eps)
+        __model_proof_output!(rms_weighted(x, &self.weight, self.eps))
     }
 
     /// The one tensor name this norm consumes.
@@ -756,6 +756,7 @@ mod tests {
     /// [`spans_run`] is what keeps this from being a false green: without it the test passes
     /// trivially with the chunking deleted, since both sides would then run the same single GEMM.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_swiglu_matches_the_unchunked_projection() {
         let (hidden, ffn, seq) = (8usize, 6usize, 37usize);
         let ff = tiny_ff(hidden, ffn);
@@ -802,11 +803,15 @@ mod tests {
             "37 = 5·7 + 2 — eight spans, the last ragged"
         );
         assert!(rel_max_abs(&uneven, &want) < 1e-5, "ragged tail");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::chunked_swiglu_matches_the_unchunked_projection");
     }
 
     /// The default budget leaves a small geometry on the single un-chunked GEMM, so nothing that
     /// already fits changes at all.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_geometry_that_fits_stays_on_the_unchunked_path() {
         let (hidden, ffn, seq) = (8usize, 6usize, 37usize);
         assert_eq!(
@@ -824,6 +829,9 @@ mod tests {
         let a = ff.forward(&x).expect("forward");
         let b = ff.forward_span(&x).expect("span");
         assert_eq!(rel_max_abs(&a, &b), 0.0, "byte-identical to the bare span");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::a_geometry_that_fits_stays_on_the_unchunked_path");
     }
 
     /// **The shipped ceiling, as arithmetic.** `[1, 104000, 28672]` is ~2.98e9 elements — over
@@ -873,6 +881,7 @@ mod tests {
     /// Rank-1 activations have no token axis to chunk; the plan must not divide by, or narrow, an
     /// axis that is not there.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_rank_one_activation_takes_the_span_path() {
         let ff = tiny_ff(8, 6);
         // Poison the probe first: the rank-<2 branch returns before the planner runs, so if it did
@@ -894,6 +903,9 @@ mod tests {
             "the rank-<2 branch is one span and records it"
         );
         assert_eq!(ffn_token_block(1, 12, 0, AttentionBudget::UNBOUNDED), 0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::a_rank_one_activation_takes_the_span_path");
     }
 
     // ─── the packed tier (sc-20267) ─────────────────────────────────────────────────────────────
@@ -933,6 +945,7 @@ mod tests {
     /// through the *same* `LinearNoBias::from_weights` on a dense key set. So this measures the
     /// packed **path**, not quantization error.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_forward_matches_a_dense_reference() {
         let (out, in_) = (32usize, 128usize);
         let mut map = std::collections::HashMap::new();
@@ -957,6 +970,9 @@ mod tests {
             drift < 5e-3,
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::the_packed_forward_matches_a_dense_reference");
     }
 
     /// **A LoRA composes over a PACKED base** — the property the shared `AdaptLinear` adoption
@@ -964,6 +980,7 @@ mod tests {
     /// the residual rides unmerged, and its contribution equals the same residual measured over the
     /// dense reference.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_lora_rides_a_packed_base_unmerged() {
         let (out, in_, rank) = (32usize, 128usize, 4usize);
         let mut map = std::collections::HashMap::new();
@@ -1009,9 +1026,13 @@ mod tests {
             0.0,
             "clear_adapters must restore the bare base bit-for-bit"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::a_lora_rides_a_packed_base_unmerged");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_structured_lokr_rides_a_packed_base_unmerged() {
         let (out, in_) = (32usize, 128usize);
         let mut map = std::collections::HashMap::new();
@@ -1049,6 +1070,9 @@ mod tests {
         let dense_residual = (dense.forward(&x).unwrap() - dense_base).unwrap();
         let drift = rel_max_abs(&packed_residual, &dense_residual);
         assert!(drift < 1e-5, "packed-vs-dense LoKr residual {drift:.3e}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::a_structured_lokr_rides_a_packed_base_unmerged");
     }
 
     /// A factor pair that does not compose is refused on a **packed** base too — the shape check

@@ -13,6 +13,15 @@
 //! Unlike the Generator providers this crate is not part of a provider catalog: a face
 //! embedder is a composed utility, so consumers construct it directly via [`load`] / [`load_on`].
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod align;
 pub mod bisenet;
 mod common;

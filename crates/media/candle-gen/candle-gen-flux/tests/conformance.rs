@@ -45,6 +45,9 @@ fn flux_schnell_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_flux::load_schnell(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::flux_schnell_conformance");
 }
 
 #[test]
@@ -63,4 +66,7 @@ fn flux_dev_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_flux::load_dev(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::flux_dev_conformance");
 }

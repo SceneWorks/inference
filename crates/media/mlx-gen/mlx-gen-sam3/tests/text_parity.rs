@@ -90,4 +90,6 @@ fn text_encoder_matches_oracle() {
         worst > 0.999,
         "worst valid-token cosine {worst:.6} below 0.999"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED text_parity::text_encoder_matches_oracle");
 }

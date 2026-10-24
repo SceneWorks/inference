@@ -94,6 +94,8 @@ fn cuda_upscale_smoke() {
         Ok(p) => p,
         Err(_) => {
             eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_smoke.rs:97 (cuda_upscale_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return;
         }
     };
@@ -155,6 +157,9 @@ fn cuda_upscale_smoke() {
         corr > 0.7,
         "upscale not structurally faithful to the LR (corr={corr:.4}) — likely a transcription bug"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_smoke::cuda_upscale_smoke");
 }
 
 /// sc-6225: the **image** path ([`Seedvr2Pipeline::generate`]) must spatially tile when a single
@@ -172,6 +177,8 @@ fn seedvr2_image_path_tiles_when_over_budget() {
         Ok(p) => p,
         Err(_) => {
             eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_smoke.rs:175 (seedvr2_image_path_tiles_when_over_budget): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return;
         }
     };
@@ -231,4 +238,9 @@ fn seedvr2_image_path_tiles_when_over_budget() {
     let cos = pixel_cosine(&tiled.pixels, &single.pixels);
     eprintln!("[seedvr2-smoke] image-path tiled vs single-pass: cosine={cos:.6}");
     assert!(cos > 0.95, "tiled image diverged from single-pass: {cos}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cuda_smoke::seedvr2_image_path_tiles_when_over_budget"
+    );
 }

@@ -369,6 +369,7 @@ fn the_same_loader_serves_a_dense_tier_densely() {
 /// checkpoint of the *unquantized* weight is a different tensor and comparing against it would only
 /// measure quantization error, not decode correctness.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_packed_forward_matches_its_dense_grid_at_every_target() {
     let (out, in_) = (32usize, 128usize);
     let x = Tensor::from_vec(
@@ -410,6 +411,9 @@ fn the_packed_forward_matches_its_dense_grid_at_every_target() {
         }
     }
     println!("[quant-policy] worst packed-vs-dense-grid rel-max-abs = {worst:.3e}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_policy::the_packed_forward_matches_its_dense_grid_at_every_target");
 }
 
 /// A `.scales` sibling whose `.weight` is **not** a u32 code stream is a typed load error, not a

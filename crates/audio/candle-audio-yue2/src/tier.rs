@@ -295,7 +295,14 @@ pub fn verify_tier(dir: &Path) -> Result<VerifiedTier, AssetError> {
 
 pub(crate) fn verify_tier_from(source: TierSource, dir: &Path) -> Result<VerifiedTier, AssetError> {
     let manifest_path = dir.join(TIER_MANIFEST);
-    let text = std::fs::read(&manifest_path).map_err(|source| AssetError::Io {
+    let text = candle_audio::gen_core::__model_input_reader!(
+        std::fs::read(&manifest_path),
+        "crates/audio/candle-audio-yue2/src/tier.rs::verify_tier_from::std::fs::read@11458",
+        ArtifactInput,
+        &manifest_path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    )
+    .map_err(|source| AssetError::Io {
         component: COMPONENT_KEY.into(),
         path: manifest_path.clone(),
         source,

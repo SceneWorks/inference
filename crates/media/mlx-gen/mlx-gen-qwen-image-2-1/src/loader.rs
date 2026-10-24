@@ -108,7 +108,14 @@ pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
     if !text_encoder.is_file() {
         return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&text_encoder)?)
+    let value: serde_json::Value =
+        serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&text_encoder),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5424",
+ArtifactInput,
+&text_encoder,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
         .map_err(|e| Error::Msg(format!("qwen_image_2_1: text_encoder/config.json: {e}")))?;
     if value.get("vision_config").is_none() {
         return Ok(None);
@@ -121,8 +128,16 @@ pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
         let path = root.join(candidate);
         if path.is_file() {
             processor = Some(
-                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path)?)
-                    .map_err(|e| Error::Msg(format!("qwen_image_2_1: {candidate}: {e}")))?,
+                serde_json::from_slice::<serde_json::Value>(
+                    &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@5935",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?,
+                )
+                .map_err(|e| Error::Msg(format!("qwen_image_2_1: {candidate}: {e}")))?,
             );
             break;
         }
@@ -268,9 +283,15 @@ fn read_model_index(id: &str, root: &Path) -> Result<Option<serde_json::Value>> 
     if !path.is_file() {
         return Ok(None);
     }
-    serde_json::from_slice(&std::fs::read(&path)?)
-        .map(Some)
-        .map_err(|e| Error::Msg(format!("{id}: model_index.json: {e}")))
+    serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::read_model_index::std::fs::read@12258",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
+    .map(Some)
+    .map_err(|e| Error::Msg(format!("{id}: model_index.json: {e}")))
 }
 
 /// The saved-sigma schedule of a **distilled** snapshot (`Qwen/Qwen-Image-2.1-Turbo`):
@@ -284,7 +305,13 @@ pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
         read_model_index(crate::model::TURBO_MODEL_ID, root)?.unwrap_or(serde_json::Value::Null);
     let path = root.join("scheduler").join("scheduler_config.json");
     let scheduler_config = if path.is_file() {
-        serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| {
+        serde_json::from_slice(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/loader.rs::load_saved_sigma_schedule::std::fs::read@13192",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?).map_err(|e| {
             Error::Msg(format!(
                 "qwen_image_2_1_turbo: scheduler/scheduler_config.json: {e}"
             ))
@@ -366,6 +393,7 @@ mod tests {
     ///
     /// *Mutation that reds this:* dropping any of the three `w.materialize_accessed()` calls.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn loaders_consume_their_snapshot_bytes_at_load() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("snapshot");
@@ -443,5 +471,7 @@ mod tests {
             byte_equal(&want, &got),
             "vae output differs after truncation"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED loader::tests::loaders_consume_their_snapshot_bytes_at_load");
     }
 }

@@ -225,7 +225,7 @@ fn staged_only() -> Option<GenerationMemory> {
 /// let allocator warm-up masquerade as the rung's effect; requiring the saving in both orders rules
 /// that out.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn bounded_attention_reduces_the_staged_denoise_peak() {
     println!(
         "SC-15615 MLX Z-Image bounded-attention A/B ({:?} tier, {}x{}, {} steps)",
@@ -279,6 +279,9 @@ fn bounded_attention_reduces_the_staged_denoise_peak() {
             bd / GIB
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::bounded_attention_reduces_the_staged_denoise_peak");
 }
 
 /// Attribution: the saving is the per-chunk `eval` barrier cutting the lazy graph, not a bounded
@@ -286,7 +289,7 @@ fn bounded_attention_reduces_the_staged_denoise_peak() {
 /// and includes the **control** that pins the claim — a budget that never chunks but still sets
 /// `eval_per_chunk` must be inert.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_saving_comes_from_the_per_chunk_eval_barrier() {
     use mlx_gen::attention::AttentionBudget;
     use mlx_gen::FlowMatchEuler;
@@ -400,11 +403,14 @@ fn the_saving_comes_from_the_per_chunk_eval_barrier() {
         100.0 * (lazy - unbounded) / unbounded,
         100.0 * (eager - unbounded) / unbounded
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::the_saving_comes_from_the_per_chunk_eval_barrier");
 }
 
 /// The numerical half: the budget must not change the image.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn bounded_attention_preserves_the_image() {
     let without = run(staged_only());
     let with = run(bounded());
@@ -423,6 +429,9 @@ fn bounded_attention_preserves_the_image() {
         mean, 0.0,
         "bounded attention changed the image (mean delta {mean})"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::bounded_attention_preserves_the_image");
 }
 
 /// The measured answer to GitHub #1932's question, printed with its assumptions stated. This does not
@@ -433,7 +442,7 @@ fn bounded_attention_preserves_the_image() {
 /// and GitHub #1932 is precisely the case where it did not. The resident number is what that user's
 /// machine was asked for.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_eight_gb_mac_verdict() {
     let staged = run(staged_only());
     let with_rung3 = run(bounded());
@@ -496,6 +505,11 @@ fn the_eight_gb_mac_verdict() {
         resident as f64 / GIB,
         peak / GIB
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::the_eight_gb_mac_verdict"
+    );
 }
 
 /// Whole-request peak on the **resident** policy — every component held warm and, because
@@ -524,7 +538,7 @@ fn resident_peak() -> usize {
 /// here are second-runs on a warm generator; the only difference is whether the first run was
 /// canceled.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn a_canceled_run_leaves_no_resident_cache() {
     /// Peak of a second generation on a warm generator whose first generation either completed or
     /// was canceled at the first step boundary.
@@ -577,6 +591,9 @@ fn a_canceled_run_leaves_no_resident_cache() {
         after_cancel as f64 / GIB,
         after_success as f64 / GIB
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::a_canceled_run_leaves_no_resident_cache");
 }
 
 /// The error half of "per-chunk cancellation checks and **cleanup on error**".
@@ -588,7 +605,7 @@ fn a_canceled_run_leaves_no_resident_cache() {
 /// legitimately peaks a little above a cold one, and comparing against cold would blame that on the
 /// fault.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
     use mlx_gen::gen_core::MemoryPhase;
 
@@ -659,4 +676,7 @@ fn an_errored_run_at_any_phase_leaves_no_resident_cache() {
             after_success as f64 / GIB
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention_real_weights::an_errored_run_at_any_phase_leaves_no_resident_cache");
 }

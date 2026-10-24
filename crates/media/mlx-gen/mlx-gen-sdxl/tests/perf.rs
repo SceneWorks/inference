@@ -53,7 +53,8 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot (SDXL_SNAPSHOT or HF cache)"]
 fn sdxl_per_step_compiled_vs_eager() {
     let snap = match snapshot() {
         Some(p) => p,
@@ -83,7 +84,11 @@ fn sdxl_per_step_compiled_vs_eager() {
     let timestep = 700.0f32;
 
     let run = || {
-        unet.forward(&latents, timestep, &conditioning, &pooled, &time_ids)
+        (
+            crate::common::record_model_inference_device(),
+            unet.forward(&latents, timestep, &conditioning, &pooled, &time_ids),
+        )
+            .1
             .unwrap()
     };
 
@@ -135,4 +140,6 @@ fn sdxl_per_step_compiled_vs_eager() {
         max_diff, 0.0,
         "SDXL compiled SiLU diverged from eager on the real fp16 UNet"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED perf::sdxl_per_step_compiled_vs_eager");
 }

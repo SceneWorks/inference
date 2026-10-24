@@ -40,7 +40,20 @@ impl Weights {
 
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let (tensors, metadata) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let (tensors, metadata) = gen_core::__model_input_reader!(
+Array::load_safetensors_with_metadata(path.as_ref()),
+"crates/media/mlx-gen/src/weights.rs::from_file::Array::load_safetensors_with_metadata@1543",
+TensorInput,
+__input_path,
+|__model_input_path| Array::load_safetensors_with_metadata(__model_input_path)
+)?;
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_model_weight_paths(
+            "mlx-gen::Weights::from_file",
+            &[__input_path],
+        );
         Ok(Self {
             tensors,
             metadata,
@@ -166,7 +179,12 @@ impl Weights {
         path: impl AsRef<Path>,
         mut include: impl FnMut(&str) -> bool,
     ) -> Result<Self> {
-        let file = std::fs::File::open(path.as_ref())?;
+        #[cfg(feature = "model-inference-proof")]
+        let __input_path = path.as_ref();
+        let file = gen_core::__model_input_choose!(
+            std::fs::File::open(path.as_ref()),
+            std::fs::File::open(__input_path)
+        )?;
         // SAFETY: the mapping is read-only and remains alive until every borrowed
         // TensorView has been copied into MLX-owned array storage below.
         let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -242,6 +260,12 @@ impl Weights {
             };
             tensors.insert(name.to_owned(), value);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_reader_paths(
+            "mlx-gen::Weights::from_file_with_fp8_filter",
+            gen_core::model_input_proof::InputRole::ModelWeights,
+            &[__input_path],
+        );
         Ok(Self {
             tensors,
             metadata: HashMap::new(),
@@ -281,8 +305,14 @@ impl Weights {
         for f in files {
             // Name the offending file: the underlying mlx-c error carries only its own C++ source
             // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
-            let (t, m) = Array::load_safetensors_with_metadata(f)
-                .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
+            let (t, m) = gen_core::__model_input_reader!(
+Array::load_safetensors_with_metadata(f),
+"crates/media/mlx-gen/src/weights.rs::from_paths::Array::load_safetensors_with_metadata@13609",
+TensorInput,
+f,
+|__model_input_path| Array::load_safetensors_with_metadata(__model_input_path)
+)
+            .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
             // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
             // a stray extra file in the dir) and a plain `extend` would silently let the later shard
             // win, loading a partially-wrong tensor set. Surface it instead (F-032). Metadata is
@@ -298,6 +328,11 @@ impl Weights {
             }
             metadata.extend(m);
         }
+        #[cfg(feature = "model-inference-proof")]
+        gen_core::model_input_proof::record_model_weight_paths(
+            "mlx-gen::Weights::from_paths",
+            files,
+        );
         Ok(Self {
             tensors,
             metadata,

@@ -110,6 +110,15 @@
 //! (sc-19443) the ComfyUI key-space conversion the MLX lane originally refused. It reaches every
 //! task's DiT through the one [`model::MiniMaxH3::load_task_dit`] seam, `ref2va` included.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod alias_free;
 pub mod audio_config;

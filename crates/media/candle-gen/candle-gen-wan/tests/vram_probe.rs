@@ -254,9 +254,17 @@ fn measure(engine_id: &str) {
     let conditioning = if r.i2v {
         let image = match env("WAN_VRAM_IMAGE") {
             Some(p) => {
-                let rgb = image::open(&p)
-                    .unwrap_or_else(|e| panic!("open {p}: {e}"))
-                    .to_rgb8();
+                let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(&p),
+"crates/media/candle-gen/candle-gen-wan/tests/vram_probe.rs::measure::image::open@11467",
+Reference,
+&p,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+                .unwrap_or_else(|e| panic!("open {p}: {e}"))
+                .to_rgb8();
                 Image {
                     width: rgb.width(),
                     height: rgb.height(),
@@ -427,6 +435,9 @@ fn measure(engine_id: &str) {
 #[ignore = "sc-12402 VRAM campaign; needs a staged wan_2_2 tier in WAN_VRAM_DIR + an idle CUDA GPU"]
 fn wan_vram_ti2v_5b() {
     measure("wan2_2_ti2v_5b");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::wan_vram_ti2v_5b");
 }
 
 /// T2V-A14B dual-expert MoE at the shipped 1280x720 / 5 s default + the mandatory Lightning distill.
@@ -434,6 +445,9 @@ fn wan_vram_ti2v_5b() {
 #[ignore = "sc-12402 VRAM campaign; needs a staged wan_2_2_t2v_14b tier + Lightning pair + an idle CUDA GPU"]
 fn wan_vram_t2v_14b() {
     measure("wan2_2_t2v_14b");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::wan_vram_t2v_14b");
 }
 
 /// I2V-A14B dual-expert MoE (channel-concat conditioning) at the shipped default + Lightning.
@@ -441,4 +455,7 @@ fn wan_vram_t2v_14b() {
 #[ignore = "sc-12402 VRAM campaign; needs a staged wan_2_2_i2v_14b tier + Lightning pair + an idle CUDA GPU"]
 fn wan_vram_i2v_14b() {
     measure("wan2_2_i2v_14b");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vram_probe::wan_vram_i2v_14b");
 }

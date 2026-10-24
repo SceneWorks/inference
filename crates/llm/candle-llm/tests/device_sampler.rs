@@ -19,6 +19,15 @@
 //!   -- --ignored --nocapture ac2_qwen38
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod common;
 
 use std::collections::HashMap;
@@ -596,6 +605,7 @@ fn assert_greedy_unchanged<M: StepModel>(model: &M) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cpu_routes_are_reported_and_never_silent() {
     let model = tiny_qwen35(&Device::Cpu);
     // No device kernel on CPU: a temperature + top-p request is a host request, and says so.
@@ -610,6 +620,9 @@ fn cpu_routes_are_reported_and_never_silent() {
     assert_host_routes_are_reported(&model);
     assert_greedy_unchanged(&tiny_llama(&Device::Cpu));
     assert_greedy_unchanged(&model);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cpu_routes_are_reported_and_never_silent");
 }
 
 #[test]
@@ -761,9 +774,13 @@ fn assert_the_engine_draws_through_sample<M: StepModel>(model: &M) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn cpu_engine_without_drafts_draws_through_sample_on_both_families() {
     assert_the_engine_draws_through_sample(&tiny_qwen35(&Device::Cpu));
     assert_the_engine_draws_through_sample(&tiny_llama(&Device::Cpu));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cpu_engine_without_drafts_draws_through_sample_on_both_families");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1110,6 +1127,7 @@ mod cuda {
     /// AC2, unit level: a temperature + top-p request on a tiny config copies zero logits rows and
     /// syncs exactly once per token — the same as greedy — on both decode drivers.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ac2_tiny_config_temperature_top_p_has_zero_logits_copies_and_one_sync_per_token() {
         let model = tiny_qwen35(&gpu());
         let (tokens, record) = run_step(&model, &stochastic(TOKENS));
@@ -1152,23 +1170,34 @@ mod cuda {
         let (_, reference) = with_reference_sampler(|| run_step(&model, &stochastic(TOKENS)));
         assert_eq!(reference.sampler.label(), "host:reference");
         assert_eq!(reference.sampler.logits_to_host, TOKENS as u64);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda::ac2_tiny_config_temperature_top_p_has_zero_logits_copies_and_one_sync_per_token");
     }
 
     /// sc-24140: on CUDA the engine with no proposer — `generate_step`, the provider's Off path,
     /// LLaVA, StarVector — keeps a temperature + top-p request on the device sampler for both
     /// families: zero logits rows to the host, one sync per token, the seam loop's seeded stream.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cuda_engine_without_drafts_draws_through_sample_on_both_families() {
         assert_the_engine_draws_through_sample(&tiny_qwen35(&gpu()));
         assert_the_engine_draws_through_sample(&tiny_llama(&gpu()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda::cuda_engine_without_drafts_draws_through_sample_on_both_families");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ac3_cuda_penalties_and_constraints_take_the_host_path() {
         let model = tiny_qwen35(&gpu());
         assert_host_routes_are_reported(&model);
         assert_greedy_unchanged(&tiny_llama(&gpu()));
         assert_greedy_unchanged(&model);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda::ac3_cuda_penalties_and_constraints_take_the_host_path");
     }
 
     /// The sampler's own per-token cost on the Qwen3.8 vocabulary width (no weights): device
@@ -1400,4 +1429,7 @@ fn ac2_qwen38_temperature_top_p_decodes_without_logits_copies() {
     if let Some(path) = std::env::var_os(EVIDENCE_VAR).filter(|v| !v.is_empty()) {
         std::fs::write(path, text + "\n").unwrap();
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ac2_qwen38_temperature_top_p_decodes_without_logits_copies");
 }

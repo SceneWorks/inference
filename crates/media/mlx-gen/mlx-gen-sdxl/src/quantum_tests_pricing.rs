@@ -641,7 +641,11 @@ fn image(w: i32, h: i32, seed: i32) -> mlx_gen::media::Image {
 /// at sequential CFG, the rung-2 tiled decode and the pixel conversion.
 fn run_request(l: &Loaded, route: Route, tiling: &mlx_gen::tiling::TilingConfig) -> Result<()> {
     let (pixels_w, pixels_h) = (LATENT * VAE_SCALE, LATENT * VAE_SCALE);
-    let (cond, pooled) = crate::pipeline::encode_conditioning(&l.te1, &l.te2, &ids())?;
+    let (cond, pooled) = (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::encode_conditioning(&l.te1, &l.te2, &ids()),
+    )
+        .1?;
     let ip_tokens = match &l.ip {
         Some(encoder) => {
             let tokens = encoder.tokens(&image(20, 18, 1))?;
@@ -657,14 +661,18 @@ fn run_request(l: &Loaded, route: Route, tiling: &mlx_gen::tiling::TilingConfig)
     )?;
     let mut blend = None;
     let latents = if route.encodes_init_for_test() {
-        let init = crate::pipeline::encode_init_latents_tiled(
-            &l.vae,
-            &image(pixels_w, pixels_h, 3),
-            pixels_w as u32,
-            pixels_h as u32,
-            Some(tiling),
-            None,
-        )?;
+        let init = (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::encode_init_latents_tiled(
+                &l.vae,
+                &image(pixels_w, pixels_h, 3),
+                pixels_w as u32,
+                pixels_h as u32,
+                Some(tiling),
+                None,
+            ),
+        )
+            .1?;
         let noise = rnd(init.shape(), 5, 1.0);
         let x_t = euler.add_noise_with(&init, &noise, 800.0)?;
         if route == Route::Mask {
@@ -703,46 +711,79 @@ fn run_request(l: &Loaded, route: Route, tiling: &mlx_gen::tiling::TilingConfig)
                 cond_embed: l.controls[0].embed_cond(&control)?,
                 scale: 1.0,
             };
-            crate::pipeline::denoise_control(
-                &d,
-                latents,
-                &cond,
-                &pooled,
-                &ids,
-                5.0,
-                &cancel,
-                &mut |_| {},
-                &cc,
-            )?
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_control(
+                    &d,
+                    latents,
+                    &cond,
+                    &pooled,
+                    &ids,
+                    5.0,
+                    &cancel,
+                    &mut |_| {},
+                    &cc,
+                ),
+            )
+                .1?
         }
-        Route::IpAdapter => crate::pipeline::denoise_ip(
-            &d,
-            latents,
-            &cond,
-            &pooled,
-            &ids,
-            5.0,
-            &cancel,
-            &mut |_| {},
-            ip_tokens.as_ref().expect("IP tokens"),
-            0.6,
-        )?,
-        Route::Mask => crate::pipeline::denoise_inpaint(
-            &d,
-            latents,
-            &cond,
-            &pooled,
-            &ids,
-            5.0,
-            &cancel,
-            &mut |_| {},
-            blend.as_ref().expect("inpaint blend"),
-        )?,
+        Route::IpAdapter => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_ip(
+                    &d,
+                    latents,
+                    &cond,
+                    &pooled,
+                    &ids,
+                    5.0,
+                    &cancel,
+                    &mut |_| {},
+                    ip_tokens.as_ref().expect("IP tokens"),
+                    0.6,
+                ),
+            )
+                .1?
+        }
+        Route::Mask => {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_inpaint(
+                    &d,
+                    latents,
+                    &cond,
+                    &pooled,
+                    &ids,
+                    5.0,
+                    &cancel,
+                    &mut |_| {},
+                    blend.as_ref().expect("inpaint blend"),
+                ),
+            )
+                .1?
+        }
         _ => {
-            crate::pipeline::denoise(&d, latents, &cond, &pooled, &ids, 5.0, &cancel, &mut |_| {})?
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise(
+                    &d,
+                    latents,
+                    &cond,
+                    &pooled,
+                    &ids,
+                    5.0,
+                    &cancel,
+                    &mut |_| {},
+                ),
+            )
+                .1?
         }
     };
-    crate::pipeline::decode_image_tiled(&l.vae, &latents, None, Some(tiling), None)?;
+    (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::decode_image_tiled(&l.vae, &latents, None, Some(tiling), None),
+    )
+        .1?;
     Ok(())
 }
 
@@ -849,6 +890,7 @@ fn observed_by_phase(events: &[Ev]) -> (HashMap<IosPhase, u64>, HashMap<String, 
 /// loaders and pipeline under the CPU diagnostic observer and require, per phase, the largest
 /// observed checked scratch to EQUAL `ios_pricing`'s priced scratch for that phase (every load
 /// floor equal by label), and every observed label to be priced.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn pricing_is_the_guards_formulas() {
     if !cpu_child("pricing::pricing_is_the_guards_formulas") {
@@ -864,6 +906,10 @@ fn pricing_is_the_guards_formulas() {
     ] {
         assert_pricing_is_observed(&snap, route);
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::pricing_is_the_guards_formulas"
+    );
 }
 
 /// Run `route` on `snap` through the real loaders and pipeline under the CPU diagnostic observer
@@ -873,7 +919,11 @@ fn assert_pricing_is_observed(snap: &Snapshot, route: Route) {
     let regime = regime(route);
     let (result, events) = observe(PLENTY, || {
         let loaded = load(snap, route)?;
-        run_request(&loaded, route, regime.tiling.as_ref().unwrap())
+        (
+            crate::test_device::record_model_inference_device(),
+            run_request(&loaded, route, regime.tiling.as_ref().unwrap()),
+        )
+            .1
     });
     result.unwrap();
     // The load floors are checks before a construction (no synchronized quantum); the rest of
@@ -972,6 +1022,7 @@ fn assert_pricing_is_observed(snap: &Snapshot, route: Route) {
 /// [`pricing_is_the_guards_formulas`] on a q4-packed tier: the packed projections' bf16 scales
 /// promote the U-Net's activations (and from the first step's output on, the latent) to f32, and
 /// the load-time-quantized ControlNet's to f32 — every dtype the guards read, priced header-only.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packed_pricing_is_the_guards_formulas() {
     if !cpu_child("pricing::packed_pricing_is_the_guards_formulas") {
@@ -981,11 +1032,14 @@ fn packed_pricing_is_the_guards_formulas() {
     for route in [Route::Text, Route::Reference, Route::Control] {
         assert_pricing_is_observed(&snap, route);
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::packed_pricing_is_the_guards_formulas");
 }
 
 /// Exercise the actual text/IP final-quantum call sites, not just the shared norm helper.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn final_norm_guards_cover_norm_pool_and_projection() {
     if !cpu_child("pricing::final_norm_guards_cover_norm_pool_and_projection") {
         return;
@@ -997,8 +1051,14 @@ fn final_norm_guards_cover_norm_pool_and_projection() {
     ] {
         let loaded = load(&snap, Route::IpAdapter).unwrap();
         let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
-        with_cpu_diagnostic_headroom(PLENTY, || run_request(&loaded, Route::IpAdapter, &tiling))
-            .unwrap();
+        with_cpu_diagnostic_headroom(PLENTY, || {
+            (
+                crate::test_device::record_model_inference_device(),
+                run_request(&loaded, Route::IpAdapter, &tiling),
+            )
+                .1
+        })
+        .unwrap();
         let counts = Rc::new(RefCell::new(HashMap::<String, usize>::new()));
         let sink = counts.clone();
         let mut open = None;
@@ -1032,7 +1092,13 @@ fn final_norm_guards_cover_norm_pool_and_projection() {
                     }
                     _ => {}
                 },
-                || run_request(&loaded, Route::IpAdapter, &tiling),
+                || {
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        run_request(&loaded, Route::IpAdapter, &tiling),
+                    )
+                        .1
+                },
             )
         })
         .unwrap();
@@ -1051,6 +1117,8 @@ fn final_norm_guards_cover_norm_pool_and_projection() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::final_norm_guards_cover_norm_pool_and_projection");
 }
 
 /// The sampler's wider img2img state is NOT its f16 forward input. Dense text ends f16, dense
@@ -1110,7 +1178,8 @@ fn decode_resident_separates_sampler_state_forward_cast_and_compute_alias() {
 /// tracks the stalled measured peak (>= measured, <= 1.5x) at an f32 block (256 wide, a 1024-wide
 /// GEGLU) over 64 tokens, weight-dominated as every production SDXL block is.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn streamed_block_quantum_tracks_its_measured_peak() {
     if !cpu_child("pricing::streamed_block_quantum_tracks_its_measured_peak") {
         return;
@@ -1179,6 +1248,8 @@ fn streamed_block_quantum_tracks_its_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::streamed_block_quantum_tracks_its_measured_peak");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::streamed_block_quantum_tracks_its_measured_peak");
 }
 
 /// A streamed U-Net load's floor counts only the tensors the load materializes (the resident
@@ -1216,6 +1287,7 @@ fn streamed_unet_load_floor_tracks_its_measured_peak() {
 
 /// Parity: holding a cast load's sources changes no value — the fp16-fix VAE loaded on the iOS
 /// path (sources held) decodes bit-identically to the host load (no hold).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn held_cast_sources_load_bit_identical_weights() {
     if !cpu_child("pricing::held_cast_sources_load_bit_identical_weights") {
@@ -1231,9 +1303,25 @@ fn held_cast_sources_load_bit_identical_weights() {
     let z = rnd(&[1, LATENT, LATENT, 4], 31, 1.0);
     z.eval().unwrap();
     assert_eq!(
-        bits(&host.decode(&z).unwrap()),
-        bits(&held.decode(&z).unwrap())
+        bits(
+            &(
+                crate::test_device::record_model_inference_device(),
+                host.decode(&z)
+            )
+                .1
+                .unwrap()
+        ),
+        bits(
+            &(
+                crate::test_device::record_model_inference_device(),
+                held.decode(&z)
+            )
+                .1
+                .unwrap()
+        )
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::held_cast_sources_load_bit_identical_weights");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1249,6 +1337,7 @@ fn ip_bundle(s: &Snapshot) -> crate::model::SdxlHeavyOwned {
 /// Output parity: the shed path's image-prompt tokens are bit-identical to the resident path's,
 /// so the denoise that consumes them is too; the shed path releases the tower (and a resident
 /// bundle keeps it for the next request).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn staged_ip_request_sheds_the_image_encoder_with_identical_tokens() {
     if !cpu_child("pricing::staged_ip_request_sheds_the_image_encoder_with_identical_tokens") {
@@ -1269,6 +1358,8 @@ fn staged_ip_request_sheds_the_image_encoder_with_identical_tokens() {
         "a staged request must release the image encoder once its tokens exist"
     );
     assert!(!crate::model::sheds_ip_image_encoder(false));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::staged_ip_request_sheds_the_image_encoder_with_identical_tokens");
 }
 
 /// The lever's price: the staged IP denoise's priced resident bytes (U-Net remainder + VAE + the
@@ -1276,7 +1367,8 @@ fn staged_ip_request_sheds_the_image_encoder_with_identical_tokens() {
 /// shed (>= measured, <= 1.5x) — the tower here is most of the bundle, so pricing it resident (or
 /// not shedding it) fails the bound.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn staged_ip_denoise_resident_tracks_the_measured_bundle() {
     if !cpu_child("pricing::staged_ip_denoise_resident_tracks_the_measured_bundle") {
         return;
@@ -1320,6 +1412,8 @@ fn staged_ip_denoise_resident_tracks_the_measured_bundle() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::staged_ip_denoise_resident_tracks_the_measured_bundle");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::staged_ip_denoise_resident_tracks_the_measured_bundle");
 }
 
 /// A CAST load (the fp16-fix VAE: f32 on disk, f16 resident): the floor the guard checks tracks the
@@ -1371,6 +1465,7 @@ mod additivity;
 /// Nonzero production consumer discriminator. Native HashMap order and actual Array values are
 /// independent witnesses; no selected-world metadata is used to choose the native winning alias.
 /// This is source-logical/guard parity, NOT a physical allocator, RSS, device or RGB certificate.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn adapter_world_prefix_forward_and_conv_consumer() {
     let Some(mut completed) =
@@ -1524,7 +1619,12 @@ fn adapter_world_prefix_forward_and_conv_consumer() {
         let residual = input as f32 * 0.125 * 2.0 * coefficient;
         assert!(residual > 0.0);
         let expected_linear = mlx_rs::ops::add(&baseline, scalar(residual)).unwrap();
-        let actual_linear = linear.forward(&probe).unwrap();
+        let actual_linear = (
+            crate::test_device::record_model_inference_device(),
+            linear.forward(&probe),
+        )
+            .1
+            .unwrap();
         assert_eq!(
             actual_linear.try_as_slice::<f32>().unwrap(),
             expected_linear.try_as_slice::<f32>().unwrap(),
@@ -1648,7 +1748,11 @@ fn adapter_world_prefix_forward_and_conv_consumer() {
         let (result, events) = observe(PLENTY, || -> Result<Vec<f32>> {
             // Actual ordered base-only pack retains the already installed nonzero residual.
             crate::quant::guarded_load_quantize(|| native.quantize(4))?;
-            let output = native.forward(&x, 500.0, &context, &pooled, &time_ids)?;
+            let output = (
+                crate::test_device::record_model_inference_device(),
+                native.forward(&x, 500.0, &context, &pooled, &time_ids),
+            )
+                .1?;
             Ok(flattened(&output))
         });
         let values = result.unwrap();
@@ -1795,6 +1899,8 @@ fn adapter_world_prefix_forward_and_conv_consumer() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::adapter_world_prefix_forward_and_conv_consumer");
 }
 
 /// Actual direct broadcast installs whose output exceeds the ENTIRE legacy guard, including its
@@ -2005,6 +2111,7 @@ fn broadcast_install_cost_exceeds_legacy_budget() {
 /// This isolates the logical operand contribution of the HOST broadcast add, not an allocator
 /// peak: native add may donate an unshared base result. No artificial retention is called public
 /// ownership, and neither this extent nor the metadata price establishes physical memory.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn packed_residual_host_add_uses_native_broadcast_extent() {
     let Some(mut completed) =
@@ -2079,10 +2186,20 @@ fn packed_residual_host_add_uses_native_broadcast_extent() {
         let base = {
             let mut bare = linear.clone();
             bare.set_adapters(Vec::new());
-            bare.forward(&probe).unwrap()
+            (
+                crate::test_device::record_model_inference_device(),
+                bare.forward(&probe),
+            )
+                .1
+                .unwrap()
         };
         let residual = linear.adapters()[0].residual(&probe).unwrap();
-        let output = linear.forward(&probe).unwrap();
+        let output = (
+            crate::test_device::record_model_inference_device(),
+            linear.forward(&probe),
+        )
+            .1
+            .unwrap();
         output.eval().unwrap();
         assert_eq!(
             unsafe { mlx_sys::mlx_synchronize(mlx_rs::Stream::cpu().as_ptr()) },
@@ -2147,6 +2264,8 @@ fn packed_residual_host_add_uses_native_broadcast_extent() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::packed_residual_host_add_uses_native_broadcast_extent");
 }
 
 /// All four classified DOWN/UP winner combinations are supplied as complete native key orders.
@@ -2154,7 +2273,8 @@ fn packed_residual_host_add_uses_native_broadcast_extent() {
 /// ranks refuse at the real dense merge after the earlier K install. Native arrays, not another
 /// header replay, supply installed geometry, values, packed operands and ordered guard facts.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
     let Some(mut completed) =
         completed_cpu_child("pricing::correlated_rank_worlds_restore_effects_and_native_prefixes")
@@ -2462,9 +2582,16 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
                         read(q_weight).iter().all(|v| *v == 0.0625),
                         "two independent nonzero .03125 merges"
                     );
-                    assert!(read(&q_linear.forward(&probe).unwrap())
-                        .iter()
-                        .all(|v| *v == 4.0));
+                    assert!(read(
+                        &(
+                            crate::test_device::record_model_inference_device(),
+                            q_linear.forward(&probe)
+                        )
+                            .1
+                            .unwrap()
+                    )
+                    .iter()
+                    .all(|v| *v == 4.0));
                     let k_linear = native.adaptable_mut(&kp).unwrap();
                     assert_eq!(k_linear.adapters().len(), 2);
                     for (index, (rank, coefficient)) in
@@ -2483,7 +2610,12 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
                         mlx_gen::array::scalar(4.0f32),
                     )
                     .unwrap();
-                    let actual_k = k_linear.forward(&probe).unwrap();
+                    let actual_k = (
+                        crate::test_device::record_model_inference_device(),
+                        k_linear.forward(&probe),
+                    )
+                        .1
+                        .unwrap();
                     assert_eq!(
                         actual_k.shape(),
                         &[1, 64],
@@ -2517,7 +2649,11 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
                     let pooled = tensor(&[1, 16], 0.125, crate::model::DTYPE);
                     let ids = crate::pipeline::text_time_ids(1);
                     let (output, forward_events) = observe(PLENTY, || {
-                        native.forward(&x, 500.0, &context, &pooled, &ids)
+                        (
+                            crate::test_device::record_model_inference_device(),
+                            native.forward(&x, 500.0, &context, &pooled, &ids),
+                        )
+                            .1
                     });
                     let output = output.unwrap();
                     let values = read(&output);
@@ -2824,12 +2960,15 @@ fn correlated_rank_worlds_restore_effects_and_native_prefixes() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::pricing::correlated_rank_worlds_restore_effects_and_native_prefixes");
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::correlated_rank_worlds_restore_effects_and_native_prefixes");
 }
 
 /// Native PEFT constructor order, not a shared header formula as its own oracle. Every row starts
 /// with a nonzero real LoRA file so a later constructor refusal must preserve that prior install.
 /// Full factors shadow malformed decomposed products; packed FULL-scale finiteness is deliberately
 /// NOT the dense positive-metadata-rank policy. No test adds a new accepted-shape restriction.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn peft_lokr_scale_gate_precedes_factor_reconstruction() {
     let Some(mut completed) =
@@ -3087,7 +3226,14 @@ fn peft_lokr_scale_gate_precedes_factor_reconstruction() {
                     mlx_rs::ops::add(&prior, mlx_gen::array::scalar(delta)).unwrap()
                 };
                 assert_eq!(
-                    read(&linear.forward(&probe).unwrap()),
+                    read(
+                        &(
+                            crate::test_device::record_model_inference_device(),
+                            linear.forward(&probe)
+                        )
+                            .1
+                            .unwrap()
+                    ),
                     read(&expected),
                     "{packed}/{name}: independent nonzero prior-file and full-factor value/order"
                 );
@@ -3136,6 +3282,8 @@ fn peft_lokr_scale_gate_precedes_factor_reconstruction() {
         eprintln!("SDXL_PEFT_GATE_MECHANISM 0 native_storage_specific_scale_before_factor_fullshadow_and_prefix");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::peft_lokr_scale_gate_precedes_factor_reconstruction");
 }
 
 // Source-proposal TP mechanisms: no native call below is reached before completed_cpu_child.
@@ -3488,6 +3636,7 @@ fn tp_proof_check(
     worlds
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tp_raw_groups_revisit_target_and_preserve_real_prefixes() {
     let Some(mut completed) =
@@ -3585,6 +3734,8 @@ fn tp_raw_groups_revisit_target_and_preserve_real_prefixes() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::tp_raw_groups_revisit_target_and_preserve_real_prefixes");
 }
 
 /// Planning estimate only. This is the original fixed Snapshot source inventory, not native RSS,
@@ -3685,6 +3836,7 @@ fn tp_proof_alpha_file(
     (file, key)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn all_alpha_shapes_full_casts_and_entrypoint_policies() {
     let Some(mut completed) =
@@ -4033,8 +4185,11 @@ fn all_alpha_shapes_full_casts_and_entrypoint_policies() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::all_alpha_shapes_full_casts_and_entrypoint_policies");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tp_full_product_tucker_and_batched_native_branches() {
     let Some(mut completed) =
@@ -4208,10 +4363,13 @@ fn tp_full_product_tucker_and_batched_native_branches() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::tp_full_product_tucker_and_batched_native_branches");
 }
 
 /// Native configured file → dense broadcast merge → ACTUAL post-adapter pack, not a fabricated
 /// mixed-dtype activation. The old native shape model stays unmodified while selected effects grow.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn selected_projection_operands_use_actual_context_after_native_pack() {
     let Some(mut completed) = completed_cpu_child(
@@ -4332,7 +4490,12 @@ fn selected_projection_operands_use_actual_context_after_native_pack() {
                     0.125,
                     crate::model::DTYPE,
                 );
-                let positive = resampler.forward(&features).unwrap();
+                let positive = (
+                    crate::test_device::record_model_inference_device(),
+                    resampler.forward(&features),
+                )
+                    .1
+                    .unwrap();
                 crate::ip_adapter::cfg_pair(&positive).unwrap()
             });
             let (packed, _) = observe(PLENTY, || native.quantize(4));
@@ -4351,7 +4514,12 @@ fn selected_projection_operands_use_actual_context_after_native_pack() {
                 assert_eq!(scales.shape(), &[64, 1]);
                 assert_eq!(scales.dtype(), Dtype::Bfloat16);
                 assert_eq!((group, bits), (64, 4));
-                let output = linear.forward(&context).unwrap();
+                let output = (
+                    crate::test_device::record_model_inference_device(),
+                    linear.forward(&context),
+                )
+                    .1
+                    .unwrap();
                 output.eval().unwrap();
                 assert_eq!(output.shape(), &[2, TOKENS, 64]);
                 assert_eq!(
@@ -4387,7 +4555,11 @@ fn selected_projection_operands_use_actual_context_after_native_pack() {
                                 == "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_v_ip"
                         {
                             seen += 1;
-                            let output = linear.forward(tokens)?;
+                            let output = (
+                                crate::test_device::record_model_inference_device(),
+                                linear.forward(tokens),
+                            )
+                                .1?;
                             output.eval()?;
                             assert_eq!(tokens.shape()[2], 64);
                             assert_eq!(output.shape()[..2], tokens.shape()[..2]);
@@ -4445,6 +4617,8 @@ fn selected_projection_operands_use_actual_context_after_native_pack() {
         eprintln!("SDXL_P5_OPERAND_MECHANISM 0 real_file_postpack_context_width_and_ip_operands");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::selected_projection_operands_use_actual_context_after_native_pack");
 }
 
 fn rgb_observation_active() -> u64 {
@@ -4620,6 +4794,7 @@ fn rgb_realized_f32_literals_preserve_caller_and_observe_absolute_peak() {
     completed.body_completed = true;
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn rgb_actual_vae_returns_preserve_lazy_boundary_and_observe_absolute_peak() {
     let Some(mut completed) = completed_cpu_child(
@@ -4653,7 +4828,13 @@ fn rgb_actual_vae_returns_preserve_lazy_boundary_and_observe_absolute_peak() {
             let nchw = latents.transpose_axes(&[0, 3, 1, 2]).unwrap();
             let active_before_decode = rgb_observation_active();
             mlx_rs::memory::reset_peak_memory();
-            let (returned, decode_events) = rgb_observation_capture(|| native.decode(&nchw));
+            let (returned, decode_events) = rgb_observation_capture(|| {
+                (
+                    crate::test_device::record_model_inference_device(),
+                    native.decode(&nchw),
+                )
+                    .1
+            });
             let decode_absolute_peak = mlx_rs::memory::get_peak_memory() as u64;
             let active_at_return = rgb_observation_active();
             assert_eq!(
@@ -4704,6 +4885,8 @@ fn rgb_actual_vae_returns_preserve_lazy_boundary_and_observe_absolute_peak() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::rgb_actual_vae_returns_preserve_lazy_boundary_and_observe_absolute_peak");
 }
 
 /// HOST-only mechanism regression: no Array/CPU-device/stream/allocator operation. The independent
@@ -4894,6 +5077,12 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
     assert_eq!(facts[0].1.bias.as_ref().unwrap().dtype, Dtype::Float16);
     assert!(facts[12].1.bias.is_none());
     assert_eq!(price.pooled_width(), 16);
+    let rows = 2_u64 * 8;
+    let elements = rows * 64;
+    // Two native mean normalizers and epsilon, plus the eager two-row i32 EOS indices.
+    // These owners overlap the lazy norm and cannot hide inside its max with pooling.
+    let fallback_scalars = (2 + 1) * 4;
+    let eos_indices = 2 * std::mem::size_of::<i32>() as u64;
     crate::quantum::with_backend(Backend::Cpu, || {
         let mut quanta = Vec::new();
         assert_eq!(
@@ -4903,10 +5092,16 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
                 .unwrap(),
             (Dtype::Float16, Dtype::Float16)
         );
-        // Independent literals for embedding extent and CPU final norm's competing live sets:
-        // 3*(2*8*64*2); max(1024*12,1024*18)+3*16*4 (no affine casts).
+        // Independent source counts: three half epilogue outputs and three F32 fallback
+        // operands, three per-row F32 statistics, native scalar owners and EOS indices.
         assert_eq!(quanta[0], (CLIP_EMBEDDINGS, 6144));
-        assert_eq!(quanta[3], (CLIP_POOLED, 18624));
+        assert_eq!(
+            quanta[3],
+            (
+                CLIP_POOLED,
+                elements * (3 * 2 + 3 * 4) + 3 * rows * 4 + fallback_scalars + eos_indices
+            )
+        );
         assert_eq!(
             quanta.iter().map(|p| p.0).collect::<Vec<_>>(),
             [CLIP_EMBEDDINGS, CLIP_LAYER, CLIP_LAYER, CLIP_POOLED]
@@ -4938,8 +5133,15 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
                     .unwrap(),
                 (Dtype::Float32, Dtype::Float32)
             );
-            // CPU final norm at F32: 1024*12 + 3*16*4 + 2*64*4 affine casts.
-            assert_eq!(quanta[3], (CLIP_POOLED, 12992));
+            // F32 normalization/affine graph, row statistics, both promoted affine operands,
+            // the same native scalar owners, and the separate eager EOS allocation.
+            assert_eq!(
+                quanta[3],
+                (
+                    CLIP_POOLED,
+                    elements * (3 * 4) + 3 * rows * 4 + 2 * 64 * 4 + fallback_scalars + eos_indices
+                )
+            );
         });
     }
     // Literal source q8 codes/scales + ordinary bias. Requested q4 is a constructor/pack no-op,
@@ -5013,6 +5215,7 @@ fn native_free_clip_headers_preserve_literals_lookup_casts_and_pack_host() {
     assert_eq!(headers, clip_literal_headers().0);
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
     let Some(mut completed) = completed_cpu_child(
@@ -5249,7 +5452,13 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
                         .unwrap()
                 });
                 let ids = clip_ids(8);
-                let (output, events) = observe(PLENTY, || native.forward(&ids));
+                let (output, events) = observe(PLENTY, || {
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        native.forward(&ids),
+                    )
+                        .1
+                });
                 let output = output.unwrap();
                 let observed: Vec<_> = events
                     .iter()
@@ -5284,8 +5493,16 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
         let (one, two) = Files::of(&snap).text().unwrap();
         let ids = clip_ids(TOKENS);
         let (native, events) = observe(PLENTY, || {
-            let one = one.forward(&ids)?;
-            let two = two.forward(&ids)?;
+            let one = (
+                crate::test_device::record_model_inference_device(),
+                one.forward(&ids),
+            )
+                .1?;
+            let two = (
+                crate::test_device::record_model_inference_device(),
+                two.forward(&ids),
+            )
+                .1?;
             Ok((one, two))
         });
         let (one, two) = native.unwrap();
@@ -5319,6 +5536,8 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
         eprintln!("SDXL_NATIVE_FREE_CLIP_MECHANISM 0 six_native_rows_and_served_pair");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::native_free_clip_pair_matches_actual_load_pack_and_forward_cpu");
 }
 
 // Native-free hierarchy literals are independent of the fixture's native parameter generator.
@@ -5577,6 +5796,8 @@ fn native_free_unet_control_literals_layout_geglu_effects_stream_and_merge_host(
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu() {
     let Some(mut completed) = completed_cpu_child(
         "pricing::native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu",
@@ -5720,7 +5941,13 @@ fn native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu() {
                 }
                 assert_eq!(expected.last().map(|q| q.0.as_str()), Some(UNET_CONV_OUT));
                 let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
-                let (result, events) = observe(PLENTY, || run_request(&loaded, route, &tiling));
+                let (result, events) = observe(PLENTY, || {
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        run_request(&loaded, route, &tiling),
+                    )
+                        .1
+                });
                 result.unwrap();
                 assert_well_ordered(
                     &events
@@ -5759,8 +5986,11 @@ fn native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu() {
         eprintln!("SDXL_NATIVE_FREE_HIERARCHY_MECHANISM 0 nine_synthetic_native_cases_not_physical_evidence");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu() {
     let Some(mut completed) = completed_cpu_child(
@@ -5788,8 +6018,11 @@ fn native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu() {
         let loaded = loaded.unwrap();
         let ((cond, pooled, contexts), _) = {
             let (result, events) = observe(PLENTY, || {
-                let (cond, pooled) =
-                    crate::pipeline::encode_conditioning(&loaded.te1, &loaded.te2, &ids())?;
+                let (cond, pooled) = (
+                    crate::test_device::record_model_inference_device(),
+                    crate::pipeline::encode_conditioning(&loaded.te1, &loaded.te2, &ids()),
+                )
+                    .1?;
                 let mut contexts = Vec::new();
                 for (index, branch) in loaded.controls.iter().enumerate() {
                     let edge = LATENT * CONTROL_SCALE;
@@ -5824,17 +6057,21 @@ fn native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu() {
         let time_ids = crate::pipeline::text_time_ids(2);
         let cancel = mlx_gen::CancelFlag::default();
         let (result, events) = observe(PLENTY, || {
-            crate::pipeline::denoise_multi_control(
-                &denoiser,
-                latents,
-                &cond,
-                &pooled,
-                &time_ids,
-                5.0,
-                &cancel,
-                &mut |_| {},
-                &contexts,
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise_multi_control(
+                    &denoiser,
+                    latents,
+                    &cond,
+                    &pooled,
+                    &time_ids,
+                    5.0,
+                    &cancel,
+                    &mut |_| {},
+                    &contexts,
+                ),
             )
+                .1
         });
         let result = result.unwrap();
         assert_eq!(super::bits(&result).len(), (LATENT * LATENT * 4) as usize);
@@ -5889,6 +6126,8 @@ fn native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu() {
         );
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu");
 }
 
 fn vae_literal_conv(
@@ -6199,6 +6438,7 @@ fn native_free_vae_literal_cast_geometry_halo_and_rgb_host() {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
     let Some(mut completed) = completed_cpu_child(
@@ -6304,9 +6544,18 @@ fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
             for input in [Dtype::Float16, Dtype::Float32] {
                 let latents = rnd(&[1, 5, 7, 4], 1901, 0.1).as_dtype(input).unwrap();
                 assert_eq!(
-                    metadata
-                        .decode_input_retained_bytes(&crate::quantum::activation_facts(&latents)),
-                    native.decode_input_retained_bytes(&latents),
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        metadata.decode_input_retained_bytes(&crate::quantum::activation_facts(
+                            &latents
+                        ))
+                    )
+                        .1,
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        native.decode_input_retained_bytes(&latents)
+                    )
+                        .1,
                     "actual input identity versus distinct compute copy"
                 );
                 for edge in [None, Some(7)] {
@@ -6327,8 +6576,20 @@ fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
                     ));
                     let (result, events) = observe(PLENTY, || {
                         let decoded = match &tiling {
-                            Some(cfg) => native.decode_tiled(&latents, cfg, None)?,
-                            None => native.decode(&latents)?,
+                            Some(cfg) => {
+                                (
+                                    crate::test_device::record_model_inference_device(),
+                                    native.decode_tiled(&latents, cfg, None),
+                                )
+                                    .1?
+                            }
+                            None => {
+                                (
+                                    crate::test_device::record_model_inference_device(),
+                                    native.decode(&latents),
+                                )
+                                    .1?
+                            }
                         };
                         // Shape/dtype only, no returned-image pre-eval/readback/pointer or retained
                         // alternate decoded parent before the ORIGINAL NHWC RGB consumer.
@@ -6360,7 +6621,13 @@ fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
                     )
                 })
                 .unwrap();
-                let (result, events) = observe(PLENTY, || native.encode_tiled(&pixels, edge, None));
+                let (result, events) = observe(PLENTY, || {
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        native.encode_tiled(&pixels, edge, None),
+                    )
+                        .1
+                });
                 let encoded = result.unwrap();
                 assert_eq!(encoded.shape(), [1, 6, 8, 4]);
                 assert_eq!(encoded.dtype(), Dtype::Float32);
@@ -6383,7 +6650,11 @@ fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
         });
         let (result, events) = observe(PLENTY, || {
             let loaded = load(&snapshot, Route::Reference)?;
-            run_request(&loaded, Route::Reference, r.tiling.as_ref().unwrap())
+            (
+                crate::test_device::record_model_inference_device(),
+                run_request(&loaded, Route::Reference, r.tiling.as_ref().unwrap()),
+            )
+                .1
         });
         result.unwrap();
         let expected_rgb = items
@@ -6435,6 +6706,8 @@ fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
         eprintln!("SDXL_NATIVE_FREE_VAE_MECHANISM 0 eight_decode_four_encode_and_served_reference_not_physical_evidence");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu");
 }
 
 fn ip_literal_headers() -> (
@@ -6789,6 +7062,7 @@ fn ip_reference_work_sidecar_and_scalar_policy_preserve_actual_context_host() {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn native_free_ip_tokens_cfg_and_actual_encoder_release_match_cpu() {
     let Some(mut completed) = completed_cpu_child(
@@ -6827,7 +7101,11 @@ fn native_free_ip_tokens_cfg_and_actual_encoder_release_match_cpu() {
             let (result, _) = observe(PLENTY, || load(&snapshot, Route::IpAdapter));
             let loaded = result.unwrap();
             let (text, _) = observe(PLENTY, || {
-                crate::pipeline::encode_conditioning(&loaded.te1, &loaded.te2, &ids())
+                (
+                    crate::test_device::record_model_inference_device(),
+                    crate::pipeline::encode_conditioning(&loaded.te1, &loaded.te2, &ids()),
+                )
+                    .1
             });
             let (conditioning, pooled) = text.unwrap();
             let heavy = crate::model::SdxlHeavyOwned::with_controls_for_test(
@@ -6902,18 +7180,22 @@ fn native_free_ip_tokens_cfg_and_actual_encoder_release_match_cpu() {
                     let latents = euler.sample_prior(&[1, LATENT, LATENT, 4]).unwrap();
                     let cancel = mlx_gen::CancelFlag::default();
                     let (output, _) = observe(PLENTY, || {
-                        crate::pipeline::denoise_ip(
-                            &denoiser,
-                            latents,
-                            &conditioning,
-                            &pooled,
-                            &crate::pipeline::text_time_ids(2),
-                            5.0,
-                            &cancel,
-                            &mut |_| {},
-                            &actual,
-                            0.6,
+                        (
+                            crate::test_device::record_model_inference_device(),
+                            crate::pipeline::denoise_ip(
+                                &denoiser,
+                                latents,
+                                &conditioning,
+                                &pooled,
+                                &crate::pipeline::text_time_ids(2),
+                                5.0,
+                                &cancel,
+                                &mut |_| {},
+                                &actual,
+                                0.6,
+                            ),
                         )
+                            .1
                     });
                     assert_eq!(
                         super::bits(&output.unwrap()).len(),
@@ -6949,6 +7231,8 @@ fn native_free_ip_tokens_cfg_and_actual_encoder_release_match_cpu() {
         eprintln!("SDXL_NATIVE_FREE_IP_MECHANISM 0 nine_synthetic_token_cfg_release_rows_not_physical_evidence");
     }
     completed.body_completed = true;
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::pricing::native_free_ip_tokens_cfg_and_actual_encoder_release_match_cpu");
 }
 
 fn fused_literal_headers() -> Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader> {

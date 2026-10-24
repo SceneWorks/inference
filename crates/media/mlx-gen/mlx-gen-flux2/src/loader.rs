@@ -31,7 +31,13 @@ pub(crate) fn read_component_quant(dir: &Path) -> Result<Option<Flux2Quant>> {
     if !path.exists() {
         return Ok(None);
     }
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+    let v: serde_json::Value = serde_json::from_str(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/mlx-gen/mlx-gen-flux2/src/loader.rs::read_component_quant::std::fs::read_to_string@1653",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?)
         .map_err(|e| mlx_gen::Error::Msg(format!("flux2: parse {}: {e}", path.display())))?;
     Ok(v.get("quantization")
         .filter(|q| q.is_object())

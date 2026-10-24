@@ -68,7 +68,7 @@ impl GroupNorm32 {
             .permute((0, 2, 1, 3, 4))?
             .reshape((b * t, c, h, w))?
             .contiguous()?;
-        let y = self.gn.forward(&x)?;
+        let y = __model_proof_output!(self.gn.forward(&x))?;
         // back to NCTHW.
         Ok(y.reshape((b, t, c, h, w))?
             .permute((0, 2, 1, 3, 4))?
@@ -551,6 +551,7 @@ mod tests {
     /// The synthetic decoder reproduces the AsymmVAE geometry (temporal `(T−1)·6+1`, spatial ×8,
     /// out_channels 3) and is deterministic across two runs — the CPU CI-green VAE gate (no weights).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn synthetic_decode_shape_and_determinism() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -583,6 +584,11 @@ mod tests {
                 .all(|x| x.is_finite()),
             "decode produced non-finite values"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::synthetic_decode_shape_and_determinism"
+        );
     }
 
     /// **Chunked == single-shot, exactly** (sc-12291) — the candle mirror of the MLX
@@ -591,6 +597,7 @@ mod tests {
     /// `FrameCache`, so chunking is an exact refactor, not an approximation to be blended. Runs on the
     /// real resnet geometry, since the temporal coupling is the thing under test.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_decode_is_identical_to_single_shot() {
         let dev = Device::Cpu;
         let cfg = real_geometry_cfg();
@@ -621,5 +628,8 @@ mod tests {
                 "chunk={chunk}: chunked decode must be identical to single-shot (max abs diff {d:.3e})"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::chunked_decode_is_identical_to_single_shot");
     }
 }

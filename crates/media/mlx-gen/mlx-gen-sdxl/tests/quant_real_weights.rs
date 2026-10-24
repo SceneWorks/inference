@@ -91,7 +91,13 @@ fn render_quant(q: Quant, g: &Weights) -> Image {
         guidance: Some(g.metadata("cfg").unwrap().parse().unwrap()),
         ..Default::default()
     };
-    match model.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
     }
@@ -137,13 +143,19 @@ fn render_gate(q: Quant, name: &str, tag: &str) {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + Q8 golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + Q8 golden"]
 fn q8_render_matches_reference() {
     render_gate(Quant::Q8, "sdxl_q8_fp16_golden.safetensors", "q8");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::q8_render_matches_reference");
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + Q4 golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + Q4 golden"]
 fn q4_render_matches_reference() {
     render_gate(Quant::Q4, "sdxl_q4_fp16_golden.safetensors", "q4");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::q4_render_matches_reference");
 }

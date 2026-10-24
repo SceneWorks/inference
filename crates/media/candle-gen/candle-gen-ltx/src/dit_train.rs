@@ -672,6 +672,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn zero_adapter_matches_inference_avdit_video_path() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -711,6 +712,9 @@ pub(crate) mod tests {
             diff < 2e-3,
             "train/inference video velocity max diff {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::zero_adapter_matches_inference_avdit_video_path");
     }
 
     fn assert_trained_lora_inference_roundtrip(dev: Device, tag: &str) {
@@ -897,8 +901,12 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn trained_lora_reloads_into_inference_and_changes_velocity() {
         assert_trained_lora_inference_roundtrip(Device::Cpu, "cpu");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::trained_lora_reloads_into_inference_and_changes_velocity");
     }
 
     /// A valid Eros/distill adapter must not hide a second selected adapter that contributes no LTX
@@ -972,9 +980,13 @@ pub(crate) mod tests {
     #[ignore = "requires a CUDA device"]
     fn trained_lora_reloads_into_inference_and_changes_velocity_cuda() {
         assert_trained_lora_inference_roundtrip(Device::new_cuda(0).unwrap(), "cuda");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::trained_lora_reloads_into_inference_and_changes_velocity_cuda");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn lora_host_and_segments_cover_every_block() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1015,9 +1027,13 @@ pub(crate) mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(diff, 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::lora_host_and_segments_cover_every_block");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn backward_reaches_attention_lora_factors() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -1069,9 +1085,13 @@ pub(crate) mod tests {
             set.vars.len(),
             "some LoRA factors had zero gradients"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::backward_reaches_attention_lora_factors");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn av_training_host_enumerates_video_audio_cross_modal_and_ff_targets() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg_25();
@@ -1215,9 +1235,13 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("no active loss tokens"), "{error}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::av_training_host_enumerates_video_audio_cross_modal_and_ff_targets");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ltx25_av_qlora_train_shifts_output_and_strictly_reloads() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg_25();
@@ -1355,5 +1379,8 @@ pub(crate) mod tests {
             video_diff < 1e-6 && audio_diff < 1e-6,
             "strict AV adapter reload must reproduce trained predictions"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::tests::ltx25_av_qlora_train_shifts_output_and_strictly_reloads");
     }
 }

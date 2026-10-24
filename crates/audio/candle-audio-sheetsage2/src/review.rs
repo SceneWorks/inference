@@ -779,7 +779,14 @@ impl ReviewArtifact {
     /// does not hold — is an error.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         let path = dir.join(MANIFEST);
-        let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+        let bytes = candle_audio::gen_core::__model_input_reader!(
+            std::fs::read(&path),
+            "crates/audio/candle-audio-sheetsage2/src/review.rs::open::std::fs::read@29936",
+            ArtifactInput,
+            &path,
+            |__model_input_path| std::fs::read(__model_input_path)
+        )
+        .map_err(|e| Error::io(&path, e))?;
         let manifest: Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Replay(format!("manifest is not JSON: {e}")))?;
         if manifest["schema"] != SCHEMA {

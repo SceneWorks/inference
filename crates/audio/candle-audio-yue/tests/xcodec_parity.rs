@@ -16,6 +16,16 @@
 //!   cargo test --locked -p candle-audio-yue --test xcodec_parity -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_yue::candle_audio::candle_core::{DType, Device, Tensor};
@@ -136,4 +146,7 @@ fn xcodec_get_embed_and_decode_match_the_reference() {
         "mutations rejected: embed×1.01 {bad_embed_rel:.3e}, wave shift {bad_wave_rel:.3e}, \
          wave×1.0001 {scaled_rel:.3e}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED xcodec_get_embed_and_decode_match_the_reference");
 }

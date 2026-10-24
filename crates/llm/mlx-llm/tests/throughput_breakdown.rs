@@ -207,6 +207,9 @@ fn breakdown(name: &str, model: &CausalLm) {
                     est as f64 / 1e9,
                     KV_BUDGET_BYTES as f64 / 1e9
                 );
+                crate::model_inference_device::record_model_inference_prerequisite_missing(
+                    "required work unavailable in breakdown; see preceding skip diagnostic",
+                );
                 continue;
             }
             // T_full on its own caches; C_gather on a fresh set at the same L; C_sdpa from shapes.
@@ -427,9 +430,14 @@ fn prefill_breakdown(name: &str, model: &CausalLm) {
 fn prefill_throughput_llama() {
     let Some(model) = load("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in prefill_throughput_llama; see preceding skip diagnostic",
+        );
         return;
     };
     prefill_breakdown("SmolLM2-135M (GQA g=3, hd=64)", &model);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED throughput_breakdown::prefill_throughput_llama");
 }
 
 #[test]
@@ -437,9 +445,14 @@ fn prefill_throughput_llama() {
 fn prefill_throughput_qwen3() {
     let Some(model) = load("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in prefill_throughput_qwen3; see preceding skip diagnostic",
+        );
         return;
     };
     prefill_breakdown("Qwen3-0.6B (GQA g=2, hd=128)", &model);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED throughput_breakdown::prefill_throughput_qwen3");
 }
 
 #[test]
@@ -447,9 +460,12 @@ fn prefill_throughput_qwen3() {
 fn throughput_breakdown_llama() {
     let Some(model) = load("MLX_LLM_TEST_MODEL") else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in throughput_breakdown_llama; see preceding skip diagnostic");
         return;
     };
     breakdown("SmolLM2-135M (GQA g=3)", &model);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED throughput_breakdown::throughput_breakdown_llama");
 }
 
 #[test]
@@ -457,7 +473,10 @@ fn throughput_breakdown_llama() {
 fn throughput_breakdown_qwen3() {
     let Some(model) = load("MLX_LLM_QWEN3_MODEL") else {
         eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in throughput_breakdown_qwen3; see preceding skip diagnostic");
         return;
     };
     breakdown("Qwen3-0.6B (GQA g=2, hd=128)", &model);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED throughput_breakdown::throughput_breakdown_qwen3");
 }

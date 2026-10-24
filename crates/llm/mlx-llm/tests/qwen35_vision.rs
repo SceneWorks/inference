@@ -97,4 +97,6 @@ fn qwen35_vision_grounds_on_image() {
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED qwen35_vision::qwen35_vision_grounds_on_image");
 }

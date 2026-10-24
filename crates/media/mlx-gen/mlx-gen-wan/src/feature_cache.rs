@@ -312,6 +312,7 @@ mod tests {
     /// a cache that leaked cross-step state, an op reordered, a bf16 cast moved, or the `ptr::eq`
     /// single-cast guard regressing into a double cast would all show up here.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_off_path_is_bit_identical_to_a_verbatim_pre_sc18322_control() {
         let h = harness();
         for &t in TIMESTEPS.iter() {
@@ -345,6 +346,8 @@ mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_off_path_is_bit_identical_to_a_verbatim_pre_sc18322_control");
     }
 
     /// **The single bf16 cast on the un-pruned self-attention path.**
@@ -355,6 +358,7 @@ mod tests {
     /// test would catch it. The `ptr::eq` guard is what prevents that, and this pins it: the two casts
     /// must be the *same array object*, not merely equal ones.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_unpruned_self_attention_casts_its_input_once() {
         let h = harness();
         let (tokens, _) = h
@@ -385,6 +389,8 @@ mod tests {
             crate::transformer::AttentionCasts::Separate,
             "two distinct input streams must each be cast"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_unpruned_self_attention_casts_its_input_once");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -424,6 +430,7 @@ mod tests {
     /// change the prediction (or it is inert), and it must keep the prediction's shape (or nothing
     /// downstream — `apply_head`, `unpatchify`, the feature cache's shape guard — still works).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_pruned_forward_changes_the_prediction_and_keeps_its_shape() {
         let h = harness();
         let (_, grid) = h
@@ -476,6 +483,8 @@ mod tests {
             exercised > 0,
             "the fixture's {total}-token grid must admit at least one dropping stride"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::a_pruned_forward_changes_the_prediction_and_keeps_its_shape");
     }
 
     /// **A dropped token passes through a block bit-exactly.**
@@ -486,6 +495,7 @@ mod tests {
     /// dropped rows of its *input* byte for byte — while the kept rows must not (or the block did
     /// nothing at all).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_dropped_token_leaves_a_block_holding_exactly_the_bits_it_entered_with() {
         let h = harness();
         let (tokens, grid) = h
@@ -537,6 +547,8 @@ mod tests {
             "the kept tokens must actually be updated — otherwise the pass-through assertion above is \
              vacuous"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::a_dropped_token_leaves_a_block_holding_exactly_the_bits_it_entered_with");
     }
 
     /// Per-row little-endian f32 bytes of a `[1, total, dim]` token stream.
@@ -582,6 +594,7 @@ mod tests {
     /// ~2.4e-3, squarely the bf16 class this crate's own parity suites gate at 2e-2; the bound is 1e-2
     /// relative, tight enough that a pruned key set fails it.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_surviving_token_gets_the_update_the_exact_block_would_have_applied() {
         let h = harness();
         let (tokens, _) = h
@@ -650,6 +663,8 @@ mod tests {
             }
         }
         assert!(checked > 0, "the walk must have compared some kept rows");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::a_surviving_token_gets_the_update_the_exact_block_would_have_applied");
     }
 
     /// **A pruned step updates every position** — the tensor-level refutation of starvation.
@@ -659,6 +674,7 @@ mod tests {
     /// holding the bits it entered with. A fixed keep-set fails this immediately — its dropped rows are
     /// still the raw patch embedding after the last block.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_pruned_step_updates_every_position() {
         let h = harness();
         let (tokens, _) = h
@@ -697,6 +713,8 @@ mod tests {
                 );
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::a_pruned_step_updates_every_position");
     }
 
     /// **Per-token time modulation is refused on the pruned path.**
@@ -707,6 +725,7 @@ mod tests {
     /// is the local backstop, and it needs its own test because the provider-level refusal cannot reach
     /// this code.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn per_token_time_modulation_is_refused_on_the_pruned_path() {
         let h = harness();
         let (tokens, grid) = h
@@ -748,6 +767,8 @@ mod tests {
                 keep,
             )
             .expect("a scalar modulation must be accepted");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::per_token_time_modulation_is_refused_on_the_pruned_path");
     }
 
     /// **A warmup step prunes nothing, so a partially-warmed policy still perturbs only past its
@@ -762,6 +783,7 @@ mod tests {
     /// here is that the warmup boundary is honoured at all: a warmup of `steps - 1` perturbs the result
     /// (one step prunes) and perturbs it *less* than no warmup at all.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_pruning_warmup_boundary_is_honoured_by_the_driver() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -811,6 +833,8 @@ mod tests {
         // And the contract agrees with the driver about which of these is inert.
         assert!(!pruning(2, steps as u32 - 1).is_inert_over(steps));
         assert!(pruning(2, steps as u32).is_inert_over(steps));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_pruning_warmup_boundary_is_honoured_by_the_driver");
     }
 
     /// **An approximate policy that engages on no step of THIS trajectory is refused.**
@@ -857,6 +881,7 @@ mod tests {
     /// per-step `eval` and the progress callback are the same straight-line statements outside the
     /// branch. Asserted against both mechanisms at once, since a step can be reused *and* pruned.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cancellation_and_progress_survive_a_step_that_both_reuses_and_prunes() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -892,10 +917,13 @@ mod tests {
             vec![1, 2, 3],
             "the loop must stop at the step following the cancellation, reuse and pruning included"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::cancellation_and_progress_survive_a_step_that_both_reuses_and_prunes");
     }
 
     /// **The two mechanisms compose**, and each contributes: cache+prune differs from either alone.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_cache_and_pruning_compose_into_a_third_distinct_trajectory() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -948,6 +976,8 @@ mod tests {
             bytes(&both),
             "adding the cache on top of pruning must change the result"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_cache_and_pruning_compose_into_a_third_distinct_trajectory");
     }
 
     /// **The mechanism is real, and only where the policy says.**
@@ -957,6 +987,7 @@ mod tests {
     /// because a reuse that happened to match would mean the cache was silently recomputing and the
     /// whole mechanism was inert. Shapes are asserted on both; nothing here counts elements.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_recompute_step_matches_the_exact_forward_and_a_reused_step_does_not() {
         let h = harness();
         let mut cache = cache(2, 1);
@@ -1012,6 +1043,8 @@ mod tests {
             "the trajectory must exercise both phases (reused {reused_steps}, recomputed \
              {recomputed_steps})"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::a_recompute_step_matches_the_exact_forward_and_a_reused_step_does_not");
     }
 
     /// **`denoise` is byte-identical to a reference loop built on the verbatim control.**
@@ -1021,6 +1054,7 @@ mod tests {
     /// `forward_cached_pre_sc18322_control`, so neither side of the comparison runs any sc-18322 code
     /// in common. It pins both the driver's operation order and the transformer's.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_public_denoise_matches_a_reference_loop_on_the_verbatim_control() {
         use crate::scheduler::{make_scheduler, SolverKind};
         let h = harness();
@@ -1065,6 +1099,8 @@ mod tests {
             bytes(&latents),
             "denoise must be byte-identical to the reference loop it delegates to"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_public_denoise_matches_a_reference_loop_on_the_verbatim_control");
     }
 
     /// **Cancellation requested at a *reused* step is still observed at that step.**
@@ -1076,6 +1112,7 @@ mod tests {
     /// have completed. A mechanism that moved the cancel check or the per-step `eval` inside the
     /// recompute branch would run to completion here instead.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cancellation_is_observed_at_a_reused_step() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -1113,6 +1150,8 @@ mod tests {
             vec![1, 2, 3],
             "the loop must stop at the reuse step following the cancellation"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::cancellation_is_observed_at_a_reused_step");
     }
 
     /// **Every step reports progress and is materialized, reused or not.**
@@ -1123,6 +1162,7 @@ mod tests {
     /// pinned without an instrumentation hook: a mechanism that skipped the tail of the loop body on a
     /// reused step would drop both together.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn progress_and_the_per_step_barrier_do_not_skip_a_reused_step() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -1153,6 +1193,8 @@ mod tests {
                 "warmup {warmup}: every step must report once, reused steps included"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::progress_and_the_per_step_barrier_do_not_skip_a_reused_step");
     }
 
     /// **The cached trajectory is a different trajectory** — the approximation is not cosmetic — and it
@@ -1161,6 +1203,7 @@ mod tests {
     /// Shape, never element counts: the assertion that matters is that reuse changed the result while
     /// leaving the tensor usable by the VAE decode that follows.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_cached_trajectory_differs_from_the_exact_one_and_keeps_its_shape() {
         let h = harness();
         let cfg = tiny_cfg();
@@ -1211,6 +1254,8 @@ mod tests {
             "reusing a trunk residual must change the trajectory — an identical result would mean \
              the mechanism never engaged"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED feature_cache::tests::the_cached_trajectory_differs_from_the_exact_one_and_keeps_its_shape");
     }
 
     #[test]

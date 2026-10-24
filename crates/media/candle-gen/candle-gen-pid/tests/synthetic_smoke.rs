@@ -170,6 +170,7 @@ fn build_pidnet_weights(cfg: &PidConfig) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn pidnet_forward_shapes_and_finite() {
     let cfg = tiny_cfg();
     let w = build_pidnet_weights(&cfg);
@@ -208,6 +209,9 @@ fn pidnet_forward_shapes_and_finite() {
         flat.iter().all(|v| v.is_finite()),
         "forward output is finite"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED synthetic_smoke::pidnet_forward_shapes_and_finite");
 }
 
 fn gemma_tiny_cfg() -> Gemma2Config {
@@ -254,6 +258,7 @@ fn build_gemma_weights(cfg: &Gemma2Config) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma2_forward_shapes_and_finite() {
     let cfg = gemma_tiny_cfg();
     let w = build_gemma_weights(&cfg);
@@ -266,4 +271,7 @@ fn gemma2_forward_shapes_and_finite() {
     assert_eq!(out.dims(), &[1, 5, cfg.hidden_size as usize]);
     let flat = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert!(flat.iter().all(|v| v.is_finite()), "gemma output is finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED synthetic_smoke::gemma2_forward_shapes_and_finite");
 }

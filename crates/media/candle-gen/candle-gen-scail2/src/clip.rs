@@ -100,7 +100,7 @@ impl ClipBlock {
         let (b, s, _) = x.dims3()?;
         let (n, d) = (self.n, self.d);
         // Fused qkv: [b, s, 3·dim] → [b, s, 3, n, d], split the "3" axis.
-        let qkv = self.to_qkv.forward(x)?.reshape((b, s, 3, n, d))?;
+        let qkv = __model_proof_output!(self.to_qkv.forward(x))?.reshape((b, s, 3, n, d))?;
         let parts = qkv.chunk(3, 2)?;
         let head = |t: &Tensor| -> Result<Tensor> {
             t.reshape((b, s, n, d))?.transpose(1, 2)?.contiguous()
@@ -110,11 +110,13 @@ impl ClipBlock {
         let v = head(&parts[2])?;
         let out = sdpa(&q, &k, &v, self.scale)?;
         let out = out.transpose(1, 2)?.reshape((b, s, n * d))?;
-        self.proj.forward(&out)
+        __model_proof_output!(self.proj.forward(&out))
     }
 
     fn mlp(&self, x: &Tensor) -> Result<Tensor> {
-        self.mlp2.forward(&self.mlp0.forward(x)?.gelu_erf()?)
+        __model_proof_output!(self
+            .mlp2
+            .forward(&__model_proof_output!(self.mlp0.forward(x))?.gelu_erf()?))
     }
 
     /// `x`: `[B, L, dim]` (f32).
@@ -181,7 +183,7 @@ impl ScailClip {
             .permute((0, 2, 4, 1, 3, 5))?
             .contiguous()?
             .reshape((b, nh * nw, 3 * p * p))?;
-        let x = self.patch_embedding.forward(&tokens)?;
+        let x = __model_proof_output!(self.patch_embedding.forward(&tokens))?;
 
         // Prepend cls, add positional, pre-norm.
         let cls = self.cls.broadcast_as((b, 1, dim))?;

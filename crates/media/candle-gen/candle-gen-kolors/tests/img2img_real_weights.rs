@@ -291,4 +291,7 @@ fn registered_reference_img2img_uses_the_vae_init_and_strength_tail() {
         &curated_secondary_img2img,
         "kolors_img2img_curated_euler_secondary.png",
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::registered_reference_img2img_uses_the_vae_init_and_strength_tail");
 }

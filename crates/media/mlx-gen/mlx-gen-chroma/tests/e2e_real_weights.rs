@@ -168,6 +168,8 @@ fn chroma_hd_e2e_matches_diffusers() {
 
     // 3. full true-CFG denoise + decode.
     run_image_parity(ChromaVariant::Hd, "Chroma1-HD", "chroma_e2e_hd", 4.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_hd_e2e_matches_diffusers");
 }
 
 #[test]
@@ -206,6 +208,8 @@ fn chroma_hd_quant_bounded() {
         eprintln!("{q:?} noise_pred rel-L2 vs dense = {rl:.4}");
         assert!(rl < gate, "{q:?} quant perturbation too large: {rl}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_hd_quant_bounded");
 }
 
 #[test]
@@ -213,6 +217,8 @@ fn chroma_hd_quant_bounded() {
 fn chroma_base_e2e_matches_diffusers() {
     // Base uses the beta sigma schedule (use_beta_sigmas).
     run_image_parity(ChromaVariant::Base, "Chroma1-Base", "chroma_e2e_base", 4.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_base_e2e_matches_diffusers");
 }
 
 /// sc-5514 / sc-5399: the per-step `eval` in the denoise loop makes the per-step `CancelFlag`
@@ -278,6 +284,8 @@ fn chroma_flash_async_cancel_interrupts_denoise() {
         steps_seen < CANCEL_STEPS,
         "cancel must stop the denoise early; ran all {steps_seen}/{CANCEL_STEPS} steps"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_flash_async_cancel_interrupts_denoise");
 }
 
 #[test]
@@ -294,6 +302,8 @@ fn chroma_flash_e2e_matches_diffusers() {
         "chroma_e2e_flash",
         1.0,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_flash_e2e_matches_diffusers");
 }
 
 /// sc-6903 (F-005): production Chroma1-Flash defaults to the **Heun** sampler (sc-5392), but the
@@ -370,4 +380,6 @@ fn chroma_flash_heun_path_gated() {
         img.pixels.iter().any(|&p| p != img.pixels[0]),
         "Heun decode produced a degenerate flat image"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::chroma_flash_heun_path_gated");
 }

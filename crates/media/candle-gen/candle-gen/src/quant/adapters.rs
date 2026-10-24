@@ -745,6 +745,7 @@ mod tests {
     /// *Mutations that red this:* pricing at the file length (`adapter_stack_resident_bytes`), or
     /// dropping the prepared copy's width from `adapter_stack_upcast_resident_bytes`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_overlay_price_covers_the_installed_factors_for_bf16_and_f32_files() {
         use gen_core::{
             adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
@@ -810,6 +811,9 @@ mod tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapters::tests::the_overlay_price_covers_the_installed_factors_for_bf16_and_f32_files");
     }
 
     /// sc-24163 review: a **low-rank** LoKr is priced at what `LokrFactors::build` +
@@ -823,6 +827,7 @@ mod tests {
     /// the `w2ᵀ` copy from `LokrKroneckerDims::resident_bytes`, or dropping the `w1` copy at a
     /// narrower compute width.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_overlay_price_covers_an_installed_low_rank_lokr() {
         use gen_core::{
             adapter_stack_upcast_resident_bytes, AdapterResidencyMode::Additive, UpcastLoraCopy,
@@ -892,6 +897,9 @@ mod tests {
                 "per-stored-element pricing ({stored}) under-prices the installed LoKr ({resident})"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapters::tests::the_overlay_price_covers_an_installed_low_rank_lokr");
     }
 
     #[test]
@@ -1128,6 +1136,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn flux1_and_flux2_bfl_fused_qkv_lokr_fan_out_structurally() {
         let temp = tempfile::tempdir().unwrap();
         let device = Device::Cpu;
@@ -1172,6 +1181,9 @@ mod tests {
                 assert!(values.iter().all(|value| (*value - want).abs() < 1e-6));
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::adapters::tests::flux1_and_flux2_bfl_fused_qkv_lokr_fan_out_structurally");
     }
 
     #[test]

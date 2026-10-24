@@ -38,8 +38,13 @@ impl Conv {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.bn
-            .apply(&conv2d(x, &self.w, None, self.stride, self.pad)?)
+        self.bn.apply(&__model_proof_output!(conv2d(
+            x,
+            &self.w,
+            None,
+            self.stride,
+            self.pad
+        ))?)
     }
 }
 

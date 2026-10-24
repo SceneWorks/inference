@@ -64,4 +64,6 @@ fn dit_matches_real_reference() {
     let c = cosine(&velocity, want);
     println!("Krea 2 real-weight DiT parity cosine = {c:.7}");
     assert!(c > 0.98, "real-weight DiT cosine {c:.7} <= 0.98");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_real_weights::dit_matches_real_reference");
 }

@@ -167,4 +167,6 @@ fn tiled_vs_whole_decode() {
     );
 
     assert!(max_abs.is_finite(), "non-finite diff");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED tiling_ab::tiled_vs_whole_decode");
 }

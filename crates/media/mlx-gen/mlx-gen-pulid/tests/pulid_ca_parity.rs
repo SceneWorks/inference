@@ -90,6 +90,10 @@ fn ca_forward_and_schedule_match_torch_f32() {
         );
         assert!(mr < 5e-3, "{kind} blk {blk} ca[{ca_idx}] mean-rel {mr:.3e}");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pulid_ca_parity::ca_forward_and_schedule_match_torch_f32"
+    );
 }
 
 #[test]
@@ -111,6 +115,8 @@ fn injection_index_gate() {
         let some = ca.after_single(i, &img).unwrap().is_some();
         assert_eq!(some, i % 4 == 0, "single block {i} injection");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pulid_ca_parity::injection_index_gate");
 }
 
 #[test]

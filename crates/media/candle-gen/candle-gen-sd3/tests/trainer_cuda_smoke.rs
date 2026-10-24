@@ -104,7 +104,15 @@ macro_rules! smoke {
         #[ignore = "needs real SD3.5 weights and explicitly scheduled CUDA"]
         fn $name() {
             run($id, $env, $kind);
-        }
+                    #[cfg(feature = "model-inference-proof")]
+            match stringify!($name) {
+                "sd35_large_lora_real_cuda" => println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::sd35_large_lora_real_cuda"),
+                "sd35_large_lokr_real_cuda" => println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::sd35_large_lokr_real_cuda"),
+                "sd35_medium_lora_real_cuda" => println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::sd35_medium_lora_real_cuda"),
+                "sd35_medium_lokr_real_cuda" => println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::sd35_medium_lokr_real_cuda"),
+                _ => panic!("undeclared generated model-proof case"),
+            };
+}
     };
 }
 

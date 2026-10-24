@@ -26,6 +26,7 @@ fn max_abs(a: &mlx_rs::Array) -> f32 {
     max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_matches_diffusers() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -58,4 +59,6 @@ fn forward_matches_diffusers() {
         rel < 5e-3,
         "transformer output peak-rel = {rel} (max|Δ|={d}, scale={scale}) exceeds the mlx-Metal f32 floor"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED transformer_parity::forward_matches_diffusers");
 }

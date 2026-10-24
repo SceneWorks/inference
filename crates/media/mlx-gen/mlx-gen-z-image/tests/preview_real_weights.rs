@@ -132,7 +132,7 @@ fn save_final(dir: &Path, route: &str, output: &Image) -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights, exact control overlays for control routes, and Metal"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights, exact control overlays for control routes, and Metal"]
 fn registered_route_emits_exact_step_cadence_without_changing_output() {
     mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
     let route = std::env::var("ZIMAGE_PREVIEW_ROUTE").expect("set ZIMAGE_PREVIEW_ROUTE");
@@ -207,4 +207,7 @@ fn registered_route_emits_exact_step_cadence_without_changing_output() {
         strip.display(),
         final_image.display()
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED preview_real_weights::registered_route_emits_exact_step_cadence_without_changing_output");
 }

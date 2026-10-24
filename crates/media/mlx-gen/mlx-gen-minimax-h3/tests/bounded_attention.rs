@@ -90,6 +90,7 @@ const FIXTURE_TOLERANCE: f32 = 2e-3;
 /// unreachable. The head axis is pinned to **exactly** zero and the query-row axis to
 /// [`FIXTURE_TOLERANCE`] — the numerical contracts genuinely differ, and asserting the same bound on
 /// both would throw away the stronger claim.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_bounded_plan_reaches_the_real_dit_attention_call() {
     let f = Weights::from_file(DIT_FIXTURE).unwrap();
@@ -201,6 +202,8 @@ fn a_bounded_plan_reaches_the_real_dit_attention_call() {
         planned_attention_chunks(BoundedAttention::heads(budget), 1, heads, seq),
         (head_chunks, 1)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bounded_attention::a_bounded_plan_reaches_the_real_dit_attention_call");
 }
 
 /// The plan must reach **every** block, not just the one a unit test happens to drive.
@@ -209,6 +212,7 @@ fn a_bounded_plan_reaches_the_real_dit_attention_call() {
 /// test above and bound nothing in a render. Driven through both modulation arms — `Cached`, the
 /// shipped precompute-and-evict path, and `Temb`, the resident one — because a rung reachable on
 /// only one of them is selectable on a request routed to the other.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_bounded_plan_threads_the_whole_block_stack() {
     use mlx_gen_minimax_h3::dit::DitBlock;
@@ -277,6 +281,8 @@ fn a_bounded_plan_threads_the_whole_block_stack() {
              moved {delta:e} relative"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bounded_attention::a_bounded_plan_threads_the_whole_block_stack");
 }
 
 /// **The declaration cannot drift from the mechanism, in either direction.**

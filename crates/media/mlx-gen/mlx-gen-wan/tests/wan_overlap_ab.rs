@@ -441,4 +441,6 @@ fn wan_overlap_wall_time_and_quality_ab() {
         current_clip.1,
         gib(reference_peak),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wan_overlap_ab::wan_overlap_wall_time_and_quality_ab");
 }

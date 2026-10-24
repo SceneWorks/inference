@@ -139,6 +139,10 @@ fn krea_turbo_pid_decode_vs_vae() {
         pid_img.width,
         pid_dt / vae_dt.max(1e-3)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::krea_turbo_pid_decode_vs_vae"
+    );
 }
 
 struct LadderRun {
@@ -278,4 +282,6 @@ fn krea_pid_full_ladder_exercises_multitile_decode_attention_and_window() {
         max_delta,
         mean_delta,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pid_decode_real_weights::krea_pid_full_ladder_exercises_multitile_decode_attention_and_window");
 }

@@ -146,9 +146,16 @@ fn recipe(name: &str) -> (Option<u32>, Option<f32>, Option<&'static str>) {
 }
 
 fn load_rgb(path: &str) -> Image {
-    let rgb = image::open(path)
-        .unwrap_or_else(|e| panic!("open image {path}: {e}"))
-        .to_rgb8();
+    let rgb = mlx_gen::gen_core::__model_input_reader!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/veda_ab.rs::load_rgb::image::open@7990",
+        Reference,
+        path,
+        |__model_input_path| image::open(__model_input_path),
+        origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+    )
+    .unwrap_or_else(|e| panic!("open image {path}: {e}"))
+    .to_rgb8();
     Image {
         width: rgb.width(),
         height: rgb.height(),
@@ -486,6 +493,8 @@ fn veda_ab_render_one_cell() {
         if veda_on { "on" } else { "off" },
         degenerate.join("; ")
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda_ab::veda_ab_render_one_cell");
 }
 
 /// Why a decoded render is degenerate — the signature of NaN/Inf poisoning that a VAE decode

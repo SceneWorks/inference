@@ -169,6 +169,7 @@ fn per_frame_diff(a: &Array, b: &Array) -> Vec<f32> {
 /// silu/residual/proj are elementwise or per-position) or a causal conv fed real history by the
 /// `FrameCache`, so chunking is an exact refactor — not an approximation to be blended. Any chunk size,
 /// including ones that do not divide the clip, must reproduce the single-shot decode bit-for-bit.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn chunked_decode_is_identical_to_single_shot() {
     let (_cfg, dec) = real_geometry_decoder();
@@ -198,11 +199,16 @@ fn chunked_decode_is_identical_to_single_shot() {
             "chunk={chunk}: chunked decode must be identical to single-shot (max abs diff {d:.3e})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED chunked_decode::chunked_decode_is_identical_to_single_shot"
+    );
 }
 
 /// The decoder is temporally **causal**: decoding only the first `p` latent frames reproduces the
 /// corresponding prefix of the full decode exactly. This is the property the `FrameCache` exploits —
 /// if it did not hold, no chunking scheme could be exact.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_is_temporally_causal() {
     let (_cfg, dec) = real_geometry_decoder();
@@ -224,6 +230,8 @@ fn decode_is_temporally_causal() {
         d, 0.0,
         "decoding a latent prefix must reproduce the video prefix (causality); max abs diff {d:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED chunked_decode::decode_is_temporally_causal");
 }
 
 /// **Why this is a conv cache and not the repo's shared overlap+blend tiling.**
@@ -233,6 +241,7 @@ fn decode_is_temporally_causal() {
 /// stacked `kt=3` causal convs carry it ~45 latent frames (~270 output frames, ~9 s at 30 fps) — wider
 /// than an entire 5 s clip (26 latent frames). A tile decoded with 1 frame of history is therefore not
 /// slightly seamed at its edge; it is wrong throughout, and no trapezoidal blend recovers it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn temporal_receptive_field_exceeds_a_full_clip() {
     let (_cfg, dec) = real_geometry_decoder();
@@ -277,11 +286,14 @@ fn temporal_receptive_field_exceeds_a_full_clip() {
         "receptive field {reach_latent:.1} latent frames no longer exceeds a 5 s clip (26) — the \
          rationale for the FrameCache over `mlx_gen::tiling` overlap+blend needs revisiting"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED chunked_decode::temporal_receptive_field_exceeds_a_full_clip");
 }
 
 /// The negative control for the test above: a chunk decoded **without** history — which is what an
 /// overlap+blend tile with a 1-frame left context approximates — diverges from the truth by O(1) across
 /// the whole tile, not just at its seam. This is what the `FrameCache` buys.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_without_history_is_materially_wrong() {
     let (_cfg, dec) = real_geometry_decoder();
@@ -317,6 +329,10 @@ fn decode_without_history_is_materially_wrong() {
         "a history-free tile came within 1% of the truth ({d:.3e} vs {scale:.3e}) — if the decoder \
          really were this weakly coupled in time, overlap+blend tiling would suffice and the \
          FrameCache would be unnecessary complexity"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED chunked_decode::decode_without_history_is_materially_wrong"
     );
 }
 
@@ -359,6 +375,7 @@ fn element_ceiling_guard_holds_at_production_geometry() {
 
 /// The clamp's behaviour, at a geometry cheap enough for CI: an over-large chunk must be clamped down
 /// rather than honored, and the result must still be exact.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn an_over_large_chunk_is_clamped_not_honored() {
     let (_cfg, dec) = real_geometry_decoder();
@@ -373,6 +390,10 @@ fn an_over_large_chunk_is_clamped_not_honored() {
         max_abs(&subtract(&asked_too_big, &safe_chunked).unwrap()),
         0.0,
         "a clamped over-large chunk must still decode exactly"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED chunked_decode::an_over_large_chunk_is_clamped_not_honored"
     );
 }
 
@@ -411,6 +432,8 @@ fn single_shot_decode_renders_over_the_element_ceiling() {
         0.0,
         "the over-bound single-shot decode must equal the below-bound chunked reference exactly"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED chunked_decode::single_shot_decode_renders_over_the_element_ceiling");
 }
 
 /// A pre-tripped cancel is honored before any chunk work (mirrors the LTX/Wan tiled-decode gates).

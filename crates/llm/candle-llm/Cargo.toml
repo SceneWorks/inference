@@ -51,6 +51,7 @@ sha2 = { workspace = true }
 candle-llm = { path = ".", features = ["test-kv-arm"] }
 
 [features]
+model-inference-proof = ["candle-llm/model-inference-proof", "candle-quant-kernels/model-inference-proof", "candle-core/model-inference-proof", "core-llm/model-inference-proof"]
 # Default works with NO extra features: candle-core defaults to the CPU backend (builds anywhere).
 default = []
 # NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.

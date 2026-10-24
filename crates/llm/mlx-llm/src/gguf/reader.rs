@@ -196,7 +196,12 @@ impl GgufFile {
         // mutate the source while conversion is running.
         let mmap = unsafe { Mmap::map(&file) }
             .map_err(|e| Error::Msg(format!("gguf: mmap {}: {e}", path.display())))?;
-        Self::parse_backing(Backing::Mapped(mmap))
+        crate::__model_input_result!(
+            Self::parse_backing(Backing::Mapped(mmap)),
+            "mlx-llm::gguf::GgufFile::open",
+            TensorInput,
+            &[path]
+        )
     }
 
     /// Parse an in-memory GGUF image.

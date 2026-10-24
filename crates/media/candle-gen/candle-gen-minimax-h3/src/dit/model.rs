@@ -145,7 +145,12 @@ impl MiniMaxH3Dit {
         // Drop the map here rather than at the call site: every tensor in it shares storage with
         // the model's, and a surviving clone is exactly what makes an eviction free nothing.
         drop(w);
-        Ok(model)
+        candle_gen::gen_core::__model_input_result!(
+            Ok(model),
+            "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration",
+            Configuration,
+            &[&config_path]
+        )
     }
 
     /// Every tensor name the DiT consumes — the published 638 at the shipped geometry.
@@ -1001,6 +1006,7 @@ mod veda_controls_tests {
         (bits, calls, observed)
     }
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
         for mode in 0..5 {
             for tier in [None, Some(4), Some(8)] {
@@ -1011,8 +1017,12 @@ mod veda_controls_tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack");
     }
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn native_base_and_all_published_turbo_steps_reach_attention() {
         for (name, steps, shift, mode) in [
             ("base", 50, 12.0, 0),
@@ -1024,5 +1034,8 @@ mod veda_controls_tests {
             let (_, calls, _) = run(mode, 2, None, steps, shift, true);
             assert_eq!(calls.last().unwrap().step, steps - 1, "{name}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention");
     }
 }

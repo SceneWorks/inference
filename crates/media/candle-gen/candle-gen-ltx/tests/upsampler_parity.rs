@@ -169,6 +169,9 @@ fn ltx_2_5_spatial_upsampler_matches_reference() {
         &d,
     );
     assert_eq!(got.dims(), &[1, 128, 3, 12, 12]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED upsampler_parity::ltx_2_5_spatial_upsampler_matches_reference");
 }
 
 #[test]
@@ -184,6 +187,9 @@ fn ltx_2_5_temporal_upsampler_matches_reference() {
     );
     // 9 latent frames in, 2·9−1 = 17 out, spatial untouched.
     assert_eq!(got.dims(), &[1, 128, 17, 6, 6]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED upsampler_parity::ltx_2_5_temporal_upsampler_matches_reference");
 }
 
 #[test]
@@ -474,6 +480,7 @@ fn assert_matches_config_compares_block_count_and_channels_not_just_the_mode() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1() {
     let d = Device::Cpu;
     let up = synthetic_upsampler(true, &d);
@@ -491,9 +498,13 @@ fn temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1() {
         assert_eq!(&out.dims()[3..], &[3, 3]);
         assert_eq!(out.dim(1).unwrap(), IN, "channels round-trip");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED upsampler_parity::temporal_upsampling_produces_2n_minus_1_frames_and_keeps_n_mod_8_eq_1");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone() {
     let d = Device::Cpu;
     let up = synthetic_upsampler(false, &d);
@@ -505,4 +516,7 @@ fn spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone() {
         assert_eq!(out.dims(), &[1, IN, frames, 6, 6], "{frames} frames");
         assert_eq!(up.output_frames(frames).unwrap(), frames);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED upsampler_parity::spatial_upsampling_doubles_hw_and_leaves_the_frame_count_alone");
 }

@@ -1197,6 +1197,7 @@ mod tests {
     /// `Snake1d` is `SnakeBeta` with `beta = alpha` and NO log scale — the identity this module
     /// relies on to reuse the decoder's activation instead of growing a second one.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn snake1d_is_snakebeta_with_beta_equal_to_alpha() {
         let x = spread(&[1, 4, 3]);
         let alpha = Array::from_slice(&[0.7f32, 1.1, 0.4], &[1, 3, 1]);
@@ -1225,6 +1226,8 @@ mod tests {
             .unwrap()
             .item::<f32>();
         assert!(gap > 1e-2, "log-scaled Snake agreed with the linear one");
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED audio_vae_encoder::tests::snake1d_is_snakebeta_with_beta_equal_to_alpha");
     }
 
     /// The hop is the product of the encoder rates, and degenerate rate lists are typed errors.

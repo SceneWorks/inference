@@ -653,4 +653,8 @@ fn fit_preview_rgb() {
         }
         std::fs::write(dir.join("fit_report.txt"), report).unwrap();
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED fit_preview_rgb::fit_preview_rgb");
 }

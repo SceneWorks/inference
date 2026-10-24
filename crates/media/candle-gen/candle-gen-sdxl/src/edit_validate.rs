@@ -289,4 +289,7 @@ fn real_weight_edit() {
     );
     assert!(inpaint.width == w && inpaint.height == h);
     println!("SDXL edit validation PASS ✅");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED edit_validate::real_weight_edit");
 }

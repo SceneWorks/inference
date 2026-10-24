@@ -50,6 +50,7 @@ fn case(golden: &Fixture, name: &str) -> (Image, DepthResolution) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn depth_matches_upstream_stage_by_stage() {
     let golden = fixture("iris_depth_golden.safetensors");
     let model = load_depth_export(export(), DType::F32, &Device::Cpu).unwrap();
@@ -112,14 +113,23 @@ fn depth_matches_upstream_stage_by_stage() {
         assert_eq!(m.resolution, resolution);
         assert_eq!(m.output_resample == "bilinear", plan.resized(), "{name}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED depth_parity::depth_matches_upstream_stage_by_stage"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bf16_release_policy_tracks_upstream() {
     let golden = fixture("iris_depth_golden.safetensors");
     let model = load_depth_export(export(), DType::BF16, &Device::Cpu).unwrap();
     let raw = model.forward(golden.require("native_odd/input")).unwrap();
     assert_close("bf16 raw", &raw, golden.require("native_odd/raw"), 5e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_parity::bf16_release_policy_tracks_upstream");
 }
 
 #[test]

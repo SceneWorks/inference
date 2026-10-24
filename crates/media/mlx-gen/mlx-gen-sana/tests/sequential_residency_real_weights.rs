@@ -141,6 +141,10 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
@@ -165,4 +169,8 @@ fn sequential_repeat_job_stays_bounded() {
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_repeat_job_stays_bounded");
 }

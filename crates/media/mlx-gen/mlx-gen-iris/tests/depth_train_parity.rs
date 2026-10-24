@@ -93,10 +93,14 @@ fn setup() -> (DepthModel, Params) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn one_step_matches_the_torch_oracle() {
     crate::common::cpu_process(
         "depth_train_parity::one_step_matches_the_torch_oracle",
-        one_step_matches_the_torch_oracle_body,
+        || {
+            one_step_matches_the_torch_oracle_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_parity::one_step_matches_the_torch_oracle");
+        },
     );
 }
 
@@ -259,10 +263,14 @@ fn tensor_loss_matches_the_host_reference_body() {
 /// backbone, the reducer and Eq. 5 downstream of them. f32: the gradients are the plain graph's;
 /// bf16: the same loss bit for bit and gradients within the declared bf16 bound.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     crate::common::cpu_process(
         "depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph",
-        activation_checkpointing_gradients_equal_the_plain_graph_body,
+        || {
+            activation_checkpointing_gradients_equal_the_plain_graph_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph");
+        },
     );
 }
 

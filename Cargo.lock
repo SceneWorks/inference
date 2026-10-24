@@ -466,6 +466,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors 0.7.0",
+ "sha2",
  "thiserror 2.0.18",
  "tokenizers 0.22.2",
  "yoke 0.8.3",

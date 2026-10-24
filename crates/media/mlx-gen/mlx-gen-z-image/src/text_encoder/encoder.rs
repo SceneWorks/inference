@@ -28,6 +28,23 @@ pub struct ZTextEncoderConfig {
 impl ZTextEncoderConfig {
     /// The production Z-Image-turbo text encoder (`Tongyi-MAI/Z-Image` `text_encoder/`).
     pub fn z_image() -> Self {
+        #[cfg(feature = "test-support")]
+        {
+            let contract = crate::active_encoder_contract();
+            if contract != crate::ENCODER_CONTRACT {
+                return Self {
+                    vocab_size: contract.vocab_size as i32,
+                    hidden_size: contract.hidden_size as i32,
+                    n_layers: contract.loaded_hidden_layers,
+                    n_heads: contract.num_attention_heads as i32,
+                    n_kv_heads: contract.num_key_value_heads as i32,
+                    head_dim: contract.head_dim as i32,
+                    intermediate_size: contract.intermediate_size as i32,
+                    rope_theta: contract.rope_theta.get() as f32,
+                    rms_norm_eps: contract.rms_norm_eps.get() as f32,
+                };
+            }
+        }
         Self {
             vocab_size: 151936,
             hidden_size: 2560,

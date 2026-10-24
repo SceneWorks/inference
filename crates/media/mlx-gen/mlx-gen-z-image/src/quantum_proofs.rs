@@ -351,9 +351,10 @@ enum Tier {
 const TIERS: [Tier; 3] = [Tier::F32, Tier::Bf16, Tier::Q4];
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dit_block_formulas_track_the_measured_peak() {
     if !in_cpu_child("dit_block_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::dit_block_formulas_track_the_measured_peak");
         return;
     }
     let (dim, heads, ff, t) = (128, 2, 384, 256);
@@ -429,6 +430,7 @@ fn dit_block_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::dit_block_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::dit_block_formulas_track_the_measured_peak");
 }
 
 /// A DiT at the shipped proportions in miniature: dim 128 (2 heads x 64), FFN x3, a 64-wide
@@ -508,9 +510,10 @@ fn caption(n: i32, seed: u64) -> Array {
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn dit_stage_formulas_track_the_measured_peak() {
     if !in_cpu_child("dit_stage_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::dit_stage_formulas_track_the_measured_peak");
         return;
     }
     let backend = Backend::current();
@@ -589,12 +592,14 @@ fn dit_stage_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::dit_stage_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::dit_stage_formulas_track_the_measured_peak");
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn text_encoder_formulas_track_the_measured_peak() {
     if !in_cpu_child("text_encoder_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::text_encoder_formulas_track_the_measured_peak");
         return;
     }
     let backend = Backend::current();
@@ -675,6 +680,7 @@ fn text_encoder_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::text_encoder_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::text_encoder_formulas_track_the_measured_peak");
 }
 
 /// Save `map` (keys sorted) as one `.safetensors` file at `path`.
@@ -692,9 +698,10 @@ fn save(map: &HashMap<String, Array>, path: &std::path::Path) {
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn control_and_streamed_formulas_track_the_measured_peak() {
     if !in_cpu_child("control_and_streamed_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::control_and_streamed_formulas_track_the_measured_peak");
         return;
     }
     let backend = Backend::current();
@@ -887,15 +894,17 @@ fn control_and_streamed_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::control_and_streamed_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::control_and_streamed_formulas_track_the_measured_peak");
 }
 
 /// Every adapter kind's forward-time residual chain ([`crate::quantum::adapter_bytes`]) on one adapted
 /// projection: LoRA, a dense LoKr whose bf16 delta casts to the f32 stream, and a structured LoKr
 /// with bf16 factors — each over the projection's own output.
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn adapter_formulas_track_the_measured_peak() {
     if !in_cpu_child("adapter_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::adapter_formulas_track_the_measured_peak");
         return;
     }
     use mlx_gen::adapters::{AdaptableLinear, Adapter, LokrFactors};
@@ -955,12 +964,16 @@ fn adapter_formulas_track_the_measured_peak() {
             "\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::adapter_formulas_track_the_measured_peak"
         );
     }
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::adapter_formulas_track_the_measured_peak"
+    );
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn vae_formulas_track_the_measured_peak() {
     if !in_cpu_child("vae_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::vae_formulas_track_the_measured_peak");
         return;
     }
     let backend = Backend::current();
@@ -1102,6 +1115,9 @@ fn vae_formulas_track_the_measured_peak() {
             "\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::vae_formulas_track_the_measured_peak"
         );
     }
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::vae_formulas_track_the_measured_peak"
+    );
 }
 
 /// A decoder that returns a fixed (materialized) decode, so `decode_batch`'s own pixel-conversion
@@ -1117,9 +1133,10 @@ impl mlx_gen::LatentDecoder for FixedDecode {
 }
 
 #[test]
-#[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+#[ignore = "model inference; explicit model-proof workflow; expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
 fn pipeline_and_vae_head_formulas_track_the_measured_peak() {
     if !in_cpu_child("pipeline_and_vae_head_formulas_track_the_measured_peak") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED quantum_proofs::pipeline_and_vae_head_formulas_track_the_measured_peak");
         return;
     }
     let backend = Backend::current();
@@ -1280,6 +1297,7 @@ fn pipeline_and_vae_head_formulas_track_the_measured_peak() {
     if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
         eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_proofs::pipeline_and_vae_head_formulas_track_the_measured_peak");
     }
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_proofs::pipeline_and_vae_head_formulas_track_the_measured_peak");
 }
 
 /// The encoder's `conv_in` (`first`) or `conv_out` weight.

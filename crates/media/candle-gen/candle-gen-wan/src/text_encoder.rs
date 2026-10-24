@@ -261,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn f32_encode_runs_and_is_finite() {
         // The encoder stays dtype-agnostic; the CPU-golden / reference path is f32 (CPU has no bf16
         // matmul). An f32 load runs the full embed → attn → FFN → norm forward to a finite f32 embed.
@@ -273,6 +274,11 @@ mod tests {
         assert!(
             flat.iter().all(|v| v.is_finite()),
             "f32 encode must be finite"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::tests::f32_encode_runs_and_is_finite"
         );
     }
 }

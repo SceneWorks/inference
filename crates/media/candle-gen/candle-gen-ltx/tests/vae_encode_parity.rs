@@ -68,5 +68,7 @@ fn encode_matches_mlx_golden_psnr() -> candle_gen::Result<()> {
         psnr >= 35.0,
         "LTX encoder diverged from the real MLX golden: PSNR {psnr:.2} dB < 35 dB"
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_encode_parity::encode_matches_mlx_golden_psnr");
     Ok(())
 }

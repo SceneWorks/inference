@@ -454,8 +454,14 @@ fn pinned_quant_marker(component: &ComponentInventory) -> CoreResult<Option<i32>
 /// `config.json`, or `None` for a dense component. Shared by the pinned inventory and the
 /// header-only tier resolver.
 fn quant_marker_at(component: &str, config: &Path) -> CoreResult<Option<i32>> {
-    let bytes = std::fs::read(config)
-        .map_err(|error| CoreError::Msg(format!("flux1: read {component} config: {error}")))?;
+    let bytes = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read(config),
+"crates/media/mlx-gen/mlx-gen-flux/src/artifact_inventory.rs::quant_marker_at::std::fs::read@16685",
+ArtifactInput,
+config,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+    .map_err(|error| CoreError::Msg(format!("flux1: read {component} config: {error}")))?;
     let json: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| CoreError::Msg(format!("flux1: parse {component} config: {error}")))?;
     let Some(marker) = json.get("quantization") else {

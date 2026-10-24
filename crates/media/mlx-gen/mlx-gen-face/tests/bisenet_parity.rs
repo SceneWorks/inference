@@ -125,4 +125,6 @@ fn bisenet_mask_and_features_parity() {
         "face_features_image diverged from torch: {:.4}%",
         ffi_frac * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bisenet_parity::bisenet_mask_and_features_parity");
 }

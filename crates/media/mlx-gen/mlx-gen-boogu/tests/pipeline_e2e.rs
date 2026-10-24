@@ -109,6 +109,8 @@ fn t2i_smoke() {
     )
     .unwrap();
     println!("wrote {}", out.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_e2e::t2i_smoke");
 }
 
 /// Save an RGB8 [`mlx_gen::media::Image`] to `reference/outputs/{name}` and assert it is
@@ -224,6 +226,8 @@ fn edit_smoke() {
         "boogu_mlx_edit_green_apple_512_textonly.png",
         "edit (text-only baseline)",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_e2e::edit_smoke");
 }
 
 /// Real-weight Turbo (DMD few-step) smoke: render with the Turbo checkpoint + DMD sampler (no CFG)
@@ -269,6 +273,8 @@ fn turbo_smoke() {
     )
     .unwrap();
     println!("wrote {}", out.display());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_e2e::turbo_smoke");
 }
 
 /// E7b **multi-reference** edit (sc-7645): compose TWO references into one edit. Renders two distinct
@@ -333,4 +339,6 @@ fn edit_multi_smoke() {
         "boogu_mlx_editmulti_apple_banana_512.png",
         "edit (2-ref composite)",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pipeline_e2e::edit_multi_smoke");
 }

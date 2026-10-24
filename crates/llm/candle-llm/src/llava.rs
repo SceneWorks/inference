@@ -150,13 +150,13 @@ impl LlavaProjector {
 
     /// Project SigLIP features `[b, seq, vision_hidden]` to language features `[b, seq, hidden]`.
     pub fn forward(&self, features: &Tensor) -> Result<Tensor> {
-        let h = linear(features, &self.linear1_w, Some(&self.linear1_b))?;
+        let h = __model_proof_output!(linear(features, &self.linear1_w, Some(&self.linear1_b)))?;
         let h = if self.gelu_tanh {
             gelu(&h)?
         } else {
             gelu_erf(&h)?
         };
-        linear(&h, &self.linear2_w, Some(&self.linear2_b))
+        __model_proof_output!(linear(&h, &self.linear2_w, Some(&self.linear2_b)))
     }
 }
 
@@ -277,7 +277,13 @@ impl LlavaModel {
         requested: Option<QuantSpec>,
     ) -> Result<Self> {
         let dir = dir.as_ref();
-        let text = std::fs::read_to_string(dir.join("config.json"))?;
+        let text = crate::__model_input_reader!(
+            std::fs::read_to_string(dir.join("config.json")),
+            "crates/llm/candle-llm/src/llava.rs::from_dir_with::std::fs::read_to_string@11509",
+            ArtifactInput,
+            dir.join("config.json"),
+            |__model_input_path| std::fs::read_to_string(__model_input_path)
+        )?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("llava config.json: {e}")))?;
         let cfg = LlavaConfig::from_json(&v)?;
@@ -961,6 +967,7 @@ mod tests {
     /// `off`, and the prefix cache's `none` named in every case — and an unset option resolves
     /// against the provider's per-backend default, which an explicit `off` still overrides.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn generate_reports_the_captioner_reasons() {
         use core_llm::{ImageRef, Speculative, SpeculativeProposer};
         let dir = tiny_llava_snapshot();
@@ -1011,6 +1018,11 @@ mod tests {
         assert!(report(&provider, Some(Speculative::Off)).is_empty());
         provider.speculative_default = Speculative::Off;
         assert!(report(&provider, None).is_empty());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED llava::tests::generate_reports_the_captioner_reasons"
+        );
     }
 
     use std::cell::Cell;

@@ -5,6 +5,15 @@
 //! oracle remain immutable and reviewable; the executable model is a small CPU fixture with the
 //! released 248,320-token vocabulary and exact 15-key MTP layout.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -484,4 +493,9 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     ));
     assert_eq!(stop_stats.accepted_tokens, 0);
     assert_eq!(stop_stats.target_forwards, 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED frozen_qwen38_provider_executes_ar_mtp_tools_and_stops"
+    );
 }

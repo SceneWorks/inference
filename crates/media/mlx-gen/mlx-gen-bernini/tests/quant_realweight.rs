@@ -97,6 +97,9 @@ fn quant_vs_bf16_t2i() {
     let snap = snapshot();
     if !snap.join("high_noise_model.safetensors").is_file() {
         eprintln!("skipping: combined snapshot missing at {}", snap.display());
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in quant_vs_bf16_t2i; see preceding skip diagnostic",
+        );
         return;
     }
     let src = WeightsSource::Dir(snap);
@@ -133,4 +136,6 @@ fn quant_vs_bf16_t2i() {
         p_q8 <= p_bf16 && p_q4 < p_bf16,
         "quantized load peak must be <= bf16 (bf16={p_bf16:.1} Q8={p_q8:.1} Q4={p_q4:.1})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_realweight::quant_vs_bf16_t2i");
 }

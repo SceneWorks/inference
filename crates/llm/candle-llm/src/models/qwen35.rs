@@ -163,8 +163,8 @@ enum QwenEmbedding {
 impl QwenEmbedding {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(weight) => embed(weight, ids),
-            Self::Prism(weight) => weight.embedding(ids),
+            Self::Dense(weight) => __model_proof_output!(embed(weight, ids)),
+            Self::Prism(weight) => __model_proof_output!(weight.embedding(ids)),
         }
     }
 }
@@ -3489,6 +3489,7 @@ pub(crate) mod tests {
     /// view into the live cache's static KV buffer, which would pin that whole buffer beyond the
     /// bytes the entry is charged for.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_prefix_snapshot_holds_compact_copies_of_its_positions() {
         use crate::decode::{StepModel, StepRequest};
         let (_, model) = text_model();
@@ -3521,6 +3522,9 @@ pub(crate) mod tests {
             }
         }
         assert!(attention > 0, "the fixture has full-attention layers");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_prefix_snapshot_holds_compact_copies_of_its_positions");
     }
 
     #[test]
@@ -3834,6 +3838,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn assembled_forward_produces_finite_logits() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
@@ -3848,9 +3853,13 @@ pub(crate) mod tests {
         }
         // The full-attention layer (layer 3) advanced the KV cache to 5 positions.
         assert_eq!(cache.offset(), 5);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::assembled_forward_produces_finite_logits");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn flat_text_and_wrapped_qwen35_match_target_and_mtp() {
         let mut wrapped_json = cfg_json();
         wrapped_json["text_config"]["mtp_num_hidden_layers"] = json!(1);
@@ -3882,9 +3891,13 @@ pub(crate) mod tests {
             .step(2, &previous, 0, 0, &mut flat_mtp.new_cache())
             .unwrap();
         assert_eq!(host(&wrapped_draft), host(&flat_draft));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::flat_text_and_wrapped_qwen35_match_target_and_mtp");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_after_prefill_advances_cache() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3901,6 +3914,9 @@ pub(crate) mod tests {
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size as usize]);
         assert_eq!(cache.offset(), 4);
         assert!(host(&logits).iter().all(|x| x.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_after_prefill_advances_cache");
     }
 
     /// A model-level invariant the hybrid cache must satisfy: prefilling a sequence in one pass must
@@ -3908,6 +3924,7 @@ pub(crate) mod tests {
     /// (conv tail + recurrent SSM state for linear layers, growing KV for full-attention). On CPU
     /// (f32) this is bit-exact; the tolerance allows a hair of float reorder.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prefill_equals_stepwise_decode() {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3944,12 +3961,16 @@ pub(crate) mod tests {
             md < 1e-4,
             "prefill vs stepwise last-token logits diverged: max abs diff {md}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::prefill_equals_stepwise_decode");
     }
 
     /// AC (sc-24443): chunkwise prefill leaves Qwen35 greedy decoding unchanged against the
     /// per-token reference recurrence — a short and a multi-chunk prompt, a speculative-verify-width
     /// forward and the decode steps after it, on a plain cache and on a checkpointing (ringed) one.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn greedy_tokens_match_the_per_token_reference_recurrence() {
         let (_cfg, model) = text_model();
         let argmax_rows = |logits: &Tensor| -> Vec<u32> {
@@ -4020,6 +4041,9 @@ pub(crate) mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::greedy_tokens_match_the_per_token_reference_recurrence");
     }
 
     /// The whole Gated DeltaNet layer, validated against the numeric oracle from the exact
@@ -4028,6 +4052,7 @@ pub(crate) mod tests {
     /// framework-independent fixture the mlx-llm port (sc-7629) used; CPU runs the whole layer in f32
     /// so the match is tight.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn deltanet_layer_matches_qwen3_5_reference() {
         let json: Value =
             serde_json::from_str(include_str!("testdata/qwen35_deltanet_oracle.json")).unwrap();
@@ -4092,6 +4117,9 @@ pub(crate) mod tests {
         // The cache advanced and holds both the recurrent and conv state for a follow-on decode step.
         assert_eq!(cache.offset(), s as i32);
         assert!(cache.conv_state().is_some() && cache.ssm_state().is_some());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::deltanet_layer_matches_qwen3_5_reference");
     }
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape scaled down): 6 experts, top-2, with a shared
@@ -4112,6 +4140,7 @@ pub(crate) mod tests {
     /// sigmoid-gated shared expert. Built via the same un-fuse path as the loader. The same
     /// framework-independent fixture as the mlx-llm port (sc-7630); single token so CPU runs exact f32.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn moe_ffn_matches_qwen3_5_moe_reference() {
         let json: Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4180,6 +4209,9 @@ pub(crate) mod tests {
             md < 2e-4,
             "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_ffn_matches_qwen3_5_moe_reference");
     }
 
     /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
@@ -4287,6 +4319,7 @@ pub(crate) mod tests {
     /// same seeded non-zero weights give identical target hidden states and identical MTP
     /// logits / hidden state.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
         let run = |fused: bool| {
@@ -4310,6 +4343,9 @@ pub(crate) mod tests {
         assert_eq!(a.0, b.0, "target hidden");
         assert_eq!(a.1, b.1, "MTP hidden");
         assert_eq!(a.2, b.2, "MTP logits");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_moe_mtp_head_runs_identically_in_both_expert_layouts");
     }
 
     /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
@@ -4317,6 +4353,7 @@ pub(crate) mod tests {
     /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
     /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_mtp_layer_ffn_matches_the_moe_reference() {
         let json: Value =
             serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
@@ -4384,6 +4421,9 @@ pub(crate) mod tests {
                  exp {exp:?}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::the_mtp_layer_ffn_matches_the_moe_reference");
     }
 
     /// sc-24140 review: the qwen3_5 loader quantizes every MoE expert from a view narrowed out of
@@ -4394,6 +4434,7 @@ pub(crate) mod tests {
     /// release one). Each expert's Q8_0 gate / up / down tracks its dense twin, and so do the
     /// model's logits.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn q8_moe_experts_quantize_from_their_own_slices() {
         let mut json = cfg_json_moe();
         let text = json["text_config"].as_object_mut().unwrap();
@@ -4462,9 +4503,13 @@ pub(crate) mod tests {
         let norm = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>().sqrt();
         let cosine = dot / (norm(&want) * norm(&got));
         assert!(cosine > 0.999, "Q8 logits vs dense: cosine {cosine}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::q8_moe_experts_quantize_from_their_own_slices");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn moe_model_forward_and_prefill_equals_stepwise() {
         let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
         assert!(cfg.moe.is_some());
@@ -4505,6 +4550,9 @@ pub(crate) mod tests {
             md < 1e-4,
             "MoE prefill vs stepwise diverged: max abs diff {md}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::moe_model_forward_and_prefill_equals_stepwise");
     }
 
     pub(crate) fn text_model() -> (Qwen35Config, Qwen35Model) {
@@ -5037,6 +5085,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn step_seam_rope_delta_shifts_the_continuation_positions() {
         // A cache prefilled at positions 0..3 whose continuation must run at 3 + delta (the
         // M-RoPE `mrope_delta` after a multimodal prompt): the step seam's logits equal a direct
@@ -5084,6 +5133,9 @@ pub(crate) mod tests {
             .logits;
         assert_eq!(host(&via_host), host(&via_device));
         assert_eq!(via_host.dims(), &[1, 3, 50]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::step_seam_rope_delta_shifts_the_continuation_positions");
     }
 
     /// `mrope_positions` (the `get_rope_index` port) must reproduce the reference 3-D position rows +
@@ -5125,6 +5177,7 @@ pub(crate) mod tests {
     /// interleaved M-RoPE collapses to 1D and the embeds path is the same compute. This is the gate
     /// that the multimodal hook doesn't perturb the (verified) text decoder.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn decode_from_embeds_text_only_equals_decode_logits() {
         let (_cfg, model) = text_model();
         let toks = [1u32, 7, 3, 42, 9, 2];
@@ -5150,6 +5203,9 @@ pub(crate) mod tests {
             md == 0.0,
             "embeds text path must equal token-id path bit-for-bit; max abs diff {md}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::decode_from_embeds_text_only_equals_decode_logits");
     }
 
     /// The splice hook overwrites exactly the image-token rows (in order) with the feature rows and
@@ -5190,6 +5246,7 @@ pub(crate) mod tests {
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
     /// decode_logits_from_embeds) runs end to end and yields finite `[1, vocab]` logits.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn image_text_decode_from_embeds_runs() {
         let (cfg, model) = text_model();
         let img = 49i32; // within the synthetic vocab (50) so embed gather is in-bounds
@@ -5216,6 +5273,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(logits.dims(), &[1, cfg.vocab_size as usize]);
         assert!(host(&logits).iter().all(|x| x.is_finite()));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::image_text_decode_from_embeds_runs");
     }
 
     /// The load census reports every projection the synthetic decoder holds, by kind, and every
@@ -5241,14 +5301,19 @@ pub(crate) mod tests {
     /// produces finite logits that track the dense model's.
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn nvfp4_format_loads_the_large_projections_as_nvfp4() {
         use crate::primitives::projection::{ProjectionFormat, ProjectionKind};
         let Ok(device) = crate::device::new_cuda_for_test() else {
             candle_quant_kernels::skip_without_sm120("no CUDA device");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/qwen35.rs:5248 (nvfp4_format_loads_the_large_projections_as_nvfp4): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let Ok(format) = ProjectionFormat::nvfp4(&device) else {
             candle_quant_kernels::skip_without_sm120("CUDA device below the NVFP4 floor");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/src/models/qwen35.rs:5252 (nvfp4_format_loads_the_large_projections_as_nvfp4): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         // The fixture's vocabulary (50) is not a multiple of 16; NVFP4 needs N % 16 == 0.
@@ -5329,6 +5394,9 @@ pub(crate) mod tests {
             rel_rms <= 0.3,
             "NVFP4 logits diverged from dense: relative RMS {rel_rms}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::nvfp4_format_loads_the_large_projections_as_nvfp4");
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
@@ -5344,6 +5412,7 @@ pub(crate) mod tests {
     /// logits must equal a fresh decode to `n + 1` — exactly, since the restored recurrent state is
     /// the same tensor and the narrowed KV holds the same values.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn rollback_to_then_redecode_matches_fresh_decode() {
         let (_cfg, model) = text_model();
         let toks = [1u32, 7, 3, 42, 9, 2, 11, 5];
@@ -5402,12 +5471,16 @@ pub(crate) mod tests {
             .decode_logits(&ids(&[toks[n + 1]]), &mut cache, n as i32 + 1)
             .unwrap();
         assert_eq!(max_abs_diff(&a, &b), 0.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::rollback_to_then_redecode_matches_fresh_decode");
     }
 
     /// Rollback refuses positions the ring no longer holds (older than `max_checkpoints` behind
     /// the current one), and never approximates; `0` and the current position always work, and
     /// every position the ring holds — inside a multi-token prefill too — is exact.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn rollback_is_exact_or_refused() {
         let (_cfg, model) = text_model();
         let mut cache = StepModel::new_cache(&model);
@@ -5496,6 +5569,11 @@ pub(crate) mod tests {
             Err(Error::RollbackUnavailable { n: 4, have }) => assert!(have.is_empty()),
             other => panic!("expected RollbackUnavailable {{ n: 4, have: [] }}, got {other:?}"),
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::rollback_is_exact_or_refused"
+        );
     }
 
     /// sc-24446 (defect A) on the model: a prompt prefill takes no per-token Gated DeltaNet step
@@ -5503,6 +5581,7 @@ pub(crate) mod tests {
     /// logits are bit-identical for every depth; a verify step after it still rolls back to its
     /// start (the prefill's state, bit for bit) and to each of its positions.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_prompt_prefill_rings_only_its_final_state_at_every_draft_depth() {
         use crate::primitives::gated_delta::counters;
         let (_cfg, model) = text_model();
@@ -5560,6 +5639,9 @@ pub(crate) mod tests {
             logits.windows(2).all(|w| w[0] == w[1]),
             "bit-identical logits"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_prompt_prefill_rings_only_its_final_state_at_every_draft_depth");
     }
 
     /// **AC1 (tiny config).** After one verify forward of `K + 1` tokens, rolling back to any
@@ -5568,6 +5650,7 @@ pub(crate) mod tests {
     /// `K in 1..=5` — and the rings' addresses never change across the verify step and the
     /// rollbacks (the CUDA-graph identity).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn verify_step_rollback_to_every_position_matches_a_fresh_decode() {
         let (_cfg, model) = text_model();
         let prompt = [1u32, 7, 3, 42];
@@ -5675,6 +5758,9 @@ pub(crate) mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::verify_step_rollback_to_every_position_matches_a_fresh_decode");
     }
 
     /// The memory accounting: a step cache's rings are priced in full from creation (one slot
@@ -5685,6 +5771,7 @@ pub(crate) mod tests {
     /// the state it must carry over — leaves every ring (depth, buffers, restorable positions),
     /// the recurrent bytes and `max_checkpoints` exactly as they were.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_ring_replacement_failing_part_way_leaves_the_cache_untouched() {
         let (_cfg, model) = text_model();
         let mut cache = StepModel::new_cache(&model);
@@ -5733,9 +5820,13 @@ pub(crate) mod tests {
             (depths, cache.max_checkpoints()),
             (vec![6; before.0.len()], 6)
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::a_ring_replacement_failing_part_way_leaves_the_cache_untouched");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn memory_accounting_tracks_live_state_and_checkpoints() {
         let (cfg, model) = text_model();
         let mut cache = StepModel::new_cache(&model);
@@ -5785,10 +5876,14 @@ pub(crate) mod tests {
             ring,
             "a rollback frees nothing: slots are reused"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::memory_accounting_tracks_live_state_and_checkpoints");
     }
 
     /// A schedule with no full-attention layer still reports its position (from the linear layers).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn offset_falls_back_to_linear_layers() {
         let mut v = cfg_json();
         v["text_config"]["full_attention_interval"] = json!(100);
@@ -5809,11 +5904,15 @@ pub(crate) mod tests {
         assert_eq!(cache.offset(), 4);
         cache.rollback_to(3).unwrap();
         assert_eq!(cache.offset(), 3);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::offset_falls_back_to_linear_layers");
     }
 
     /// **AC1 (tiny config).** Greedy generation through the `StepModel` seam is token-identical to
     /// the reference `Decode` loop, and the record says which path ran.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn step_model_greedy_matches_reference_decode_loop() {
         use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
         let (_cfg, model) = text_model();
@@ -5874,11 +5973,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(step.tokens, reference.tokens);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::step_model_greedy_matches_reference_decode_loop");
     }
 
     /// The `StepModel` step shapes: last vs all logits, optional hidden states, and the cache
     /// advancing by the token count.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn step_model_shapes_and_cache_advance() {
         let (cfg, model) = text_model();
         let vocab = cfg.vocab_size as usize;
@@ -5916,6 +6019,9 @@ pub(crate) mod tests {
             .unwrap()
             .logits;
         assert!(max_abs_diff(&a, &b) < 1e-4);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::step_model_shapes_and_cache_advance");
     }
 
     // ---- Static KV cache (story sc-24132) ------------------------------------------------------
@@ -5929,6 +6035,7 @@ pub(crate) mod tests {
     /// `StepModel` driver with the growing cache selected — and the record names the cache that
     /// ran. Step logits agree to f32 reduction order on every step.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn static_kv_greedy_matches_attn_kv_reference_path() {
         use crate::decode::{generate_step, generate_with, CancelFlag, GenerationConfig};
         let (_cfg, mut model) = text_model();
@@ -5993,6 +6100,9 @@ pub(crate) mod tests {
             .unwrap()
             .logits;
         assert!(max_abs_diff(&a, &b) < 1e-5);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::static_kv_greedy_matches_attn_kv_reference_path");
     }
 
     /// **AC2 (op counter).** After warm-up, N single-token steps on the static cache record **zero**
@@ -6002,6 +6112,7 @@ pub(crate) mod tests {
     /// with the `Expanded` formulation selected three (the `cat` pair plus two `repeat_kv`) — which
     /// is what proves both that the counter counts and that the selector switches the arithmetic.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn static_kv_decode_steps_materialize_nothing_and_hold_memory_flat() {
         use crate::primitives::kv_cache::kv_materialize_count;
         let (cfg, mut model) = text_model();
@@ -6084,12 +6195,16 @@ pub(crate) mod tests {
         }
         assert_eq!(kv_materialize_count() - before, 0);
         model.set_attn_formulation(AttnFormulation::Gqa);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::static_kv_decode_steps_materialize_nothing_and_hold_memory_flat");
     }
 
     /// The two formulations agree on the tiny f32 config to reduction order (the growing slots
     /// attend through `sdpa_gqa_causal` or `repeat_kv` + `sdpa`; same tokens either way), and the
     /// step record names the formulation that ran.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn attn_formulation_selector_switches_the_growing_arithmetic_and_is_recorded() {
         use crate::decode::{generate_step, CancelFlag, GenerationConfig};
         let (_cfg, mut model) = text_model();
@@ -6133,12 +6248,16 @@ pub(crate) mod tests {
             .unwrap()
             .logits;
         assert!(max_abs_diff(&la, &lb) < 1e-5);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::attn_formulation_selector_switches_the_growing_arithmetic_and_is_recorded");
     }
 
     /// **AC3 (tiny config, storage identity).** Through 100 single-token steps and a rollback the
     /// static attention buffers keep their storage addresses; the rollback then re-decodes exactly
     /// (the rolled-back positions are overwritten in place).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn static_kv_buffers_keep_their_addresses_across_100_steps_and_rollback() {
         let (_cfg, model) = text_model();
         let mut cache = model.new_static_cache(128, 8).unwrap();
@@ -6182,12 +6301,16 @@ pub(crate) mod tests {
         cache.reset();
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::static_kv_buffers_keep_their_addresses_across_100_steps_and_rollback");
     }
 
     /// sc-24441: a request's record names the attention its cached steps ran — the length-aware
     /// decode attention whenever the model's device positions are active (the static cache that
     /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn records_report_the_decode_attention_when_device_positions_run_it() {
         use crate::decode::{generate_step, CancelFlag, GenerationConfig};
         let (_cfg, mut model) = text_model();
@@ -6220,6 +6343,9 @@ pub(crate) mod tests {
             "expanded",
             "the expanded selector keeps sdpa"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::records_report_the_decode_attention_when_device_positions_run_it");
     }
 
     /// sc-24441: a cache's graph identity follows the device buffers a captured step touches,
@@ -6228,6 +6354,7 @@ pub(crate) mod tests {
     /// runner never replays a graph into freed buffers. The attention-only decoder has no
     /// checkpoint ring, so the K/V and position buffers are all that can move the identity.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn graph_identity_follows_the_kv_and_position_buffers() {
         let (_cfg, mut model) = text_model_attention_only_on(&Device::Cpu);
         let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
@@ -6273,6 +6400,9 @@ pub(crate) mod tests {
             DecodeCache::graph_identity(&cache),
             "a restored cache in its place"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::graph_identity_follows_the_kv_and_position_buffers");
     }
 
     /// sc-24134 after sc-24131 and sc-24441: the CUDA-graph declarations. A linear layer that
@@ -6282,6 +6412,7 @@ pub(crate) mod tests {
     /// layer still replaces its state per step (`deltanet_state_unstable`, including once a ring
     /// is dropped), and a growing attention cache is `growing_kv`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn graph_support_accepts_the_ringed_static_cache_and_names_the_rest() {
         let (_cfg, mut model) = text_model();
         assert!(!model.device_positions(), "off on the CPU by default");
@@ -6327,6 +6458,9 @@ pub(crate) mod tests {
         );
         let growing = model.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS);
         assert_eq!(DecodeCache::graph_support(&growing), Err("growing_kv"));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::graph_support_accepts_the_ringed_static_cache_and_names_the_rest");
     }
 
     fn assert_rows_close(what: &str, a: &Tensor, b: &Tensor) {
@@ -6350,6 +6484,7 @@ pub(crate) mod tests {
     /// engine are identical; and the cache's host bookkeeping (lengths, restorable positions) is
     /// the same on both paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn device_positions_steps_match_the_host_path() {
         use crate::decode::{
             generate_speculative, generate_step, CancelFlag, GenerationConfig, NgramProposer,
@@ -6437,6 +6572,9 @@ pub(crate) mod tests {
             assert_eq!(spec(&dev_model), spec(&host_model), "{what}: speculative");
             assert_eq!(spec(&dev_model), greedy, "{what}: greedy-exact");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::device_positions_steps_match_the_host_path");
     }
 
     /// sc-24441: a replayed step's host side ([`DecodeCache::replay_advance`]) leaves the cache
@@ -6444,6 +6582,7 @@ pub(crate) mod tests {
     /// ring views — and refuses where a replay could not be correct (no device positions, or no
     /// live state to read at position zero).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn replay_advance_does_the_forwards_bookkeeping() {
         let (_, mut model) = text_model();
         model.set_device_positions(true);
@@ -6492,6 +6631,9 @@ pub(crate) mod tests {
             .forward_step(&mut host, StepRequest::last(&[1, 7]))
             .unwrap();
         assert!(DecodeCache::replay_advance(&mut host, 1).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::replay_advance_does_the_forwards_bookkeeping");
     }
 
     /// **E6.** The static cache is bounded by the request and the model: a capacity of zero is a
@@ -6501,6 +6643,7 @@ pub(crate) mod tests {
     /// exactly as they were; the step driver surfaces the same typed error for an over-budget
     /// request.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn static_kv_capacity_is_bounded_and_fails_closed() {
         use crate::decode::{generate_step, CancelFlag, GenerationConfig};
         let (cfg, model) = text_model();
@@ -6574,11 +6717,15 @@ pub(crate) mod tests {
             ),
             "{err}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::static_kv_capacity_is_bounded_and_fails_closed");
     }
 
     /// **E6.** The preallocation is what the cache reports as live bytes from its first step, and
     /// [`Qwen35Model::static_kv_bytes`] is that exact number (the term admission charges).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn static_kv_preallocation_is_priced_exactly() {
         let (cfg, model) = text_model();
         let capacity = 40usize;
@@ -6605,6 +6752,9 @@ pub(crate) mod tests {
             cache.recurrent_bytes(),
             "past the preallocation only the recurrent state is live"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::static_kv_preallocation_is_priced_exactly");
     }
 
     /// **E6, a static cache with a checkpoint ring** — the CPU twin of the real-weight AC3 memory
@@ -6615,6 +6765,7 @@ pub(crate) mod tests {
     /// slot counted live, the rest as checkpoints — and neither decoding nor a rollback grows it or
     /// moves the KV buffers.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn ringed_static_cache_holds_exactly_what_admission_prices() {
         let (_cfg, model) = text_model();
         let (capacity, max_checkpoints) = (40usize, 4usize);
@@ -6657,5 +6808,8 @@ pub(crate) mod tests {
         assert_eq!(cache.len(), n);
         assert_eq!(cache.memory(), preallocated, "nor on a rollback");
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::qwen35::tests::ringed_static_cache_holds_exactly_what_admission_prices");
     }
 }

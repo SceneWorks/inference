@@ -85,6 +85,7 @@ fn vitpose_with_head(gain: f64, shift: f64) -> VitPose {
 /// ViTPose vs HF `VitPoseForPoseEstimation` + upstream's encoder. Mutations: drop `+ pos[:, :1]`;
 /// swap `(x, y)` in `heatmaps_to_keypoints`; skip `substitute_low_confidence` — each ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn vitpose_matches_the_reference_implementation() {
     let w = fixture();
     let m = vitpose(&w);
@@ -122,11 +123,17 @@ fn vitpose_matches_the_reference_implementation() {
     let (rb, vb) = substitute_low_confidence(&rb, &vb, &reference.ratios).unwrap();
     close("ratios_b", &rb, &t(&w, "vitpose.out.ratios_b"), 1e-4);
     close("ratio_vis_b", &vb, &t(&w, "vitpose.out.ratio_vis_b"), 2e-4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::vitpose_matches_the_reference_implementation"
+    );
 }
 
 /// HybrIK vs upstream's encoder. Mutations: `align_corners=True` in `forward_crop`; drop
 /// `+ init_shape` ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn hybrik_matches_the_reference_implementation() {
     let w = fixture();
     let m = hybrik(&w);
@@ -174,10 +181,14 @@ fn hybrik_matches_the_reference_implementation() {
         &t(&w, "hybrik.out.l1_encode"),
         1e-5,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::hybrik_matches_the_reference_implementation");
 }
 
 /// Sapiens vs upstream's estimator. Mutations: drop an InstanceNorm; skip the letterbox pad ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sapiens_matches_the_reference_implementation() {
     let w = fixture();
     let m = sapiens(&w);
@@ -235,6 +246,11 @@ fn sapiens_matches_the_reference_implementation() {
             .unwrap(),
         &t(&w, "sapiens.out.loss_masked_encode"),
         1e-4,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::sapiens_matches_the_reference_implementation"
     );
 }
 
@@ -369,6 +385,7 @@ fn full_mask() -> Tensor {
 /// AC1, per loss: a nonzero, finite gradient reaches the LoRA factor through decoder + frozen
 /// model on candle. Mutation: `.detach()` the live heatmaps / betas / normals ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn each_body_loss_trains_the_lora_through_the_shared_path() {
     let w = fixture();
     let losses: Vec<(&str, Box<dyn PerceptualLoss>, Option<Tensor>)> = vec![
@@ -399,11 +416,15 @@ fn each_body_loss_trains_the_lora_through_the_shared_path() {
             lora_grad(&mut path, mask.as_ref()).unwrap_or_else(|| panic!("{name}: no aux term"));
         assert!(g > 0.0 && g.is_finite(), "{name}: LoRA gradient {g}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::each_body_loss_trains_the_lora_through_the_shared_path");
 }
 
 /// AC1, per loss: no detected person ⇒ no reference, no aux term, diffusion fallback. Mutation:
 /// return a reference regardless of `detect` ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn each_body_loss_is_zero_without_a_detected_person() {
     let w = fixture();
     let losses: Vec<(&str, Box<dyn PerceptualLoss>)> = vec![
@@ -427,11 +448,17 @@ fn each_body_loss_is_zero_without_a_detected_person() {
         let plan = path.plan(0, 0, 0.5).unwrap();
         assert!(plan.diffusion && plan.aux.is_empty(), "{name}: {plan:?}");
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::each_body_loss_is_zero_without_a_detected_person"
+    );
 }
 
 /// The restricted normal loss refuses a reference without a mask and the mask changes the loss.
 /// Mutation: ignore `r.mask` in `NormalLoss::loss` ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     let w = fixture();
     let restricted = NormalLoss::new(person_pose(), sapiens(&w), true);
@@ -449,6 +476,9 @@ fn the_subject_restricted_normal_loss_needs_and_uses_the_mask() {
     let a = scalar(&restricted.loss(&live, r_masked.as_ref()).unwrap());
     let b = scalar(&plain.loss(&live, r_plain.as_ref()).unwrap());
     assert!((a - b).abs() > 1e-5, "masked {a} vs full {b}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::the_subject_restricted_normal_loss_needs_and_uses_the_mask");
 }
 
 /// E7: candle arm footprints are the backend-neutral split. Mutation: drop the ViTPose
@@ -515,6 +545,11 @@ fn real_vitpose_matches_the_reference_implementation() {
         &t(&r, "vitpose.out.ratio_vis_a"),
         2e-3,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::real_vitpose_matches_the_reference_implementation"
+    );
 }
 
 /// AC2 at real scale: the re-hosted HybrIK ResNet-34 vs upstream's encoder on the original `.pth`.
@@ -541,6 +576,11 @@ fn real_hybrik_matches_the_reference_implementation() {
         &t(&r, "hybrik.out.betas_a_encode"),
         1e-3,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::real_hybrik_matches_the_reference_implementation"
+    );
 }
 
 /// AC2 at real scale: the re-hosted Sapiens normal 0.3B vs upstream's estimator on the `.pth`.
@@ -562,6 +602,11 @@ fn real_sapiens_matches_the_reference_implementation() {
         &sap.encode_pixels(&img).unwrap(),
         &nhwc(&r, "sapiens.out.normals_a_encode"),
         5e-3,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::real_sapiens_matches_the_reference_implementation"
     );
 }
 
@@ -603,6 +648,7 @@ fn restricted_normals_ignore_error_outside_the_mask() {
 /// term by it: weighted = schedule weight × t × raw. Mutation: drop the `timestep_weight` override
 /// of any body loss ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn each_body_loss_is_weighted_by_the_noise_level() {
     let w = fixture();
     let losses: Vec<(&str, Box<dyn PerceptualLoss>)> = vec![
@@ -647,6 +693,11 @@ fn each_body_loss_is_weighted_by_the_noise_level() {
             0.5 * t * raw
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED tests::each_body_loss_is_weighted_by_the_noise_level"
+    );
 }
 
 /// Keypoint `i` of a synthetic pose at DSNT `[-1, 1]` coordinates — distinct, non-degenerate bones.
@@ -724,6 +775,7 @@ fn no_person_gate_averages_every_ratio_in_use() {
 /// one; the normal reference is the native-letterbox `encode_pixels`. Mutations: compute the
 /// reference betas on `crop_for` ⇒ red; compute the reference normals with `forward_pixels` ⇒ red.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn reference_paths_follow_upstream_encode() {
     let w = fixture();
     let clean = nhwc(&w, "input.a");
@@ -756,4 +808,7 @@ fn reference_paths_follow_upstream_encode() {
         &sapiens(&w).encode_pixels(&clean).unwrap(),
         1e-6,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::reference_paths_follow_upstream_encode");
 }

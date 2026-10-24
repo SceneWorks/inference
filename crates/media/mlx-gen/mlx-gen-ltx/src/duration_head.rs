@@ -273,41 +273,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_requires_at_least_one_modality() {
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         assert!(head.forward(None, None).is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_requires_at_least_one_modality");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_is_modality_agnostic_video_only() {
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         let video = probe(&[1, 5, hparams::VIDEO_CROSS_ATTENTION_DIM as i32]);
         let seconds = head.predict_seconds(Some(&video), None).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_is_modality_agnostic_video_only");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_is_modality_agnostic_audio_only() {
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         let audio = probe(&[1, 4, hparams::AUDIO_CROSS_ATTENTION_DIM as i32]);
         let seconds = head.predict_seconds(None, Some(&audio)).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_is_modality_agnostic_audio_only");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_accepts_both_modalities_at_once() {
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         let video = probe(&[1, 5, hparams::VIDEO_CROSS_ATTENTION_DIM as i32]);
         let audio = probe(&[1, 4, hparams::AUDIO_CROSS_ATTENTION_DIM as i32]);
         let seconds = head.predict_seconds(Some(&video), Some(&audio)).unwrap();
         assert!(seconds.is_finite() && seconds > 0.0, "seconds={seconds}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::forward_accepts_both_modalities_at_once");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn predict_seconds_rejects_a_multi_item_batch() {
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         let video = probe(&[2, 5, hparams::VIDEO_CROSS_ATTENTION_DIM as i32]);
         assert!(head.predict_seconds(Some(&video), None).is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::predict_seconds_rejects_a_multi_item_batch");
     }
 
     /// Reachability at the real-component level (sc-18774 acceptance): wiring
@@ -315,6 +330,7 @@ mod tests {
     /// synthetic-weighted) `DurationHead::forward` proves the opt-in seam reaches all the way into
     /// the network's forward pass, not just a mock closure.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn opt_in_seam_reaches_the_real_forward_pass() {
         use mlx_gen::gen_core::duration_head::{resolve_request_num_frames, AutoDurationRange};
 
@@ -358,5 +374,7 @@ mod tests {
         .unwrap();
         assert_eq!(explicit, Some(65));
         assert_eq!(calls, 0, "explicit duration must never reach the head");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED duration_head::tests::opt_in_seam_reaches_the_real_forward_pass");
     }
 }

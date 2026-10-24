@@ -107,4 +107,6 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
         started.elapsed(),
         mlx_rs::memory::get_peak_memory()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED adaln_cold_start::fresh_adaln_tables_match_warm_projection_with_turbo");
 }

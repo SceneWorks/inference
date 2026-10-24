@@ -551,7 +551,13 @@ pub fn prequantize_text_encoder(src: &Path, dst: &Path, bits: i32) -> Result<()>
     );
     let mut out: HashMap<String, Array> = HashMap::new();
     for shard in crate::text_encoder::weight_shards(src, untied)? {
-        let tensors = Array::load_safetensors(&shard)?;
+        let tensors = mlx_gen::gen_core::__model_input_reader!(
+Array::load_safetensors(&shard),
+"crates/media/mlx-gen/mlx-gen-iris/src/packed.rs::prequantize_text_encoder::Array::load_safetensors@23531",
+TensorInput,
+&shard,
+|__model_input_path| Array::load_safetensors(__model_input_path)
+)?;
         let mut names: Vec<String> = tensors
             .keys()
             .filter(|n| crate::text_encoder::is_text_tower_tensor(n, untied))
@@ -590,7 +596,13 @@ pub fn prequantize_text_encoder(src: &Path, dst: &Path, bits: i32) -> Result<()>
     )?;
     drop(out);
     let mut config: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(src.join("config.json"))
+        &mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(src.join("config.json")),
+"crates/media/mlx-gen/mlx-gen-iris/src/packed.rs::prequantize_text_encoder::std::fs::read_to_string@25050",
+ArtifactInput,
+src.join("config.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
             .map_err(|e| Error::Msg(format!("iris convert: reading config.json: {e}")))?,
     )
     .map_err(|e| Error::Msg(format!("iris convert: parsing config.json: {e}")))?;

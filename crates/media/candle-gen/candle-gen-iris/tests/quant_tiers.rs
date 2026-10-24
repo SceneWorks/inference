@@ -140,6 +140,7 @@ fn assert_priced(what: &str, measured: u64, priced: u64) {
 /// (adapted or not) is caught by `an_adapted_load_holds_the_packed_model_at_a_tier` and the
 /// `memory_strategy` pricing unit test.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_backbone_holds_packed_projections_at_each_tier() {
     let scratch = tempfile::tempdir().unwrap();
     let tower = aligned_tiny_text_encoder(scratch.path());
@@ -203,6 +204,9 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
             "{tier}: the dense image"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_backbone_holds_packed_projections_at_each_tier");
 }
 
 /// The committed LoRA fixture plus one more module on `blocks.2.mlp.w2` — a 170-wide SwiGLU down
@@ -265,6 +269,7 @@ fn lora_on_an_unaligned_projection(root: &Path) -> PathBuf {
 /// equals the unadapted / without-w2 image); handing the residuals the padded input (a shape
 /// error).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn an_adapted_load_holds_the_packed_model_at_a_tier() {
     let scratch = tempfile::tempdir().unwrap();
     let tower = aligned_tiny_text_encoder(scratch.path());
@@ -363,6 +368,9 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
         from_without_w2 > 0.0,
         "the padded projection's residual did not reach the q4 image"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::an_adapted_load_holds_the_packed_model_at_a_tier");
 }
 
 /// The text tower at each tier: packed projections whose measured resident bytes equal the
@@ -381,6 +389,7 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
 /// bounds alone absorb it). That the weight-only forward is exact is held by `candle-llm`'s
 /// `a_dequantized_forward_projection_never_quantizes_the_activation`.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_text_tower_holds_packed_projections_at_each_tier() {
     let scratch = tempfile::tempdir().unwrap();
     let tower = aligned_tiny_text_encoder(scratch.path());
@@ -437,6 +446,9 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
         }
         other => panic!("expected a typed refusal, got {:?}", other.err()),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_text_tower_holds_packed_projections_at_each_tier");
 }
 
 /// The production path at each tier: `load` of a quantized spec renders a non-constant image
@@ -451,6 +463,7 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
 /// way to both component loaders (the q4 render would equal the dense one byte for byte —
 /// asserted unequal). Which component a tier reaches is gated by the two tests above.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_production_load_renders_at_each_tier() {
     let scratch = tempfile::tempdir().unwrap();
     let tower = aligned_tiny_text_encoder(scratch.path());
@@ -503,4 +516,9 @@ fn the_production_load_renders_at_each_tier() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quant_tiers::the_production_load_renders_at_each_tier"
+    );
 }

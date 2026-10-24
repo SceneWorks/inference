@@ -65,7 +65,13 @@ fn render(spec: &LoadSpec, g: &Weights) -> Image {
         guidance: Some(g.metadata("cfg").unwrap().parse().unwrap()),
         ..Default::default()
     };
-    match model.generate(&req, &mut |_| {}).unwrap() {
+    match (
+        crate::common::record_model_inference_device(),
+        model.generate(&req, &mut |_| {}),
+    )
+        .1
+        .unwrap()
+    {
         GenerationOutput::Images(mut v) => v.pop().unwrap(),
         other => panic!("expected Images, got {other:?}"),
     }
@@ -121,7 +127,8 @@ fn lora_merge_count_matches_vendored() {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LCM-LoRA + lora golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LCM-LoRA + lora golden"]
 fn lora_render_matches_vendored() {
     // The golden is the **vendored** 515-module merge; `model::load` defaults to the COMPLETE 809
     // surface (sc-2671), so opt into the vendored surface to compare apples-to-apples. (Run this
@@ -167,6 +174,8 @@ fn lora_render_matches_vendored() {
         "SDXL LoRA render diverged beyond the cross-build residual: {:.3}% px>8",
         px8 * 100.0
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::lora_render_matches_vendored");
 }
 
 #[test]
@@ -230,7 +239,8 @@ fn peft_format_merges_end_to_end() {
 }
 
 #[test]
-#[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
 fn scale_zero_lora_is_bit_exact_noop() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let base = render(&LoadSpec::new(WeightsSource::Dir(snapshot())), &g);
@@ -249,6 +259,10 @@ fn scale_zero_lora_is_bit_exact_noop() {
         "scale-0 LoRA must be a bit-exact no-op ({differ} px differ)"
     );
     println!("✓ scale-0 LoRA is a bit-exact no-op");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::scale_zero_lora_is_bit_exact_noop"
+    );
 }
 
 /// sc-10734: a LoRA applies on a **quantized (Q8)** SDXL base. Before the additive-residual switch,
@@ -259,7 +273,8 @@ fn scale_zero_lora_is_bit_exact_noop() {
 /// (a turnkey `bf16/` tier works), `SDXL_LORA_PATH` = a kohya SDXL LoRA. The dense path is unchanged
 /// (see `lora_render_matches_vendored`); this only exercises the new packed path.
 #[test]
-#[ignore = "sc-10734: needs an SDXL diffusers snapshot (SDXL_SNAPSHOT) + a kohya SDXL LoRA (SDXL_LORA_PATH)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "sc-10734: needs an SDXL diffusers snapshot (SDXL_SNAPSHOT) + a kohya SDXL LoRA (SDXL_LORA_PATH)"]
 fn lora_applies_on_quantized_q8_base() {
     let lora = PathBuf::from(
         std::env::var("SDXL_LORA_PATH")
@@ -284,7 +299,13 @@ fn lora_applies_on_quantized_q8_base() {
             guidance: Some(7.0),
             ..Default::default()
         };
-        match model.generate(&req, &mut |_| {}).unwrap() {
+        match (
+            crate::common::record_model_inference_device(),
+            model.generate(&req, &mut |_| {}),
+        )
+            .1
+            .unwrap()
+        {
             GenerationOutput::Images(mut v) => v.pop().unwrap(),
             other => panic!("expected Images, got {other:?}"),
         }
@@ -316,4 +337,8 @@ fn lora_applies_on_quantized_q8_base() {
          residual is not being applied"
     );
     println!("✓ sc-10734: LoRA applies on a Q8 SDXL base (forward-time residual, no merge); mean_abs_delta {delta:.2}");
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED lora_real_weights::lora_applies_on_quantized_q8_base"
+    );
 }

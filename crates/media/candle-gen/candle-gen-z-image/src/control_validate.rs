@@ -39,6 +39,9 @@ use crate::control::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
 #[ignore = "real-weight GPU validation; set ZIMG_CTRL_BASE/ZIMG_CTRL_NET/ZIMG_CTRL_POSE/ZIMG_CTRL_OUT"]
 fn real_weight_control() {
     run_control_validation(false, "turbo", 8, None, None);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_validate::real_weight_control");
 }
 
 /// Base-mode (sc-8680) real-weight validation: point `ZIMG_CTRL_BASE` at a `Tongyi-MAI/Z-Image`
@@ -56,6 +59,9 @@ fn real_weight_control_base() {
         Some(4.0),
         Some("blurry, low quality, deformed"),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED control_validate::real_weight_control_base");
 }
 
 /// The shared control-validation harness (sc-8680): loads the model in the requested mode (`base`),

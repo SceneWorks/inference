@@ -267,7 +267,7 @@ impl CausalConv3d {
             .reshape((b, t, o, hp, wp))?
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?;
-        y.broadcast_add(&self.bias)
+        __model_proof_output!(y.broadcast_add(&self.bias))
     }
 }
 
@@ -281,6 +281,7 @@ mod tests {
     /// The streaming `feat_cache` path (one frame at a time) must be bit-equivalent to the single
     /// pass over the whole clip — the causal-conv identity sc-5176 relies on for VAE-decode parity.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn streaming_matches_single_pass() -> Result<()> {
         let dev = Device::Cpu;
         let (o, i, kd) = (5usize, 3usize, 3usize);
@@ -315,6 +316,8 @@ mod tests {
             max_diff < 1e-5,
             "streaming vs single-pass max abs diff = {max_diff}"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv3d::tests::streaming_matches_single_pass");
         Ok(())
     }
 

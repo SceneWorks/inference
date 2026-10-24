@@ -226,6 +226,8 @@ fn lora_frames_match_reference() {
         "LoRA frames px>8 {:.2}% exceeds the 0.32.0 acceptance envelope (sc-12896)",
         px * 100.0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lora_real_weights::lora_frames_match_reference");
 }
 
 #[test]
@@ -325,5 +327,9 @@ fn lora_per_pass_strength_changes_output() {
     assert!(
         mr > 1e-3,
         "per-pass [1.0, 0.0] should differ from the uniform golden, got mean_rel {mr:.3e}"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED lora_real_weights::lora_per_pass_strength_changes_output"
     );
 }

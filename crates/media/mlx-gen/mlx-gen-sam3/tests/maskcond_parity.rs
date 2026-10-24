@@ -70,4 +70,8 @@ fn mask_conditioning_decode_matches_oracle() {
         (out.object_score - score_want).abs() < 1e-4,
         "object_score mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED maskcond_parity::mask_conditioning_decode_matches_oracle"
+    );
 }

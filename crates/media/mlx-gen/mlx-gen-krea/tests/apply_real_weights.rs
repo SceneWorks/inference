@@ -317,6 +317,7 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR + KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in raw_lora_visibly_shifts_turbo_toward_concept; see preceding skip diagnostic");
         return;
     };
 
@@ -377,6 +378,8 @@ fn raw_lora_visibly_shifts_turbo_toward_concept() {
          (magenta Δ={:.1}); raise KREA_LORA_STEPS/KREA_LORA_SCALE if marginal",
         m_on - m_off
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED apply_real_weights::raw_lora_visibly_shifts_turbo_toward_concept");
 }
 
 /// sc-7579 characterization — re-render at a sweep of adapter scales over the ALREADY-TRAINED
@@ -389,6 +392,7 @@ fn lora_scale_sweep_over_trained_concept() {
     let tmp = tempfile::tempdir().unwrap();
     let Some(turbo) = snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo") else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in lora_scale_sweep_over_trained_concept; see preceding skip diagnostic");
         return;
     };
     let adapter = std::env::var("KREA_ADAPTER")
@@ -399,6 +403,7 @@ fn lora_scale_sweep_over_trained_concept() {
             "skipping: no adapter at {} (run raw_lora_visibly_shifts_turbo_toward_concept first)",
             adapter.display()
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in lora_scale_sweep_over_trained_concept; see preceding skip diagnostic");
         return;
     }
     let prompt_owned = std::env::var("KREA_SWEEP_PROMPT")
@@ -427,6 +432,10 @@ fn lora_scale_sweep_over_trained_concept() {
             is_coherent(&img)
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED apply_real_weights::lora_scale_sweep_over_trained_concept"
+    );
 }
 
 #[test]
@@ -438,6 +447,7 @@ fn raw_trained_lora_applies_at_turbo_inference() {
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR + KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in raw_trained_lora_applies_at_turbo_inference; see preceding skip diagnostic");
         return;
     };
 
@@ -467,6 +477,8 @@ fn raw_trained_lora_applies_at_turbo_inference() {
         diff > 0.1,
         "the Raw-trained LoRA must change the Turbo output above numeric noise (mean|Δ|={diff:.3})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED apply_real_weights::raw_trained_lora_applies_at_turbo_inference");
 }
 
 #[test]
@@ -478,6 +490,7 @@ fn raw_trained_lokr_applies_at_turbo_inference() {
         snapshot("KREA_TURBO_DIR", "models--krea--Krea-2-Turbo"),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR + KREA_TURBO_DIR");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in raw_trained_lokr_applies_at_turbo_inference; see preceding skip diagnostic");
         return;
     };
 
@@ -492,4 +505,6 @@ fn raw_trained_lokr_applies_at_turbo_inference() {
         is_coherent(&adapted),
         "LoKr-applied Turbo render must be a coherent image"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED apply_real_weights::raw_trained_lokr_applies_at_turbo_inference");
 }

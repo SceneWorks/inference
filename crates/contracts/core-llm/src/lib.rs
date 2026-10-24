@@ -51,6 +51,12 @@
 //!   preparation: turn a downloaded HF-safetensors or GGUF source into a loadable,
 //!   optionally-quantized snapshot, delegating tensor work to a selected backend.
 
+#[path = "../../gen-core/src/model_input_macros.rs"]
+mod model_input_macros;
+#[cfg(feature = "model-inference-proof")]
+#[path = "../../gen-core/src/model_input_proof.rs"]
+pub mod model_input_proof;
+
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;

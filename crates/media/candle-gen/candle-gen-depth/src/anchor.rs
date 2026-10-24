@@ -277,6 +277,7 @@ mod tests {
     /// backbone LayerNorm through candle's fused `candle_nn::ops::layer_norm` (`apply_op3_no_bwd`)
     /// ⇒ the pixels get no gradient ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn depth_anchor_loss_is_differentiable_in_the_pixels() {
         let loss = tiny_depth_anchor_loss(4, &Device::Cpu).unwrap();
         for (h, w, depth_hw) in [(16, 16, (8, 8)), (16, 24, (6, 8))] {
@@ -301,12 +302,16 @@ mod tests {
                 "{h}x{w}: pixel gradient {mag}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED anchor::tests::depth_anchor_loss_is_differentiable_in_the_pixels");
     }
 
     /// A non-square input is resized aspect-preservingly and a native square input never
     /// resamples the position embedding. Mutation: resize to `(image_size, image_size)` in
     /// `forward_pixels` ⇒ the 16×24 depth is 8×8 ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn non_square_inputs_keep_their_aspect() {
         let cfg = tiny_config();
         assert_eq!(cfg.input_hw(16, 24), (6, 8));
@@ -335,6 +340,11 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-6, "{diff}");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED anchor::tests::non_square_inputs_keep_their_aspect"
+        );
     }
 
     #[test]

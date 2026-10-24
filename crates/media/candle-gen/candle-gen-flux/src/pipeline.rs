@@ -496,7 +496,12 @@ impl Pipeline {
                 path.display()
             ))
         })?;
-        Ok(candle_gen::quant::PackedConfig::from_config(&v))
+        candle_gen::gen_core::__model_input_result!(
+            Ok(candle_gen::quant::PackedConfig::from_config(&v)),
+            "candle-gen-flux::pipeline::Pipeline::component_packed_config/configuration",
+            Configuration,
+            &[&path]
+        )
     }
 
     /// Whether this snapshot uses the **diffusers component layout** (`transformer/`, `text_encoder*/`,
@@ -547,6 +552,12 @@ impl Pipeline {
                 if let Some(n) = v.get("num_single_layers").and_then(|x| x.as_u64()) {
                     num_single = n as usize;
                 }
+                #[cfg(feature = "model-inference-proof")]
+                candle_gen::gen_core::model_input_proof::record_reader_paths(
+                    "candle-gen-flux::pipeline::Pipeline::dit_block_counts/configuration",
+                    candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+                    &[&path],
+                );
             }
         }
         Ok((num_double, num_single))
@@ -1611,8 +1622,14 @@ impl FluxTokenizers {
     /// Load both tokenizers from the snapshot `root` (T5 from `tokenizer_2/`, CLIP from the vendored
     /// bytes). Call once at component load.
     pub fn load(root: &Path) -> Result<Self> {
-        let t5 = Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
+        let t5 = candle_gen::gen_core::__model_input_reader!(
+            Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json")),
+            "candle-gen-flux::pipeline::FluxTokenizers::load/tokenizer",
+            Tokenizer,
+            root.join("tokenizer_2/tokenizer.json"),
+            |actual_path| Tokenizer::from_file(actual_path)
+        )
+        .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
         let clip = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
             .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
         Ok(Self { t5, clip })
@@ -1647,7 +1664,7 @@ pub fn encode_text(
     let t5_input = Tensor::new(t5_ids.as_slice(), device)?.unsqueeze(0)?;
     let t5_emb = {
         let mut t5 = candle_gen::lock_recover(t5);
-        t5.forward(&t5_input)?
+        __model_proof_output!(t5.forward(&t5_input))?
     }
     .to_dtype(dtype)?;
 
@@ -1662,7 +1679,7 @@ pub fn encode_text(
         return Err(CandleError::Msg("flux: empty CLIP tokenization".into()));
     }
     let clip_input = Tensor::new(clip_ids.as_slice(), device)?.unsqueeze(0)?;
-    let clip_emb = clip.forward(&clip_input)?.to_dtype(dtype)?;
+    let clip_emb = __model_proof_output!(clip.forward(&clip_input))?.to_dtype(dtype)?;
 
     Ok((t5_emb, clip_emb))
 }

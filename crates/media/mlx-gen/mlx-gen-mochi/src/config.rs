@@ -123,8 +123,14 @@ impl MochiVaeConfig {
     /// back to a field's [`Default`] value when the key is absent so a partial config still loads.
     pub fn from_model_dir(root: &Path) -> Result<Self> {
         let path = root.join("vae").join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("mochi vae config {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                &path,
+                "mlx-gen-mochi::config::MochiVaeConfig::from_model_dir",
+            )
+        )
+        .map_err(|e| Error::Msg(format!("mochi vae config {}: {e}", path.display())))?;
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("mochi vae config {}: {e}", path.display())))?;
         let d = Self::default();
@@ -222,8 +228,14 @@ impl MochiSplitModel {
         if !path.exists() {
             return Ok(Self::dense());
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("mochi split_model {}: {e}", path.display())))?;
+        let text = mlx_gen::gen_core::__model_input_choose!(
+            std::fs::read_to_string(&path),
+            mlx_gen::gen_core::model_input_proof::read_configuration_to_string_for(
+                &path,
+                "mlx-gen-mochi::config::MochiSplitModel::from_model_dir",
+            )
+        )
+        .map_err(|e| Error::Msg(format!("mochi split_model {}: {e}", path.display())))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("mochi split_model {}: {e}", path.display())))?;
         Ok(Self::from_value(&v))

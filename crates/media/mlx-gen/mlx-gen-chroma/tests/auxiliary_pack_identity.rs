@@ -155,4 +155,6 @@ fn packed_auxiliaries_match_load_time_quantization() {
         })
     );
     println!("✓ Q{bits} offline pack ≡ load-time pack (exact, T5 + VAE decode/encode)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED auxiliary_pack_identity::packed_auxiliaries_match_load_time_quantization");
 }

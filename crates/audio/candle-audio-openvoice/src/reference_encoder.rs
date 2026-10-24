@@ -93,9 +93,9 @@ impl ReferenceEncoder {
         }
         let x = Tensor::from_vec(transposed, (1, 1, t, n_bins), &self.device)?;
         // LayerNorm over the frequency axis (last dim).
-        let mut out = self.layernorm.forward(&x)?;
+        let mut out = __model_proof_output!(self.layernorm.forward(&x))?;
         for conv in &self.convs {
-            out = conv.forward(&out)?.relu()?;
+            out = __model_proof_output!(conv.forward(&out))?.relu()?;
         }
         // `[1, C, T', F'] → [1, T', C, F'] → [1, T', C·F']`.
         let out = out.transpose(1, 2)?.contiguous()?;
@@ -104,7 +104,7 @@ impl ReferenceEncoder {
         // GRU over the sequence; take the final hidden state (reference `memory, out = gru(...)`).
         let states = self.gru.seq(&out)?;
         let last = states.last().expect("gru produced at least one state");
-        let g = self.proj.forward(&last.h)?; // [1, GIN_CHANNELS]
+        let g = __model_proof_output!(self.proj.forward(&last.h))?; // [1, GIN_CHANNELS]
         Ok(g.unsqueeze(2)?) // [1, GIN_CHANNELS, 1]
     }
 }

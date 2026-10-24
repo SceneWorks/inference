@@ -261,6 +261,7 @@ fn extract(
 /// un-rotated key to the capture); skipping the cache concat in `Attention::forward_cached`
 /// (target attends to itself only); reading the `t = 0` modulation row for the cached target
 /// tokens; slicing the wrong RoPE rows for the target.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -318,6 +319,8 @@ fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_velocity_is_the_prefill_velocity_at_every_evaluation");
 }
 
 /// Question 2 at the transformer, on the CPU device: the port's extract velocity, the K/V it
@@ -327,6 +330,7 @@ fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
 /// *Mutations that red this:* caching `k` before RoPE (the fixture's `k` is post-RoPE, as
 /// `QwenImage21KVLayerCache` documents); caching `v` after a norm or rotation; caching the wrong
 /// rows (e.g. the target's); any cached-step defect listed on the test above.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn extract_cache_and_cached_velocity_match_upstream() {
     let _cpu = CpuDevice::new();
@@ -388,6 +392,10 @@ fn extract_cache_and_cached_velocity_match_upstream() {
             }
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED kv_cache::extract_cache_and_cached_velocity_match_upstream"
+    );
 }
 
 /// Everything one `denoise_reported` call needs for a fixture case.
@@ -502,6 +510,7 @@ fn assert_cached_shape(tag: &str, case: &Case, report: &DenoiseReport, evaluatio
 /// `block_tokens` assertion: 16 expected, the joint length observed); sharing one cache across the
 /// two CFG branches (the `*_cfg` cases diverge by ~1e0 and `kv_cache_bytes` halves); ignoring the
 /// switch (`Off` reporting a cache, or `On` reporting none).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -542,6 +551,8 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_denoise_matches_prefill_denoise_and_reports_its_path");
 }
 
 /// Question 2 for the whole loop, on the CPU device: three Euler steps with the cache on land on
@@ -553,6 +564,7 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
 /// *Mutation that reds the off-path row:* a numeric change to the prefill loop or forward — e.g.
 /// the off path's true-CFG combine rewritten as `pos + (s − 1)·(pos − neg)` with the wrong scale,
 /// or `Attention::project` normalising `k` with `norm_q`.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_denoise_matches_upstream_end_to_end() {
     let _cpu = CpuDevice::new();
@@ -589,6 +601,8 @@ fn cached_denoise_matches_upstream_end_to_end() {
             UPSTREAM_TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_denoise_matches_upstream_end_to_end");
 }
 
 /// The rule is per model **evaluation**, not per sampler step. Heun evaluates the model twice on
@@ -599,6 +613,7 @@ fn cached_denoise_matches_upstream_end_to_end() {
 /// *Mutation that reds this:* any per-step or per-sigma lifetime for the cache (e.g. dropping it
 /// after a decode so the next evaluation prefills again) — the report then shows more than one
 /// `Extract` for the branch.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -633,6 +648,8 @@ fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation()
             RTOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation");
 }
 
 /// True CFG holds two independent caches. The prompts differ in length, so the two prefixes do too
@@ -642,6 +659,7 @@ fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation()
 ///
 /// *Mutation that reds this (and the `*_cfg` rows of the tests above):* the negative branch
 /// reading the positive branch's cache.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_negative_branch_has_its_own_cache() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -678,6 +696,8 @@ fn the_negative_branch_has_its_own_cache() {
              their isolation"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::the_negative_branch_has_its_own_cache");
 }
 
 /// With the switch off the loop is the plain prefill loop: the latents are bit-for-bit what an
@@ -691,6 +711,7 @@ fn the_negative_branch_has_its_own_cache() {
 /// rewritten as `pos + (s − 1)·(pos − neg)`. (An ignored switch is caught by the report assertions
 /// of `cached_denoise_matches_prefill_denoise_and_reports_its_path`: on Metal the cached path's
 /// latents are bit-identical to the prefill's, so bits alone could not tell.)
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cache_off_is_bit_identical_to_the_prefill_loop() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -748,6 +769,10 @@ fn cache_off_is_bit_identical_to_the_prefill_loop() {
             "{name}: cache off must be the prefill loop, bit for bit"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED kv_cache::cache_off_is_bit_identical_to_the_prefill_loop"
+    );
 }
 
 /// A cancellation requested when step 2 is announced — i.e. right after the step that prefills —
@@ -757,6 +782,7 @@ fn cache_off_is_bit_identical_to_the_prefill_loop() {
 /// *Mutation that reds this:* a report only written back when the loop completes (a cancelled
 /// run would then report nothing), or a loop that keeps evaluating after the cancellation (the
 /// report would carry `Cached` entries).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cancelling_after_the_prefill_step_runs_no_cached_evaluation() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -803,6 +829,8 @@ fn cancelling_after_the_prefill_step_runs_no_cached_evaluation() {
         let (_, report) = run.ok();
         assert_cached_shape(name, &case, &report, case.steps);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::cancelling_after_the_prefill_step_runs_no_cached_evaluation");
 }
 
 /// The same tiny weights as a model that is **not** `causal_condition`.
@@ -822,6 +850,7 @@ fn non_causal_model() -> QwenImage21Transformer {
 /// *Mutation that reds this:* dropping the `causal_condition` term from the loop's decision (the
 /// run fails with the transformer's refusal) or the refusal from the transformer (a step-dependent
 /// prefix would be cached silently).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -883,10 +912,13 @@ fn without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill() {
             .map(|v| v.to_bits())
             .collect::<Vec<_>>(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::without_causal_condition_the_cache_is_refused_and_the_loop_runs_prefill");
 }
 
 /// A cache cannot be built from a failed prefill, and it decodes only the target it was extracted
 /// for.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_cache_is_only_ever_complete_and_only_fits_its_own_target() {
     let w = fixture("qwen21_kv_cache.safetensors");
@@ -913,6 +945,8 @@ fn a_cache_is_only_ever_complete_and_only_fits_its_own_target() {
             .contains("prefix KV cache was extracted for a 16-token target"),
         "{err}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::a_cache_is_only_ever_complete_and_only_fits_its_own_target");
 }
 
 /// A seeded random model at an arbitrary geometry — for the production head dim, which the
@@ -1012,6 +1046,7 @@ fn seeded(shape: &[i32], seed: u64) -> Array {
 ///
 /// *Mutations that red this:* the same cached-step defects as the tiny-fixture test, at this
 /// geometry (e.g. `k` cached before RoPE, the prefix concat skipped).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel() {
     let cfg = production_head_config();
@@ -1104,6 +1139,8 @@ fn cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel() 
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel");
 }
 
 /// The cache owns its buffers. An MLX slice is a view of the array it was cut from, so a cache
@@ -1116,6 +1153,7 @@ fn cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel() 
 /// *Mutations that red this:* caching the slices themselves (`owned_copy` returning its input);
 /// evaluating only each block's output and never its cache entry (the lazy cache then keeps every
 /// block's full K/V alive).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_cache_does_not_pin_the_prefill_keys_and_values() {
     let cfg = production_head_config();
@@ -1162,6 +1200,8 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
         ATOL,
         RTOL,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::the_cache_does_not_pin_the_prefill_keys_and_values");
 }
 
 /// The extract step does not hold every block's K/V at once. Each block's prefix rows are cut from
@@ -1178,6 +1218,7 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
 ///
 /// *Mutation that reds this:* deferring the copies' evaluation to the end of the forward (keeping
 /// the captured slices alive across blocks).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
     let _cpu = CpuDevice::new();
@@ -1240,6 +1281,8 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
         extract_peak.saturating_sub(prefill_peak),
         cfg.num_layers
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::the_extract_step_peaks_at_the_prefill_plus_the_cache");
 }
 
 /// AT4's committed half (sc-25909): **the base id's render with the cache shed is the prefill
@@ -1261,6 +1304,7 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
 /// *Mutations that red this:* the base generator running cached when nothing is selected (link
 /// 1's report, and its pixels off the `Off` assembly); any numeric change to the prefill forward
 /// or loop (link 2).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates() {
     use mlx_gen::gen_core::{GenerationMemory, GenerationOutput, PrefixKvCacheMode};
@@ -1375,4 +1419,6 @@ fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates
         w.require("t2i/latents_final_prefill").unwrap(),
         UPSTREAM_TOL,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED kv_cache::the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates");
 }

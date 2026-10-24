@@ -42,7 +42,14 @@ fn cpu_child(test: &str, body: fn()) {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("done");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .args([
+            "--include-ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
         .env(CHILD, test)
         .env(DONE, &marker)
         .status()
@@ -349,6 +356,7 @@ fn base(compute: Dtype) -> Weights {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn generated_headers_match_actual_retained_stacks() {
     cpu_child(
         "adapters::adapter_facts_tests::generated_headers_match_actual_retained_stacks",
@@ -457,6 +465,7 @@ fn generated_headers_match_actual_retained_stacks() {
                     }
                 }
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapter_facts_tests::generated_headers_match_actual_retained_stacks");
         },
     );
 }
@@ -481,6 +490,7 @@ fn contract_factor_allowance_floors_at_actual_promoted_lora_payloads() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn production_lora_forward_peak_requires_rank_and_dtype_terms() {
     cpu_child(
         "adapters::adapter_facts_tests::production_lora_forward_peak_requires_rank_and_dtype_terms",
@@ -556,6 +566,7 @@ fn production_lora_forward_peak_requires_rank_and_dtype_terms() {
                     assert!(owned >= allocated(384 * 65 * 4) + allocated(384 * 64 * 4));
                 }
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapter_facts_tests::production_lora_forward_peak_requires_rank_and_dtype_terms");
         },
     );
 }
@@ -776,6 +787,7 @@ fn actual_materialization_guard_covers_lazy_reconstruction_peak() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn actual_parent_embed_guard_prices_installed_projection() {
     cpu_child(
         "adapters::adapter_facts_tests::actual_parent_embed_guard_prices_installed_projection",
@@ -831,11 +843,13 @@ fn actual_parent_embed_guard_prices_installed_projection() {
             if formula as f64 > 1.5 * measured.max(1) as f64 {
                 eprintln!("REPORT ONLY: actual adapted embed ratio exceeds 1.5");
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapter_facts_tests::actual_parent_embed_guard_prices_installed_projection");
         },
     );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn materialized_lokr_loha_native_peak_requires_adapter_budget() {
     cpu_child(
         "adapters::adapter_facts_tests::materialized_lokr_loha_native_peak_requires_adapter_budget",
@@ -897,6 +911,7 @@ fn materialized_lokr_loha_native_peak_requires_adapter_budget() {
                     }
                 }
             }
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapter_facts_tests::materialized_lokr_loha_native_peak_requires_adapter_budget");
         },
     );
 }
@@ -959,6 +974,7 @@ fn kohya_ambiguous_roles_fail_independent_of_key_order() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn scale_zero_keeps_payloads_but_executes_no_residual() {
     cpu_child(
         "adapters::adapter_facts_tests::scale_zero_keeps_payloads_but_executes_no_residual",
@@ -1016,6 +1032,7 @@ fn scale_zero_keeps_payloads_but_executes_no_residual() {
             let want = bare.forward(&x).unwrap();
             eval([&out, &want]).unwrap();
             assert_eq!(out.as_slice::<f32>(), want.as_slice::<f32>());
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::adapter_facts_tests::scale_zero_keeps_payloads_but_executes_no_residual");
         },
     );
 }

@@ -1292,7 +1292,13 @@ fn resolve_compute_dtype(train_dtype: &str) -> Dtype {
 /// [`MageTransformer::from_weights`] (reconstruct-in-trace) and [`save_full_checkpoint`] (save). Every
 /// tensor is widened to f32 (master weights); the published checkpoint is bf16.
 fn load_master_weights(transformer_dir: &Path) -> Result<(LoraParams, MageFlowConfig)> {
-    let json = std::fs::read_to_string(transformer_dir.join(TRANSFORMER_CONFIG_FILE))?;
+    let json = mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(transformer_dir.join(TRANSFORMER_CONFIG_FILE)),
+"crates/media/mlx-gen/mlx-gen-mage/src/training.rs::load_master_weights::std::fs::read_to_string@64128",
+ArtifactInput,
+transformer_dir.join(TRANSFORMER_CONFIG_FILE),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?;
     let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
     let weights = Weights::from_file(transformer_dir.join(TRANSFORMER_WEIGHTS_FILE))?;
     let keys: Vec<String> = weights.keys().map(str::to_string).collect();
@@ -1421,8 +1427,13 @@ fn resolve_target_paths(transformer: &MageTransformer, cfg: &TrainingConfig) -> 
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_result!(
+        image::open(path),
+        "crates/media/mlx-gen/mlx-gen-mage/src/training.rs::decode_image/image::open",
+        Reference,
+        &[path]
+    )
+    .map_err(|e| mlx_gen::Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1999,6 +2010,10 @@ mod tests {
             losses[0],
             losses.last().unwrap()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::tests::overfits_a_fixed_batch_loss_decreases"
+        );
     }
 
     #[test]
@@ -2027,6 +2042,7 @@ mod tests {
     /// all-zero grads; a half map lands strictly between. The half map's token layout is checked too
     /// (token `y·g + x` carries the weight of latent cell `(y, x)` on every channel).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_loss_paths() {
         use mlx_gen::train::loss::subject_mask_weight;
         let fx = Weights::from_file(concat!(
@@ -2209,6 +2225,8 @@ mod tests {
             eval(gr.values()).unwrap();
             (l, gr)
         });
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_loss_paths");
     }
 
     /// sc-24828 × sc-2127: with mask loss on and two buckets, each bucket's weight map has THAT
@@ -2585,6 +2603,10 @@ mod tests {
             losses[0],
             losses.last().unwrap()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::tests::full_finetune_overfits_a_fixed_batch"
+        );
     }
 
     /// sc-14056 full base fine-tune **e2e** — the whole [`Trainer::train`] path (dataset caching → the
@@ -2710,6 +2732,10 @@ mod tests {
         assert!(
             max_abs > 0.0 && max_abs.is_finite(),
             "a full fine-tune must move the DiT: reloaded velocity == base (max_abs {max_abs})"
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::tests::full_finetune_runs_e2e_and_reloads"
         );
     }
 }
@@ -2886,6 +2912,7 @@ mod depth_anchoring_tests {
     /// B factors get a nonzero gradient; a diffusion step carries no depth term. Mutation: force
     /// `diffusion_on = true` in `compute_loss_grads` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_through_depth_only() {
         let (mut dit, dcfg) = fixture_model();
         let cfg = cfg();
@@ -2905,6 +2932,8 @@ mod depth_anchoring_tests {
         assert_eq!(depth.total, aux);
         let gb = abs_sum(&g, ".lora_b");
         assert!(gb > 0.0 && gb.is_finite(), "LoRA-B grad |Σ| = {gb}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_through_depth_only");
     }
 
     /// The alternation interleaves (never two depth steps in a row) and gives each of 2
@@ -2912,6 +2941,7 @@ mod depth_anchoring_tests {
     /// the plan on the bare global step (no period) ⇒ item 0 is locked to diffusion ⇒ red; build
     /// the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn every_item_gets_both_kinds_and_references_are_built_once() {
         let (mut dit, dcfg) = fixture_model();
         let cfg = cfg();
@@ -2933,12 +2963,15 @@ mod depth_anchoring_tests {
             assert!(k.contains(&true) && k.contains(&false), "{kinds:?}");
         }
         assert_eq!(d.path().reference_computations(), cache.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::every_item_gets_both_kinds_and_references_are_built_once");
     }
 
     /// E1: with no aux loss nothing is built and the step is bit-identical to the pre-epic-2123
     /// LoRA step (its loss closure reproduced verbatim). Mutation: perturb the off-path diffusion
     /// graph (scale `diff` by 1.0001 before `reduce_loss`) ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(mlx_gen_perceptual::build_perceptual_path(
             &TrainingConfig::default(),
@@ -2997,6 +3030,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_legacy {
             assert_eq!(bits(v), bits(&g_off[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: depth grows the estimate by the decoder + DA2 (more for Large), and the guard refuses at
@@ -3104,6 +3139,7 @@ mod depth_anchoring_tests {
     /// to NHWC `[0, 1]`, and is differentiable in the latent. Mutations: drop the `(x+1)/2` map ⇒
     /// values differ ⇒ red; `stop_gradient` the decode input ⇒ zero gradient ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mage_vae_fallback_decoder_matches_the_plain_decode_and_flows_gradient() {
         let vae = tiny_vae();
         let bottleneck = vae.shape().bottleneck;
@@ -3145,5 +3181,7 @@ mod depth_anchoring_tests {
         let g = mlx_rs::transforms::grad(f)(&z).unwrap();
         let mag = g.abs().unwrap().sum(None).unwrap().item::<f32>();
         assert!(mag > 0.0 && mag.is_finite(), "latent gradient {mag}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::mage_vae_fallback_decoder_matches_the_plain_decode_and_flows_gradient");
     }
 }

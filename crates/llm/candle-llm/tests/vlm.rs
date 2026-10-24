@@ -8,6 +8,15 @@
 //! `--features cuda`), and confirms the conformance suite's multimodal check passes via the **generate**
 //! branch.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
@@ -230,6 +239,7 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
 /// size, and splicing them into the right embedding rows changes the first-token logits — i.e. the
 /// image actually drives the decode (not silently dropped).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn image_features_flow_into_decode_cpu() {
     let model = build_tiny_llava();
     assert_eq!(model.config().image_seq_length, N_PATCHES);
@@ -266,10 +276,14 @@ fn image_features_flow_into_decode_cpu() {
         max_abs_diff(&lg, &lr) > 1e-4,
         "different images must change the decoder's first-token logits"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED image_features_flow_into_decode_cpu");
 }
 
 /// Greedy captioning is deterministic and produces the full token budget.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn generate_is_deterministic_cpu() {
     let model = build_tiny_llava();
     let feat = model.image_features(&gray(), V_IMG, V_IMG).unwrap();
@@ -293,6 +307,9 @@ fn generate_is_deterministic_cpu() {
     assert_eq!(a.tokens, b.tokens, "greedy caption must be deterministic");
     assert_eq!(a.tokens.len(), 8);
     assert!(a.tokens.iter().all(|&t| (t as usize) < VOCAB));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generate_is_deterministic_cpu");
 }
 
 // ---- real-weights, env-gated (CUDA with --features cuda) --------------------------------------
@@ -338,6 +355,8 @@ mod real {
     fn llava_captions_image_and_passes_multimodal_check() {
         let Some(snap) = snapshot() else {
             eprintln!("skip: set CANDLE_LLM_VLM_MODEL to a LLaVA snapshot dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/vlm.rs:341 (llava_captions_image_and_passes_multimodal_check): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let provider = LlavaProvider::load(&LoadSpec::dense(snap)).expect("load LLaVA provider");
@@ -383,5 +402,8 @@ mod real {
             ..Default::default()
         };
         assert!(provider.generate(&no_image, &mut |_| {}).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED real::llava_captions_image_and_passes_multimodal_check");
     }
 }

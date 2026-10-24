@@ -24,7 +24,11 @@ use crate::transformer::{ZImageTransformer, ZImageTransformerConfig};
 use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 /// Qwen3 pad token id (`<|endoftext|>`).
-const PAD_TOKEN_ID: i32 = 151643;
+fn pad_token_id() -> i32 {
+    crate::active_encoder_contract()
+        .bos_token_id
+        .expect("Qwen pad/bos token") as i32
+}
 /// Prompts pad to this length (the fork's `padding="max_length"`).
 pub(crate) const MAX_LENGTH: usize = 512;
 
@@ -48,7 +52,7 @@ pub(crate) fn control_load_keeps(streamed: bool, name: &str) -> bool {
 
 /// Load the Qwen tokenizer with the Z-Image chat-template + padding policy.
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    let source = crate::ENCODER_CONTRACT
+    let source = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_tokenizer(&source)
 }
@@ -72,7 +76,7 @@ pub(crate) fn load_tokenizer_from_receipt(
             path,
             TokenizerConfig {
                 max_length: MAX_LENGTH,
-                pad_token_id: PAD_TOKEN_ID,
+                pad_token_id: pad_token_id(),
                 chat_template: ChatTemplate::QwenInstruct,
                 pad_to_max_length: true,
             },
@@ -84,7 +88,7 @@ pub(crate) fn load_tokenizer_from_receipt(
 /// Load the Qwen3-style text encoder (prompt → `cap_feats`). The checkpoint keys are prefixed
 /// `model.` (the encoder's own modules); no other remap is needed.
 pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
-    let selected = crate::ENCODER_CONTRACT
+    let selected = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_text_encoder(&selected)
 }
@@ -131,7 +135,7 @@ pub(crate) fn load_validated_text_encoder_with(
 /// shape with no phase reload, so the repeated materialization is an explicit load-shape cost rather
 /// than an accidental rung-4 fallback.
 pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
-    let selected = crate::ENCODER_CONTRACT
+    let selected = crate::active_encoder_contract()
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     load_validated_text_encoder_streamable(&selected)
 }

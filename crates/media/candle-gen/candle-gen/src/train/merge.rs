@@ -141,8 +141,14 @@ fn read_adapter_capped(path: &Path, max_bytes: u64) -> Result<AdapterFile> {
             path.display(),
         )));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
+    let bytes = gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
+    .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
     let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
     let (_, md) = safetensors::SafeTensors::read_metadata(&bytes)
         .map_err(|e| CandleError::Msg(format!("read adapter metadata {}: {e}", path.display())))?;

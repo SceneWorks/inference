@@ -225,7 +225,7 @@ impl VisionPatchEmbed {
 
     /// `pixel_values`: `[n, 1176]` → `[n, embed]`.
     fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        Ok(pixel_values.matmul(&self.proj_t)?)
+        Ok(__model_proof_output!(pixel_values.matmul(&self.proj_t))?)
     }
 }
 
@@ -246,9 +246,9 @@ impl VisionMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(x)?.silu()?;
-        let up = self.up.forward(x)?;
-        Ok(self.down.forward(&(gate * up)?)?)
+        let gate = __model_proof_output!(self.gate.forward(x))?.silu()?;
+        let up = __model_proof_output!(self.up.forward(x))?;
+        Ok(__model_proof_output!(self.down.forward(&(gate * up)?))?)
     }
 }
 
@@ -279,7 +279,7 @@ impl VisionAttention {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, cu: &[i32]) -> Result<Tensor> {
         let seq = x.dims()[0];
         let (h, hd) = (self.num_heads, self.head_dim);
-        let qkv = self.qkv.forward(x)?.reshape((seq, 3, h, hd))?;
+        let qkv = __model_proof_output!(self.qkv.forward(x))?.reshape((seq, 3, h, hd))?;
         // each → [1, h, seq, hd]
         let to_heads = |idx: usize| -> Result<Tensor> {
             Ok(qkv
@@ -313,7 +313,7 @@ impl VisionAttention {
             .transpose(0, 1)? // [seq, h, hd]
             .contiguous()?
             .reshape((seq, h * hd))?;
-        Ok(self.proj.forward(&out)?)
+        Ok(__model_proof_output!(self.proj.forward(&out))?)
     }
 }
 
@@ -337,8 +337,16 @@ impl VisionBlock {
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, cu: &[i32]) -> Result<Tensor> {
-        let x = (x + self.attn.forward(&self.norm1.forward(x)?, cos, sin, cu)?)?;
-        let out = (&x + self.mlp.forward(&self.norm2.forward(&x)?)?)?;
+        let x = (x + self.attn.forward(
+            &__model_proof_output!(self.norm1.forward(x))?,
+            cos,
+            sin,
+            cu,
+        )?)?;
+        let out = (&x
+            + self
+                .mlp
+                .forward(&__model_proof_output!(self.norm2.forward(&x))?)?)?;
         Ok(out)
     }
 }
@@ -371,9 +379,9 @@ impl PatchMerger {
     /// `x`: `[seq, embed]` (window-reordered) → `[seq/merge², out_hidden]`.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let rows = x.elem_count() / self.hidden_merged;
-        let x = self.ln_q.forward(x)?.reshape((rows, self.hidden_merged))?;
-        let x = self.mlp0.forward(&x)?.gelu_erf()?;
-        Ok(self.mlp1.forward(&x)?)
+        let x = __model_proof_output!(self.ln_q.forward(x))?.reshape((rows, self.hidden_merged))?;
+        let x = __model_proof_output!(self.mlp0.forward(&x))?.gelu_erf()?;
+        Ok(__model_proof_output!(self.mlp1.forward(&x))?)
     }
 }
 

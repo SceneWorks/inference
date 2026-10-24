@@ -161,7 +161,9 @@ impl TrainFfn {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.out.forward(&self.proj.forward(x)?.gelu()?)
+        __model_proof_output!(self
+            .out
+            .forward(&__model_proof_output!(self.proj.forward(x))?.gelu()?))
     }
 }
 
@@ -231,10 +233,11 @@ impl TrainBlock {
         let hf = (hf + a.to_dtype(DType::F32)?.broadcast_mul(&gate_msa)?)?;
 
         // 2. cross-attention (affine norm2, ungated)
-        let n = ln_no_affine(&hf, self.eps)?
-            .broadcast_mul(&self.norm2_w)?
-            .broadcast_add(&self.norm2_b)?
-            .to_dtype(dt)?;
+        let n = __model_proof_output!(__model_proof_output!(
+            ln_no_affine(&hf, self.eps)?.broadcast_mul(&self.norm2_w)
+        )?
+        .broadcast_add(&self.norm2_b))?
+        .to_dtype(dt)?;
         let a = self.attn2.forward(&n, context, None)?;
         let hf = (hf + a.to_dtype(DType::F32)?)?;
 
@@ -321,7 +324,9 @@ impl WanTransformerTrain {
     /// linears (PixArtAlphaTextProjection). Frozen — no adapter targets here.
     pub fn embed_text(&self, prompt_embeds: &Tensor) -> Result<Tensor> {
         let x = prompt_embeds.to_dtype(self.dtype)?;
-        self.text_l2.forward(&self.text_l1.forward(&x)?.gelu()?)
+        __model_proof_output!(self
+            .text_l2
+            .forward(&__model_proof_output!(self.text_l1.forward(&x))?.gelu()?))
     }
 
     /// One DiT forward: `latents [B,C,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t` (the
@@ -364,8 +369,8 @@ impl WanTransformerTrain {
             .reshape((b * f, self.cfg.in_channels, hl, wl))?
             .contiguous()?
             .to_dtype(self.dtype)?;
-        let y = merged.conv2d(&self.patch_w, 0, ph, 1, 1)?;
-        let y = y.broadcast_add(&self.patch_b)?;
+        let y = __model_proof_output!(merged.conv2d(&self.patch_w, 0, ph, 1, 1))?;
+        let y = __model_proof_output!(y.broadcast_add(&self.patch_b))?;
         let hidden = y
             .reshape((b, f, self.cfg.dim, pph, ppw))?
             .permute((0, 1, 3, 4, 2))?
@@ -373,12 +378,10 @@ impl WanTransformerTrain {
             .contiguous()?;
 
         let sinus = timestep_sinusoid(t, self.cfg.freq_dim, b, device)?.to_dtype(self.dtype)?;
-        let temb = self
+        let temb = __model_proof_output!(self
             .time_l2
-            .forward(&self.time_l1.forward(&sinus)?.silu()?)?;
-        let temb6 = self
-            .time_proj
-            .forward(&temb.silu()?)?
+            .forward(&__model_proof_output!(self.time_l1.forward(&sinus))?.silu()?))?;
+        let temb6 = __model_proof_output!(self.time_proj.forward(&temb.silu()?))?
             .reshape((b, 6, self.cfg.dim))?
             .to_dtype(DType::F32)?;
         Ok((
@@ -430,7 +433,7 @@ impl WanTransformerTrain {
             .broadcast_mul(&(scale + 1.0)?)?
             .broadcast_add(&shift)?
             .to_dtype(self.dtype)?;
-        let out = self.proj_out.forward(&normed)?;
+        let out = __model_proof_output!(self.proj_out.forward(&normed))?;
 
         let oc = self.cfg.out_channels;
         out.reshape(&[b, ppf, pph, ppw, pt, ph, pw, oc][..])?
@@ -497,6 +500,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dit_matches_stock_forward() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
@@ -540,6 +544,9 @@ mod parity_tests {
             diff < 1e-5,
             "vendored Wan DiT diverged from stock by {diff}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_train::parity_tests::vendored_dit_matches_stock_forward");
     }
 
     /// The [`LoraHost`] walk reaches exactly `4 × 2 × num_layers` projections — the four attention

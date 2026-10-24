@@ -35,6 +35,7 @@ fn small_cfg() -> ZImageTransformerConfig {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn denoise_loop_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let transformer = ZImageTransformer::from_weights(&w, "w", small_cfg()).unwrap();
@@ -55,4 +56,7 @@ fn denoise_loop_matches_fork() {
             .item::<bool>(),
         "denoise loop diverged from the fork"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED denoise_loop::denoise_loop_matches_fork");
 }

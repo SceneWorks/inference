@@ -1346,5 +1346,7 @@ mod tests {
             .expect("read eager-reference cache");
         assert_eq!(optimized.retained_tokens() * 2, old_window);
         assert_eq!(eager.retained_tokens(), old_window);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED generate::tests::next_read_eviction_is_bit_identical_to_eager_max_window_retention");
     }
 }

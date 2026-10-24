@@ -180,14 +180,20 @@ fn slice_matches_reference(bits: i32) {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn q4_slice_forward_matches_reference() {
     slice_matches_reference(4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q4_slice_forward_matches_reference");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn q8_slice_forward_matches_reference() {
     slice_matches_reference(8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q8_slice_forward_matches_reference");
 }
 
 // --------------------------------------------------------------- real-tier residual (#[ignore]d)
@@ -207,6 +213,9 @@ fn tier_transformer_residual(bits: i32) {
         eprintln!(
             "skip: {} has no transformer/ (build the tiers first — MOCHI_Q{bits}_DIR)",
             dir.display()
+        );
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in tier_transformer_residual; see preceding skip diagnostic",
         );
         return;
     }
@@ -253,12 +262,16 @@ fn tier_transformer_residual(bits: i32) {
 #[ignore = "needs a built q4 tier dir (MOCHI_Q4_DIR) + tools/golden/mochi_dit_golden.safetensors"]
 fn q4_tier_transformer_residual() {
     tier_transformer_residual(4);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q4_tier_transformer_residual");
 }
 
 #[test]
 #[ignore = "needs a built q8 tier dir (MOCHI_Q8_DIR) + tools/golden/mochi_dit_golden.safetensors"]
 fn q8_tier_transformer_residual() {
     tier_transformer_residual(8);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED quant_parity::q8_tier_transformer_residual");
 }
 
 // -------------------------------------------------------------- full tier load (#[ignore]d, heavy)

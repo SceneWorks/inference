@@ -201,6 +201,9 @@ fn real_conditioning_and_forward_match_upstream() {
         max_abs <= max_tol * peak,
         "max |Δ| {max_abs} > {max_tol} × {peak}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_conditioning_and_forward_match_upstream");
 }
 
 /// The structural gate on the REAL 3B backbone: FP32 on the Candle CPU device (true f32), fed the
@@ -290,6 +293,9 @@ fn real_backbone_matches_upstream_in_fp32_on_cpu() {
     );
     assert!(mean <= 1e-3, "mean |Δ| {mean}");
     assert!(max_abs <= 0.25, "max |Δ| {max_abs}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_backbone_matches_upstream_in_fp32_on_cpu");
 }
 
 /// The production path end to end on the build's device: catalog load from the two task
@@ -387,6 +393,9 @@ fn provider_renders_a_real_image() {
     );
     assert!(mean > 5.0 && mean < 250.0, "degenerate image (mean {mean})");
     assert!(var.sqrt() > 5.0, "flat image (std {})", var.sqrt());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::provider_renders_a_real_image");
 }
 
 /// sc-25681: the production path with every non-default upstream control at once — a two-prompt
@@ -501,5 +510,10 @@ fn provider_renders_with_non_default_controls() {
     assert_ne!(
         images[0].pixels, images[1].pixels,
         "the two prompts rendered the same image"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::provider_renders_with_non_default_controls"
     );
 }

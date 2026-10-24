@@ -79,7 +79,15 @@ fn mae(a: &[u8], b: &[u8]) -> f32 {
 
 /// Minimal binary-PPM (P6) reader → an [`Image`] (RGB8), matching the edit smoke fixture format.
 fn read_ppm(path: &PathBuf) -> Image {
-    let bytes = std::fs::read(path).expect("read source PPM");
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs::read_ppm::std::fs::read@3856",
+Reference,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("read source PPM");
     assert_eq!(&bytes[0..2], b"P6", "expected a binary P6 PPM");
     let mut nums = Vec::with_capacity(3);
     let mut cur = String::new();
@@ -116,7 +124,15 @@ fn read_source(path: &PathBuf) -> Image {
     if !is_png {
         return read_ppm(path);
     }
-    let rgb = image::open(path).expect("decode PNG source").to_rgb8();
+    let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs::read_source::image::open@4989",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).expect("decode PNG source").to_rgb8();
     let (width, height) = rgb.dimensions();
     Image {
         width,
@@ -171,6 +187,8 @@ fn img2img_is_coherent_and_monotone_in_reference_fidelity() {
         std::env::var("KREA_IMG2IMG_SOURCE"),
     ) else {
         eprintln!("skipping: set KREA_TURBO_DIR + KREA_IMG2IMG_SOURCE");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs:174 (img2img_is_coherent_and_monotone_in_reference_fidelity): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let root = PathBuf::from(root);
@@ -249,6 +267,9 @@ fn img2img_is_coherent_and_monotone_in_reference_fidelity() {
         );
         prev_mae = m;
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_is_coherent_and_monotone_in_reference_fidelity");
 }
 
 /// The **Raw CFG** img2img AC on the real GPU (sc-10226, epic 8588) — the full-CFG twin of the Turbo test
@@ -274,6 +295,8 @@ fn raw_img2img_is_coherent_and_monotone_in_reference_fidelity() {
         std::env::var("KREA_IMG2IMG_SOURCE"),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR + KREA_IMG2IMG_SOURCE");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/img2img_real_weights.rs:277 (raw_img2img_is_coherent_and_monotone_in_reference_fidelity): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let root = PathBuf::from(root);
@@ -356,4 +379,7 @@ fn raw_img2img_is_coherent_and_monotone_in_reference_fidelity() {
         );
         prev_mae = m;
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::raw_img2img_is_coherent_and_monotone_in_reference_fidelity");
 }

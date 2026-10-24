@@ -67,6 +67,7 @@ pub fn case_request(case: &Value, config: &IrisConfig) -> GenerationRequest {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn every_control_matches_upstream_on_the_miniature() {
     {
         let base_config = tiny_config();
@@ -160,4 +161,7 @@ fn every_control_matches_upstream_on_the_miniature() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED controls_parity::every_control_matches_upstream_on_the_miniature");
 }

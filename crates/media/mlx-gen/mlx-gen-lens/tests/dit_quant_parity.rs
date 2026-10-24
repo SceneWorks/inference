@@ -119,4 +119,6 @@ fn lens_dit_quant_matches_dense() {
         "Q4 DiT cosine {q4_cos:.6} ≤ 0.80 — collapsed, not a coherent quantization"
     );
     eprintln!("ALL PASS");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_quant_parity::lens_dit_quant_matches_dense");
 }

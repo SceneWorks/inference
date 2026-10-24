@@ -18,6 +18,16 @@
 //! cargo test --locked -p candle-audio-whisper --test conformance -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_whisper::gen_core::{
@@ -178,6 +188,9 @@ fn whisper_transcribes_kokoro_roundtrip_within_cer() {
         out.language,
         out.generated_tokens.unwrap_or(0),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED whisper_transcribes_kokoro_roundtrip_within_cer");
 }
 
 /// Determinism: greedy (temperature 0) transcription of the same clip is byte-identical text.
@@ -202,4 +215,7 @@ fn whisper_greedy_transcription_is_deterministic() {
     let a = transcriber.transcribe(&req, &mut |_| {}).expect("first");
     let b = transcriber.transcribe(&req, &mut |_| {}).expect("second");
     assert_eq!(a.text, b.text, "greedy transcription must be deterministic");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED whisper_greedy_transcription_is_deterministic");
 }

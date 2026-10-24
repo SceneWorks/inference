@@ -350,7 +350,12 @@ impl CausalConv3d {
             h = reflect_pad_axis(&h, 4, self.spatial_padding, self.spatial_padding)?;
         }
         h = zero_pad_front_time(&h, self.temporal_padding)?;
-        conv3d_ncthw(&h, &self.weight, Some(&self.bias), self.stride)
+        __model_proof_output!(conv3d_ncthw(
+            &h,
+            &self.weight,
+            Some(&self.bias),
+            self.stride
+        ))
     }
 }
 
@@ -425,13 +430,14 @@ impl FrameIsolatedGroupNorm {
         let normed = centred
             .broadcast_div(&(var + self.eps)?.sqrt()?)?
             .reshape((b, t, c, h, w))?;
-        let affine = normed
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?.reshape((1, 1, c, 1, 1))?)?
-            .broadcast_add(&self.bias.to_dtype(DType::F32)?.reshape((1, 1, c, 1, 1))?)?;
-        Ok(affine
+        let affine = __model_proof_output!(__model_proof_output!(
+            normed.broadcast_mul(&self.weight.to_dtype(DType::F32)?.reshape((1, 1, c, 1, 1))?)
+        )?
+        .broadcast_add(&self.bias.to_dtype(DType::F32)?.reshape((1, 1, c, 1, 1))?))?;
+        __model_proof_output!(Ok(affine
             .permute((0, 2, 1, 3, 4))?
             .contiguous()?
-            .to_dtype(dtype)?)
+            .to_dtype(dtype)?))
     }
 }
 

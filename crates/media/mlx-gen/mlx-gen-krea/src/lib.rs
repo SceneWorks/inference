@@ -966,3 +966,6 @@ mod reexport_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

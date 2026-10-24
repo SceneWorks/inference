@@ -385,20 +385,23 @@ impl Gemma4VisionEmbedder {
             )));
         }
         let eps = self.cfg.norm_eps;
-        let x = layer_norm(patches, &self.patch_ln1_w, &self.patch_ln1_b, eps)?;
-        let x = linear(&x, &self.patch_dense_w, Some(&self.patch_dense_b))?;
-        let x = layer_norm(&x, &self.patch_ln2_w, &self.patch_ln2_b, eps)?;
+        let x = __model_proof_output!(layer_norm(
+            patches,
+            &self.patch_ln1_w,
+            &self.patch_ln1_b,
+            eps
+        ))?;
+        let x = __model_proof_output!(linear(&x, &self.patch_dense_w, Some(&self.patch_dense_b)))?;
+        let x = __model_proof_output!(layer_norm(&x, &self.patch_ln2_w, &self.patch_ln2_b, eps))?;
 
         let (row_idx, col_idx) = posemb_indices(gh, gw, self.cfg.posemb_size);
         let rows = Tensor::from_vec(row_idx, n, &self.device)?;
         let cols = Tensor::from_vec(col_idx, n, &self.device)?;
-        let pos = self
-            .pos_row
-            .index_select(&rows, 0)?
+        let pos = __model_proof_output!(self.pos_row.index_select(&rows, 0))?
             .add(&self.pos_col.index_select(&cols, 0)?)?;
         let x = x.add(&pos.to_dtype(self.dtype)?)?;
-        let x = layer_norm(&x, &self.pos_norm_w, &self.pos_norm_b, eps)?;
-        linear(&x, &self.proj_w, None)
+        let x = __model_proof_output!(layer_norm(&x, &self.pos_norm_w, &self.pos_norm_b, eps))?;
+        __model_proof_output!(linear(&x, &self.proj_w, None))
     }
 }
 
@@ -451,7 +454,7 @@ impl Gemma4AudioEmbedder {
                 self.cfg.samples_per_token
             )));
         }
-        linear(frames, &self.proj_w, None)
+        __model_proof_output!(linear(frames, &self.proj_w, None))
     }
 }
 
@@ -972,6 +975,7 @@ mod tests {
     /// the dense projection, both positional axes, and the output projection) without a real
     /// checkpoint, and proves the *spatial* claim the positional table exists for.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vision_embedder_forward_is_position_sensitive() {
         use std::collections::HashMap;
         let dev = Device::Cpu;
@@ -1069,11 +1073,15 @@ mod tests {
 
         // A grid whose product disagrees with the patch count is refused, not silently reshaped.
         assert!(tower.forward(&patches, (1, 3)).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::gemma4_mm::tests::vision_embedder_forward_is_position_sensitive");
     }
 
     /// The audio projector on synthetic weights: shape, finiteness, and that different frames map to
     /// different embeddings (a projector wired to a constant would pass a shape-only check).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn audio_embedder_projects_each_frame() {
         use std::collections::HashMap;
         let dev = Device::Cpu;
@@ -1121,6 +1129,9 @@ mod tests {
         // A frame width the projector was not built for is refused rather than broadcast.
         let wrong = Tensor::zeros((1, spt + 1), DType::F32, &dev).unwrap();
         assert!(proj.forward(&wrong).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED models::gemma4_mm::tests::audio_embedder_projects_each_frame");
     }
 
     /// A checkpoint whose `audio_config` frames at a width the projection does not accept must fail

@@ -1339,6 +1339,7 @@ mod tests {
     /// so the chunk-count probe is asserted alongside it. Both `qk_norm` variants are covered because
     /// the norm is applied before the head split and therefore before any chunk boundary.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn chunked_cross_attention_is_bit_exact_and_actually_chunks() {
         for qk_norm in [false, true] {
             let (attn, _cfg) = cross_attn(4, 16, qk_norm);
@@ -1381,6 +1382,10 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::chunked_cross_attention_is_bit_exact_and_actually_chunks");
     }
 
     /// **The masked path must narrow nothing.** SANA's caption mask is `[B, 1, 1, M]` — broadcast
@@ -1389,6 +1394,7 @@ mod tests {
     /// swamp the conditioning. The bit-exactness assertion above covers the first; this pins that the
     /// mask is load-bearing at all, so "bit-exact" is not being satisfied by two identical no-ops.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn the_caption_mask_changes_the_chunked_result() {
         let (attn, _cfg) = cross_attn(4, 16, false);
         let x = tokens(1, 64, 16, 0.1);
@@ -1407,6 +1413,10 @@ mod tests {
             unmasked.as_slice::<f32>(),
             "the caption padding mask must reach the chunked kernel"
         );
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::tests::the_caption_mask_changes_the_chunked_result");
     }
 
     /// **The sibling families' 64 Mi operating point is inert at every advertised SANA geometry.**
@@ -1492,6 +1502,7 @@ mod query_row_boundary_tests {
     /// the epic's standard one: the DOMAIN excludes the degenerate case, and that exclusion is
     /// checked over the whole advertised size range rather than at one convenient point.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one() {
         // The exactness boundary, on the smallest shape that exhibits it.
         let (attn, _) = super::tests::cross_attn(4, 16, false);
@@ -1563,6 +1574,10 @@ mod query_row_boundary_tests {
             "the narrowest published chunk width moved; re-measure the exactness boundary before \
              publishing the new budget"
         );
+
+        #[cfg(target_os = "macos")]
+        crate::test_metal_guard::record_model_inference_device();
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::query_row_boundary_tests::a_single_query_row_chunk_is_not_bit_exact_and_the_domain_cannot_reach_one");
     }
 }
 

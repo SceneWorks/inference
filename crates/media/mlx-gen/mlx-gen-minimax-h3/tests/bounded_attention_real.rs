@@ -496,4 +496,6 @@ fn the_in_forward_graph_cut_is_measured_on_both_chunk_axes() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED bounded_attention_real::the_in_forward_graph_cut_is_measured_on_both_chunk_axes");
 }

@@ -42,6 +42,15 @@
 //! elsewhere; its tokens are compared exactly everywhere. Comparisons between two paths of this
 //! tree (default growing vs static, and so on) are bit for bit on every platform.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -411,15 +420,25 @@ fn causal_reference(model: &CausalLm, prompt: &[i32]) -> Golden {
 const LLAMA_PROMPT: [i32; 8] = [3, 17, 5, 29, 3, 17, 5, 11];
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llama_reference_matches_its_pre_migration_golden() {
     let mut model = tiny_causal(false, 0x0001_1A4A);
     golden("llama", causal_before(&mut model, &LLAMA_PROMPT));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llama_reference_matches_its_pre_migration_golden");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn qwen3_dense_reference_matches_its_pre_migration_golden() {
     let mut model = tiny_causal(true, 0x03E3);
     golden("qwen3_dense", causal_before(&mut model, &LLAMA_PROMPT));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED qwen3_dense_reference_matches_its_pre_migration_golden"
+    );
 }
 
 // ---- Gemma 4 (the shared decoder fixture) -------------------------------------------------------
@@ -468,9 +487,13 @@ fn gemma4_prompt() -> Vec<i32> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_reference_matches_its_pre_migration_golden() {
     let mut model = gemma4();
     golden("gemma4", causal_before(&mut model, &gemma4_prompt()));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_reference_matches_its_pre_migration_golden");
 }
 
 /// The `gemma4_mm` splice, standing in for the vision/audio embedders: the prompt's embeddings
@@ -550,9 +573,15 @@ fn gemma4_mm_reference(model: &CausalLm, prompt: &[i32]) -> Golden {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_mm_reference_matches_its_pre_migration_golden() {
     let mut model = gemma4();
     golden("gemma4_mm", gemma4_mm_before(&mut model, &gemma4_prompt()));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_mm_reference_matches_its_pre_migration_golden"
+    );
 }
 
 // ---- LLaVA -------------------------------------------------------------------------------------
@@ -754,14 +783,19 @@ fn llava_reference(model: &LlavaModel) -> Golden {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llava_caption_matches_its_pre_migration_golden() {
     let mut model = tiny_llava();
     golden("llava", llava_before(&mut model));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llava_caption_matches_its_pre_migration_golden");
 }
 
 /// sc-24139: the caption decodes through the engine, and the generation carries the engine's
 /// measured record — the step seam, one prefill forward, every emitted token counted.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llava_caption_carries_the_engines_decode_record() {
     let model = tiny_llava();
     let features = model.image_features(&llava_image(), V_IMG, V_IMG).unwrap();
@@ -781,12 +815,16 @@ fn llava_caption_carries_the_engines_decode_record() {
     assert_eq!(out.record.prefill_forwards, 1);
     assert_eq!(out.record.generated_tokens, out.tokens.len() as u64);
     assert_eq!(out.record.report(false).path, "step_model");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llava_caption_carries_the_engines_decode_record");
 }
 
 /// sc-24139: the LLaVA provider reports that record on `TextLlmOutput::decode` — the path a
 /// product shows for this generation — instead of `None`. It is not wired to the CUDA-graph
 /// runner, so the report says the switch was off.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llava_provider_reports_its_decode_path() {
     use candle_llm::core_llm::{
         Content, ImageRef, LoadSpec, Message, Role, TextLlm, TextLlmRequest,
@@ -829,6 +867,9 @@ fn llava_provider_reports_its_decode_path() {
     assert!(!decode.cuda_graphs.enabled);
     assert_eq!(decode.cuda_graphs.path, "none");
     assert!(decode.target_forwards >= 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llava_provider_reports_its_decode_path");
 }
 
 // ---- StarCoder2 (the StarVector-8B decoder) -------------------------------------------------------
@@ -955,9 +996,15 @@ fn starcoder2_golden_walk(model: &StarCoder2) -> Golden {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn starcoder2_reference_matches_its_pre_migration_golden() {
     let mut model = tiny_starcoder2();
     golden("starcoder2", starcoder2_before(&mut model));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED starcoder2_reference_matches_its_pre_migration_golden"
+    );
 }
 
 // ---- StarVector-1B (GPTBigCode, multi-query) ------------------------------------------------------
@@ -1044,6 +1091,7 @@ fn tiny_starvector_1b() -> StarVectorDecoder {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn starvector_1b_decoder_matches_its_pre_migration_golden() {
     let decoder = tiny_starvector_1b();
     let (greedy, rows) = starvector_1b_loop(&decoder, &SamplingParams::default(), 0);
@@ -1056,6 +1104,11 @@ fn starvector_1b_decoder_matches_its_pre_migration_golden() {
             greedy_logits: rows,
             sampled_tokens: sampled,
         },
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED starvector_1b_decoder_matches_its_pre_migration_golden"
     );
 }
 
@@ -1300,6 +1353,7 @@ fn causal_after(name: &str, model: &mut CausalLm, g: &Golden, gqa: bool) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llama_decodes_to_its_golden_on_every_seam_path() {
     let mut model = tiny_causal(false, 0x0001_1A4A);
     let g = golden("llama", causal_before(&mut model, &LLAMA_PROMPT));
@@ -1321,26 +1375,40 @@ fn llama_decodes_to_its_golden_on_every_seam_path() {
         &step_rows(&model, &mut paged, &g),
         &g.greedy_logits,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED llama_decodes_to_its_golden_on_every_seam_path");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn qwen3_dense_decodes_to_its_golden_on_every_seam_path() {
     let mut model = tiny_causal(true, 0x03E3);
     let g = golden("qwen3_dense", causal_before(&mut model, &LLAMA_PROMPT));
     causal_after("qwen3_dense", &mut model, &g, true);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED qwen3_dense_decodes_to_its_golden_on_every_seam_path"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_decodes_to_its_golden_on_every_seam_path() {
     let mut model = gemma4();
     let g = golden("gemma4", causal_before(&mut model, &gemma4_prompt()));
     causal_after("gemma4", &mut model, &g, false);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_decodes_to_its_golden_on_every_seam_path");
 }
 
 /// The Gemma 4 soft-token splice through the seam: the spliced embeddings prefill the step cache
 /// (static and growing), the continuation decodes through the engine. The default growing
 /// backing is the static cache's arithmetic bit for bit; with `Expanded` selected it is the golden.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
     let mut model = gemma4();
     let prompt = gemma4_prompt();
@@ -1399,6 +1467,11 @@ fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
         &step_walk(&model, &mut cache, first, &g.greedy_tokens),
         &g.greedy_logits,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED gemma4_mm_splice_decodes_to_its_golden_through_the_seam"
+    );
 }
 
 /// LLaVA's caption now decodes through the seam (its own loop is gone): the provider path on the
@@ -1406,6 +1479,7 @@ fn gemma4_mm_splice_decodes_to_its_golden_through_the_seam() {
 /// formulation it gives the golden's tokens, and the static backing gives the same tokens with
 /// the default rows bit for bit.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn llava_caption_decodes_to_its_golden_through_the_seam() {
     let mut model = tiny_llava();
     let g = golden("llava", llava_before(&mut model));
@@ -1493,6 +1567,11 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
         out.finish_reason,
         candle_llm::decode::FinishReason::Cancelled
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED llava_caption_decodes_to_its_golden_through_the_seam"
+    );
 }
 
 /// StarCoder2 (StarVector-8B's decoder) through the seam: the conditioning prefix prefills the
@@ -1500,6 +1579,7 @@ fn llava_caption_decodes_to_its_golden_through_the_seam() {
 /// reference loop and growing backing are the static cache's arithmetic bit for bit; with
 /// `Expanded` selected the growing backing is the golden.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn starcoder2_decodes_to_its_golden_through_the_seam() {
     let mut model = tiny_starcoder2();
     let g = golden("starcoder2", starcoder2_before(&mut model));
@@ -1584,11 +1664,15 @@ fn starcoder2_decodes_to_its_golden_through_the_seam() {
             .live_bytes,
         model.static_kv_bytes(capacity)
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED starcoder2_decodes_to_its_golden_through_the_seam");
 }
 
 /// The StarVector-1B decoder through the seam, on both backings: its multi-query fold attends the
 /// one shared K/V head un-expanded either way, so both are the golden bit for bit.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn starvector_1b_decodes_to_its_golden_through_the_seam() {
     let decoder = tiny_starvector_1b();
     let (greedy, rows) = starvector_1b_loop(&decoder, &SamplingParams::default(), 0);
@@ -1644,6 +1728,11 @@ fn starvector_1b_decodes_to_its_golden_through_the_seam() {
         decoder.new_static_cache(SV1_GEOMETRY.max_positions + 1),
         Err(candle_llm::Error::KvCapacityExceeded { .. })
     ));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED starvector_1b_decodes_to_its_golden_through_the_seam"
+    );
 }
 
 /// A static request past `max_position_embeddings` is refused with the typed error before any
@@ -1697,6 +1786,7 @@ fn speculative_rs_holds_no_decode_loop() {
 /// A draft whose vocabulary is not the target's is refused before any inference (the check the
 /// retired draft-model loop made, now the engine's).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn engine_refuses_a_draft_with_another_vocabulary() {
     let target = tiny_causal(false, 0x0001_1A4A);
     let draft = tiny_causal(true, 0x03E3);
@@ -1755,6 +1845,9 @@ fn engine_refuses_a_draft_with_another_vocabulary() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("vocab mismatch"), "{err}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED engine_refuses_a_draft_with_another_vocabulary");
 }
 
 /// sc-24134 × sc-24138 × sc-24441: the families migrated onto the step seam declare whether
@@ -1923,6 +2016,7 @@ fn assert_device_positions_steps_match(what: &str, host_model: &CausalLm, dev_mo
 /// the llama family's fixtures — Llama, dense Qwen3 (per-head q/k norm) and Gemma 4 (sliding
 /// window of 3, per-layer-type RoPE with a proportional partial schedule, shared K/V projection).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn device_positions_steps_match_the_host_path() {
     for (what, host_model, mut dev_model) in [
         ("llama", tiny_causal(false, 7), tiny_causal(false, 7)),
@@ -1933,4 +2027,7 @@ fn device_positions_steps_match_the_host_path() {
         assert_eq!(dev_model.device_positions_support(), Ok(()), "{what}");
         assert_device_positions_steps_match(what, &host_model, &dev_model);
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED device_positions_steps_match_the_host_path");
 }

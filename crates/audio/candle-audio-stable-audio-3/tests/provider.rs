@@ -1,5 +1,15 @@
 //! Connected-provider real-weight gates for both registered Stable Audio 3 small variants.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::candle_audio;
@@ -1074,6 +1084,9 @@ fn sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         SFX_SWEEP_PROMPTS,
         10.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sfx_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 /// The calibration behind [`MUSIC_SIDE_RATIO_FLOOR`], and the measurement the per-window median
@@ -1098,6 +1111,9 @@ fn music_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         MUSIC_SWEEP_PROMPTS,
         50.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED music_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 /// Long-form medium renders, measured rather than asserted.
@@ -1155,6 +1171,9 @@ fn medium_long_form_renders_are_exact_and_timed() {
             eprintln!("medium long-form WAV: {}", path.display());
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED medium_long_form_renders_are_exact_and_timed");
 }
 
 /// The calibration behind [`MEDIUM_SIDE_RATIO_FLOOR`], over medium's own two-domain prompt space.
@@ -1167,24 +1186,36 @@ fn medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         MEDIUM_SWEEP_PROMPTS,
         10.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED medium_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 #[test]
 #[ignore = "real 10.4 GB weights; set SA3_MEDIUM_SNAPSHOT"]
 fn connected_medium_generation_is_stereo_finite_and_exact_length() {
     run_case(&CASES[2]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_medium_generation_is_stereo_finite_and_exact_length");
 }
 
 #[test]
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_SNAPSHOT"]
 fn connected_short_generation_is_stereo_finite_and_exact_length() {
     run_case(&CASES[0]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_short_generation_is_stereo_finite_and_exact_length");
 }
 
 #[test]
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_SNAPSHOT"]
 fn connected_sfx_generation_is_stereo_finite_and_exact_length() {
     run_case(&CASES[1]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_sfx_generation_is_stereo_finite_and_exact_length");
 }
 
 /// Drive one `-base` variant over its prompt space **at its own resolved defaults** and calibrate
@@ -1322,6 +1353,9 @@ fn music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         MUSIC_BASE_MEASURED_MINIMUM,
         50.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED music_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 /// The SFX-base sweep borrows the **post-trained** SFX prompt space on purpose.
@@ -1340,6 +1374,9 @@ fn sfx_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         SFX_BASE_MEASURED_MINIMUM,
         10.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sfx_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 /// `medium-base` ships no `demo_cond` at all, so it borrows the post-trained medium's two-domain
@@ -1355,22 +1392,34 @@ fn medium_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds() {
         MEDIUM_BASE_MEASURED_MINIMUM,
         10.0,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED medium_base_stereo_width_floor_is_calibrated_across_prompts_and_seeds");
 }
 
 #[test]
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_MUSIC_BASE_SNAPSHOT"]
 fn connected_music_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
     run_default_case(&CASES[3]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_music_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length");
 }
 
 #[test]
 #[ignore = "real 3.45 GB weights; set SA3_SMALL_SFX_BASE_SNAPSHOT"]
 fn connected_sfx_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
     run_default_case(&CASES[4]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_sfx_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length");
 }
 
 #[test]
 #[ignore = "real 10.4 GB weights; set SA3_MEDIUM_BASE_SNAPSHOT"]
 fn connected_medium_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length() {
     run_default_case(&CASES[5]);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED connected_medium_base_generation_at_its_own_defaults_is_stereo_finite_and_exact_length");
 }

@@ -2365,6 +2365,7 @@ mod tests {
     /// class (vector-only 96/256, full-kernel 64/80/128, unserved 8/32/72/512) × MHA / GQA 4 / GQA 8
     /// × prompts inside one vector tile, across tiles, and across many tiles.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
         use crate::primitives::attention::route_override::{
             assert_greedy_matches_pre_sc24442, GreedyComparison,
@@ -2443,6 +2444,8 @@ mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::llama::tests::greedy_tokens_match_pre_sc24442_sdpa_routing");
     }
 
     /// sc-24446 parity gate for the Gemma decoders' GeGLU in the activation dtype: Gemma 2 on a
@@ -2451,6 +2454,7 @@ mod tests {
     /// to the gate's logit budget and greedy-margin rule against its own `f32` path
     /// ([`crate::primitives::activation::parity`]).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn gemma_geglu_activation_dtype_parity() {
         use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
         use serde_json::json;
@@ -2522,6 +2526,8 @@ mod tests {
         let prompt: Vec<i32> = floats(&g["prompt"]).iter().map(|&x| x as i32).collect();
         let report = assert_geglu_parity("gemma4", &gemma4, &prompt, 16);
         eprintln!("gemma4 GeGLU parity: {report:?}");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED models::llama::tests::gemma_geglu_activation_dtype_parity");
     }
 
     #[test]

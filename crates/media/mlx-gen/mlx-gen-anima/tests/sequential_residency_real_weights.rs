@@ -68,7 +68,7 @@ fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, 
 }
 
 #[test]
-#[ignore = "needs a real circlestone-labs/Anima snapshot (ANIMA_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real circlestone-labs/Anima snapshot (ANIMA_SNAPSHOT or the HF cache)"]
 fn sequential_bounds_peak_and_is_byte_identical() {
     let req = probe_request();
     let (pixels_resident, peak_resident) = render_measured(OffloadPolicy::Resident, &req);
@@ -103,10 +103,13 @@ fn sequential_bounds_peak_and_is_byte_identical() {
         peak_sequential as f64 / GIB,
         peak_resident as f64 / GIB,
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_bounds_peak_and_is_byte_identical");
 }
 
 #[test]
-#[ignore = "needs a real circlestone-labs/Anima snapshot (ANIMA_SNAPSHOT or the HF cache)"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real circlestone-labs/Anima snapshot (ANIMA_SNAPSHOT or the HF cache)"]
 fn sequential_repeat_job_stays_bounded() {
     let req = probe_request();
     let (_p1, peak1) = render_measured(OffloadPolicy::Sequential, &req);
@@ -123,4 +126,7 @@ fn sequential_repeat_job_stays_bounded() {
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED sequential_residency_real_weights::sequential_repeat_job_stays_bounded");
 }

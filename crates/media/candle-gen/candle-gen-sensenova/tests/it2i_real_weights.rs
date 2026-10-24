@@ -241,4 +241,7 @@ fn registered_reference_it2i_consumes_image_and_true_cfg() {
     save(&secondary_it2i, "sensenova_it2i_secondary_reference.png");
     save(&true_cfg_one_it2i, "sensenova_it2i_true_cfg_1_0.png");
     save(&multi_it2i, "sensenova_it2i_multi_reference.png");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED it2i_real_weights::registered_reference_it2i_consumes_image_and_true_cfg");
 }

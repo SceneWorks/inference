@@ -47,6 +47,16 @@
 //! conformance), the geometry seam that decides sizing from the *requested* duration rather than the
 //! source's extent, and the typed rejections.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_stable_audio_3::candle_audio::candle_core::{DType, Device, Tensor};
@@ -903,6 +913,9 @@ fn real_reference_restyle_is_bounded_and_ordered_on_all_six_variants() {
             "{id}: aggregate source retention must rise with strength — high {high:.6} vs low {low:.6}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_reference_restyle_is_bounded_and_ordered_on_all_six_variants");
 }
 
 /// The frozen draw order: the sampler's initial noise is the request stream's **first** draw, and
@@ -995,5 +1008,10 @@ fn real_initial_sampler_noise_precedes_the_source_encode() {
         "no checkpoint's encode consumed a draw, so the ordering assertion above discriminated \
          nothing on any of them — the SAME-L encoder's eval-time noise is what makes this case a \
          gate rather than a tautology"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_initial_sampler_noise_precedes_the_source_encode"
     );
 }

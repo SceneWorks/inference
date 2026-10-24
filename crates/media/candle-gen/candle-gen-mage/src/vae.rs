@@ -120,8 +120,8 @@ impl Resnet {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.c1.forward(&self.n1.group(x)?.silu()?)?;
-        x + self.c2.forward(&self.n2.group(&h)?.silu()?)?
+        let h = __model_proof_output!(self.c1.forward(&self.n1.group(x)?.silu()?))?;
+        x + __model_proof_output!(self.c2.forward(&self.n2.group(&h)?.silu()?))?
     }
 }
 
@@ -201,7 +201,7 @@ impl LocalAttention {
             .reshape((1, c, hp, wp))?
             .narrow(2, 0, h)?
             .narrow(3, 0, w)?;
-        x + self.out.forward(&o)?
+        x + __model_proof_output!(self.out.forward(&o))?
     }
 }
 
@@ -231,12 +231,14 @@ impl CodDecoder {
         })
     }
     fn forward(&self, z: &Tensor, softmax: SoftmaxFn) -> Result<Tensor> {
-        let h = self.r0.forward(&self.input.forward(z)?)?;
+        let h = self
+            .r0
+            .forward(&__model_proof_output!(self.input.forward(z))?)?;
         let h = self.a0.forward(&h, softmax)?;
         let h = self.r1.forward(&h)?;
         let h = self.a1.forward(&h, softmax)?;
         let h = self.r2.forward(&h)?;
-        self.output.forward(&self.norm.group(&h)?.silu()?)
+        __model_proof_output!(self.output.forward(&self.norm.group(&h)?.silu()?))
     }
 }
 
@@ -263,18 +265,25 @@ impl DiCoCore {
         })
     }
     fn forward(&self, x: &Tensor, conditioning: &Tensor) -> Result<Tensor> {
-        let p = self.adaln.forward(&conditioning.silu()?)?;
+        let p = __model_proof_output!(self.adaln.forward(&conditioning.silu()?))?;
         let chunks = p.chunk(6, 1)?;
         let e = |i: usize| chunks[i].reshape((chunks[i].dim(0)?, 384, 1, 1));
         let h = layer_norm_channels(x, None, None)?;
         let h = h.broadcast_mul(&(e(1)? + 1.)?)?.broadcast_add(&e(0)?)?;
-        let h = self.c2.forward(&self.c1.forward(&h)?)?.gelu_erf()?;
-        let ca = candle_nn::ops::sigmoid(&self.ca.forward(&h.mean_keepdim((2, 3))?)?)?;
-        let h = self.c3.forward(&h.broadcast_mul(&ca)?)?;
+        let h = __model_proof_output!(self
+            .c2
+            .forward(&__model_proof_output!(self.c1.forward(&h))?))?
+        .gelu_erf()?;
+        let ca = candle_nn::ops::sigmoid(&__model_proof_output!(self
+            .ca
+            .forward(&h.mean_keepdim((2, 3))?))?)?;
+        let h = __model_proof_output!(self.c3.forward(&h.broadcast_mul(&ca)?))?;
         let x = (x + h.broadcast_mul(&e(2)?)?)?;
         let h = layer_norm_channels(&x, None, None)?;
         let h = h.broadcast_mul(&(e(4)? + 1.)?)?.broadcast_add(&e(3)?)?;
-        let h = self.c5.forward(&self.c4.forward(&h)?.gelu_erf()?)?;
+        let h = __model_proof_output!(self
+            .c5
+            .forward(&__model_proof_output!(self.c4.forward(&h))?.gelu_erf()?))?;
         x + h.broadcast_mul(&e(5)?)?
     }
 }
@@ -300,7 +309,9 @@ impl VaeTime {
             1,
         )?
         .to_dtype(dtype)?;
-        self.l2.forward(&self.l1.forward(&input)?.silu()?)
+        __model_proof_output!(self
+            .l2
+            .forward(&__model_proof_output!(self.l1.forward(&input))?.silu()?))
     }
 }
 
@@ -326,13 +337,19 @@ impl EncoderCore {
     }
 
     fn spatial(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.c2.forward(&self.c1.forward(x)?)?.gelu_erf()?;
-        let ca = candle_nn::ops::sigmoid(&self.ca.forward(&h.mean_keepdim((2, 3))?)?)?;
-        self.c3.forward(&h.broadcast_mul(&ca)?)
+        let h =
+            __model_proof_output!(self.c2.forward(&__model_proof_output!(self.c1.forward(x))?))?
+                .gelu_erf()?;
+        let ca = candle_nn::ops::sigmoid(&__model_proof_output!(self
+            .ca
+            .forward(&h.mean_keepdim((2, 3))?))?)?;
+        __model_proof_output!(self.c3.forward(&h.broadcast_mul(&ca)?))
     }
 
     fn channel(&self, x: &Tensor) -> Result<Tensor> {
-        self.c5.forward(&self.c4.forward(x)?.gelu_erf()?)
+        __model_proof_output!(self
+            .c5
+            .forward(&__model_proof_output!(self.c4.forward(x))?.gelu_erf()?))
     }
 }
 
@@ -406,23 +423,25 @@ impl MageVaeEncoder {
                 image.dims()
             );
         }
-        let mut cond = self.patch_cond.forward(&image.to_dtype(self.dtype)?)?;
+        let mut cond =
+            __model_proof_output!(self.patch_cond.forward(&image.to_dtype(self.dtype)?))?;
         for block in &self.head {
             cond = block.forward(&cond)?;
         }
-        cond = self.proj_down.forward(&cond)?;
+        cond = __model_proof_output!(self.proj_down.forward(&cond))?;
         let z = Tensor::zeros(
             (b, LATENT_CHANNELS, h / 16, w / 16),
             self.dtype,
             image.device(),
         )?;
-        let z = self.z_proj.forward(&z)?;
-        let mut state = self.fuse_proj.forward(&Tensor::cat(&[cond, z], 1)?)?;
+        let z = __model_proof_output!(self.z_proj.forward(&z))?;
+        let mut state =
+            __model_proof_output!(self.fuse_proj.forward(&Tensor::cat(&[cond, z], 1)?))?;
         let time = self.time.zero(b, self.dtype, image.device())?;
         for block in &self.blocks {
             state = block.forward(&state, &time)?;
         }
-        let packed = self.proj_out.forward(&self.norm_out.layer(&state)?)?;
+        let packed = __model_proof_output!(self.proj_out.forward(&self.norm_out.layer(&state)?))?;
         let parts = packed.chunk(2, 1)?;
         let logvar = parts[1].clamp(-20f64, 10f64)?;
         Ok(EncoderMoments {
@@ -449,7 +468,7 @@ impl MlpBlock {
         })
     }
     fn forward(&self, x: &Tensor, cond: &Tensor) -> Result<Tensor> {
-        let p = self.adaln.forward(&cond.silu()?)?;
+        let p = __model_proof_output!(self.adaln.forward(&cond.silu()?))?;
         let d = p.dim(D::Minus1)? / 3;
         let shift = p.narrow(D::Minus1, 0, d)?;
         let scale = p.narrow(D::Minus1, d, d)?;
@@ -460,10 +479,10 @@ impl MlpBlock {
             .permute((0, 2, 3, 1))?
             .squeeze(2)?;
         let h = h.broadcast_mul(&(scale + 1.)?)?.broadcast_add(&shift)?;
-        x + self
+        x + __model_proof_output!(self
             .l2
-            .forward(&self.l1.forward(&h)?.silu()?)?
-            .broadcast_mul(&gate)?
+            .forward(&__model_proof_output!(self.l1.forward(&h))?.silu()?))?
+        .broadcast_mul(&gate)?
     }
 }
 
@@ -598,19 +617,17 @@ impl MageVae {
             self.dtype,
             latent.device(),
         )?;
-        let patched = self.patch_embed.forward(&zeros)?;
-        let mut state = self
+        let patched = __model_proof_output!(self.patch_embed.forward(&zeros))?;
+        let mut state = __model_proof_output!(self
             .patch_fuse
-            .forward(&Tensor::cat(&[patched, cond.clone()], 1)?)?;
+            .forward(&Tensor::cat(&[patched, cond.clone()], 1)?))?;
         let t = self.time.zero(b, self.dtype, latent.device())?;
         for block in &self.blocks {
             state = block.forward(&state, &t)?;
         }
         let state_flat = state.permute((0, 2, 3, 1))?.reshape((b * h * w, 384))?;
         // y_embedder_x is feature-major: [hidden_x, position].
-        let y = self
-            .y_pixels
-            .forward(&cond)?
+        let y = __model_proof_output!(self.y_pixels.forward(&cond))?
             .reshape((b, 32, 256, h, w))?
             .permute((0, 3, 4, 2, 1))?
             .reshape((b * h * w, 256, 32))?;
@@ -619,13 +636,14 @@ impl MageVae {
         // CUDA matmul requires the concatenated feature tensor to be contiguous. `y` is a
         // permuted view and `dct` is broadcast, so Candle can otherwise preserve a strided layout.
         let pixel_features = Tensor::cat(&[rgb, y, dct], 2)?.contiguous()?;
-        let mut pixels = self.x_embed.forward(&pixel_features)?;
-        pixels = self.input_proj.forward(&pixels)?;
+        let mut pixels = __model_proof_output!(self.x_embed.forward(&pixel_features))?;
+        pixels = __model_proof_output!(self.input_proj.forward(&pixels))?;
         // cond_embed is position-major.
-        let pos_cond = self
-            .cond_embed
-            .forward(&state_flat)?
-            .reshape((b * h * w, 256, 32))?;
+        let pos_cond = __model_proof_output!(self.cond_embed.forward(&state_flat))?.reshape((
+            b * h * w,
+            256,
+            32,
+        ))?;
         for mlp in &self.mlps {
             pixels = mlp.forward(&pixels, &pos_cond)?;
         }
@@ -640,8 +658,7 @@ impl MageVae {
             .broadcast_div(&denom)?
             .broadcast_mul(&self.final_norm.to_dtype(DType::F32)?)?
             .to_dtype(self.dtype)?;
-        self.final_linear
-            .forward(&pixels)?
+        __model_proof_output!(self.final_linear.forward(&pixels))?
             .reshape((b, h, w, 16, 16, 3))?
             .permute((0, 5, 1, 3, 2, 4))?
             .reshape((b, 3, h * 16, w * 16))
@@ -691,6 +708,7 @@ mod tests {
     /// direction agrees). Mutation: set `DIFFERENTIABLE_SOFTMAX = fused_softmax` (no backward) ⇒
     /// the probability path drops out of the gradient ⇒ the directional derivatives disagree ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn differentiable_attention_matches_fused_and_has_the_true_gradient() {
         let attn = tiny_attention(32);
         let x = rand(&[1, 32, 3, 5], 7);
@@ -735,6 +753,9 @@ mod tests {
             (analytic - numeric).abs() <= 2e-2 * numeric.abs().max(1e-3),
             "analytic {analytic} vs numeric {numeric}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::differentiable_attention_matches_fused_and_has_the_true_gradient");
     }
 
     #[test]

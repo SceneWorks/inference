@@ -261,7 +261,20 @@ impl Pipeline {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
-            .map(|pc| pc.group_size as usize)
+            .map(|pc| {
+                candle_gen::gen_core::__model_input_choose!(
+                    pc.group_size as usize,
+                    {
+                        let group_size = pc.group_size as usize;
+                        candle_gen::gen_core::model_input_proof::record_reader_paths(
+                            "candle-gen-chroma::pipeline::Pipeline::transformer_group_size/configuration",
+                            candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+                            &[dit_dir.join("config.json")],
+                        );
+                        group_size
+                    }
+                )
+            })
             .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
     }
 

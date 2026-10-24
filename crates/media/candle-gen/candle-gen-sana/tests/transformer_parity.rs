@@ -90,6 +90,7 @@ fn split_golden(golden: &Weights) -> (Weights, Tensor, Tensor, Tensor, Tensor) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn trunk_matches_diffusers_tiny() {
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -116,9 +117,13 @@ fn trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — that IS a port bug, not rounding"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::trunk_matches_diffusers_tiny");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sprint_trunk_matches_diffusers_tiny() {
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -144,6 +149,11 @@ fn sprint_trunk_matches_diffusers_tiny() {
         "mean_rel {mean} too high — a port bug in the guidance-embed / qk-norm path"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::sprint_trunk_matches_diffusers_tiny"
+    );
 }
 
 /// Full-model parity vs the real `Sana_1600M_1024px_diffusers` transformer + a `--real` golden
@@ -194,4 +204,7 @@ fn trunk_matches_diffusers_real() {
         mean < 3.4e-2,
         "mean_rel {mean} above the per-step drift band"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer_parity::trunk_matches_diffusers_real");
 }

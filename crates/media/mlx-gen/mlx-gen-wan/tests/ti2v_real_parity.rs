@@ -65,6 +65,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_5B_MODEL_DIR to the converted 5B snapshot dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_ti2v_5b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -72,6 +73,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_5B_FIXTURE (run tools/dump_ti2v_real_fixtures.py first)");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_ti2v_5b_real_weight_e2e_matches_reference; see preceding skip diagnostic");
             return;
         }
     };
@@ -290,4 +292,6 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         ti2v_mr < 3e-1,
         "ti2v video diverged: {ti2v_mr:.3e} (sc-12896 envelope)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ti2v_real_parity::wan_ti2v_5b_real_weight_e2e_matches_reference");
 }

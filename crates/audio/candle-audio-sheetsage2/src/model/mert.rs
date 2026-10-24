@@ -44,9 +44,9 @@ impl Linear {
             dims[dims.len() - 1],
         );
         let flat = x.contiguous()?.reshape((rows, features))?;
-        let mut out = flat.matmul(&self.weight_t)?;
+        let mut out = __model_proof_output!(flat.matmul(&self.weight_t))?;
         if let Some(b) = &self.bias {
-            out = out.broadcast_add(b)?;
+            out = __model_proof_output!(out.broadcast_add(b))?;
         }
         let mut shape = dims;
         let last = shape.len() - 1;
@@ -87,12 +87,12 @@ impl LayerNorm {
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        Ok(candle_nn::ops::layer_norm(
+        __model_proof_output!(Ok(candle_nn::ops::layer_norm(
             &x.contiguous()?,
             &self.weight,
             &self.bias,
             self.eps,
-        )?)
+        )?))
     }
 
     fn bytes(&self) -> usize {
@@ -144,7 +144,7 @@ impl DepthwiseConv {
         let padded = x.pad_with_zeros(1, pad, pad)?;
         let mut acc: Option<Tensor> = None;
         for (j, tap) in self.taps.iter().enumerate() {
-            let term = padded.narrow(1, j, t)?.broadcast_mul(tap)?;
+            let term = __model_proof_output!(padded.narrow(1, j, t)?.broadcast_mul(tap))?;
             acc = Some(match acc {
                 None => term,
                 Some(a) => (a + term)?,
@@ -181,8 +181,11 @@ impl Grn {
             .to_dtype(DType::F32)?;
         let mean = magnitude.mean_keepdim(D::Minus1)?;
         let normalized = magnitude.broadcast_div(&(mean + 1e-6)?)?;
-        let scaled = x.broadcast_mul(&normalized)?.broadcast_mul(&self.weight)?;
-        Ok(((scaled.broadcast_add(&self.bias))? + x)?)
+        let scaled =
+            __model_proof_output!(x.broadcast_mul(&normalized)?.broadcast_mul(&self.weight))?;
+        __model_proof_output!(Ok(((__model_proof_output!(
+            scaled.broadcast_add(&self.bias)
+        ))? + x)?))
     }
 }
 
@@ -242,10 +245,10 @@ impl Resampler {
                 )))
             }
         };
-        let out = pairs
+        let out = __model_proof_output!(__model_proof_output!(pairs
             .reshape((b * frames, 2 * c))?
-            .matmul(&self.weight)?
-            .broadcast_add(&self.bias)?;
+            .matmul(&self.weight))?
+        .broadcast_add(&self.bias))?;
         Ok(out.reshape((b, frames, self.weight.dim(1)?))?)
     }
 }

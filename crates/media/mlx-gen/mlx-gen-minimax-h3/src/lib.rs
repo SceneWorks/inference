@@ -360,3 +360,6 @@ pub mod veda;
 
 #[cfg(test)]
 mod veda_fixture;
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

@@ -92,7 +92,8 @@ fn peak_rel_slices(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-#[ignore = "needs h94/IP-Adapter weights + the ip_adapter_spike golden"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs h94/IP-Adapter weights + the ip_adapter_spike golden"]
 fn ip_adapter_image_path_matches_torch() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let pixel_nchw = g.require("pixel_values").unwrap(); // [1, 3, 224, 224]
@@ -168,14 +169,22 @@ fn ip_adapter_image_path_matches_torch() {
     diagnose("ViT-H penultimate       ", &vit, vit_golden);
 
     // 2a. Resampler from the GOLDEN penultimate (isolates the Resampler).
-    let tok_iso = resampler
-        .forward(&vit_golden.as_dtype(Dtype::Float32).unwrap())
+    let tok_iso = (
+        crate::common::record_model_inference_device(),
+        resampler.forward(&vit_golden.as_dtype(Dtype::Float32).unwrap()),
+    )
+        .1
         .unwrap();
     let tok_iso_rel = peak_rel(&tok_iso, tok_golden);
     println!("[ip-adapter spike] Resampler tokens (golden in) peak_rel = {tok_iso_rel:.3e}");
 
     // 2b. Resampler from the Rust encoder's own penultimate (full image -> tokens chain).
-    let tok_e2e = resampler.forward(&vit).unwrap();
+    let tok_e2e = (
+        crate::common::record_model_inference_device(),
+        resampler.forward(&vit),
+    )
+        .1
+        .unwrap();
     let tok_e2e_rel = peak_rel(&tok_e2e, tok_golden);
     println!("[ip-adapter spike] Resampler tokens (e2e) peak_rel = {tok_e2e_rel:.3e}");
 
@@ -197,4 +206,6 @@ fn ip_adapter_image_path_matches_torch() {
         vit_rel < 1e-1,
         "ViT-H penultimate diverged beyond the cross-backend floor: {vit_rel:.3e}"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ip_adapter_real_weights::ip_adapter_image_path_matches_torch");
 }

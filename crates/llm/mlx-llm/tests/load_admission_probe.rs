@@ -118,4 +118,6 @@ fn load_admission_probe() {
             "decode_tokens_per_sec": decode_tokens_per_sec,
         })
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED load_admission_probe::load_admission_probe");
 }

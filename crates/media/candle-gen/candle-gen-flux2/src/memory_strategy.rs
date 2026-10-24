@@ -862,7 +862,13 @@ fn packed_quant(spec: &LoadSpec) -> gen_core::Result<Option<Quant>> {
         return Ok(None);
     };
     let config = root.join("transformer/config.json");
-    let packed = match std::fs::read_to_string(&config) {
+    let packed = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&config),
+"crates/media/candle-gen/candle-gen-flux2/src/memory_strategy.rs::packed_quant::std::fs::read_to_string@40791",
+ArtifactInput,
+&config,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(text) => {
             let value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
                 gen_core::Error::Unsupported(format!(

@@ -70,3 +70,6 @@ pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use tracker::{MemoryFeatures, Sam3Tracker, TrackerFrameOutput, TrackerMask};
 pub use video::{Sam3VideoModel, VideoFrameOutput};
 pub use vision::Sam3VisionEncoder;
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

@@ -658,6 +658,7 @@ mod tests {
     /// to the pre-engine loop — greedy and seeded temperature / nucleus draws through the
     /// heap-order host `sample` — with both an eos end and a budget end among the cases.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn caption_engine_decode_matches_the_pre_engine_loop() {
         let te = tiny_caption_tower();
         let ids = Array::from_slice(&[3i32, 17, 42, 8, 60, 11], &[1, 6]);
@@ -702,5 +703,7 @@ mod tests {
             te.generate_from_embeds(&embeds, 5, sampling, &cancel),
             Err(Error::Canceled)
         ));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::caption_engine_decode_matches_the_pre_engine_loop");
     }
 }

@@ -421,6 +421,7 @@ fn with_references(images: Vec<Image>) -> GenerationRequest {
 /// over the base shifted schedule or 40 steps; the loop re-extracting instead of decoding from
 /// the cache.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_cache() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -519,6 +520,9 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
             "{name}: not the render over the base shifted schedule"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_cache");
 }
 
 /// Reference ORDER reaches the Turbo render: each order renders its own assembly, and the two
@@ -527,6 +531,7 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
 /// *Mutation that reds this:* canonicalising the reference list (any order-insensitive feed) —
 /// both orders then render the same picture.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_reference_order_changes_the_render() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -553,6 +558,9 @@ fn turbo_reference_order_changes_the_render() {
     }
     assert_moved("[a, b] vs [b, a]", &rendered[0].1, &rendered[1].1);
     assert_ne!(rendered[0].0, rendered[1].0);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_reference_order_changes_the_render");
 }
 
 fn refusal(generator: &dyn Generator, req: &GenerationRequest) -> String {
@@ -613,6 +621,7 @@ fn turbo_refuses_the_eleventh_reference_exactly_as_base_does() {
 /// *Mutation that reds this:* the Turbo generator answering an `Rgba` request from the RGB decode
 /// (a fabricated `A = 255`, or `Images`).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_emits_the_decoded_alpha_on_an_rgba_request() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -654,6 +663,9 @@ fn turbo_emits_the_decoded_alpha_on_an_rgba_request() {
         .max()
         .unwrap();
     assert!(worst <= 1, "RGB vs composited RGBA differ by {worst} LSB");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_emits_the_decoded_alpha_on_an_rgba_request");
 }
 
 /// An RGBA reference is accepted on the Turbo id and its **alpha** conditions the render: the
@@ -662,6 +674,7 @@ fn turbo_emits_the_decoded_alpha_on_an_rgba_request() {
 ///
 /// *Mutation that reds this:* flattening a `ReferenceRgba` to opaque before it is encoded.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -711,6 +724,9 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
         none.rgba().pixels,
         "the layer-conditioned render is not the text-to-image one"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render");
 }
 
 // ── (c) true CFG ────────────────────────────────────────────────────────────────────────────────
@@ -723,6 +739,7 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
 /// *Mutation that reds this:* the Turbo generator never engaging the negative branch (the guided
 /// request renders the unguided assembly).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_true_cfg_runs_the_negative_branch_with_its_own_cache() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -808,6 +825,9 @@ fn turbo_true_cfg_runs_the_negative_branch_with_its_own_cache() {
             "{name}: a scale with no negative prompt"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_true_cfg_runs_the_negative_branch_with_its_own_cache");
 }
 
 // ── (d) adapters ────────────────────────────────────────────────────────────────────────────────
@@ -817,6 +837,7 @@ fn turbo_true_cfg_runs_the_negative_branch_with_its_own_cache() {
 ///
 /// *Mutation that reds this:* the Turbo load skipping the adapter install.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_lora_and_a_lokr_apply_to_the_turbo_transformer() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -865,6 +886,9 @@ fn a_lora_and_a_lokr_apply_to_the_turbo_transformer() {
         plain_pixels,
         "strength 0 is the unadapted render"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::a_lora_and_a_lokr_apply_to_the_turbo_transformer");
 }
 
 /// The adapter is in effect on the **cached** path. In a two-reference Turbo render seven of the
@@ -879,6 +903,7 @@ fn a_lora_and_a_lokr_apply_to_the_turbo_transformer() {
 /// *Mutation that reds this:* the cached attention projecting through the un-adapted base
 /// Linears (cache on then departs from cache off by the adapter's whole effect).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_adapters_are_in_effect_on_the_cached_path() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -938,6 +963,9 @@ fn turbo_adapters_are_in_effect_on_the_cached_path() {
     );
     assert_extract_then_cached(&on_the_generators_device.report, PromptBranch::Positive, 8);
     assert_eq!(pixels, on_the_generators_device.rgb());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_adapters_are_in_effect_on_the_cached_path");
 }
 
 // ── (e) the curated menu's refusals ─────────────────────────────────────────────────────────────
@@ -965,6 +993,7 @@ fn turbo_refuses_an_off_menu_sampler_or_scheduler_exactly_as_base_does() {
 /// Non-square and non-preset on-grid sizes render on the Turbo id at the size asked for, an
 /// off-grid or out-of-range size is the base id's refusal, and `count` returns that many images.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn turbo_renders_the_size_envelope_and_the_requested_count() {
     let fixture = turbo_snapshot();
     let root = fixture.path();
@@ -1032,6 +1061,9 @@ fn turbo_renders_the_size_envelope_and_the_requested_count() {
         ..request()
     };
     assert_refused_as_on_base(generator.as_ref(), base.as_ref(), &over, "count");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED request_surface::turbo_renders_the_size_envelope_and_the_requested_count");
 }
 
 // ── (g) the descriptor ──────────────────────────────────────────────────────────────────────────

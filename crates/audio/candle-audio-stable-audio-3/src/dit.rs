@@ -50,7 +50,9 @@ fn expo_fourier_features(values: &Tensor, dim: usize) -> Result<Tensor> {
 }
 
 fn sequential_two(first: &Linear, second: &Linear, input: &Tensor) -> Result<Tensor> {
-    second.forward(&candle_nn::ops::silu(&first.forward(input)?)?)
+    __model_proof_output!(second.forward(&candle_nn::ops::silu(&__model_proof_output!(
+        first.forward(input)
+    )?)?))
 }
 
 fn assemble_raw_context(
@@ -86,9 +88,7 @@ impl Conv1x1 {
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let weight = self.weight.squeeze(2)?.transpose(0, 1)?;
-        input
-            .transpose(1, 2)?
-            .broadcast_matmul(&weight)?
+        __model_proof_output!(input.transpose(1, 2)?.broadcast_matmul(&weight))?
             .transpose(1, 2)?
             .contiguous()
     }
@@ -139,7 +139,7 @@ impl NumberConditioner {
     }
 
     pub fn forward(&self, seconds: &Tensor) -> Result<Tensor> {
-        self.projection.forward(&self.features(seconds)?)
+        __model_proof_output!(self.projection.forward(&self.features(seconds)?))
     }
 }
 
@@ -429,7 +429,8 @@ impl StableAudio3Dit {
             .number
             .features(inputs.seconds_total)?
             .to_dtype(self.dtype)?;
-        let number_embedding = self.number.projection.forward(&number_features)?;
+        let number_embedding =
+            __model_proof_output!(self.number.projection.forward(&number_features))?;
         let raw_context =
             assemble_raw_context(&prompt, &number_embedding, zero_cross_context_from_batch)?;
         let context = sequential_two(&self.to_cond_first, &self.to_cond_second, &raw_context)?;
@@ -451,9 +452,9 @@ impl StableAudio3Dit {
             sequential_two(&self.global_first, &self.global_second, &combined_global)?;
 
         let preprocessed = (&latents + self.preprocess.forward(&latents)?)?;
-        let projected_input = self
+        let projected_input = __model_proof_output!(self
             .project_in
-            .forward(&preprocessed.transpose(1, 2)?.contiguous()?)?;
+            .forward(&preprocessed.transpose(1, 2)?.contiguous()?))?;
         let (mut hidden, extended_mask) =
             self.memory.prepend(&projected_input, inputs.padding_mask)?;
         let rotary = self.rotary.frequencies(hidden.dim(1)?)?;
@@ -503,7 +504,7 @@ impl StableAudio3Dit {
             }
         }
         let trimmed = self.memory.trim(&hidden)?;
-        let projected_output = self.project_out.forward(&trimmed)?;
+        let projected_output = __model_proof_output!(self.project_out.forward(&trimmed))?;
         let projected_bct = projected_output.transpose(1, 2)?.contiguous()?;
         let output = (&projected_bct + self.postprocess.forward(&projected_bct)?)?;
         if let Some(trace) = trace {

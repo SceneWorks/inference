@@ -19,10 +19,14 @@ use crate::common::{
 };
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn generate_matches_upstream_from_injected_noise() {
     cpu_process(
         "e2e_parity::generate_matches_upstream_from_injected_noise",
-        run,
+        || {
+            run();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_parity::generate_matches_upstream_from_injected_noise");
+        },
     );
 }
 

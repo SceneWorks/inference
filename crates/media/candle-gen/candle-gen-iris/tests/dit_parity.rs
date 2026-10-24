@@ -24,6 +24,7 @@ fn masks(flat: Vec<i32>, rows: usize) -> Vec<Vec<i32>> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn backbone_and_pixel_head_match_upstream_in_fp32() {
     let config = IrisConfig::from_dir(&tiny_backbone()).unwrap();
     let dit = load_backbone(&tiny_backbone(), &config, DType::F32, &cpu()).unwrap();
@@ -45,9 +46,13 @@ fn backbone_and_pixel_head_match_upstream_in_fp32() {
         .unwrap();
     assert_eq!(out.dtype(), DType::F32);
     assert_close("velocity", &out, golden.require("out"), 1e-4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::backbone_and_pixel_head_match_upstream_in_fp32");
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn bf16_compute_stays_within_bf16_distance_of_fp32() {
     let config = IrisConfig::from_dir(&tiny_backbone()).unwrap();
     let device = device();
@@ -64,6 +69,9 @@ fn bf16_compute_stays_within_bf16_distance_of_fp32() {
     eprintln!("bf16 velocity device: {:?}", out.device().location());
     assert_eq!(out.dtype(), DType::F32);
     assert_close("velocity (bf16 compute)", &out, golden.require("out"), 5e-2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::bf16_compute_stays_within_bf16_distance_of_fp32");
 }
 
 #[test]

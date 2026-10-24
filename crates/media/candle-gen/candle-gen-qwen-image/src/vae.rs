@@ -84,7 +84,7 @@ impl ChanNorm {
         // x: [B,C,H,W]. L2 over channel axis (1), keepdim.
         let l2 = (x.sqr()?.sum_keepdim(1)? + NORM_EPS)?.sqrt()?;
         let normed = x.broadcast_div(&l2)?;
-        (normed * self.sqrt_c)?.broadcast_mul(&self.gamma)
+        __model_proof_output!((normed * self.sqrt_c)?.broadcast_mul(&self.gamma))
     }
 }
 
@@ -732,6 +732,9 @@ mod tests {
             pixels.len()
         );
         report.assert_trustworthy(1.0);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::real_weight_sub_512_overlap_probe");
     }
 
     #[test]

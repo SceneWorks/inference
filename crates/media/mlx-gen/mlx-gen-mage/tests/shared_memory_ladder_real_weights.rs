@@ -563,4 +563,6 @@ fn serial_shared_ladder_and_terminal_recovery() {
         rung4_warm.after_clear.active,
         rung4_warm.after_clear.cache,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED shared_memory_ladder_real_weights::serial_shared_ladder_and_terminal_recovery");
 }

@@ -61,7 +61,7 @@ pub fn conv2d_row_plan(x_dims: [usize; 4], conv: &Conv2d, budget: usize) -> Resu
 pub fn conv2d_budgeted(x: &Tensor, conv: &Conv2d, budget: usize) -> Result<Tensor> {
     let dims = x.dims4()?;
     let Some(rows) = conv2d_row_plan([dims.0, dims.1, dims.2, dims.3], conv, budget)? else {
-        return conv.forward(x);
+        return __model_proof_output!(conv.forward(x));
     };
     let cfg = conv.config();
     let (p, s, d) = (cfg.padding, cfg.stride, cfg.dilation);
@@ -191,6 +191,7 @@ mod tests {
     /// explicitly-padded 3×3/p0/s2 downsampler, 1×1 shortcuts and quant convs) plus a dilated
     /// case: a one-row chunking and a ragged multi-row chunking both match the single pass.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_conv_matches_single_pass_across_the_vae_shapes() {
         let (b, c_in, c_out, h, w) = (2usize, 3usize, 4usize, 11usize, 7usize);
         let x = fill((b, c_in, h, w), 0);
@@ -218,7 +219,10 @@ mod tests {
                 None
             );
             // Exactly the un-guarded op below the budget.
-            assert_eq!(max_abs_diff(&single, &conv.forward(&x).unwrap()), 0.0);
+            assert_eq!(
+                max_abs_diff(&single, &__model_proof_output!(conv.forward(&x)).unwrap()),
+                0.0
+            );
 
             let h_out = out_len(h, k, padding, stride, dilation);
             let w_out = out_len(w, k, padding, stride, dilation);
@@ -239,6 +243,9 @@ mod tests {
                 );
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED conv::tests::chunked_conv_matches_single_pass_across_the_vae_shapes");
     }
 
     /// The widest full-resolution 3×3 conv of every candle image VAE at the 2048² render cap —

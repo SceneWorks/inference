@@ -230,6 +230,7 @@ fn reference_preprocessing_matches_upstream() {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn conditioning_matches_upstream_for_one_two_and_ten_references() {
     let w = fixture("qwen21_edit.safetensors");
@@ -254,8 +255,11 @@ fn conditioning_matches_upstream_for_one_two_and_ten_references() {
             TEXT_TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_parity::conditioning_matches_upstream_for_one_two_and_ten_references");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn reference_latents_match_upstream_in_order() {
     let w = fixture("qwen21_edit.safetensors");
@@ -274,6 +278,10 @@ fn reference_latents_match_upstream_in_order() {
             );
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_parity::reference_latents_match_upstream_in_order"
+    );
 }
 
 /// Run the whole conditioned denoise for one case from upstream's own initial noise.
@@ -358,6 +366,7 @@ fn run_case_feeding(snap: &Snapshot, w: &Weights, c: &Case, feed: ReferenceFeed)
     out
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn conditioned_denoise_matches_upstream_end_to_end() {
     let w = fixture("qwen21_edit.safetensors");
@@ -380,8 +389,11 @@ fn conditioned_denoise_matches_upstream_end_to_end() {
             LATENT_TOL,
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_parity::conditioned_denoise_matches_upstream_end_to_end");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn swapping_two_references_changes_the_output() {
     let w = fixture("qwen21_edit.safetensors");
@@ -469,6 +481,10 @@ fn swapping_two_references_changes_the_output() {
     assert_eq!(host_f32(&a[0]), host_f32(&b[1]));
     assert_eq!(host_f32(&a[1]), host_f32(&b[0]));
     assert_ne!(host_f32(&a[0]), host_f32(&a[1]));
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED edit_parity::swapping_two_references_changes_the_output"
+    );
 }
 
 #[test]
@@ -568,6 +584,7 @@ fn a_mask_conditioning_is_refused_with_the_upstream_workaround() {
     );
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_text_to_image_path_is_unchanged_by_the_reference_route() {
     // With no references the conditioned entry point must be the plain 1-D-RoPE text path: the
@@ -603,4 +620,6 @@ fn the_text_to_image_path_is_unchanged_by_the_reference_route() {
         a.iter().zip(&b).all(|(x, y)| x == y),
         "the reference route changed the text-to-image conditioning"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED edit_parity::the_text_to_image_path_is_unchanged_by_the_reference_route");
 }

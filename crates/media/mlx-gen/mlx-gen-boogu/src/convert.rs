@@ -401,7 +401,13 @@ fn write_quantized_config(
 ) -> Result<()> {
     let src_cfg = src_dir.join("config.json");
     let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
+        serde_json::from_str(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&src_cfg),
+"crates/media/mlx-gen/mlx-gen-boogu/src/convert.rs::write_quantized_config::std::fs::read_to_string@16466",
+ArtifactInput,
+&src_cfg,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)?)
             .map_err(|e| Error::Msg(format!("boogu: parse {}: {e}", src_cfg.display())))?
     } else {
         serde_json::json!({})
@@ -638,6 +644,10 @@ mod tests {
         assert!(
             c > 0.9999,
             "on-disk Q4 must match load-time Q4 (cosine {c})"
+        );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED convert::tests::on_disk_quant_matches_load_time_quant"
         );
     }
 }

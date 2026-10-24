@@ -44,6 +44,7 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn control_forward_matches_fork() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let base = ZImageTransformer::from_weights(&w, "w", small_cfg()).unwrap();
@@ -96,5 +97,10 @@ fn control_forward_matches_fork() {
     println!(
         "✓ control transformer matches fork: ctrl shape {:?}; on-vs-off max|Δ| {delta:.4}",
         y_ctrl.shape()
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED z_control_transformer::control_forward_matches_fork"
     );
 }

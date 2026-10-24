@@ -363,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn production_load_upsamples_each_track_through_its_own_decoder_instead_of_refusing() {
         let snap = tiny_snapshot();
         let vocoder = load(&assets(snap.path())).expect("production vocoder loads staged weights");
@@ -382,6 +383,9 @@ mod tests {
         assert_eq!(up.decoder(Track::Vocals).config().num_layers, 2);
         assert_eq!(up.decoder(Track::Instrumental).config().num_layers, 3);
         assert_eq!(up.decoder(Track::Vocals).config().n_fft, N_FFT);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocoder::tests::production_load_upsamples_each_track_through_its_own_decoder_instead_of_refusing");
     }
 
     #[test]
@@ -414,6 +418,7 @@ mod tests {
     /// clamp, so every numeric step of the decoder is checked in ordinary CI. Measured max relative
     /// difference: 1.1e-6 (CPU/f32), bound 1e-5.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn load_decoder_matches_the_upstream_reference_at_yue_geometry() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/vocos_tiny_yue_reference.safetensors");
@@ -447,6 +452,9 @@ mod tests {
             rel <= 1e-5,
             "chunked vocos diverges from the reference: {rel:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocoder::tests::load_decoder_matches_the_upstream_reference_at_yue_geometry");
     }
 
     /// max |got − want| / max |want|.
@@ -479,6 +487,7 @@ mod tests {
     /// 0 on CPU/f32 (the Vocos noise floor vs torch is 2e-5). Mutation: a context narrower than
     /// the backbone + ISTFT span must fail the same bound.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_upsample_equals_the_whole_song_upsample_and_needs_its_context() {
         let snap = tiny_snapshot();
         let up = VocosUpsampler::load(snap.path(), &Device::Cpu)
@@ -512,6 +521,9 @@ mod tests {
                 assert!(m > 2e-5, "{track:?} context {context} passed ({m:.3e})");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vocoder::tests::chunked_upsample_equals_the_whole_song_upsample_and_needs_its_context");
     }
 
     #[test]

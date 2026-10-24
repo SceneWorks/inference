@@ -580,6 +580,8 @@ fn the_duration_cost_curve_at_the_gating_canvas() {
         exponent > 0.8,
         "the cost grew as S^{exponent:.2}, sub-linearly — that is not a real forward"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED duration_sweep_real::the_duration_cost_curve_at_the_gating_canvas");
 }
 
 /// **Cost is linear in steps** — the premise that makes a reduced-step sweep an honest measurement
@@ -719,6 +721,8 @@ fn the_cost_is_linear_in_steps_so_a_reduced_sweep_is_honest() {
         "peak grew {ratio:.2}x from 2 to {steps} steps — it is schedule-bound after all, and the \
          reduced-step sweep under-reports the peak column"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED duration_sweep_real::the_cost_is_linear_in_steps_so_a_reduced_sweep_is_honest");
 }
 
 /// **The default canvas** (sc-17152): the same lattice floor at 1344x768, the area the released
@@ -808,6 +812,8 @@ fn the_default_canvas_is_bounded_by_area_not_by_duration() {
         "peak {} B is too small for a real 33 B forward",
         p.peak_bytes
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED duration_sweep_real::the_default_canvas_is_bounded_by_area_not_by_duration");
 }
 
 /// **The 4 s row of the story's table is structurally unrenderable**, not slow and not missing.

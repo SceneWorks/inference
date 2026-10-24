@@ -40,6 +40,15 @@
 //! (`sdxl_conformance` / `realvisxl_conformance` on the CUDA lane). See `pipeline` for the layout
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod control_provider;
 mod memory_strategy;
 mod pipeline;

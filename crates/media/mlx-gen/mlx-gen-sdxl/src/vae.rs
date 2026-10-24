@@ -1842,14 +1842,23 @@ pub(crate) mod tests {
     /// This test crosses the public autoencoder seam. The synthetic input is deliberately
     /// position-dependent so replacing global GroupNorm statistics with per-crop statistics makes
     /// the assertion fail even though both paths retain the same shape.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn tiled_autoencoder_decode_tracks_dense_with_global_group_norm() {
         let (weights, cfg) = fixture();
         let vae = Autoencoder::from_weights(&weights, &cfg).unwrap();
         let latent = latent();
-        let dense = vae.decode(&latent).unwrap();
-        let tiled = vae
-            .decode_tiled(&latent, &TilingConfig::spatial_only(8, 0), None)
+        let dense = (
+            crate::test_device::record_model_inference_device(),
+            vae.decode(&latent),
+        )
+            .1
+            .unwrap();
+        let tiled = (
+            crate::test_device::record_model_inference_device(),
+            vae.decode_tiled(&latent, &TilingConfig::spatial_only(8, 0), None),
+        )
+            .1
             .unwrap();
         dense.eval().unwrap();
         tiled.eval().unwrap();
@@ -1865,11 +1874,14 @@ pub(crate) mod tests {
             max_delta < 3e-3,
             "layer-wise tiled SDXL VAE diverged from dense decode: max|delta|={max_delta:.3e}"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::tiled_autoencoder_decode_tracks_dense_with_global_group_norm");
     }
 
     /// Evaluated reference keeps the untiled arithmetic, byte for byte, while cutting the lazy
     /// graph's lifetime. This compares both output and allocator high-water on a decorrelated
     /// tiny VAE: replacing `decode_evaluated` with the lazy decode must fail the peak comparison.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn evaluated_untiled_decode_preserves_pixels_and_reduces_peak() {
         let _cpu = crate::test_device::cpu_only();
@@ -1881,9 +1893,19 @@ pub(crate) mod tests {
             mlx_rs::memory::clear_cache();
             mlx_rs::memory::reset_peak_memory();
             let out = if evaluated {
-                vae.decode_evaluated(&z).unwrap()
+                (
+                    crate::test_device::record_model_inference_device(),
+                    vae.decode_evaluated(&z),
+                )
+                    .1
+                    .unwrap()
             } else {
-                vae.decode(&z).unwrap()
+                (
+                    crate::test_device::record_model_inference_device(),
+                    vae.decode(&z),
+                )
+                    .1
+                    .unwrap()
             };
             out.eval().unwrap();
             let peak = mlx_rs::memory::get_peak_memory();
@@ -1902,6 +1924,8 @@ pub(crate) mod tests {
             evaluated_peak < lazy_peak,
             "evaluation must release transients: evaluated {evaluated_peak}, lazy {lazy_peak}"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::evaluated_untiled_decode_preserves_pixels_and_reduces_peak");
     }
 
     /// The declared tolerance for a **half-precision** decode against the f32 untiled decode of
@@ -1963,6 +1987,7 @@ pub(crate) mod tests {
     /// sc-26268 AC: the **fp16 VAE decode** matches the f32 untiled decode of the same weights
     /// within [`FP16_RELATIVE_TOLERANCE`], runs at f16 (no silent promotion back to f32), and hands
     /// its output back at f32.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn fp16_decode_matches_the_f32_untiled_decode_within_the_declared_tolerance() {
         let _cpu = crate::test_device::cpu_only();
@@ -1974,9 +1999,19 @@ pub(crate) mod tests {
 
         // The production latent arrives at the U-Net's f16.
         let latent = latent().as_dtype(Dtype::Float16).unwrap();
-        let dense = reference.decode(&latent).unwrap();
+        let dense = (
+            crate::test_device::record_model_inference_device(),
+            reference.decode(&latent),
+        )
+            .1
+            .unwrap();
         assert_eq!(dense.dtype(), Dtype::Float32);
-        let decoded = half.decode(&latent).unwrap();
+        let decoded = (
+            crate::test_device::record_model_inference_device(),
+            half.decode(&latent),
+        )
+            .1
+            .unwrap();
         assert_eq!(decoded.dtype(), Dtype::Float32, "callers receive f32");
         let delta = relative_max_delta(&dense, &decoded);
         assert!(
@@ -1990,13 +2025,28 @@ pub(crate) mod tests {
 
         // The img2img encode follows the same contract.
         let image = values(&[1, 16, 18, 3], 3.0, 0.8);
-        let encoded = half.encode_mean(&image).unwrap();
+        let encoded = (
+            crate::test_device::record_model_inference_device(),
+            half.encode_mean(&image),
+        )
+            .1
+            .unwrap();
         assert_eq!(encoded.dtype(), Dtype::Float32);
-        let delta = relative_max_delta(&reference.encode_mean(&image).unwrap(), &encoded);
+        let delta = relative_max_delta(
+            &(
+                crate::test_device::record_model_inference_device(),
+                reference.encode_mean(&image),
+            )
+                .1
+                .unwrap(),
+            &encoded,
+        );
         assert!(
             delta <= FP16_RELATIVE_TOLERANCE,
             "fp16 encode drifted {delta:.3e}"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::fp16_decode_matches_the_f32_untiled_decode_within_the_declared_tolerance");
     }
 
     /// sc-26268 AC: the **fixed tiled decode** (layer-wise halo tiling + full-image GroupNorm)
@@ -2004,6 +2054,7 @@ pub(crate) mod tests {
     /// [`FP16_RELATIVE_TOLERANCE`] on the fp16 VAE — at every edge, including ragged splits. The
     /// pre-SC-19753 per-crop normalization moved this position-dependent fixture by orders of
     /// magnitude more (see `tiled_autoencoder_decode_tracks_dense_with_global_group_norm`).
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn tiled_decode_matches_the_f32_untiled_decode_across_edges() {
         let _cpu = crate::test_device::cpu_only();
@@ -2011,16 +2062,31 @@ pub(crate) mod tests {
         let reference = f32_reference(&weights, &cfg);
         let half = fp16_vae(&weights, &cfg);
         let latent = latent().as_dtype(Dtype::Float16).unwrap();
-        let dense = reference.decode(&latent).unwrap();
+        let dense = (
+            crate::test_device::record_model_inference_device(),
+            reference.decode(&latent),
+        )
+            .1
+            .unwrap();
         for edge in SYNTHETIC_EDGES {
             let tiling = TilingConfig::spatial_only(edge, 0);
-            let tiled = reference.decode_tiled(&latent, &tiling, None).unwrap();
+            let tiled = (
+                crate::test_device::record_model_inference_device(),
+                reference.decode_tiled(&latent, &tiling, None),
+            )
+                .1
+                .unwrap();
             let delta = relative_max_delta(&dense, &tiled);
             assert!(
                 delta <= F32_TILED_RELATIVE_TOLERANCE,
                 "f32 tiled decode at edge {edge} drifted {delta:.3e} of peak"
             );
-            let tiled_half = half.decode_tiled(&latent, &tiling, None).unwrap();
+            let tiled_half = (
+                crate::test_device::record_model_inference_device(),
+                half.decode_tiled(&latent, &tiling, None),
+            )
+                .1
+                .unwrap();
             assert_eq!(tiled_half.dtype(), Dtype::Float32);
             let delta = relative_max_delta(&dense, &tiled_half);
             assert!(
@@ -2028,10 +2094,13 @@ pub(crate) mod tests {
                 "fp16 tiled decode at edge {edge} drifted {delta:.3e} of peak"
             );
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::tiled_decode_matches_the_f32_untiled_decode_across_edges");
     }
 
     /// The tracer must distinguish finite corruption, NaN and infinity before RGB conversion
     /// clips or casts them away. Explicit trace state avoids process-environment mutation in tests.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn decode_trace_counts_nonfinite_values_and_restores_scope() {
         let _cpu = crate::test_device::cpu_only();
@@ -2056,8 +2125,20 @@ pub(crate) mod tests {
         let half = fp16_vae(&weights, &cfg);
         let z = latent().as_dtype(Dtype::Float16).unwrap();
         let decode = || {
-            half.decoder
-                .tail_tiled(&half.decoder.head(&z, 0).unwrap(), 8, None)
+            (
+                crate::test_device::record_model_inference_device(),
+                half.decoder.tail_tiled(
+                    &(
+                        crate::test_device::record_model_inference_device(),
+                        half.decoder.head(&z, 0),
+                    )
+                        .1
+                        .unwrap(),
+                    8,
+                    None,
+                ),
+            )
+                .1
                 .unwrap()
         };
         let plain = f32_values(&decode());
@@ -2067,6 +2148,8 @@ pub(crate) mod tests {
             plain, traced,
             "stage observation must not change the output"
         );
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::decode_trace_counts_nonfinite_values_and_restores_scope");
     }
 
     /// Real failing kernel geometry with synthetic weights: the upsample feeds a 256²×256 half
@@ -2138,6 +2221,7 @@ pub(crate) mod tests {
     /// Scaled analogue of the failing real-weight cell: 4×4+ragged core grids at half precision,
     /// after other decode sizes have populated/released allocator buffers. Tiny synthetic weights,
     /// CPU only; retains a tight decoded-float comparison, not a clipped RGB-only comparison.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn fp16_tiled_ragged_grids_remain_finite_after_cache_reuse() {
         let _cpu = crate::test_device::cpu_only();
@@ -2145,10 +2229,20 @@ pub(crate) mod tests {
         let half = fp16_vae(&weights, &cfg);
         for edge in [16, 32, 64, 32] {
             let z = values(&[1, edge, edge, 4], 1.7, 0.2);
-            let reference = f32_values(&half.decode_evaluated(&z).unwrap());
+            let reference = f32_values(
+                &(
+                    crate::test_device::record_model_inference_device(),
+                    half.decode_evaluated(&z),
+                )
+                    .1
+                    .unwrap(),
+            );
             for tile in [56, 48, 40, 32, 24, 16] {
-                let decoded = half
-                    .decode_tiled(&z, &TilingConfig::spatial_only(tile, 0), None)
+                let decoded = (
+                    crate::test_device::record_model_inference_device(),
+                    half.decode_tiled(&z, &TilingConfig::spatial_only(tile, 0), None),
+                )
+                    .1
                     .unwrap();
                 let got = f32_values(&decoded);
                 assert!(
@@ -2168,6 +2262,8 @@ pub(crate) mod tests {
                 mlx_rs::memory::clear_cache();
             }
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::fp16_tiled_ragged_grids_remain_finite_after_cache_reuse");
     }
 
     #[test]

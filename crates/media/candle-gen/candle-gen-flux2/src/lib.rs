@@ -37,6 +37,15 @@
 //! wired: the klein weight-variant edits (`flux2_klein_9b_kv_edit`) and LoRA/LoKr. `backend =
 //! "candle"`, `mac_only = false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod caption_upsample;
 pub mod config;
 pub mod control_provider;
@@ -778,7 +787,8 @@ impl Pipeline {
     /// the verified source pin and retained on the pipeline; read them back through
     /// [`Flux2Generator::checkpoint_weight_facts`].
     fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
-        dit_file.read_unchanged(|dit_path| {
+        candle_gen::gen_core::__model_input_choose!(
+            dit_file.read_unchanged(|dit_path| {
             let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
             // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
             // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
@@ -816,7 +826,58 @@ impl Pipeline {
             self.klein_facts.publish(facts);
             self.device.synchronize()?;
             Ok(dit)
-        })
+        }),
+            (dit_file.read_unchanged(|dit_path| {
+            let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
+            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
+            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
+            let residency = single_file::klein_import_residency(&self.device);
+            let plan =
+                candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
+            let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
+                dit_path,
+                plan,
+                &self.device,
+                residency.native_execution_capability(),
+            )?;
+            let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
+            let src = single_file::PlannedDitWeights::new(
+                reader,
+                self.device.clone(),
+                self.dtype,
+                ctx,
+                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
+            );
+            let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
+            // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
+            // off the shared reader after the full materialization, so a contradiction between the
+            // stored codec inventory and what this run executed fails the load instead of shipping
+            // a dishonest report. Bound to the verified pin (`with_verified_source` re-verifies it,
+            // so facts are never reported about bytes that changed under the load) and RETAINED on
+            // the pipeline — the krea precedent — so a consumer reads them through
+            // [`Flux2Generator::checkpoint_weight_facts`] rather than scraping stderr.
+            let facts = src
+                .checkpoint_weight_facts()?
+                .with_verified_source(dit_file)
+                .map_err(|error| CandleError::Msg(error.to_string()))?;
+            // Last-write-wins through the shared sink (sc-11045 fix round): a staged provider that
+            // re-materializes reports the read that just finished, never a stale first one.
+            self.klein_facts.publish(facts);
+            self.device.synchronize()?;
+            Ok(dit)
+        })).inspect(|_| {
+                candle_gen::gen_core::model_input_proof::record_inputs(
+                    "candle-gen-flux2::Pipeline::load_klein_planned_dit/verified-weights",
+                    candle_gen::gen_core::model_input_proof::InputRole::ModelWeights,
+                    &[candle_gen::gen_core::model_input_proof::InputIdentity::validated(
+                        dit_file.loader_path(),
+                        *dit_file.content_sha256(),
+                        "gen-core::ArtifactSeal",
+                        "same existing finalized pin across actual native DiT materialization and original pre/post path checks; not an opened-handle or ABA guarantee",
+                    )],
+                );
+            })
+        )
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -3165,9 +3226,16 @@ mod tests {
         let Ok(reference_path) = std::env::var("FLUX2_PARITY_REFERENCE") else {
             return (contract, gen_core::MemoryParityResult::NotRun);
         };
-        let reference = std::fs::read(&reference_path).unwrap_or_else(|error| {
-            panic!("read FLUX2_PARITY_REFERENCE={reference_path}: {error}")
-        });
+        let reference = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&reference_path),
+"crates/media/candle-gen/candle-gen-flux2/src/lib.rs::measured_output_parity::std::fs::read@142120",
+TensorInput,
+&reference_path,
+|__model_input_path| std::fs::read(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
+        .unwrap_or_else(|error| panic!("read FLUX2_PARITY_REFERENCE={reference_path}: {error}"));
         let (contract, result, metrics) = assess_output_parity(strategy, &reference, output);
         if let Some(metrics) = metrics {
             eprintln!(
@@ -3411,6 +3479,11 @@ mod tests {
     #[ignore]
     fn flux2_dev_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux2_dev", "FLUX2_DEV_DIR", load_dev, true, 8);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED tests::flux2_dev_probed_generate_for_offload_ab"
+        );
     }
 
     /// klein sibling of [`flux2_dev_probed_generate_for_offload_ab`] (epic 10765 Phase 1c follow-up,
@@ -3427,6 +3500,11 @@ mod tests {
     #[ignore]
     fn flux2_klein_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, true, 4);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED tests::flux2_klein_probed_generate_for_offload_ab"
+        );
     }
 
     /// Reference-bearing companion to [`flux2_klein_probed_generate_for_offload_ab`]. One process
@@ -3444,7 +3522,15 @@ mod tests {
 
         let root = env_path("FLUX2_KLEIN_DIR");
         let reference_path = env_path("FLUX2_KLEIN_REF");
-        let reference_rgb = image::open(&reference_path)
+        let reference_rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(&reference_path),
+"crates/media/candle-gen/candle-gen-flux2/src/lib.rs::flux2_klein_reference_routes_probed_memory_ladder::image::open@156009",
+Reference,
+&reference_path,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .unwrap_or_else(|error| panic!("decode {}: {error}", reference_path.display()))
             .to_rgb8();
         let reference = Image {
@@ -3603,5 +3689,8 @@ mod tests {
         if let Some(reason) = parity_failure {
             panic!("FLUX.2 reference memory-ladder output parity failed: {reason}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::flux2_klein_reference_routes_probed_memory_ladder");
     }
 }

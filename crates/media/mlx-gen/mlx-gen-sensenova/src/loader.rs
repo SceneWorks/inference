@@ -33,6 +33,21 @@ pub fn load_raw(root: impl AsRef<Path>) -> Result<Weights> {
     Weights::from_dir(root)
 }
 
+/// Load the explicit base shard set without importing the already-resolved distill companion.
+/// All original duplicate-key validation and caller architecture coverage remain mandatory.
+pub(crate) fn load_raw_with_companion(root: &Path, companion: Option<&Path>) -> Result<Weights> {
+    if companion.is_none() {
+        return load_raw(root);
+    }
+    let files = crate::memory_strategy::selected_base_files(root, companion).ok_or_else(|| {
+        Error::Msg(format!(
+            "sensenova: invalid base shard inventory after selecting distill companion in {}",
+            root.display()
+        ))
+    })?;
+    Weights::from_paths(&files, root)
+}
+
 /// The canonical set of tensor keys the NEO-Unify dense dual-transformer defines for `cfg`.
 ///
 /// Built purely from the config (layer count, `tie_word_embeddings`, `fm_head_layers`,

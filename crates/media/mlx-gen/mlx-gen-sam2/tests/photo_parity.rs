@@ -100,4 +100,6 @@ fn box_prompt_go_vs_spike_baseline() {
         "one or more images below the spike-band IoU target — see output"
     );
     println!("GO ✓ — MLX box-prompt segmentation matches the spike quality baseline.");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED photo_parity::box_prompt_go_vs_spike_baseline");
 }

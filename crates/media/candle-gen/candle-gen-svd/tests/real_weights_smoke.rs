@@ -1,5 +1,14 @@
 #![cfg(feature = "cuda")]
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -214,6 +223,9 @@ fn default_25_frame_profile_then_8_frame_control() {
     // reader at all, which is `-D dead-code` on the CUDA lane, so the FIELD is gone too. The
     // `[[SVD_32GB]]` line still reports `wallSeconds`: it prints `run_profile`'s local `wall`, and
     // never read the struct field.
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED default_25_frame_profile_then_8_frame_control");
 }
 
 /// Error and mid-denoise cancellation must both leave the same generator healthy for a later job.
@@ -246,6 +258,11 @@ fn failure_and_cancel_are_followed_by_a_healthy_second_job() {
     let recovery = request(256, 256, 2, 1, 2);
     let recovered = run_profile("post-failure-cancel", generator.as_ref(), &recovery);
     assert_eq!(recovered.frames.len(), 2);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED failure_and_cancel_are_followed_by_a_healthy_second_job"
+    );
 }
 
 struct EnvRestore {
@@ -312,4 +329,7 @@ fn forced_spatial_tiling_matches_monolithic_with_acceptable_psnr() {
         psnr >= 20.0,
         "forced spatial tiling must remain visually faithful to monolithic decode; PSNR {psnr:.2} dB"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED forced_spatial_tiling_matches_monolithic_with_acceptable_psnr");
 }

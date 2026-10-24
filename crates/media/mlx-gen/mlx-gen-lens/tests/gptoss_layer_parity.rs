@@ -85,4 +85,6 @@ fn gptoss_decoder_layer_matches_reference() {
         pr < 2e-2,
         "decoder-layer peak_rel {pr:.3e} exceeds tol 2e-2"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gptoss_layer_parity::gptoss_decoder_layer_matches_reference");
 }

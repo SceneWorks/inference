@@ -63,6 +63,7 @@ fn render(root: &std::path::Path, policy: OffloadPolicy) -> (Vec<Image>, usize) 
 fn sequential_drops_one_expert_and_preserves_output() {
     let Some(root) = std::env::var_os("WANVACE_FUN_DIR").map(PathBuf::from) else {
         eprintln!("skip: set WANVACE_FUN_DIR to an assembled VACE-Fun snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in sequential_drops_one_expert_and_preserves_output; see preceding skip diagnostic");
         return;
     };
     let resident = render(&root, OffloadPolicy::Resident);
@@ -82,4 +83,6 @@ fn sequential_drops_one_expert_and_preserves_output() {
         sequential.1 as f64 <= resident.1 as f64 * 0.85,
         "Sequential peak did not drop by at least 15%"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_fun_expert_swap_footprint::sequential_drops_one_expert_and_preserves_output");
 }

@@ -103,6 +103,7 @@ fn pixel_sincos_pos_matches() {
     assert!(d < 1e-4, "pixel sin/cos pos max|Δ| = {d}");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn backbone_forward_matches() {
     let w = fixture();
@@ -124,4 +125,6 @@ fn backbone_forward_matches() {
         "backbone output peak-rel = {rel} (max|Δ|={d}, scale={scale}) — structural divergence \
          (a correct port sits near the ~2.4e-3 mlx-Metal f32 matmul floor)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED backbone_parity::backbone_forward_matches");
 }

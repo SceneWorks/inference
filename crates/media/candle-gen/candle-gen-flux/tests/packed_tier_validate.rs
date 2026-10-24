@@ -60,6 +60,8 @@ fn assert_coherent(img: &Image, tag: &str) {
 fn render_tier(env: &str, tag: &str) {
     let Ok(dir) = std::env::var(env) else {
         eprintln!("SKIP {tag}: set {env} to the packed tier subdir");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-flux/tests/packed_tier_validate.rs:63 (render_tier): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&dir)));
@@ -109,6 +111,9 @@ fn render_tier(env: &str, tag: &str) {
 #[ignore = "needs FLUX_SCHNELL_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q4_renders_coherent() {
     render_tier("FLUX_SCHNELL_PACKED_Q4", "q4");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_renders_coherent");
 }
 
 /// The q8 packed tier renders a coherent image (double-quant Q8_0 path); only runs when the q8 tier is
@@ -117,4 +122,7 @@ fn packed_q4_renders_coherent() {
 #[ignore = "needs FLUX_SCHNELL_PACKED_Q8 (packed q8 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q8_renders_coherent() {
     render_tier("FLUX_SCHNELL_PACKED_Q8", "q8");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q8_renders_coherent");
 }

@@ -18,6 +18,15 @@
 //! 10 GB host RSS there (9.5 GB measured on the 4.2 GB stage-1 tier: the shard read plus the
 //! tensors built from it — its projections load straight from their stored GGML blocks).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_core::{DType, Device, Tensor};
 use candle_llm::LlamaProvider;
 use core_llm::LoadSpec;
@@ -95,6 +104,9 @@ fn yue_stage1_q4_prepared_snapshot_loads_and_yields_finite_logits() {
     let (_provider, row, vocab) = last_logits(&dir, STAGE1_PROMPT);
     assert_eq!(vocab, 83_968, "stage-1 vocab width");
     assert_finite_and_informative("stage-1 q4", &row);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED yue_stage1_q4_prepared_snapshot_loads_and_yields_finite_logits");
 }
 
 #[test]
@@ -104,4 +116,7 @@ fn yue_stage2_q4_prepared_snapshot_loads_and_yields_finite_logits() {
     let (_provider, row, vocab) = last_logits(&dir, STAGE2_PROMPT);
     assert_eq!(vocab, 83_840, "stage-2 vocab width");
     assert_finite_and_informative("stage-2 q4", &row);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED yue_stage2_q4_prepared_snapshot_loads_and_yields_finite_logits");
 }

@@ -18,6 +18,16 @@
 //! Loads real weights and decodes 60 s whole-song for the comparison (~10 GB CPU working set):
 //! run it under an external RSS watchdog.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_yue::candle_audio::candle_core::Device;
@@ -135,4 +145,7 @@ fn chunked_codec_and_vocos_equal_the_whole_song_decode_on_a_60s_grid() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chunked_codec_and_vocos_equal_the_whole_song_decode_on_a_60s_grid");
 }

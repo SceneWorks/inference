@@ -122,7 +122,14 @@ impl std::fmt::Debug for MmTokenizer {
 impl MmTokenizer {
     /// Load `tokenizer.json`.
     pub fn from_file(path: &Path) -> gen_core::Result<Self> {
-        let inner = tokenizers::Tokenizer::from_file(path).map_err(|e| {
+        let inner = candle_audio::gen_core::__model_input_reader!(
+tokenizers::Tokenizer::from_file(path),
+"crates/audio/candle-audio-yue/src/tokenizer.rs::from_file::tokenizers::Tokenizer::from_file@5969",
+Tokenizer,
+path,
+|__model_input_path| tokenizers::Tokenizer::from_file(__model_input_path)
+)
+        .map_err(|e| {
             gen_core::Error::Msg(format!(
                 "candle-audio-yue: cannot load the mm tokenizer {}: {e}",
                 path.display()

@@ -227,11 +227,11 @@ impl XcodecDecoder {
             let (_, dim) = self.codebooks[0].dims2()?;
             return Ok(Tensor::zeros((1, dim, 0), DType::F32, &Device::Cpu)?);
         }
-        Ok(rvq_dequantize(
+        Ok(__model_proof_output!(rvq_dequantize(
             &self.codebooks,
             &frames.codebooks,
             &self.device,
-        )?)
+        ))?)
     }
 
     /// Decode an embedding from [`Self::get_embed`] to the `[1, 1, 320·frames]` waveform
@@ -241,11 +241,11 @@ impl XcodecDecoder {
         embedding: &Tensor,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Option<Tensor>, AudioError> {
-        let x = self
+        let x = __model_proof_output!(self
             .fc_post2
-            .forward(&embedding.transpose(1, 2)?.contiguous()?)?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .forward(&embedding.transpose(1, 2)?.contiguous()?))?
+        .transpose(1, 2)?
+        .contiguous()?;
         Ok(self.decoder.decode(&x, cancel)?)
     }
 
@@ -462,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn production_load_decodes_a_staged_checkpoint_instead_of_refusing() {
         let snap = tiny_snapshot();
         let codec = load(&assets(snap.path())).expect("production codec loads staged weights");
@@ -469,9 +470,13 @@ mod tests {
         assert_eq!(out.wave.len(), 3 * SAMPLES_PER_FRAME);
         assert!(out.wave.iter().all(|s| s.is_finite()));
         assert_eq!(out.embedding.dims(), [1, E, 3]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::production_load_decodes_a_staged_checkpoint_instead_of_refusing");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn get_embed_is_the_sum_of_the_first_eight_codebook_rows() {
         let snap = tiny_snapshot();
         let dec = XcodecDecoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu).unwrap();
@@ -498,6 +503,9 @@ mod tests {
                 assert!((row[t] - want).abs() < 1e-6, "frame {t} dim {d}");
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::get_embed_is_the_sum_of_the_first_eight_codebook_rows");
     }
 
     #[test]
@@ -552,6 +560,7 @@ mod tests {
     /// [`XcodecDecoder::load`], so a wrong dilation, activation, padding or weight-norm fold is
     /// caught without real weights. Measured max relative error: embed 0, wave 5.4e-7.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn tiny_upstream_decoder_matches_the_torch_reference() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -586,6 +595,9 @@ mod tests {
             chunked_rel <= 1e-5,
             "chunked decode diverges: {chunked_rel:.3e}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::tiny_upstream_decoder_matches_the_torch_reference");
     }
 
     #[test]
@@ -601,6 +613,7 @@ mod tests {
     /// max relative difference 0 on CPU/f32 (the xcodec noise floor vs torch is 1e-5). Mutation: a
     /// context narrower than the receptive field must fail the same bound.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn chunked_decode_equals_the_whole_song_decode_and_needs_its_context() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -648,6 +661,9 @@ mod tests {
             println!("mutation context {context}: {m:.3e}");
             assert!(m > 1e-5, "context {context} passed ({m:.3e})");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED codec::tests::chunked_decode_equals_the_whole_song_decode_and_needs_its_context");
     }
 
     #[test]

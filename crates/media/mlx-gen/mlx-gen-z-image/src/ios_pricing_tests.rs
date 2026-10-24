@@ -1020,54 +1020,69 @@ fn assert_priced_exactly(mode: Mode, edge: u32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn text_pricing_equals_the_observed_quanta() {
     if !in_cpu_child("text_pricing_equals_the_observed_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::text_pricing_equals_the_observed_quanta");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
     assert_priced_exactly(Mode::Text, EDGE);
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::text_pricing_equals_the_observed_quanta");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn reference_pricing_equals_the_observed_quanta() {
     if !in_cpu_child("reference_pricing_equals_the_observed_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::reference_pricing_equals_the_observed_quanta");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
     assert_priced_exactly(Mode::Reference, EDGE);
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::reference_pricing_equals_the_observed_quanta");
 }
 
 /// The whole-image encode and the untiled decode (an image within both tiles).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn untiled_reference_pricing_equals_the_observed_quanta() {
     if !in_cpu_child("untiled_reference_pricing_equals_the_observed_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::untiled_reference_pricing_equals_the_observed_quanta");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
     assert_priced_exactly(Mode::Reference, SMALL_EDGE);
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::untiled_reference_pricing_equals_the_observed_quanta");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn control_pricing_equals_the_observed_quanta() {
     if !in_cpu_child("control_pricing_equals_the_observed_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::control_pricing_equals_the_observed_quanta");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
     assert_priced_exactly(Mode::Control, EDGE);
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::control_pricing_equals_the_observed_quanta");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn control_reference_pricing_equals_the_observed_quanta() {
     if !in_cpu_child("control_reference_pricing_equals_the_observed_quanta") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::control_reference_pricing_equals_the_observed_quanta");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
     assert_priced_exactly(Mode::ControlReference, EDGE);
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::control_reference_pricing_equals_the_observed_quanta");
 }
 
 /// Actual tiny native quantization + the production Control block guard, not a metadata-only
@@ -1437,8 +1452,10 @@ pub(crate) fn packed_transformer(snap: &Snapshot, root: &Path, bits: i32) {
 /// Parity: the deferred load's windowed forward equals the eager load's resident forward bit for
 /// bit, and a non-windowed forward on the deferred load is refused rather than run dense.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_deferred_control_load_packs_only_its_resident_blocks() {
     if !in_cpu_child("a_deferred_control_load_packs_only_its_resident_blocks") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::a_deferred_control_load_packs_only_its_resident_blocks");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
@@ -1537,6 +1554,7 @@ fn a_deferred_control_load_packs_only_its_resident_blocks() {
         .forward_budgeted(&x, 0.5, &cap, Some(&cc), 0.8, plan)
         .is_err());
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::a_deferred_control_load_packs_only_its_resident_blocks");
 }
 
 /// Actual native leaf construction/packing, with an independently retained raw dictionary. This
@@ -1635,8 +1653,10 @@ fn constructor_bias_ownership_matches_actual_native_packing() {
 /// The actual ordinary and streamed encoder loops execute/finish ALL configured layers, even
 /// though the returned hidden state is second-to-last. Only the first entry carries an alias pair.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn encoder_carry_matches_ordinary_and_streamed_run_finish_chronology() {
     if !in_cpu_child("encoder_carry_matches_ordinary_and_streamed_run_finish_chronology") {
+        eprintln!("\nMODEL_INFERENCE_PARENT_COMPLETED ios_pricing_tests::encoder_carry_matches_ordinary_and_streamed_run_finish_chronology");
         return;
     }
     let mut parent_completion: Option<CpuChildCompletion> = None;
@@ -1764,6 +1784,7 @@ fn encoder_carry_matches_ordinary_and_streamed_run_finish_chronology() {
         "ZIMAGE_ENCODER_CARRY_NATIVE_BODY_COMPLETED_V1 mechanisms=2 fixture_owners_dropped=1 cpu_sync=0"
     );
     let _ = parent_completion.replace(CpuChildCompletion);
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing_tests::encoder_carry_matches_ordinary_and_streamed_run_finish_chronology");
 }
 
 #[test]

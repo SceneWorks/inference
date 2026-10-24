@@ -10,6 +10,15 @@
 //!   cargo test --features cuda --test bonsai_multimodal -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::LlamaProvider;
 use core_llm::{
     Content, ImageRef, LoadSpec, Message, Role, Sampling, TextLlm, TextLlmRequest, ThinkingMode,
@@ -110,4 +119,7 @@ fn bonsai_images_multiimage_and_video_ground_in_document_order() {
     let red_at = answer.find("red").expect("video answer names starting red");
     let blue_at = answer.find("blue").expect("video answer names ending blue");
     assert!(red_at < blue_at, "temporal video order: {answer:?}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED bonsai_images_multiimage_and_video_ground_in_document_order");
 }

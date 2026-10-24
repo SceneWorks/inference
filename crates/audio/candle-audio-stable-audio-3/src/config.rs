@@ -94,8 +94,14 @@ pub struct StableAudioConfig {
 
 impl StableAudioConfig {
     pub fn from_path(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
+        let text = candle_audio::gen_core::__model_input_reader!(
+std::fs::read_to_string(path),
+"crates/audio/candle-audio-stable-audio-3/src/config.rs::from_path::std::fs::read_to_string@2252",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+)
+        .map_err(|e| AudioError::Msg(format!("read {}: {e}", path.display())))?;
         let parsed: Self = serde_json::from_str(&text)
             .map_err(|e| AudioError::Msg(format!("parse {}: {e}", path.display())))?;
         parsed.validate()?;

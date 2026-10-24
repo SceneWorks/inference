@@ -139,6 +139,9 @@ fn adaptable_paths_resolve_on_real_dit() {
 fn lora_apply_smoke() {
     let Ok(lora) = std::env::var("SCAIL2_LORA") else {
         eprintln!("SCAIL2_LORA unset — skipping the LoRA apply smoke");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in lora_apply_smoke; see preceding skip diagnostic",
+        );
         return;
     };
     let lora_path = PathBuf::from(&lora);
@@ -243,6 +246,8 @@ fn lora_apply_smoke() {
         "LoRA smoke: {} frames @ {w}x{h}, guide {guide}, {steps} steps, shift {shift}, byte range [{lo},{hi}]",
         frames.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lora::lora_apply_smoke");
 }
 
 /// Merge the **real** lightx2v diff-patch lightning LoRA (`SCAIL2_DIFF_PATCH_LORA`) into the real
@@ -341,6 +346,7 @@ fn diff_patch_applies_on_prequantized() {
         std::env::var("SCAIL2_Q4_SNAPSHOT_DIR"),
     ) else {
         eprintln!("SCAIL2_DIFF_PATCH_LORA / SCAIL2_Q4_SNAPSHOT_DIR unset — skipping");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in diff_patch_applies_on_prequantized; see preceding skip diagnostic");
         return;
     };
     let (lora_path, root) = (PathBuf::from(&lora), PathBuf::from(&q4_dir));
@@ -393,4 +399,6 @@ fn diff_patch_applies_on_prequantized() {
         "diff-patch applied on the pre-quantized snapshot: {} frame(s)",
         frames.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED lora::diff_patch_applies_on_prequantized");
 }

@@ -390,4 +390,6 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         "[A/B] outputs in {} (P6 PPM frames + dfr_ab_metrics.json); total forwards observed: {steps}",
         out_dir.display()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dfr_ab_fast_motion::dfr_ab_fast_motion_records_detail_retention");
 }

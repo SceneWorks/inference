@@ -113,9 +113,14 @@ fn frac_diff(a: &Image, b: &Image) -> f32 {
 fn default_euler_discrete_is_coherent() {
     let Some(img) = render(None, None) else {
         eprintln!("skipping: no Kolors snapshot (set KOLORS_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in default_euler_discrete_is_coherent; see preceding skip diagnostic");
         return;
     };
     assert_coherent(&img, "default");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::default_euler_discrete_is_coherent"
+    );
 }
 
 /// N2: a curated named sampler renders a coherent image that genuinely differs from the default.
@@ -124,6 +129,7 @@ fn default_euler_discrete_is_coherent() {
 fn curated_dpmpp_2m_is_coherent_and_distinct() {
     let (Some(default), Some(dpmpp)) = (render(None, None), render(Some("dpmpp_2m"), None)) else {
         eprintln!("skipping: no Kolors snapshot (set KOLORS_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in curated_dpmpp_2m_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     assert_coherent(&dpmpp, "dpmpp_2m");
@@ -136,6 +142,8 @@ fn curated_dpmpp_2m_is_coherent_and_distinct() {
         frac > 0.01,
         "dpmpp_2m must differ from the leading-Euler default (a real curated solver); differ {frac}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::curated_dpmpp_2m_is_coherent_and_distinct");
 }
 
 /// Scheduler axis: the curated `karras` σ schedule (with `euler`) renders a coherent image.
@@ -144,7 +152,10 @@ fn curated_dpmpp_2m_is_coherent_and_distinct() {
 fn curated_karras_scheduler_is_coherent() {
     let Some(karras) = render(Some("euler"), Some("karras")) else {
         eprintln!("skipping: no Kolors snapshot (set KOLORS_SNAPSHOT)");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in curated_karras_scheduler_is_coherent; see preceding skip diagnostic");
         return;
     };
     assert_coherent(&karras, "euler+karras");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::curated_karras_scheduler_is_coherent");
 }

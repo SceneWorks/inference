@@ -291,6 +291,8 @@ fn conditioning_matches_the_torch_golden() {
         &cond.segment(1).unwrap().as_dtype(Dtype::Float32).unwrap(),
         &f32_of(&g, "neg_txt"),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity_real_weights::conditioning_matches_the_torch_golden");
 }
 
 /// **Discrimination.** The parity gate above must reject the two mistakes this port exists to
@@ -400,6 +402,8 @@ fn discrimination_wrong_layer_and_wrong_drop_idx_both_fail() {
         &want_txt,
     );
     assert!(passes(ok_drop_abs, ok_drop_rel));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity_real_weights::discrimination_wrong_layer_and_wrong_drop_idx_both_fail");
 }
 
 /// **Discrimination, subtle edition — and an honest limit of the golden.**
@@ -478,10 +482,17 @@ fn subtly_wrong_hyperparameters_are_caught_by_the_gate_or_by_the_config_guard() 
 
     // …so the compensating control is the config guard, which rejects a checkpoint declaring the
     // sibling's epsilon before a single weight is read.
-    let published = std::fs::read_to_string(
-        snapshot()
-            .join(text_encoder::COMPONENT_DIR)
-            .join("config.json"),
+    let published = mlx_gen::gen_core::__model_input_choose!(
+        std::fs::read_to_string(
+            snapshot()
+                .join(text_encoder::COMPONENT_DIR)
+                .join("config.json"),
+        ),
+        mlx_gen::gen_core::model_input_proof::read_configuration_to_string(
+            snapshot()
+                .join(text_encoder::COMPONENT_DIR)
+                .join("config.json")
+        )
     )
     .expect("published text_encoder/config.json");
     text_encoder::verify_text_config(&published).expect("the published config must verify");
@@ -493,6 +504,8 @@ fn subtly_wrong_hyperparameters_are_caught_by_the_gate_or_by_the_config_guard() 
         "the config guard is the ONLY thing standing between this port and the sibling's \
          QK-norm epsilon, and it did not fire"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity_real_weights::subtly_wrong_hyperparameters_are_caught_by_the_gate_or_by_the_config_guard");
 }
 
 /// The **edit** template's token plumbing, up to (not including) the vision tower — the seam
@@ -530,4 +543,6 @@ fn edit_template_reproduces_the_reference_edit_input_ids() {
         ids.len() - PromptKind::Edit.drop_idx(),
         i32_vec(&g, "edit_txt_len")[0] as usize
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity_real_weights::edit_template_reproduces_the_reference_edit_input_ids");
 }

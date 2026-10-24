@@ -114,6 +114,8 @@ fn max_abs(t: &Tensor) -> f32 {
 fn conv_vae_round_trips_on_the_unconverted_2_5_component_file() {
     let Some(dir) = vae_dir() else {
         eprintln!("skip: set LTX25_VAE_DIR to a directory holding the LTX-2.5 VAE components");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-ltx/tests/ltx_2_5_vae_real_weights.rs:117 (conv_vae_round_trips_on_the_unconverted_2_5_component_file): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let device = device();
@@ -186,6 +188,9 @@ fn conv_vae_round_trips_on_the_unconverted_2_5_component_file() {
             "{w}x{h}x{frames}: round-trip PSNR {psnr:.2} dB is too low for a working VAE"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_vae_real_weights::conv_vae_round_trips_on_the_unconverted_2_5_component_file");
 }
 
 #[test]
@@ -193,6 +198,8 @@ fn conv_vae_round_trips_on_the_unconverted_2_5_component_file() {
 fn audio_vae_and_vocoder_produce_stereo_audio_off_the_unconverted_2_5_component_file() {
     let Some(dir) = vae_dir() else {
         eprintln!("skip: set LTX25_VAE_DIR to a directory holding the LTX-2.5 VAE components");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-ltx/tests/ltx_2_5_vae_real_weights.rs:196 (audio_vae_and_vocoder_produce_stereo_audio_off_the_unconverted_2_5_component_file): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let device = device();
@@ -258,4 +265,7 @@ fn audio_vae_and_vocoder_produce_stereo_audio_off_the_unconverted_2_5_component_
         amplitude.is_finite() && amplitude > 1e-5 && amplitude <= 1.5,
         "the vocoder waveform is not a sane audio signal (max|v| = {amplitude})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_vae_real_weights::audio_vae_and_vocoder_produce_stereo_audio_off_the_unconverted_2_5_component_file");
 }

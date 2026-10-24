@@ -737,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn peft_lokr_routes_to_structured_residual_and_moves_forward() {
         let dev = Device::Cpu;
         let spec = AdapterSpec::new("peft-lokr.safetensors".into(), 1.0, AdapterKind::Lokr);
@@ -792,6 +793,9 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(out, [30.0]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::peft_lokr_routes_to_structured_residual_and_moves_forward");
     }
 
     #[test]

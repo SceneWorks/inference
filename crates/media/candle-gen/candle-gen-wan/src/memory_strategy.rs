@@ -240,7 +240,14 @@ fn packed_marker(transformer: &Path) -> gen_core::Result<Option<Quant>> {
         return Ok(None);
     }
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+        serde_json::from_slice(&candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-wan/src/memory_strategy.rs::packed_marker::std::fs::read@11155",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)?)
+        .map_err(|error| {
             gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: invalid transformer quantize_config.json at {}: {error}",
                 path.display()

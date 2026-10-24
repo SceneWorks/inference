@@ -86,6 +86,8 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
     // SAFETY: read-only, process-owned weight file, mapped only to read the header here.
     let st = unsafe { MmapedSafetensors::new(dit_path)? };
     let config_path = dit_path.with_file_name("config.json");
+    #[cfg(feature = "model-inference-proof")]
+    let mut config_consumed = false;
     let packed_config = if config_path.is_file() {
         let text = std::fs::read_to_string(&config_path).map_err(|error| {
             CandleError::Msg(format!(
@@ -99,6 +101,10 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
                 config_path.display()
             ))
         })?;
+        #[cfg(feature = "model-inference-proof")]
+        {
+            config_consumed = true;
+        }
         candle_gen::quant::PackedConfig::from_config(&config)
     } else {
         None
@@ -252,6 +258,14 @@ fn dit_path_quant_tier(dit_path: &Path) -> Result<Option<Quant>> {
             config_path.display(),
             dit_path.display()
         )));
+    }
+    #[cfg(feature = "model-inference-proof")]
+    if config_consumed {
+        candle_gen::gen_core::model_input_proof::record_reader_paths(
+            "candle-gen-anima::loader::dit_path_quant_tier/configuration",
+            candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+            &[&config_path],
+        );
     }
     Ok(tier)
 }

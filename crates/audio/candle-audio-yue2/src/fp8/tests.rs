@@ -189,6 +189,7 @@ mod cuda {
     /// rounding remains (relative ≤ 2⁻⁸). A transposed operand, a swapped or dropped scale, or an
     /// unpadded row count fails it by orders of magnitude.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn fp8_gemm_matches_its_dequantized_reference() {
         let dev = cuda();
         let (n, k, m) = (48usize, 64usize, 5usize);
@@ -256,6 +257,9 @@ mod cuda {
             worst <= scale * 2f32.powi(-8),
             "max |Δ| {worst} vs scale {scale}"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED fp8::tests::cuda::fp8_gemm_matches_its_dequantized_reference");
     }
 
     /// Preparing swaps exactly the 7 AR projections of every layer (never `lm_head` or a NAR
@@ -263,6 +267,7 @@ mod cuda {
     /// restoring puts back tensors **bit-identical** to the originals read before preparation —
     /// the tensors the acoustic stage then runs.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn prepare_then_restore_is_bit_exact_and_counted() {
         let dev = cuda();
         let mut lm = mot::model_on(MotPaths::ArAndNar, &dev, DType::BF16);
@@ -359,6 +364,9 @@ mod cuda {
         prepare_fp8_ar(&mut lm).unwrap();
         assert!(matches!(lm.layers()[0].ar.projections()[0], Proj::Fp8(_)));
         restore_ar_bf16(&mut lm).unwrap();
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED fp8::tests::cuda::prepare_then_restore_is_bit_exact_and_counted");
     }
 
     /// The public acoustic stage restores an active FP8 AR mode itself: called directly on a model
@@ -368,6 +376,7 @@ mod cuda {
     /// Mutation (run on the CUDA lane): removing the `restore_ar_bf16` call at the top of
     /// `nar::synthesize` fails this test.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_public_acoustic_stage_restores_an_active_fp8_mode() {
         use crate::nar::{
             synthesize, synthetic::model_on_dtype, NarOptions, SongNoise, SynthesisHooks,
@@ -408,12 +417,16 @@ mod cuda {
             "the acoustic stage restored the BF16 AR path"
         );
         assert_eq!(got, run(&mut native), "bit-identical to a native model");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED fp8::tests::cuda::the_public_acoustic_stage_restores_an_active_fp8_mode");
     }
 
     /// The engine lifecycle: an FP8 engine runs the AR stages in FP8, and the acoustic stage on the
     /// exact BF16 originals — restored before the NAR prefill — then prepares FP8 again for the
     /// next AR stage. The acoustic stage's latents and identity equal a native engine's.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn the_engine_restores_bf16_before_the_acoustic_stage() {
         use crate::engine::{EngineHooks, SongSettings, Yue2Engine};
         let dev = cuda();
@@ -490,5 +503,8 @@ mod cuda {
             fp8.fp8_status().unwrap().active,
             "prepared again for the AR stage"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED fp8::tests::cuda::the_engine_restores_bf16_before_the_acoustic_stage");
     }
 }

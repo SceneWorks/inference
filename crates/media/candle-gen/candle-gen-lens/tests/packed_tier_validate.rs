@@ -67,6 +67,8 @@ fn assert_coherent(img: &Image, tag: &str) {
 fn render_tier(env: &str, tag: &str) {
     let Ok(dir) = std::env::var(env) else {
         eprintln!("SKIP {tag}: set {env} to the packed lens tier subdir (…/q4 or …/q8)");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/packed_tier_validate.rs:70 (render_tier): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     // No `.with_quant(...)`: the packed tier is detected from the on-disk `.scales` siblings, so this
@@ -124,6 +126,9 @@ fn render_tier(env: &str, tag: &str) {
 #[ignore = "needs LENS_PACKED_Q4 (packed q4 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q4_renders_coherent() {
     render_tier("LENS_PACKED_Q4", "q4");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q4_renders_coherent");
 }
 
 /// The q8 packed tier renders a coherent image (double-quant Q8_0 experts + DiT); only runs when the q8
@@ -132,4 +137,7 @@ fn packed_q4_renders_coherent() {
 #[ignore = "needs LENS_PACKED_Q8 (packed q8 tier subdir) + a CUDA GPU; run with --features cuda --ignored"]
 fn packed_q8_renders_coherent() {
     render_tier("LENS_PACKED_Q8", "q8");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::packed_q8_renders_coherent");
 }

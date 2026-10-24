@@ -101,6 +101,8 @@ fn load_pipe() -> Option<(Seedvr2Pipeline, DType)> {
         Ok(p) => p,
         Err(_) => {
             eprintln!("SKIP: set SEEDVR2_CKPT to a numz/SeedVR2_comfyUI checkpoint dir");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs:104 (load_pipe): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             return None;
         }
     };
@@ -122,6 +124,8 @@ fn load_pipe() -> Option<(Seedvr2Pipeline, DType)> {
 #[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
 fn cuda_video_chunk_overlap_smoke() {
     let Some((pipe, _dt)) = load_pipe() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs:125 (cuda_video_chunk_overlap_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
 
@@ -239,6 +243,9 @@ fn cuda_video_chunk_overlap_smoke() {
         ck_mean <= pf_mean * 1.5 + 1.0,
         "chunked path is markedly less coherent than per-frame ({ck_mean:.3} vs {pf_mean:.3})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_video_smoke::cuda_video_chunk_overlap_smoke");
 }
 
 /// Isolation diagnostic: VAE round-trip (encode → decode, NO DiT) on a MOVING 16-frame clip. If the
@@ -249,6 +256,8 @@ fn cuda_video_chunk_overlap_smoke() {
 fn cuda_video_vae_roundtrip_smoke() {
     use candle_gen::candle_core::Tensor;
     let Some((pipe, _dt)) = load_pipe() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs:252 (cuda_video_vae_roundtrip_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let (src, tgt) = (256usize, 512usize);
@@ -288,6 +297,9 @@ fn cuda_video_vae_roundtrip_smoke() {
         mn > -15.0 && mx < 15.0,
         "VAE round-trip explodes on a moving clip (min={mn:.3} max={mx:.3}) — VAE bug, not DiT"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_video_smoke::cuda_video_vae_roundtrip_smoke");
 }
 
 /// Isolation diagnostic: an 8-frame clip of IDENTICAL frames should decode to ~8 copies of the
@@ -298,6 +310,8 @@ fn cuda_video_vae_roundtrip_smoke() {
 #[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
 fn cuda_video_identical_frames_smoke() {
     let Some((pipe, _dt)) = load_pipe() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs:301 (cuda_video_identical_frames_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
     let (src, tgt) = (256usize, 512usize);
@@ -325,12 +339,19 @@ fn cuda_video_identical_frames_smoke() {
              decoder T>1 structural bug"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED cuda_video_smoke::cuda_video_identical_frames_smoke"
+    );
 }
 
 #[test]
 #[ignore = "needs SEEDVR2_CKPT weights + a CUDA build"]
 fn cuda_video_hd_tiling_smoke() {
     let Some((pipe, dt)) = load_pipe() else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-seedvr2/tests/cuda_video_smoke.rs:334 (cuda_video_hd_tiling_smoke): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
         return;
     };
 
@@ -383,6 +404,9 @@ fn cuda_video_hd_tiling_smoke() {
         corr > 0.9,
         "spatial tiling diverges from the single-pass upscale (corr={corr:.4}) — feather/partition bug"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED cuda_video_smoke::cuda_video_hd_tiling_smoke");
 }
 
 /// sc-12465 / F-013: the real spatial-tile loop honours a tripped cancel flag **before** running a

@@ -21,6 +21,15 @@
 //! matmul). `backend = "candle"`, `mac_only = false`. Quant tiers ship as pre-quantized per-tier
 //! checkpoints (epic 1788 / A6), *not* on-the-fly requant, so `supported_quants` is empty.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod config;
 pub mod conv3d;
 pub mod nn;

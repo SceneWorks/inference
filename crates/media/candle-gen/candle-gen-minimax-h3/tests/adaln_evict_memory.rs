@@ -485,6 +485,7 @@ fn warm_up(c: &MiniMaxH3DitConfig, device: &Device) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_evicted_adaln_weights_leave_memory() {
     pin_matmul_to_one_thread();
 
@@ -843,6 +844,9 @@ fn the_evicted_adaln_weights_leave_memory() {
         fresh.iter().all(DitBlock::holds_adaln),
         "a refused precompute must not have evicted anything"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_memory");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -916,4 +920,7 @@ fn the_evicted_adaln_weights_leave_the_cuda_pool() {
          `precompute_and_evict` is what is supposed to return them (SC-15791)"
     );
     one_forward(&c, &blocks, &cache, &device);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool");
 }

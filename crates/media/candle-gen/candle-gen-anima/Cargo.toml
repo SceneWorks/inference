@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 
 [features]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof"]
 # Default works on Mac / Linux CPU with NO extra features (candle-core defaults to the CPU backend);
 # this is the lane the `cargo check -F backend-candle` parity build and the CPU golden tests use.
 default = []

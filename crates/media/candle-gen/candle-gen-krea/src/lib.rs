@@ -30,6 +30,15 @@
 //! complete valid warm cache is read without taking its preparation lock; operators should budget
 //! roughly one additional packed-projection copy in whichever cache location is selected.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_gen::candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_gen::candle_core::Tensor, ()>::Err(()));
+};
+
 pub mod adapters;
 pub mod config;
 pub mod convert;
@@ -7028,7 +7037,15 @@ mod tests {
         let conditioning = if edit {
             let source = std::env::var("KREA_EDIT_SOURCE")
                 .expect("set KREA_EDIT_SOURCE for KREA_SEQ_EDIT=1");
-            let rgb = image::open(source)
+            let rgb = candle_gen::gen_core::__model_input_reader!(
+image::open(source),
+"crates/media/candle-gen/candle-gen-krea/src/lib.rs::krea_probed_generate_for_offload_ab::image::open@325143",
+Reference,
+source,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
                 .expect("decode KREA_EDIT_SOURCE")
                 .to_rgb8();
             let (width, height) = rgb.dimensions();
@@ -7354,6 +7371,9 @@ mod tests {
                 "KREA_PHASE rung={memory_mode} repeat={repeat} phase={phase} peak_gb={peak_gb:.3}"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::krea_probed_generate_for_offload_ab");
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).

@@ -506,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn budget_exhaustion_is_reported_as_truncation() {
         let lm = synthetic::model(MotPaths::Ar);
         let s = greedy(5);
@@ -526,12 +527,16 @@ mod tests {
             .tokens
             .iter()
             .all(|&t| Phase::Semantic.allows(t) && t != MUSIC_END));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::budget_exhaustion_is_reported_as_truncation");
     }
 
     /// The end id stops the decode: it is reported to the observer, excluded from the tokens, and
     /// the decode is not truncated. Driven through the real loop with an injected draw that lands
     /// on MUSIC_END's slot of the shaped distribution.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn end_id_stops_and_is_reported_but_not_returned() {
         let lm = synthetic::model(MotPaths::Ar);
         let s = greedy(1);
@@ -567,9 +572,13 @@ mod tests {
         );
         assert!(out.tokens.is_empty() && out.ended && !out.truncated);
         assert_eq!(out.output_tokens, 1);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::end_id_stops_and_is_reported_but_not_returned");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn min_tokens_bars_the_end_id_in_the_real_loop() {
         let lm = synthetic::model(MotPaths::Ar);
         let s = test_sampling(1.0, 1.0, VOCAB_SIZE.into(), 1.0, 50, 3, 3);
@@ -590,6 +599,9 @@ mod tests {
         let out = out.unwrap();
         assert_eq!(out.tokens.len(), 3);
         assert!(out.tokens.iter().all(|&t| t != MUSIC_END));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::min_tokens_bars_the_end_id_in_the_real_loop");
     }
 
     #[test]
@@ -627,6 +639,7 @@ mod tests {
     /// Cancellation is observed before the prefill and at every step boundary: tripping it after
     /// the second token ends the decode before a third token, with the typed error.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn cancellation_is_observed_at_bounded_boundaries() {
         let lm = synthetic::model(MotPaths::Ar);
         let s = greedy(50);
@@ -669,11 +682,15 @@ mod tests {
         assert_eq!(tokens.get(), 2, "no token after the flag tripped");
         // before-prefill + positive chunk + before-negative + negative chunk + 3 step checks.
         assert_eq!(polls.get(), 7);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::cancellation_is_observed_at_bounded_boundaries");
     }
 
     /// Guidance runs the negative branch and mixes it in; scale 1 runs one branch and samples the
     /// conditional row unchanged.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn guidance_mixes_the_negative_branch() {
         let lm = synthetic::model(MotPaths::Ar);
         let s = greedy(3);
@@ -711,6 +728,11 @@ mod tests {
         let uncond = host_row(&lm.prefill(&negative, &mut neg_cache, || Ok(())).unwrap()).unwrap();
         let want = cfg_mix(&ra.logits[0], &uncond, 3.0, Arith::F32);
         assert_eq!(rc.logits[0], want);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::guidance_mixes_the_negative_branch"
+        );
     }
 
     fn tok() -> &'static Yue2TextTokenizer {
@@ -775,6 +797,7 @@ mod tests {
     /// carry the plan's exact score; between `EOD` and the framing both prefixes hold ordinary text
     /// ids only; and scale, legacy flag and positive prefix must be the plan's.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn semantic_guidance_requires_the_exact_planned_score() {
         let lm = synthetic::model(MotPaths::Ar);
         let cfg = config(greedy(2));
@@ -892,12 +915,16 @@ mod tests {
             "without guidance",
             "a negative at scale 1",
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::semantic_guidance_requires_the_exact_planned_score");
     }
 
     /// The `cot = off` semantic stage samples with the historical arithmetic (top-p keeps three),
     /// the planned modes with the standard one (keeps one): with a vanishing `top_p` and a draw
     /// near 1, only the legacy rule can return anything but the top-1 id.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn off_semantic_stage_uses_the_legacy_sampler() {
         let lm = synthetic::model(MotPaths::Ar);
         let cfg = config(test_sampling(1.0, 1e-6, 100, 1.0, 1, 0, 1));
@@ -940,11 +967,15 @@ mod tests {
         assert_eq!(stage(&off), direct(off.prefix(), true));
         let full = ready(request(CotMode::Full, Some(SCORE), None));
         assert_eq!(stage(&full), direct(full.prefix(), false));
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::off_semantic_stage_uses_the_legacy_sampler");
     }
 
     /// `cot = off` guidance is instruction-only: its negative is `EOD`, ordinary instruction ids and
     /// `MUSIC_START` — no score framing and no stray specials anywhere.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn off_mode_negative_is_instruction_only() {
         let lm = synthetic::model(MotPaths::Ar);
         let cfg = config(greedy(2));
@@ -991,6 +1022,9 @@ mod tests {
             "ordinary",
             "a special id in an off positive body",
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::off_mode_negative_is_instruction_only");
     }
 
     /// The whole symbolic path on the synthetic model, for every `cot`:
@@ -1002,6 +1036,7 @@ mod tests {
     /// which `finish` decodes; that the planner sampled `planning.prefix()` is shown by its logits
     /// rows equalling a direct decode of that prefix.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn symbolic_plan_drives_both_stages_end_to_end() {
         let lm = synthetic::model(MotPaths::Ar);
         let abc_steps = 4;
@@ -1069,5 +1104,8 @@ mod tests {
             assert!(out.decoded.truncated);
             assert!(out.codes.iter().all(|&c| c < CODEC_SIZE));
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED generate::tests::symbolic_plan_drives_both_stages_end_to_end");
     }
 }

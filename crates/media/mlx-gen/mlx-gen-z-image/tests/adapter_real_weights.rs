@@ -223,12 +223,17 @@ fn print_residual_diagnostic(kind: &str, my_kind: AdapterKind) {
 /// Pre-tightening diagnostic. The source/env-bound recorder runs this exact test first; a cap may
 /// be locked only after the adapted residual is measured below the zero-residual control.
 #[test]
-#[ignore = "needs real Z-Image weights + adapter & base goldens (same config)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + adapter & base goldens (same config)"]
 fn residual_mutation_diagnostic() {
     // Cargo prints `test <name> ... ` without a newline before test output.
     println!();
     print_residual_diagnostic("lora", AdapterKind::Lora);
     print_residual_diagnostic("lokr", AdapterKind::Lokr);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::residual_mutation_diagnostic"
+    );
 }
 
 fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
@@ -278,20 +283,30 @@ fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + adapter & base goldens (same config)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + adapter & base goldens (same config)"]
 fn lora_render_matches_fork_golden() {
     assert_matches_golden("lora", AdapterKind::Lora);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::lora_render_matches_fork_golden"
+    );
 }
 
 #[test]
-#[ignore = "needs real Z-Image weights + adapter & base goldens (same config)"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + adapter & base goldens (same config)"]
 fn lokr_render_matches_fork_golden() {
     assert_matches_golden("lokr", AdapterKind::Lokr);
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::lokr_render_matches_fork_golden"
+    );
 }
 
 /// A scale-0 adapter must be a bit-exact no-op vs the no-adapter render (no regression).
 #[test]
-#[ignore = "needs real Z-Image weights + adapter golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + adapter golden"]
 fn scale_zero_adapter_is_noop() {
     let base = render_with_adapter(None, "lora");
     let zero = render_with_adapter(
@@ -301,6 +316,9 @@ fn scale_zero_adapter_is_noop() {
     let differ = base.iter().zip(&zero).filter(|(a, b)| a != b).count();
     println!("✓ scale-0 adapter no-op: {differ} px differ from the no-adapter render");
     assert_eq!(differ, 0, "scale-0 adapter must be a bit-exact no-op");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED adapter_real_weights::scale_zero_adapter_is_noop");
 }
 
 /// The single installed LoRA's `(a, b)` arrays, or panic — the equivalence comparison expects

@@ -101,6 +101,7 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
 fn batch_of_one_matches_single() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in batch_of_one_matches_single; see preceding skip diagnostic");
         return;
     };
     for text in [
@@ -127,6 +128,8 @@ fn batch_of_one_matches_single() {
         );
         assert_eq!(batched[0].finish_reason, single_fin);
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::batch_of_one_matches_single");
 }
 
 /// Identical input rows in one batch produce identical outputs — adding rows does not corrupt a row,
@@ -136,6 +139,7 @@ fn batch_of_one_matches_single() {
 fn identical_rows_are_identical() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in identical_rows_are_identical; see preceding skip diagnostic");
         return;
     };
     let p = encode(&fx.tok, "The capital of France is");
@@ -169,6 +173,8 @@ fn identical_rows_are_identical() {
             "row {i} streamed ids must reconstruct the output"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::identical_rows_are_identical");
 }
 
 /// The whole batched run is deterministic: the same batch produces the same outputs every time.
@@ -177,6 +183,7 @@ fn identical_rows_are_identical() {
 fn batched_decode_is_reproducible() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in batched_decode_is_reproducible; see preceding skip diagnostic");
         return;
     };
     let reqs = vec![
@@ -195,6 +202,8 @@ fn batched_decode_is_reproducible() {
     let b = run_batch(&fx, &reqs);
     assert_eq!(a, b, "batched decode must be reproducible");
     assert!(a.iter().all(|r| !r.is_empty()));
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::batched_decode_is_reproducible");
 }
 
 /// N differing-length requests, two ways:
@@ -214,6 +223,7 @@ fn batched_decode_is_reproducible() {
 fn differing_lengths_complete_and_track_batch1() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in differing_lengths_complete_and_track_batch1; see preceding skip diagnostic");
         return;
     };
     let prompts = [
@@ -284,6 +294,8 @@ fn differing_lengths_complete_and_track_batch1() {
             "row {i} must agree with batch-1 on at least the prefill argmax"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::differing_lengths_complete_and_track_batch1");
 }
 
 /// Differing `max_new_tokens` retire sequences at different steps, exercising mid-batch retirement
@@ -294,6 +306,7 @@ fn differing_lengths_complete_and_track_batch1() {
 fn retirement_and_compaction_respects_budgets() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in retirement_and_compaction_respects_budgets; see preceding skip diagnostic");
         return;
     };
     let prompts = [
@@ -332,6 +345,8 @@ fn retirement_and_compaction_respects_budgets() {
         );
         assert!(cp >= 1, "row {i} must track its batch-1 run");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::retirement_and_compaction_respects_budgets");
 }
 
 /// A mid-stream cancel stops the whole batch promptly; rows still running finish `Cancelled` with
@@ -341,6 +356,7 @@ fn retirement_and_compaction_respects_budgets() {
 fn mid_stream_cancel_stops_the_batch() {
     let Some(fx) = load() else {
         eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in mid_stream_cancel_stops_the_batch; see preceding skip diagnostic");
         return;
     };
     let prompts = [
@@ -372,4 +388,6 @@ fn mid_stream_cancel_stops_the_batch() {
             "cancel should stop well before the budget"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED batch::mid_stream_cancel_stops_the_batch");
 }

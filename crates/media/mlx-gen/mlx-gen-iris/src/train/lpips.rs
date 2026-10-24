@@ -110,10 +110,16 @@ impl Lpips {
     pub fn load(vgg16: &Path, lin: &Path) -> Result<Self> {
         let read = |p: &Path, keep: &dyn Fn(&str) -> bool| -> Result<HashMap<String, Array>> {
             if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
-                Ok(Array::load_safetensors(p)?
-                    .into_iter()
-                    .filter(|(k, _)| keep(k))
-                    .collect())
+                Ok(mlx_gen::gen_core::__model_input_reader!(
+Array::load_safetensors(p),
+"crates/media/mlx-gen/mlx-gen-iris/src/train/lpips.rs::load::Array::load_safetensors@4447",
+TensorInput,
+p,
+|__model_input_path| Array::load_safetensors(__model_input_path)
+)?
+                .into_iter()
+                .filter(|(k, _)| keep(k))
+                .collect())
             } else {
                 mlx_gen::pth::load_pth_f32_filtered(p, keep)
             }

@@ -74,7 +74,7 @@ impl Dinov2Layer {
         let (h, hd) = (self.num_heads, self.head_dim);
 
         // --- self-attention sub-block (pre-norm + LayerScale + residual) ---
-        let hn = layer_norm(x, &self.norm1_w, &self.norm1_b, self.eps)?;
+        let hn = __model_proof_output!(layer_norm(x, &self.norm1_w, &self.norm1_b, self.eps))?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
             Ok(t.reshape((b, n, h, hd))?.transpose(1, 2)?.contiguous()?)
         };
@@ -91,7 +91,7 @@ impl Dinov2Layer {
         let x = x.add(&attn)?;
 
         // --- MLP sub-block (pre-norm + LayerScale + residual) ---
-        let hn = layer_norm(&x, &self.norm2_w, &self.norm2_b, self.eps)?;
+        let hn = __model_proof_output!(layer_norm(&x, &self.norm2_w, &self.norm2_b, self.eps))?;
         let y = self.fc1.forward(&hn)?.gelu_erf()?; // exact GELU
         let y = self.fc2.forward(&y)?;
         let y = y.broadcast_mul(&self.ls2)?;
@@ -186,12 +186,12 @@ impl Dinov2Backbone {
             x = layer.forward(&x)?;
             if capture.contains(&idx) {
                 // DA-V2 applies the backbone's final LayerNorm to each captured state.
-                out.push(layer_norm(
+                out.push(__model_proof_output!(layer_norm(
                     &x,
                     &self.final_ln_w,
                     &self.final_ln_b,
                     self.cfg.layer_norm_eps,
-                )?);
+                ))?);
             }
         }
         Ok(out)

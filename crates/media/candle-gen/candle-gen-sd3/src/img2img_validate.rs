@@ -188,6 +188,9 @@ fn real_weight_large_img2img() {
         guidance: Some(4.0),
         steps: 28,
     });
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_validate::real_weight_large_img2img");
 }
 
 /// **SD3.5 Medium** (MMDiT-X, true-CFG): the dual-attention img2img strength sweep.
@@ -201,6 +204,9 @@ fn real_weight_medium_img2img() {
         guidance: Some(4.5),
         steps: 40,
     });
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_validate::real_weight_medium_img2img");
 }
 
 /// **SD3.5 Large Turbo** (guidance-distilled, CFG-free): the few-step img2img strength sweep. NO
@@ -216,4 +222,7 @@ fn real_weight_turbo_img2img() {
         guidance: None,
         steps: 8,
     });
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_validate::real_weight_turbo_img2img");
 }

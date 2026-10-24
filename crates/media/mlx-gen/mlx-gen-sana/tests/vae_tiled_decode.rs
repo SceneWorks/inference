@@ -230,11 +230,13 @@ use crate::common::quantum_metal_guard;
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
     const CHILD: &str = "DCAE_QUANTUM_CPU_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "vae_tiled_decode::dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom",
                 "--nocapture",
@@ -245,9 +247,9 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         assert!(status.success());
         return;
     }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     assert!(quantum_metal_guard::forbid_metal());
     assert!(quantum_metal_guard::metal_forbidden());
-    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let dec = decoder();
     let z = latent(3, 3);
     let cancel = CancelFlag::new();
@@ -285,6 +287,8 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         .unwrap_err()
         .to_string()
         .contains("before construction"));
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode::dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom");
 }
 
 fn encoder() -> mlx_gen_sana::DcAeEncoder {
@@ -343,17 +347,18 @@ fn encoder() -> mlx_gen_sana::DcAeEncoder {
 /// zero-cache scope must restore the caller's policy on the cancellation error path.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn dcae_quanta_observe_cancellation_between_blocks_and_restore_cache() {
     const CHILD: &str = "DCAE_QUANTUM_CANCEL_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "vae_tiled_decode::dcae_quanta_observe_cancellation_between_blocks_and_restore_cache", "--nocapture"])
+            .args(["--include-ignored", "--exact", "vae_tiled_decode::dcae_quanta_observe_cancellation_between_blocks_and_restore_cache", "--nocapture"])
             .env(CHILD, "1").status().unwrap();
         assert!(status.success());
         return;
     }
-    assert!(quantum_metal_guard::forbid_metal());
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
     let dec = decoder();
     let enc = encoder();
     let z = latent(3, 3);
@@ -401,6 +406,8 @@ fn dcae_quanta_observe_cancellation_between_blocks_and_restore_cache() {
             "{name}: cache policy not restored"
         );
     }
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode::dcae_quanta_observe_cancellation_between_blocks_and_restore_cache");
 }
 
 fn decoder() -> DcAeDecoder {
@@ -411,6 +418,7 @@ fn decoder() -> DcAeDecoder {
 /// The head/tail split must be an exact decomposition of the dense decode — otherwise the bounded
 /// route would be tracking the wrong reference.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn head_then_tail_is_exactly_the_dense_decode() {
     let dec = decoder();
     let z = latent(8, 9);
@@ -421,6 +429,10 @@ fn head_then_tail_is_exactly_the_dense_decode() {
     composed.eval().unwrap();
     assert_eq!(composed.shape(), dense.shape());
     assert_eq!(max_abs(&dense, &composed), 0.0);
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode::head_then_tail_is_exactly_the_dense_decode");
 }
 
 /// The split lands where the attention does: two shallow `Res` stages are tileable, and the tail's
@@ -454,6 +466,7 @@ fn the_tail_is_the_attention_free_prefix_and_carries_its_own_scale() {
 /// observably different from the dense decode, because each crop's `LinearAttn` sums over its own
 /// token set. This is what makes the bounded-vs-dense comparison a real guard.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn per_crop_whole_decoder_attention_is_observably_wrong() {
     let dec = decoder();
     let z = latent(8, 9);
@@ -477,6 +490,10 @@ fn per_crop_whole_decoder_attention_is_observably_wrong() {
         "per-crop whole-decoder attention must be observably different from the dense decode: \
          max|delta|={delta:.3e}"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode::per_crop_whole_decoder_attention_is_observably_wrong");
 }
 
 /// The bounded tail must track the dense decode **materially better** than the retired per-crop
@@ -489,6 +506,7 @@ fn per_crop_whole_decoder_attention_is_observably_wrong() {
 /// and the comparison isolates exactly that: both sides carry the same conv seam, only the retired
 /// side also aggregates attention per crop.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bounded_tail_tracks_dense_better_than_per_crop_decoding() {
     let dec = decoder();
     let z = latent(8, 9);
@@ -564,4 +582,8 @@ fn bounded_tail_tracks_dense_better_than_per_crop_decoding() {
         "keeping the EfficientVit attention whole must materially reduce the divergence from a \
          dense decode: bounded={bounded_rel:.3e} vs legacy={legacy_rel:.3e}"
     );
+
+    #[cfg(target_os = "macos")]
+    crate::common::quantum_metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiled_decode::bounded_tail_tracks_dense_better_than_per_crop_decoding");
 }

@@ -120,10 +120,16 @@ fn transformer_variant(dir: &Path) -> Option<TransformerVariant> {
 fn tiers() -> Option<PathBuf> {
     let Some(src) = bundle_dir() else {
         eprintln!("skip: set LTX25_BUNDLE_DIR to the Lightricks/LTX-2.5 snapshot root");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in tiers; see preceding skip diagnostic",
+        );
         return None;
     };
     let Some(out) = tier_root() else {
         eprintln!("skip: set LTX25_TIER_DIR to a writable directory with ~135 GB free");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in tiers; see preceding skip diagnostic",
+        );
         return None;
     };
     let variant = source_variant();
@@ -938,6 +944,8 @@ fn every_component_loads_and_forwards_at_every_tier() {
             clear_cache();
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_tiers_real_weights::every_component_loads_and_forwards_at_every_tier");
 }
 
 /// The quantized tiers must actually *change* the DiT's numbers relative to bf16 — and by an amount
@@ -1028,6 +1036,8 @@ fn quantization_moves_the_dit_block_and_q8_is_tighter_than_q4() {
         deltas["q8"],
         deltas["q4"]
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_tiers_real_weights::quantization_moves_the_dit_block_and_q8_is_tighter_than_q4");
 }
 
 /// The 48 per-layer `layer_scalar` buffers and the missing `v_proj` on the eight `full_attention`
@@ -1139,4 +1149,6 @@ fn the_gemma_4_checkpoint_shapes_survive_at_every_tier() {
         }
     }
     let _ = DenseReason::NoLinearWeights;
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_tiers_real_weights::the_gemma_4_checkpoint_shapes_survive_at_every_tier");
 }

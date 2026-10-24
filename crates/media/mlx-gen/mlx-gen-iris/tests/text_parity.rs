@@ -53,10 +53,14 @@ fn template_pieces_tokenize_like_upstream_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn windows_masks_and_layer_states_match_upstream() {
     cpu_process(
         "text_parity::windows_masks_and_layer_states_match_upstream",
-        windows_masks_and_layer_states_match_upstream_body,
+        || {
+            windows_masks_and_layer_states_match_upstream_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::windows_masks_and_layer_states_match_upstream");
+        },
     );
 }
 
@@ -108,10 +112,14 @@ fn windows_masks_and_layer_states_match_upstream_body() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn empty_negative_prompt_is_the_training_null() {
     cpu_process(
         "text_parity::empty_negative_prompt_is_the_training_null",
-        empty_negative_prompt_is_the_training_null_body,
+        || {
+            empty_negative_prompt_is_the_training_null_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::empty_negative_prompt_is_the_training_null");
+        },
     );
 }
 

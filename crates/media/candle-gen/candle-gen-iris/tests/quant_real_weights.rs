@@ -246,4 +246,7 @@ fn real_quantized_renders_track_the_bf16_render_at_512() {
             "{tier}: composition corr {corr} < {min_corr}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512");
 }

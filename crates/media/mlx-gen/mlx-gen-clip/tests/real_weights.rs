@@ -73,6 +73,10 @@ fn embeds_real_images_with_sane_cosine_geometry() {
         "clip ok: dim={}, red·red={self_cos:.5}, red·blue={cross_cos:.5}",
         red.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED real_weights::embeds_real_images_with_sane_cosine_geometry"
+    );
 }
 
 #[test]
@@ -109,4 +113,6 @@ fn text_and_image_embeds_rank_matching_colours_higher() {
         "clip text/image ok: red_text·red={red_text_red:.5}, red_text·blue={red_text_blue:.5}, \
          blue_text·blue={blue_text_blue:.5}, blue_text·red={blue_text_red:.5}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED real_weights::text_and_image_embeds_rank_matching_colours_higher");
 }

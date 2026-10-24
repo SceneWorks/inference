@@ -132,6 +132,7 @@ fn steps_in(root: &Path) -> Vec<u64> {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly() {
     cpu_process(
         "train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly",
@@ -175,11 +176,13 @@ fn a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly() {
                 read_checkpoint_state(&lb).unwrap()
             );
             assert_eq!(tensors(&a.path().join(name)), tensors(&b.path().join(name)));
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly");
         },
     );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints() {
     cpu_process(
         "train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints",
@@ -216,11 +219,13 @@ fn a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints() {
             resume.resume = true;
             assert_eq!(run(&items, resume, out.path(), name, None), (4, 2));
             assert_eq!(steps_in(&root), [3, 4]);
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints");
         },
     );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_full_model_export_replaces_its_directory_whole() {
     cpu_process(
         "train_lineage::a_full_model_export_replaces_its_directory_whole",
@@ -250,6 +255,7 @@ fn a_full_model_export_replaces_its_directory_whole() {
                 staged.is_empty(),
                 "no staging directory is left: {staged:?}"
             );
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lineage::a_full_model_export_replaces_its_directory_whole");
         },
     );
 }
@@ -257,6 +263,7 @@ fn a_full_model_export_replaces_its_directory_whole() {
 /// sc-25690: a resume source refused at validation leaves the output's checkpoint root as it was
 /// (retirement runs only after the source was validated and loaded).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_refused_resume_leaves_the_checkpoint_root_untouched() {
     cpu_process(
         "train_lineage::a_refused_resume_leaves_the_checkpoint_root_untouched",
@@ -294,6 +301,7 @@ fn a_refused_resume_leaves_the_checkpoint_root_untouched() {
                 "the refused run moved nothing aside"
             );
             assert!(!prior_checkpoint_root(out.path(), name).exists());
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED train_lineage::a_refused_resume_leaves_the_checkpoint_root_untouched");
         },
     );
 }

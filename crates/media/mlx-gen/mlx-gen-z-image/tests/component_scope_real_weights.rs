@@ -163,7 +163,7 @@ fn image_delta(a: &Image, b: &Image) -> u8 {
 /// The whole story in one test: the encoder scope must cut the conditioning phase, must not change the
 /// image, and — the part that decides whether it ships — must move the request peak.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_encoder_scope_moves_the_request_peak_without_changing_the_image() {
     let (_, tier) = tier_from_path();
     let dit_only = run_with(TransformerComponent::Dit);
@@ -245,4 +245,7 @@ fn the_encoder_scope_moves_the_request_peak_without_changing_the_image() {
             req_cut * 100.0
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED component_scope_real_weights::the_encoder_scope_moves_the_request_peak_without_changing_the_image");
 }

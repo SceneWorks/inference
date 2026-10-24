@@ -16,6 +16,15 @@
 //! Assertions are on **absolute** error, not cosine similarity — a rope schedule with the right
 //! shape and the wrong base is cosine-close and numerically wrong.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -748,6 +757,7 @@ fn gemma4_sliding_window_prefill_matches_the_eager_reference() {
 /// V takes the **scale-free** `v_norm` of the *raw* projection output — so the two are different
 /// tensors built from one matmul, which is exactly what the goldens pin.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn gemma4_k_eq_v_projection_matches_golden() {
     let g = goldens();
     let c = &g["k_eq_v"];
@@ -840,6 +850,9 @@ fn gemma4_k_eq_v_projection_matches_golden() {
         max_abs_err(&host(&sep_v), &floats(&c["v_shared"])) > 1e-3,
         "a separate v_proj must not reproduce the shared one"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_k_eq_v_projection_matches_golden");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -855,6 +868,7 @@ fn gemma4_k_eq_v_projection_matches_golden() {
 /// consumer builds. Here it is pinned by pushing the stack's last entry through the (tied) LM head
 /// and requiring it to reproduce the model's own all-position logits.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn hidden_state_stack_matches_the_logits_forward() {
     const HIDDEN: usize = 32;
     const VOCAB: usize = 48;
@@ -966,6 +980,9 @@ fn hidden_state_stack_matches_the_logits_forward() {
     assert_eq!(step.len(), LAYERS + 1);
     assert_eq!(step[0].dims(), &[1, 1, HIDDEN]);
     assert_eq!(cache.offset(), seq as i32 + 1);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED hidden_state_stack_matches_the_logits_forward");
 }
 
 /// A stray guard: the mask enum's new variant must not have quietly changed how the existing masks

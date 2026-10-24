@@ -869,6 +869,7 @@ mod tiled_decode_tests {
     /// Deliberately isolates the *tail*: the head runs once and is shared, so the divergence
     /// measured here is normalization alone, not the mid block's global attention.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn per_crop_tail_normalization_is_observably_wrong() {
         let vae = Flux2Vae::from_weights(&fixture()).unwrap();
         let packed = packed_latents(4, 5);
@@ -903,12 +904,15 @@ mod tiled_decode_tests {
             "per-crop tail normalization must be observably different from the dense tail, else the \
              bounded-decode tolerance proves nothing: max|delta|={delta:.3e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tiled_decode_tests::per_crop_tail_normalization_is_observably_wrong");
     }
 
     /// The layer-wise bounded tail must track the dense decode. The tolerance is meaningful because
     /// `per_crop_tail_normalization_is_observably_wrong` executes the defect on this same fixture
     /// and lands orders of magnitude outside this bound.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_packed_decode_tracks_dense_with_global_group_norm() {
         let vae = Flux2Vae::from_weights(&fixture()).unwrap();
         let packed = packed_latents(4, 5);
@@ -928,11 +932,14 @@ mod tiled_decode_tests {
             delta < 3e-3,
             "layer-wise tiled FLUX.2 VAE diverged from dense decode: max|delta|={delta:.3e}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tiled_decode_tests::tiled_packed_decode_tracks_dense_with_global_group_norm");
     }
 
     /// A tiling request that does not actually split this latent must fall through to the exact
     /// single-pass decode rather than assembling a one-tile plan.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn untiled_request_falls_through_to_the_dense_decode() {
         let vae = Flux2Vae::from_weights(&fixture()).unwrap();
         let packed = packed_latents(4, 5);
@@ -947,9 +954,12 @@ mod tiled_decode_tests {
         dense.eval().unwrap();
         passthrough.eval().unwrap();
         assert_eq!(max_abs_delta(&dense, &passthrough), 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tiled_decode_tests::untiled_request_falls_through_to_the_dense_decode");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_decode_honors_a_pretripped_cancel() {
         let vae = Flux2Vae::from_weights(&fixture()).unwrap();
         let cancel = mlx_gen::CancelFlag::new();
@@ -962,6 +972,8 @@ mod tiled_decode_tests {
             let result = vae.decode_packed_latents_tiled(&packed, &tiling, Some(&cancel));
             assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED vae::tiled_decode_tests::tiled_decode_honors_a_pretripped_cancel");
     }
 }
 

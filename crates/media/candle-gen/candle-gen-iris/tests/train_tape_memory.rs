@@ -194,6 +194,7 @@ fn critic_terms(g: &Fixture) -> Vec<(Tensor, Vec<Vec<u32>>)> {
 /// loss or of any gradient — under the f32 policy and the bf16 one, with and without activation
 /// checkpointing (whose recompute replays the folded nodes).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn folded_generation_gradients_are_the_plain_graphs_bit_for_bit() {
     let params = base_params();
     for compute in [DType::F32, DType::BF16] {
@@ -218,11 +219,15 @@ fn folded_generation_gradients_are_the_plain_graphs_bit_for_bit() {
             assert!(nonzero * 10 > plain.len() * 9, "{nonzero}/{}", plain.len());
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::folded_generation_gradients_are_the_plain_graphs_bit_for_bit");
 }
 
 /// The folded depthwise sums (the trunk's 7×7, the head's BlurPool) leave the generator term's
 /// gradient to the image and the critic loss's gradients to the head bit-identical.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn folded_critic_gradients_are_the_plain_graphs_bit_for_bit() {
     let g = fixture("iris_restoration_train_golden.safetensors");
     let folded = critic_terms(&g);
@@ -238,6 +243,9 @@ fn folded_critic_gradients_are_the_plain_graphs_bit_for_bit() {
             assert_eq!(f, p);
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::folded_critic_gradients_are_the_plain_graphs_bit_for_bit");
 }
 
 /// The tape of a generation step and of the generator's adversarial term keep a fraction of what
@@ -245,6 +253,7 @@ fn folded_critic_gradients_are_the_plain_graphs_bit_for_bit() {
 /// fold more — the attention scores grow with the square of the token count, these have 4 to 20
 /// tokens).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn the_folded_tape_keeps_a_fraction_of_the_plain_chains() {
     let params = base_params();
     let model = full_model(DType::F32);
@@ -277,12 +286,16 @@ fn the_folded_tape_keeps_a_fraction_of_the_plain_chains() {
         folded as f64 / plain as f64
     );
     assert!(folded * 100 <= plain * BLUR_FOLD_PCT, "{folded} vs {plain}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::the_folded_tape_keeps_a_fraction_of_the_plain_chains");
 }
 
 /// An activation-checkpointed full step builds two backbones (on the tape, and off it for the
 /// regions' forward) from one cast of the f32 masters: the bf16 policy casts exactly the bytes a
 /// plain step casts.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_casts_the_masters_once() {
     let params = base_params();
     let model = full_model(DType::BF16);
@@ -294,6 +307,9 @@ fn activation_checkpointing_casts_the_masters_once() {
     let (none, full) = (cast(AcPolicy::None), cast(AcPolicy::Full));
     assert!(none > 0, "the bf16 policy casts the f32 masters");
     assert_eq!(full, none, "a checkpointed step must not cast them again");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::activation_checkpointing_casts_the_masters_once");
 }
 
 /// Deterministic, non-symmetric values in `[-1, 1)`.
@@ -578,6 +594,9 @@ fn folds_are_bit_identical_on_the_build_device() {
         "the device does not reproduce the plain chain bit for bit"
     );
     assert_eq!(moved, 0, "folding moved {moved} tensors on this device");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::folds_are_bit_identical_on_the_build_device");
 }
 
 /// An identity node that holds a token for as long as it is on a tape and, when a gradient passes
@@ -620,6 +639,7 @@ impl candle_gen::candle_core::CustomOp1 for Witness {
 /// (the propagation out of the first region); by then the witness downstream of the regions must
 /// be off the tape.
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn a_checkpointed_backward_drops_the_loss_graph_before_replaying_the_regions() {
     use candle_gen_iris::dit::TextBatch;
     use candle_gen_iris::train::model::grads_under_ac;
@@ -668,4 +688,7 @@ fn a_checkpointed_backward_drops_the_loss_graph_before_replaying_the_regions() {
         1,
         "holders of the downstream token when the last gradient arrived: the test alone"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_tape_memory::a_checkpointed_backward_drops_the_loss_graph_before_replaying_the_regions");
 }

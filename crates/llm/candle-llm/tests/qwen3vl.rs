@@ -18,6 +18,15 @@
 //!   which color comes first is a temporal-grounding check; the reversed-order pair (blue→green) makes
 //!   a fixed/order-insensitive answer impossible.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::LlamaProvider;
 use core_llm::{
     Channel, Content, ImageRef, LoadSpec, Message, ProposerKind, Role, Sampling, Speculative,
@@ -117,6 +126,9 @@ fn qwen3vl_vision_grounds_on_image() {
             "{label}: greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl_vision_grounds_on_image");
 }
 
 /// Build a sampled video from solid-color frames at `fps`, with the per-frame timestamps the host
@@ -205,6 +217,9 @@ fn qwen3vl_video_grounds_temporal_order() {
              (blue), got: {content:?}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl_video_grounds_temporal_order");
 }
 
 /// **Video — temporal grounding on a second, independent video (order reversed).** Colors in the
@@ -249,4 +264,7 @@ fn qwen3vl_video_temporal_order_reversed() {
              (green), got: {content:?}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen3vl_video_temporal_order_reversed");
 }

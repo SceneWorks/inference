@@ -14,6 +14,15 @@
 //! 2×24GB consumer GPUs) run by putting contiguous layer blocks on each GPU. The sharded loader
 //! streams each file through host memory, so no single GPU ever holds more than its own shard.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -134,6 +143,7 @@ fn build_tiny_dir() -> tempfile::TempDir {
 /// Sharded-onto-one-device is a perfect drop-in for an ordinary load: same loader output, same
 /// inferred per-layer device, same forward (the cross-device hand-off is a no-op on one device).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn sharded_single_device_matches_plain_cpu() {
     let guard = build_tiny_dir();
     let dir = guard.path();
@@ -168,6 +178,9 @@ fn sharded_single_device_matches_plain_cpu() {
         sharded_out, plain_out,
         "a sharded load onto one device must be token-for-token identical to a plain load"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED sharded_single_device_matches_plain_cpu");
 }
 
 // ---- Real multi-GPU variant (#[ignore]) ----------------------------------------------------------
@@ -193,10 +206,14 @@ mod real {
             .filter(|v| !v.is_empty())
         else {
             eprintln!("skip: set CANDLE_LLM_TEST_MODEL");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/shard.rs:196 (shards_across_two_gpus_and_matches_single): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
         let (Ok(d0), Ok(d1)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
             eprintln!("skip: needs two CUDA devices");
+            #[cfg(feature = "model-inference-proof")]
+            crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/shard.rs:200 (shards_across_two_gpus_and_matches_single): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
             return;
         };
 
@@ -242,6 +259,11 @@ mod real {
         assert_eq!(
             out_sharded, out_single,
             "2-GPU sharded output must match the single-GPU run token-for-token"
+        );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real::shards_across_two_gpus_and_matches_single"
         );
     }
 }

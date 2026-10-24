@@ -143,6 +143,11 @@ fn quantized_segmenter_stays_close_to_dense() {
             dense.len()
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quant_smoke::quantized_segmenter_stays_close_to_dense"
+    );
 }
 
 #[test]
@@ -190,5 +195,10 @@ fn quantized_tracker_stays_close_to_dense() {
     assert!(
         mask_iou > 0.85,
         "tracker Q8 binary IoU {mask_iou:.4} below 0.85"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quant_smoke::quantized_tracker_stays_close_to_dense"
     );
 }

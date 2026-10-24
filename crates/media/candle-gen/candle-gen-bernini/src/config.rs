@@ -88,9 +88,24 @@ impl BerniniKnobs {
     /// (F-145; mirrors krea/boogu's `read_optional_json`, F-073).
     pub fn from_dir(root: &Path) -> CResult<Self> {
         let d = Self::default();
-        let v = read_optional_json(
-            &root.join("bernini_renderer.json"),
-            "bernini_renderer knobs",
+        #[cfg(feature = "model-inference-proof")]
+        let renderer_config_path = root.join("bernini_renderer.json");
+        let v = candle_gen::gen_core::__model_input_choose!(
+            read_optional_json(
+                &root.join("bernini_renderer.json"),
+                "bernini_renderer knobs",
+            ),
+            read_optional_json(&renderer_config_path, "bernini_renderer knobs").inspect(
+                |input: &Option<serde_json::Value>| {
+                    if input.is_some() {
+                        candle_gen::gen_core::model_input_proof::record_reader_paths(
+                            "candle-gen-bernini::config::BerniniKnobs::from_dir/configuration",
+                            candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+                            &[&renderer_config_path],
+                        );
+                    }
+                }
+            )
         )?
         .unwrap_or(serde_json::Value::Null);
         let f = |k: &str, dv: f32| {

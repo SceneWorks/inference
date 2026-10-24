@@ -200,6 +200,8 @@ fn window_one_reduces_the_full_request_peak_against_the_resident_attribution_con
         max_delta <= 1,
         "windowed output changed: max channel delta {max_delta}, mean {mean_delta:.6}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::window_one_reduces_the_full_request_peak_against_the_resident_attribution_control");
 }
 
 #[test]
@@ -322,4 +324,6 @@ fn full_shared_ladder_exercises_every_rung_and_preserves_the_image() {
         gib(baseline.request_peak()),
         gib(full.request_peak()),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED block_residency_real_weights::full_shared_ladder_exercises_every_rung_and_preserves_the_image");
 }

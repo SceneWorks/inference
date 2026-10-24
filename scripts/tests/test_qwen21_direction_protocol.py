@@ -108,7 +108,7 @@ class FailedDonorTests(unittest.TestCase):
                        "url": "https://api.github.com/repos/SceneWorks/inference/releases/402708057", "assets": []}
             release[key] = value
             with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GH_TOKEN": "redacted-test"}):
-                path = Path(directory) / "adapters"
+                path = Path(directory).resolve() / "adapters"
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, "unpublished"):
                     donor.prepare(copy.deepcopy(donor.MANIFEST), path, "a" * 40,
                                   lambda request: io.BytesIO(json.dumps(release).encode()))
@@ -137,7 +137,7 @@ class FailedDonorTests(unittest.TestCase):
             return io.BytesIO(b"wrong" if corrupt else adapter_bytes if request.full_url.endswith("/611294721") else receipt_bytes)
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"GH_TOKEN": "redacted-test"}), \
                 patch.multiple(donor, MANIFEST=manifest, ENTRIES=entries, ADAPTER_SHA=adapter_sha, RECEIPT_SHA=entries[1]["sha256"]):
-            destination = Path(directory) / "adapters"
+            destination = Path(directory).resolve() / "adapters"
             resolved = donor.prepare(manifest, destination, "a" * 40, fetch)
             data = json.loads(resolved.read_text(encoding="utf-8"))
             self.assertEqual(data["kind"], "DIAGNOSTIC_ONLY")
@@ -281,14 +281,14 @@ class ReceiptTests(unittest.TestCase):
 
     def test_negative_velocity_gain_is_observation_not_acceptance(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); source, manifest, _, _, _ = self.fixture(root)
+            root = Path(directory).resolve(); source, manifest, _, _, _ = self.fixture(root)
             result = evidence.validate(root, source, manifest, 0)
             self.assertIs(result["accepted"], False)
             self.assertEqual(result["velocityForwardCount"], 16)
 
     def test_velocity_provenance_counts_arithmetic_and_vector_mutants(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); source, manifest, _, _, receipt = self.fixture(root)
+            root = Path(directory).resolve(); source, manifest, _, _, receipt = self.fixture(root)
             for key, value in [("sourceCandidate", "b" * 40), ("accepted", True), ("acceptanceEvidence", 0),
                                ("arithmeticBoundVerdict", "PASS"), ("forwardCount", 15), ("repeatCount", 1),
                                ("sigma", 0.7), ("adapterStrength", 2), ("cpuCachePeakBytes", 67108865)]:
@@ -308,7 +308,7 @@ class ReceiptTests(unittest.TestCase):
 
     def test_only_completed_style_direction_failure_may_continue(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); source, _, receipt, controls, _ = self.fixture(root)
+            root = Path(directory).resolve(); source, _, receipt, controls, _ = self.fixture(root)
             row = receipt["renders"][2]; row["paletteDistanceGain"] = -1
             controls["stageResult"] = "direction_failed"
             controls["directionFailures"] = [{"tier": "q4", "criterion": "palette_gain", "actual": -1, "floor": 1}]
@@ -325,7 +325,7 @@ class ReceiptTests(unittest.TestCase):
 
     def test_hash_correct_nonfinite_velocity_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); source, manifest, _, _, receipt = self.fixture(root)
+            root = Path(directory).resolve(); source, manifest, _, _, receipt = self.fixture(root)
             vector = receipt["vectors"][0]
             path = root / "velocity-discriminator" / vector["file"]
             raw = struct.pack("<f", float("nan")) + path.read_bytes()[4:]
@@ -336,7 +336,7 @@ class ReceiptTests(unittest.TestCase):
 
     def test_trace_run_identity_and_final_pressure_mutants_abort_continuation(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); source, _, _, controls, _ = self.fixture(root)
+            root = Path(directory).resolve(); source, _, _, controls, _ = self.fixture(root)
             path = root / "style-protocol/stage-controls.json"
             controls["githubRunId"] = "123"
             path.write_text(json.dumps(controls), encoding="utf-8")

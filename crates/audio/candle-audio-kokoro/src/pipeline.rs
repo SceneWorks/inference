@@ -143,9 +143,7 @@ impl KokoroPipeline {
         let t = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, t), &self.device)?;
         let bert_dur = self.bert.forward(&input_ids)?; // [1, T, 768]
-        let d_en = self
-            .bert_encoder
-            .forward(&bert_dur)? // [1, T, 512]
+        let d_en = __model_proof_output!(self.bert_encoder.forward(&bert_dur))? // [1, T, 512]
             .transpose(1, 2)?
             .contiguous()?; // [1, 512, T]
         stage(1)?;
@@ -219,9 +217,7 @@ impl KokoroPipeline {
         let input_ids = Tensor::from_vec(ids, (1, t), &self.device)?;
         let (_, style_prosody) = split_ref_s(ref_s, &self.device)?;
         let bert_dur = self.bert.forward(&input_ids)?;
-        let d_en = self
-            .bert_encoder
-            .forward(&bert_dur)?
+        let d_en = __model_proof_output!(self.bert_encoder.forward(&bert_dur))?
             .transpose(1, 2)?
             .contiguous()?;
         let d = self.predictor.text_encoder.forward(&d_en, &style_prosody)?;

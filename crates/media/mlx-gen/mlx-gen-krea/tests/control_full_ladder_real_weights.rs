@@ -175,4 +175,6 @@ fn pose_control_attention_and_base_window_reduce_peak_without_changing_output() 
         max_delta,
         mean_delta,
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED control_full_ladder_real_weights::pose_control_attention_and_base_window_reduce_peak_without_changing_output");
 }

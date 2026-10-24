@@ -40,6 +40,9 @@ fn chroma_hd_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_chroma::load_hd(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::chroma_hd_conformance");
 }
 
 #[test]
@@ -58,4 +61,7 @@ fn chroma_flash_conformance() {
         ..Profile::cheap()
     };
     conformance(|| candle_gen_chroma::load_flash(&spec).unwrap(), &profile);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::chroma_flash_conformance");
 }

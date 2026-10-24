@@ -84,4 +84,6 @@ fn registered_native_route_emits_one_numbered_frame_per_step() {
         assert_eq!((frame.image.width, frame.image.height), (64, 64));
     }
     save_evidence(&frames, &final_image);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED preview_real_weights::registered_native_route_emits_one_numbered_frame_per_step");
 }

@@ -487,12 +487,16 @@ fn install_retired(
 #[ignore = "fixed real-weight 16-forward diagnostic; DIAGNOSTIC_ONLY, never image acceptance"]
 fn diagnostic_dense_q4_conditioning_velocity() {
     run(Binding::Historical).unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioning_velocity_diagnostic::diagnostic_dense_q4_conditioning_velocity");
 }
 
 #[test]
 #[ignore = "fixed current-adapter teacher-forced diagnostic; zero renders/training; never acceptance"]
 fn diagnostic_current_failed_adapter_dense_q4_conditioning_velocity() {
     run(Binding::CurrentFailedNative768).unwrap();
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioning_velocity_diagnostic::diagnostic_current_failed_adapter_dense_q4_conditioning_velocity");
 }
 
 fn run(binding: Binding) -> Result<()> {
@@ -908,5 +912,6 @@ fn run(binding: Binding) -> Result<()> {
     receipt["phaseTraceComplete"] = json!(trace.len() == 25);
     assert_eq!(trace.len(), 25);
     evidence::write_json(&out, "receipt", &receipt);
+    crate::model_inference_device::record_model_inference_device();
     Ok(())
 }

@@ -63,7 +63,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// scheduler port.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        encoder_contract: Some(crate::active_encoder_contract()),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
@@ -331,7 +331,7 @@ pub fn load_from_comfyui_components(
     tokenizer_root: impl AsRef<Path>,
 ) -> Result<Box<dyn Generator>> {
     let text_encoder_file = text_encoder_file.as_ref();
-    let text_encoder = crate::ENCODER_CONTRACT.validate_comfyui_source_against_base(
+    let text_encoder = crate::active_encoder_contract().validate_comfyui_source_against_base(
         &WeightsSource::File(text_encoder_file.to_owned()),
         tokenizer_root.as_ref(),
     )?;
@@ -349,7 +349,7 @@ pub fn load_from_comfyui_checkpoint(
 ) -> Result<Box<dyn Generator>> {
     let checkpoint = gen_core::PinnedWeightsFile::pin(checkpoint_file.as_ref())?;
     let tokenizer = checkpoint.read_unchanged(|path| {
-        crate::ENCODER_CONTRACT.validate_embedded_comfyui_file_against_base(
+        crate::active_encoder_contract().validate_embedded_comfyui_file_against_base(
             path,
             &[
                 "conditioner.embedders.0.transformer.",
@@ -827,7 +827,7 @@ pub(crate) fn component_footprint(
             ))
         }
     };
-    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let selected = crate::active_encoder_contract().source_for_load(spec, root)?;
     let text_encoder = selected.read_unchanged(|source| {
         Ok::<u64, gen_core::Error>(match source {
             WeightsSource::Dir(path) | WeightsSource::File(path) => {

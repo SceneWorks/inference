@@ -112,6 +112,7 @@ fn scail2_provider_geometry_is_the_wan_z16_geometry() {
 /// per-tile-whole-decoder 3.407e-1 — a 47 % reduction. If SCAIL-2 ever stopped routing to the fixed
 /// `WanVae::decode_tiled` (or that head/tail split regressed to whole-tail tiling), the two numbers
 /// converge and this fails.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn scail2_bounded_decode_is_closer_to_dense_than_per_tile_normalization() {
     let (vae, latent) = fixture_vae();
@@ -140,11 +141,14 @@ fn scail2_bounded_decode_is_closer_to_dense_than_per_tile_normalization() {
         "SCAIL-2's bounded decode is not keeping the middle-block attention whole: \
          bounded={bounded_rel:.3e} vs per-tile={per_tile_rel:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::scail2_bounded_decode_is_closer_to_dense_than_per_tile_normalization");
 }
 
 /// The tiling control. A request too wide to tile must be the *exact* single-pass decode — the
 /// mutation control that separates "bounded and correct" from "never bounded", which the relative
 /// claim above cannot see on its own.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_request_too_wide_to_tile_is_the_exact_single_pass_decode() {
     let (vae, latent) = fixture_vae();
@@ -161,6 +165,8 @@ fn a_request_too_wide_to_tile_is_the_exact_single_pass_decode() {
         fallthrough.as_slice::<f32>(),
         "a request too wide to tile must be the exact single-pass decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_inheritance::a_request_too_wide_to_tile_is_the_exact_single_pass_decode");
 }
 
 /// A pre-tripped cancel must be observed before any tensor work on the SCAIL-2 seam too — the decode

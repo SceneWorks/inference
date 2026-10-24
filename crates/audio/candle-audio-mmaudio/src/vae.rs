@@ -179,7 +179,7 @@ impl MpConv1d {
 
     /// `(B, in, L) → (B, out, L)` (kernel-size-preserving; stride 1, dilation 1).
     pub fn forward(&self, x: &Tensor) -> CResult<Tensor> {
-        let y = x.conv1d(&self.weight, self.padding, 1, 1, 1)?;
+        let y = __model_proof_output!(x.conv1d(&self.weight, self.padding, 1, 1, 1))?;
         if (self.gain - 1.0).abs() < f64::EPSILON {
             Ok(y)
         } else {

@@ -185,7 +185,13 @@ impl Weights {
 /// Mirrors krea's `read_packed_config` and z-image's `component_is_packed` (sc-9426, F-073 sibling).
 fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
     let path = dir.join("config.json");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match candle_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(&path),
+"crates/media/candle-gen/candle-gen-boogu/src/loader.rs::read_packed_config::std::fs::read_to_string@8917",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+) {
         Ok(t) => t,
         // No config.json at all → legitimate dense / single-file fixture tier.
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -454,6 +460,7 @@ mod tests {
     /// forward reproduces the affine grid the pack represents (proving the group-32 repack + threading is
     /// correct, not a silent dense fallback).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
@@ -494,6 +501,8 @@ mod tests {
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged");
         Ok(())
     }
 
@@ -644,6 +653,7 @@ mod tests {
     /// reproduces its affine grid rows, dequantized to the component dtype (dtype parity); a dense
     /// `embed_tokens` (the boogu tier actually keeps this table bf16) stays `Dense`.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn embedding_detect_group32() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (96usize, 128usize);
@@ -674,6 +684,8 @@ mod tests {
             "group-32 packed embedding deviates from the grid"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::embedding_detect_group32");
         Ok(())
     }
 
@@ -683,6 +695,7 @@ mod tests {
     /// store, since a dequant to bf16 would round the q4 rows before the encoder's f32 widen. Reverting
     /// the pin to `w.dtype()` makes this dequantize to bf16 → the dtype assertion below fails RED.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_embedding_dequants_f32_on_bf16_store() -> Result<()> {
         let dev = Device::Cpu;
         let (vocab, hidden) = (96usize, 128usize);
@@ -717,6 +730,8 @@ mod tests {
             "f32-dequant packed embed deviates from the grid"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED loader::tests::packed_embedding_dequants_f32_on_bf16_store");
         Ok(())
     }
 }

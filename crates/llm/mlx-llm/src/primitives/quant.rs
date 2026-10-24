@@ -388,6 +388,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quantized_embedding_gathers_rows_without_expanding_the_table() {
         let dense = Array::from_slice(
             &(0..4 * 64)
@@ -415,6 +416,8 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(left, right)| (*left - *right).abs() <= f32::EPSILON));
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::quantized_embedding_gathers_rows_without_expanding_the_table");
     }
 
     /// Quantize→dequantize should round-trip within the affine grid's tolerance.
@@ -439,6 +442,7 @@ mod tests {
 
     /// Quantized matmul should approximate the dense linear it replaces.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn quantized_matmul_approximates_linear_q8() {
         let n = 4 * 64;
         let wdata: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32 / 13.0) - 0.5).collect();
@@ -453,5 +457,7 @@ mod tests {
         for (a, b) in dense.iter().zip(&quant) {
             assert!((a - b).abs() < 0.05, "{a} vs {b}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::quantized_matmul_approximates_linear_q8");
     }
 }

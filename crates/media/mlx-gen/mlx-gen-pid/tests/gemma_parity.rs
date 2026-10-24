@@ -12,6 +12,7 @@ use mlx_rs::Array;
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
 mod quantum_metal_guard;
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[cfg(target_os = "macos")]
 #[test]
 fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
@@ -20,6 +21,7 @@ fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
+                "--include-ignored",
                 "gemma_parity::gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom",
                 "--nocapture",
             ])
@@ -27,6 +29,7 @@ fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
             .status()
             .unwrap();
         assert!(status.success());
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED gemma_parity::gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom");
         return;
     }
     assert!(quantum_metal_guard::forbid_metal());
@@ -56,6 +59,9 @@ fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         .unwrap_err()
         .to_string()
         .contains("before construction"));
+
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma_parity::gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom");
 }
 
 fn max_abs(a: &Array) -> f32 {
@@ -77,6 +83,7 @@ fn tiny_cfg() -> Gemma2Config {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn gemma2_decoder_matches() {
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
@@ -98,4 +105,6 @@ fn gemma2_decoder_matches() {
         rel < 2e-2,
         "gemma2 last_hidden peak-rel={rel} (max|Δ|={d}) — divergence in the decoder forward"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED gemma_parity::gemma2_decoder_matches");
 }

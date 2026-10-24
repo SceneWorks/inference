@@ -124,6 +124,10 @@ fn video_connector_matches_reference() -> candle_gen::Result<()> {
         "video connector valid-row peak_rel {pr_valid:.3e} too high"
     );
     assert!(pr < 1.5e-1, "video connector peak_rel {pr:.3e} too high");
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED connector_parity::video_connector_matches_reference"
+    );
     Ok(())
 }
 
@@ -157,5 +161,9 @@ fn audio_connector_matches_reference() -> candle_gen::Result<()> {
         "audio connector valid-row peak_rel {pr_valid:.3e} too high"
     );
     assert!(pr < 2.5e-1, "audio connector peak_rel {pr:.3e} too high");
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED connector_parity::audio_connector_matches_reference"
+    );
     Ok(())
 }

@@ -9,6 +9,15 @@
 //!   cargo test --features cuda --test breadth -- --ignored --nocapture
 //! ```
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_llm::{load_for_model, provider::LlamaProvider};
 use core_llm::{
     AudioRef, Content, ImageRef, LoadSpec, Message, Quantize, Role, Sampling, StreamEvent, TextLlm,
@@ -21,6 +30,8 @@ use core_llm::{
 fn assert_streams_coherent(env: &str, family: &str) {
     let Some(dir) = std::env::var(env).ok().filter(|v| !v.is_empty()) else {
         eprintln!("skip: set {env}");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/breadth.rs:24 (assert_streams_coherent): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let spec = LoadSpec::dense(dir);
@@ -74,6 +85,9 @@ fn assert_streams_coherent(env: &str, family: &str) {
 #[ignore = "needs a Phi-3 snapshot via CANDLE_LLM_PHI3_MODEL"]
 fn phi3_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_PHI3_MODEL", "phi3");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED phi3_streams_coherent_text");
 }
 
 /// Qwen2-MoE: Qwen2 attention (q/k/v bias) + a sparse MoE FFN (router + top-k experts + shared).
@@ -81,6 +95,9 @@ fn phi3_streams_coherent_text() {
 #[ignore = "needs a Qwen2-MoE snapshot via CANDLE_LLM_QWEN2MOE_MODEL"]
 fn qwen2_moe_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_QWEN2MOE_MODEL", "qwen2_moe");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen2_moe_streams_coherent_text");
 }
 
 /// Gemma-2: `(1+weight)` norms, embedding ×√hidden, GeGLU, soft-capped attention + final logits,
@@ -89,6 +106,9 @@ fn qwen2_moe_streams_coherent_text() {
 #[ignore = "needs a Gemma-2 snapshot via CANDLE_LLM_GEMMA2_MODEL"]
 fn gemma2_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GEMMA2_MODEL", "gemma2");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma2_streams_coherent_text");
 }
 
 /// GLM-4: 4-norm sandwich (standard RMSNorm), q/k/v bias, packed gate_up, and partial + interleaved
@@ -97,6 +117,9 @@ fn gemma2_streams_coherent_text() {
 #[ignore = "needs a GLM-4 snapshot via CANDLE_LLM_GLM4_MODEL"]
 fn glm4_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GLM4_MODEL", "glm4");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED glm4_streams_coherent_text");
 }
 
 /// DeepSeek-V2: Multi-head Latent Attention (low-rank KV path + decoupled YaRN RoPE) and a fine-
@@ -106,6 +129,9 @@ fn glm4_streams_coherent_text() {
 #[ignore = "needs a DeepSeek-V2 snapshot via CANDLE_LLM_DEEPSEEK_MODEL"]
 fn deepseek_v2_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_DEEPSEEK_MODEL", "deepseek_v2");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED deepseek_v2_streams_coherent_text");
 }
 
 /// Gemma 4 unified (sc-18761): the **per-layer-type** decoder — 40 `sliding_attention` layers
@@ -121,6 +147,9 @@ fn deepseek_v2_streams_coherent_text() {
 #[ignore = "needs a Gemma 4 unified snapshot via CANDLE_LLM_GEMMA4_MODEL"]
 fn gemma4_unified_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GEMMA4_MODEL", "gemma4_unified");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_unified_streams_coherent_text");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -147,6 +176,8 @@ fn gemma4_provider(quantize: Option<Quantize>) -> Option<LlamaProvider> {
         .filter(|v| !v.is_empty())
     else {
         eprintln!("skip: set CANDLE_LLM_GEMMA4_MODEL to a google/gemma-4-12B-it snapshot");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/breadth.rs:150 (gemma4_provider): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return None;
     };
     let spec = LoadSpec {
@@ -213,6 +244,8 @@ fn answer_channel(text: &str) -> String {
 #[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
 fn gemma4_answers_at_a_quantized_tier() {
     let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/breadth.rs:216 (gemma4_answers_at_a_quantized_tier): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     assert!(p.is_quantized(), "the Q4 tier must actually be applied");
@@ -227,6 +260,9 @@ fn gemma4_answers_at_a_quantized_tier() {
         out.to_lowercase().contains("paris"),
         "a coherent Q4 Gemma 4 should name Paris; got {out:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_answers_at_a_quantized_tier");
 }
 
 /// **Image conditioning, demonstrated.** The model must answer a question whose only possible source
@@ -253,6 +289,8 @@ fn gemma4_answers_at_a_quantized_tier() {
 #[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL; currently RED - vision unvalidated"]
 fn gemma4_answers_about_an_image() {
     let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/breadth.rs:256 (gemma4_answers_about_an_image): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     assert!(
@@ -291,6 +329,9 @@ fn gemma4_answers_about_an_image() {
         bl.contains("blue") && !bl.contains("red"),
         "a blue left half must be answered 'blue'; got {blue_left:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_answers_about_an_image");
 }
 
 /// **Audio conditioning, demonstrated.** A clip measurably reaches the decoder: generation succeeds
@@ -305,6 +346,8 @@ fn gemma4_answers_about_an_image() {
 #[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
 fn gemma4_accepts_audio_conditioning() {
     let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/breadth.rs:308 (gemma4_accepts_audio_conditioning): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     assert!(
@@ -351,4 +394,7 @@ fn gemma4_accepts_audio_conditioning() {
         "a tone and silence must not produce identical continuations — identical output means the \
          audio never reached the decoder"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gemma4_accepts_audio_conditioning");
 }

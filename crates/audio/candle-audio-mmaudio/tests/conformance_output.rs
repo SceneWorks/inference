@@ -35,6 +35,16 @@
 //! panics when either is unset, because inference never self-fetches and never derives a hub-cache
 //! location (epic 13657). There is no hub fallback.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 mod common;
 
 use candle_audio_mmaudio as mm;
@@ -152,6 +162,9 @@ fn output_latent_to_waveform_finite_deterministic() {
         mm::bigvgan::HOP * 2 * LATENT_LEN,
         w_var.sqrt()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED output_latent_to_waveform_finite_deterministic");
 }
 
 /// Numerical parity for the 16k output path against the committed PyTorch reference (sc-17285).
@@ -237,4 +250,7 @@ fn output_16k_matches_reference() {
              is mis-scaled even if its shape matches"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED output_16k_matches_reference");
 }

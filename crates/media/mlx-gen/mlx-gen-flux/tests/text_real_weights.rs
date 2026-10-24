@@ -44,4 +44,8 @@ fn flux_text_path_runs_on_real_weights() {
     );
     assert_eq!(prompt_embeds.shape()[2], 4096);
     assert_eq!(pooled.shape(), &[1, 768]);
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED text_real_weights::flux_text_path_runs_on_real_weights"
+    );
 }

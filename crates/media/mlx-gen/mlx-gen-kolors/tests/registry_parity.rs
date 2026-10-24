@@ -118,6 +118,8 @@ fn registry_t2i_and_count() {
     req.count = 2;
     assert_coherent(run(&base_spec(), &req), 2);
     println!("✓ mlx_gen_kolors::provider_registry().unwrap().load(\"kolors\").generate T2I (count=2) renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_t2i_and_count");
 }
 
 #[test]
@@ -130,6 +132,8 @@ fn registry_img2img() {
     }];
     assert_coherent(run(&base_spec(), &req), 1);
     println!("✓ registry img2img (Reference) renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_img2img");
 }
 
 fn images_of(out: GenerationOutput) -> Vec<Image> {
@@ -173,6 +177,8 @@ fn registry_t2i_matches_direct() {
         "registry T2I must be byte-identical to the struct-API generate (single denoise assembly)"
     );
     println!("✓ registry T2I == direct generate, byte-identical (F-146 single assembly)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_t2i_matches_direct");
 }
 
 /// F-146 drift guard for the img2img assembly — the one with the trickiest RNG order (VAE-encode the
@@ -210,6 +216,8 @@ fn registry_img2img_matches_direct() {
         "registry img2img must be byte-identical to the struct-API img2img (RNG order preserved)"
     );
     println!("✓ registry img2img == direct img2img, byte-identical (F-146 single assembly)");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_img2img_matches_direct");
 }
 
 #[test]
@@ -219,6 +227,8 @@ fn registry_quant_q8() {
     spec.quantize = Some(Quant::Q8);
     assert_coherent(run(&spec, &t2i_req()), 1);
     println!("✓ registry Q8 load + T2I renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_quant_q8");
 }
 
 #[test]
@@ -234,6 +244,8 @@ fn registry_controlnet() {
     }];
     assert_coherent(run(&spec, &req), 1);
     println!("✓ registry ControlNet (Control/Pose) renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_controlnet");
 }
 
 #[test]
@@ -249,4 +261,6 @@ fn registry_ip_adapter() {
     }];
     assert_coherent(run(&spec, &req), 1);
     println!("✓ registry IP-Adapter (Reference = image prompt) renders coherently");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED registry_parity::registry_ip_adapter");
 }

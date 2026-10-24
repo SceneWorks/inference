@@ -362,16 +362,19 @@ impl QuantizedLinear {
     /// cast back to `x`'s dtype so it composes with a bf16 decoder.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = match &self.inner {
-            QuantizedWeight::Matmul(inner) => inner
-                .forward(&x.to_dtype(DType::F32)?)?
-                .to_dtype(x.dtype())?,
+            QuantizedWeight::Matmul(inner) => {
+                __model_proof_output!(inner.forward(&x.to_dtype(DType::F32)?))?
+                    .to_dtype(x.dtype())?
+            }
             QuantizedWeight::Dequant(weight) => {
                 let dense = weight.dequantize(x.device())?.to_dtype(x.dtype())?;
-                Linear::new(dense, None).forward(x)?
+                __model_proof_output!(Linear::new(dense, None).forward(x))?
             }
         };
         match &self.bias {
-            Some(b) => Ok(y.broadcast_add(&b.to_dtype(y.dtype())?)?),
+            Some(b) => Ok(__model_proof_output!(
+                y.broadcast_add(&b.to_dtype(y.dtype())?)
+            )?),
             None => Ok(y),
         }
     }
@@ -385,6 +388,7 @@ mod tests {
 
     /// Quantized matmul should approximate the dense linear it replaces (Q8_0, in=256 = 8 blocks).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantized_matmul_approximates_linear_q8() {
         let (out, inn) = (4usize, 256usize);
         let wdata: Vec<f32> = (0..out * inn)
@@ -411,6 +415,9 @@ mod tests {
         for (a, b) in dense.iter().zip(&quant) {
             assert!((a - b).abs() < 0.05, "{a} vs {b}");
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::quantized_matmul_approximates_linear_q8");
     }
 
     /// sc-26266: a weight-only projection holds the same GGML blocks as the `QMatMul` one (same
@@ -421,6 +428,7 @@ mod tests {
     /// *Mutation that reds this:* `quantize_dequantized` building a `QuantizedWeight::Matmul` (for
     /// any one of Q8_0 / Q4_0 / Q4_K), or `dequantizes_forward` not reporting it.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn a_dequantized_forward_projection_never_quantizes_the_activation() {
         // Q4_K is the shipped q4 tier on 256-aligned widths (the real Qwen3-VL tower); its
         // super-block needs `in` = 256.
@@ -431,6 +439,9 @@ mod tests {
         ] {
             weight_only_forward_is_exact(dtype, inn);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::a_dequantized_forward_projection_never_quantizes_the_activation");
     }
 
     fn weight_only_forward_is_exact(dtype: GgmlDType, inn: usize) {
@@ -499,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn mlx_affine_q8_reconstructs_lsb_bytes_bias_and_input_groups() {
         let dev = Device::Cpu;
         let (out, inn, group) = (2usize, 64usize, 16usize);
@@ -547,6 +559,9 @@ mod tests {
 
         let y = packed.forward(&x).unwrap();
         assert_eq!(y.dims(), &[2, out]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::tests::mlx_affine_q8_reconstructs_lsb_bytes_bias_and_input_groups");
     }
 
     /// sc-24444: a 4-bit MLX affine triple (eight little-endian nibbles per word — a published
@@ -639,6 +654,7 @@ mod cuda_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn quantize_on_load_zeroes_the_padding_mmq_reads() {
         let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
         let Device::Cuda(cuda) = &dev else {
@@ -700,5 +716,8 @@ mod cuda_tests {
                 }
             }
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED primitives::quant::cuda_tests::quantize_on_load_zeroes_the_padding_mmq_reads");
     }
 }

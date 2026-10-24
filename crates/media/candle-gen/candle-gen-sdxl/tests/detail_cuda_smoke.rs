@@ -92,4 +92,9 @@ fn sdxl_family_tile_detail_real_cuda() {
         plain.pixels, output.pixels,
         "positive tile-ControlNet scale must change deterministic img2img output"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED detail_cuda_smoke::sdxl_family_tile_detail_real_cuda"
+    );
 }

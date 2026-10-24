@@ -101,7 +101,7 @@ static INSTALLED: OnceLock<bool> = OnceLock::new();
 /// the trap is in place (`false` only on a host with no Metal device, where there is no GPU to
 /// protect).
 pub fn forbid_metal() -> bool {
-    *INSTALLED.get_or_init(|| unsafe {
+    let installed = *INSTALLED.get_or_init(|| unsafe {
         let device = MTLCreateSystemDefaultDevice();
         if device.is_null() {
             return false;
@@ -116,7 +116,73 @@ pub fn forbid_metal() -> bool {
             }
         }
         true
-    })
+    });
+    if installed {
+        record_model_inference_device();
+    }
+    installed
+}
+
+/// Opt-in proof evidence of the selected execution stream INSIDE the actual
+/// model/device scope. Call before restoring that scope, never in a root
+/// orchestrator on behalf of its CPU workers. No graph evaluation is added.
+/// Ordinary tests (without MODEL_INFERENCE_CASE_FQN) perform no MLX query here.
+pub fn record_model_inference_device() {
+    record_model_inference_device_inner(metal_forbidden());
+}
+
+fn record_model_inference_device_inner(cpu_trapped: bool) {
+    let Some(case) = std::env::var_os("MODEL_INFERENCE_CASE_FQN") else {
+        return;
+    };
+    let case = case.into_string().expect("model-proof case must be UTF-8");
+    assert!(
+        !case.is_empty()
+            && case
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':'),
+        "model-proof case must be an exact Rust test FQN"
+    );
+    let stream = mlx_rs::Stream::task_local_or_default();
+    let device = stream
+        .get_device()
+        .expect("read selected model stream device");
+    let selected_cpu = match device.get_type().expect("read selected model device type") {
+        mlx_rs::DeviceType::Cpu => true,
+        mlx_rs::DeviceType::Gpu => false,
+    };
+    if cpu_trapped {
+        assert!(
+            metal_forbidden(),
+            "CPU device evidence requires the armed Metal trap"
+        );
+        let default = mlx_rs::Device::try_default().expect("read actual default model device");
+        assert!(
+            matches!(
+                default.get_type().expect("read default device type"),
+                mlx_rs::DeviceType::Cpu
+            ),
+            "CPU proof must bind the CPU default BEFORE arming the Metal trap"
+        );
+        assert!(
+            selected_cpu,
+            "CPU proof selected a non-CPU execution stream"
+        );
+        let default_stream = mlx_rs::Stream::cpu();
+        let default_stream_device = default_stream
+            .get_device()
+            .expect("read default CPU stream device");
+        assert!(matches!(
+            default_stream_device
+                .get_type()
+                .expect("read default CPU stream type"),
+            mlx_rs::DeviceType::Cpu
+        ));
+    }
+    // Only the selected execution stream is primary evidence. A default device
+    // or unrelated registered stream is NOT unioned into the model's device set.
+    let backend = if selected_cpu { "mlx-cpu" } else { "mlx-metal" };
+    eprintln!("\nMODEL_INFERENCE_DEVICE {case} {backend}");
 }
 
 /// Whether [`forbid_metal`] has armed the trap in this process.

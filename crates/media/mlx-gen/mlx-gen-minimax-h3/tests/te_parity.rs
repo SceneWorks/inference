@@ -51,6 +51,7 @@ fn run(w: &Weights, cfg: &MiniMaxH3TeConfig) -> Array {
 }
 
 /// The headline parity gate: the port reproduces the reference's select-layer context.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn context_matches_the_reference() {
     let w = load();
@@ -62,6 +63,8 @@ fn context_matches_the_reference() {
     let (peak, mean) = rel(&got, want);
     println!("H3 TE context parity: peak-rel={peak:.3e} mean-rel={mean:.3e}");
     assert_parity(&got, want, TOL, "h3 te context");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::context_matches_the_reference");
 }
 
 /// **The single highest-risk detail in this story.** HF `hidden_states[k]` is the state after `k`
@@ -71,6 +74,7 @@ fn context_matches_the_reference() {
 /// implementation still returns a well-formed tensor of the right shape. This asserts the port is
 /// **unequal** to both neighbours by a wide margin, so moving the tap one layer in either direction
 /// fails here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn layer_selection_is_off_by_one_safe_in_both_directions() {
     let w = load();
@@ -95,11 +99,14 @@ fn layer_selection_is_off_by_one_safe_in_both_directions() {
              test would pass against a shifted selection"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::layer_selection_is_off_by_one_safe_in_both_directions");
 }
 
 /// Shifting `select_hidden` by one must actually change the output — the converse of the test
 /// above, driven through the config rather than the fixture. This proves the knob is wired, not
 /// merely that three reference tensors differ from each other.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn shifting_select_hidden_changes_the_context() {
     let w = load();
@@ -120,11 +127,16 @@ fn shifting_select_hidden_changes_the_context() {
             "select_hidden {delta:+} produced the same context as the correct tap (peak {peak:.3e})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED te_parity::shifting_select_hidden_changes_the_context"
+    );
 }
 
 /// Only `select_hidden` layers are ever loaded — the evidence sc-17139's hosting decision rests on.
 /// Layers `select_hidden..num_layers`, the final `norm` and `lm_head` are never touched, so they
 /// can be trimmed from an uploaded artifact without changing a single output value.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn only_the_selected_layers_are_loaded() {
     let w = load();
@@ -160,6 +172,8 @@ fn only_the_selected_layers_are_loaded() {
         TOL,
         "context from a trimmed checkpoint",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::only_the_selected_layers_are_loaded");
 }
 
 /// **sc-18741.** The context keeps ONE ROW PER PRESENTATION TOKEN — nothing is sliced off the
@@ -167,6 +181,7 @@ fn only_the_selected_layers_are_loaded() {
 ///
 /// Asserted against the reference tensor's own length rather than a constant, so a slice
 /// reintroduced anywhere in the forward shortens the output and fails here.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn context_keeps_every_presentation_row() {
     let w = load();
@@ -181,12 +196,15 @@ fn context_keeps_every_presentation_row() {
          came back (sc-18741)"
     );
     assert_eq!(w.require("out.context").unwrap().shape()[1], seq);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::context_keeps_every_presentation_row");
 }
 
 /// A short prompt must work. Under sc-17143's prefix slice, any prompt of 3 tokens or fewer was a
 /// hard error ("must exceed the 3 dropped template-prefix tokens") — a real capability loss that
 /// fell out of a slice the reference never performs. `MiniMax-H3` prompts like `"东京的夜景"`
 /// tokenize to 4 ids, and `"\ttab start"` to 2.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn short_prompts_are_accepted() {
     let w = load();
@@ -201,10 +219,13 @@ fn short_prompts_are_accepted() {
             .unwrap_or_else(|e| panic!("{s}-token prompt must encode, got: {e}"));
         assert_eq!(out.shape(), &[1, s, cfg.hidden_size], "{s}-token context");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::short_prompts_are_accepted");
 }
 
 /// **Mutation check.** Perturbing any weight the forward depends on must move the output; a parity
 /// test that passes against a mutated checkpoint is not testing the math.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mutating_a_weight_changes_the_context() {
     let w = load();
@@ -233,11 +254,14 @@ fn mutating_a_weight_changes_the_context() {
             "mutating {key} moved the context by only {peak:.3e} — it is not load-bearing"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::mutating_a_weight_changes_the_context");
 }
 
 /// Mutating a tensor the encoder must NOT read (a layer past the tap, the final norm, `lm_head`)
 /// must leave the output bit-identical. This is the other half of the trim evidence: it proves the
 /// unused tail is genuinely unused rather than merely unlisted.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn mutating_an_unused_tensor_changes_nothing() {
     let w = load();
@@ -261,6 +285,8 @@ fn mutating_an_unused_tensor_changes_nothing() {
             "{key} is past the layer-{SELECT_HIDDEN} tap but moved the context by {peak:.3e}"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::mutating_an_unused_tensor_changes_nothing");
 }
 
 /// **Non-constant-field check.** A golden whose expected output is ~constant would pass against an

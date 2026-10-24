@@ -277,10 +277,16 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 /// consume, falling back to the upstream `BerniniConfig` defaults where a field is absent.
 fn planner_knobs(pkg: &Path) -> serde_json::Value {
     use serde_json::json;
-    let cfg: serde_json::Value = std::fs::read(pkg.join("config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_else(|| json!({}));
+    let cfg: serde_json::Value = mlx_gen::gen_core::__model_input_reader!(
+        std::fs::read(pkg.join("config.json")),
+        "crates/media/mlx-gen/mlx-gen-bernini/src/convert.rs::planner_knobs::std::fs::read@12350",
+        ArtifactInput,
+        pkg.join("config.json"),
+        |__model_input_path| std::fs::read(__model_input_path)
+    )
+    .ok()
+    .and_then(|b| serde_json::from_slice(&b).ok())
+    .unwrap_or_else(|| json!({}));
     let f = |k: &str, d: f64| cfg.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
     let b = |k: &str, d: bool| cfg.get(k).and_then(serde_json::Value::as_bool).unwrap_or(d);
     let i = |k: &str, d: i64| cfg.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);

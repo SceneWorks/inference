@@ -71,6 +71,9 @@ fn v1pt5_flux_loads_and_forwards() {
         "v1.5 forward degenerate (peak={peak})"
     );
     eprintln!("candle v1.5 flux forward OK — output [1,3,64,64], peak|·|={peak:.4}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED v1pt5_real_weights::v1pt5_flux_loads_and_forwards");
 }
 
 #[test]
@@ -99,5 +102,10 @@ fn v1pt5_flux_forward_matches_reference() {
     assert!(
         peak_rel < 5e-3,
         "candle v1.5 forward diverges from reference: peak-rel={peak_rel} (max|Δ|={max_abs_diff})"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED v1pt5_real_weights::v1pt5_flux_forward_matches_reference"
     );
 }

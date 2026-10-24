@@ -1461,6 +1461,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn scale_zero_lora_is_bit_exact_noop_on_a_bf16_dense_base() {
         let (mut lin, x, a, b) = bf16_host();
         let base = lin.forward(&x).unwrap();
@@ -1491,6 +1492,8 @@ mod tests {
             !bit_exact(&live.forward(&x).unwrap(), &base),
             "a live adapter must change the forward (residual is not identically zero)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::scale_zero_lora_is_bit_exact_noop_on_a_bf16_dense_base");
     }
 
     /// A `[rows, cols]` f32 array whose every entry is `+INFINITY`.
@@ -1499,6 +1502,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_disabled_adapters_residual_is_never_evaluated() {
         // sc-15265, MAJOR-1 gate. This is the ONLY test that discriminates the `is_disabled()`
         // short-circuit in `apply_adapters` from the narrowing cast beside it. Every other
@@ -1595,9 +1599,12 @@ mod tests {
             bit_exact(&poisoned.forward_upcast(&x).unwrap(), &upcast_base),
             "forward_upcast must short-circuit a disabled adapter too"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::a_disabled_adapters_residual_is_never_evaluated");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn scale_zero_lora_is_bit_exact_noop_on_a_packed_base() {
         for bits in [4, 8] {
             let (mut lin, x, a, b) = bf16_host();
@@ -1617,9 +1624,12 @@ mod tests {
                 "q{bits}: a scale-0 adapter must be bit-exact to no adapter at all"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::scale_zero_lora_is_bit_exact_noop_on_a_packed_base");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn scale_zero_lokr_variants_are_bit_exact_noops_on_a_bf16_base() {
         // The two LoKr arms, both of which are pure regression pins rather than reproductions of
         // the sc-15265 promotion:
@@ -1670,9 +1680,12 @@ mod tests {
             bit_exact(&got, &base),
             "a scale-0 structured LoKr must be bit-exact to no adapter"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::scale_zero_lokr_variants_are_bit_exact_noops_on_a_bf16_base");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn live_adapter_keeps_the_host_output_dtype_and_matches_a_cast_residual() {
         // Half 2 (sc-15265): the widening is NOT confined to scale 0. A live f32-factor adapter
         // over a bf16 host must land its residual in the host dtype — `bf16(base) + bf16(residual)`
@@ -1699,9 +1712,12 @@ mod tests {
             bit_exact(&got, &want),
             "the forward must be base + host-dtype(residual)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::live_adapter_keeps_the_host_output_dtype_and_matches_a_cast_residual");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_training_stack_keeps_its_pre_sc15265_numerics() {
         // sc-15265 rule 0. The trainers ship f32 master factors over bf16 block streams
         // (`install_training_lora` passes `dtype = None`); narrowing that residual would round the
@@ -1754,9 +1770,12 @@ mod tests {
             Dtype::Bfloat16,
             "set_adapters must clear the training flag, not leave it latched"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::a_training_stack_keeps_its_pre_sc15265_numerics");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_upcast_also_keeps_its_own_output_dtype() {
         // `forward_upcast` widens the BASE to the activation dtype on purpose; the adapter must
         // still not widen it any further than that.
@@ -1775,9 +1794,12 @@ mod tests {
             bit_exact(&zero, &base),
             "forward_upcast: a scale-0 adapter must be a bit-exact no-op too"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::forward_upcast_also_keeps_its_own_output_dtype");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_upcast_uses_activation_dtype_without_mutating_storage() {
         let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2])
             .as_dtype(Dtype::Bfloat16)
@@ -1796,6 +1818,8 @@ mod tests {
             panic!("expected dense base");
         };
         assert_eq!(base.weight.value.dtype(), Dtype::Bfloat16);
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::forward_upcast_uses_activation_dtype_without_mutating_storage");
     }
 
     #[test]
@@ -1850,6 +1874,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn scale_zero_lokr_is_bit_exact_noop() {
         let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
         let x = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
@@ -1861,6 +1886,10 @@ mod tests {
         });
         let out = lin.forward(&x).unwrap();
         assert!(array_eq(&out, &base, false).unwrap().item::<bool>());
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::scale_zero_lokr_is_bit_exact_noop"
+        );
     }
 
     #[test]
@@ -1974,6 +2003,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn biased_dense_forward_is_fused_addmm() {
         // sc-2779: the biased dense base must be a FUSED `addmm(bias, x, Wᵀ)`, not `matmul`+`add`.
         // In bf16 the two differ (double-rounding), so feed bf16 activations and assert the forward
@@ -2019,9 +2049,14 @@ mod tests {
             !array_eq(&got, &matmul_add, false).unwrap().item::<bool>(),
             "bf16 addmm should differ from matmul+add (double-rounding) — fusion not applied?"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::biased_dense_forward_is_fused_addmm"
+        );
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn biased_dense_forward_f32_acts_match_matmul_add_bit_exact() {
         // sc-2779 golden-safety invariant: with f32 activations (the current Z-Image/Qwen/FLUX path,
         // even over bf16 weights), `addmm == matmul+add` bit-for-bit — nothing rounds to bf16
@@ -2057,9 +2092,12 @@ mod tests {
             array_eq(&got, &matmul_add, false).unwrap().item::<bool>(),
             "f32-activation addmm must be bit-exact to matmul+add (no golden regression)"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::biased_dense_forward_f32_acts_match_matmul_add_bit_exact");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn merge_dense_delta_adds_to_weight_and_zero_is_noop() {
         let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
         let x = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
@@ -2096,6 +2134,8 @@ mod tests {
         assert!(lin3
             .merge_dense_delta(&Array::from_slice(&[0.0f32; 4096], &[64, 64]))
             .is_err());
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::merge_dense_delta_adds_to_weight_and_zero_is_noop");
     }
 
     #[test]
@@ -2222,6 +2262,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn stacks_mixed_lora_and_lokr_summing_residuals() {
         let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
         let x = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
@@ -2247,6 +2288,8 @@ mod tests {
                 .unwrap()
                 .item::<bool>()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::stacks_mixed_lora_and_lokr_summing_residuals");
     }
 
     // ---- Structured (deferred) LoKr — the vec-trick (sc-10050) ------------------------------------
@@ -2417,6 +2460,7 @@ mod tests {
     /// finite output and the base stays packed — the memory-safe packed-tier path (sc-10050). The
     /// residual is computed only from the small factors (asserted above), so no `[out,in]` is built.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn structured_lokr_applies_on_quantized_base() {
         let (a, b, c, d) = (4i32, 8, 8, 8); // out=32, in=64 (in % group_size(64)==0)
         let (out, inp) = (a * b, c * d);
@@ -2471,5 +2515,7 @@ mod tests {
             sum_abs.is_finite() && sum_abs > 0.0,
             "output must be finite and non-zero"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::tests::structured_lokr_applies_on_quantized_base");
     }
 }

@@ -84,10 +84,14 @@ fn run() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn tiny_full_backbone_bounded_matches_unbounded() {
     crate::common::cpu_process(
         "bounded_attention::tiny_full_backbone_bounded_matches_unbounded",
-        full_backbone,
+        || {
+            full_backbone();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention::tiny_full_backbone_bounded_matches_unbounded");
+        },
     );
 }
 
@@ -120,10 +124,14 @@ fn full_backbone() {
 
 #[cfg(debug_assertions)]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn production_solver_observes_every_site_and_cancels_inside_the_forward() {
     crate::common::cpu_process(
         "bounded_attention::production_solver_observes_every_site_and_cancels_inside_the_forward",
-        production_solver,
+        || {
+            production_solver();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention::production_solver_observes_every_site_and_cancels_inside_the_forward");
+        },
     );
 }
 
@@ -217,10 +225,14 @@ fn production_solver() {
 
 #[cfg(debug_assertions)]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn generator_request_budget_reaches_cfg_and_non_cfg_solver_sites() {
     crate::common::cpu_process(
         "bounded_attention::generator_request_budget_reaches_cfg_and_non_cfg_solver_sites",
-        generator_request,
+        || {
+            generator_request();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention::generator_request_budget_reaches_cfg_and_non_cfg_solver_sites");
+        },
     );
 }
 
@@ -281,10 +293,10 @@ fn generator_request() {
 /// `AttentionBudget::UNBOUNDED` for a request without `chunk_attention`.
 #[cfg(debug_assertions)]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path() {
     crate::common::cpu_process(
-        "bounded_attention::the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path",
-        default_request,
+        "bounded_attention::the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path", || { default_request(); eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention::the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path"); },
     );
 }
 
@@ -415,10 +427,14 @@ fn default_request() {
 /// is not this test's to catch:
 /// `the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path` asserts the plan.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn the_default_paths_match_the_base_rev_golden() {
     crate::common::cpu_process(
         "bounded_attention::the_default_paths_match_the_base_rev_golden",
-        default_paths_golden,
+        || {
+            default_paths_golden();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED bounded_attention::the_default_paths_match_the_base_rev_golden");
+        },
     );
 }
 

@@ -367,6 +367,7 @@ fn hidden_states(path: &Path, dense: &Weights, bits: Option<i32>, prompt: &[i32]
 fn the_text_encoder_survives_quantization_at_every_tier() {
     let Some(root) = tier_root() else {
         eprintln!("skip: set LTX25_TIER_DIR to a directory holding the built q4/q8/bf16 tiers");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in the_text_encoder_survives_quantization_at_every_tier; see preceding skip diagnostic");
         return;
     };
     // A real caption, not a token-index ramp: the quantization error that matters is the one on the
@@ -491,6 +492,8 @@ fn the_text_encoder_survives_quantization_at_every_tier() {
         Q4_BAR.0,
         Q4_BAR.1
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_tier_quality::the_text_encoder_survives_quantization_at_every_tier");
 }
 
 /// **The decision, as shipped — read out of the tiers' own tensors.** The `q4` tier carries a dense
@@ -513,6 +516,7 @@ fn the_text_encoder_survives_quantization_at_every_tier() {
 fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
     let Some(root) = tier_root() else {
         eprintln!("skip: set LTX25_TIER_DIR to a directory holding the built q4/q8/bf16 tiers");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in the_shipped_tiers_match_the_measured_text_encoder_decision; see preceding skip diagnostic");
         return;
     };
     // Short, but a real forward: 16 tokens through all 48 layers binds every projection.
@@ -590,6 +594,8 @@ fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
         drop(model);
         memory::clear_cache();
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_tier_quality::the_shipped_tiers_match_the_measured_text_encoder_decision");
 }
 
 /// **The packed set, derived from the shipped tier rather than restated here.**

@@ -126,9 +126,14 @@ pub struct SubjectMask {
 impl SubjectMask {
     /// Decode a mask image (any format the `image` crate reads; colour is reduced to luma).
     pub fn load(path: &Path) -> crate::Result<Self> {
-        let gray = image::open(path)
-            .map_err(|e| crate::Error::Msg(format!("decode subject mask {}: {e}", path.display())))?
-            .to_luma8();
+        let gray = crate::__model_input_result!(
+            image::open(path),
+            "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open",
+            Reference,
+            &[path]
+        )
+        .map_err(|e| crate::Error::Msg(format!("decode subject mask {}: {e}", path.display())))?
+        .to_luma8();
         let (width, height) = gray.dimensions();
         Ok(Self {
             width,

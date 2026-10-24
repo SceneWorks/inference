@@ -100,6 +100,9 @@ class PrecisionControlTests(unittest.TestCase):
                 if name == "real-weights.yml":
                     self.assertEqual(other["group"],
                                      "${{ github.event_name == 'workflow_dispatch' && "
+                                     "(inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures') && "
+                                     "format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) || "
+                                     "github.event_name == 'workflow_dispatch' && "
                                      "inputs.profile == 'qwen-image-2-1-lora-mlx' && "
                                      "inputs.qwen_image_2_1_lora_runner == 'rw-starvector' && "
                                      "'inference-real-weights-qwen21-primary-mac' || "

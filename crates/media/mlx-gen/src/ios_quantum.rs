@@ -970,6 +970,7 @@ fn cpu_quantum_materializes_refuses_and_restores_cache() {
         return;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert!(quantum_metal_guard::forbid_metal());
     assert!(quantum_metal_guard::metal_forbidden());
     fn available(value: &Array) -> bool {
@@ -1110,6 +1111,7 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         return;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert!(quantum_metal_guard::forbid_metal());
     assert!(quantum_metal_guard::metal_forbidden());
     let measured = measured_peak_bytes(|| {
@@ -1206,6 +1208,7 @@ fn cpu_quantum_synchronizes_the_installed_non_default_stream() {
         return;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert!(quantum_metal_guard::forbid_metal());
     let installed = mlx_rs::Stream::new_with_device(&mlx_rs::Device::cpu());
     let default_index = mlx_rs::Stream::new().get_index().unwrap();
@@ -1261,6 +1264,7 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
         return;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert!(quantum_metal_guard::forbid_metal());
     const MIB: u64 = 1 << 20;
     let headroom = 1024 * MIB;
@@ -1346,6 +1350,7 @@ fn a_label_ratio_never_authorizes_changed_quantum_discount() {
         return;
     }
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert!(quantum_metal_guard::forbid_metal());
     const MIB: u64 = 1 << 20;
     let calibration = std::collections::BTreeMap::from([(

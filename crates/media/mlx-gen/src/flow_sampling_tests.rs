@@ -542,6 +542,7 @@ fn small_real_native_solver_allocation_checks_logical_adapter_assumptions() {
     }
     assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::model_inference_device::record_model_inference_device();
     assert_eq!(
         unsafe { mlx_sys::mlx_set_default_stream(mlx_rs::Stream::cpu().as_ptr()) },
         0

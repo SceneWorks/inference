@@ -82,4 +82,7 @@ fn dynamic_multimask_matches_oracle() {
         "dyn iou ours {} vs {want_iou}",
         out.iou
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dynmask_parity::dynamic_multimask_matches_oracle");
 }

@@ -4363,6 +4363,105 @@ fn cumulative_native_upper(
     Ok(maximum)
 }
 
+/// A complete request-initialization + ONE-forward native allocation upper. The legacy
+/// synchronized-retirement transfer cannot cancel an img2img first-use prefix against a
+/// text anchor's steady F32 body merely because the forward dtypes agree. Reuse the same
+/// source-operation ledgers as the full-request certificate, with no retirement/donation
+/// credit for this prefix. Work is bounded by architecture, not requested step count.
+pub(super) fn uncancelled_forward_prefix_upper(
+    inputs: &mut Inputs,
+    r: &Regime,
+    page: u64,
+) -> Result<u64> {
+    if r.sampling.route() != SamplingRoute::Ancestral
+        || !matches!(r.route, Route::Text | Route::Reference | Route::Mask)
+        || !matches!(inputs.quant_bits, Some(4 | 8))
+    {
+        return Err(invalid(
+            "uncancelled prefix requires the packed ancestral forward domain",
+        ));
+    }
+    let steps = execution_steps(r)?;
+    let nodes = plus(steps, 1)?;
+    let schedules = if r.route == Route::Mask { 2 } else { 1 };
+    let rounded_nodes = product(&[nodes, schedules])?;
+    let worlds = native_worlds(inputs)?;
+    let mut maximum = 0;
+    for world in worlds {
+        if let Some(f) = &mut inputs.fused {
+            f.world = world;
+        }
+        let priced = Priced::build(inputs)?;
+        let (first, steady) = q::with_backend(Backend::Metal, || priced.ancestral_states(r))?;
+        for state in [first, steady]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, state)| (index == 0 || state != first).then_some(state))
+        {
+            for backend in [NativeBackend::Cpu, NativeBackend::Metal] {
+                let mut ledger = NativeLedger::new(page, backend)?;
+                ledger.ancestral_constructor()?;
+                ledger.load_recipe(inputs, r, None)?;
+                let (memory_dtype, pooled_dtype) = ledger.text_recipe(inputs, r)?;
+                let rows = r.conditioning_rows() as u64;
+                let chunks = ceil(r.context_tokens as u64, inputs.arch.text_tokens as u64)?;
+                let context = ForwardContext {
+                    inputs,
+                    priced: &priced,
+                    memory: GraphTensor::new(
+                        &[
+                            rows,
+                            p!(chunks, inputs.arch.text_tokens),
+                            inputs.arch.context_dim as u64,
+                        ],
+                        memory_dtype,
+                    )?,
+                    pooled: GraphTensor::new(
+                        &[rows, priced.te.1.pooled_width() as u64],
+                        pooled_dtype,
+                    )?,
+                    time_ids: GraphTensor::new(&[rows, 6], Dtype::Float32)?,
+                    controls: Vec::new(),
+                    ip: None,
+                };
+                let h = r.height as u64 / inputs.arch.latent_scale as u64;
+                let w = r.width as u64 / inputs.arch.latent_scale as u64;
+                let elements = p!(h, w, 4);
+                if r.has_init {
+                    let image =
+                        GraphTensor::new(&[1, r.height as u64, r.width as u64, 3], Dtype::Float32)?;
+                    ledger.array(4, image.elements()?)?;
+                    let tile = r
+                        .tiling
+                        .as_ref()
+                        .and_then(|t| t.spatial.as_ref())
+                        .map(|s| s.tile_px as u64);
+                    ledger.vae_encode_graph(&priced.vae, image, tile)?;
+                }
+                if r.route == Route::Mask {
+                    ledger.array(4, elements / 4)?;
+                }
+                // Actual f16 schedule nodes: F32 scalar -> F16 -> F32. Count them
+                // multiplicatively (including the mask's separate schedule), never build N nodes.
+                ledger.repeated(4, 1, p!(rounded_nodes, 2))?;
+                ledger.repeated(2, 1, rounded_nodes)?;
+                ledger.initial_latent(r, elements)?;
+                let prior = r
+                    .count
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("zero serial count"))?;
+                ledger.repeated(q::dtype_bytes(steady), elements, prior as u64)?;
+                ledger.forward_request(&context, r, state)?;
+                maximum = maximum.max(ledger.total);
+            }
+        }
+    }
+    if let Some(f) = &mut inputs.fused {
+        f.world = Vec::new();
+    }
+    Ok(maximum)
+}
+
 struct ForwardContext<'a> {
     inputs: &'a Inputs,
     priced: &'a Priced,

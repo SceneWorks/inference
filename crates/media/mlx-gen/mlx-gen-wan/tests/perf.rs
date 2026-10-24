@@ -67,6 +67,7 @@ fn wan_a14b_per_step_cached_vs_legacy() {
         Some(p) => p,
         None => {
             eprintln!("skip: set WAN_A14B_MODEL_DIR to the converted A14B model dir");
+            crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_a14b_per_step_cached_vs_legacy; see preceding skip diagnostic");
             return;
         }
     };
@@ -206,4 +207,6 @@ fn wan_a14b_per_step_cached_vs_legacy() {
         cac <= leg * 1.10,
         "cached path materially slower than legacy: {cac:.4} vs {leg:.4} s/step (beyond noise band)"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED perf::wan_a14b_per_step_cached_vs_legacy");
 }

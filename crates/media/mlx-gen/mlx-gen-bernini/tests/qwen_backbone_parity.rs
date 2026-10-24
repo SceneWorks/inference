@@ -56,6 +56,7 @@ fn errors(a: &Array, b: &Array) -> (f32, f32) {
     (max_diff, max_diff / peak)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn qwen_backbone_matches_reference_f32() {
     let w = Weights::from_file(FIXTURE).expect("load golden fixture");
@@ -100,4 +101,8 @@ fn qwen_backbone_matches_reference_f32() {
     let p2 = backbone.penultimate(&embeds, &position_ids, &mask).unwrap();
     let (_, rel2) = errors(&p2, penult);
     assert!(rel2 < 1e-6, "penultimate() == forward()[-2]");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED qwen_backbone_parity::qwen_backbone_matches_reference_f32"
+    );
 }

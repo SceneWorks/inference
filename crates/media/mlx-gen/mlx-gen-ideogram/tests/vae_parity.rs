@@ -47,4 +47,6 @@ fn vae_decode_matches_reference() {
     let c = cosine(&out, want);
     println!("Ideogram 4 VAE decode parity cosine = {c:.7}");
     assert!(c > 0.999, "VAE decode parity cosine {c} too low");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_parity::vae_decode_matches_reference");
 }

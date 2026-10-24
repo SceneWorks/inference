@@ -202,11 +202,17 @@ impl WnConv1d {
 
     /// `[B, C_in, T]` → `[B, C_out, T']`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y =
-            x.contiguous()?
-                .conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?;
+        let y = __model_proof_output!(x.contiguous()?.conv1d(
+            &self.weight,
+            self.padding,
+            self.stride,
+            self.dilation,
+            1
+        ))?;
         let c = y.dims()[1];
-        Ok(y.broadcast_add(&self.bias.reshape((1, c, 1))?)?)
+        Ok(__model_proof_output!(
+            y.broadcast_add(&self.bias.reshape((1, c, 1))?)
+        )?)
     }
 }
 
@@ -567,7 +573,7 @@ impl CausalAttention {
             )));
         }
         let (b, n) = (s[0], s[1]);
-        let qkv = linear(x, &self.qkv_w, &self.qkv_b)?;
+        let qkv = __model_proof_output!(linear(x, &self.qkv_w, &self.qkv_b))?;
         // `[B, N, 3·D] → [B, N, 3, H, Dh]`: the THIRDS are the outer split and the heads the
         // inner one. Reading it per-head-interleaved instead is shape-identical and wrong.
         let qkv = qkv.reshape((b, n, 3, self.heads, self.head_dim))?;
@@ -595,7 +601,7 @@ impl CausalAttention {
         // Mean-pool the HEADS away: `[B, H, N, Dh]` → `[B, N, Dh]`.
         let pooled = attended.mean(1)?;
         let pooled = adaptive_avg_pool_last_axis(&pooled, self.out_dim)?;
-        linear(&pooled, &self.proj_w, &self.proj_b)
+        __model_proof_output!(linear(&pooled, &self.proj_w, &self.proj_b))
     }
 }
 
@@ -669,13 +675,13 @@ impl GeGluMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = layer_norm(x, &self.norm_w, &self.norm_b, LAYER_NORM_EPS)?;
+        let h = __model_proof_output!(layer_norm(x, &self.norm_w, &self.norm_b, LAYER_NORM_EPS))?;
         // candle's `gelu` IS the tanh approximation (`gelu_erf` is the exact one), matching the
         // reference's `nn.GELU(approximate="tanh")`.
-        let gate = linear(&h, &self.w0.0, &self.w0.1)?.gelu()?;
-        let value = linear(&h, &self.w1.0, &self.w1.1)?;
+        let gate = __model_proof_output!(linear(&h, &self.w0.0, &self.w0.1))?.gelu()?;
+        let value = __model_proof_output!(linear(&h, &self.w1.0, &self.w1.1))?;
         let h = (gate * value)?;
-        linear(&h, &self.w2.0, &self.w2.1)
+        __model_proof_output!(linear(&h, &self.w2.0, &self.w2.1))
     }
 }
 
@@ -1051,8 +1057,8 @@ impl MiniMaxH3AudioVaeEncoder {
         let hidden = self
             .pre_block
             .forward(&hidden.permute((0, 2, 1))?.contiguous()?)?;
-        let mean = linear(&hidden, &self.mean_w, &self.mean_b)?;
-        let logs = linear(&hidden, &self.logs_w, &self.logs_b)?;
+        let mean = __model_proof_output!(linear(&hidden, &self.mean_w, &self.mean_b))?;
+        let logs = __model_proof_output!(linear(&hidden, &self.logs_w, &self.logs_b))?;
         AudioDiagonalGaussian::new(
             mean.permute((0, 2, 1))?.contiguous()?,
             logs.permute((0, 2, 1))?.contiguous()?,

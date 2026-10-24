@@ -188,7 +188,13 @@ impl TrainOptimizer {
     /// kind (checked via [`kind_tag`](Self::kind_tag) in the resume metadata).
     pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
         match self {
-            TrainOptimizer::AdamW { opt, .. } => opt.state_mut().load_safetensors(path)?,
+            TrainOptimizer::AdamW { opt, .. } => gen_core::__model_input_reader!(
+opt.state_mut().load_safetensors(path),
+"crates/media/mlx-gen/src/train/optim.rs::load_state::opt.state_mut().load_safetensors@9545",
+TensorInput,
+path,
+|__model_input_path| opt.state_mut().load_safetensors(__model_input_path)
+)?,
             TrainOptimizer::Rose(_) => {} // stateless — nothing to restore
             TrainOptimizer::Prodigy(p) => p.load_state(path)?,
         }
@@ -487,7 +493,13 @@ impl Prodigy {
     /// Rebuilds the per-parameter buffer map and the global scalars; the `{k}::exp_avg` keys carry the
     /// parameter identity (a `k` never ends in `::exp_avg`, so the base key is unambiguous).
     fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let (tensors, _meta) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        let (tensors, _meta) = gen_core::__model_input_reader!(
+Array::load_safetensors_with_metadata(path.as_ref()),
+"crates/media/mlx-gen/src/train/optim.rs::load_state::Array::load_safetensors_with_metadata@22532",
+TensorInput,
+path.as_ref(),
+|__model_input_path| Array::load_safetensors_with_metadata(__model_input_path)
+)?;
         let scalar = |name: &str| -> Result<f32> {
             let a = tensors.get(name).ok_or_else(|| {
                 crate::Error::Msg(format!("prodigy resume: snapshot missing global '{name}'"))

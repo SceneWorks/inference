@@ -325,6 +325,7 @@ fn lokr_spec(path: PathBuf, scale: f32) -> AdapterSpec {
 /// AND a scale-0 apply is a **bit-exact no-op** — so a no-op install (adapters dropped, never applied)
 /// would fail one of the two halves.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn synthetic_lora_changes_forward_and_scale0_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -385,6 +386,8 @@ fn synthetic_lora_changes_forward_and_scale0_is_noop() {
         delta > 50.0 * d0,
         "a scale-0 LoRA must be negligible (no-op) vs. the scale-1 change: d0={d0}, delta={delta}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED style_lora::synthetic_lora_changes_forward_and_scale0_is_noop");
 }
 
 /// A deterministic f32 activation `[n, dim]` for the per-linear residual probes.
@@ -403,6 +406,7 @@ fn linear_forward(host: &mut CausalKreaTransformer, path: &[&str], x: &Array) ->
 
 /// (2) Two stacked LoRAs on the same target stack **additively**: the residual of A+B equals the sum of
 /// A's and B's residuals (both installed over the identical base).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn stacked_loras_stack_additively() {
     let tmp = tempfile::tempdir().unwrap();
@@ -470,10 +474,13 @@ fn stacked_loras_stack_additively() {
             .item::<bool>(),
         "stacked LoRA residual must equal the sum of the individual residuals"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora::stacked_loras_stack_additively");
 }
 
 /// (3) A per-LoRA `scale` scales the residual linearly: `scale = 0` ⇒ exactly zero; `scale = 2` ⇒ ~2×
 /// the `scale = 1` residual.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn per_lora_scale_scales_the_residual() {
     let tmp = tempfile::tempdir().unwrap();
@@ -520,6 +527,8 @@ fn per_lora_scale_scales_the_residual() {
             .item::<bool>(),
         "scale = 2 residual must be ~2× the scale = 1 residual"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora::per_lora_scale_scales_the_residual");
 }
 
 /// **(3b) sc-8446 S13 — the whole-model globals install AND move the forward.**
@@ -533,6 +542,7 @@ fn per_lora_scale_scales_the_residual() {
 /// step-distill file populates only six (`patch_embedding` ships a `.diff_b` bias delta with no
 /// low-rank pair), which is the 406-vs-407 gap asserted in `causal.rs` and on the real weights in
 /// `tests/style_lora_real_weights.rs`. Seven here is a statement about the host, not about those files.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn globals_install_end_to_end_and_change_the_forward() {
     let tmp = tempfile::tempdir().unwrap();
@@ -580,6 +590,8 @@ fn globals_install_end_to_end_and_change_the_forward() {
         "a globals-only LoRA installed but did not move the forward (Δ {delta:.3e} vs signal \
          {signal:.3e}) — the residual is not reaching the global Linears"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora::globals_install_end_to_end_and_change_the_forward");
 }
 
 /// (4) An unsupported / unmatched adapter target is **surfaced** — the strict installer errors and names
@@ -640,6 +652,7 @@ fn unsupported_target_is_reported_not_silently_dropped() {
 /// (5) Key normalization: a Wan reference-named FFN key (`ffn.0`) resolves to the converted Krea DiT
 /// target (`ffn.fc1`) both via the raw resolver AND end-to-end through the strict installer.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn wan_family_ffn_key_normalizes_and_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -715,12 +728,17 @@ fn wan_family_ffn_key_normalizes_and_resolves() {
         0.0,
         "ffn.0 and ffn.fc1 must address the same linear (normalization), so identical factors match"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED style_lora::wan_family_ffn_key_normalizes_and_resolves"
+    );
 }
 
 /// (6) A peft **LoKr** file installs on the dense base through the same strict path and shifts the
 /// forward — the `supports_lokr = true` the descriptor advertises is genuine (dense install; the packed
 /// Q4/Q8 LoKr is the separate quant-tier story S19).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lokr_installs_on_dense_and_changes_forward() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tiny_cfg();
@@ -740,6 +758,10 @@ fn lokr_installs_on_dense_and_changes_forward() {
     assert!(
         delta > 1e-3 * signal,
         "a LoKr must change the forward: max|Δ|={delta} (signal ~{signal})"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED style_lora::lokr_installs_on_dense_and_changes_forward"
     );
 }
 
@@ -839,6 +861,7 @@ fn tiny_transformer_q4(cfg: &KreaRealtimeConfig) -> CausalKreaTransformer {
 /// Discriminating on three axes at once: the fold count (a tier-gated bias fold collapses the Q4 arm),
 /// the unapplied list (any drop, silent or not, shows up), and the forward (a fold that resolved but
 /// wrote nothing leaves the output bit-identical to baseline).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
     let tmp = tempfile::tempdir().unwrap();
@@ -886,6 +909,8 @@ fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
             "{label}: the diff-patch fold changed nothing in the forward (delta {delta})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED style_lora::lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense");
 }
 
 /// The `.diff` norm deltas reach the **norm** parameters specifically — not silently absorbed by the
@@ -893,6 +918,7 @@ fn lightx2v_shaped_diff_patch_applies_identically_on_q4_and_dense() {
 /// factors) installs cleanly and moves the forward; before sc-15326 these had nowhere to land at any
 /// `AdaptableHost` width and were dropped without a word.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
     let cfg = tiny_cfg();
     let dim = cfg.wan.dim as i32;
@@ -930,6 +956,8 @@ fn norm_only_diff_patch_installs_through_the_norm_param_surface() {
         max_abs_diff(&before, &after) > 1e-4,
         "a norm .diff fold that resolved but wrote nothing would leave the forward unchanged"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED style_lora::norm_only_diff_patch_installs_through_the_norm_param_surface");
 }
 
 /// No silent drop survives: a diff-patch key for a module this **T2V** backbone does not have (an

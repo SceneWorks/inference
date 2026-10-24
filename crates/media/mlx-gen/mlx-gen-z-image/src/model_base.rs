@@ -62,7 +62,7 @@ pub const PID_BACKBONE: &str = "zimage-turbo";
 /// base is a non-distilled foundation model: real CFG (guidance + negative prompt) is supported.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
-        encoder_contract: Some(crate::ENCODER_CONTRACT),
+        encoder_contract: Some(crate::active_encoder_contract()),
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::FLUX1_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],

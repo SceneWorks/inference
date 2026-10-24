@@ -1326,6 +1326,7 @@ fn prove_all(tamper: impl Fn(&Request, &mut IosPricing), tiers: usize) -> Vec<St
 /// measurement or physical/process certificate. One dense Sprint text request,
 /// same seed/weights/carrier, with exact ordinary-versus-joined output parity.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn joined_native_sprint_matches_ordinary_pixels_and_completes_receipts() {
     if !in_cpu_child("joined_native_sprint_matches_ordinary_pixels_and_completes_receipts") {
         return;
@@ -1394,6 +1395,8 @@ fn joined_native_sprint_matches_ordinary_pixels_and_completes_receipts() {
         observation.telemetry_complete,
     )
     .expect("real configured invocation must complete every captured-prefix receipt");
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing::additivity::joined_native_sprint_matches_ordinary_pixels_and_completes_receipts");
 }
 
 /// Literal resident TEXT uses the production warm callback's encoder superset, independent of

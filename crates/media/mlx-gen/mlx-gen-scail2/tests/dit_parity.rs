@@ -77,7 +77,15 @@ fn dit_parity_tiny_seeded() {
     for name in cases {
         let cdir = dir.join(name);
         let meta: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(cdir.join("case.json")).unwrap())
+            serde_json::from_str(&mlx_gen::gen_core::__model_input_reader!(
+std::fs::read_to_string(cdir.join("case.json")),
+"crates/media/mlx-gen/mlx-gen-scail2/tests/dit_parity.rs::dit_parity_tiny_seeded::std::fs::read_to_string@2901",
+Configuration,
+cdir.join("case.json"),
+|__model_input_path| std::fs::read_to_string(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+).unwrap())
                 .unwrap();
         let t = meta["t"].as_f64().unwrap() as f32;
         let replace_flag = meta["replace_flag"].as_bool().unwrap();
@@ -130,4 +138,6 @@ fn dit_parity_tiny_seeded() {
         "worst-case cosine across {} cases: {worst_cos:.7}",
         cases.len()
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_parity::dit_parity_tiny_seeded");
 }

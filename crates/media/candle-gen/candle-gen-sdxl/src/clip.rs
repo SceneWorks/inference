@@ -155,8 +155,9 @@ fn layer_norm_to_device(norm: &mut nn::LayerNorm, device: &Device) -> Result<()>
 
 impl Module for ClipTextEmbeddings {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let token_embedding = self.token_embedding.forward(xs)?;
-        let position_embedding = self.position_embedding.forward(&self.position_ids)?;
+        let token_embedding = __model_proof_output!(self.token_embedding.forward(xs))?;
+        let position_embedding =
+            __model_proof_output!(self.position_embedding.forward(&self.position_ids))?;
         token_embedding.broadcast_add(&position_embedding)
     }
 }
@@ -338,12 +339,12 @@ impl ClipEncoderLayer {
 
     fn forward(&self, xs: &Tensor, causal_attention_mask: &Tensor) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.layer_norm1.forward(xs)?;
+        let xs = __model_proof_output!(self.layer_norm1.forward(xs))?;
         let xs = self.self_attn.forward(&xs, causal_attention_mask)?;
         let xs = (xs + residual)?;
 
         let residual = &xs;
-        let xs = self.layer_norm2.forward(&xs)?;
+        let xs = __model_proof_output!(self.layer_norm2.forward(&xs))?;
         let xs = self.mlp.forward(&xs)?;
         xs + residual
     }
@@ -455,7 +456,7 @@ impl ClipTextTransformer {
         let causal_attention_mask =
             Self::build_causal_attention_mask(bsz, seq_len, mask_after, xs.device())?;
         let xs = self.encoder.forward(&xs, &causal_attention_mask)?;
-        self.final_layer_norm.forward(&xs)
+        __model_proof_output!(self.final_layer_norm.forward(&xs))
     }
 
     /// Returns `(final_layer_norm(last), hidden_states[until_layer])` — the penultimate hidden path
@@ -487,7 +488,10 @@ impl ClipTextTransformer {
             }
         }
 
-        Ok((self.final_layer_norm.forward(&xs)?, intermediate))
+        Ok((
+            __model_proof_output!(self.final_layer_norm.forward(&xs))?,
+            intermediate,
+        ))
     }
 
     /// Test-only: whether every projection on the transformer's Linear surface loaded packed.
@@ -789,6 +793,7 @@ mod tests {
     /// the sc-9416 UNet packed-vs-dense tolerance (the repack is lossless and both forwards
     /// dequant-to-dense-matmul). Runs both the last-hidden and the penultimate paths.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_vs_dense_encode_parity() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let c = tiny_cfg();
@@ -822,12 +827,15 @@ mod tests {
 
         std::fs::remove_file(&tmp_p).ok();
         std::fs::remove_file(&tmp_d).ok();
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED clip::tests::packed_vs_dense_encode_parity");
         Ok(())
     }
 
     /// The packed bigG `text_projection` forward matches the dense one on the same grid — the pooled
     /// head packs too (sc-9527 AC: the bigG final text projection packed-detects).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn packed_text_projection_matches_dense() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let dim = 64usize;
@@ -854,6 +862,10 @@ mod tests {
         );
         std::fs::remove_file(&tmp_p).ok();
         std::fs::remove_file(&tmp_d).ok();
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED clip::tests::packed_text_projection_matches_dense"
+        );
         Ok(())
     }
 
@@ -872,6 +884,7 @@ mod tests {
     /// conditioner actually reads — the last-hidden `forward` AND the penultimate
     /// `forward_until_encoder_layer(.., -2)` (InstantID/refiner conditioning path).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vendored_dense_matches_stock() -> Result<()> {
         // One arm: build the vendored tower first (populating the VarMap with random dense weights —
         // no `.scales`, so the dense fallback fires), then the stock tower reads the SAME parameters,
@@ -926,6 +939,8 @@ mod tests {
             "vendored bigG penultimate diverged from stock by {g_penult}"
         );
 
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED clip::tests::vendored_dense_matches_stock");
         Ok(())
     }
 }

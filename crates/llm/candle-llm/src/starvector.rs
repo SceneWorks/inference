@@ -258,7 +258,13 @@ pub fn read_config(dir: impl AsRef<Path>) -> Result<StarVectorConfig> {
     } else {
         source.to_path_buf()
     };
-    let text = std::fs::read_to_string(&path)?;
+    let text = crate::__model_input_reader!(
+        std::fs::read_to_string(&path),
+        "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042",
+        ArtifactInput,
+        &path,
+        |__model_input_path| std::fs::read_to_string(__model_input_path)
+    )?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| Error::Config(format!("starvector config {}: {error}", path.display())))?;
     StarVectorConfig::from_json(&value)
@@ -1399,6 +1405,9 @@ mod tests {
             || Box::new(CandleStarVectorProvider::load(&spec).unwrap()),
             &profile,
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance");
     }
 
     #[test]

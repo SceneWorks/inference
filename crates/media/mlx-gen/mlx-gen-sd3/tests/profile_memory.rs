@@ -276,6 +276,8 @@ fn profile_memory_single() {
         prequant_from_env(),
         size_from_env(),
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED profile_memory::profile_memory_single");
 }
 
 /// Sweep the whole Large/Turbo × Q8/Q4 matrix (load-time-quant) in ONE process — a quick RELATIVE
@@ -291,4 +293,6 @@ fn profile_memory_all() {
             profile_one(&tmp, v, q, false, size);
         }
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED profile_memory::profile_memory_all");
 }

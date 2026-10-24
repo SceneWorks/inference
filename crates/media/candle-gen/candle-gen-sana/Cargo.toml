@@ -47,6 +47,7 @@ sceneworks-gen-core-testkit = { workspace = true }
 # hashes or re-parses weights.
 
 [features]
+model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof"]
 default = []
 # Apple Metal GPU backend (Mac) — forwarded to the candle backend. Not in `default`.
 metal = ["candle-gen/metal"]

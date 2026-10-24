@@ -56,6 +56,8 @@ fn te_matches_reference_last_hidden() {
         c > 0.999,
         "TE parity cosine {c} too low — structural mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::te_matches_reference_last_hidden");
 }
 
 /// E3 — real-weight parity for the DiT velocity. Feeds the golden's `dit_in_latent_chw`, `timestep`,
@@ -89,4 +91,6 @@ fn dit_matches_reference_velocity() {
         c > 0.999,
         "DiT velocity parity cosine {c} too low — structural mismatch"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED te_parity::dit_matches_reference_velocity");
 }

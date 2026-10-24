@@ -50,3 +50,6 @@ pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
 pub use registry::{lookup, BackboneSpec, CkptType, LatentNorm};
 pub use sampler::Sampler;
+
+#[cfg(test)]
+pub(crate) mod model_inference_device;

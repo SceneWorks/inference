@@ -101,7 +101,7 @@ fn render_with(sampler: Option<&str>, scheduler: Option<&str>) -> Image {
 
 /// N1: the unset-sampler default IS the curated Euler integrator — byte-identical to `sampler:"euler"`.
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
 fn default_sampler_equals_explicit_euler() {
     let default = render(None);
     let euler = render(Some("euler"));
@@ -110,11 +110,14 @@ fn default_sampler_equals_explicit_euler() {
         default.pixels, euler.pixels,
         "the unset-sampler default must be byte-identical to explicit euler (epic 7114 N1)"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::default_sampler_equals_explicit_euler");
 }
 
 /// N2: a curated named sampler renders a coherent image that genuinely differs from Euler.
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
 fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
     let euler = render(Some("euler"));
     let dpmpp = render(Some("dpmpp_2m"));
@@ -134,6 +137,9 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
         frac > 0.01,
         "dpmpp_2m must differ from euler (a real solver swap, not a silent fallback); differ {frac}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::named_sampler_dpmpp_2m_is_coherent_and_distinct");
 }
 
 /// Scheduler axis (epic 7114): a curated scheduler re-shapes the σ schedule over the static `shift=3.0`
@@ -142,7 +148,7 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
 /// a structurally-distinct σ ramp (`normal`/`sgm_uniform` nearly coincide with the native
 /// `linspace(1,1/N,N)`-through-shift schedule; `karras` re-distributes the steps and differs clearly).
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
 fn scheduler_karras_is_coherent_and_distinct() {
     let native = render_with(None, None);
     let karras = render_with(None, Some("karras"));
@@ -162,4 +168,7 @@ fn scheduler_karras_is_coherent_and_distinct() {
         frac > 0.01,
         "karras must re-shape the schedule vs the native default; differ {frac}"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED unified_sampler_smoke::scheduler_karras_is_coherent_and_distinct");
 }

@@ -280,6 +280,8 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     assert!(later["fallbackReason"].is_null());
     println!("S7 observed generator outcome: {}", outcome);
     println!("S1 native Generator: canonical1344x768/124f, 2 fixture DiT blocks, learned score calls={}, selected/dense={}/{}, dense/off identity, missing/self-test fallbacks verified",report.predictor_score_calls,report.selected_token_pairs,report.dense_token_pairs);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda_fixture::native_generator_learned_sparse_off_and_failure_paths");
 }
 #[test]
 #[ignore = "requires the exclusive local Metal token"]
@@ -428,4 +430,6 @@ fn native_veda_controls_preserve_carriers_and_capture_published_schedules() {
             r.fallback_reason
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda_fixture::native_veda_controls_preserve_carriers_and_capture_published_schedules");
 }

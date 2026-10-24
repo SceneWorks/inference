@@ -68,7 +68,15 @@ fn ip_snap() -> Option<PathBuf> {
 /// meaningful with real images; the coherence + distinctness gate holds either way.
 fn image_from(env: &str) -> Image {
     if let Ok(p) = std::env::var(env) {
-        let img = image::open(&p)
+        let img = mlx_gen::gen_core::__model_input_reader!(
+image::open(&p),
+"crates/media/mlx-gen/mlx-gen-kolors/tests/conditioned_curated_smoke.rs::image_from::image::open@3166",
+Reference,
+&p,
+|__model_input_path| image::open(__model_input_path)
+,
+origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
+)
             .unwrap_or_else(|e| panic!("open {env}={p}: {e}"))
             .to_rgb8();
         return Image {
@@ -221,6 +229,7 @@ fn run_mode(label: &str, spec: LoadSpec, conditioning: impl Fn() -> Vec<Conditio
 fn controlnet_curated_is_coherent_and_distinct() {
     let (Some(base), Some(cn)) = (base_snap(), cn_snap()) else {
         eprintln!("skipping: no Kolors base / ControlNet snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in controlnet_curated_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     let pose = image_from("KOLORS_POSE");
@@ -231,6 +240,8 @@ fn controlnet_curated_is_coherent_and_distinct() {
             scale: Some(0.7),
         }]
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioned_curated_smoke::controlnet_curated_is_coherent_and_distinct");
 }
 
 /// IP-Adapter, curated: the decoupled-attn image tokens thread the curated solver.
@@ -239,6 +250,7 @@ fn controlnet_curated_is_coherent_and_distinct() {
 fn ip_adapter_curated_is_coherent_and_distinct() {
     let (Some(base), Some(ip)) = (base_snap(), ip_snap()) else {
         eprintln!("skipping: no Kolors base / IP-Adapter snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in ip_adapter_curated_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     let reference = image_from("KOLORS_REF");
@@ -248,6 +260,8 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
             strength: None,
         }]
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioned_curated_smoke::ip_adapter_curated_is_coherent_and_distinct");
 }
 
 /// Combined pose tier (sc-5012), curated: ControlNet residuals + IP tokens on an img2img init — the
@@ -257,6 +271,7 @@ fn ip_adapter_curated_is_coherent_and_distinct() {
 fn combined_pose_curated_is_coherent_and_distinct() {
     let (Some(base), Some(cn), Some(ip)) = (base_snap(), cn_snap(), ip_snap()) else {
         eprintln!("skipping: no Kolors base / ControlNet / IP-Adapter snapshot");
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in combined_pose_curated_is_coherent_and_distinct; see preceding skip diagnostic");
         return;
     };
     let pose = image_from("KOLORS_POSE");
@@ -274,4 +289,6 @@ fn combined_pose_curated_is_coherent_and_distinct() {
             },
         ]
     });
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED conditioned_curated_smoke::combined_pose_curated_is_coherent_and_distinct");
 }

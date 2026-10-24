@@ -223,7 +223,7 @@ fn tier_dirs() -> Vec<(String, PathBuf)> {
 /// printing numbers: streaming is worth building only where the weights it can bound are a
 /// meaningful share of the peak.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_conditioning_weight_activation_split_per_tier() {
     let mut splits = Vec::new();
     for (tier, dir) in tier_dirs() {
@@ -329,6 +329,9 @@ fn the_conditioning_weight_activation_split_per_tier() {
          z-image on every measured tier, and the story's remaining justification rests entirely on \
          the TE-dominant families"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_residency_real_weights::the_conditioning_weight_activation_split_per_tier");
 }
 
 /// **The half that decides whether the split matters.** A conditioning-phase saving is only a win if
@@ -341,7 +344,7 @@ fn the_conditioning_weight_activation_split_per_tier() {
 /// non-composable), records the three phase peaks, and states the request peak before and after
 /// applying the predicted conditioning reduction.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_request_peak_effect_of_the_predicted_split() {
     use mlx_gen::gen_core::GenerationMemory;
     use mlx_gen::{
@@ -577,6 +580,9 @@ fn the_request_peak_effect_of_the_predicted_split() {
             cut * 100.0
         );
     }
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_residency_real_weights::the_request_peak_effect_of_the_predicted_split");
 }
 
 /// Guards the measurement itself. The resident-weight figure is only meaningful because a warm-up
@@ -587,7 +593,7 @@ fn the_request_peak_effect_of_the_predicted_split() {
 /// This measures the un-warmed figure explicitly and asserts it is far below the warmed one, so the
 /// method cannot silently regress into the trap it was written to avoid.
 #[test]
-#[ignore = "needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
+#[ignore = "model inference; explicit model-proof workflow; needs a real Z-Image-Turbo snapshot + Apple/Metal GPU"]
 fn the_weight_measurement_is_not_reading_an_unmaterialized_encoder() {
     let (tier, dir) = tier_dirs().pop().expect("at least one tier");
     let te_dir = dir.join("text_encoder");
@@ -627,4 +633,7 @@ fn the_weight_measurement_is_not_reading_an_unmaterialized_encoder() {
         gib(cold),
         gib(warm)
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder_residency_real_weights::the_weight_measurement_is_not_reading_an_unmaterialized_encoder");
 }

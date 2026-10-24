@@ -148,7 +148,12 @@ pub fn resolve_indexed_safetensors_shards(
             loader_path,
         });
     }
-    Ok(Some(paths))
+    crate::__model_input_result!(
+        Ok(Some(paths)),
+        "gen-core::safetensors_shards::resolve_indexed_safetensors_shards/index-present-used",
+        Configuration,
+        &[&index_target]
+    )
 }
 
 fn canonical_roots(allowed_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {

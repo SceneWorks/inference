@@ -65,6 +65,8 @@ fn decode_packed_latents_matches_fork() {
     let (peak, mean) = rel(&out, &want);
     println!("flux2 VAE decode: peak_rel={peak:.5} mean_rel={mean:.5}");
     assert!(mean < 5e-3, "VAE decode diverged: mean_rel={mean}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::decode_packed_latents_matches_fork");
 }
 
 #[test]
@@ -79,4 +81,6 @@ fn encode_matches_fork() {
     let (peak, mean) = rel(&out, &want);
     println!("flux2 VAE encode: peak_rel={peak:.5} mean_rel={mean:.5}");
     assert!(mean < 5e-3, "VAE encode diverged: mean_rel={mean}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED vae_real_weights::encode_matches_fork");
 }

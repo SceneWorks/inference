@@ -1089,8 +1089,14 @@ fn block_trainables(
 
 /// Decode an image file (PNG/JPEG) into the core RGB8 [`Image`].
 fn decode_image(path: &Path) -> Result<Image> {
-    let dynimg = image::open(path)
-        .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_image::image::open@51854",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+)
+    .map_err(|e| Error::Msg(format!("decode image {}: {e}", path.display())))?;
     let rgb = dynimg.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     Ok(Image {
@@ -1104,8 +1110,14 @@ fn decode_image(path: &Path) -> Result<Image> {
 /// opaque case (`A = 255`, exactly what the render path's `Conditioning::Reference` widening
 /// produces), a file with alpha keeps it (the `Conditioning::ReferenceRgba` case).
 fn decode_reference(path: &Path) -> Result<RgbaImage> {
-    let dynimg = image::open(path)
-        .map_err(|e| Error::Msg(format!("decode reference image {}: {e}", path.display())))?;
+    let dynimg = mlx_gen::gen_core::__model_input_reader!(
+image::open(path),
+"crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::decode_reference::image::open@52482",
+Reference,
+path,
+|__model_input_path| image::open(__model_input_path)
+)
+    .map_err(|e| Error::Msg(format!("decode reference image {}: {e}", path.display())))?;
     let rgba = dynimg.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     Ok(RgbaImage {
@@ -1288,7 +1300,12 @@ fn edit_target_size(item: &TrainingItem, edge: u32) -> Result<(u32, u32)> {
     if !item.is_edit_pair() {
         return Ok((edge, edge));
     }
-    let (w, h) = image::image_dimensions(&item.image_path).map_err(|e| {
+    let (w, h) = mlx_gen::gen_core::__model_input_result!(
+        image::image_dimensions(&item.image_path),
+        "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::edit_target_size/image::image_dimensions",
+        Reference,
+        &[&item.image_path]
+    ).map_err(|e| {
         Error::Msg(format!(
             "{TRAINER_ID} trainer: read target image {}: {e}",
             item.image_path.display()
@@ -3137,6 +3154,7 @@ mod tests {
     /// *Mutations that red this:* `item_branches` building every layout at the first edge;
     /// `encode_item_targets` encoding every latent at one edge.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_item_caches_one_branch_and_latent_per_bucket_edge() {
         let root = tiny_snapshot();
         let tmp = tempfile::tempdir().unwrap();
@@ -3185,6 +3203,8 @@ mod tests {
                 "the two buckets train different grids"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::an_item_caches_one_branch_and_latent_per_bucket_edge");
     }
 
     /// sc-24828 × sc-2127: with subject-masked loss on and two buckets, every bucket's packed
@@ -3196,6 +3216,7 @@ mod tests {
     /// *Mutations that red this:* `encode_item_targets` resampling the mask once at the first
     /// bucket's grid and reusing it for every bucket.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_is_resampled_per_bucket() {
         let root = tiny_snapshot();
         let tmp = tempfile::tempdir().unwrap();
@@ -3251,6 +3272,8 @@ mod tests {
                 }
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_is_resampled_per_bucket");
     }
 
     /// The preflight's adapter sizing on the tiny DiT: LoRA has no deltas; LoKr's deltas are
@@ -3436,6 +3459,7 @@ mod tests {
     /// AC: the loss decreases over N steps — a fixed batch (fixed `t`, fixed noise) overfits under
     /// the real step (install → DiT → MSE → grads → clip → AdamW).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn loss_decreases_over_steps_on_a_fixed_batch() {
         let mut dit = tiny_dit();
         let Built {
@@ -3487,6 +3511,8 @@ mod tests {
             last < 0.9 * first,
             "the loss must fall on a fixed batch: {losses:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::loss_decreases_over_steps_on_a_fixed_batch");
     }
 
     fn max_rel_diff(a: &LoraParams, b: &LoraParams) -> f32 {
@@ -3504,6 +3530,7 @@ mod tests {
     /// The gradient-checkpointed block forward is the dense forward: same loss, same grads, for
     /// LoRA and LoKr alike (non-zero factors, so every factor's gradient is exercised).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn checkpointed_grads_match_dense_for_lora_and_lokr() {
         for network in [NetworkType::Lora, NetworkType::Lokr] {
             let mut dit = tiny_dit();
@@ -3564,6 +3591,8 @@ mod tests {
             eprintln!("[sc-24159] {network:?} checkpointed-vs-dense grad max rel diff {rel:.2e}");
             assert!(rel < 1e-3, "{network:?}: max rel grad diff {rel:.2e}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::checkpointed_grads_match_dense_for_lora_and_lokr");
     }
 
     #[test]
@@ -3675,6 +3704,7 @@ mod tests {
     /// reference latent differs); `decode_references` reversing/sorting the paths (layout and
     /// latents differ); `item_branch` assembling at a different size than the render request.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn edit_training_assembles_the_render_paths_joint_sequence() {
         use mlx_gen::{Conditioning, GenerationRequest};
 
@@ -3705,7 +3735,12 @@ mod tests {
 
         // The render path's own assembly, from a request carrying the same pictures.
         let rgb = |path: &Path| {
-            let img = image::open(path).unwrap().to_rgb8();
+            let img = mlx_gen::gen_core::__model_input_result!(
+                image::open(path),
+                "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/src/training.rs::edit_training_assembles_the_render_paths_joint_sequence/image::open",
+                Reference,
+                &[path]
+            ).unwrap().to_rgb8();
             Image {
                 width: img.width(),
                 height: img.height(),
@@ -3807,6 +3842,8 @@ mod tests {
             swapped.layout, trained.layout,
             "reference order must be kept"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::edit_training_assembles_the_render_paths_joint_sequence");
     }
 
     /// Major (review): an edit target keeps its aspect ratio — a 2:1 target trains as a 2:1 target
@@ -3816,6 +3853,7 @@ mod tests {
     /// *Mutation that reds this:* `edit_target_size` returning `(edge, edge)` for edit pairs, or
     /// `encode_item_target` centre-cropping an edit target.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_wide_edit_target_trains_as_a_wide_target_block() {
         let root = tiny_snapshot();
         let tmp = tempfile::tempdir().unwrap();
@@ -3857,6 +3895,8 @@ mod tests {
         );
         let square = encode_item_target(&vae, &captioned, edge).unwrap();
         assert_eq!(square.shape()[1], (128 / 16) * (128 / 16));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::a_wide_edit_target_trains_as_a_wide_target_block");
     }
 
     /// Review: a reference the Qwen3-VL processor would rebind (its fit leaves the pixel budget)
@@ -3942,6 +3982,7 @@ mod tests {
     /// *Mutations that red this:* the step ignoring `references` (the two losses coincide);
     /// regressing onto the wrong target or not stepping the factors (the window does not fall).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn edit_loss_decreases_over_steps_and_depends_on_the_references() {
         let mut dit = tiny_dit();
         let Built {
@@ -4043,11 +4084,14 @@ mod tests {
             last < 0.9 * first,
             "the windowed edit loss must fall under varying noise/t: {losses:?}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::edit_loss_decreases_over_steps_and_depends_on_the_references");
     }
 
     /// The gradient-checkpointed joint forward is the dense joint forward on an **edit** layout
     /// too: same loss, same grads.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn checkpointed_edit_grads_match_dense() {
         let mut dit = tiny_dit();
         let Built {
@@ -4103,6 +4147,10 @@ mod tests {
         );
         let rel = max_rel_diff(&g_dense, &g_ckpt);
         assert!(rel < 1e-3, "max rel grad diff {rel:.2e}");
+        crate::model_inference_device::record_model_inference_device();
+        println!(
+            "MODEL_INFERENCE_BODY_COMPLETED training::tests::checkpointed_edit_grads_match_dense"
+        );
     }
 
     /// sc-24828: the packed subject-mask weight lines up token-for-token with the packed latent —
@@ -4136,6 +4184,7 @@ mod tests {
     /// all-background map zeroes the loss and every adapter grad, a half map lies strictly between
     /// and agrees across paths.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn subject_mask_weight_reaches_both_backward_paths() {
         let mut dit = tiny_dit();
         let Built {
@@ -4237,6 +4286,8 @@ mod tests {
                 "{mode}: dense {dense} vs checkpointed {ckpt}"
             );
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_both_backward_paths");
     }
 
     /// Unlike the historical8-channel fixture, img_in and all hidden projections
@@ -4397,6 +4448,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn fully_packed_trained_factors_preserve_direct_delta_through_export() {
         crate::q4_diagnostic::cpu_export_preserves_three_strided_rows_and_output_components();
         use mlx_gen::weights::Weights;
@@ -4677,12 +4729,15 @@ mod tests {
                 serde_json::to_vec_pretty(&serde_json::json!({"kind":"NUMERICAL_FIXTURE_ONLY","acceptanceEvidence":false,
                     "geometry":{"inChannels":64,"inner":64,"context":64,"layers":2,"mlpRatio":3},"cells":receipts})).unwrap()).unwrap();
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::fully_packed_trained_factors_preserve_direct_delta_through_export");
     }
 
     /// A changed render alone cannot identify a save/reload defect. Compare the *trained*
     /// in-memory velocity with the saved file installed on a fresh base, for both adapter kinds,
     /// both modalities and the actual bf16 production compute path, before any sampling metric.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn trained_factors_preserve_velocity_through_save_and_reload() {
         let mut failures = Vec::new();
         for network in [NetworkType::Lora, NetworkType::Lokr] {
@@ -4901,6 +4956,8 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::tests::trained_factors_preserve_velocity_through_save_and_reload");
     }
 
     // This test reference neither reads the serialized file nor calls the loader/builder.
@@ -5333,6 +5390,7 @@ mod adapter_noise_loop_tests {
     /// *Mutation that reds this:* restoring the inline clip → step → eval at the Qwen update site
     /// (noise dropped), or firing the update every micro-step.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn train_loop_applies_weight_noise_once_per_real_update() {
         let sigma = 0.05f32;
         let mut clean = train(0.0, 0.0, 2, 2);
@@ -5342,10 +5400,13 @@ mod adapter_noise_loop_tests {
         for (k, v) in &clean {
             assert_close(&host(&noisy[k]), &host(v), k);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::adapter_noise_loop_tests::train_loop_applies_weight_noise_once_per_real_update");
     }
 
     /// Gradient noise reaches the loop's optimizer step and reproduces under the job seed.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn train_loop_applies_gradient_noise_reproducibly() {
         let clean = train(0.0, 0.0, 2, 1);
         let a = train(0.0, 0.05, 2, 1);
@@ -5359,6 +5420,8 @@ mod adapter_noise_loop_tests {
             effect > 1e-3,
             "gradient noise must reach the trained adapter (max |diff| {effect})"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::adapter_noise_loop_tests::train_loop_applies_gradient_noise_reproducibly");
     }
 }
 
@@ -5567,6 +5630,7 @@ mod depth_anchoring_tests {
     /// (no diffusion term, total == aux, non-zero finite LoRA-B grad); a diffusion step has no depth
     /// term. Mutation: force `diffusion_on = true` ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn depth_step_trains_the_lora_on_every_path() {
         for edit in [false, true] {
             for ckpt in [false, true] {
@@ -5599,6 +5663,8 @@ mod depth_anchoring_tests {
                 assert!(gb > 0.0 && gb.is_finite(), "{tag}: LoRA-B |Σ| = {gb}");
             }
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_step_trains_the_lora_on_every_path");
     }
 
     /// The aux step trains at `t` remapped into `[0.6, 0.8]`, and its depth term is the depth loss
@@ -5606,6 +5672,7 @@ mod depth_anchoring_tests {
     /// condition the forward, only the target is decoded). Mutations: keep the sampled `t` ⇒ red;
     /// recover with the opposite flow sign ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn aux_step_trains_at_the_remapped_noise_level() {
         let mut cfg = cfg();
         let window = AuxLossSchedule {
@@ -5668,6 +5735,8 @@ mod depth_anchoring_tests {
             (want - got).abs() <= 1e-5 * want.abs().max(1.0),
             "{want} vs {got}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::aux_step_trains_at_the_remapped_noise_level");
     }
 
     /// Interleaved alternation (round-robin N = 2: no two depth steps in a row, each image both
@@ -5676,6 +5745,7 @@ mod depth_anchoring_tests {
     /// bare global step (no period) ⇒ image 0 never trains depth ⇒ red; pass the item as the
     /// `AuxStep` entry ⇒ a bucket-1 depth step compares against bucket 0's reference ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn alternation_interleaves_with_per_entry_references() {
         let cfg = cfg();
         let mut f = fixture(&cfg);
@@ -5788,12 +5858,15 @@ mod depth_anchoring_tests {
         }
         assert!(depth_off_item, "no depth step on an entry != its item");
         assert_eq!(d.path().reference_computations(), cache.len());
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::alternation_interleaves_with_per_entry_references");
     }
 
     /// E1: depth off ⇒ nothing loaded, no aux bytes, and the step is bit-identical to the
     /// pre-epic-2123 closure (reproduced verbatim); a diffusion-only step of an enabled path is
     /// bit-identical too. Mutation: flip MAE/MSE in the diffusion term ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn everything_off_is_bit_identical_to_the_legacy_step() {
         assert!(load_perceptual_path(&TrainingConfig::default())
             .unwrap()
@@ -5864,6 +5937,8 @@ mod depth_anchoring_tests {
         for (k, v) in &g_none1 {
             assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::everything_off_is_bit_identical_to_the_legacy_step");
     }
 
     /// E7: the aux bytes (TAEQI2.1 + DA2, more for Large, sized at the largest target) land in the

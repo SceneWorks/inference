@@ -131,8 +131,11 @@ fn measure(dir: &std::path::Path, tier: &str, shape: LoadShape, req: &Generation
     clear_cache();
     reset_peak_memory();
     let started = std::time::Instant::now();
-    let out = model
-        .generate(req, &mut |_: Progress| {})
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(req, &mut |_: Progress| {}),
+    )
+        .1
         .expect("generate must succeed");
     let peak = get_peak_memory();
     // Timed inside the reset/read window, so the row's clock covers exactly the request its peak
@@ -328,7 +331,8 @@ fn warm_up(dir: &std::path::Path, tier: &str) {
 /// A cell whose resolution is 5.67% can support no cadence claim at all, in either direction — which
 /// is exactly what SC-17679 established about 512² q8.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn identical_requests_reproduce_once_the_allocator_has_settled() {
     const SETTLE_PROBE_ROWS: usize = 8;
     /// The tolerance `transformer_window_sweep_and_streamed_output_identity`'s flatness assertion
@@ -403,6 +407,8 @@ fn identical_requests_reproduce_once_the_allocator_has_settled() {
         100.0 * spread,
         100.0 * SETTLE_TOLERANCE
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::identical_requests_reproduce_once_the_allocator_has_settled");
 }
 
 /// The order the cadence sweep executes its rows in — **the control that tells a cadence effect
@@ -450,7 +456,8 @@ fn probe_order() -> Vec<u32> {
 /// lower while producing a **byte-identical** image: rung 1 sheds the two CLIP towers before the
 /// heavy bundle loads, which is a residency change and not an arithmetic one.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn staged_residency_bounds_the_request_peak_and_preserves_output() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -484,6 +491,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
         staged_row.peak_gib,
         resident.peak_gib
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::staged_residency_bounds_the_request_peak_and_preserves_output");
 }
 
 // ── Rung 2 ───────────────────────────────────────────────────────────────────────────────────────
@@ -495,7 +504,8 @@ fn staged_residency_bounds_the_request_peak_and_preserves_output() {
 /// Their mechanisms are still in the crate — which is exactly why this test exists: the only thing
 /// between `Autoencoder::decode_tiled` and a production render is the refusal.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn the_rejected_rungs_are_refused_by_the_production_path() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -512,7 +522,12 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
             decode_overlap: Some(ms::DECODE_OVERLAP),
             ..staged()
         };
-        let err = match model.generate(&request(Some(memory), 1024, 2), &mut |_| {}) {
+        let err = match (
+            crate::common::record_model_inference_device(),
+            model.generate(&request(Some(memory), 1024, 2), &mut |_| {}),
+        )
+            .1
+        {
             Ok(_) => panic!("a bounded decode must not render on this provider (edge {edge})"),
             Err(err) => err,
         };
@@ -522,7 +537,12 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
         );
     }
 
-    let err = match model.generate(&request(Some(staged_chunked()), 1024, 2), &mut |_| {}) {
+    let err = match (
+        crate::common::record_model_inference_device(),
+        model.generate(&request(Some(staged_chunked()), 1024, 2), &mut |_| {}),
+    )
+        .1
+    {
         Ok(_) => panic!("bounded attention must not render on this provider"),
         Err(err) => err,
     };
@@ -534,9 +554,14 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
 
     // The control: the published composition renders. Without it, a generator that refused every
     // request would satisfy every assertion above.
-    model
-        .generate(&request(Some(staged()), 1024, 2), &mut |_| {})
+    (
+        crate::common::record_model_inference_device(),
+        model.generate(&request(Some(staged()), 1024, 2), &mut |_| {}),
+    )
+        .1
         .expect("the published rung-1 composition must render");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_rejected_rungs_are_refused_by_the_production_path");
 }
 
 /// **The mechanism-level tile sweep** that decides which edges the ladder may publish.
@@ -559,7 +584,8 @@ fn the_rejected_rungs_are_refused_by_the_production_path() {
 /// Set `SDXL_SWEEP_EDGES` / `SDXL_SWEEP_OVERLAPS` (comma-separated) to explore; the defaults are the
 /// published ladder and its rejection set.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn decode_tile_mechanism_sweep() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -585,8 +611,11 @@ fn decode_tile_mechanism_sweep() {
     let model = registry
         .load("sdxl", &spec(&dir, "bf16", LoadShape::EagerMaterialization))
         .expect("load sdxl");
-    let out = model
-        .generate(&request(Some(staged()), size, 6), &mut |_| {})
+    let out = (
+        crate::common::record_model_inference_device(),
+        model.generate(&request(Some(staged()), size, 6), &mut |_| {}),
+    )
+        .1
         .expect("render one image for the sweep latent");
     let image = match out {
         GenerationOutput::Images(mut images) => images.swap_remove(0),
@@ -597,13 +626,23 @@ fn decode_tile_mechanism_sweep() {
 
     let vae = mlx_gen_sdxl::load_vae(&dir).expect("load vae");
     let nhwc = mlx_gen_sdxl::preprocess_init_image(&image, size, size).expect("preprocess");
-    let latent = vae.encode_mean(&nhwc).expect("encode");
+    let latent = (
+        crate::common::record_model_inference_device(),
+        vae.encode_mean(&nhwc),
+    )
+        .1
+        .expect("encode");
     // The untiled decode is both the drift reference AND the peak this mechanism is measured
     // against. Recording only the tiled peaks left the "what does tiling buy" half of the evidence
     // with no denominator from this test.
     clear_cache();
     reset_peak_memory();
-    let reference = vae.decode(&latent).expect("untiled decode");
+    let reference = (
+        crate::common::record_model_inference_device(),
+        vae.decode(&latent),
+    )
+        .1
+        .expect("untiled decode");
     reference.eval().expect("eval reference");
     let untiled_peak = get_peak_memory() as f64 / GIB;
     let ref_px = mlx_gen_sdxl::decoded_to_image(&reference)
@@ -633,7 +672,12 @@ fn decode_tile_mechanism_sweep() {
             let tiles = plan.h.len() * plan.w.len();
             clear_cache();
             reset_peak_memory();
-            let tiled = vae.decode_tiled(&latent, &cfg, None).expect("tiled decode");
+            let tiled = (
+                crate::common::record_model_inference_device(),
+                vae.decode_tiled(&latent, &cfg, None),
+            )
+                .1
+                .expect("tiled decode");
             tiled.eval().expect("eval tiled");
             let peak = get_peak_memory() as f64 / GIB;
             let px = mlx_gen_sdxl::decoded_to_image(&tiled)
@@ -670,6 +714,10 @@ fn decode_tile_mechanism_sweep() {
              quote the old figure — re-derive them"
         );
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::decode_tile_mechanism_sweep"
+    );
 }
 
 /// SC-19753 regression across the provider's advertised output range.
@@ -679,7 +727,8 @@ fn decode_tile_mechanism_sweep() {
 /// now the bug model. Full-activation statistics must keep every measured size within the bar. Exact
 /// sealed route/geometry policies decide production admission; the route-blind fallback stays closed.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -698,8 +747,11 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
         let model = registry
             .load("sdxl", &spec(&dir, "bf16", LoadShape::EagerMaterialization))
             .expect("load sdxl");
-        let out = model
-            .generate(&request(Some(staged()), size, 6), &mut |_| {})
+        let out = (
+            crate::common::record_model_inference_device(),
+            model.generate(&request(Some(staged()), size, 6), &mut |_| {}),
+        )
+            .1
             .expect("render the sweep latent");
         let image = match out {
             GenerationOutput::Images(mut images) => images.swap_remove(0),
@@ -709,8 +761,18 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
         clear_cache();
 
         let nhwc = mlx_gen_sdxl::preprocess_init_image(&image, size, size).expect("preprocess");
-        let latent = vae.encode_mean(&nhwc).expect("encode");
-        let reference = vae.decode(&latent).expect("untiled decode");
+        let latent = (
+            crate::common::record_model_inference_device(),
+            vae.encode_mean(&nhwc),
+        )
+            .1
+            .expect("encode");
+        let reference = (
+            crate::common::record_model_inference_device(),
+            vae.decode(&latent),
+        )
+            .1
+            .expect("untiled decode");
         reference.eval().expect("eval reference");
         let ref_px = mlx_gen_sdxl::decoded_to_image(&reference)
             .expect("reference image")
@@ -721,7 +783,12 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
             BEST_DECODE_OVERLAP as i32,
         );
         clear_cache();
-        let tiled = vae.decode_tiled(&latent, &cfg, None).expect("tiled decode");
+        let tiled = (
+            crate::common::record_model_inference_device(),
+            vae.decode_tiled(&latent, &cfg, None),
+        )
+            .1
+            .expect("tiled decode");
         tiled.eval().expect("eval tiled");
         let px = mlx_gen_sdxl::decoded_to_image(&tiled)
             .expect("tiled image")
@@ -747,6 +814,8 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
             at(size),
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::layerwise_decode_clears_the_bar_across_the_advertised_output_range");
 }
 
 /// Request-level memory and quality for layer-wise decode on a production latent.
@@ -765,7 +834,8 @@ fn layerwise_decode_clears_the_bar_across_the_advertised_output_range() {
 /// re-encoded image. The same row now guards the repair: it must preserve the measured memory saving
 /// while clearing the 48/255 quality bar on the latent a user actually receives.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn layerwise_decode_is_priced_at_the_request_level() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -808,6 +878,8 @@ fn layerwise_decode_is_priced_at_the_request_level() {
          {drift}/255",
         ms::DECODE_TILE_EDGE,
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::layerwise_decode_is_priced_at_the_request_level");
 }
 
 /// The drift bar this family is judged against, in 8-bit levels out of 255.
@@ -866,8 +938,12 @@ fn measure_end_to_end(
     let tokens = tokenizer
         .tokenize_batch(prompt, Some(negative))
         .expect("tokenize");
-    let (conditioning, pooled) =
-        mlx_gen_sdxl::encode_conditioning(&te1, &te2, &tokens).expect("encode");
+    let (conditioning, pooled) = (
+        crate::common::record_model_inference_device(),
+        mlx_gen_sdxl::encode_conditioning(&te1, &te2, &tokens),
+    )
+        .1
+        .expect("encode");
     // Force the encode before dropping the towers — an unevaluated output keeps them referenced
     // through the lazy graph, so the drop would free nothing.
     mlx_rs::transforms::eval([&conditioning, &pooled]).expect("eval conditioning");
@@ -896,18 +972,26 @@ fn measure_end_to_end(
     let denoiser = mlx_gen_sdxl::pipeline::Denoiser::with_plan(&unet, &sampler, plan);
     let time_ids = mlx_gen_sdxl::text_time_ids(pooled.shape()[0]);
     let cancel = mlx_gen::gen_core::CancelFlag::default();
-    let out = mlx_gen_sdxl::denoise(
-        &denoiser,
-        latents,
-        &conditioning,
-        &pooled,
-        &time_ids,
-        7.0,
-        &cancel,
-        &mut |_: Progress| {},
+    let out = (
+        crate::common::record_model_inference_device(),
+        mlx_gen_sdxl::denoise(
+            &denoiser,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            7.0,
+            &cancel,
+            &mut |_: Progress| {},
+        ),
     )
-    .expect("denoise");
-    let image = mlx_gen_sdxl::pipeline::decode_image_tiled(&vae, &out, None, decode_tiling, None)
+        .1
+        .expect("denoise");
+    let image = (
+        crate::common::record_model_inference_device(),
+        mlx_gen_sdxl::pipeline::decode_image_tiled(&vae, &out, None, decode_tiling, None),
+    )
+        .1
         .expect("decode");
 
     let peak = get_peak_memory();
@@ -948,7 +1032,8 @@ fn measure_end_to_end(
 /// test is what makes the rung-2 and rung-3 *peak* numbers attributable to `generate`; it is not a
 /// general equivalence proof between the two paths.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -978,6 +1063,8 @@ fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
         reassembled.peak_gib,
         production.peak_gib
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_end_to_end_reassembly_reproduces_the_real_generate_peak");
 }
 
 /// **The rung-3 REQUEST-level measurement** — the first of the two independent reasons rung 3 is
@@ -996,7 +1083,8 @@ fn the_end_to_end_reassembly_reproduces_the_real_generate_peak() {
 /// * **six steps** is the production schedule, and shows what that per-forward divergence becomes
 ///   once a chaos-sensitive sampler has fed it back into itself.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn attention_chunking_is_measured_against_the_rung_two_top() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -1041,6 +1129,8 @@ fn attention_chunking_is_measured_against_the_rung_two_top() {
          every query-block size, the output-preservation half of ATTENTION_SUPPORT no longer holds \
          and the rung must be re-measured, not left Missing on a stale reason"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_against_the_rung_two_top");
 }
 
 /// **The rung-3 mechanism measurement**, which is why rung 3 is declared `Missing`.
@@ -1057,7 +1147,8 @@ fn attention_chunking_is_measured_against_the_rung_two_top() {
 /// 2. whether the output moves — chunking is mathematically identity, but MLX dispatches a
 ///    different kernel per query-block size and SDXL runs fp16.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn attention_chunking_is_measured_at_the_unet_seam() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -1074,8 +1165,11 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
     let run = |plan: mlx_gen_sdxl::SdxlForwardPlan<'_>| -> (f64, Vec<f32>) {
         clear_cache();
         reset_peak_memory();
-        let out = unet
-            .forward_planned(&x, 500.0, &ctx, &pooled, &time_ids, None, None, plan)
+        let out = (
+            crate::common::record_model_inference_device(),
+            unet.forward_planned(&x, 500.0, &ctx, &pooled, &time_ids, None, None, plan),
+        )
+            .1
             .expect("unet forward");
         out.eval().expect("eval");
         let peak = get_peak_memory() as f64 / GIB;
@@ -1123,6 +1217,8 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
          {unbounded_peak:.4} GiB) — re-measure and re-publish memory_strategy::ATTENTION_SUPPORT \
          rather than widening this margin"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::attention_chunking_is_measured_at_the_unet_seam");
 }
 
 // ── Rung 4 ───────────────────────────────────────────────────────────────────────────────────────
@@ -1148,7 +1244,8 @@ fn attention_chunking_is_measured_at_the_unet_seam() {
 /// [`ms::TRANSFORMER_WINDOW_SIZES`]' table come from it, and they are what establish that the flat
 /// peak is a property of this family rather than of 1024².
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn transformer_window_sweep_and_streamed_output_identity() {
     // `SDXL_WINDOW_PROBE_TIER` / `SDXL_WINDOW_PROBE_SIZE` re-run the sweep at another tier or output
     // edge. The bf16/q4 and 512² rows in `ms::TRANSFORMER_WINDOW_SIZES`' tables come from them, and
@@ -1251,6 +1348,8 @@ fn transformer_window_sweep_and_streamed_output_identity() {
              longer flat, the flat region has moved and the domain owes fresh per-cadence evidence"
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::transformer_window_sweep_and_streamed_output_identity");
 }
 
 /// **The published window domain is enforced on both layers, and it is REACHABLE on both.**
@@ -1278,7 +1377,8 @@ fn transformer_window_sweep_and_streamed_output_identity() {
 /// by `BlockPlan::new`'s own `>= 1` guard. That one provider-side function is the whole gate on this
 /// path.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
@@ -1293,7 +1393,11 @@ fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path(
 
     let mut admitted = 0_usize;
     for size in ms::TRANSFORMER_WINDOW_SIZES {
-        let outcome = model.generate(&request(Some(full_ladder(*size)), 1024, 2), &mut |_| {});
+        let outcome = (
+            crate::common::record_model_inference_device(),
+            model.generate(&request(Some(full_ladder(*size)), 1024, 2), &mut |_| {}),
+        )
+            .1;
         println!(
             "[sc-15525 rung4 domain] WINDOW-REQUEST size={size} admitted={} refused={}",
             outcome.is_ok(),
@@ -1323,7 +1427,11 @@ fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path(
             !ms::TRANSFORMER_WINDOW_SIZES.contains(&bad),
             "the negative list must stay disjoint from the published domain"
         );
-        let outcome = model.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {});
+        let outcome = (
+            crate::common::record_model_inference_device(),
+            model.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {}),
+        )
+            .1;
         println!(
             "[sc-15525 rung4 domain] WINDOW-REQUEST size={bad} admitted={} refused={}",
             outcome.is_ok(),
@@ -1359,11 +1467,14 @@ fn the_published_window_domain_is_enforced_and_reachable_on_the_production_path(
         OUT_OF_DOMAIN.len(),
         "every out-of-domain cadence must be refused by the provider's window validator"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_published_window_domain_is_enforced_and_reachable_on_the_production_path");
 }
 
 /// **Rung 4 fails closed on every precondition**, on real weights, through the production path.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn rung_four_preconditions_fail_closed_on_real_weights() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
@@ -1374,7 +1485,12 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
     let eager = registry
         .load("sdxl", &spec(&dir, "q8", LoadShape::EagerMaterialization))
         .expect("load sdxl eager");
-    let err = match eager.generate(&request(Some(full_ladder(1)), 1024, 2), &mut |_| {}) {
+    let err = match (
+        crate::common::record_model_inference_device(),
+        eager.generate(&request(Some(full_ladder(1)), 1024, 2), &mut |_| {}),
+    )
+        .1
+    {
         Ok(_) => panic!("a window on an eager load must be refused"),
         Err(err) => err,
     };
@@ -1394,7 +1510,12 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
         stage_residency: false,
         ..full_ladder(1)
     };
-    let err = match deferred.generate(&request(Some(unstaged), 1024, 2), &mut |_| {}) {
+    let err = match (
+        crate::common::record_model_inference_device(),
+        deferred.generate(&request(Some(unstaged), 1024, 2), &mut |_| {}),
+    )
+        .1
+    {
         Ok(_) => panic!("rung 4 without rung 1 must be refused"),
         Err(err) => err,
     };
@@ -1408,7 +1529,12 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
             !ms::TRANSFORMER_WINDOW_SIZES.contains(&bad),
             "the negative list must stay disjoint from the published domain"
         );
-        let err = match deferred.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {}) {
+        let err = match (
+            crate::common::record_model_inference_device(),
+            deferred.generate(&request(Some(full_ladder(bad)), 1024, 2), &mut |_| {}),
+        )
+            .1
+        {
             Ok(_) => panic!("an out-of-domain window {bad} must be refused"),
             Err(err) => err,
         };
@@ -1427,7 +1553,12 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
             transformer_window_component: Some(component),
             ..full_ladder(1)
         };
-        let err = match deferred.generate(&request(Some(memory), 1024, 2), &mut |_| {}) {
+        let err = match (
+            crate::common::record_model_inference_device(),
+            deferred.generate(&request(Some(memory), 1024, 2), &mut |_| {}),
+        )
+            .1
+        {
             Ok(_) => panic!("an unimplemented window component must be refused"),
             Err(err) => err,
         };
@@ -1436,15 +1567,21 @@ fn rung_four_preconditions_fail_closed_on_real_weights() {
 
     // The control: the published composition renders. Without it every assertion above would pass
     // against a generator that refuses everything.
-    deferred
-        .generate(&request(Some(full_ladder(1)), 1024, 2), &mut |_| {})
+    (
+        crate::common::record_model_inference_device(),
+        deferred.generate(&request(Some(full_ladder(1)), 1024, 2), &mut |_| {}),
+    )
+        .1
         .expect("the published rung-4 composition must render");
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::rung_four_preconditions_fail_closed_on_real_weights");
 }
 
 /// The eleven sub-stacks are the shape SC-16355 describes — asserted against the **built** U-Net,
 /// not re-read from the config, so a config/checkpoint disagreement shows up here.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn the_unet_has_eleven_windowable_sub_stacks_at_two_depths() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "bf16") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing bf16/");
@@ -1468,6 +1605,8 @@ fn the_unet_has_eleven_windowable_sub_stacks_at_two_depths() {
         70,
         "70 windowable blocks, which is also the IP-Adapter K/V pair count"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_unet_has_eleven_windowable_sub_stacks_at_two_depths");
 }
 
 // ── Per-entry coverage ───────────────────────────────────────────────────────────────────────────
@@ -1522,7 +1661,8 @@ const EXPECTED_RUNG_FOUR: &[(&str, &str, bool)] = &[
 /// saying which row it came from; the other four Implemented declarations were inheriting
 /// `realvisxl`'s number by family resemblance. Each now carries its own.
 #[test]
-#[ignore = "needs the real SDXL-family snapshots (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs the real SDXL-family snapshots (see the module docs for the env vars)"]
 fn every_catalog_entry_loads_and_publishes_the_ladder() {
     use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
 
@@ -1658,12 +1798,15 @@ fn every_catalog_entry_loads_and_publishes_the_ladder() {
         "this test's per-entry claim needs both a streaming and a non-streaming snapshot cached; \
          got streaming={streaming:?} not_streaming={not_streaming:?}"
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::every_catalog_entry_loads_and_publishes_the_ladder");
 }
 
 /// A memory-capped host is where this ladder exists to help, so the full composition must still
 /// render under a cap that the resident path would not fit.
 #[test]
-#[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
+#[ignore = "model inference; explicit model-proof workflow"]
+// Prior ignore attribute: #[ignore = "needs a real SDXL-family snapshot (see the module docs for the env vars)"]
 fn the_full_ladder_renders_under_a_memory_cap() {
     let Some(dir) = tier_dir(REPRESENTATIVE, "q8") else {
         panic!("SKIPPED-BY-ABSENCE: set {REPRESENTATIVE} to a snapshot root containing q8/");
@@ -1734,4 +1877,6 @@ fn the_full_ladder_renders_under_a_memory_cap() {
             rows[0].0
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED memory_ladder_real_weights::the_full_ladder_renders_under_a_memory_cap");
 }

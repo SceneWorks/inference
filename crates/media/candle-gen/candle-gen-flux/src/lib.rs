@@ -24,6 +24,15 @@
 //! fallback rather than the candle backend silently dropping a control (the false-capability trap,
 //! exactly as the SDXL and Z-Image slices did). `backend` is `"candle"` and `mac_only` is `false`.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 mod pipeline;
 
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
@@ -975,6 +984,9 @@ mod tests {
     #[ignore]
     fn flux_dev_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux1_dev", "FLUX_DEV_DIR", load_dev, 8);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::flux_dev_probed_generate_for_offload_ab");
     }
 
     /// FLUX.1-schnell sibling required by the live worker gate (sc-12138). Needs a real-file snapshot
@@ -984,5 +996,10 @@ mod tests {
     #[ignore]
     fn flux_schnell_probed_generate_for_offload_ab() {
         run_probed_offload_ab("flux1_schnell", "FLUX_SCHNELL_DIR", load_schnell, 4);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED tests::flux_schnell_probed_generate_for_offload_ab"
+        );
     }
 }

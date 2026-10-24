@@ -174,6 +174,7 @@ mod tests {
     /// direction with the SD3.5 config. Uses random weights so the structural wiring is what's
     /// validated (not pixel quality).
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn vae_builds_and_decodes_on_cpu() {
         use candle_gen::candle_core::{DType, Device, Tensor};
         use candle_gen::candle_nn::{VarBuilder, VarMap};
@@ -184,8 +185,11 @@ mod tests {
         let vae = load_vae(vb).unwrap();
         // A tiny 16-ch latent /8: a 16x16 image -> 2x2 latent.
         let latent = Tensor::randn(0f32, 1f32, (1, LATENT_CHANNELS, 2, 2), &dev).unwrap();
-        let decoded = vae.decode(&latent).unwrap();
+        let decoded = __model_proof_output!(vae.decode(&latent)).unwrap();
         // Decode -> [B, 3, H, W] at the upscaled resolution (2*8 = 16).
         assert_eq!(decoded.dims(), &[1, 3, 16, 16]);
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::tests::vae_builds_and_decodes_on_cpu");
     }
 }

@@ -94,6 +94,8 @@ fn geometry_encoder_matches_oracle() {
     assert_eq!(out.shape(), want.shape(), "geometry output shape mismatch");
     assert!(cos > 0.9999, "geometry cosine {cos:.7} below 0.9999");
     assert!(maxabs < 1e-2, "geometry max_abs {maxabs:.5} above 1e-2");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED geometry_parity::geometry_encoder_matches_oracle");
 }
 
 #[test]
@@ -156,4 +158,6 @@ fn pvs_box_prompt_matches_oracle() {
         worst_iou > 0.95,
         "worst PVS instance mask IoU {worst_iou:.4} below 0.95"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED geometry_parity::pvs_box_prompt_matches_oracle");
 }

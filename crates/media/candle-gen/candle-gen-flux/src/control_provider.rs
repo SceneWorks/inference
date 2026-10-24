@@ -585,6 +585,7 @@ mod tests {
     /// stream — the old sampled path (`AutoEncoder::encode` + `set_seed`) drew device `randn` and
     /// diverged when the RNG state moved between calls.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn control_encode_mean_is_deterministic_and_rng_free() {
         let dev = Device::Cpu;
         let enc = tiny_mean_encoder(&dev);
@@ -601,11 +602,15 @@ mod tests {
         );
         assert!(av.iter().all(|v| v.is_finite()), "finite latent");
         assert_eq!(av, bv, "mean encode must be bit-identical across calls");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_provider::tests::control_encode_mean_is_deterministic_and_rng_free");
     }
 
     /// sc-8988: the encode is the shift/scale-normalized posterior MEAN — the first `z_channels` chunk
     /// of the encoder moments, exactly as `AutoEncoder::encode` normalizes, minus the sampling.
     #[test]
+    #[ignore = "model inference; explicit model workflow only"]
     fn control_encode_takes_the_posterior_mean() {
         let dev = Device::Cpu;
         let enc = tiny_mean_encoder(&dev);
@@ -619,5 +624,8 @@ mod tests {
             want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         );
         assert_eq!(g, w, "encode must equal (posterior_mean - shift) * scale");
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED control_provider::tests::control_encode_takes_the_posterior_mean");
     }
 }

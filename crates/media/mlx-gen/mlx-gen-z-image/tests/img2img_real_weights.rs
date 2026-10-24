@@ -109,7 +109,7 @@ fn img2img_preprocess_matches_fork() {
 /// Gate C: the VAE **encoder** path — `encode_init_latents` (preprocess → encode → pack) vs the
 /// fork's packed `clean` latents. This is the core new module for sc-2533.
 #[test]
-#[ignore = "needs real Z-Image weights + local img2img golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local img2img golden"]
 fn img2img_encode_matches_fork() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let (w, h) = (meta_u32(&g, "w"), meta_u32(&g, "h"));
@@ -120,6 +120,9 @@ fn img2img_encode_matches_fork() {
     let (peak, mean) = rel_errors(&clean, want);
     println!("img2img encode (clean latents): peak-rel {peak:.3e}  mean-rel {mean:.3e}");
     assert!(mean < 3e-2, "VAE-encoder clean latents mean-rel {mean:.3e}");
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_encode_matches_fork");
 }
 
 /// Gate D: the noise blend `(1-σ)·clean + σ·noise` at σ = sigmas[init_step]. Blends the **fork's**
@@ -150,7 +153,7 @@ fn img2img_blend_matches_fork() {
 /// The integration proof: the full img2img pipeline through the **public** Generator API with a
 /// `Conditioning::Reference`, compared to the fork's img2img golden render.
 #[test]
-#[ignore = "needs real Z-Image weights + local img2img golden"]
+#[ignore = "model inference; explicit model-proof workflow; needs real Z-Image weights + local img2img golden"]
 fn img2img_full_pipeline_matches_fork() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let (steps, w, h) = (meta_u32(&g, "steps"), meta_u32(&g, "w"), meta_u32(&g, "h"));
@@ -230,5 +233,10 @@ fn img2img_full_pipeline_matches_fork() {
     assert!(
         frac < 0.05,
         "img2img image diverges from the fork: {differ} px (>8)"
+    );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED img2img_real_weights::img2img_full_pipeline_matches_fork"
     );
 }

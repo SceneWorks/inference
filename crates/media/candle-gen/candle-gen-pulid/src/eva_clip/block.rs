@@ -36,9 +36,9 @@ impl Block {
     }
 
     pub fn forward(&self, x: &Tensor, rope: &VisionRope) -> candle_core::Result<Tensor> {
-        let n1 = self.norm1.forward(x)?;
+        let n1 = __model_proof_output!(self.norm1.forward(x))?;
         let x = (x + self.attn.forward(&n1, rope)?)?;
-        let n2 = self.norm2.forward(&x)?;
+        let n2 = __model_proof_output!(self.norm2.forward(&x))?;
         &x + self.mlp.forward(&n2)?
     }
 }

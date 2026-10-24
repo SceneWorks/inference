@@ -941,6 +941,7 @@ mod tests {
     /// [`MiniMaxH3TextEncoder::embed_screened`], before the splice. Delete that call and this test
     /// reds while `forward_refuses_an_all_zero_context` stays green — which is exactly the hole.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_with_images_refuses_a_zeroed_token_table_the_context_screen_cannot_see() {
         let cfg = tiny_config();
         let te = MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, false), TEST_PREFIX, &cfg)
@@ -960,11 +961,14 @@ mod tests {
             message.contains("CPU token-embedding lookup is invalid"),
             "{message}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_with_images_refuses_a_zeroed_token_table_the_context_screen_cannot_see");
     }
 
     /// The same fixture with a live table must pass, or the arm above would be green for a screen
     /// that rejects every grounded forward.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_with_images_returns_a_healthy_grounded_context() {
         let cfg = tiny_config();
         let te = MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, true), TEST_PREFIX, &cfg)
@@ -975,6 +979,8 @@ mod tests {
             .forward_with_images(&g.input_ids, &g.mask, &g.embeds, &g.deepstack, &g.grids)
             .expect("a live grounded encoder must forward");
         assert_eq!(context.shape(), &[1, 6, cfg.hidden_size]);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_with_images_returns_a_healthy_grounded_context");
     }
 
     /// **The sc-23402 mutation target.** A *packed* token table — the q4/q8 tier every shipped
@@ -986,6 +992,7 @@ mod tests {
     /// still fires (from the post-lookup screen) but without the `CPU token-embedding lookup is
     /// invalid` clause, and this arm reds while every dense arm stays green.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_with_references_screens_a_zeroed_packed_token_table_at_the_cpu_lookup() {
         let cfg = packed_tiny_config();
         let mut te =
@@ -1008,6 +1015,8 @@ mod tests {
             "the packed table must be screened at the CPU lookup, not only after the gather: \
              {message}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_with_references_screens_a_zeroed_packed_token_table_at_the_cpu_lookup");
     }
 
     /// The packed arm's CPU reference is the same lookup the GPU gather performs: a live packed
@@ -1015,6 +1024,7 @@ mod tests {
     /// the default-stream ones element for element. Without this the arm above would be green for
     /// a CPU lookup that dequantizes garbage.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_live_packed_token_table_passes_the_screen_and_matches_the_gpu_lookup() {
         let cfg = packed_tiny_config();
         let mut te =
@@ -1061,6 +1071,8 @@ mod tests {
             3,
             "a packed table verifies weight, scales and biases"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::a_live_packed_token_table_passes_the_screen_and_matches_the_gpu_lookup");
     }
 
     /// **Why the post-stack screen is not enough**, stated as a measurement rather than an argument:
@@ -1069,6 +1081,7 @@ mod tests {
     /// wrong*. If this ever starts reporting a defect, the grounded splice stopped overwriting the
     /// pad rows and `embed_screened`'s justification needs re-reading.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_grounded_context_hides_a_zeroed_token_table_from_the_post_stack_screen() {
         let cfg = tiny_config();
         let te = MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, false), TEST_PREFIX, &cfg)
@@ -1103,6 +1116,8 @@ mod tests {
                 .is_none(),
             "premise of `embed_screened`: a whole-context screen is blind to this"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::a_grounded_context_hides_a_zeroed_token_table_from_the_post_stack_screen");
     }
 
     /// **The mutation target for the post-stack backstop.** A context that goes bad *inside* the
@@ -1113,6 +1128,7 @@ mod tests {
     /// is fine and every state after layer 0 is not. Delete the `refuse_if_degenerate` call in
     /// `run_layers` and this reds while every other arm stays green.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_refuses_a_context_the_stack_itself_poisoned() {
         let cfg = tiny_config();
         let mut w = tiny_weights(&cfg, true);
@@ -1146,6 +1162,8 @@ mod tests {
             message.contains("te (t2va):"),
             "must be the post-stack screen, not the embedding one: {message}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_refuses_a_context_the_stack_itself_poisoned");
     }
 
     /// A `t2va` forward whose context comes out all-zero must return the typed refusal, not the
@@ -1155,6 +1173,7 @@ mod tests {
     /// On `t2va` this is satisfied by the **embedding** screen, which fires first — the post-stack
     /// backstop has its own arm above.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_refuses_an_all_zero_context() {
         let cfg = tiny_config();
         let te = MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, false), TEST_PREFIX, &cfg)
@@ -1178,11 +1197,14 @@ mod tests {
             message.contains("CPU token-embedding lookup is invalid"),
             "{message}"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_refuses_an_all_zero_context");
     }
 
     /// The refusal must be **specific**. The same fixture with a live token table has to pass, or
     /// the arm above would be green for a guard that rejects every forward.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_returns_a_healthy_context_untouched() {
         let cfg = tiny_config();
         let te = MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, true), TEST_PREFIX, &cfg)
@@ -1198,6 +1220,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::forward_returns_a_healthy_context_untouched");
     }
 
     /// The propagation claim the sc-17153 investigation rests on, stated executably: zeroing **only**
@@ -1209,6 +1233,7 @@ mod tests {
     /// If this ever stops holding, the "a zeroed token table explains the signature" line of the
     /// investigation is dead and the bisect has to start again from the intermediates.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_zeroed_token_table_produces_an_exactly_zero_context() {
         let cfg = tiny_config();
         let w = tiny_weights(&cfg, false);
@@ -1235,6 +1260,8 @@ mod tests {
             peak, 0.0,
             "a zeroed token table must walk the stack unchanged"
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::a_zeroed_token_table_produces_an_exactly_zero_context");
     }
 
     /// Text-only MRoPE is a plain sequential ramp on all three axes — the reduction that lets the
@@ -1309,6 +1336,7 @@ mod tests {
     /// A text-only prompt must produce the same `cos`/`sin` as plain 1-D RoPE, since all three
     /// sections index the same position. This is the invariant `forward` relies on.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn text_only_mrope_matches_plain_rope() {
         let head_dim = 24;
         let theta = 5_000_000.0;
@@ -1323,5 +1351,7 @@ mod tests {
         };
         assert!(close(&cos_m, &cos_r), "cos diverged from 1-D RoPE");
         assert!(close(&sin_m, &sin_r), "sin diverged from 1-D RoPE");
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::text_only_mrope_matches_plain_rope");
     }
 }

@@ -170,6 +170,11 @@ fn render(width: u32, height: u32) {
 #[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR)"]
 fn turbo_engine_renders_coherent_1024() {
     render(1024, 1024);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_renders_coherent_1024"
+    );
 }
 
 /// sc-9592 regression lock: at 1536² the DiT scores tensor is `48·9216² ≈ 4.1e9 > i32::MAX`, which
@@ -178,12 +183,22 @@ fn turbo_engine_renders_coherent_1024() {
 #[ignore = "needs the real snapshot (KREA_TURBO_DIR); larger footprint — run if it fits"]
 fn turbo_engine_renders_coherent_1536() {
     render(1536, 1536);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_renders_coherent_1536"
+    );
 }
 
 #[test]
 #[ignore = "needs the real snapshot (KREA_TURBO_DIR); larger footprint — run if it fits"]
 fn turbo_engine_renders_coherent_2048() {
     render(2048, 2048);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_renders_coherent_2048"
+    );
 }
 
 // ── sc-9994 Krea 2 Raw (undistilled, full-CFG) end-to-end ─────────────────────────────────────────
@@ -266,6 +281,8 @@ fn mean_abs_diff(a: &Image, b: &Image) -> f32 {
 fn raw_engine_renders_coherent_1024_cfg() {
     let Some(img) = render_raw(1024, 1024, 3.5, "blurry, deformed, low quality, watermark") else {
         eprintln!("skipping: set KREA_RAW_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs:269 (raw_engine_renders_coherent_1024_cfg): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     save(&img, "raw_fox_1024_g3p5");
@@ -273,6 +290,11 @@ fn raw_engine_renders_coherent_1024_cfg() {
     assert!(
         is_coherent(&img),
         "Raw CFG render must be a coherent image, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::raw_engine_renders_coherent_1024_cfg"
     );
 }
 
@@ -288,6 +310,8 @@ fn raw_cfg_visibly_affects_render() {
         render_raw(1024, 1024, 0.0, ""),
     ) else {
         eprintln!("skipping: set KREA_RAW_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs:291 (raw_cfg_visibly_affects_render): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     save(&cfg_on, "raw_fox_1024_cfg_on");
@@ -298,6 +322,9 @@ fn raw_cfg_visibly_affects_render() {
         diff > 2.0,
         "guidance must visibly change the render; mean|Δ|={diff:.2} is too small — CFG path may be inert"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::raw_cfg_visibly_affects_render");
 }
 
 // ── sc-7836 inference-side LoRA/LoKr adapter merge ────────────────────────────────────────────────
@@ -499,6 +526,8 @@ fn render_with(root: &Path, width: u32, height: u32, adapters: Vec<AdapterSpec>)
 fn turbo_engine_applies_lora_adapter() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: set KREA_TURBO_DIR");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs:502 (turbo_engine_applies_lora_adapter): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let cfg = Krea2Config::from_snapshot(&root).expect("parse transformer config");
@@ -547,6 +576,11 @@ fn turbo_engine_applies_lora_adapter() {
         "adapted render must be a coherent image (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
     );
     assert!(diff > 0, "a non-zero-scale adapter must change the render");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_applies_lora_adapter"
+    );
 }
 
 /// sc-13726 end-to-end on the real GPU: the community "filter-bypass" — a **diff-only** file carrying
@@ -560,6 +594,8 @@ fn turbo_engine_applies_lora_adapter() {
 fn turbo_engine_applies_projector_bypass() {
     let (Some(root), Some(bypass)) = (snapshot(), bypass_file()) else {
         eprintln!("skipping: set KREA_TURBO_DIR and KREA_BYPASS_FILE");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs:563 (turbo_engine_applies_projector_bypass): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let base = render_with(&root, 1024, 1024, vec![]);
@@ -598,6 +634,11 @@ fn turbo_engine_applies_projector_bypass() {
     assert!(
         changed > 0,
         "the projector diff-patch must change the render — a diff-only file, folded not silently dropped"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_applies_projector_bypass"
     );
 }
 
@@ -730,6 +771,8 @@ fn real_aitoolkit_lokr_merges_full_surface() {
 fn turbo_engine_applies_aitoolkit_lokr() {
     let (Some(root), Ok(adapter)) = (snapshot(), std::env::var(AITOOLKIT_LOKR_ENV)) else {
         eprintln!("skipping: set KREA_TURBO_DIR and {AITOOLKIT_LOKR_ENV}");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs:733 (turbo_engine_applies_aitoolkit_lokr): Required selected learned asset/device path returns normally instead of running its neural/reference work; shape/report work in other paths does not satisfy this branch.");
         return;
     };
     let adapter = PathBuf::from(adapter);
@@ -762,4 +805,9 @@ fn turbo_engine_applies_aitoolkit_lokr() {
         "ai-toolkit LoKr render must be coherent (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
     );
     assert!(diff > 0, "the LoKr merge must change the render");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_engine_applies_aitoolkit_lokr"
+    );
 }

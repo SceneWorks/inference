@@ -1388,12 +1388,13 @@ pub(crate) mod quantum_proofs {
     /// diverges observably. The stitch quantum's counted scratch is proven against its measured
     /// peak.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch() {
         const CHILD: &str = "SANA_TILED_ENCODE_CPU_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "--exact",
+                    "--include-ignored", "--exact",
                     "dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch",
                     "--nocapture",
                 ])
@@ -1467,6 +1468,8 @@ pub(crate) mod quantum_proofs {
         );
 
         // The stalled stitch allocation measurement is an individually selected capture below.
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch");
     }
 
     #[test]

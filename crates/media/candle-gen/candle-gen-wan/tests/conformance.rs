@@ -62,4 +62,7 @@ fn wan_conformance() {
         || Box::new(TinyClip(candle_gen_wan::load(&spec).unwrap())),
         &profile,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED conformance::wan_conformance");
 }

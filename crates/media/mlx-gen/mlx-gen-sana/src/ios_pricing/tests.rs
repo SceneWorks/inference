@@ -248,6 +248,7 @@ fn pricing_refuses_unknown_routes_and_unexecutable_levers() {
 /// SANA text-to-image and Sprint img2img. The pricing reads only the fixture's safetensors headers.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn observed_peak_quantum_per_phase_is_the_priced_one() {
     use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
     use crate::pipeline::{SanaConditioning, SanaGenerateRequest, SanaHeavy};
@@ -260,6 +261,7 @@ fn observed_peak_quantum_per_phase_is_the_priced_one() {
     if std::env::var_os(CHILD).is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "ios_pricing::tests::observed_peak_quantum_per_phase_is_the_priced_one",
                 "--nocapture",
@@ -611,4 +613,6 @@ fn observed_peak_quantum_per_phase_is_the_priced_one() {
             "per label, sprint={sprint} img2img={img2img}"
         );
     }
+
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED ios_pricing::tests::observed_peak_quantum_per_phase_is_the_priced_one");
 }

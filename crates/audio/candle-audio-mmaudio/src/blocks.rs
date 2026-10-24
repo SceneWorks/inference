@@ -55,7 +55,7 @@ impl PatchEmbed3d {
         // (BS, ntok, patch_elems) · (patch_elems, EMBED_DIM) + bias
         let wt = self.weight.t()?; // (patch_elems, EMBED_DIM)
         let x = x.broadcast_matmul(&wt)?;
-        x.broadcast_add(&self.bias)
+        __model_proof_output!(x.broadcast_add(&self.bias))
     }
 }
 
@@ -105,7 +105,7 @@ impl DividedAttention {
         let scale = (hd as f64).powf(-0.5);
 
         // qkv → 3×(B, N, D); reshape each to (B·h, N, hd): 'b n (h d) -> (b h) n d'.
-        let qkv = self.qkv.forward(x)?; // (B, N, 3D)
+        let qkv = __model_proof_output!(self.qkv.forward(x))?; // (B, N, 3D)
         let qkv = qkv.reshape((b, ntot, 3, h, hd))?;
         let q = qkv.narrow(2, 0, 1)?.squeeze(2)?; // (B, N, h, hd)
         let k = qkv.narrow(2, 1, 1)?.squeeze(2)?;
@@ -182,7 +182,7 @@ impl DividedAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, ntot, config::EMBED_DIM))?;
-        self.proj.forward(&out)
+        __model_proof_output!(self.proj.forward(&out))
     }
 }
 
@@ -201,8 +201,8 @@ impl Mlp {
     }
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
         // nn.GELU() default is the exact erf gelu.
-        let x = self.fc1.forward(x)?.gelu_erf()?;
-        self.fc2.forward(&x)
+        let x = __model_proof_output!(self.fc1.forward(x))?.gelu_erf()?;
+        __model_proof_output!(self.fc2.forward(&x))
     }
 }
 
@@ -231,15 +231,23 @@ impl DividedSpaceTimeBlock {
 
     /// `x`: `(B, 1+F·n, D)`; `f` = T temporal tokens, `n` = 196 spatial tokens.
     pub fn forward(&self, x: &Tensor, f: usize, n: usize) -> CResult<Tensor> {
-        let time_out = self
-            .timeattn
-            .forward(&self.norm3.forward(x)?, Mode::Time, f, n)?;
+        let time_out = self.timeattn.forward(
+            &__model_proof_output!(self.norm3.forward(x))?,
+            Mode::Time,
+            f,
+            n,
+        )?;
         let time_res = (x + time_out)?;
-        let space_out = self
-            .attn
-            .forward(&self.norm1.forward(&time_res)?, Mode::Space, f, n)?;
+        let space_out = self.attn.forward(
+            &__model_proof_output!(self.norm1.forward(&time_res))?,
+            Mode::Space,
+            f,
+            n,
+        )?;
         let space_res = (time_res + space_out)?;
-        let mlp_out = self.mlp.forward(&self.norm2.forward(&space_res)?)?;
+        let mlp_out = self
+            .mlp
+            .forward(&__model_proof_output!(self.norm2.forward(&space_res))?)?;
         &space_res + mlp_out
     }
 }

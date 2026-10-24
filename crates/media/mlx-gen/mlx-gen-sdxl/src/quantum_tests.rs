@@ -435,6 +435,7 @@ fn assert_unet_counts(events: &[Ev], unet: &UNet2DConditionModel, cfg: &UNetConf
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn unet_forward_is_bounded_identical_and_refuses_before_construction() {
     if !cpu_child("unet_forward_is_bounded_identical_and_refuses_before_construction") {
@@ -443,7 +444,13 @@ fn unet_forward_is_bounded_identical_and_refuses_before_construction() {
     let cfg = crate::test_support::tiny_unet_config();
     let unet = crate::test_support::tiny_unet(7).unwrap();
     let (x, ctx, pooled, ids) = unet_inputs(1, 8, 8);
-    let forward = || unet.forward(&x, 500.0, &ctx, &pooled, &ids);
+    let forward = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            unet.forward(&x, 500.0, &ctx, &pooled, &ids),
+        )
+            .1
+    };
     let host = forward().unwrap();
     let (guarded, events) = observe(PLENTY, forward);
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
@@ -469,8 +476,11 @@ fn unet_forward_is_bounded_identical_and_refuses_before_construction() {
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
     )));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::unet_forward_is_bounded_identical_and_refuses_before_construction");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn unet_ip_forward_prices_the_ip_tokens_and_stays_identical() {
     if !cpu_child("unet_ip_forward_prices_the_ip_tokens_and_stays_identical") {
@@ -479,7 +489,13 @@ fn unet_ip_forward_prices_the_ip_tokens_and_stays_identical() {
     let cfg = crate::test_support::tiny_unet_config();
     let mut unet = crate::test_support::tiny_unet(7).unwrap();
     let (x, ctx, pooled, ids) = unet_inputs(1, 8, 8);
-    let (_, plain) = observe(PLENTY, || unet.forward(&x, 500.0, &ctx, &pooled, &ids));
+    let (_, plain) = observe(PLENTY, || {
+        (
+            crate::test_device::record_model_inference_device(),
+            unet.forward(&x, 500.0, &ctx, &pooled, &ids),
+        )
+            .1
+    });
     let layers: usize = unet.transformer_stack_depths().iter().sum();
     let pairs = (0..layers)
         .map(|i| {
@@ -500,7 +516,13 @@ fn unet_ip_forward_prices_the_ip_tokens_and_stays_identical() {
         .collect();
     unet.install_ip_adapter(pairs).unwrap();
     let tokens = rnd(&[1, 3, crate::test_support::TINY_CONTEXT_DIM], 31, 1.0);
-    let forward = || unet.forward_with_ip(&x, 500.0, &ctx, &pooled, &ids, (&tokens, 0.7));
+    let forward = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            unet.forward_with_ip(&x, 500.0, &ctx, &pooled, &ids, (&tokens, 0.7)),
+        )
+            .1
+    };
     let host = forward().unwrap();
     let (guarded, events) = observe(PLENTY, forward);
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
@@ -538,8 +560,11 @@ fn unet_ip_forward_prices_the_ip_tokens_and_stays_identical() {
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
     )));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::unet_ip_forward_prices_the_ip_tokens_and_stays_identical");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn controlnet_branch_and_injection_are_bounded_and_identical() {
     if !cpu_child("controlnet_branch_and_injection_are_bounded_and_identical") {
@@ -561,8 +586,16 @@ fn controlnet_branch_and_injection_are_bounded_and_identical() {
     image.eval().unwrap();
     let run = || -> Result<Vec<Array>> {
         let cond = control.embed_cond(&image)?;
-        let residuals = control.forward(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8)?;
-        let eps = unet.forward_with_control(&x, 500.0, &ctx, &pooled, &ids, &residuals)?;
+        let residuals = (
+            crate::test_device::record_model_inference_device(),
+            control.forward(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8),
+        )
+            .1?;
+        let eps = (
+            crate::test_device::record_model_inference_device(),
+            unet.forward_with_control(&x, 500.0, &ctx, &pooled, &ids, &residuals),
+        )
+            .1?;
         let mut out = residuals.down;
         out.push(residuals.mid);
         out.push(eps);
@@ -594,17 +627,29 @@ fn controlnet_branch_and_injection_are_bounded_and_identical() {
     // The full-resolution conditioning embedding is this chain's widest quantum, so prove the
     // mid-path refusal on the U-Net-with-control half (stem → … → injections) on its own.
     let cond = control.embed_cond(&image).unwrap();
-    let residuals = control
-        .forward(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8)
+    let residuals = (
+        crate::test_device::record_model_inference_device(),
+        control.forward(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8),
+    )
+        .1
         .unwrap();
-    let inject = || unet.forward_with_control(&x, 500.0, &ctx, &pooled, &ids, &residuals);
+    let inject = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            unet.forward_with_control(&x, 500.0, &ctx, &pooled, &ids, &residuals),
+        )
+            .1
+    };
     let (_, inject_events) = observe(PLENTY, inject);
     assert_well_ordered(&inject_events);
     assert!(assert_refusals(&inject_events, |headroom| observe(
         headroom, inject
     )));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::controlnet_branch_and_injection_are_bounded_and_identical");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn streamed_transformer_blocks_are_checked_before_materialization() {
     if !cpu_child("streamed_transformer_blocks_are_checked_before_materialization") {
@@ -636,11 +681,24 @@ fn streamed_transformer_blocks_are_checked_before_materialization() {
             size: 1,
             cancel: &cancel,
         }));
-    let forward = || streamed.forward_planned(&x, 500.0, &ctx, &pooled, &ids, None, None, plan);
+    let forward = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            streamed.forward_planned(&x, 500.0, &ctx, &pooled, &ids, None, None, plan),
+        )
+            .1
+    };
     let host = forward().unwrap();
     assert_eq!(
         bits(&host),
-        bits(&resident.forward(&x, 500.0, &ctx, &pooled, &ids).unwrap())
+        bits(
+            &(
+                crate::test_device::record_model_inference_device(),
+                resident.forward(&x, 500.0, &ctx, &pooled, &ids)
+            )
+                .1
+                .unwrap()
+        )
     );
     let (guarded, events) = observe(PLENTY, forward);
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
@@ -650,7 +708,13 @@ fn streamed_transformer_blocks_are_checked_before_materialization() {
     // request); its quantum also reads the block from the snapshot (epic 16774): every stored
     // tensor of the block plus the GEGLU value/gate halves beside the projection they are sliced
     // from — read off the file, in forward order (down, mid, up).
-    let (_, resident_events) = observe(PLENTY, || resident.forward(&x, 500.0, &ctx, &pooled, &ids));
+    let (_, resident_events) = observe(PLENTY, || {
+        (
+            crate::test_device::record_model_inference_device(),
+            resident.forward(&x, 500.0, &ctx, &pooled, &ids),
+        )
+            .1
+    });
     let mut stacks: Vec<String> = Vec::new();
     let n = cfg.block_out_channels.len();
     for i in 0..n {
@@ -717,11 +781,14 @@ fn streamed_transformer_blocks_are_checked_before_materialization() {
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
     )));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::streamed_transformer_blocks_are_checked_before_materialization");
 }
 
 /// The block floor is `attention_block_bytes` over THIS block's loaded tensors (non-production
 /// widths: 64 channels, 2 heads, a 4x GEGLU, 16-wide context) and the request (tokens, context
 /// tokens, chunk rows) — and it grows with the latent grid.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry() {
     if !cpu_child("block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry") {
@@ -730,7 +797,14 @@ fn block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry() {
     let unet = crate::test_support::tiny_unet(7).unwrap();
     let observe_at = |h: i32, w: i32| {
         let (x, ctx, pooled, ids) = unet_inputs(1, h, w);
-        observe(PLENTY, || unet.forward(&x, 500.0, &ctx, &pooled, &ids)).1
+        observe(PLENTY, || {
+            (
+                crate::test_device::record_model_inference_device(),
+                unet.forward(&x, 500.0, &ctx, &pooled, &ids),
+            )
+                .1
+        })
+        .1
     };
     let small = observe_at(8, 8);
     let large = observe_at(16, 16);
@@ -767,7 +841,11 @@ fn block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry() {
         mlx_gen::attention::AttentionPlan::budgeted(budget),
     );
     let (bounded_out, chunked) = observe(PLENTY, || {
-        unet.forward_planned(&x, 500.0, &ctx, &pooled, &ids, None, None, plan)
+        (
+            crate::test_device::record_model_inference_device(),
+            unet.forward_planned(&x, 500.0, &ctx, &pooled, &ids, None, None, plan),
+        )
+            .1
     });
     bounded_out.unwrap();
     let (full, bounded) = (
@@ -783,6 +861,8 @@ fn block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry() {
         full[0],
         transformer_block_bytes(1, 1, 64, 64, 2, 32, 5, 4 * 64, 64, false, 4, Backend::Cpu)
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -876,6 +956,7 @@ fn clip_ids(n: i32) -> Array {
     Array::from_slice(&ids, &[2, n])
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn clip_text_encoders_are_bounded_per_layer_and_identical() {
     if !cpu_child("clip_text_encoders_are_bounded_per_layer_and_identical") {
@@ -886,7 +967,13 @@ fn clip_text_encoders_are_bounded_per_layer_and_identical() {
     let te1 = crate::text_encoder::ClipTextEncoder::from_weights(&w1, "text_model", &c1).unwrap();
     let te2 = crate::text_encoder::ClipTextEncoder::from_weights(&w2, "text_model", &c2).unwrap();
     let ids = clip_ids(8);
-    let encode = || crate::pipeline::encode_conditioning(&te1, &te2, &ids);
+    let encode = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::encode_conditioning(&te1, &te2, &ids),
+        )
+            .1
+    };
     let (cond, pooled) = encode().unwrap();
     let (guarded, events) = observe(PLENTY, encode);
     let (g_cond, g_pooled) = guarded.unwrap();
@@ -908,11 +995,20 @@ fn clip_text_encoders_are_bounded_per_layer_and_identical() {
         clip_layer_bytes(2, 8, 32, 96, 4, 8, true, 4, Backend::Cpu)
     );
     let short = clip_ids(4);
-    let (_, short_events) = observe(PLENTY, || te1.forward(&short).map(|o| o.pooled));
+    let (_, short_events) = observe(PLENTY, || {
+        (
+            crate::test_device::record_model_inference_device(),
+            te1.forward(&short),
+        )
+            .1
+            .map(|o| o.pooled)
+    });
     assert!(checked(&short_events, CLIP_LAYER)[0] < layers[0]);
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, encode
     )));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::clip_text_encoders_are_bounded_per_layer_and_identical");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -976,6 +1072,7 @@ fn tiny_ip_encoder() -> crate::ip_adapter::IpImageEncoder {
     crate::ip_adapter::IpImageEncoder::with_image_size(encoder, resampler, 16)
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn ip_image_encoder_is_bounded_per_layer_and_identical() {
     if !cpu_child("ip_image_encoder_is_bounded_per_layer_and_identical") {
@@ -1018,6 +1115,8 @@ fn ip_image_encoder_is_bounded_per_layer_and_identical() {
     );
     // The patch-embedding quantum is this chain's widest, so only the first-quantum refusal applies.
     assert_refusals(&events, |headroom| observe(headroom, tokens));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::ip_image_encoder_is_bounded_per_layer_and_identical");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1050,6 +1149,7 @@ fn assert_dense_decode_counts(events: &[Ev]) {
     }
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae_dense_and_evaluated_decode_are_bounded_and_identical() {
     if !cpu_child("vae_dense_and_evaluated_decode_are_bounded_and_identical") {
@@ -1060,9 +1160,17 @@ fn vae_dense_and_evaluated_decode_are_bounded_and_identical() {
     for evaluated in [false, true] {
         let decode = || {
             if evaluated {
-                vae.decode_evaluated(&z)
+                (
+                    crate::test_device::record_model_inference_device(),
+                    vae.decode_evaluated(&z),
+                )
+                    .1
             } else {
-                vae.decode(&z)
+                (
+                    crate::test_device::record_model_inference_device(),
+                    vae.decode(&z),
+                )
+                    .1
             }
         };
         let host = decode().unwrap();
@@ -1084,10 +1192,13 @@ fn vae_dense_and_evaluated_decode_are_bounded_and_identical() {
             headroom, decode
         )));
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::vae_dense_and_evaluated_decode_are_bounded_and_identical");
 }
 
 /// The production decode route (`pipeline::decode_image_tiled` through the NCHW decoder seam, both
 /// dense and tiled) ends in a guarded pixel conversion and stays byte-identical.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_image_route_is_bounded_end_to_end() {
     if !cpu_child("decode_image_route_is_bounded_end_to_end") {
@@ -1097,7 +1208,13 @@ fn decode_image_route_is_bounded_end_to_end() {
     let z = vae_latent();
     let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
     for tiled in [None, Some(&tiling)] {
-        let decode = || crate::pipeline::decode_image_tiled(&vae, &z, None, tiled, None);
+        let decode = || {
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::decode_image_tiled(&vae, &z, None, tiled, None),
+            )
+                .1
+        };
         let host = decode().unwrap();
         let (guarded, events) = observe(PLENTY, decode);
         let guarded = guarded.unwrap();
@@ -1111,6 +1228,10 @@ fn decode_image_route_is_bounded_end_to_end() {
         assert_eq!(synced(&events, DECODED_TO_IMAGE), 1);
         assert_refusals(&events, |headroom| observe(headroom, decode));
     }
+
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::decode_image_route_is_bounded_end_to_end"
+    );
 }
 
 /// Tiles one layer-wise tiled conv of an `h x w` input cuts at `edge` (the halo-1 core plan of
@@ -1123,6 +1244,7 @@ fn tiles(h: i32, w: i32, edge: i32) -> usize {
     (((h + core - 1) / core) * ((w + core - 1) / core)) as usize
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae_tiled_decode_checks_every_tile_before_its_graph() {
     if !cpu_child("vae_tiled_decode_checks_every_tile_before_its_graph") {
@@ -1131,7 +1253,13 @@ fn vae_tiled_decode_checks_every_tile_before_its_graph() {
     let vae = tiny_vae();
     let z = vae_latent();
     let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
-    let decode = || vae.decode_tiled(&z, &tiling, None);
+    let decode = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            vae.decode_tiled(&z, &tiling, None),
+        )
+            .1
+    };
     let host = decode().unwrap();
     let (guarded, events) = observe(PLENTY, decode);
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
@@ -1154,8 +1282,11 @@ fn vae_tiled_decode_checks_every_tile_before_its_graph() {
     let tile_floors = checked(&events, VAE_TILE);
     assert!(tile_floors[0] < *tile_floors.last().unwrap());
     assert_refusals(&events, |headroom| observe(headroom, decode));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::vae_tiled_decode_checks_every_tile_before_its_graph");
 }
 
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae_encode_is_bounded_and_identical() {
     if !cpu_child("vae_encode_is_bounded_and_identical") {
@@ -1164,7 +1295,13 @@ fn vae_encode_is_bounded_and_identical() {
     let vae = tiny_vae();
     let image = rnd(&[1, 16, 18, 3], 81, 0.5);
     image.eval().unwrap();
-    let encode = || vae.encode_mean(&image);
+    let encode = || {
+        (
+            crate::test_device::record_model_inference_device(),
+            vae.encode_mean(&image),
+        )
+            .1
+    };
     let host = encode().unwrap();
     let (guarded, events) = observe(PLENTY, encode);
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
@@ -1180,6 +1317,8 @@ fn vae_encode_is_bounded_and_identical() {
         assert_eq!(synced(&events, label), want, "{label} synchronizations");
     }
     assert_refusals(&events, |headroom| observe(headroom, encode));
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::vae_encode_is_bounded_and_identical");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1475,6 +1614,7 @@ fn half_upsample_stage_prices_its_f32_accumulation_copies() {
 /// peak for the fp16 VAE against the f32 whole-image encode of the same f16-rounded weights — at
 /// tile edges that split the image evenly, raggedly and down to the 3-pixel floor (the stride-2
 /// downsample tiles reach the padding row/column at the ragged edges).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn tiled_encode_meets_the_tiled_parity_standard() {
     if !cpu_child("tiled_encode_meets_the_tiled_parity_standard") {
@@ -1491,16 +1631,31 @@ fn tiled_encode_meets_the_tiled_parity_standard() {
     for (h, wd) in [(16, 18), (17, 23)] {
         let image = rnd(&[1, h, wd, 3], 81, 0.5);
         image.eval().unwrap();
-        let dense = reference.encode_mean(&image).unwrap();
+        let dense = (
+            crate::test_device::record_model_inference_device(),
+            reference.encode_mean(&image),
+        )
+            .1
+            .unwrap();
         for edge in [3, 5, 8, 9] {
-            let tiled = reference.encode_tiled(&image, edge, None).unwrap();
+            let tiled = (
+                crate::test_device::record_model_inference_device(),
+                reference.encode_tiled(&image, edge, None),
+            )
+                .1
+                .unwrap();
             let delta = relative_max_delta(&dense, &tiled);
             eprintln!("{h}x{wd} edge {edge}: f32 {delta:.3e}");
             assert!(
                 delta <= 1e-4,
                 "f32 tiled encode at edge {edge} drifted {delta:.3e}"
             );
-            let tiled16 = half.encode_tiled(&image, edge, None).unwrap();
+            let tiled16 = (
+                crate::test_device::record_model_inference_device(),
+                half.encode_tiled(&image, edge, None),
+            )
+                .1
+                .unwrap();
             assert_eq!(tiled16.dtype(), Dtype::Float32, "callers receive f32");
             let delta = relative_max_delta(&dense, &tiled16);
             eprintln!("{h}x{wd} edge {edge}: f16 {delta:.3e}");
@@ -1512,9 +1667,18 @@ fn tiled_encode_meets_the_tiled_parity_standard() {
         // An image that fits one tile takes the exact whole-image encode.
         assert_eq!(
             bits(&dense),
-            bits(&reference.encode_tiled(&image, 32, None).unwrap())
+            bits(
+                &(
+                    crate::test_device::record_model_inference_device(),
+                    reference.encode_tiled(&image, 32, None)
+                )
+                    .1
+                    .unwrap()
+            )
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::tiled_encode_meets_the_tiled_parity_standard");
 }
 
 /// The bounded encode on the iOS path: `encode_mean` selects it above one tile, every tiled stage
@@ -1523,6 +1687,7 @@ fn tiled_encode_meets_the_tiled_parity_standard() {
 /// query-chunked; off the iOS path `encode_mean` is the whole-image encode. A bounded-decode rung's
 /// tiling routes the img2img init encode through the tiled encode (its cancel point proves the
 /// route).
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung() {
     if !cpu_child("bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung") {
@@ -1534,12 +1699,23 @@ fn bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung() {
     // (17689 tokens), so the bounded attention chunks.
     let image = rnd(&[1, tile + 10, tile + 10, 3], 91, 0.5);
     image.eval().unwrap();
-    let host = vae.encode_tiled(&image, tile, None).unwrap();
+    let host = (
+        crate::test_device::record_model_inference_device(),
+        vae.encode_tiled(&image, tile, None),
+    )
+        .1
+        .unwrap();
     assert!(
         mlx_gen::attention::last_chunk_count() > 1,
         "the bounded encode's mid attention must run query-chunked"
     );
-    let (guarded, events) = observe(PLENTY, || vae.encode_mean(&image));
+    let (guarded, events) = observe(PLENTY, || {
+        (
+            crate::test_device::record_model_inference_device(),
+            vae.encode_mean(&image),
+        )
+            .1
+    });
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
     assert_well_ordered(&events);
     assert!(
@@ -1560,7 +1736,11 @@ fn bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung() {
     );
     assert!(assert_refusals(&events, |headroom| observe(
         headroom,
-        || vae.encode_mean(&image)
+        || (
+            crate::test_device::record_model_inference_device(),
+            vae.encode_mean(&image)
+        )
+            .1
     )));
 
     // The rung's tiling routes the init encode through the tiled encode: a tripped cancel flag
@@ -1573,26 +1753,37 @@ fn bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung() {
     let tripped = mlx_gen::CancelFlag::default();
     tripped.cancel();
     let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
-    let routed = crate::pipeline::encode_init_latents_tiled(
-        &vae,
-        &pixels,
-        40,
-        32,
-        Some(&tiling),
-        Some(&tripped),
-    );
+    let routed = (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::encode_init_latents_tiled(
+            &vae,
+            &pixels,
+            40,
+            32,
+            Some(&tiling),
+            Some(&tripped),
+        ),
+    )
+        .1;
     assert!(
         matches!(routed, Err(mlx_gen::Error::Canceled)),
         "{routed:?}"
     );
-    crate::pipeline::encode_init_latents_tiled(&vae, &pixels, 40, 32, None, Some(&tripped))
+    (
+        crate::test_device::record_model_inference_device(),
+        crate::pipeline::encode_init_latents_tiled(&vae, &pixels, 40, 32, None, Some(&tripped)),
+    )
+        .1
         .unwrap();
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung");
 }
 
 /// Items 3 and 5 (sc-26270 round 3): every ancestral denoise step's CFG combine + sampler update is
 /// materialized inside its own guarded quantum (checked, synchronized, byte-identical to the host),
 /// and a sequential CFG half prices its transformer blocks at the ONE latent row it runs — only the
 /// text k/v it projects at the pair's batch are pair-sized.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
     if !cpu_child("denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch") {
@@ -1628,16 +1819,20 @@ fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
         let latents = latents.clone();
         move || -> Result<Array> {
             mlx_rs::random::seed(5)?;
-            crate::pipeline::denoise(
-                &d,
-                latents.clone(),
-                ctx,
-                pooled,
-                ids,
-                5.0,
-                cancel,
-                &mut |_| {},
+            (
+                crate::test_device::record_model_inference_device(),
+                crate::pipeline::denoise(
+                    &d,
+                    latents.clone(),
+                    ctx,
+                    pooled,
+                    ids,
+                    5.0,
+                    cancel,
+                    &mut |_| {},
+                ),
             )
+                .1
         }
     };
     for batching in [CfgBatching::Batched, CfgBatching::Sequential] {
@@ -1689,15 +1884,17 @@ fn denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch() {
             "{batching:?}: actual stem input has exactly {batch} latent rows"
         );
     }
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::denoise_steps_are_guarded_and_sequential_cfg_prices_the_latent_batch");
 }
 
-/// The VAE-boundary cast alone is insufficient: adding f32 noise promotes sampler state again.
-/// Every actual noised/scaled U-Net input must still enter its stem at the compute dtype. Guard
-/// scratch observes the actual forward input, so removing ONLY the forward-boundary cast fails
-/// this test even when the init-latent cast remains.
+/// F32 noising is part of the historical sampler arithmetic, not a request to narrow the
+/// model input. Both actual forwards must price and preserve that promoted operand; the narrow
+/// counterfactual keeps this native driver test sensitive to a reintroduced iOS-only cast.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
-fn actual_noised_unet_input_is_cast_at_every_forward() {
-    if !cpu_child("actual_noised_unet_input_is_cast_at_every_forward") {
+fn actual_noised_unet_input_preserves_sampler_precision_at_every_forward() {
+    if !cpu_child("actual_noised_unet_input_preserves_sampler_precision_at_every_forward") {
         return;
     }
     let mut unet = crate::test_support::tiny_unet(7).unwrap();
@@ -1724,10 +1921,10 @@ fn actual_noised_unet_input_is_cast_at_every_forward() {
             .unwrap()
             .1
     };
-    let expected = full_stem(&narrow);
+    let expected = full_stem(&pair);
     assert_ne!(
         expected,
-        full_stem(&pair),
+        full_stem(&narrow),
         "the fixture must distinguish f32 from compute-dtype stem inputs"
     );
     let euler = crate::sampler::EulerSampler::new_with_dtype(
@@ -1749,27 +1946,34 @@ fn actual_noised_unet_input_is_cast_at_every_forward() {
     let noised = euler.add_noise_with(&init, &noise, 800.0).unwrap();
     assert_eq!(noised.dtype(), Dtype::Float32);
     let (out, events) = observe(PLENTY, || {
-        crate::pipeline::denoise(
-            &d,
-            noised,
-            &ctx,
-            &pooled,
-            &ids,
-            5.0,
-            &mlx_gen::CancelFlag::default(),
-            &mut |_| {},
+        (
+            crate::test_device::record_model_inference_device(),
+            crate::pipeline::denoise(
+                &d,
+                noised,
+                &ctx,
+                &pooled,
+                &ids,
+                5.0,
+                &mlx_gen::CancelFlag::default(),
+                &mut |_| {},
+            ),
         )
+            .1
     });
     assert_eq!(
         out.unwrap().dtype(),
         Dtype::Float32,
-        "forward casts must not narrow the persistent sampler state"
+        "forward execution must not narrow the persistent sampler state"
     );
     assert_eq!(checked(&events, UNET_STEM), vec![expected; 2]);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::actual_noised_unet_input_preserves_sampler_precision_at_every_forward");
 }
 
 /// Item 3 (sc-26270 round 3): the ControlNet branch keeps the request's bounded attention plan, so
 /// its attention runs (and its blocks are priced) under the plan's chunking, not unbounded.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn controlnet_keeps_the_bounded_attention_plan() {
     if !cpu_child("controlnet_keeps_the_bounded_attention_plan") {
@@ -1788,8 +1992,11 @@ fn controlnet_keeps_the_bounded_attention_plan() {
     cond.eval().unwrap();
     let run = |plan: crate::plan::SdxlForwardPlan<'_>| {
         mlx_gen::attention::reset_chunk_count();
-        let out = control
-            .forward_planned(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8, plan)
+        let out = (
+            crate::test_device::record_model_inference_device(),
+            control.forward_planned(&x, &cond, 500.0, &ctx, &pooled, &ids, 0.8, plan),
+        )
+            .1
             .unwrap();
         (out.mid, mlx_gen::attention::last_chunk_count())
     };
@@ -1808,6 +2015,8 @@ fn controlnet_keeps_the_bounded_attention_plan() {
     );
     // Chunked attention is the same attention (fused per chunk): the branch's output holds.
     assert!(relative_max_delta(&mid, &bounded_mid) <= 1e-4);
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::controlnet_keeps_the_bounded_attention_plan");
 }
 
 /// The device's convolution transients, modelled from MLX's Metal dispatch (they cannot be measured
@@ -1914,6 +2123,7 @@ fn relative_max_delta(reference: &Array, candidate: &Array) -> f32 {
 /// on the same f16-rounded weights — at chunk sizes that divide the tokens, leave a ragged tail,
 /// and degenerate to one row. The chunked plan is selected only under the iOS path: off device the
 /// plan is unbounded, so the host decode is the historical single SDPA call, byte for byte.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() {
     if !cpu_child("vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only") {
@@ -1941,8 +2151,18 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
     let x16 = x.as_dtype(Dtype::Float16).unwrap();
     let tokens = 24 * 40;
     let unbounded = mlx_gen::attention::AttentionPlan::UNBOUNDED;
-    let full = attn.forward_planned(&x, unbounded).unwrap();
-    let full16 = attn16.forward_planned(&x16, unbounded).unwrap();
+    let full = (
+        crate::test_device::record_model_inference_device(),
+        attn.forward_planned(&x, unbounded),
+    )
+        .1
+        .unwrap();
+    let full16 = (
+        crate::test_device::record_model_inference_device(),
+        attn16.forward_planned(&x16, unbounded),
+    )
+        .1
+        .unwrap();
     for rows in [1, 37, 128, 480, tokens - 1] {
         let budget = mlx_gen::attention::AttentionBudget::from_score_elements(
             rows as u64 * tokens as u64,
@@ -1950,7 +2170,12 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
         );
         assert_eq!(budget.query_block(1, 1, tokens, tokens), rows);
         let plan = mlx_gen::attention::AttentionPlan::budgeted(budget);
-        let chunked = attn.forward_planned(&x, plan).unwrap();
+        let chunked = (
+            crate::test_device::record_model_inference_device(),
+            attn.forward_planned(&x, plan),
+        )
+            .1
+            .unwrap();
         let delta = relative_max_delta(&full, &chunked);
         eprintln!(
             "f32 {rows}-row chunks: {delta:.3e} of peak, bit-exact {}",
@@ -1960,7 +2185,12 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
             delta <= 1e-4,
             "f32 {rows}-row chunks drifted {delta:.3e} of peak"
         );
-        let chunked16 = attn16.forward_planned(&x16, plan).unwrap();
+        let chunked16 = (
+            crate::test_device::record_model_inference_device(),
+            attn16.forward_planned(&x16, plan),
+        )
+            .1
+            .unwrap();
         assert_eq!(
             chunked16.dtype(),
             Dtype::Float16,
@@ -1992,6 +2222,8 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
         vae_attention_bytes(1, 16384, 512, 1024, 4, Backend::Metal)
             < vae_attention_bytes(1, 16384, 512, 16384, 4, Backend::Metal) / 4
     );
+
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2361,7 +2593,8 @@ mod proofs {
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn biased_projection_prices_all_addmm_operand_promotions() {
         if !cpu_child("proofs::biased_projection_prices_all_addmm_operand_promotions") {
             return;
@@ -2383,10 +2616,24 @@ mod proofs {
         prove(
             "mixed biased addmm",
             linear_operand_bytes(&p, x.shape(), x.dtype()) + out_bytes,
-            || Ok(vec![p.forward(&x)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        p.forward(&x),
+                    )
+                        .1?,
+                ])
+            },
         );
         prove("pre-promoted biased addmm", out_bytes, || {
-            Ok(vec![ready.forward(&ready_x)?])
+            Ok(vec![
+                (
+                    crate::test_device::record_model_inference_device(),
+                    ready.forward(&ready_x),
+                )
+                    .1?,
+            ])
         });
         assert_eq!(
             linear_operand_bytes(&p, x.shape(), x.dtype()),
@@ -2401,6 +2648,8 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::biased_projection_prices_all_addmm_operand_promotions");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::biased_projection_prices_all_addmm_operand_promotions");
     }
 
     #[test]
@@ -2445,6 +2694,7 @@ mod proofs {
         }
     }
 
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn decode_input_dtype_alias_and_retention_are_priced_without_narrowing_state() {
         if !cpu_child(
@@ -2460,12 +2710,20 @@ mod proofs {
         let x16 = half(&x32);
         assert_eq!(vae.dtype(), Dtype::Float16);
         assert_eq!(
-            vae.decode_input_retained_bytes(&x16),
+            (
+                crate::test_device::record_model_inference_device(),
+                vae.decode_input_retained_bytes(&x16)
+            )
+                .1,
             bytes(&x16),
             "compute input aliases caller"
         );
         assert_eq!(
-            vae.decode_input_retained_bytes(&x32),
+            (
+                crate::test_device::record_model_inference_device(),
+                vae.decode_input_retained_bytes(&x32)
+            )
+                .1,
             bytes(&x32) + bytes(&x16),
             "caller plus distinct compute cast"
         );
@@ -2484,7 +2742,13 @@ mod proofs {
         for caller in [&x16, &x32] {
             let mut quanta = Vec::new();
             vae.price_decode(caller, None, &mut quanta).unwrap();
-            let (decoded, events) = observe(PLENTY, || vae.decode(caller));
+            let (decoded, events) = observe(PLENTY, || {
+                (
+                    crate::test_device::record_model_inference_device(),
+                    vae.decode(caller),
+                )
+                    .1
+            });
             decoded.unwrap().eval().unwrap();
             let actual = checked(&events, VAE_DECODE_IN);
             assert_eq!(
@@ -2501,12 +2765,15 @@ mod proofs {
                 }
             );
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::decode_input_dtype_alias_and_retention_are_priced_without_narrowing_state");
     }
 
     // -- U-Net ---------------------------------------------------------------------------------
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn unet_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::unet_quanta_track_their_measured_peaks") {
             return;
@@ -2524,19 +2791,26 @@ mod proofs {
         // Resnet: the down/mid shape and the up path's skip concatenation.
         let plain = crate::unet::ResnetBlock2D::from_weights(&w, "plain").unwrap();
         prove(UNET_RESNET, plain.quantum_scratch(&x, Some(&temb)), || {
-            Ok(vec![plain.forward_quantum(&x, None, Some(&temb), plan)?])
+            Ok(vec![
+                (
+                    crate::test_device::record_model_inference_device(),
+                    plain.forward_quantum(&x, None, Some(&temb), plan),
+                )
+                    .1?,
+            ])
         });
         let up = crate::unet::ResnetBlock2D::from_weights(&w, "up").unwrap();
         prove(
             &format!("{UNET_RESNET} (skip concat)"),
             up.quantum_scratch(&x, Some(&temb)),
             || {
-                Ok(vec![up.forward_quantum(
-                    &x,
-                    Some(skip.clone()),
-                    Some(&temb),
-                    plan,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        up.forward_quantum(&x, Some(skip.clone()), Some(&temb), plan),
+                    )
+                        .1?,
+                ])
             },
         );
 
@@ -2599,10 +2873,13 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::unet_quanta_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::unet_quanta_track_their_measured_peaks");
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn transformer_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::transformer_quanta_track_their_measured_peaks") {
             return;
@@ -2626,14 +2903,30 @@ mod proofs {
         prove(
             TRANSFORMER_BLOCK,
             block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float32, unbounded.attention),
-            || Ok(vec![block.forward_ip(&y, &memory, None, unbounded)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &memory, None, unbounded),
+                    )
+                        .1?,
+                ])
+            },
         );
         // Sequential CFG half: the latent at ONE row, the text k/v projected at the pair's two.
         let half = unbounded.with_cfg_row(Some(1));
         prove(
             &format!("{TRANSFORMER_BLOCK} (sequential CFG half)"),
             block.quantum_scratch(1, 2, 256, 7, false, Dtype::Float32, half.attention),
-            || Ok(vec![block.forward_ip(&y, &pair_memory, None, half)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &pair_memory, None, half),
+                    )
+                        .1?,
+                ])
+            },
         );
         // Bounded attention: 64 query rows per self-attention chunk, each chunk evaluated.
         let budget = mlx_gen::attention::AttentionBudget::from_score_elements(2 * 64 * 256, true);
@@ -2644,7 +2937,15 @@ mod proofs {
         prove(
             &format!("{TRANSFORMER_BLOCK} (bounded attention)"),
             block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float32, bounded.attention),
-            || Ok(vec![block.forward_ip(&y, &memory, None, bounded)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &memory, None, bounded),
+                    )
+                        .1?,
+                ])
+            },
         );
 
         // proj_in / proj_out of a Transformer2D over a 16x16 grid.
@@ -2663,6 +2964,8 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::transformer_quanta_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::transformer_quanta_track_their_measured_peaks");
     }
 
     #[test]
@@ -2775,7 +3078,8 @@ mod proofs {
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_unet_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_unet_quanta_track_their_measured_peaks") {
             return;
@@ -2791,24 +3095,38 @@ mod proofs {
         let skip = half(&rnd(&[1, 32, 32, 64], 3, 1.0));
 
         let plain = crate::unet::ResnetBlock2D::from_weights(&w, "plain").unwrap();
-        let out = plain.forward_quantum(&x, None, Some(&temb), plan).unwrap();
+        let out = (
+            crate::test_device::record_model_inference_device(),
+            plain.forward_quantum(&x, None, Some(&temb), plan),
+        )
+            .1
+            .unwrap();
         assert_eq!(out.dtype(), Dtype::Float16, "the f16 resnet stays f16");
         prove(
             &format!("{UNET_RESNET} (f16)"),
             plain.quantum_scratch(&x, Some(&temb)),
-            || Ok(vec![plain.forward_quantum(&x, None, Some(&temb), plan)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        plain.forward_quantum(&x, None, Some(&temb), plan),
+                    )
+                        .1?,
+                ])
+            },
         );
         let up = crate::unet::ResnetBlock2D::from_weights(&w, "up").unwrap();
         prove(
             &format!("{UNET_RESNET} (f16, skip concat)"),
             up.quantum_scratch(&x, Some(&temb)),
             || {
-                Ok(vec![up.forward_quantum(
-                    &x,
-                    Some(skip.clone()),
-                    Some(&temb),
-                    plan,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        up.forward_quantum(&x, Some(skip.clone()), Some(&temb), plan),
+                    )
+                        .1?,
+                ])
             },
         );
 
@@ -2901,13 +3219,16 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_unet_quanta_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::f16_unet_quanta_track_their_measured_peaks");
     }
 
     /// The packed tier's promotions: a pre-quantized snapshot's `time_emb_proj` (BF16 scales) turns
     /// the f16 resnet's second half f32 (the projected f32 time embedding widens the sum); after it
     /// the U-Net carries f32 activations through f16 convolutions, whose weights MLX casts up.
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn packed_tier_resnet_and_conv_promotions_track_their_measured_peaks() {
         if !cpu_child("proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks") {
             return;
@@ -2924,8 +3245,11 @@ mod proofs {
         let resnet = crate::unet::ResnetBlock2D::from_weights(&w, "r").unwrap();
         let x16 = half(&rnd(&[1, 32, 32, 64], 1, 1.0));
         let temb32 = evaluated(rnd(&[1, 128], 2, 1.0));
-        let out = resnet
-            .forward_quantum(&x16, None, Some(&temb32), plan)
+        let out = (
+            crate::test_device::record_model_inference_device(),
+            resnet.forward_quantum(&x16, None, Some(&temb32), plan),
+        )
+            .1
             .unwrap();
         assert_eq!(
             out.dtype(),
@@ -2936,12 +3260,13 @@ mod proofs {
             &format!("{UNET_RESNET} (f16 in, packed f32 temb)"),
             resnet.quantum_scratch(&x16, Some(&temb32)),
             || {
-                Ok(vec![resnet.forward_quantum(
-                    &x16,
-                    None,
-                    Some(&temb32),
-                    plan,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        resnet.forward_quantum(&x16, None, Some(&temb32), plan),
+                    )
+                        .1?,
+                ])
             },
         );
         // The promoted half is priced at f32 (on the CPU the GroupNorms' f32 working copies hide
@@ -2969,12 +3294,13 @@ mod proofs {
             &format!("{UNET_RESNET} (f32 activations, f16 convs)"),
             resnet.quantum_scratch(&x32, Some(&temb32)),
             || {
-                Ok(vec![resnet.forward_quantum(
-                    &x32,
-                    None,
-                    Some(&temb32),
-                    plan,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        resnet.forward_quantum(&x32, None, Some(&temb32), plan),
+                    )
+                        .1?,
+                ])
             },
         );
         let wo = half_conv_weight(4, 3, 64, 4);
@@ -3004,6 +3330,8 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks");
     }
 
     #[test]
@@ -3044,7 +3372,8 @@ mod proofs {
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn resnet_affine_bias_and_shortcut_promotions_are_tensor_derived() {
         if !cpu_child("proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived") {
             return;
@@ -3073,24 +3402,28 @@ mod proofs {
             "resnet affine/bias/shortcut",
             r.quantum_scratch(&x, None),
             || {
-                Ok(vec![r.forward_quantum(
-                    &x,
-                    None,
-                    None,
-                    crate::plan::SdxlForwardPlan::UNBOUNDED,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        r.forward_quantum(&x, None, None, crate::plan::SdxlForwardPlan::UNBOUNDED),
+                    )
+                        .1?,
+                ])
             },
         );
 
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::resnet_affine_bias_and_shortcut_promotions_are_tensor_derived");
     }
 
     /// Both CLIP text encoders run f16 on the device; a packed snapshot's BF16 scales make each
     /// layer's projections, and so its residual stream, f32.
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_and_packed_clip_layers_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_and_packed_clip_layers_track_their_measured_peaks") {
             return;
@@ -3163,10 +3496,13 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_and_packed_clip_layers_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::f16_and_packed_clip_layers_track_their_measured_peaks");
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn f16_transformer_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::f16_transformer_quanta_track_their_measured_peaks") {
             return;
@@ -3198,19 +3534,40 @@ mod proofs {
         let pair_memory = half(&rnd(&[2, 7, ctx_dim], 3, 1.0));
         let long_memory = half(&rnd(&[2, 308, ctx_dim], 4, 1.0));
         let unbounded = crate::plan::SdxlForwardPlan::UNBOUNDED;
-        let out = block.forward_ip(&y, &memory, None, unbounded).unwrap();
+        let out = (
+            crate::test_device::record_model_inference_device(),
+            block.forward_ip(&y, &memory, None, unbounded),
+        )
+            .1
+            .unwrap();
         assert_eq!(out.dtype(), Dtype::Float16, "the f16 block stays f16");
 
         prove(
             &format!("{TRANSFORMER_BLOCK} (f16)"),
             block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, unbounded.attention),
-            || Ok(vec![block.forward_ip(&y, &memory, None, unbounded)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &memory, None, unbounded),
+                    )
+                        .1?,
+                ])
+            },
         );
         let half_plan = unbounded.with_cfg_row(Some(1));
         prove(
             &format!("{TRANSFORMER_BLOCK} (f16, sequential CFG half)"),
             block.quantum_scratch(1, 2, 256, 7, false, Dtype::Float16, half_plan.attention),
-            || Ok(vec![block.forward_ip(&y, &pair_memory, None, half_plan)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &pair_memory, None, half_plan),
+                    )
+                        .1?,
+                ])
+            },
         );
         let budget = mlx_gen::attention::AttentionBudget::from_score_elements(2 * 64 * 256, true);
         let bounded = crate::plan::SdxlForwardPlan::with_attention(
@@ -3219,7 +3576,15 @@ mod proofs {
         prove(
             &format!("{TRANSFORMER_BLOCK} (f16, bounded attention)"),
             block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, bounded.attention),
-            || Ok(vec![block.forward_ip(&y, &memory, None, bounded)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&y, &memory, None, bounded),
+                    )
+                        .1?,
+                ])
+            },
         );
 
         // Cross-attention-dominated: 256 latent tokens against a four-window long prompt's 308 text
@@ -3246,12 +3611,13 @@ mod proofs {
             &format!("{TRANSFORMER_BLOCK} (f16, cross-attention + IP, CFG half)"),
             cross,
             || {
-                Ok(vec![block.forward_ip(
-                    &few,
-                    &long_memory,
-                    Some((&tokens, 0.6)),
-                    half_plan,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        block.forward_ip(&few, &long_memory, Some((&tokens, 0.6)), half_plan),
+                    )
+                        .1?,
+                ])
             },
         );
 
@@ -3288,8 +3654,11 @@ mod proofs {
             crate::unet::transformer::TransformerBlock::from_weights(&packed_w, "b", dim, heads)
                 .unwrap();
         // MLX promotes the f16 activations through the BF16-scaled projections: the block runs f32.
-        let out = packed_block
-            .forward_ip(&y, &memory, None, unbounded)
+        let out = (
+            crate::test_device::record_model_inference_device(),
+            packed_block.forward_ip(&y, &memory, None, unbounded),
+        )
+            .1
             .unwrap();
         assert_eq!(out.dtype(), Dtype::Float32);
         assert_eq!(packed_block.activation_bytes(Dtype::Float16), 4);
@@ -3305,18 +3674,29 @@ mod proofs {
         prove(
             &format!("{TRANSFORMER_BLOCK} (f16, packed Q4 / BF16 scales)"),
             packed_block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, unbounded.attention),
-            || Ok(vec![packed_block.forward_ip(&y, &memory, None, unbounded)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        packed_block.forward_ip(&y, &memory, None, unbounded),
+                    )
+                        .1?,
+                ])
+            },
         );
 
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks");
     }
 
     // -- Text / vision encoders ------------------------------------------------------------------
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn encoder_layers_track_their_measured_peaks() {
         if !cpu_child("proofs::encoder_layers_track_their_measured_peaks") {
             return;
@@ -3421,12 +3801,15 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::encoder_layers_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::encoder_layers_track_their_measured_peaks");
     }
 
     // -- VAE -------------------------------------------------------------------------------------
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn vae_quanta_track_their_measured_peaks() {
         if !cpu_child("proofs::vae_quanta_track_their_measured_peaks") {
             return;
@@ -3444,7 +3827,13 @@ mod proofs {
         let resnet = crate::unet::ResnetBlock2D::from_weights(&w, "r").unwrap();
         let x = rand(&[1, 32, 32, 64], 1);
         prove(VAE_RESNET, resnet.quantum_scratch(&x, None), || {
-            Ok(vec![resnet.forward(&x, None)?])
+            Ok(vec![
+                (
+                    crate::test_device::record_model_inference_device(),
+                    resnet.forward(&x, None),
+                )
+                    .1?,
+            ])
         });
 
         // Mid attention, unchunked (the host path) and query-chunked (the iOS plan) — priced at
@@ -3454,7 +3843,15 @@ mod proofs {
         prove(
             VAE_ATTENTION,
             vae_attention_bytes(1, 256, 64, 256, 4, Backend::Cpu),
-            || Ok(vec![attn.forward(&small)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        attn.forward(&small),
+                    )
+                        .1?,
+                ])
+            },
         );
         let budget = mlx_gen::attention::AttentionBudget::from_score_elements(128 * 1024, true);
         assert_eq!(budget.query_block(1, 1, 1024, 1024), 128);
@@ -3462,7 +3859,15 @@ mod proofs {
         prove(
             &format!("{VAE_ATTENTION} (query-chunked)"),
             vae_attention_bytes(1, 1024, 64, 128, 4, Backend::Cpu),
-            || Ok(vec![attn.forward_planned(&x, chunked)?]),
+            || {
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        attn.forward_planned(&x, chunked),
+                    )
+                        .1?,
+                ])
+            },
         );
 
         // Downsample: asymmetric pad + stride-2 conv.
@@ -3529,10 +3934,13 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::vae_quanta_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::vae_quanta_track_their_measured_peaks");
     }
 
     #[test]
-    #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    // Prior ignore attribute: #[ignore = "expensive fixture capture; use the fixed ios-selected-captures dispatch profile"]
     fn tiled_vae_stages_and_tiles_track_their_measured_peaks() {
         if !cpu_child("proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks") {
             return;
@@ -3560,12 +3968,13 @@ mod proofs {
             &format!("{VAE_TILED_STAGE} + {VAE_TILE} (resnet)"),
             tiled_stage_bytes(&[1, 32, 32, 64], 64, 64, 4, true) + tile,
             || {
-                Ok(vec![resnet.forward_tiled_vae(
-                    &x,
-                    16,
-                    None,
-                    crate::quantum::VAE_DECODE_LABELS,
-                )?])
+                Ok(vec![
+                    (
+                        crate::test_device::record_model_inference_device(),
+                        resnet.forward_tiled_vae(&x, 16, None, crate::quantum::VAE_DECODE_LABELS),
+                    )
+                        .1?,
+                ])
             },
         );
         // The bounded encode's stride-2 downsample, at a stage-dominated shape (8-pixel output
@@ -3636,6 +4045,8 @@ mod proofs {
         if std::env::var_os("IOS_CAPTURE_IN_CHILD").is_some() {
             eprintln!("\nIOS_CAPTURE_BODY_COMPLETED quantum_tests::proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks");
         }
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::proofs::tiled_vae_stages_and_tiles_track_their_measured_peaks");
     }
 
     #[test]
@@ -4283,6 +4694,7 @@ mod adapters {
     /// refuses and nothing merges; at a headroom that admits the read but not the first install,
     /// the install refuses before it is built and the U-Net is untouched; guarded installs are
     /// byte-identical to the host's.
+    #[ignore = "model inference; explicit model-proof workflow"]
     #[test]
     fn adapter_reads_and_installs_refuse_before_they_run_and_stay_identical() {
         if !cpu_child(
@@ -4399,6 +4811,8 @@ mod adapters {
         assert_eq!(forward(&mut guarded), forward(&mut host));
         assert_eq!(checked(&events, ADAPTER_MERGE).len(), 4);
         assert_eq!(synced(&events, ADAPTER_MERGE), 4);
+
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED quantum_tests::adapters::adapter_reads_and_installs_refuse_before_they_run_and_stay_identical");
     }
 }
 

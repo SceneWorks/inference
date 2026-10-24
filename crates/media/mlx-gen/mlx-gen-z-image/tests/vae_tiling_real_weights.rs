@@ -28,7 +28,7 @@ fn bf16(a: &Array) -> Array {
 }
 
 #[test]
-#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
+#[ignore = "model inference; explicit model-proof workflow; needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
 fn tiled_decode_matches_single_pass() {
     let Some(snap) = snapshot_opt() else {
         eprintln!(
@@ -105,4 +105,7 @@ fn tiled_decode_matches_single_pass() {
         max_d <= 48,
         "layer-wise tiled decode exceeds the production 48/255 quality bar: {max_d}/255"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED vae_tiling_real_weights::tiled_decode_matches_single_pass");
 }

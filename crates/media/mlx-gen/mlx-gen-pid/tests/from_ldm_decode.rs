@@ -153,4 +153,6 @@ fn from_ldm_runb() {
         save_png(&out, &format!("{dir}/mlx_runb_{label}_4096.png"));
         eprintln!("[{label}] wrote mlx_runb_{label}_4096.png + qwenvae_runb_{label}.png");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED from_ldm_decode::from_ldm_runb");
 }

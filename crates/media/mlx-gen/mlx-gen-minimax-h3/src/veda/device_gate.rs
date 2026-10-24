@@ -300,6 +300,8 @@ fn runtime_masks_equal_the_host_oracle_bit_for_bit() {
         }
         println!("VEDA_GATE masks mode={name} heads_checked={checked} result=exact");
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda::device_gate::runtime_masks_equal_the_host_oracle_bit_for_bit");
 }
 
 /// The Metal scorer's logits equal the host contract's bit for bit (not only their masks), for
@@ -358,6 +360,8 @@ fn metal_scorer_logits_are_the_host_contract_bit_for_bit() {
             layout.video
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda::device_gate::metal_scorer_logits_are_the_host_contract_bit_for_bit");
 }
 
 /// The frozen upstream capture fixtures select their recorded masks through the Metal scorer.
@@ -676,6 +680,8 @@ fn metal_non_finite_output_falls_back_to_dense_and_is_reported() {
         "{:?}",
         r.fallback_reason
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda::device_gate::metal_non_finite_output_falls_back_to_dense_and_is_reported");
 }
 
 /// Per-layer wall time of one sparse Veda attention call against the dense SDPA it replaces, on
@@ -735,6 +741,8 @@ fn per_layer_bench() {
             })
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda::device_gate::per_layer_bench");
 }
 
 /// E8: the first-use self-test's actual MLX allocator peak fits its declared bound.
@@ -816,4 +824,6 @@ fn memory_reaches_a_steady_state_across_layers() {
         gb(warm),
         gb(last)
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED veda::device_gate::memory_reaches_a_steady_state_across_layers");
 }

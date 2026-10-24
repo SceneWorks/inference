@@ -17,6 +17,15 @@
 //! reproduces HF's top-1 token and greedy continuation; a lossy k-quant only needs a high softmax
 //! cosine (a broken dequant or a mis-permuted q/k projection collapses it toward 0 / gibberish).
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use candle_core::DType;
 
 use candle_llm::config::ModelConfig;
@@ -111,6 +120,8 @@ fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i
 fn gguf_load_tracks_hf() {
     let (Some(gguf), Some(dir)) = (gguf_path(), hf_dir()) else {
         eprintln!("skip: set CANDLE_LLM_GGUF + CANDLE_LLM_TEST_MODEL");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/gguf.rs:114 (gguf_load_tracks_hf): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let device = select_device().unwrap();
@@ -183,6 +194,9 @@ fn gguf_load_tracks_hf() {
             "lossless greedy prefix {prefix}/24 — expected ~exact"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gguf_load_tracks_hf");
 }
 
 /// The tokenizer reconstructed from the GGUF's embedded metadata (the `else` branch when there is no
@@ -232,6 +246,8 @@ fn gguf_tokenizer_metadata_matches_hf() {
 fn gguf_streams_through_textllm() {
     let Some(gguf) = gguf_path() else {
         eprintln!("skip: set CANDLE_LLM_GGUF");
+        #[cfg(feature = "model-inference-proof")]
+        crate::model_proof::missing_required_work("required work omitted at crates/llm/candle-llm/tests/gguf.rs:235 (gguf_streams_through_textllm): This source branch exits a selected test/helper or skips a source-declared matrix arm because the prerequisite environment/path/device/format/weight/case is unavailable or deselected. Other successful rows do not satisfy this omitted row. Preserve optional selectors, but report the precise omitted cell before the existing exit.");
         return;
     };
     let provider = LlamaProvider::load(&LoadSpec::dense(gguf)).expect("load gguf provider");
@@ -259,4 +275,7 @@ fn gguf_streams_through_textllm() {
         streamed, out.text,
         "streamed deltas must reconstruct the final text"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED gguf_streams_through_textllm");
 }

@@ -86,6 +86,10 @@ fn memory_encoder_matches_mlx_reference_large() {
     let (cos_p, _, mean_p) = metrics(&out.vision_pos_enc, g.require("mem_vis_pos").unwrap());
     println!("memory_encoder pos_enc: cos {cos_p:.7} mean-rel {mean_p:.3e}");
     assert!(cos_p > 0.99999, "pos_enc cosine {cos_p:.7}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED memory_parity::memory_encoder_matches_mlx_reference_large"
+    );
 }
 
 #[test]
@@ -110,4 +114,6 @@ fn memory_attention_matches_mlx_reference_large() {
     println!("memory_attention out: cos {cos:.7} peak-rel {peak:.3e} mean-rel {mean:.3e} (num_obj {num_obj})");
     assert!(cos > 0.999, "attention cosine {cos:.7}");
     assert!(mean < 5e-3, "attention mean-rel {mean:.3e}");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED memory_parity::memory_attention_matches_mlx_reference_large");
 }

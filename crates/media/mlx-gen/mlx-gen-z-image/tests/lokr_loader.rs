@@ -27,6 +27,7 @@ const CFG: ZImageBlockConfig = ZImageBlockConfig {
 const SCALE: f32 = 0.7;
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn lokr_file_loads_and_matches_fork() {
     let base = Weights::from_file(BASE).unwrap();
     let adapter = Weights::from_file(ADAPTER).unwrap();
@@ -58,4 +59,7 @@ fn lokr_file_loads_and_matches_fork() {
             .item::<bool>(),
         "LoKr-adapted output diverged from the fork"
     );
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED lokr_loader::lokr_file_loads_and_matches_fork");
 }

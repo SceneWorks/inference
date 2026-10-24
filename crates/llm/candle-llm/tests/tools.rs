@@ -10,6 +10,15 @@
 //! simply did not call a tool. A model that *actually emits and parses* a call is the gated
 //! `tests/qwen35_tools.rs` real-weight acceptance gate.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_core::Tensor, ()> =
+        __model_proof_output!(std::result::Result::<candle_core::Tensor, ()>::Err(()));
+};
+
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Tensor};
@@ -116,6 +125,7 @@ fn weather_tool() -> ToolSpec {
 }
 
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tools_provider_passes_core_llm_conformance() {
     let guard = write_tools_snapshot();
     let dir = guard.path();
@@ -140,6 +150,9 @@ fn tools_provider_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load tools provider")),
         &TextLlmProfile::cheap(),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tools_provider_passes_core_llm_conformance");
 }
 
 /// A tools request validates and generates without error on a tools-capable provider, and never
@@ -147,6 +160,7 @@ fn tools_provider_passes_core_llm_conformance() {
 /// answer is plain content and no calls are parsed — proving the tool wiring is transparent when no
 /// call is made).
 #[test]
+#[ignore = "model inference; explicit model workflow only"]
 fn tools_request_generates_without_leaking_markup() {
     let guard = write_tools_snapshot();
     let dir = guard.path();
@@ -172,4 +186,7 @@ fn tools_request_generates_without_leaking_markup() {
     );
     // The synthetic model's t0..t31 vocabulary cannot spell `<tool_call>`, so it makes no call.
     assert!(out.tool_calls.is_empty());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED tools_request_generates_without_leaking_markup");
 }

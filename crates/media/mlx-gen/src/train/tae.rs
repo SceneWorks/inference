@@ -798,6 +798,7 @@ mod tests {
     /// promote/err) and counts f32 bytes. Mutation: drop the `as_dtype(Float32)` ⇒ param bytes
     /// halve ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn f16_checkpoints_load_as_f32() {
         let spec = TinyDecoderSpec {
             latent_channels: 8,
@@ -817,9 +818,12 @@ mod tests {
         let z = random::normal::<f32>(&[1, 8, 2, 2], None, None, Some(&random::key(1).unwrap()))
             .unwrap();
         assert_eq!(dec.decode(&z).unwrap().dtype(), Dtype::Float32);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::tae::tests::f16_checkpoints_load_as_f32");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn decode_upscales_by_eight_into_unit_range_and_is_differentiable() {
         let cfg = tiny_cfg();
         let dec = TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&cfg, 2).unwrap(), cfg)
@@ -840,6 +844,8 @@ mod tests {
         let g = grad(f)(&z).unwrap();
         eval([&g]).unwrap();
         assert!(g.abs().unwrap().sum(None).unwrap().item::<f32>() > 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::tae::tests::decode_upscales_by_eight_into_unit_range_and_is_differentiable");
     }
 
     fn grad_flows(dec: &TinyDecoder, z: &Array) -> f32 {
@@ -857,6 +863,7 @@ mod tests {
     /// differentiably. Mutations: drop the pixel shuffle ⇒ 8× ⇒ red; drop the RGB slice ⇒ 4
     /// channels ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn f16_decode_upscales_by_sixteen_to_rgb() {
         let spec = TinyDecoderSpec {
             latent_channels: 8,
@@ -873,6 +880,8 @@ mod tests {
         eval([&px]).unwrap();
         assert!(px.as_slice::<f32>().iter().all(|x| (0.0..=1.0).contains(x)));
         assert!(grad_flows(&dec, &z) > 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::tae::tests::f16_decode_upscales_by_sixteen_to_rgb");
     }
 
     /// `pixel_shuffle2` is torch `PixelShuffle(2)`: input channel `c·4 + i·2 + j` at `(h, w)` lands
@@ -897,6 +906,7 @@ mod tests {
     /// weights without the pool, and it stays differentiable. Mutation: skip `x += pool(x)` in
     /// `Block::forward` ⇒ outputs equal ⇒ red.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn midblock_pool_changes_the_decode_and_is_differentiable() {
         let spec = TinyDecoderSpec {
             latent_channels: 4,
@@ -929,6 +939,8 @@ mod tests {
             .item::<f32>();
         assert!(diff > 0.0, "pool had no effect");
         assert!(grad_flows(&with, &z) > 0.0);
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED train::tae::tests::midblock_pool_changes_the_decode_and_is_differentiable");
     }
 
     /// The composed GroupNorm normalizes each contiguous channel group over (H, W, group channels)

@@ -71,10 +71,14 @@ fn render(generator: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (Vec<S
 /// default) instead of `run_request_scoped(stage_residency_for(..))` — the staged request then
 /// loads nothing and reports only its steps.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image() {
     cpu_process(
         "memory_contract::a_staged_selection_stages_a_warm_generator_and_renders_the_same_image",
-        a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body,
+        || {
+            a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body();
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED memory_contract::a_staged_selection_stages_a_warm_generator_and_renders_the_same_image");
+        },
     );
 }
 

@@ -156,6 +156,9 @@ fn wan_vace_generate_smoke() {
         eprintln!(
             "skipping: no wan_vace snapshot (set WANVACE_DIR or populate the HF/mlx-gen cache)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in wan_vace_generate_smoke; see preceding skip diagnostic",
+        );
         return;
     };
     let g = mlx_gen_wan::provider_registry()
@@ -163,6 +166,8 @@ fn wan_vace_generate_smoke() {
         .load(MODEL_ID_VACE, &LoadSpec::new(WeightsSource::Dir(dir)))
         .expect("load wan_vace");
     run_vace_smoke(g.as_ref(), "dense-bf16");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_e2e::wan_vace_generate_smoke");
 }
 
 /// sc-3440: the Q4/Q8 `WanVaceTransformer::quantize` path loads + generates a coherent video on real
@@ -174,6 +179,7 @@ fn wan_vace_quantized_generate_smoke() {
         eprintln!(
             "skipping: no wan_vace snapshot (set WANVACE_DIR or populate the HF/mlx-gen cache)"
         );
+        crate::model_inference_device::record_model_inference_prerequisite_missing("required work unavailable in wan_vace_quantized_generate_smoke; see preceding skip diagnostic");
         return;
     };
     let g = mlx_gen_wan::provider_registry()
@@ -184,4 +190,6 @@ fn wan_vace_quantized_generate_smoke() {
         )
         .expect("load wan_vace Q8");
     run_vace_smoke(g.as_ref(), "q8");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED wanvace_e2e::wan_vace_quantized_generate_smoke");
 }

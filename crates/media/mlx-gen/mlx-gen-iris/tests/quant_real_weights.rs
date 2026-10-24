@@ -230,6 +230,10 @@ fn real_quantized_renders_track_the_bf16_render_at_512() {
             "{tier}: composition corr {corr} < {min_corr}"
         );
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512");
 }
 
 /// Every projection the release's q8 / q4 tiers pack, through the production quantizers — the
@@ -552,4 +556,8 @@ fn real_quantized_tiers_track_the_bf16_denoiser_at_512() {
         drop(dit);
         mlx_rs::memory::clear_cache();
     }
+
+    #[cfg(target_os = "macos")]
+    crate::common::metal_guard::record_model_inference_device();
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::real_quantized_tiers_track_the_bf16_denoiser_at_512");
 }

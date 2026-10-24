@@ -31,6 +31,11 @@ pub mod campaign;
 #[cfg(feature = "media")]
 mod campaign_media;
 
+// Test-only selected-stream evidence; normal app/library builds expose no hook or API.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../../crates/media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
+pub mod model_inference_device;
+
 /// Weights-free, catalog-derived campaign listing for host tooling and the device bridge.
 #[cfg(feature = "media")]
 pub fn campaign_catalog_report() -> Result<String, String> {
@@ -580,9 +585,32 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
             ..Default::default()
         };
         let bench_started = Instant::now();
-        let bench_out = llm
-            .complete(&bench)
-            .map_err(|e| format!("throughput run failed: {e}"))?;
+        let bench_out = {
+            #[cfg(all(test, target_os = "macos"))]
+            {
+                if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_some() {
+                    let mut recorded_device = false;
+                    // complete() is generate(request, noop). Observe the SAME request's first
+                    // actual token while generate's execution scope is still active, not the
+                    // restored caller default after complete() returns. No extra inference/eval.
+                    llm.generate(&bench, &mut |event| {
+                        if !recorded_device
+                            && matches!(event, runtime_ios::core_llm::StreamEvent::Token { .. })
+                        {
+                            model_inference_device::record_model_inference_device();
+                            recorded_device = true;
+                        }
+                    })
+                } else {
+                    llm.complete(&bench)
+                }
+            }
+            #[cfg(not(all(test, target_os = "macos")))]
+            {
+                llm.complete(&bench)
+            }
+        }
+        .map_err(|e| format!("throughput run failed: {e}"))?;
         let bench_secs = bench_started.elapsed().as_secs_f64();
         let bench_tokens = bench_out.usage.generated_tokens;
 
@@ -1839,6 +1867,7 @@ mod tests {
     /// The same checks must pass on the host, so a failure on device is attributable to the iOS
     /// build rather than to a bug in the checks themselves.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn smoke_passes_on_the_host() {
         let report = super::run_report();
         // Printed, not just asserted. Most of these checks report measurements (throughput, peak
@@ -1847,5 +1876,11 @@ mod tests {
         // are read against. Visible under `--nocapture`.
         println!("{report}");
         assert!(report.starts_with("SMOKE: PASS"), "{report}");
+        // Only the actual successful model-completion detail contains this throughput field.
+        if report.lines().any(|line| {
+            line.starts_with("  [ok] runtime-ios generation -- ") && line.contains(" tok/s")
+        }) {
+            eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED tests::smoke_passes_on_the_host");
+        }
     }
 }

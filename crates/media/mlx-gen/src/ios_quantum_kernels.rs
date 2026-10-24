@@ -1124,6 +1124,7 @@ mod metadata_constructor_tests {
         assert!(marker.is_absolute(), "ROOT_METADATA_DONE_ABSOLUTE");
         assert!(!marker.exists(), "ROOT_METADATA_DONE_FRESH");
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        crate::model_inference_device::record_model_inference_device();
         assert_eq!(
             mlx_rs::Device::try_default().unwrap(),
             mlx_rs::Device::cpu(),

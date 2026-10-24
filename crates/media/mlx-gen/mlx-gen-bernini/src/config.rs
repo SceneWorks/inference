@@ -69,7 +69,13 @@ pub fn validate_bernini_geometry(id: &str, req: &GenerationRequest) -> Result<()
 /// (the old `.ok().and_then(..ok())` behaviour) is worse than surfacing the corruption, so this
 /// returns `Err` instead of pretending the sidecar was absent.
 pub(crate) fn read_knob_sidecar(path: &Path) -> Result<serde_json::Value> {
-    match std::fs::read(path) {
+    match mlx_gen::gen_core::__model_input_reader!(
+        std::fs::read(path),
+        "crates/media/mlx-gen/mlx-gen-bernini/src/config.rs::read_knob_sidecar::std::fs::read@3856",
+        ArtifactInput,
+        path,
+        |__model_input_path| std::fs::read(__model_input_path)
+    ) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
             Error::Msg(format!(
                 "bernini: {} is present but not valid JSON: {e}",

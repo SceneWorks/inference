@@ -135,7 +135,13 @@ pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
     if !text_encoder.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&text_encoder).map_err(|e| {
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&text_encoder),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@6378",
+ArtifactInput,
+&text_encoder,
+|__model_input_path| std::fs::read(__model_input_path)
+).map_err(|e| {
         Error::Msg(format!(
             "qwen_image_2_1: read {}: {e}",
             text_encoder.display()
@@ -153,7 +159,13 @@ pub fn load_vision_config(root: &Path) -> Result<Option<VisionConfig>> {
     ] {
         let path = root.join(candidate);
         if path.is_file() {
-            let bytes = std::fs::read(&path)
+            let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(&path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::load_vision_config::std::fs::read@7027",
+ArtifactInput,
+&path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
                 .map_err(|e| Error::Msg(format!("qwen_image_2_1: read {}: {e}", path.display())))?;
             processor = Some(
                 serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -304,7 +316,13 @@ fn read_optional_json(variant: Variant, path: &Path) -> Result<Option<serde_json
         return Ok(None);
     }
     let id = variant.id();
-    let bytes = std::fs::read(path)
+    let bytes = candle_gen::gen_core::__model_input_reader!(
+std::fs::read(path),
+"crates/media/candle-gen/candle-gen-qwen-image-2-1/src/loader.rs::read_optional_json::std::fs::read@13725",
+ArtifactInput,
+path,
+|__model_input_path| std::fs::read(__model_input_path)
+)
         .map_err(|e| Error::Msg(format!("{id}: read {}: {e}", path.display())))?;
     serde_json::from_slice(&bytes)
         .map(Some)

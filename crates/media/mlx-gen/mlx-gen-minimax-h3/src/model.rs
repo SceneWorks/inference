@@ -1739,8 +1739,11 @@ impl MiniMaxH3 {
         let source = self.root.join("FL2VA").join("audio_vae");
         let read = |name: &str| -> Result<String> {
             let path = source.join(name);
-            std::fs::read_to_string(&path)
-                .map_err(|e| Error::Msg(format!("{MODEL_ID}: reading {}: {e}", path.display())))
+            mlx_gen::gen_core::__model_input_choose!(
+                std::fs::read_to_string(&path),
+                mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&path)
+            )
+            .map_err(|e| Error::Msg(format!("{MODEL_ID}: reading {}: {e}", path.display())))
         };
         let cfg = MiniMaxH3AudioVaeConfig::from_source_files(
             &read("config.json")?,
@@ -1923,8 +1926,11 @@ impl MiniMaxH3 {
         let source = self.root.join("FL2VA").join("audio_vae");
         let read = |name: &str| -> Result<String> {
             let path = source.join(name);
-            std::fs::read_to_string(&path)
-                .map_err(|e| Error::Msg(format!("{MODEL_ID}: reading {}: {e}", path.display())))
+            mlx_gen::gen_core::__model_input_choose!(
+                std::fs::read_to_string(&path),
+                mlx_gen::gen_core::model_input_proof::read_configuration_to_string(&path)
+            )
+            .map_err(|e| Error::Msg(format!("{MODEL_ID}: reading {}: {e}", path.display())))
         };
         let cfg = MiniMaxH3AudioVaeConfig::from_source_files(
             &read("config.json")?,
@@ -3522,6 +3528,7 @@ pub(crate) mod tests {
         }
         println!("[render seam] {adapted} module(s) folded via MiniMaxH3::load_task_dit");
         assert_eq!(adapted, 312);
+        crate::model_inference_device::record_model_inference_device();
     }
 
     /// The requested step count is model EVALUATIONS; the schedule adds the terminal σ = 0.

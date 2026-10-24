@@ -73,6 +73,7 @@ fn vae(token_drop: i32) -> MiniMaxH3VideoVae {
 
 /// One transformer block: RMSNorm pre-norms, non-affine q/k RMSNorm, 3-D partial RoPE, SwiGLU
 /// FFN and the two scaled residuals.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn transformer_block_matches_the_reference() {
     let f = fixture();
@@ -113,10 +114,15 @@ fn transformer_block_matches_the_reference() {
         TOL,
         "transformer block",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::transformer_block_matches_the_reference"
+    );
 }
 
 /// The whole ViT decoder: token packing, `proj_in`, register tokens + zero CLS token, zeroed
 /// suffix position ids, 2 blocks, `norm_out`, `proj_out`, suffix truncation and patch unpacking.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn vit_decoder_matches_the_reference() {
     let f = fixture();
@@ -130,9 +136,12 @@ fn vit_decoder_matches_the_reference() {
     // 5 latent frames × 4, 3×2 spatial × 2 -> [1, 3, 20, 6, 8].
     assert_eq!(got.shape(), &[1, 3, 20, 6, 8]);
     assert_parity(&got, want, TOL, "ViT3DDecoder");
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::vit_decoder_matches_the_reference");
 }
 
 /// `decode` = `post_quant_conv` (1×1×1 Conv3d, applied here as a pointwise linear) then the ViT.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn decode_clip_matches_the_reference() {
     let f = fixture();
@@ -145,6 +154,8 @@ fn decode_clip_matches_the_reference() {
         TOL,
         "post_quant_conv + decoder",
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::decode_clip_matches_the_reference");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -155,6 +166,7 @@ fn decode_clip_matches_the_reference() {
 /// `token_drop = 3`: 5 and 9 need repeat padding, 7 is a single chunk, 12 and 17 exercise the
 /// cross-faded seam across 2 and 3 chunks. Each also exercises the 24-entry per-channel
 /// de-normalization, since `decode` applies it before chunking.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn temporal_decode_matches_the_reference() {
     let f = fixture();
@@ -170,10 +182,15 @@ fn temporal_decode_matches_the_reference() {
         );
         assert_parity(&got, want, TOL, &format!("decode_temporal({tokens})"));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::temporal_decode_matches_the_reference"
+    );
 }
 
 /// `token_drop = 0` — the two-pass alignment path: no overlap, one split per chunk, chunks abut
 /// with no cross-fade.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn token_drop_zero_two_pass_matches_the_reference() {
     let f = fixture();
@@ -192,10 +209,13 @@ fn token_drop_zero_two_pass_matches_the_reference() {
         assert_eq!(got.shape(), &[1, 3, frames, 6, 8]);
         assert_parity(&got, want, TOL, &format!("drop0 decode_temporal({tokens})"));
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::token_drop_zero_two_pass_matches_the_reference");
 }
 
 /// The two drop settings must actually produce DIFFERENT decodes from the same latent — proof
 /// that `token_drop` is wired through rather than being an inert config field.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn token_drop_changes_the_decode() {
     let f = fixture();
@@ -209,6 +229,8 @@ fn token_drop_changes_the_decode() {
         "token_drop=3 and token_drop=0 decoded identically (peak rel {peak:.3e}); the chunk \
          plan is not reaching the tensor path"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::token_drop_changes_the_decode");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -217,6 +239,7 @@ fn token_drop_changes_the_decode() {
 
 /// The per-channel statistics must be APPLIED, not assumed unit. Decoding a latent directly
 /// (skipping de-normalization) must differ from decoding it properly.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn latent_denormalization_is_applied_per_channel() {
     let f = fixture();
@@ -249,6 +272,8 @@ fn latent_denormalization_is_applied_per_channel() {
         peak > 1e-2,
         "decode ignored latents_mean/std (peak rel {peak:.3e})"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::latent_denormalization_is_applied_per_channel");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -366,6 +391,7 @@ fn published_ffn_projection_is_value_then_gate() {
 /// `silu(a)·b` and `silu(b)·a` share sign structure. A `norm`, `std` or checksum assertion of any
 /// tolerance would pass here.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let f = fixture();
     let cfg = fixture_config(3);
@@ -409,6 +435,8 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         "the source-layout decode still matches the reference within {TOL:.0e} ({vs_ref:.3e}) — \
          the fixture is not in the converted layout"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED video_vae_parity::reading_the_ffn_halves_gate_first_breaks_parity");
 }
 
 /// The fixture must record which reference path produced it. A regeneration that reverts to
@@ -528,6 +556,7 @@ fn fixture_is_not_degenerate() {
 /// Mutation check: perturbing any single weight must move the decode. If a tensor can be changed
 /// without changing the output, it is not actually wired into the graph and the parity test is
 /// not covering it.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn every_weight_is_load_bearing() {
     let f = fixture();
@@ -625,12 +654,15 @@ fn every_weight_is_load_bearing() {
              it is either not wired into the graph or no longer observable here"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::every_weight_is_load_bearing");
 }
 
 /// The suffix tokens must sit at the rotary ORIGIN (zero position ids). If they inherited the
 /// patch grid's ids instead, the decode changes — pin that the implementation takes the zero-id
 /// path by checking the register tokens influence the output at all, and that a decoder built
 /// with a different register-token count is rejected.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn register_tokens_participate_and_their_shape_is_checked() {
     let f = fixture();
@@ -658,11 +690,14 @@ fn register_tokens_participate_and_their_shape_is_checked() {
     bad.num_register_tokens = 2;
     let mut w = model_weights();
     assert!(ViT3dDecoder::from_weights(&mut w, "decoder", &bad, Dtype::Float32).is_err());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::register_tokens_participate_and_their_shape_is_checked");
 }
 
 /// A config claiming full (non-partial) rotary must NOT reproduce the golden — the strongest
 /// available evidence that `rope_dim_ratio = 0.75` is genuinely load-bearing rather than a
 /// constant nobody reads.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn full_rotary_breaks_parity() {
     let f = fixture();
@@ -684,6 +719,8 @@ fn full_rotary_breaks_parity() {
         "full rotary reproduced the partial-rotary golden (peak rel {peak:.3e}); the ratio is \
          not reaching the rotary"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::full_rotary_breaks_parity");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -705,6 +742,7 @@ fn full_rotary_breaks_parity() {
 /// magnitude below one 256 px tile. So `decode_clip` with the shipped defaults must be **bit**
 /// identical to the untiled path, which is what keeps every reference-backed decode assertion in
 /// this file (and its byte-identical candle twin) valid across the tiling change.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile() {
     let vae = vae(3);
@@ -725,6 +763,8 @@ fn shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile() {
         peak, 0.0,
         "below one tile the tiled path must be BIT-identical, got rel-max-abs {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::shipped_tiling_is_on_by_default_and_bit_inert_below_one_tile");
 }
 
 /// The plan the fixture canvas takes at a shrunk tile, against the reference's own `_split_tiles`.
@@ -758,6 +798,7 @@ fn the_fixture_canvas_tiles_into_the_reference_grid() {
 /// The decoder is a ViT whose attention is global over the whole clip, so a tile sees a strictly
 /// smaller context than the full canvas and cannot agree with it. The measured separation is
 /// printed so the margin over the ~1e-3 numeric noise floor stays auditable.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_tile_smaller_than_the_canvas_changes_the_decode() {
     let vae = vae(3);
@@ -778,10 +819,13 @@ fn a_tile_smaller_than_the_canvas_changes_the_decode() {
         peak > MUTATION_FLOOR,
         "a 2x3 tile grid moved the decode by only {peak:.3e}; the tiled path is not being taken"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_tile_smaller_than_the_canvas_changes_the_decode");
 }
 
 /// The `enable_tiling` / `disable_tiling` knobs select the paths they name — the reference exposes
 /// both and the conditioning encode half reads the same fields.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_tiling_knobs_select_the_paths_they_name() {
     use mlx_gen_minimax_h3::spatial_tiling::SpatialTiling;
@@ -808,10 +852,13 @@ fn the_tiling_knobs_select_the_paths_they_name() {
     assert_eq!(rel(&built.decode_clip(latent).unwrap(), &untiled).0, 0.0);
     let built_on = vae(3).with_tiling(SpatialTiling::square(4, 2));
     assert_eq!(rel(&built_on.decode_clip(latent).unwrap(), &tiled).0, 0.0);
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::the_tiling_knobs_select_the_paths_they_name");
 }
 
 /// Tiling composes with the temporal chunking rather than replacing it: `decode` still produces the
 /// planned frame count, at a canvas that tiles spatially.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
     let f = fixture();
@@ -834,6 +881,8 @@ fn spatial_tiling_composes_with_the_temporal_chunk_plan() {
         peak > MUTATION_FLOOR,
         "the spatial grid was not applied under chunking"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::spatial_tiling_composes_with_the_temporal_chunk_plan");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -875,6 +924,7 @@ fn temporal_delta(v: &Array) -> Array {
 /// stitching it the old way. If `decode_clip_tiled` ever streams a different grid — a transposed
 /// push order, a dropped tile, a strip captured after the blend instead of before — this separates
 /// while every parity assertion in this file stays green.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_bounded_stitch_reproduces_the_full_grid_decode_exactly() {
     use mlx_gen_minimax_h3::spatial_tiling::{stitch_tiles, TilePlan};
@@ -919,6 +969,8 @@ fn the_bounded_stitch_reproduces_the_full_grid_decode_exactly() {
         peak, 0.0,
         "the bounded stitch must be BIT-identical to the full-grid stitch, got {peak:.3e}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::the_bounded_stitch_reproduces_the_full_grid_decode_exactly");
 }
 
 /// **A starved tile overlap corrupts the decode, and it does so across every frame** — the AC2
@@ -937,6 +989,7 @@ fn the_bounded_stitch_reproduces_the_full_grid_decode_exactly() {
 /// The overlap is the *only* thing that moves: same weights, same tile size, same latent, same
 /// temporal plan. And the run is over `in.temporal12.latent`, which spans multiple temporal chunks,
 /// so the frame sequence under test is a real one rather than a single clip.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_starved_tile_overlap_corrupts_the_decode_across_frames() {
     /// Set from **this probe's own measured minimum**, not inherited from [`MUTATION_FLOOR`].
@@ -1018,6 +1071,8 @@ fn a_starved_tile_overlap_corrupts_the_decode_across_frames() {
         0.0,
         "the cross-frame metric must report 0.0 for an identical decode"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_starved_tile_overlap_corrupts_the_decode_across_frames");
 }
 
 /// **The latent-alignment guard is reachable from the public API**, not merely declared on
@@ -1029,6 +1084,7 @@ fn a_starved_tile_overlap_corrupts_the_decode_across_frames() {
 /// wrong-sized video and no error at all. Both clauses are probed separately so removing either
 /// one alone fails here, and the aligned geometry is decoded to show the guard is not simply
 /// rejecting everything.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
     let f = fixture();
@@ -1080,4 +1136,6 @@ fn a_tile_geometry_the_latent_grid_cannot_express_is_refused() {
 
     // The aligned geometry still decodes, so the guard rejects the misalignment and nothing else.
     assert!(vae(3).decode_clip_tiled(latent, 4, 4, 2, 2).is_ok());
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED video_vae_parity::a_tile_geometry_the_latent_grid_cannot_express_is_refused");
 }

@@ -16,6 +16,16 @@
 //! `chatterbox_ve_wav_conformance` also writes the reference clip next to the test output
 //! (`CHATTERBOX_VE_WAV_OUT` overrides the path) so a human can listen to the evidence.
 
+// Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
+#[macro_use]
+#[path = "../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+const _: fn() = || {
+    let _: std::result::Result<candle_audio::candle_core::Tensor, ()> = __model_proof_output!(
+        std::result::Result::<candle_audio::candle_core::Tensor, ()>::Err(())
+    );
+};
+
 use std::path::PathBuf;
 
 use candle_audio_chatterbox_ve as ve;
@@ -129,6 +139,9 @@ fn chatterbox_ve_discriminates_speakers() {
         same > cross + 0.1,
         "same-speaker must be clearly closer than different-speaker (same={same:.4}, cross={cross:.4})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_ve_discriminates_speakers");
 }
 
 /// The real-WAV DoD companion: the reference clip the embedder consumed is non-silent, 24 kHz
@@ -166,4 +179,7 @@ fn chatterbox_ve_wav_conformance() {
     candle_audio::wav::write_wav_pcm16(std::path::Path::new(&out), &reference)
         .expect("write reference wav");
     eprintln!("wrote reference clip: {out} ({secs:.2}s, peak {peak:.3})");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED chatterbox_ve_wav_conformance");
 }

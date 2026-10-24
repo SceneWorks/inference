@@ -233,7 +233,7 @@ impl RvqDecoder {
             })
             .collect();
         let emb = rvq_dequantize(&self.codebooks, &clamped, device)?; // [1, CODEBOOK_DIM, T]
-        self.output_proj.forward(&emb) // [1, CODE_DIM, T]
+        __model_proof_output!(self.output_proj.forward(&emb)) // [1, CODE_DIM, T]
     }
 }
 
@@ -290,13 +290,13 @@ impl OmniLayer {
     /// `x` is `[1, T, d_model]`; full (non-causal) self-attention, no pad mask (batch=1, all valid).
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let residual = x;
-        let h = self.self_attn_layer_norm.forward(x)?;
+        let h = __model_proof_output!(self.self_attn_layer_norm.forward(x))?;
         let attn = self.attention(&h)?;
         let x = (residual + attn)?;
         let residual = &x;
-        let h = self.final_layer_norm.forward(&x)?;
-        let h = self.fc1.forward(&h)?.gelu_erf()?;
-        let h = self.fc2.forward(&h)?;
+        let h = __model_proof_output!(self.final_layer_norm.forward(&x))?;
+        let h = __model_proof_output!(self.fc1.forward(&h))?.gelu_erf()?;
+        let h = __model_proof_output!(self.fc2.forward(&h))?;
         residual + h
     }
 
@@ -305,9 +305,9 @@ impl OmniLayer {
         let h = self.num_heads;
         let d = self.head_dim;
         let scale = (d as f64).powf(-0.5);
-        let q = (self.q_proj.forward(x)? * scale)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = (__model_proof_output!(self.q_proj.forward(x))? * scale)?;
+        let k = __model_proof_output!(self.k_proj.forward(x))?;
+        let v = __model_proof_output!(self.v_proj.forward(x))?;
         let shape = |t_: Tensor| -> CandleResult<Tensor> {
             t_.reshape((b, t, h, d))?.transpose(1, 2)?.contiguous()
         };
@@ -318,7 +318,7 @@ impl OmniLayer {
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att.matmul(&v)?; // [b, h, t, d]
         let out = out.transpose(1, 2)?.reshape((b, t, h * d))?;
-        self.out_proj.forward(&out)
+        __model_proof_output!(self.out_proj.forward(&out))
     }
 }
 
@@ -364,13 +364,13 @@ impl PostRvqAdapter {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // proj on channels: (1, T, in) -> (1, T, d_model)
         let h = x.transpose(1, 2)?.contiguous()?; // [1, T, CODE_DIM]
-        let mut h = self.proj.forward(&h)?; // [1, T, D_MODEL]
+        let mut h = __model_proof_output!(self.proj.forward(&h))?; // [1, T, D_MODEL]
         h = add_positional(&h)?;
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }
-        h = self.layer_norm.forward(&h)?;
-        let h = self.out_proj.forward(&h)?; // [1, T, CODE_DIM]
+        h = __model_proof_output!(self.layer_norm.forward(&h))?;
+        let h = __model_proof_output!(self.out_proj.forward(&h))?; // [1, T, CODE_DIM]
         h.transpose(1, 2)?.contiguous()
     }
 }
@@ -403,7 +403,7 @@ impl Upsample {
 
     /// `[1, CODE_DIM, T]` -> `[1, D_MODEL, 4T]`.
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        self.up_conv.forward(x)
+        __model_proof_output!(self.up_conv.forward(x))
     }
 }
 
@@ -472,11 +472,11 @@ impl AcousticDecoder {
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }
-        h = self.layer_norm.forward(&h)?;
+        h = __model_proof_output!(self.layer_norm.forward(&h))?;
         let h = h.transpose(1, 2)?.contiguous()?; // [1, D_MODEL, L]
-        let h = self.deconv1.forward(&h)?.gelu_erf()?;
-        let h = self.deconv2.forward(&h)?.gelu_erf()?; // [1, 80, ~2L]
-                                                       // Trim to exactly L * stride_size (the reference's expected_length guard).
+        let h = __model_proof_output!(self.deconv1.forward(&h))?.gelu_erf()?;
+        let h = __model_proof_output!(self.deconv2.forward(&h))?.gelu_erf()?; // [1, 80, ~2L]
+                                                                              // Trim to exactly L * stride_size (the reference's expected_length guard).
         let expected = l * self.stride_size;
         if h.dim(2)? > expected {
             h.narrow(2, 0, expected)

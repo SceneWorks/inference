@@ -59,6 +59,7 @@ fn projections(w: &mut Weights, cfg: &MiniMaxH3DitConfig) -> DitProjections {
 /// (cos first) and `downscale_freq_shift = 0`. Both are shape-invisible, and the whole model's
 /// modulation — every AdaLN projection in all 50 blocks plus `norm_out` — is a function of this one
 /// tensor, so an error here is a uniform bias applied at every step.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_timestep_mlp_reproduces_the_reference_embedding() {
     let mut w = fixture();
@@ -116,12 +117,15 @@ fn the_timestep_mlp_reproduces_the_reference_embedding() {
         (norm(&unflipped) - norm(&sincos)).abs() / norm(&sincos) < 1e-6,
         "…and the two have the SAME norm, which is why a magnitude gate cannot see the flip"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_io::the_timestep_mlp_reproduces_the_reference_embedding");
 }
 
 /// **`context_embedder` reproduces the reference's refiner input.**
 ///
 /// The fixture's `in.refiner.hidden` is `model.context_embedder(in.refiner.context)`, so this covers
 /// the one input projection that is bfloat16 in the published checkpoint rather than float32.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_context_embedder_reproduces_the_reference_projection() {
     let mut w = fixture();
@@ -139,11 +143,14 @@ fn the_context_embedder_reproduces_the_reference_projection() {
         got.shape(),
         rel(&got, &want).0
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_io::the_context_embedder_reproduces_the_reference_projection");
 }
 
 /// The whole model reproduces the refiner chain the reference dumped — `context_embedder` **then**
 /// `token_refiner`, which is the order the reference's `forward` applies and the order a port that
 /// refined before embedding would get wrong at the same shapes.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_model_embeds_the_context_before_refining_it() {
     let mut w = fixture();
@@ -161,6 +168,10 @@ fn the_model_embeds_the_context_before_refining_it() {
         .is_err());
     assert_eq!(dit.num_layers(), cfg.num_layers as usize);
     assert!(dit.holds_adaln(), "nothing is evicted at load");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED dit_io::the_model_embeds_the_context_before_refining_it"
+    );
 }
 
 /// **`norm_out.linear` is `shift` then `scale`**, and it is addressed by the **bare timestep
@@ -169,6 +180,7 @@ fn the_model_embeds_the_context_before_refining_it() {
 /// Both are shape-identical mistakes. Reversing the halves swaps an additive term for a
 /// multiplicative one; feeding it the blocks' `adaln_indices` reads a row `MODALITY_NUM` times too
 /// far into the table and, when the table happens to be long enough, gathers silently.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone() {
     let mut w = fixture();
@@ -237,6 +249,8 @@ fn the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone() {
          refused",
         m.shift.shape()[0]
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_io::the_output_norm_is_shift_then_scale_and_keyed_on_the_timestep_alone");
 }
 
 /// The declared timestep index really is what an independent derivation from the schedule produces
@@ -319,6 +333,7 @@ fn the_seventeen_load_at_the_published_geometry() {
 /// residency `match` — `adaln_unverified_at_eviction` becomes 4 and this reds while `[0, 0, 0]` and
 /// `released_bytes > 0` both still pass. Mis-partition a key (`adaln_proj` into `body`) — the
 /// `[38, 4, 20]` split reds.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() {
     use mlx_gen_minimax_h3::denoise::{adaln_schedule, JointSchedule};
@@ -374,6 +389,8 @@ fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() 
         model.released_bytes() > 0,
         "the eviction still happens after the adaln verification"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED dit_io::a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it");
 }
 
 /// **The whole-model golden** (sc-17147): the reference's own
@@ -384,6 +401,7 @@ fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() 
 /// `audio_proj_in`, `norm_out`, `proj_out`, `audio_proj_out`) **and** their composition: the
 /// scatter into the packed sequence, the row-major patch order, the two distinct index tensors, and
 /// the output heads' row selection. Each of those is a shape-identical mistake on its own.
+#[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn the_whole_model_reproduces_the_reference_velocity() {
     let mut w = fixture();
@@ -478,5 +496,9 @@ fn the_whole_model_reproduces_the_reference_velocity() {
         w.metadata("provenance"),
         Some("converted-checkpoint"),
         "rule 3: the golden must come from the CONVERTED layout production loads"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED dit_io::the_whole_model_reproduces_the_reference_velocity"
     );
 }

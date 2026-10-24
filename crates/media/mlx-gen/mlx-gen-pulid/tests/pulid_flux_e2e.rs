@@ -196,6 +196,9 @@ fn pulid_flux_end_to_end() {
         assert!(cos > 0.3, "identity not transferred (cosine {cos:.4})");
     } else {
         println!("WARNING: no face detected in the generated image (low-step render?) — identity cosine skipped");
+        crate::model_inference_device::record_model_inference_prerequisite_missing(
+            "required work unavailable in pulid_flux_end_to_end; see preceding skip diagnostic",
+        );
     }
 
     // (4) sc-3075: real-CFG (true_cfg>1) + negative prompt engages the dual-forward branch and
@@ -232,4 +235,6 @@ fn pulid_flux_end_to_end() {
             cosine(&gf.embedding, &ref_emb)
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED pulid_flux_e2e::pulid_flux_end_to_end");
 }

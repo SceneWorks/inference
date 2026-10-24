@@ -2329,11 +2329,12 @@ mod quantum_tests {
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn tiled_sana_decode_checks_final_normalization_after_last_fold() {
         const CHILD: &str = "SANA_TILED_FINALIZER_CPU_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "pipeline::quantum_tests::tiled_sana_decode_checks_final_normalization_after_last_fold", "--nocapture"])
+                .args(["--include-ignored", "--exact", "pipeline::quantum_tests::tiled_sana_decode_checks_final_normalization_after_last_fold", "--nocapture"])
                 .env(CHILD, "1").status().unwrap();
             assert!(status.success());
             return;
@@ -2378,6 +2379,8 @@ mod quantum_tests {
             .filter(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE tile fold"))
             .count();
         assert!(folds > 1, "fixture must genuinely tile: {events:?}");
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::tiled_sana_decode_checks_final_normalization_after_last_fold");
     }
 
     /// The tiled decode's fold and finalization quanta, proven against MLX's measured peak for the
@@ -2595,11 +2598,12 @@ mod quantum_tests {
     /// within the tiled-encode parity standard (1e-5 of peak; see the body). Off device the same
     /// call resolves no tiling.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode() {
         const CHILD: &str = "SANA_IOS_TILED_ENCODE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "pipeline::quantum_tests::ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode", "--nocapture"])
+                .args(["--include-ignored", "--exact", "pipeline::quantum_tests::ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode", "--nocapture"])
                 .env(CHILD, "1").status().unwrap();
             assert!(
                 status.success(),
@@ -2711,6 +2715,8 @@ mod quantum_tests {
             scratch: mlx_gen::ios_quantum::elementwise_bytes(latent_elements + 1, 1),
         }));
         // The stalled scaling allocation measurement is selected independently below.
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode");
     }
 
     #[test]
@@ -2856,11 +2862,13 @@ mod quantum_tests {
     /// [`BASE_GOLDEN`], [`DENOISE_GOLDEN_TOLERANCE`] (the denoised latents),
     /// [`assert_image_matches_golden`] (the decoded image).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn default_paths_match_the_base_rev_goldens() {
         const CHILD: &str = "SANA_BASE_GOLDEN_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "pipeline::quantum_tests::default_paths_match_the_base_rev_goldens",
                     "--nocapture",
@@ -3023,6 +3031,8 @@ mod quantum_tests {
             off * 10 > other.pixels.len(),
             "the golden must discriminate: only {off} pixels moved under a different seed"
         );
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::default_paths_match_the_base_rev_goldens");
     }
 
     /// The opt-in Mac bounded-VAE rung (`tile_vae_decode`, no iOS scope) tiles the img2img
@@ -3031,12 +3041,13 @@ mod quantum_tests {
     /// `encode_init_latents`, as does the unchanged untiled default. The 448x384 fixture image
     /// genuinely tiles at that edge (more than one tile's input quantum is checked).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn mac_bounded_rung_encode_matches_the_base_rev_whole_image_encode() {
         const CHILD: &str = "SANA_BOUNDED_ENCODE_GOLDEN_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "--exact",
+                    "--include-ignored", "--exact",
                     "pipeline::quantum_tests::mac_bounded_rung_encode_matches_the_base_rev_whole_image_encode",
                     "--nocapture",
                 ])
@@ -3127,6 +3138,8 @@ mod quantum_tests {
             inputs > 1,
             "the bounded encode must genuinely tile ({inputs} tiles)"
         );
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::mac_bounded_rung_encode_matches_the_base_rev_whole_image_encode");
     }
 
     /// The Sequential img2img reorder changes no value: the reference encoded by a standalone
@@ -3134,11 +3147,13 @@ mod quantum_tests {
     /// image bytes as the historical bundle that owns the encoder and prepares the reference itself
     /// — base and Sprint, on the CPU at a tiny 6-stage DC-AE (x32) and a one-block trunk.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn sequential_reference_reorder_is_byte_identical() {
         const CHILD: &str = "SANA_SEQUENTIAL_REORDER_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "pipeline::quantum_tests::sequential_reference_reorder_is_byte_identical",
                     "--nocapture",
@@ -3277,5 +3292,7 @@ mod quantum_tests {
                 "sprint={sprint}: reference is inert"
             );
         }
+
+        eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED pipeline::quantum_tests::sequential_reference_reorder_is_byte_identical");
     }
 }

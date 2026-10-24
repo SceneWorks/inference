@@ -140,4 +140,7 @@ fn detr_detector_matches_oracle() {
         "presence |Δ| {presence_diff:.4} too large"
     );
     assert_eq!(got_n, want_n, "instance count mismatch");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED detr_parity::detr_detector_matches_oracle");
 }

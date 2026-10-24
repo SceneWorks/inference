@@ -72,4 +72,6 @@ fn duration_head_matches_reference_all_modalities() {
             "{name}: rel_err {err:.3e} too high (got {got}, want {want})"
         );
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED duration_head_golden::duration_head_matches_reference_all_modalities");
 }

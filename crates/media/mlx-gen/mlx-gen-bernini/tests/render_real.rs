@@ -125,6 +125,8 @@ fn t2i_real_weight_smoke() {
         }
         _ => panic!("expected Images for a 1-frame request"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED render_real::t2i_real_weight_smoke");
 }
 
 #[test]
@@ -158,4 +160,6 @@ fn r2v_real_weight_smoke() {
         }
         _ => panic!("expected Images for a 1-frame request"),
     }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED render_real::r2v_real_weight_smoke");
 }

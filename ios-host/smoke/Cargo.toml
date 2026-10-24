@@ -24,6 +24,7 @@ name = "campaign_catalog"
 required-features = ["media"]
 
 [features]
+model-inference-proof = ["runtime-ios/model-inference-proof", "mlx-gen-sana?/model-inference-proof", "mlx-gen?/model-inference-proof"]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
 media = ["runtime-ios/media", "runtime-ios/device-capture", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
@@ -60,6 +61,8 @@ mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = tr
 mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
 
 [dev-dependencies]
+# Only HOST tests enable compact validated Z-Image sources; normal media/iOS builds do not.
+mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", default-features = false, features = ["test-support"] }
 tempfile = "3"
 # The production Qwen3-4B encoder contract fixture a Z-Image Turbo campaign case validates.
 sceneworks-gen-core-testkit = { path = "../../crates/contracts/gen-core-testkit" }

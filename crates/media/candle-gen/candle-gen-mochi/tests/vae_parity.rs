@@ -81,4 +81,7 @@ fn vae_decode_matches_golden() {
         "VAE mean pixel error {mean_px:.3e} too high"
     );
     assert!(max_px < 5e-2, "VAE max pixel error {max_px:.3e} too high");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae_parity::vae_decode_matches_golden");
 }
