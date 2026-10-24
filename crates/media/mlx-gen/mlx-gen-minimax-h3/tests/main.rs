@@ -129,3 +129,6 @@ mod video_vae_encode_parity;
 
 #[path = "video_vae_parity.rs"]
 mod video_vae_parity;
+
+#[path = "w4a8_compare.rs"]
+mod w4a8_compare;

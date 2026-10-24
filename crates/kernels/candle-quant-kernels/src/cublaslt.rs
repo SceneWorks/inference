@@ -200,6 +200,16 @@ pub const KITCHEN_INT8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::Kernel
     cc_floor: (7, 0),
 };
 
+/// Packed W4A8 → int8 weight decode (sc-26685): nibble unpack + codebook + E4M3FN group scale +
+/// round-half-even clamp `[-127,127]`, compiled once per device through the [`nvrtc`](crate::nvrtc)
+/// seam. This is the on-device twin of the host `gen_core::w4a8_int8::dequant_packed_to_int8`
+/// decode the CPU/test path uses, so the shipped CUDA forward never full-dequants on the host.
+pub const W4A8_DEQUANT_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "w4a8_dequant_int8_v1",
+    src: include_str!("w4a8_dequant.cu"),
+    cc_floor: (7, 0),
+};
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::super::nvfp4::{Nvfp4Tensor, SF_ATOM_COLS, SF_ATOM_ROWS};
@@ -1398,6 +1408,97 @@ mod cuda_impl {
             ))
         }
 
+        /// Decode one bounded output-row tile of a resident packed W4A8 weight to device int8, for
+        /// the shared cuBLASLt INT8 IGEMM. `packed` (`U8 [out, k/2]`), `s_rel` (`U8 [out, k/g]`) and
+        /// `codebook` (`F32 [16]`) are the **resident** device tensors staged once at load; `out0`
+        /// is the first output feature of `rows` rows. The returned `DevInt8` is a transient
+        /// `[rows, k]` scratch on the device, never a resident model shadow.
+        pub fn dequant_w4a8_packed_tile(
+            &self,
+            packed: &Tensor,
+            s_rel: &Tensor,
+            codebook: &Tensor,
+            tile: W4A8DecodeTile,
+        ) -> Result<DevInt8> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let W4A8DecodeTile {
+                rows,
+                in_features: k,
+                group,
+                out0,
+            } = tile;
+            if rows == 0 || k == 0 || rows.checked_mul(k).is_none() {
+                candle_core::bail!("W4A8 decode tile geometry");
+            }
+            debug_assert!(group == 16);
+            for (name, t) in [("packed", packed), ("s_rel", s_rel), ("codebook", codebook)] {
+                if !t.device().same_device(&Device::Cuda(self.device.clone())) {
+                    candle_core::bail!("W4A8 {name} operand is not on CUDA");
+                }
+            }
+            let module = W4A8_DEQUANT_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("w4a8_dequant_int8")
+                .map_err(candle_core::Error::wrap)?;
+            let (pstorage, _) = packed.storage_and_layout();
+            let Storage::Cuda(pcs) = &*pstorage else {
+                candle_core::bail!("W4A8 packed is not on CUDA");
+            };
+            let CudaStorageSlice::U8(packed_u8) = &pcs.slice else {
+                candle_core::bail!("W4A8 packed is not raw U8");
+            };
+            let (sstorage, _) = s_rel.storage_and_layout();
+            let Storage::Cuda(scs) = &*sstorage else {
+                candle_core::bail!("W4A8 s_rel is not on CUDA");
+            };
+            let CudaStorageSlice::U8(srel_u8) = &scs.slice else {
+                candle_core::bail!("W4A8 s_rel is not raw U8");
+            };
+            let (cstorage, _) = codebook.storage_and_layout();
+            let Storage::Cuda(ccs) = &*cstorage else {
+                candle_core::bail!("W4A8 codebook is not on CUDA");
+            };
+            let CudaStorageSlice::F32(codebook_f32) = &ccs.slice else {
+                candle_core::bail!("W4A8 codebook is not F32");
+            };
+            let mut out = unsafe { self.stream.alloc::<u8>(rows * k) }.map_err(drv_err)?;
+            let (ki, gi, out0i) = (k as i32, group as i32, out0 as i32);
+            let work = (rows * k) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(packed_u8)
+                    .arg(srel_u8)
+                    .arg(codebook_f32)
+                    .arg(&mut out)
+                    .arg(&ki)
+                    .arg(&gi)
+                    .arg(&out0i)
+                    .launch(LaunchConfig {
+                        grid_dim: (work.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let out_t = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(out),
+                    device: self.device.clone(),
+                }),
+                (rows, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok(DevInt8 {
+                buf: out_t,
+                rows,
+                cols: k,
+            })
+        }
+
         // --- internals -------------------------------------------------------------------------
 
         #[allow(clippy::too_many_arguments)]
@@ -1954,6 +2055,26 @@ mod cuda_impl {
         cols: usize,
     }
 
+    /// Geometry of one bounded W4A8 output-row decode tile: the `rows` output features starting at
+    /// `out0`, each spanning the full `in_features` contraction, with one E4M3FN `s_rel` scale per
+    /// `group` columns.
+    ///
+    /// Four `usize`s passed positionally are indistinguishable to the compiler and to a reader, so
+    /// they travel as one named value (sc-26685 review: `dequant_w4a8_packed_tile` had eight
+    /// arguments). The resident-tensor operands stay separate — they are the kernel's inputs, and
+    /// this is only its launch geometry.
+    #[derive(Clone, Copy, Debug)]
+    pub struct W4A8DecodeTile {
+        /// Output features decoded by this tile (`<=` the caller's output-row tile bound).
+        pub rows: usize,
+        /// Logical contraction width (`in_features`), i.e. the decoded int8 row length.
+        pub in_features: usize,
+        /// Columns per E4M3FN relative scale (`W4A8Int8::group_size`, 16).
+        pub group: usize,
+        /// First output feature of the tile.
+        pub out0: usize,
+    }
+
     impl DevInt8 {
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {
             let (rows, cols) = t.dims2()?;
@@ -2323,7 +2444,7 @@ mod cuda_impl {
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, W4A8DecodeTile};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).
