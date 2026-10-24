@@ -70,7 +70,7 @@
 //!
 //! Native W4A8 (`asym_w4a8_int8`) routes before ConvRot/affine detection. Its byte count is the
 //! original packed I8 + FP8 relative scales + F32 channel scales/codebook, never a dense shadow.
-//! The projection exposes its bounded per-forward host/device decode scratch separately through
+//! The projection exposes its bounded per-forward device decode scratch separately through
 //! `W4A8Linear::weight_scratch_bytes`; that scratch is transient, not a frozen base allocation.
 
 use candle_gen::candle_core::quantized::GgmlDType;
@@ -99,7 +99,7 @@ pub struct TieredLinear {
 impl TieredLinear {
     /// Additional peak device weight bytes for this projection while it is executing. W4A8
     /// retains only packed operands; admission reserves one decode tile, not a full INT8 shadow.
-    /// The same number of host scratch bytes is used by its production packed-to-INT8 decoder.
+    /// CUDA decodes the bounded tile on device; there is no matching host scratch allocation.
     pub fn transient_weight_bytes(&self) -> usize {
         self.linear
             .base_w4a8()

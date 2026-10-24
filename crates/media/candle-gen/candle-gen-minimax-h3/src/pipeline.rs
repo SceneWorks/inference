@@ -57,9 +57,8 @@ use crate::audio_config::{AUDIO_LATENT_CHANNELS, AUDIO_OUTPUT_CHANNELS, AUDIO_SA
 const AUDIO_CHANNELS: usize = AUDIO_OUTPUT_CHANNELS as usize;
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, video_latent_num_frames, JointGeometry, JointSchedule,
-    JointVelocity, PackedLayout, LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
-    TEXT_TAG,
+    adaln_schedule, align_num_frames, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
+    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
 };
 use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 
@@ -68,7 +67,7 @@ use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 ///
 /// `canvas_multiple` in the reference pipeline. **Not** `VAE_RATIO` alone: a 16-aligned canvas can
 /// still be an odd number of latent columns, which has no patched representation.
-pub const SPATIAL_STRIDE: u32 = VAE_RATIO as u32 * 2;
+pub const SPATIAL_STRIDE: u32 = candle_gen::gen_core::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -80,7 +79,7 @@ pub const CANVAS_SHORT_EDGE: u32 = 768;
 /// budget. Canvas area is the *dominant* term in the packed sequence — it sets rows per latent
 /// frame, and attention is quadratic in the sequence — so an unbounded area is an unbounded render
 /// cost regardless of what the duration bound says.
-pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
+pub const CANVAS_MAX_PIXELS: u32 = candle_gen::gen_core::h3_memory::CANVAS_MAX_PIXELS;
 
 /// Widest edge any canvas this model resolves to can carry — **2016**, the long edge at the 4:1
 /// aspect ceiling. This is what `Capabilities::max_size` declares (sc-17152).
@@ -173,44 +172,8 @@ impl RequestGeometry {
 /// over [`CANVAS_MAX_PIXELS`], on a frame count that is not `17n + 5`, and on a duration outside the
 /// model's own 5.1667–14.375 s range.
 pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<RequestGeometry> {
-    if width == 0 || height == 0 {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: width/height must be positive, got {width}x{height}"
-        )));
-    }
-    if !width.is_multiple_of(SPATIAL_STRIDE) || !height.is_multiple_of(SPATIAL_STRIDE) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: width/height must be a multiple of {SPATIAL_STRIDE} (the VAE's \
-             {VAE_RATIO}x spatial compression times the DiT's width patch of {}), got \
-             {width}x{height}",
-            PATCH_SIZE[2]
-        )));
-    }
-    // Checked as a product because the per-edge cap is not the same constraint: 1344x1344 is inside
-    // `Capabilities::max_size` on both edges and 75 % over the area the model generates at.
-    if u64::from(width) * u64::from(height) > u64::from(CANVAS_MAX_PIXELS) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: {width}x{height} is {} px, over the released checkpoint's \
-             {CANVAS_MAX_PIXELS} px canvas budget ({CANVAS_SHORT_EDGE} short edge at 16:9). Canvas \
-             area sets the packed sequence length and the attention is quadratic in it",
-            u64::from(width) * u64::from(height)
-        )));
-    }
-    // **The lattice gate runs first, then the range gate.** The two reject disjoint mistakes and the
-    // caller needs to be told which one it made: a count that is not `17n + 5` has no geometry at
-    // any duration, while one that is on the lattice but outside 5.1667-14.375 s is a legal shape
-    // the model was not trained at.
-    video_latent_num_frames(num_frames)?;
-    let seconds = num_frames as f64 / MINIMAX_H3_FPS;
-    if !(MIN_DURATION_SECONDS - 1e-9..=MAX_DURATION_SECONDS + 1e-9).contains(&seconds) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: {num_frames} frames is {seconds:.4} s, outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range ({}-{} frames at \
-             {MINIMAX_H3_FPS} fps)",
-            LEGAL_FRAME_COUNTS[0],
-            LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1],
-        )));
-    }
+    candle_gen::gen_core::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
     Ok(RequestGeometry {
         width,
         height,

@@ -533,6 +533,7 @@ fn contract_with_asset_facts(
         ),
         staged_weights: mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
         transformer_stream: None,
+        native_quant: None,
         decoder_workspace: Some(mlx_gen::gen_core::DecoderWorkspaceFacts {
             tiling: mlx_gen::gen_core::DecoderTilingRealization::WholeTail,
             activation_dtype_width: 4,

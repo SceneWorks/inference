@@ -528,7 +528,28 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
     .map(Some)
 }
 /// Upper-envelope native layout sizes for an enabled request, in DiT patch units.
-fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileShape, LayoutSize>)> {
+/// Packed and conditioning row upper bounds, independent of sparse plan selection. The global
+/// row envelope includes prompt framing, visual tokens and audio; using it for the refiner is
+/// conservative (audio rows do not enter that refiner) without a second set of tokenization rules.
+pub fn h3_row_bound(req: Request<'_>) -> Result<(u64, u64)> {
+    let (_, _, globals, seq) = layout_envelope(req)?;
+    Ok((seq as u64, globals as u64))
+}
+
+/// Target followed by ordered visual reference grids in DiT patch units. Audio-only carriers
+/// contribute no visual grid. Shared with H3's native encoder/decoder workspace accounting.
+pub fn h3_visual_grids(req: Request<'_>) -> Result<([u64; 3], Vec<[u64; 3]>)> {
+    let (grid, spans, _, _) = layout_envelope(req)?;
+    let refs = spans[..spans.len() - 1]
+        .iter()
+        .map(|g| g.map(|n| n as u64))
+        .collect();
+    Ok((grid.map(|n| n as u64), refs))
+}
+
+type LayoutEnvelope = ([usize; 3], Vec<[usize; 3]>, usize, usize);
+
+fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
     let frames = req.frames as usize;
     if frames < 5 || req.width == 0 || req.height == 0 {
         return Err(bad("admission requires resolved geometry"));
@@ -541,11 +562,11 @@ fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileSha
         req.width as usize / PATCH_PIXELS,
     ];
     let mut spans = vec![grid];
-    let mut globals = req
-        .prompt
-        .len()
-        .saturating_add(512)
-        .saturating_add((frames * 40).div_ceil(24));
+    let mut globals = req.prompt.len().saturating_add(512).saturating_add(
+        (frames * 40)
+            .div_ceil(24)
+            .saturating_mul(crate::h3_memory::AUDIO_OUTPUT_CHANNELS as usize),
+    );
     let image_grid = |w: u32, h: u32| -> Result<[usize; 3]> {
         if w == 0 || h == 0 {
             return Err(bad("empty reference image"));
@@ -592,6 +613,7 @@ fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileSha
         }
         Ok(
             ((a.samples.len() as u128 * 40).div_ceil(a.sample_rate as u128 * a.channels as u128))
+                .saturating_mul(crate::h3_memory::AUDIO_OUTPUT_CHANNELS as u128)
                 .min(usize::MAX as u128) as usize,
         )
     };
@@ -681,6 +703,21 @@ fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileSha
         .checked_add(refs)
         .and_then(|n| n.checked_add(globals))
         .ok_or_else(|| bad("size overflow"))?;
+    Ok((grid, spans, globals, seq))
+}
+
+fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileShape, LayoutSize>)> {
+    let (grid, spans, globals, seq) = layout_envelope(req)?;
+    let volume = |g: &[usize; 3]| {
+        g.iter()
+            .try_fold(1usize, |n, &axis| n.checked_mul(axis))
+            .ok_or_else(|| bad("grid size overflow"))
+    };
+    let target = volume(&grid)?;
+    let refs = spans[..spans.len() - 1].iter().try_fold(0usize, |n, g| {
+        n.checked_add(volume(g)?)
+            .ok_or_else(|| bad("reference size overflow"))
+    })?;
     let plan = frozen_plan(grid)?;
     let layouts = plan
         .shapes

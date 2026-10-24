@@ -204,6 +204,8 @@ use mlx_gen::gen_core::{
     TransformerComponent, WeightsSource,
 };
 
+mod conditioning;
+
 use crate::denoise::LEGAL_FRAME_COUNTS;
 use crate::model::{DIT_COMPONENT, MODEL_ID, TEXT_ENCODER_COMPONENT};
 use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
@@ -780,6 +782,7 @@ struct ComponentBytes {
     /// step, which makes [`AdapterResidencyMode::Additive`] the honest mode: `Folded` would declare
     /// zero and under-declare the floor, exactly the failure the text-encoder note below records.
     overlay: u64,
+    native_quant: Option<mlx_gen::gen_core::h3_memory::NativeAllocationFacts>,
 }
 
 /// Bytes a `spec.precision`-following component occupies once loaded (SC-22667).
@@ -810,6 +813,52 @@ fn materialized_f32_bytes(path: &std::path::Path) -> u64 {
         mlx_gen::asset_facts::ResidentProjection::Float32
     })
     .unwrap_or(stored)
+}
+
+fn native_backend() -> mlx_gen::gen_core::h3_memory::NativeBackend {
+    mlx_gen::gen_core::h3_memory::NativeBackend::Mlx {
+        tile_columns: mlx_gen::w4a8_int8::TILE_COLS as u64,
+    }
+}
+
+fn dit_allocation(
+    path: &std::path::Path,
+    precision: mlx_gen::Precision,
+    pruned: bool,
+) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::h3_memory::NativeComponentAllocation> {
+    let width = if precision == mlx_gen::Precision::Fp32 {
+        4
+    } else {
+        2
+    };
+    let mut allocation =
+        mlx_gen::gen_core::h3_memory::component_allocation(path, native_backend(), width, |h| {
+            if pruned
+                && (h.name == TABLE_KEY
+                    || h.name.contains(".adaln_proj.linear.")
+                    || h.name.starts_with("norm_out.linear."))
+            {
+                None
+            } else if h.name.starts_with("transformer_blocks.")
+                || h.name.starts_with("token_refiner.")
+            {
+                Some(width)
+            } else {
+                None
+            }
+        })?;
+    // Unresolved inventory probes name no tensor the DiT consumes. Retain their established
+    // file-size bound; real dense/native sources use the materialized header facts above.
+    if allocation.projections.is_empty() && safetensors_path_bytes(path) > 0 {
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+        if !headers
+            .iter()
+            .any(|h| h.name.ends_with(".weight") || h.name == TABLE_KEY)
+        {
+            allocation.resident_bytes = materialized_component_bytes(path, precision);
+        }
+    }
+    Ok(allocation)
 }
 
 /// Source headers and the loader's config, without mapping any tensor payload. An absent
@@ -884,33 +933,93 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(DIT_COMPONENT),
         };
-        let mut dit_bytes = materialized_component_bytes(&dit, spec.precision);
+        use mlx_gen::gen_core::h3_memory::{NativeAllocationFacts, NativeTaskAllocation};
         let reference = dit.with_file_name(crate::model::REFERENCE_DIT_PARTITION);
-        let base_pruning = source_prune_sizing(&dit)?;
-        let reference_pruning = source_prune_sizing(&reference)?;
+        let backend = native_backend();
+        let mut tasks = Vec::new();
+        let mut dit_bytes = 0;
         let mut pruning = None;
         let mut pruned_resident = 0;
-        // Each render loads ONE task DiT (model::load_task_dit); both tasks are reachable.
-        // Correct each complete footprint before taking the route maximum. A mixed route
-        // conservatively keeps its dense companion's full floor, with no eviction credit.
-        if base_pruning.is_some() || reference_pruning.is_some() {
-            dit_bytes = 0;
-            for (directory, sizing) in [(&dit, base_pruning), (&reference, reference_pruning)] {
-                let bytes = materialized_component_bytes(directory, spec.precision);
-                let bytes = if let Some(sizing) = sizing {
-                    let live = sizing.resident_bytes().map_err(CoreError::Unsupported)?;
-                    if live > pruned_resident {
-                        pruning = Some(sizing);
-                        pruned_resident = live;
-                    }
-                    sizing
-                        .materialized_bytes(bytes, spec.precision == mlx_gen::Precision::Fp32)
-                        .map_err(CoreError::Unsupported)?
+        let mut max_adaln = 0;
+        let mut resolved = false;
+        // Each render loads ONE task. Correct source-pruned operands before taking the maximum.
+        for directory in [&dit, &reference] {
+            let sizing = source_prune_sizing(directory)?;
+            let allocation = dit_allocation(directory, spec.precision, sizing.is_some())?;
+            let bytes = if let Some(sizing) = sizing {
+                let live = sizing.resident_bytes().map_err(CoreError::Unsupported)?;
+                if live > pruned_resident {
+                    pruning = Some(sizing);
+                    pruned_resident = live;
+                }
+                // Preserve source-width pruning operands; S5 alone replaces this subset with
+                // the actual F32 compute operands and retained schedule tables.
+                sizing
+                    .materialized_bytes(allocation.resident_bytes, false)
+                    .map_err(CoreError::Unsupported)?
+            } else {
+                allocation.resident_bytes
+            };
+            max_adaln = max_adaln.max(allocation.adaln_bytes);
+            dit_bytes = dit_bytes.max(bytes);
+            resolved |= allocation.resolved;
+            let patch_size = if !allocation.resolved {
+                [1, 2, 2]
+            } else {
+                let text = std::fs::read_to_string(directory.join("config.json"))?;
+                crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
+                    .map_err(|e| CoreError::Unsupported(e.to_string()))?
+                    .patch_size
+                    .map(|n| n as u64)
+            };
+            let window = if allocation.resolved {
+                Some(
+                    mlx_gen::gen_core::h3_memory::window::WindowAllocation::from_resident_tensors(
+                        &allocation.phase_resident_by_name,
+                        &allocation.projections,
+                        bytes.saturating_sub(allocation.resident_bytes),
+                        sizing.is_some(),
+                    )?
+                    .with_source_casts(&allocation.source_cast_by_name)?,
+                )
+            } else {
+                None
+            };
+            tasks.push(NativeTaskAllocation {
+                resident_bytes: bytes,
+                constructor_bytes: 0,
+                patch_size,
+                reference_task: directory == &reference,
+                window,
+                evicted_bytes: if sizing.is_some() {
+                    0
                 } else {
-                    bytes
-                };
-                dit_bytes = dit_bytes.max(bytes);
-            }
+                    allocation.adaln_bytes
+                },
+                table_bytes_per_timestep: if sizing.is_some() {
+                    0
+                } else {
+                    allocation.table_bytes_per_timestep
+                },
+                projections: allocation.projections,
+            });
+        }
+        let has_native = resolved;
+        let mut native_quant = has_native.then_some(NativeAllocationFacts {
+            conditioning_stream: None,
+            conditioning: None,
+            conditioning_resident_bytes: 0,
+            conditioning_load_bytes: 0,
+            audio_decode_load_bytes: 0,
+            video_decode_resident_bytes: 0,
+            video_decode_load_bytes: 0,
+            audio_decode_resident_bytes: 0,
+            default_evaluations: crate::model::DEFAULT_STEPS as usize,
+            backend,
+            tasks,
+        });
+        if let Some(facts) = &mut native_quant {
+            conditioning::complete(&root, spec.precision, facts)?;
         }
         // **The condition encoder honors its own staged override too** (sc-19120 / sc-20267). It did
         // NOT before, and the omission was `DIT_COMPONENT`'s own bug one component over: sc-19120
@@ -927,6 +1036,13 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(TEXT_ENCODER_COMPONENT),
         };
+        let mut conditioning_bytes = safetensors_path_bytes(&text_encoder);
+        if let Some(native) = &mut native_quant {
+            native.conditioning_stream = conditioning::text_encoder_stream(&text_encoder)?;
+            if let Some(stream) = &native.conditioning_stream {
+                conditioning_bytes = stream.peak_bytes(None);
+            }
+        }
         // Fails closed rather than guessing: an additive stack whose file cannot be sized would
         // otherwise be charged 0, and a zero overlay on a render that holds 300 MB of factors is an
         // under-declaration in the OOM direction. The shared helper is the same one ltx uses.
@@ -942,19 +1058,36 @@ impl ComponentBytes {
         Ok(Self {
             // The Qwen3 condition encoder is built at `Dtype::Bfloat16` on every path
             // (`text_encoder/encoder.rs`), so it does not follow `spec.precision`.
-            text_encoder: safetensors_path_bytes(text_encoder),
+            text_encoder: conditioning_bytes,
             dit: dit_bytes,
             adaln: if pruning.is_some() {
                 pruned_resident
             } else {
-                resolved_adaln_bytes(&dit, dit_bytes)
+                if has_native {
+                    max_adaln
+                } else {
+                    resolved_adaln_bytes(&dit, dit_bytes)
+                }
             },
             pruning,
-            video_vae: materialized_component_bytes(&root.join("vae"), spec.precision),
+            video_vae: native_quant
+                .as_ref()
+                .filter(|n| n.conditioning.is_some())
+                .map_or_else(
+                    || materialized_component_bytes(&root.join("vae"), spec.precision),
+                    |n| n.video_decode_resident_bytes,
+                ),
             // The audio VAE is a BigVGAN stack built at `Dtype::Float32` unconditionally, on both
             // the encode and the decode side (`model.rs`) — never at `self.dtype`.
-            audio_vae: materialized_f32_bytes(&root.join("audio_vae")),
+            audio_vae: native_quant
+                .as_ref()
+                .filter(|n| n.conditioning.is_some())
+                .map_or_else(
+                    || materialized_f32_bytes(&root.join("audio_vae")),
+                    |n| n.audio_decode_resident_bytes,
+                ),
             overlay,
+            native_quant,
         })
     }
 
@@ -969,6 +1102,7 @@ impl ComponentBytes {
             video_vae: 0,
             audio_vae: 0,
             overlay: 0,
+            native_quant: None,
         }
     }
 
@@ -1407,7 +1541,13 @@ fn build_contract(
     calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
-        phase_facts: None,
+        phase_facts: components.native_quant.as_ref().map(|native| {
+            let mut facts = mlx_gen::gen_core::MemoryPhaseFacts::staged(
+                mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
+            );
+            facts.native_quant = Some(native.clone());
+            facts
+        }),
         architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
@@ -1511,10 +1651,40 @@ fn build_contract(
                 variables
             },
             resident_components: {
-                let mut resident = vec![adaln_component(
-                    components.adaln,
-                    components.pruning.is_some(),
-                )];
+                let mut resident = Vec::new();
+                if components.adaln > 0 {
+                    let mut component =
+                        adaln_component(components.adaln, components.pruning.is_some());
+                    if components.pruning.is_none() {
+                        if let Some(native) = &components.native_quant {
+                            if let MemoryComponentResidency::PrecomputedThenEvicted {
+                                retained_bytes,
+                                ..
+                            } = &mut component.residency
+                            {
+                                let rows = SourcePruneSizing::conditioned_timestep_bound(
+                                    crate::model::MAX_STEPS as usize,
+                                )
+                                .expect("nonempty native schedule");
+                                *retained_bytes = native
+                                    .tasks
+                                    .iter()
+                                    .map(|t| t.table_bytes_per_timestep.saturating_mul(rows as u64))
+                                    .max()
+                                    .unwrap_or(0);
+                            }
+                        }
+                    }
+                    // A supplied small projection stack can retain more cache than it frees.
+                    // Native phases still charge that cache; no generic net eviction is claimed.
+                    let no_saving = components.native_quant.is_some()
+                        && matches!(component.residency,
+                        MemoryComponentResidency::PrecomputedThenEvicted { retained_bytes, .. }
+                        if retained_bytes >= component.resident_bytes);
+                    if !no_saving {
+                        resident.push(component);
+                    }
+                }
                 // The LoRA stack as a typed auxiliary component. `MemoryComponentKind::AdapterStack`
                 // is the ltx spelling for the same forward-time-residual install, and
                 // `WholeRender` is literal here: `crate::model::load_task_dit` installs the factors
@@ -2393,6 +2563,126 @@ mod tests {
 
     /// DiT shards have valid headers at unchanged exact file sizes for header-aware admission.
     /// Other component fixtures retain their existing opaque, stat-only byte semantics.
+    #[test]
+    fn native_vae_facts_follow_selected_config_readsets_and_actual_compute_dtypes() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::write_native_component(&root.path().join("transformer"), 2);
+        gen_core_testkit::h3_memory::write_vae_configs(root.path());
+        gen_core_testkit::h3_memory::write_float_operands(
+            &root.path().join("vae"),
+            [
+                "encoder.conv_in.weight",
+                "decoder.patch_embed.weight",
+                "post_quant_conv.weight",
+            ]
+            .map(str::to_owned),
+            "F16",
+        );
+        let a = crate::audio_config::MiniMaxH3AudioVaeConfig::default();
+        let mut names = crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::tensor_names(&a);
+        names.extend(crate::audio_vae::MiniMaxH3AudioVae::tensor_names(&a));
+        gen_core_testkit::h3_memory::write_float_operands(
+            &root.path().join("audio_vae"),
+            names,
+            "BF16",
+        );
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+        spec.precision = mlx_gen::Precision::Fp32;
+        let contract = contract_for(&spec).unwrap();
+        let native = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        let vae = native.conditioning.as_ref().unwrap();
+        assert_eq!(
+            vae.decoder_layers, 3,
+            "source config, not stock preset depth"
+        );
+        assert_eq!(vae.video_element_bytes, 4);
+        assert_eq!(
+            vae.audio_decode_element_bytes, 4,
+            "MLX audio decoder and encoder both remain F32"
+        );
+        assert!(vae.unified_memory);
+        assert!(native.conditioning_resident_bytes > native.video_decode_resident_bytes);
+        assert!(
+            native.audio_decode_load_bytes > native.audio_decode_resident_bytes,
+            "weightnorm source/derived constructor overlap is not permanent residency"
+        );
+        assert_eq!(
+            contract.asset_facts.decoder_bytes,
+            native.video_decode_resident_bytes + native.audio_decode_resident_bytes
+        );
+        let req = mlx_gen::gen_core::GenerationRequest {
+            width: 1344,
+            height: 768,
+            frames: Some(124),
+            ..Default::default()
+        };
+        let workspace =
+            mlx_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
+        assert!(workspace.decode_bytes > 0);
+        assert!(
+            vae.video_forward_extra_bytes > 0,
+            "lazy source F16 to compute F32 cast overlaps first decode"
+        );
+        assert!(
+            vae.audio_decode_forward_extra_bytes > 0,
+            "lazy weightnorm parameters overlap decode"
+        );
+        let mut without_cast = vae.clone();
+        without_cast.video_forward_extra_bytes = 0;
+        let no_cast =
+            mlx_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), &without_cast)
+                .unwrap();
+        assert_eq!(
+            workspace.video_decode_bytes - no_cast.video_decode_bytes,
+            vae.video_forward_extra_bytes,
+            "real provider-mapped forward phase, not a separate constructor MAX"
+        );
+    }
+
+    #[test]
+    fn packed_admission_bound_covers_native_stereo_target_and_long_reference_audio() {
+        let geometry = crate::denoise::JointGeometry::new(
+            345,
+            768 / crate::config::VAE_RATIO,
+            1344 / crate::config::VAE_RATIO,
+        )
+        .unwrap();
+        let actual = crate::cost::packed_seq_len(
+            &geometry,
+            crate::pipeline::PATCH_SIZE,
+            1,
+            0,
+            crate::audio_config::AUDIO_OUTPUT_CHANNELS as i32,
+        )
+        .unwrap() as u64;
+        gen_core_testkit::h3_memory::assert_stereo_packing_bound(actual);
+    }
+
+    #[test]
+    fn dense_source_keeps_actual_dtype_accounting_without_integer_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::assert_dense_contract(root.path(), contract_for, true);
+    }
+
+    #[test]
+    fn native_formats_price_actual_payloads_shared_buffers_and_staged_task() {
+        let root = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let staged = tier.path().join("transformer");
+        gen_core_testkit::h3_memory::assert_native_contract(
+            root.path(),
+            &staged,
+            contract_for,
+            true,
+        );
+    }
+
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
@@ -4469,7 +4759,7 @@ mod tests {
             "rope_freq_dim":16,"rope_theta":10000.0,"norm_eps":1e-5,"qk_norm_eps":1e-5,"final_norm_eps":1e-5
         });
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-        bytes
+        offset
     }
 
     // Independent dtype/shape arithmetic. Two generated streams contribute at most N values each;
@@ -4481,6 +4771,46 @@ mod tests {
         let compute = table + output_width * 8 * 4 + output_width * 4;
         let retained = (2 * crate::model::MAX_STEPS as u64 + 2) * (output_width + 8) * 4;
         (source, compute, retained)
+    }
+
+    #[test]
+    fn source_pruned_native_mixed_checkpoint_never_earns_dense_eviction_credit() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::model::BASE_DIT_PARTITION);
+        let stored = write_pruning_memory_headers(&dir, pruning_memory_headers());
+        let other = tempfile::tempdir().unwrap();
+        let (native_bytes, groups) =
+            gen_core_testkit::h3_memory::write_native_component(other.path(), 2);
+        std::fs::copy(
+            other.path().join("model.safetensors"),
+            dir.join("native.safetensors"),
+        )
+        .unwrap();
+        let (source, compute, retained) = expected_pruning_memory();
+        let shared = groups.iter().map(|g| g * g * 4).sum::<u64>();
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        assert_eq!(
+            contract.asset_facts.transformer_bytes,
+            stored - source + compute + retained + native_bytes + shared
+        );
+        assert_eq!(contract.evicted_component_bytes(), 0);
+        let native = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        assert!(native.tasks.iter().all(|t| t.evicted_bytes == 0));
+        let rows = mlx_gen::gen_core::h3_memory::NativeRows {
+            packed: 17,
+            conditioning: 9,
+            schedule: 5,
+            visual_elements: 0,
+            global: 0,
+        };
+        assert!(native.denoise_peak_bytes(rows) > contract.asset_facts.transformer_bytes);
     }
 
     #[test]
@@ -4649,6 +4979,8 @@ mod tests {
                 headers[format!("{prefix}.weight")] = serde_json::json!({"dtype":"U32","shape":[18*256,64/(32/bits)],"data_offsets":[0,0]});
                 headers[format!("{prefix}.scales")] =
                     serde_json::json!({"dtype":"BF16","shape":[18*256,1],"data_offsets":[0,0]});
+                headers[format!("{prefix}.biases")] =
+                    serde_json::json!({"dtype":"BF16","shape":[18*256,1],"data_offsets":[0,0]});
             }
             headers["norm_out.linear.weight"]["shape"] = serde_json::json!([2 * 256, 64]);
             for leaf in ["linear_1", "linear_2"] {
@@ -4674,20 +5006,28 @@ mod tests {
             };
             let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_quant(quant);
             let contract = contract_for(&spec).unwrap();
+            let out = 18 * 256u64;
+            let expected = 2 * (out * 64 * bits as u64 / 8 + out * 4 + out * 2);
             assert_eq!(contract.asset_facts.transformer_bytes, stored);
-            let marker = if bits == 4 {
-                ADALN_EVICTED_Q4_BYTES
+            let retained = 2 * out * 2 * (2 * crate::model::MAX_STEPS as u64 + 2);
+            if expected > retained {
+                assert_eq!(
+                    contract.resident_components()[0].resident_bytes,
+                    expected,
+                    "actual affine payload, not a ratio against the stock model population"
+                );
             } else {
-                ADALN_EVICTED_Q8_BYTES
-            };
-            let expected = marker.min(
-                (u128::from(ADALN_EVICTED_BYTES) * u128::from(stored) / u128::from(DIT_BF16_BYTES))
-                    as u64,
-            );
-            assert_eq!(contract.resident_components()[0].resident_bytes, expected);
+                assert!(
+                    contract
+                        .resident_components()
+                        .iter()
+                        .all(|c| c.id != ADALN_COMPONENT_ID),
+                    "a cache larger than its projection stack earns no claimed eviction credit"
+                );
+            }
             assert_eq!(
                 contract.evicted_component_bytes(),
-                expected - ADALN_MODULATION_TABLE_MAX_BYTES
+                expected.saturating_sub(retained)
             );
             assert!(
                 contract.conformance_errors().is_empty(),

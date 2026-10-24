@@ -438,7 +438,12 @@ impl W4A8Linear {
                     .grid(32, cols, m)
                     .thread_group(32, 1, 1)
                     .run()?;
-                tiles.push(tile.remove(0));
+                let tile = tile.remove(0);
+                // MetalKernel::run builds a lazy graph. Force this tile before the next decode
+                // so evaluated outputs, not every decoded weight scratch, are retained by `cat`.
+                // This bounds working storage without changing any activation/epilogue arithmetic.
+                eval([&tile])?;
+                tiles.push(tile);
                 out0 += cols;
             }
             // Each tile is already its own `[m, cols]` output; only the final join is a copy.
@@ -474,6 +479,6 @@ impl W4A8Linear {
     /// residency budget that ignores it under-counts what a forward actually allocates, so it is
     /// reported rather than left implicit.
     pub fn tile_scratch_bytes(&self) -> usize {
-        TILE_COLS * self.descriptor.in_features
+        TILE_COLS.min(self.descriptor.out_features) * self.descriptor.in_features
     }
 }

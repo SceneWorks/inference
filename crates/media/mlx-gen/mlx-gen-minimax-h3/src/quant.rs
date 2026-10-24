@@ -56,9 +56,9 @@ pub fn nbytes(lin: &AdaptableLinear) -> usize {
     if let Some((wq, scales, biases, bias, _, _)) = lin.quantized_params() {
         wq.nbytes() + scales.nbytes() + biases.nbytes() + bias.map_or(0, |b| b.nbytes())
     } else if let Some(q) = lin.w4a8_base() {
-        // Resident operands PLUS the one transient tile scratch a forward holds: this sizes a
-        // *peak*, and the packed→int8 weight tile is allocated inside every forward.
-        q.nbytes() + q.tile_scratch_bytes()
+        // This is residency (and eviction credit), not an execution peak. Per-operation
+        // decoded tiles belong to memory_strategy's stage-local working profile.
+        q.nbytes()
     } else if let Some(q) = lin.convrot_base() {
         q.nbytes()
     } else if let Some((weight, bias)) = lin.dense_weight() {
