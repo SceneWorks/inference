@@ -1,0 +1,75 @@
+{
+  "status": "PASS_CPU_FROZEN_DIFFUSERS_ENCODE",
+  "fixture_sha256": "e08be4bb50782160a8e43cd74f2376277bc7a46ae4eae1182230e5375a92bd0c",
+  "script_sha256": "d8da0bf418e32f31a01c2ceaef01ce693169bdd92760a108429aa2952513eb41",
+  "source_wheel_sha256": "18e53f9e539096320470f62c6360a6fd5727ff28cffda566265316e13fcdb612",
+  "encoder_helper_sha256": "43e5fd31a40500cb720b573b547e39e9b0a298837b2ac3bd21f7a7d8bd8c521f",
+  "official_config_sha256": "cc77f3f0ce0357039c71018dc19edaa4fcceb0c2f7488fdc2b9c0580d6baafa1",
+  "source_sha256": {
+    "models/autoencoders/autoencoder_kl_flux2.py": "b094f87db6f736f587b509a83e087275835fc930c3493ece9c3bc2fbdbacf73f",
+    "models/autoencoders/vae.py": "90f6db6ed05b3a6bd61ab1abefc0414ebacf730f89135e6c4b2155b52c001d72",
+    "models/unets/unet_2d_blocks.py": "8a361d193393e46d1933644f33d3729bece636154526d1532d70e7b7ede72502",
+    "models/resnet.py": "b601e45d78a640e66b05822d3d008e40a039b92bb126abd1a9bdef6124666d84",
+    "models/attention_processor.py": "4a382975333be2e8bbd1f970cfa81e9442bfcc15485e30749654e267e8e5a0fc"
+  },
+  "license_sha256": "f9e2070c247517b1ddf65f7b11b393484a18da91a958fd18a97bd0f241c3125c",
+  "device": "cpu",
+  "threads": 1,
+  "real_weights": false,
+  "native_execution": false,
+  "config": {
+    "act_fn": "silu",
+    "batch_norm_eps": 0.0001,
+    "batch_norm_momentum": 0.1,
+    "block_out_channels": [
+      32,
+      32,
+      32,
+      32
+    ],
+    "decoder_block_out_channels": [
+      32,
+      32,
+      32,
+      32
+    ],
+    "down_block_types": [
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D"
+    ],
+    "force_upcast": true,
+    "in_channels": 3,
+    "latent_channels": 32,
+    "layers_per_block": 2,
+    "mid_block_add_attention": true,
+    "norm_num_groups": 32,
+    "out_channels": 3,
+    "patch_size": [
+      2,
+      2
+    ],
+    "sample_size": 1024,
+    "up_block_types": [
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D"
+    ],
+    "use_post_quant_conv": true,
+    "use_quant_conv": true
+  },
+  "torch_version": "2.9.1",
+  "diffusers_version": "0.38.0",
+  "weight_tensors": 242,
+  "weight_elements": 546147,
+  "mutation_max_abs": {
+    "posterior_sample": 2.8314032554626465,
+    "patch_major_packing": 0.16215267777442932,
+    "missing_bn": 0.1249954029917717
+  },
+  "absolute_tolerance": 0.0001,
+  "seconds": 3.7050448340014555,
+  "bytes": 132703
+}

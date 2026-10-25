@@ -260,12 +260,14 @@ def evaluate_policy(
     event_name: str,
     head_repository: str,
     repository: str = "SceneWorks/inference",
+    dispatch_lanes: str = "all",
 ) -> bool:
     values = {
         "needs.changes.outputs.windows_cuda": str(lanes_include_cuda).lower(),
         "github.event_name": event_name,
         "github.event.pull_request.head.repo.full_name": head_repository,
         "github.repository": repository,
+        "inputs.lanes": dispatch_lanes,
     }
     rendered = expression
     for name in sorted(values, key=len, reverse=True):
@@ -4145,7 +4147,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4175,13 +4177,47 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if "macos" in json.dumps(job.get("runs-on", "")).lower()
         }
         self.assertIn("macos-nax", macos_jobs)
+        from scripts.tests.test_windows_gpu1_diagnostic import selected_jobs
         for name in macos_jobs:
             with self.subTest(job=name):
+                if name == "moss-edit-metal":
+                    self.assertIn("inputs.lanes == 'moss-edit-metal'", parsed["jobs"][name]["if"])
+                    for selected_override in (False, True):
+                        self.assertNotIn(name, selected_jobs(parsed, 'workflow_dispatch', 'windows-cuda', selected=selected_override))
+                    continue
                 self.assertIn(
                     "needs.changes.outputs.macos_metal == 'true'",
                     parsed["jobs"][name].get("if", ""),
                     f"{name} could be scheduled by a dispatch that did not select the macOS lane",
                 )
+
+    def test_manual_cuda_binds_gpu1_without_exclusive_occupancy_admission(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Bind physical GPU1 and isolate synthetic test caches"
+        )
+        run = step["run"]
+        for required in (
+            "nvidia-smi -i 1 --query-gpu=index,uuid,name,pci.bus_id",
+            "$identity.Count -ne 1",
+            "$fields[0] -ne '1'",
+            "$fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$'",
+            'CUDA_VISIBLE_DEVICES=$gpuUuid',
+            'CUDA_DEVICE_ORDER=PCI_BUS_ID',
+            'SCENEWORKS_GPU_ID=1',
+            '$env:RUNNER_TEMP',
+            '[guid]::NewGuid()',
+            'HF_HOME=$cacheRoot',
+            'HF_HUB_CACHE=$hubRoot',
+            'HUGGINGFACE_HUB_CACHE=$hubRoot',
+            'HF_HUB_OFFLINE=1',
+        ):
+            self.assertIn(required, run)
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        for prerequisite in ("--query-compute-apps", "lease", "admission", "occupied"):
+            self.assertNotIn(prerequisite, commands.lower())
 
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
@@ -4260,11 +4296,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             policy_steps[0],
             "event or path gating the policy would let an invalid topology omit its verdict",
         )
-        self.assertNotIn(
-            "if",
-            changes,
-            "the changes job is the always-run trust boundary for feature-epic topology",
+        self.assertEqual(
+            changes.get("if"),
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')",
+            "topology remains unconditional except explicitly isolated manual dispatches",
         )
+        for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+            for lane in ("all", "windows-cuda", ""):
+                self.assertTrue(evaluate_policy(
+                    changes["if"], lanes_include_cuda=False, event_name=event,
+                    head_repository="foreign/repo", dispatch_lanes=lane,
+                ))
         self.assertIn(
             "changes",
             workflow["jobs"]["gate"]["needs"],
@@ -4309,7 +4351,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `if: always()` is the load-bearing half. The default `success()` would skip the gate
         # precisely when an upstream lane failed, and a skipped job satisfies a required status
         # check -- so the gate would report green on exactly the runs it exists to block.
-        self.assertEqual(gate["if"], "always()")
+        self.assertEqual(
+            gate["if"],
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())",
+        )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))
         self.assertEqual(

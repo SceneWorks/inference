@@ -1,0 +1,10 @@
+{
+  "status": "PASS_INDEPENDENT_CPU_FIXTURE_VALIDATION",
+  "fixture_sha256": "c2af600c1c966ced4f8485081fc469d4b206a91205db49a7f5400e66204c5985",
+  "generator_sha256": "e681a34b8c195713b67818659b0465150225e736d7e6c0ba2a4201754827e165",
+  "original_fixture_preserved": true,
+  "v1_outputs_weights_inputs_unchanged": true,
+  "cached_uncached_exact": true,
+  "source_math_unchanged": true,
+  "bias_diagnostic_sha256": "90cccac40dbb9a8569d448291ca0c7e8662d6c43d1f2416d9a02b3d720684ea4"
+}

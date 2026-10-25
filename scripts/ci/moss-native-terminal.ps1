@@ -202,15 +202,35 @@ function Stop-Owned([hashtable]$owned,[scriptblock]$live,[scriptblock]$terminate
         if (& $live $entry) { & $terminate $entry }
     }
 }
+function Owned-ExitCode($process) {
+    $code=$process.get_ExitCode()
+    Require (Integer $code) 'Owned child exit status unavailable'
+    $code
+}
 function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seconds, [scriptblock]$check, [scriptblock]$drain=$null) {
     # All arguments are fixed tool/test arguments, never raw control strings.
     $out = Join-Path $script:evidence ($name + '.stdout.log')
     $err = Join-Path $script:evidence ($name + '.stderr.log')
-    $p = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+    $start=[Diagnostics.ProcessStartInfo]::new()
+    $start.FileName=$exe
+    # Match Start-Process's existing join contract; callers already quote fixed paths.
+    $start.Arguments=[string]::Join(' ',$arguments)
+    $start.WorkingDirectory=$ExecutionContext.SessionState.Path.CurrentFileSystemLocation.Path
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true
+    $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    $p=[Diagnostics.Process]::new(); $p.StartInfo=$start
+    $started=$false; $stdout=$null; $stderr=$null; $copies=@(); $failure=$null
     $owned = @{}
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $null=$p.Handle
+        $stdout=[IO.File]::Open($out,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+        $stderr=[IO.File]::Open($err,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+        $started=$p.Start()
+        Require $started 'Owned child did not start'
+        $handle=$p.get_Handle()
+        Require ($null -ne $handle -and $handle -ne [IntPtr]::Zero) 'Owned child handle unavailable'
+        $copies+= $p.StandardOutput.BaseStream.CopyToAsync($stdout,65536)
+        $copies+= $p.StandardError.BaseStream.CopyToAsync($stderr,65536)
         $root=Capture-Owned $p
         if ($null -ne $root) {
             $owned[[int]$p.Id]=$root
@@ -218,6 +238,7 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
                 ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $script:evidence ($name+'.ownership.json')) -Encoding UTF8
         }
         while (-not $p.HasExited) {
+            foreach ($copy in $copies) { if ($copy.IsFaulted) { $null=$copy.GetAwaiter().GetResult() } }
             Require ($null -ne $root) 'Live root has no authenticated ownership identity'
             $all = @(Get-CimInstance Win32_Process)
             Discover-Owned $all $owned {param($row,$parent) Retain-Child $row $parent}
@@ -227,9 +248,10 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
             Start-Sleep -Milliseconds 500
             $p.Refresh()
         }
-        $p.WaitForExit()
-        Require ($p.ExitCode -eq 0) "Owned child failed: $name exit=$($p.ExitCode)"
-    } finally {
+        Require ($p.WaitForExit(5000)) "Owned child exit wait timed out: $name"
+        $code=Owned-ExitCode $p
+        Require ($code -eq 0) "Owned child failed: $name exit=$code"
+    } catch { $failure=$_ } finally {
         try {
             Stop-Owned $owned {param($entry) Owned-Entry-Live $entry} {
                 param($entry)
@@ -238,23 +260,43 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
                     if (Owned-Entry-Live $entry) { throw }
                 }
             }
-        } finally {
-            # Also cover identity-capture failure: Start-Process gave us this exact object,
+        } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
+        try {
+            # Also cover identity-capture failure: Start gave us this exact object,
             # even when no CIM identity could be admitted. Never look it up again by PID.
-            try {
-                if (-not $p.HasExited) { try { $p.Kill() } catch { if (-not $p.HasExited) { throw } } }
-            } finally {
-                try {
-                    # Keep every authenticated handle through the NVML drain, including
-                    # failed/terminated children. Never reopen their PIDs after disposal.
-                    if ($null -ne $drain) { & $drain $owned }
-                } finally {
-                    foreach ($entry in @($owned.Values)) { if ($entry.process -ne $p) { $entry.process.Dispose() } }
-                    $p.Dispose()
+            if ($started -and -not $p.HasExited) { try { $p.Kill() } catch { if (-not $p.HasExited) { throw } } }
+            if ($started) {
+                $cleanup=[Diagnostics.Stopwatch]::StartNew()
+                $processes=@($p)+@($owned.Values | Where-Object { $_.process -ne $p } | ForEach-Object { $_.process })
+                foreach ($process in $processes) {
+                    $remaining=[Math]::Max(0,5000-[int]$cleanup.ElapsedMilliseconds)
+                    Require ($process.WaitForExit($remaining)) "Owned child cleanup timed out: $name"
                 }
             }
+        } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
+        try {
+            # Keep every authenticated handle through the existing device drain.
+            if ($started -and $null -ne $drain) { & $drain $owned }
+        } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
+        try {
+            # Descendants can inherit the pipes: terminate them before waiting for EOF.
+            if ($copies.Count -gt 0) {
+                Require ([Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$copies,5000)) "Owned child output drain timed out: $name"
+                foreach ($copy in $copies) { $null=$copy.GetAwaiter().GetResult() }
+            }
+        } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
+        finally {
+            $resources=@($stdout,$stderr)+@($owned.Values | Where-Object { $_.process -ne $p } | ForEach-Object { $_.process })
+            if ($started) { $resources=@($p.StandardOutput,$p.StandardError)+$resources }
+            foreach ($resource in $resources) {
+                if ($null -ne $resource) {
+                    try { $resource.Dispose() } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
+                }
+            }
+            try { $p.Dispose() } catch { if ($null -eq $failure) { $failure=$_ } else { Write-Warning $_.Exception.Message } }
         }
     }
+    if ($null -ne $failure) { throw $failure }
 }
 function Check-Device([int[]]$allowed=@(),[bool]$quiescing=$false,[hashtable]$owned=@{}) {
     Require ([DateTimeOffset]::UtcNow -lt $script:deadline) 'Fresh lease expired'
@@ -608,6 +650,15 @@ if ($SelfTest) {
         Plain-Path $temp
         Require ((Hash (Join-Path $temp 'Cargo.lock')).Length -eq 64) 'Missing file hash'
         $script:evidence=$temp
+        $missingExit=[pscustomobject]@{}
+        $missingExit|Add-Member -MemberType ScriptMethod -Name get_ExitCode -Value {$null}
+        $rejected=$false
+        try { Owned-ExitCode $missingExit } catch { $rejected=$_.Exception.Message -ceq 'Owned child exit status unavailable' }
+        Require $rejected 'Missing owned exit status accepted'
+        $missingExit|Add-Member -MemberType ScriptMethod -Name get_ExitCode -Value {throw 'fixture exit getter failed'} -Force
+        $rejected=$false
+        try { Owned-ExitCode $missingExit } catch { $rejected=$_.Exception.Message -like '*fixture exit getter failed*' }
+        Require $rejected 'Throwing owned exit getter accepted'
         Owned-Run $env:ComSpec @('/d','/c','exit 0') 'fake-success' 10 {param($ids)}
         $script:fixtureFailureDrained=$false; $rejected=$false
         try { Owned-Run $env:ComSpec @('/d','/c','exit 7') 'fake-failure' 10 {param($ids)} {param($owned) $script:fixtureFailureDrained=$true} } catch {$rejected=$_.Exception.Message -ceq 'Owned child failed: fake-failure exit=7'}
@@ -674,6 +725,68 @@ try { $child.WaitForExit();exit $child.ExitCode } finally {$child.Dispose()}
         Require (-not (Same-Identity $legacy $observed.identity)) 'Legacy root identity unexpectedly passed the alias regression'
         Write-Output ('Owned alias identity: '+($observed|ConvertTo-Json -Compress -Depth 4))
         Remove-Variable fixtureRelease,fixtureChainObserved,fixtureDrainObserved -Scope Script
+        # Root exits after the exact intended child has an authenticated retained handle.
+        # Output EOF must be awaited only after that pipe-holding child has stopped.
+        [IO.File]::WriteAllText((Join-Path $temp 'pipe-child-fixture.ps1'),$grand.Replace('release-fixture','release-pipe-child'))
+        $pipeRoot=@'
+$child=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $PSScriptRoot 'pipe-child-fixture.ps1')+'"')) -NoNewWindow -PassThru
+$null=$child.Handle
+try {
+    $ready=Join-Path $PSScriptRoot 'pipe-child-ready.json'
+    [IO.File]::WriteAllText(($ready+'.tmp'),(@{pid=$child.Id;handle_created_utc=$child.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json))
+    [IO.File]::Move(($ready+'.tmp'),$ready)
+    $limit=[DateTime]::UtcNow.AddSeconds(60)
+    while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-pipe-root'))) {
+        if ([DateTime]::UtcNow -gt $limit) { exit 91 }
+        Start-Sleep -Milliseconds 25
+    }
+    exit 0
+} finally { $child.Dispose() }
+'@
+        [IO.File]::WriteAllText((Join-Path $temp 'pipe-root-fixture.ps1'),$pipeRoot)
+        $script:fixturePipeObserved=$false; $script:fixturePipeDrained=$false
+        $script:fixturePipeReady=Join-Path $temp 'pipe-child-ready.json'
+        $script:fixturePipeRelease=Join-Path $temp 'release-pipe-root'
+        $script:fixturePipeChildRelease=Join-Path $temp 'release-pipe-child'
+        $script:fixturePipeChild=$null; $script:fixturePipeClock=[Diagnostics.Stopwatch]::StartNew()
+        try {
+            Owned-Run 'powershell' @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'pipe-root-fixture.ps1')+'"')) 'root-exits-before-pipe-child' 10 {
+                param($ids,$owned)
+                if (-not $script:fixturePipeObserved -and (Test-Path -LiteralPath $script:fixturePipeReady)) {
+                    $ready=Get-Content -Raw -LiteralPath $script:fixturePipeReady|ConvertFrom-Json
+                    Require (Integer $ready.pid) 'Pipe fixture child PID unavailable'
+                    $id=[int]$ready.pid
+                    if ($owned.ContainsKey($id) -and (Owned-Entry-Live $owned[$id])) {
+                        $entry=$owned[$id]
+                        Require ($entry.identity.name -ieq 'powershell.exe' -and $entry.handle_created_utc -ceq $ready.handle_created_utc) 'Pipe fixture retained the wrong child'
+                        $script:fixturePipeChild=$entry.identity.PSObject.Copy()
+                        $script:fixturePipeObserved=$true
+                        Write-Output ('Pipe fixture retained: '+(@{elapsed_ms=$script:fixturePipeClock.ElapsedMilliseconds;child=$script:fixturePipeChild}|ConvertTo-Json -Compress -Depth 4))
+                        [IO.File]::WriteAllText($script:fixturePipeRelease,'release')
+                    }
+                }
+            } {
+                param($owned)
+                try {
+                    Require ($null -ne $script:fixturePipeChild -and $owned.ContainsKey($script:fixturePipeChild.pid)) 'Pipe child was not retained'
+                    $entry=$owned[$script:fixturePipeChild.pid]
+                    Require (Same-Identity $entry.identity $script:fixturePipeChild) 'Pipe fixture retained child changed'
+                    Require ($entry.process.HasExited) 'Pipe child survived owned cleanup'
+                    foreach ($member in $owned.Values) { Require ($member.process.HasExited) 'Pipe fixture descendant survived owned cleanup' }
+                    $script:fixturePipeDrained=$true
+                    Write-Output ('Pipe fixture retained child exited: '+$script:fixturePipeClock.ElapsedMilliseconds)
+                } finally {
+                    # Release only this fixture's waiter even when an assertion failed.
+                    [IO.File]::WriteAllText($script:fixturePipeChildRelease,'release')
+                    Write-Output ('Pipe fixture cleanup release: '+$script:fixturePipeClock.ElapsedMilliseconds)
+                }
+            }
+            Require ($script:fixturePipeObserved -and $script:fixturePipeDrained) 'Root-exit pipe cleanup never ran'
+        } finally {
+            [IO.File]::WriteAllText($script:fixturePipeChildRelease,'release')
+            Write-Output ('Pipe fixture returned/finally: '+$script:fixturePipeClock.ElapsedMilliseconds)
+            Remove-Variable fixturePipeReady,fixturePipeRelease,fixturePipeChildRelease,fixturePipeChild,fixturePipeClock,fixturePipeObserved,fixturePipeDrained -Scope Script
+        }
         # Exercise the installed Cargo/rustup launcher without Rust compilation,
         # dependencies, network, or GPU work. Cargo waits for this temporary external
         # subcommand until the supervisor has authenticated the live process chain.
@@ -684,6 +797,15 @@ using System.IO;
 using System.Threading;
 public static class MossIdentityFixture {
     public static int Main(string[] args) {
+        if (args[0] == "--io-fixture") {
+            byte[] block = new byte[65536];
+            for (int i = 0; i < block.Length; i++) block[i] = (byte)'O';
+            var stdout = Console.OpenStandardOutput();
+            stdout.Write(block, 0, block.Length); stdout.Write(block, 0, block.Length);
+            for (int i = 0; i < block.Length; i++) block[i] = (byte)'E';
+            var stderr = Console.OpenStandardError();
+            stderr.Write(block, 0, block.Length); stderr.Write(block, 0, block.Length);
+        }
         var deadline = DateTime.UtcNow.AddSeconds(60);
         while (!File.Exists(args[args.Length - 1])) {
             if (DateTime.UtcNow > deadline) return 91;
@@ -693,6 +815,17 @@ public static class MossIdentityFixture {
     }
 }
 '@
+        $spaceHelper=Join-Path $temp 'native fixture (x86).exe'
+        Copy-Item -LiteralPath $helper -Destination $spaceHelper
+        $script:fixtureIoRelease=Join-Path $temp 'release io fixture (x86)'
+        try {
+            Owned-Run $spaceHelper @('--io-fixture',('"'+$script:fixtureIoRelease+'"')) 'streamed-io' 10 {
+                param($ids)
+                [IO.File]::WriteAllText($script:fixtureIoRelease,'release')
+            }
+            Require ([IO.File]::ReadAllText((Join-Path $temp 'streamed-io.stdout.log')) -ceq ('O'*131072)) 'Owned stdout lost or changed bytes'
+            Require ([IO.File]::ReadAllText((Join-Path $temp 'streamed-io.stderr.log')) -ceq ('E'*131072)) 'Owned stderr lost or changed bytes'
+        } finally { Remove-Variable fixtureIoRelease -Scope Script }
         $previousPath=$env:PATH
         $script:fixtureRelease=Join-Path $temp 'release-cargo-fixture'; $script:fixtureCargoObserved=$false
         try {

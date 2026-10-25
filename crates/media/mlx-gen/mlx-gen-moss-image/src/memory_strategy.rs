@@ -15,6 +15,40 @@ pub fn selected_asset_facts(
     selected_facts(&sources, mode)
 }
 
+/// Cold typed edit admission before loading a generator or constructing MLX tensors.
+/// Validates request semantics and pinned component metadata, then includes ordinary
+/// assets, reference encoding, edit adapter, K/V and request-specific scratch.
+/// Host-side authentication may read source files; this is a structural estimate,
+/// not a measured peak or a credit for previously retained allocations.
+pub fn edit_request_peak(
+    variant: MossImageVariant,
+    spec: &LoadSpec,
+    request: &GenerationRequest,
+    inputs: moss_image_edit::MossImageEditInputs<'_>,
+) -> Result<u64> {
+    crate::model::MossImage::validate_load_spec(spec).map_err(Error::from)?;
+    inputs.validate()?;
+    let request = moss_image_edit::edit_request(request)?;
+    let (resolved, count) =
+        crate::model::MossImage::validate_request_inputs(variant, spec, &request, inputs.advanced)
+            .map_err(Error::from)?;
+    let edit = crate::edit::extra_peak(inputs, &request).map_err(Error::from)?;
+    crate::edit::EditAssets::prepare(spec).map_err(Error::from)?;
+    let assets = selected_asset_facts(variant, spec, resolved.acceleration)?;
+    let workspace = request_workspace_bytes(
+        request.width,
+        request.height,
+        count,
+        resolved.max_sequence_length,
+        1 + u32::from(resolved.guidance != 1.0),
+    )?;
+    workspace
+        .checked_add(assets.base_bytes)
+        .and_then(|n| n.checked_add(assets.overlay_bytes))
+        .and_then(|n| n.checked_add(edit))
+        .ok_or_else(|| Error::Unsupported("MOSS edit peak overflow".into()))
+}
+
 pub(crate) fn facts(s: &Sources) -> Result<MemoryAssetFacts> {
     selected_facts(s, moss_image::MossImageAcceleration::Off)
 }
@@ -207,9 +241,16 @@ pub(crate) fn safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    if context.geometry.reference_count != 0 || context.use_pid || context.has_phases {
+    if (context.geometry.reference_count != 0
+        && !((1..=4).contains(&context.geometry.reference_count)
+            && spec
+                .components
+                .contains_key(mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT)))
+        || context.use_pid
+        || context.has_phases
+    {
         return MemorySafetyDecision::Reject {
-            reason: "MOSS supports text-to-image only".into(),
+            reason: "MOSS supports text generation or one to four typed edit reference slots with its exact edit component; PID/phases are unsupported".into(),
         };
     }
     default_registered_memory_strategy_safety_check(spec, contract, context)
@@ -227,6 +268,140 @@ pub(crate) fn surface_specs() -> Vec<MemoryContractSurfaceSpec> {
 
 #[cfg(test)]
 mod cpu_tests {
+    #[test]
+    fn ordered_edit_provider_guard_accepts_one_to_four_only_with_component() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("unused-memory-guard".into()));
+        let contract = contract_with_facts(MossImageVariant::Sft, MemoryAssetFacts::default());
+        let mut context = MemoryRunContext {
+            selection: MemorySelection {
+                strategy: MemoryStrategy::Resident,
+                parameters: Default::default(),
+                tier: MemoryNumericTier {
+                    precision: spec.precision,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+            },
+            optimization_authority: MemoryOptimizationAuthority::Resident,
+            calibration_abi: 0,
+            calibration_fingerprint: String::new(),
+            load_shape: spec.load_shape,
+            mode: MemoryMode::Edit,
+            has_reference: true,
+            use_pid: false,
+            has_phases: false,
+            geometry: MemoryGeometry {
+                width: 512,
+                height: 512,
+                batch: 1,
+                frames: 1,
+                reference_count: 1,
+            },
+            reference_resources: None,
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: 10_000_000_000,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: 1_000_000_000,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "ordered-slots-structural-test".into(),
+        };
+        assert!(matches!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        spec.components.insert(
+            moss_image_edit::EDIT_COMPONENT.into(),
+            WeightsSource::Dir("exact-edit-component".into()),
+        );
+        for count in 1..=4 {
+            context.geometry.reference_count = count;
+            assert_eq!(
+                safety(&spec, &contract, &context),
+                MemorySafetyDecision::Accept
+            );
+        }
+        let references: Vec<_> = [(32, 32), (16, 48), (48, 16), (16, 48)]
+            .into_iter()
+            .map(|(width, height)| Image {
+                width,
+                height,
+                pixels: vec![0; (width * height * 3) as usize],
+            })
+            .collect();
+        let request = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+        let mut previous = 0;
+        for count in 1..=4 {
+            let inputs = mlx_gen::gen_core::moss_image_edit::MossImageEditInputs {
+                references: &references[..count],
+                ..Default::default()
+            };
+            let bytes = crate::edit::extra_peak(inputs, &request).unwrap();
+            assert!(
+                bytes > previous,
+                "every ordered slot adds residency and attention"
+            );
+            previous = bytes;
+        }
+        // Real provider safety budget rejection, before any provider/device callback.
+        context.predicted_peak_bytes = previous;
+        context.budget.total_bytes = previous - 1;
+        assert!(matches!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        context.budget.total_bytes = previous;
+        assert_eq!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        let overflowing = GenerationRequest {
+            width: u32::MAX,
+            height: u32::MAX,
+            ..Default::default()
+        };
+        assert!(crate::edit::extra_peak(
+            mlx_gen::gen_core::moss_image_edit::MossImageEditInputs {
+                references: &references,
+                ..Default::default()
+            },
+            &overflowing
+        )
+        .is_err());
+        context.geometry.reference_count = 5;
+        assert!(matches!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        context.geometry.reference_count = 4;
+        context.use_pid = true;
+        assert!(matches!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        context.use_pid = false;
+        context.has_phases = true;
+        assert!(matches!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        context.has_phases = false;
+        context.geometry.reference_count = 0;
+        context.has_reference = false;
+        context.mode = MemoryMode::TextToImage;
+        spec.components.clear();
+        assert_eq!(
+            safety(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+    }
     #[test]
     fn weights_free_surfaces_retain_frozen_geometry_without_claiming_assets_sc26323() {
         let preset = moss_image::MossImageConfig::default();

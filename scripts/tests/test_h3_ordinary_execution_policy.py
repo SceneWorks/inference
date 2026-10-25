@@ -208,7 +208,7 @@ LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
 
 LIB_ROUTES = [
     ("synthetic-w4a8-mlx", "mlx", "veda_fixture"),
-    ("windows-cuda", "candle", "dit::model::tests"),
+    ("synthetic-w4a8-cuda", "candle", "dit::model::tests"),
 ]
 
 # Deliberately ordinary: source-traced to metadata (`MiniMaxH3Dit::names`,
@@ -269,14 +269,14 @@ ROUTES = [
     ("synthetic-w4a8-mlx", "mlx", "dit_parity"),
     ("synthetic-w4a8-mlx", "mlx", "pruned_adaln"),
     ("synthetic-w4a8-mlx", "mlx", "turbo_lora"),
-    ("windows-cuda", "candle", "convrot_int8"),
-    ("windows-cuda", "candle", "adaln_evict_memory"),
-    ("windows-cuda", "candle", "cross_backend"),
-    ("windows-cuda", "candle", "dit_io"),
-    ("windows-cuda", "candle", "dit_parity"),
-    ("windows-cuda", "candle", "pruned_adaln"),
-    ("windows-cuda", "candle", "adapter_topology"),
-    ("windows-cuda", "candle", "turbo_lora"),
+    ("synthetic-w4a8-cuda", "candle", "convrot_int8"),
+    ("synthetic-w4a8-cuda", "candle", "adaln_evict_memory"),
+    ("synthetic-w4a8-cuda", "candle", "cross_backend"),
+    ("synthetic-w4a8-cuda", "candle", "dit_io"),
+    ("synthetic-w4a8-cuda", "candle", "dit_parity"),
+    ("synthetic-w4a8-cuda", "candle", "pruned_adaln"),
+    ("synthetic-w4a8-cuda", "candle", "adapter_topology"),
+    ("synthetic-w4a8-cuda", "candle", "turbo_lora"),
     ("synthetic-w4a8-cuda", "candle", "w4a8_compare"),
 ]
 
@@ -537,6 +537,47 @@ def rust_test_body(path: Path, name: str) -> str:
 
 
 class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
+    def test_h3_gpu0_and_main_gpu1_keep_distinct_physical_identity(self) -> None:
+        blocks = jobs(CI.read_text(encoding="utf-8"))
+        main = blocks["windows-cuda"]
+        h3 = blocks["synthetic-w4a8-cuda"]
+        for body, index in ((main, "1"), (h3, "0")):
+            self.assertIn(f"nvidia-smi -i {index} --query-gpu=index,uuid,name,pci.bus_id", body)
+            self.assertIn(f"$fields[0] -ne '{index}'", body)
+            self.assertIn("$fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$'", body)
+            self.assertIn("CUDA_VISIBLE_DEVICES=$gpuUuid", body)
+            self.assertIn("CUDA_DEVICE_ORDER=PCI_BUS_ID", body)
+            self.assertIn(f"SCENEWORKS_GPU_ID={index}", body)
+            self.assertNotIn("--query-compute-apps", body)
+        self.assertNotIn("- name: Prove H3", main)
+        self.assertIn("- name: Prove H3 pruned AdaLN", h3)
+        self.assertIn("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11", h3)
+        self.assertIn("inputs.synthetic_w4a8 == 'cuda'", h3)
+        self.assertIn("github.event_name == 'workflow_dispatch'", h3)
+
+    def test_h3_and_moss_manual_queue_keys_both_preserve_each_run(self) -> None:
+        workflow = CI.read_text(encoding="utf-8")
+        expression = re.search(r"^  group: inference-ci-\$\{\{ (.+) \}\}$", workflow, re.M).group(1)
+        def key(event, synthetic, lane, run):
+            values = {"github.event_name": event, "github.event.inputs.synthetic_w4a8": synthetic,
+                      "inputs.lanes": lane, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
+            rendered = expression
+            for name in sorted(values, key=len, reverse=True):
+                rendered = rendered.replace(name, repr(values[name]))
+            rendered = rendered.replace("&&", " and ").replace("||", " or ")
+            self.assertNotRegex(rendered, r"[A-Za-z_]\w*(?:\.\w+)+")
+            return eval(rendered, {"__builtins__": {}}, {"format": lambda template, value: template.format(value)})
+        for mode, lane in (("cuda", "windows-cuda"), ("mlx", "all"), ("both", "all"),
+                           ("none", "moss-edit-metal"), ("none", "moss-edit-cuda")):
+            self.assertNotEqual(key("workflow_dispatch", mode, lane, 1), key("workflow_dispatch", mode, lane, 2))
+        self.assertEqual(key("pull_request", "none", "all", 1), "refs/pull/7/merge")
+        self.assertEqual(key("push", "none", "all", 1), "source-sha")
+        self.assertEqual(key("workflow_dispatch", "none", "all", 1), "source-sha")
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", workflow)
+        library = (ROOT / "crates/contracts/gen-core/src/lib.rs").read_text(encoding="utf-8")
+        for module in ("moss_image_edit", "pruned_adaln", "h3_adapter_memory", "h3_conditioning_memory", "h3_memory"):
+            self.assertEqual(library.count(f"pub mod {module};"), 1, "both main and H3 contract exports must survive integration")
+
     def test_manual_geometry_proof_requires_actual_devices_and_all_cases(self) -> None:
         name = "manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"
         candle = rust_test_body(CANDLE_TESTS / "pruned_adaln.rs", name)
