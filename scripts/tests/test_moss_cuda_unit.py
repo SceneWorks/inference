@@ -153,8 +153,13 @@ class SuperviseTests(unittest.TestCase):
             open({str(pid_file)!r}, 'w').write(str(g.pid))
             time.sleep(120)
         """
+        # This is a real process-start/cleanup integration test. FakeClock advances
+        # one second per 2ms sleep and can expire before either Python interpreter
+        # starts. Keep the real three-second deadline, not an accelerated startup race.
+        self.owner = unit.PosixOwner()
         with self.assertRaisesRegex(unit.UnitFailure, "deadline"):
-            self.run_child(body, deadline=3.0)
+            unit.supervise(child_script(body), self.owner, self.log,
+                           deadline=3.0, poll=0.01, grace=5.0)
         self.assertTrue(pid_file.exists(), "grandchild never started; the test proved nothing")
         self.assert_dead(int(pid_file.read_text(encoding="utf-8")))
         self.assertFalse(self.owner.alive())
