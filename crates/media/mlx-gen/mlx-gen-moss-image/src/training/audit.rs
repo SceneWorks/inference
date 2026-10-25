@@ -1,6 +1,9 @@
 //! Actual-tensor, bounded-chunk observations for explicit native acceptance only.
 use super::*;
-use gen_core_testkit::moss_training_probe::RunProbe;
+use gen_core_testkit::moss_training_probe::{
+    EvaluationContentHasher, EvaluationObservation, EvaluationTensorDescriptor, RunProbe,
+    EVALUATION_CONTENT_ENCODING,
+};
 use sha2::{Digest, Sha256};
 const CHUNK: usize = 4_194_304;
 pub(super) fn digest(arrays: impl IntoIterator<Item = Array>) -> Result<String> {
@@ -115,6 +118,60 @@ pub(super) fn prepare(
     })
 }
 impl Evaluation {
+    fn descriptor(tensor: &Array) -> Result<EvaluationTensorDescriptor> {
+        // MLX reports placeholder contiguous strides until evaluation; inspect only
+        // after materialization of the original array, never of the flattened copy.
+        eval([tensor])?;
+        let shape = tensor
+            .shape()
+            .iter()
+            .map(|&d| {
+                usize::try_from(d)
+                    .map_err(|_| Error::Msg("invalid prepared evaluation shape".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let strides = tensor.strides().to_vec();
+        let dtype = format!("{:?}", tensor.dtype());
+        let mut hash = EvaluationContentHasher::default();
+        let flat = tensor.reshape(&[-1])?;
+        let n = usize::try_from(flat.shape()[0])
+            .map_err(|_| Error::Msg("unrepresentable audit tensor".into()))?;
+        for start in (0..n).step_by(CHUNK) {
+            let part = mlx_gen::attention::slice_axis(
+                &flat,
+                0,
+                start as i32,
+                (start + CHUNK.min(n - start)) as i32,
+            )?;
+            hash.update(crate::pipeline::logical_f32_readback(&part)?);
+        }
+        Ok(EvaluationTensorDescriptor {
+            shape,
+            strides,
+            dtype,
+            content_encoding: EVALUATION_CONTENT_ENCODING.into(),
+            content_sha256: hash.finish(),
+        })
+    }
+    pub(super) fn observation(&self, loss: f32) -> Result<EvaluationObservation> {
+        let mut tensors = std::collections::BTreeMap::new();
+        for (name, tensor) in [
+            ("latent", &self.latent),
+            ("context", &self.context),
+            ("noise", &self.noise),
+        ] {
+            tensors.insert(name.into(), Self::descriptor(tensor)?);
+        }
+        if let Some(mask) = &self.mask {
+            tensors.insert("mask".into(), Self::descriptor(mask)?);
+        }
+        Ok(EvaluationObservation {
+            tensors,
+            sigma: self.sigma,
+            loss,
+        })
+    }
+
     pub(super) fn loss(
         &self,
         model: &mut Transformer,
