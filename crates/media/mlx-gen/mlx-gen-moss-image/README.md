@@ -86,7 +86,7 @@ same generator, publishing `warm-reentry.json` only on successful reentry.
 
 Catalog-loaded `Box<dyn Generator>` exposes `generate_moss_image_edit`,
 `moss_image_edit_request_peak` and `moss_image_edit_execution_report`. Provision the
-exact `chinoll/Moss-Image-Edit@e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11`
+exact `chinoll/Moss-Image-Edit@3be9c40037e1b89b17aa85ff6f8ee805872aa558`
 package through `LoadSpec.components[gen_core::moss_image_edit::EDIT_COMPONENT]` as
 a directory containing `adapter_config.json` and `adapter_model.safetensors`.
 Prepared sources need finalized pins for both files. Both complete file SHA256s,
