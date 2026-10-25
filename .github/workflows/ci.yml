@@ -805,12 +805,21 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests "${packages[@]}"
+      - name: Check H3 precise pruned projection on hosted Metal (manual)
+        if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-pruned-hosted-metal.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
+          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
+          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
       # H3 complete-model/model-stack tests are `#[ignore]`d on both backends: ordinary PR/main
       # CI compiles them but never executes a complete DiT, block stack, or native projection.
-      # Their only route is the explicit `workflow_dispatch` H3 synthetic lane
-      # (`synthetic-w4a8-mlx` for Metal, `synthetic-w4a8-cuda` for Candle), each guarded by
-      # a positive exact execution count so a filtered/renamed run cannot pass vacuously. Do not
-      # re-add a `-- --ignored` H3 step to this ordinary job.
+      # Device suites and the hosted precision margin above run only on explicit workflow_dispatch.
+      # Every such step has positive exact count/name guards; no ignored H3 model step may run
+      # on an ordinary PR/main event.
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1264,6 +1273,16 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
+      # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("An existing connection
+      # was forcibly closed by the remote host (os error 10054)" with zero rustc diagnostics). Clear
+      # the wrapper for THIS job only; sibling jobs keep sccache and the registry/git/target caches
+      # stay intact. Same step as windows-candle.yml's heavy Candle lane.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
       - name: Verify native MOSS transport guards without GPU execution
         shell: powershell
         run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest
@@ -1465,6 +1484,15 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
+      # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
+      # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
+      # the registry/git/target caches stay intact. Same step as windows-candle.yml's heavy lane.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
       - name: Record source revision
         shell: cmd
         run: |

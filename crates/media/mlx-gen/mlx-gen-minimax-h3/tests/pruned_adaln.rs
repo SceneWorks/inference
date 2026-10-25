@@ -81,6 +81,83 @@ fn array_from_json(shape: &[i64], dtype: &str, data: &[f64]) -> Array {
     }
 }
 
+/// Independent scalar F32 dot products over the frozen producer's stored/widened operands.
+/// This is primitive CPU arithmetic only: no Array, model, device, or native projection executes.
+fn scalar_projection_error(round_coordinates: impl Fn(f32) -> f32) -> f32 {
+    let json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    let cfg = oracle_cfg();
+    let mut peak = 0f32;
+    for case in json["cases"].as_array().unwrap() {
+        let coords = f32s(case["coordinates"].as_array().unwrap());
+        for projection in 0..=cfg.num_layers as usize {
+            let name = if projection < cfg.num_layers as usize {
+                format!("transformer_blocks.{projection}.adaln_proj.linear")
+            } else {
+                "norm_out.linear".into()
+            };
+            let weight = &json["tensors"][format!("{name}.weight")];
+            let bias = &json["tensors"][format!("{name}.bias")];
+            let out = weight["shape"][0].as_u64().unwrap() as usize;
+            let rank = weight["shape"][1].as_u64().unwrap() as usize;
+            let weights = f32s(weight["data"].as_array().unwrap());
+            let biases = f32s(bias["data"].as_array().unwrap());
+            let expected = if projection < cfg.num_layers as usize {
+                f32s(case["block_modulations"][projection].as_array().unwrap())
+            } else {
+                f32s(case["norm_modulation"].as_array().unwrap())
+            };
+            assert_eq!(weights.len(), out * rank);
+            assert_eq!(biases.len(), out);
+            assert!(!coords.is_empty() && coords.len().is_multiple_of(rank));
+            assert_eq!(expected.len(), coords.len() / rank * out);
+            for (step, coordinates) in coords.chunks_exact(rank).enumerate() {
+                for row in 0..out {
+                    let mut sum = 0f32;
+                    for col in 0..rank {
+                        sum = weights[row * rank + col]
+                            .mul_add(round_coordinates(coordinates[col]), sum);
+                    }
+                    let got = sum + biases[row];
+                    assert!(got.is_finite() && expected[step * out + row].is_finite());
+                    peak = peak.max((got - expected[step * out + row]).abs());
+                }
+            }
+        }
+    }
+    peak
+}
+
+#[test]
+fn pruned_f32_scalar_oracle_discriminates_tf32_coordinates() {
+    let strict = scalar_projection_error(|x| x);
+    // TF32 keeps 10 fraction bits: truncating 13 low F32 mantissa bits reproduces
+    // the NAX failure without running any tensor/model or changing the frozen oracle.
+    let truncated = scalar_projection_error(|x| f32::from_bits(x.to_bits() & !0x1fff));
+    println!("H3_PRUNED_SCALAR_PRECISION strict_max={strict:.12e} tf32_rtz_max={truncated:.12e}");
+    assert!(
+        strict < 2e-5,
+        "the independently computed F32 projection must match the pinned oracle"
+    );
+    assert!(
+        truncated > 2e-5,
+        "the frozen corpus must discriminate TF32 coordinate truncation"
+    );
+}
+
+#[test]
+fn reduced_projection_keeps_precise_vector_dispatch_on_every_metal_family() {
+    let source = include_str!("../src/dit/pruned_adaln.rs");
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(".matmul(&coords.expand_dims(-1)?)?.squeeze_axes(&[-1])?"),
+        "the source-wide F32 reduced projection must use the precise N=1 dispatch"
+    );
+    assert!(
+        !compact.contains("mlx_gen::nn::linear(coords,&self.weight,&self.bias)"),
+        "F32 addmm can silently truncate coordinates on NAX"
+    );
+}
+
 fn index_array(json: &serde_json::Value, key: &str) -> Array {
     let vals: Vec<i32> = json[key]
         .as_array()
@@ -127,6 +204,7 @@ fn assert_abs(got: &Array, want: &[f32], tol: f32, what: &str) {
         want.len()
     );
     let diff = finite_max_abs_diff(got, want);
+    println!("H3_PRUNED_ORACLE {what}: max_abs={diff:.9e} tolerance={tol:.9e}");
     assert!(
         diff < tol && diff.is_finite(),
         "{what}: abs max diff {diff:.3e} exceeds {tol:.1e}"
@@ -228,6 +306,13 @@ fn run_case(
 #[test]
 #[ignore = "native numeric target dispatched on the MLX CI lane"]
 fn native_pruned_adaln_matches_pinned_reference() {
+    let device = mlx_rs::Device::try_default().expect("pinned oracle proof requires Metal");
+    assert!(
+        matches!(device.get_type().unwrap(), mlx_rs::DeviceType::Gpu),
+        "a CPU fallback cannot prove Metal precision"
+    );
+    println!("H3_PRUNED_ORACLE_DEVICE {device}");
+
     let json: serde_json::Value = serde_json::from_str(FIXTURE).expect("the pruned oracle fixture");
     let cfg = oracle_cfg();
 

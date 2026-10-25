@@ -701,25 +701,39 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
     def test_ordinary_jobs_never_execute_h3_model_tests(self) -> None:
         blocks = jobs(CI.read_text(encoding="utf-8"))
         for job, text in blocks.items():
-            condition = "\n".join(
-                line for line in text.splitlines() if line.strip().startswith("if:")
-            )
-            if "workflow_dispatch" in condition:
-                continue
-            body = _strip_comment_lines(text)
-            for module in ("mlx-gen-minimax-h3", "candle-gen-minimax-h3"):
-                with self.subTest(job=job, crate=module):
-                    self.assertFalse(
-                        module in body and "--ignored" in body,
-                        f"ordinary job {job!r} must compile but never execute {module} "
-                        "ignored tests; only a workflow_dispatch-gated route may run them",
-                    )
-        self.assertNotIn(
-            "Prove H3",
-            blocks["macos-metal"],
-            "macos-metal is an ordinary PR/main job; H3 model proofs belong to the "
-            "manual synthetic lane",
-        )
+            # Negative diagnostic exclusions mention workflow_dispatch too; they are NOT a
+            # manual-only gate. Require its positive equality in the actual job/step if field.
+            job_conditions = "\n".join(line for line in text.splitlines()
+                if line.startswith("    if:") or line.startswith("      (github.event_name"))
+            manual_job = "github.event_name == 'workflow_dispatch'" in job_conditions
+            for step in steps(text):
+                body = _strip_comment_lines(step)
+                if "minimax-h3" not in body or "--ignored" not in body:
+                    continue
+                step_conditions = "\n".join(line for line in step.splitlines()
+                    if line.startswith("        if:"))
+                with self.subTest(job=job, step=step.splitlines()[0]):
+                    self.assertTrue(manual_job or "github.event_name == 'workflow_dispatch'" in step_conditions,
+                        "an H3 model step needs a positive workflow_dispatch gate; ordinary PR/main must never execute it")
+
+    def test_hosted_pruned_precision_step_is_explicit_and_positive(self) -> None:
+        block = jobs(CI.read_text(encoding="utf-8"))["macos-metal"]
+        matching = [step for step in steps(block)
+            if "- name: Check H3 precise pruned projection on hosted Metal (manual)" in step]
+        self.assertEqual(len(matching), 1)
+        step = matching[0]
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", step)
+        self.assertIn("inputs.synthetic_w4a8 == 'mlx'", step)
+        self.assertIn("inputs.synthetic_w4a8 == 'both'", step)
+        self.assertIn("set -euo pipefail", step)
+        self.assertIn("--ignored --exact --nocapture", step)
+        self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored", step)
+        self.assertIn("test pruned_adaln::native_pruned_adaln_matches_pinned_reference ...", step)
+        self.assertIn("H3_PRUNED_ORACLE_DEVICE", step)
+        self.assertIn("H3_PRUNED_ORACLE block 0 modulation: max_abs=", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertNotIn("|| true", step)
+        self.assertIn('MACOSX_DEPLOYMENT_TARGET: "15.0"', block)
 
     def test_manual_h3_routes_pin_exact_counts_and_names(self) -> None:
         blocks = jobs(CI.read_text(encoding="utf-8"))

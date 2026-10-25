@@ -108,6 +108,7 @@ fn assert_close(got: &[f32], want: &[f32], tol: f64, what: &str) {
         .zip(want)
         .map(|(g, w)| (g - w).abs() as f64)
         .fold(0.0f64, f64::max);
+    println!("H3_PRUNED_ORACLE {what}: max_abs={peak:.9e} tolerance={tol:.9e}");
     assert!(
         peak <= tol,
         "{what}: peak |Δ| {peak:.3e} exceeds the pinned {tol:.3e}"
@@ -1115,10 +1116,20 @@ fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision()
 #[ignore = "requires a CUDA device; absence is failure, not skip (integration lane, sc-26684)"]
 #[test]
 fn native_pruned_adaln_matches_pinned_reference() {
+    #[cfg(feature = "cuda")]
+    assert!(
+        !candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32(),
+        "the pinned curve oracle requires CUBLAS_COMPUTE_32F, never FAST_TF32"
+    );
     let device = Device::new_cuda(0).expect(
         "the integration lane must provide a CUDA device — an unavailable device is a failure, \
          not a skip",
     );
+    assert!(
+        device.is_cuda(),
+        "a CPU fallback cannot prove CUDA precision"
+    );
+    println!("H3_PRUNED_ORACLE_DEVICE {device:?}");
     let f = fixture();
     let cfg = config();
     let c = curve(&f, &device);
