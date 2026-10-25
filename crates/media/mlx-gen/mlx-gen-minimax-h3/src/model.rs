@@ -933,8 +933,13 @@ impl MiniMaxH3 {
         task: MiniMaxH3Task,
     ) -> Result<crate::dit::MiniMaxH3DitConfig> {
         let path = self.task_dit_dir(task).join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Msg(format!("{MODEL_ID}: {}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Msg(format!("{MODEL_ID}: no task config for selected partition `{}` at {}; reimport with its config or select a partition that provides one", task.partition(), path.display()))
+            } else {
+                Error::Msg(format!("{MODEL_ID}: cannot read task config for selected partition `{}` at {}: {e}; verify the source and permissions", task.partition(), path.display()))
+            }
+        })?;
         crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
     }
 
@@ -2142,6 +2147,29 @@ pub(crate) mod tests {
         assert_eq!(
             model
                 .task_dit_config(MiniMaxH3Task::Fl2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+        std::fs::remove_file(base.join("config.json")).unwrap();
+        let error = model
+            .task_dit_config(MiniMaxH3Task::T2va)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no task config")
+                && error.contains("transformer")
+                && error.contains("reimport")
+                && error.contains("select a partition"),
+            "{error}"
+        );
+        assert!(
+            error.contains(base.join("config.json").to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Ref2va)
                 .unwrap()
                 .patch_size,
             [1, 1, 1]

@@ -195,9 +195,9 @@ LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
         ],
         "skip": ["selected_kernel_actual_device_smoke"],
     },
-    ("candle", "dit::model::tests"): {
+    ("candle", "dit::model::veda_controls_tests"): {
         "file": CANDLE_SRC / "dit" / "model.rs",
-        "filter": "dit::model::tests::",
+        "filter": "dit::model::veda_controls_tests::",
         "names": [
             "native_controls_capture_every_mode_packed_tier_and_adapter_stack",
             "native_base_and_all_published_turbo_steps_reach_attention",
@@ -208,7 +208,7 @@ LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
 
 LIB_ROUTES = [
     ("synthetic-w4a8-mlx", "mlx", "veda_fixture"),
-    ("synthetic-w4a8-cuda", "candle", "dit::model::tests"),
+    ("synthetic-w4a8-cuda", "candle", "dit::model::veda_controls_tests"),
 ]
 
 # Deliberately ordinary: source-traced to metadata (`MiniMaxH3Dit::names`,
@@ -309,6 +309,24 @@ def jobs(workflow: str) -> dict[str, str]:
 def steps(job_text: str) -> list[str]:
     parts = re.split(r"\n(?=      - name: )", job_text)
     return [p for p in parts if p.lstrip().startswith("- name:")]
+
+
+def cargo_test_commands(step: str) -> list[str]:
+    """Read complete logical commands, including the Metal turbo step's continuations."""
+    commands = []
+    pending = ""
+    for raw in step.splitlines():
+        line = raw.strip()
+        if not pending and not line.startswith("cargo test "):
+            continue
+        continued = line.endswith("\\") or line.endswith("^")
+        pending += (" " if pending else "") + (line[:-1].rstrip() if continued else line)
+        if not continued:
+            commands.append(pending)
+            pending = ""
+    if pending:
+        raise AssertionError("unterminated Cargo command in H3 workflow")
+    return commands
 
 
 def rust_tests(path: Path) -> dict[str, bool]:
@@ -510,6 +528,23 @@ def h3_source_files() -> list[Path]:
     for root in (MLX_TESTS, CANDLE_TESTS, MLX_SRC, CANDLE_SRC):
         files.extend(sorted(root.rglob("*.rs")))
     return files
+
+
+def enclosing_rust_modules(path: Path, function: str) -> list[str]:
+    """Resolve inline module ancestors without confusing comments/strings with Rust braces."""
+    clean = _strip_rust(path.read_text(encoding="utf-8"))
+    definition = re.search(r"\bfn\s+" + re.escape(function) + r"\s*\(", clean)
+    if definition is None:
+        raise AssertionError(f"{path}::{function} vanished")
+    stack: list[str | None] = []
+    for token in re.finditer(r"\bmod\s+([A-Za-z0-9_]+)\s*\{|[{}]", clean[:definition.start()]):
+        if token.group(1):
+            stack.append(token.group(1))
+        elif token.group() == "{":
+            stack.append(None)
+        else:
+            stack.pop()
+    return [name for name in stack if name is not None]
 
 
 def rust_test_body(path: Path, name: str) -> str:
@@ -759,13 +794,12 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     self.assertIn('if not "%RC%"=="0" exit /b %RC%', body)
 
                 skips = SKIPS.get((backend, module), [])
-                parsed_skips = re.findall(r"--skip\s+([A-Za-z0-9_]+)", body)
-                self.assertEqual(
-                    sorted(skips),
-                    sorted(parsed_skips),
-                    f"{job}/{module} skip set drifted; real-weight ignores must never be "
-                    "conscripted into the synthetic route",
-                )
+                commands = cargo_test_commands(body)
+                self.assertEqual(len(commands), 2, "compiled-list preflight and execution are both required")
+                for command in commands:
+                    parsed_skips = re.findall(r"--skip\s+([A-Za-z0-9_]+)", command)
+                    self.assertEqual(sorted(skips), sorted(parsed_skips),
+                        f"{job}/{module}: metadata and execution must use the same real-weight exclusions")
 
                 path = test_root(backend) / f"{module}.rs"
                 ignored = [n for n, is_ignored in rust_tests(path).items() if is_ignored]
@@ -818,8 +852,11 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     self.assertIn('if not "%RC%"=="0" exit /b %RC%', body)
 
                 skips = list(spec["skip"])
-                parsed = re.findall(r"--skip\s+([A-Za-z0-9_]+)", body)
-                self.assertEqual(sorted(skips), sorted(parsed), f"{job}/{key} skip set drifted")
+                commands = cargo_test_commands(body)
+                self.assertEqual(len(commands), 2)
+                for command in commands:
+                    parsed = re.findall(r"--skip\s+([A-Za-z0-9_]+)", command)
+                    self.assertEqual(sorted(skips), sorted(parsed), f"{job}/{key} skip set drifted")
 
                 ignored = [n for n, v in rust_tests(spec["file"]).items() if v]
                 expected = len(ignored) - len(skips)
@@ -831,6 +868,60 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                 prefix = str(spec["filter"])
                 for name in spec["names"]:
                     self.assertIn(f"test {prefix}{name} ...", step)
+
+    def test_library_filters_follow_real_rust_module_nesting(self) -> None:
+        for job, backend, key in LIB_ROUTES:
+            spec = LIB_GATED[(backend, key)]
+            root = MLX_SRC if backend == "mlx" else CANDLE_SRC
+            outer = list(spec["file"].relative_to(root).with_suffix("").parts)
+            block = jobs(CI.read_text(encoding="utf-8"))[job]
+            for name in spec["names"]:
+                actual = "::".join(outer + enclosing_rust_modules(spec["file"], name) + [name])
+                self.assertEqual(spec["filter"] + name, actual,
+                    "workflow/policy prefixes must follow the actual Rust module, not an invented namespace")
+                self.assertTrue(rust_tests(spec["file"])[name])
+                self.assertIn(f'"{actual}: test"', block)
+                self.assertIn(f'"test {actual} ..."', block)
+
+    def test_compiled_metadata_preflights_bind_every_runtime_name_and_count(self) -> None:
+        seen = 0
+        for job, block in jobs(CI.read_text(encoding="utf-8")).items():
+            for step in steps(block):
+                commands = [line for line in cargo_test_commands(step)
+                    if "minimax-h3" in line and "--ignored" in line]
+                if not commands:
+                    continue
+                with self.subTest(job=job, step=step.splitlines()[0]):
+                    self.assertEqual(len(commands), 2)
+                    listed = [line for line in commands if "--list" in line]
+                    executed = [line for line in commands if "--list" not in line]
+                    self.assertEqual(len(listed), 1)
+                    self.assertEqual(len(executed), 1)
+                    self.assertIn("--list --color never", listed[0])
+                    def command_arguments(command):
+                        return command.split(" 2>&1", 1)[0].split(" >", 1)[0]
+                    expected = command_arguments(executed[0]).replace(" --nocapture", "").replace(" --test-threads=1", "")
+                    actual = command_arguments(listed[0]).replace(" --list --color never", "")
+                    self.assertEqual(actual, expected, "metadata must list the exact executed filter/flags")
+                    runtime_names = re.findall(r'"test ([A-Za-z0-9_:]+) \.\.\."', step)
+                    metadata_names = re.findall(r'"([A-Za-z0-9_:]+): test"', step)
+                    self.assertGreater(len(runtime_names), 0)
+                    self.assertCountEqual(runtime_names, metadata_names)
+                    count = re.search(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored", step)
+                    self.assertIsNotNone(count, "metadata preflight must never replace the execution count guard")
+                    self.assertEqual(int(count[1]), len(runtime_names))
+                    if "shell: cmd" in step:
+                        self.assertIn(f'if not "%LIST_COUNT%"=="{len(runtime_names)}" exit /b 1', step)
+                        for name in runtime_names:
+                            self.assertIn(f'findstr /L /X /C:"{name}: test"', step)
+                        self.assertIn('type "%LIST%"', step)
+                    else:
+                        self.assertIn(f' -eq {len(runtime_names)}', step)
+                        for name in runtime_names:
+                            self.assertIn(f'grep -Fxq "{name}: test"', step)
+                        self.assertIn('cat "$list_log"', step)
+                    seen += len(runtime_names)
+        self.assertGreater(seen, 0)
 
     def test_real_weights_routes_do_not_select_gated_synthetic_tests(self) -> None:
         body = _strip_comment_lines(REAL_WEIGHTS.read_text(encoding="utf-8"))
