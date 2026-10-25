@@ -293,7 +293,13 @@ fn attention(
     let v = v.reshape(&shape)?.transpose_axes(&[0, 2, 1, 3])?;
     let scale = 1.0 / (g.dim as f32 / g.heads as f32).sqrt();
     let value_dtype = v.dtype();
-    let out = if training {
+    // CPU BF16 fast SDPA and explicit FP32 SDPA do not round identically. Use
+    // the same differentiable computation for CPU deployment and training, then
+    // restore the value dtype at their shared O-projection boundary. The Metal
+    // inference fast path below is deliberately unchanged.
+    let cpu_bf16 =
+        value_dtype == Dtype::Bfloat16 && mlx_rs::Device::try_default()? == mlx_rs::Device::cpu();
+    let out = if training || cpu_bf16 {
         // Explicit differentiable SDPA: no evaluation of traced adapter activations.
         let q = q.as_dtype(Dtype::Float32)?;
         let k = k.as_dtype(Dtype::Float32)?;
