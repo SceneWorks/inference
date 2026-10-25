@@ -19,7 +19,7 @@ MAPPER = ROOT / 'scripts/ci/windows-gpu1-luid.cpp'
 LANE = 'windows-gpu-diagnostic'
 
 
-def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False):
+def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False, synthetic="none"):
     """Evaluate actual job expressions with upstream lanes adversarially selected.
 
     Always returns true even after dependency failure, so a missing diagnostic
@@ -32,6 +32,7 @@ def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False
         'github.run_attempt': 1,
         'github.ref': 'refs/tags/runtime-test' if tag else 'refs/heads/story/test',
         'inputs.lanes': lane,
+        'inputs.synthetic_w4a8': synthetic,
     }
     result = set()
     for name, job in workflow['jobs'].items():
@@ -50,9 +51,10 @@ def diagnostic_isolation_errors(workflow):
     for selected in (False, True):
         for fork in (False, True):
             for tag in (False, True):
-                actual = selected_jobs(workflow, 'workflow_dispatch', LANE, selected=selected, fork=fork, tag=tag)
-                if actual != {LANE}:
-                    errors.append(actual)
+                for synthetic in ('none', 'cuda', 'mlx', 'both'):
+                    actual = selected_jobs(workflow, 'workflow_dispatch', LANE, selected=selected, fork=fork, tag=tag, synthetic=synthetic)
+                    if actual != {LANE}:
+                        errors.append(actual)
     return errors
 
 
@@ -205,6 +207,16 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
                     tail = tail.replace(selector, f"inputs.lanes == '{LANE}'")
                 mutated['jobs'][name]['if'] = tail or 'True'
                 self.assertNotEqual(diagnostic_isolation_errors(mutated), [])
+
+    def test_h3_synthetic_selectors_never_run_broad_manual_lanes(self):
+        for synthetic, lane, expected in (
+            ('cuda', 'windows-cuda', {'synthetic-w4a8-cuda'}),
+            ('mlx', 'all', {'synthetic-w4a8-mlx'}),
+            ('both', 'all', {'synthetic-w4a8-cuda', 'synthetic-w4a8-mlx'}),
+        ):
+            selected = selected_jobs(self.workflow, 'workflow_dispatch', lane, synthetic=synthetic)
+            self.assertEqual(selected & {'synthetic-w4a8-cuda', 'synthetic-w4a8-mlx'}, expected)
+            self.assertFalse(selected & {'windows-cuda', 'macos-nax', 'moss-edit-cuda', 'moss-edit-metal', LANE})
 
     def test_diagnostic_never_runs_for_other_events_or_selectors(self):
         for event in ('push', 'pull_request', 'schedule', 'workflow_call', 'merge_group'):

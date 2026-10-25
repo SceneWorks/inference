@@ -86,9 +86,23 @@
 //! render on this lane in any case. The declaration and the variable are both conditional on a
 //! non-zero overlay, so a render with **no** adapter configured publishes byte-for-byte the contract
 //! this provider always has.
+//!
+//! # Source-pruned centered-curve AdaLN (sc-26684)
+//!
+//! Canonical source headers and the loader's config feed the shared `SourcePruneSizing` facts.
+//! The stored table/reduced projections/folded biases are replaced by their actual F32 compute
+//! bytes in the transformer total, and the full admitted schedule/shift domain bounds the
+//! additional F32 block/final outputs and coordinates. These buffers coexist: pruned precompute
+//! releases no operands, so the sub-stack is `WholeRender` with zero eviction credit. One task DiT
+//! is constructed per render. Mixed routes compare corrected task footprints, not gross files
+//! followed by the winner's dense eviction; pure dense/stock sizing remains unchanged.
+
+mod adapters;
+mod conditioning;
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
+use candle_gen::gen_core::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
 use candle_gen::gen_core::{
     adapter_stack_resident_bytes, safetensors_path_bytes, AdapterResidencyMode, Error as CoreError,
     LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
@@ -286,11 +300,13 @@ struct ComponentBytes {
     /// The AdaLN sub-stack's residency **on the DiT that was actually resolved** — see
     /// [`resolved_adaln_bytes`].
     adaln: u64,
+    pruning: Option<SourcePruneSizing>,
     video_vae: u64,
     audio_vae: u64,
     /// Load-exact bytes of the configured LoRA stack, held **resident for the whole render**
     /// (sc-18650). See [`adapter_overlay_bytes`], which resolves it.
     overlay: u64,
+    native_quant: Option<candle_gen::gen_core::h3_memory::NativeAllocationFacts>,
 }
 
 impl ComponentBytes {
@@ -321,20 +337,95 @@ impl ComponentBytes {
         // Use the loader's sibling rule. An upstream dense reference partition is not
         // loaded when the base DiT was redirected to a packed tier directory.
         let paths = crate::tier::MiniMaxH3TierPaths::resolve(&root, staged_dit, None);
-        let (dit_dir, dit) = DIT_PARTITIONS
-            .iter()
-            .rev()
-            .map(|partition| {
-                let dir = if *partition == BASE_DIT_PARTITION {
-                    paths.dit_dir.clone()
+        use candle_gen::gen_core::h3_memory::{NativeAllocationFacts, NativeTaskAllocation};
+        let mut winner: Option<(std::path::PathBuf, u64)> = None;
+        let mut tasks = Vec::new();
+        let mut overlay = 0u64;
+        let mut max_adaln = 0;
+        let mut resolved = false;
+        let mut pruning = None;
+        let mut pruned_resident = 0;
+        for partition in DIT_PARTITIONS.iter().rev() {
+            let dir = if *partition == BASE_DIT_PARTITION {
+                paths.dit_dir.clone()
+            } else {
+                paths.reference_dit_dir.clone()
+            };
+            let sizing = source_prune_sizing(&dir)?;
+            let allocation = dit_allocation(&dir, sizing.is_some())?;
+            let bytes = if let Some(sizing) = sizing {
+                let live = sizing.resident_bytes().map_err(CoreError::Unsupported)?;
+                if live > pruned_resident {
+                    pruning = Some(sizing);
+                    pruned_resident = live;
+                }
+                sizing
+                    .materialized_bytes(allocation.resident_bytes, false)
+                    .map_err(CoreError::Unsupported)?
+            } else {
+                allocation.resident_bytes
+            };
+            max_adaln = max_adaln.max(allocation.adaln_bytes);
+            resolved |= allocation.resolved;
+            let patch_size = if !allocation.resolved {
+                [1, 2, 2]
+            } else {
+                let text = std::fs::read_to_string(dir.join("config.json"))?;
+                crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
+                    .map_err(|e| CoreError::Unsupported(e.to_string()))?
+                    .patch_size
+                    .map(|n| n as u64)
+            };
+            let mut constructor_bytes = allocation.constructor_bytes;
+            if sizing.is_some() {
+                for h in candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&dir)? {
+                    if h.is_float()
+                        && h.dtype != candle_gen::gen_core::weightsmeta::Dtype::F32
+                        && (h.name == TABLE_KEY
+                            || h.name.contains(".adaln_proj.linear.")
+                            || h.name.starts_with("norm_out.linear."))
+                    {
+                        constructor_bytes =
+                            constructor_bytes.saturating_add(h.materialized_bytes(4)?);
+                    }
+                }
+            }
+            let adapter = if allocation.resolved && !spec.adapters.is_empty() {
+                let profile = adapters::profile(&dir, &spec.adapters, &allocation.projections)?;
+                overlay = overlay.max(profile.resident_bytes);
+                Some(profile)
+            } else {
+                None
+            };
+            tasks.push(NativeTaskAllocation {
+                adapter,
+                resident_bytes: bytes,
+                constructor_bytes,
+                patch_size,
+                reference_task: *partition != BASE_DIT_PARTITION,
+                window: None,
+                evicted_bytes: if sizing.is_some() {
+                    0
                 } else {
-                    paths.reference_dit_dir.clone()
-                };
-                let bytes = safetensors_path_bytes(&dir);
-                (dir, bytes)
-            })
-            .max_by_key(|(_, bytes)| *bytes)
-            .expect("DIT_PARTITIONS is a non-empty array");
+                    allocation.adaln_bytes
+                },
+                table_bytes_per_timestep: if sizing.is_some() {
+                    0
+                } else {
+                    allocation.table_bytes_per_timestep
+                },
+                projections: allocation.projections,
+            });
+            if winner
+                .as_ref()
+                .is_none_or(|(_, previous)| bytes >= *previous)
+            {
+                winner = Some((dir, bytes));
+            }
+        }
+        // load_task_dit maps only the selected task per render. Compare corrected footprints,
+        // not gross files followed by a winner's fictitious eviction. Mixed routes take no credit.
+        let (dit_dir, dit) = winner.expect("DIT_PARTITIONS is a non-empty array");
         // The condition encoder honors its own staged override too (sc-19120 / sc-20267). It did NOT
         // before, and the omission was the [`DIT_PARTITIONS`] failure in a second place: the TE's tier
         // is staged **independently** of the DiT's, so a split `q4` install stages
@@ -346,6 +437,23 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(crate::tier::TEXT_ENCODER_COMPONENT),
         };
+        let has_native = resolved;
+        let mut native_quant = has_native.then_some(NativeAllocationFacts {
+            conditioning_stream: None,
+            conditioning: None,
+            conditioning_resident_bytes: 0,
+            conditioning_load_bytes: 0,
+            audio_decode_load_bytes: 0,
+            video_decode_resident_bytes: 0,
+            video_decode_load_bytes: 0,
+            audio_decode_resident_bytes: 0,
+            default_evaluations: crate::model::DEFAULT_STEPS as usize,
+            backend: native_backend(),
+            tasks,
+        });
+        if let Some(facts) = &mut native_quant {
+            conditioning::complete(&root, facts)?;
+        }
         Ok(Self {
             // The weights-free gate: only a materialized snapshot directory carries readable
             // component configs. The registry's contract surface names a sentinel that is not on
@@ -360,10 +468,36 @@ impl ComponentBytes {
             // Resolved against the partition that was actually charged, whichever of the two won the
             // max — see [`resolved_adaln_bytes`] for both legs. Declaring the flat bf16 figure against
             // a smaller staged winner would declare a sub-stack larger than the stack containing it.
-            adaln: resolved_adaln_bytes(&dit_dir, dit),
-            video_vae: safetensors_path_bytes(root.join("vae")),
-            audio_vae: safetensors_path_bytes(root.join("audio_vae")),
-            overlay: adapter_overlay_bytes(spec)?,
+            adaln: if pruning.is_some() {
+                pruned_resident
+            } else {
+                if has_native {
+                    max_adaln
+                } else {
+                    resolved_adaln_bytes(&dit_dir, dit)
+                }
+            },
+            pruning,
+            video_vae: native_quant
+                .as_ref()
+                .filter(|n| n.conditioning.is_some())
+                .map_or_else(
+                    || safetensors_path_bytes(root.join("vae")),
+                    |n| n.video_decode_resident_bytes,
+                ),
+            audio_vae: native_quant
+                .as_ref()
+                .filter(|n| n.conditioning.is_some())
+                .map_or_else(
+                    || materialized_decoder_bytes(&root.join("audio_vae"), 2),
+                    |n| n.audio_decode_resident_bytes,
+                ),
+            overlay: if resolved {
+                overlay
+            } else {
+                adapter_source_bytes(spec)?
+            },
+            native_quant,
         })
     }
 
@@ -377,6 +511,164 @@ impl ComponentBytes {
             .saturating_add(self.dit)
             .saturating_add(self.decoder())
     }
+}
+
+fn native_backend() -> candle_gen::gen_core::h3_memory::NativeBackend {
+    candle_gen::gen_core::h3_memory::NativeBackend::Candle {
+        tile_rows: candle_gen::quant::w4a8_int8::TILE_ROWS as u64,
+        workspace_bytes: candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64,
+    }
+}
+
+fn dit_allocation(
+    path: &std::path::Path,
+    pruned: bool,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::h3_memory::NativeComponentAllocation> {
+    let mut allocation =
+        candle_gen::gen_core::h3_memory::component_allocation(path, native_backend(), 2, |h| {
+            if pruned
+                && (h.name == TABLE_KEY
+                    || h.name.contains(".adaln_proj.linear.")
+                    || h.name.starts_with("norm_out.linear."))
+            {
+                None
+            } else if h.name.starts_with("transformer_blocks.")
+                || h.name.starts_with("token_refiner.")
+            {
+                Some(2)
+            } else {
+                None
+            }
+        })?;
+    if safetensors_path_bytes(path) > 0 {
+        let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+        let by_name = headers
+            .iter()
+            .map(|h| (h.name.as_str(), h))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for scales in headers.iter().filter(|h| h.name.ends_with(".scales")) {
+            let base = scales.name.strip_suffix(".scales").unwrap();
+            let weight_key = format!("{base}.weight");
+            let biases_key = format!("{base}.biases");
+            let get = |name: &str| {
+                by_name
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| CoreError::Unsupported(format!("missing affine operand {name}")))
+            };
+            let weight = get(&weight_key)?;
+            let biases = get(&biases_key)?;
+            let packed = candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                weight,
+                scales,
+                biases,
+                candle_gen::quant::MLX_GROUP_SIZE,
+            )?;
+            let source = weight.data_bytes + scales.data_bytes + biases.data_bytes;
+            // The source map is still held while the newly repacked QTensor is constructed.
+            allocation.constructor_bytes = allocation
+                .constructor_bytes
+                .checked_add(packed)
+                .ok_or_else(|| CoreError::Unsupported("affine constructor size overflow".into()))?;
+            allocation.resident_bytes = allocation
+                .resident_bytes
+                .checked_sub(source)
+                .and_then(|n| n.checked_add(packed))
+                .ok_or_else(|| CoreError::Unsupported("affine component size overflow".into()))?;
+            if base.ends_with(".adaln_proj.linear") {
+                allocation.adaln_bytes = allocation
+                    .adaln_bytes
+                    .checked_sub(source)
+                    .and_then(|n| n.checked_add(packed))
+                    .ok_or_else(|| CoreError::Unsupported("affine AdaLN size overflow".into()))?;
+            }
+            allocation.resident_by_name.retain(|(name, _)| {
+                name != &weight_key && name != &scales.name && name != &biases_key
+            });
+            allocation.resident_by_name.push((weight_key, packed));
+        }
+        if !headers
+            .iter()
+            .any(|h| h.name.ends_with(".weight") || h.name == TABLE_KEY)
+        {
+            allocation.resident_bytes = safetensors_path_bytes(path);
+        }
+    }
+    Ok(allocation)
+}
+
+fn materialized_decoder_bytes(path: &std::path::Path, width: u64) -> u64 {
+    let Ok(headers) = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+    else {
+        return safetensors_path_bytes(path);
+    };
+    if !headers.iter().any(|h| h.is_float()) {
+        return safetensors_path_bytes(path);
+    }
+    candle_gen::gen_core::weightsmeta::materialized_header_bytes(&headers, width, path)
+        .unwrap_or_else(|_| safetensors_path_bytes(path))
+}
+
+/// Source headers only; malformed materialized sources refuse before the contract can price a
+/// stock eviction for unknown bytes. An unresolved component retains the prior declaration.
+fn source_prune_sizing(
+    dir: &std::path::Path,
+) -> candle_gen::gen_core::Result<Option<SourcePruneSizing>> {
+    if safetensors_path_bytes(dir) == 0 {
+        return Ok(None);
+    }
+    let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(dir)?;
+    if !headers.iter().any(|h| {
+        h.name == TABLE_KEY
+            || h.name.ends_with(".adaln_proj.linear.weight")
+            || h.name == "norm_out.linear.weight"
+    }) {
+        return Ok(None);
+    }
+    let config_path = dir.join("config.json");
+    let text = std::fs::read_to_string(&config_path)
+        .map_err(|error| CoreError::Unsupported(format!("{}: {error}", config_path.display())))?;
+    let config = crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
+        .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+    let headers = headers
+        .into_iter()
+        .map(|h| (h.name, (h.dtype, h.shape)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let Some(topology) = PrunedAdaLn::inspect(
+        config.hidden_size,
+        config.num_layers,
+        config.time_embed_dim,
+        |name| {
+            // Same packed-vs-dense predicate as CurveAdaLn::inspect, before looking at code shape.
+            if let Some(base) = name.strip_suffix(".weight") {
+                if headers.contains_key(&format!("{base}.scales"))
+                    || headers.contains_key(&format!("{base}.comfy_quant"))
+                {
+                    return None;
+                }
+            }
+            headers
+                .get(name)
+                .filter(|(dtype, _)| {
+                    matches!(
+                        dtype,
+                        candle_gen::gen_core::weightsmeta::Dtype::F16
+                            | candle_gen::gen_core::weightsmeta::Dtype::BF16
+                            | candle_gen::gen_core::weightsmeta::Dtype::F32
+                    )
+                })
+                .cloned()
+        },
+    )
+    .map_err(CoreError::Unsupported)?
+    else {
+        return Ok(None);
+    };
+    let rows = SourcePruneSizing::conditioned_timestep_bound(crate::model::MAX_STEPS as usize)
+        .map_err(CoreError::Unsupported)?;
+    SourcePruneSizing::for_topology(&topology, rows)
+        .map(Some)
+        .map_err(CoreError::Unsupported)
 }
 
 /// **The adapter-file probe** — load-exact resident bytes of the configured LoRA stack (sc-18650).
@@ -422,7 +714,13 @@ impl ComponentBytes {
 /// What remains, and is not closed here, is the narrower window in which a *sized* file is swapped
 /// for a larger one between load and render. No load-time probe can see that; it is the ordinary
 /// time-of-check/time-of-use residual every path that sizes a file before reading it carries.
+/// Actual installed originals and prepared caches over source-selected task targets.
+/// The scalar is a route-independent envelope; request admission uses native.adapter_resident_bytes.
 pub fn adapter_overlay_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
+    Ok(ComponentBytes::resolve(spec)?.overlay)
+}
+
+fn adapter_source_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
     adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(|| {
         CoreError::Unsupported(format!(
             "{MODEL_ID}: every configured adapter must be on disk with a non-zero load-exact \
@@ -631,7 +929,16 @@ fn compute_dtype_bytes() -> u64 {
 ///   adapter.
 /// * `retained_bytes` makes the declaration **net**. The precompute keeps a modulation table in the
 ///   projections' place; declaring the gross figure claims a saving the runtime does not deliver.
-fn adaln_component(resident_bytes: u64) -> MemoryResidentComponent {
+fn adaln_component(resident_bytes: u64, pruned: bool) -> MemoryResidentComponent {
+    if pruned {
+        return MemoryResidentComponent {
+            id: ADALN_COMPONENT_ID.to_owned(),
+            kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
+            resident_bytes,
+            bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
+        };
+    }
     MemoryResidentComponent {
         id: ADALN_COMPONENT_ID.to_owned(),
         kind: MemoryComponentKind::TransformerSubStack(TransformerComponent::Dit),
@@ -830,7 +1137,13 @@ fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<Str
 
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
-        phase_facts: None,
+        phase_facts: components.native_quant.as_ref().map(|native| {
+            let mut facts = candle_gen::gen_core::MemoryPhaseFacts::staged(
+                candle_gen::gen_core::StagedWeightSchedule::ThreeStage,
+            );
+            facts.native_quant = Some(native.clone());
+            facts
+        }),
         architecture_facts: architecture_facts(components),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
@@ -928,7 +1241,40 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 variables
             },
             resident_components: {
-                let mut resident = vec![adaln_component(components.adaln)];
+                let mut resident = Vec::new();
+                if components.adaln > 0 {
+                    let mut component =
+                        adaln_component(components.adaln, components.pruning.is_some());
+                    if components.pruning.is_none() {
+                        if let Some(native) = &components.native_quant {
+                            if let MemoryComponentResidency::PrecomputedThenEvicted {
+                                retained_bytes,
+                                ..
+                            } = &mut component.residency
+                            {
+                                let rows = SourcePruneSizing::conditioned_timestep_bound(
+                                    crate::model::MAX_STEPS as usize,
+                                )
+                                .expect("nonempty native schedule");
+                                *retained_bytes = native
+                                    .tasks
+                                    .iter()
+                                    .map(|t| t.table_bytes_per_timestep.saturating_mul(rows as u64))
+                                    .max()
+                                    .unwrap_or(0);
+                            }
+                        }
+                    }
+                    // A supplied small projection stack can retain more cache than it frees.
+                    // Native phases still charge that cache; no generic net eviction is claimed.
+                    let no_saving = components.native_quant.is_some()
+                        && matches!(component.residency,
+                        MemoryComponentResidency::PrecomputedThenEvicted { retained_bytes, .. }
+                        if retained_bytes >= component.resident_bytes);
+                    if !no_saving {
+                        resident.push(component);
+                    }
+                }
                 // The LoRA stack as a typed auxiliary component, the spelling `mlx-gen-ltx` uses for
                 // the same forward-time-residual install. `WholeRender` is literal here:
                 // `crate::model::MiniMaxH3::load_task_dit` installs the factors onto the task's DiT
@@ -996,6 +1342,7 @@ pub fn weights_free_contract(
         // production formulas to be equally shaped, and gen-core skips sub-stack containment against
         // zero asset facts for exactly this case.
         adaln: ADALN_EVICTED_BYTES,
+        pruning: None,
         video_vae: 0,
         audio_vae: 0,
         // The declaration-only footprint charges no adapter, and the fixture specs
@@ -1003,6 +1350,7 @@ pub fn weights_free_contract(
         // no-adapter shape `fixture_contract_conforms_weights_free` compares against. Same choice
         // the MLX sibling's `ComponentBytes::weights_free` makes.
         overlay: 0,
+        native_quant: None,
     }))
 }
 
@@ -1066,6 +1414,29 @@ pub fn veda_workspace_bound(
     )
 }
 
+/// Loaded-generator sparse bounds use the same selected source geometry as conditioning.
+pub fn veda_workspace_bound_for_contract(
+    req: candle_gen::gen_core::veda::workspace::Request<'_>,
+    contract: &MemoryProviderContract,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>> {
+    if req.veda.is_none_or(|veda| !veda.enabled) {
+        return Ok(None);
+    }
+    let patch = match contract
+        .phase_facts
+        .as_ref()
+        .and_then(|p| p.native_quant.as_ref())
+    {
+        Some(native) => native.selected_patch(req)?,
+        None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
+    };
+    candle_gen::gen_core::veda::workspace::for_video_request_with_patch(
+        req,
+        candle_gen::gen_core::veda::workspace::Backend::Cuda,
+        patch,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,6 +1459,47 @@ mod tests {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
     }
 
+    #[test]
+    fn selected_source_partition_is_immune_to_unselected_weights_cache_constructor_and_patch() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::assert_selected_task_contract(
+            root.path(),
+            contract_for,
+            false,
+        );
+    }
+
+    #[test]
+    fn w4a8_constructor_holds_all_original_and_replacement_companions() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, steady, copied) = gen_core_testkit::h3_memory::write_w4a8_component(
+            &root.path().join("transformer"),
+            &[(32, 512), (64, 256), (16, 1024)],
+        );
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        let facts = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        let task = facts.tasks.iter().find(|t| !t.reference_task).unwrap();
+        let workspace = candle_gen::quant::cublaslt::CUBLASLT_WORKSPACE_BYTES as u64;
+        assert_eq!(
+            task.resident_bytes,
+            steady + workspace,
+            "replacement companions replace their originals in steady residency"
+        );
+        assert_eq!(task.constructor_bytes, source + copied + workspace,
+            "all model-owned relative scales/codebooks coexist with the complete original device map until construction finishes");
+        assert!(
+            copied > 64 * 256 / 16 + 64,
+            "more than a single current projection's replacement allocation"
+        );
+    }
+
     fn candle_backend() -> MemoryBackendRealization {
         MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1097,20 +1509,131 @@ mod tests {
         }
     }
 
-    /// Sparse `.safetensors` shards of exact sizes. `safetensors_path_bytes` stats rather than
-    /// parses, so this costs no disk and still exercises the real directory-name wiring.
+    /// Sparse shards with valid headers and unchanged exact total file sizes. No payload is read.
     ///
     /// It costs no disk only because the shard is flagged first. These sizes are the real asset
     /// facts — one `full_snapshot` nominally sums to ~210 GB — and NTFS allocates every byte of a
     /// `set_len` on an unflagged file. `mark_sparse` must sit between the create and the `set_len`;
     /// see its docs for why either side of that is silently wrong.
+    #[test]
+    fn native_vae_facts_follow_selected_config_readsets_and_actual_compute_dtypes() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::write_native_component(&root.path().join("transformer"), 2);
+        gen_core_testkit::h3_memory::write_vae_configs(root.path());
+        gen_core_testkit::h3_memory::write_float_operands(
+            &root.path().join("vae"),
+            [
+                "encoder.conv_in.weight",
+                "decoder.patch_embed.weight",
+                "post_quant_conv.weight",
+            ]
+            .map(str::to_owned),
+            "F32",
+        );
+        let a = crate::audio_config::MiniMaxH3AudioVaeConfig::default();
+        let mut names = crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::tensor_names(&a);
+        names.extend(crate::audio_vae::MiniMaxH3AudioVae::tensor_names(&a));
+        gen_core_testkit::h3_memory::write_float_operands(
+            &root.path().join("audio_vae"),
+            names,
+            "BF16",
+        );
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        let native = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        let vae = native.conditioning.as_ref().unwrap();
+        assert_eq!(
+            vae.decoder_layers, 3,
+            "source config, not stock preset depth"
+        );
+        assert_eq!(vae.video_element_bytes, 2);
+        assert_eq!(
+            vae.audio_decode_element_bytes, 2,
+            "Candle decode follows actual self.dtype; encoder remains F32"
+        );
+        assert!(!vae.unified_memory);
+        assert!(native.conditioning_resident_bytes > native.video_decode_resident_bytes);
+        assert!(
+            native.audio_decode_load_bytes > native.audio_decode_resident_bytes,
+            "weightnorm source/derived constructor overlap is not permanent residency"
+        );
+        assert_eq!(
+            contract.asset_facts.decoder_bytes,
+            native.video_decode_resident_bytes + native.audio_decode_resident_bytes
+        );
+        let req = candle_gen::gen_core::GenerationRequest {
+            width: 1344,
+            height: 768,
+            frames: Some(124),
+            ..Default::default()
+        };
+        let workspace =
+            candle_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
+        assert!(workspace.decode_bytes > 0);
+    }
+
+    #[test]
+    fn packed_admission_bound_covers_native_stereo_target_and_long_reference_audio() {
+        let geometry = crate::denoise::JointGeometry::new(
+            345,
+            768 / crate::config::VAE_RATIO,
+            1344 / crate::config::VAE_RATIO,
+        )
+        .unwrap();
+        let actual = crate::denoise::PackedLayout::build(
+            geometry,
+            crate::pipeline::PATCH_SIZE,
+            &[crate::denoise::TEXT_TAG],
+            crate::audio_config::AUDIO_OUTPUT_CHANNELS as usize,
+            &[],
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap()
+        .seq_len() as u64;
+        gen_core_testkit::h3_memory::assert_stereo_packing_bound(actual);
+    }
+
+    #[test]
+    fn dense_source_keeps_actual_dtype_accounting_without_integer_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        gen_core_testkit::h3_memory::assert_dense_contract(root.path(), contract_for, false);
+    }
+
+    #[test]
+    fn native_formats_price_actual_payloads_shared_buffers_and_staged_task() {
+        let root = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let staged = tier.path().join("transformer");
+        gen_core_testkit::h3_memory::assert_native_contract(
+            root.path(),
+            &staged,
+            contract_for,
+            false,
+        );
+    }
+
     fn sparse_snapshot(root: &Path, sizes: &[(&str, u64)]) {
         for (component, bytes) in sizes {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).expect("component dir");
             let path = dir.join("model.safetensors");
-            let file = std::fs::File::create(&path).expect("shard");
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).expect("shard");
             gen_core_testkit::mark_sparse(&path);
+            let payload = bytes
+                .checked_sub(264)
+                .expect("fixture has space for a header");
+            let mut header = serde_json::json!({"fixture": {"dtype":"U8", "shape":[payload], "data_offsets":[0,payload]}}).to_string();
+            assert!(header.len() <= 256);
+            header.extend(std::iter::repeat_n(' ', 256 - header.len()));
+            file.write_all(&256u64.to_le_bytes()).unwrap();
+            file.write_all(header.as_bytes()).unwrap();
             file.set_len(*bytes).expect("sparse shard");
         }
     }
@@ -2891,5 +3414,402 @@ mod tests {
             config.num_layers as u64 * (out * config.time_embed_dim as u64 + out) * 2,
             ADALN_EVICTED_BYTES
         );
+    }
+
+    // A header-only synthetic source. No downloaded table, tensor runtime, or accelerator is used.
+    fn pruning_memory_headers() -> serde_json::Value {
+        let mut headers = serde_json::Map::new();
+        let mut add = |name: String, dtype: &str, shape: Vec<usize>| {
+            headers.insert(
+                name,
+                serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[0,0]}),
+            );
+        };
+        add("adaln_t_table".into(), "F32", vec![1025, 8]);
+        add("body".into(), "F32", vec![257]);
+        for layer in 0..2 {
+            add(
+                format!("transformer_blocks.{layer}.adaln_proj.linear.weight"),
+                "BF16",
+                vec![18 * 256, 8],
+            );
+            add(
+                format!("transformer_blocks.{layer}.adaln_proj.linear.bias"),
+                "F16",
+                vec![18 * 256],
+            );
+        }
+        add("norm_out.linear.weight".into(), "BF16", vec![2 * 256, 8]);
+        add("norm_out.linear.bias".into(), "F16", vec![2 * 256]);
+        serde_json::Value::Object(headers)
+    }
+
+    fn write_pruning_memory_headers(dir: &Path, mut headers: serde_json::Value) -> u64 {
+        use std::io::Write;
+        std::fs::create_dir_all(dir).unwrap();
+        let mut offset = 0u64;
+        for header in headers.as_object_mut().unwrap().values_mut() {
+            let width = match header["dtype"].as_str().unwrap() {
+                "F32" | "U32" => 4,
+                "BF16" | "F16" => 2,
+                _ => unreachable!(),
+            };
+            let size = header["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_u64().unwrap())
+                .product::<u64>()
+                * width;
+            header["data_offsets"] = serde_json::json!([offset, offset + size]);
+            offset += size;
+        }
+        let mut header = headers.to_string();
+        header.extend(std::iter::repeat_n(' ', (8 - header.len() % 8) % 8));
+        let path = dir.join("model.safetensors");
+        let mut file = std::fs::File::create(&path).unwrap();
+        gen_core_testkit::mark_sparse(&path);
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        let bytes = 8 + header.len() as u64 + offset;
+        file.set_len(bytes).unwrap();
+        let config = serde_json::json!({
+            "_class_name":"MiniMaxH3Transformer3DModel", "hidden_size":256,"num_layers":2,
+            "num_refiner_layers":2,"num_attention_heads":2,"attention_head_dim":128,
+            "ffn_dim":256,"in_channels":24,"audio_in_channels":32,"patch_size":[1,2,2],
+            "text_dim":5120,"freq_dim":256,"time_embed_hidden_dim":256,"time_embed_dim":64,
+            "rope_freq_dim":16,"rope_theta":10000.0,"norm_eps":1e-5,"qk_norm_eps":1e-5,"final_norm_eps":1e-5
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        offset
+    }
+
+    // Independent dtype/shape arithmetic. Two generated streams contribute at most N values each;
+    // conditioned video can add one fixed clamp value and conditioned audio one fixed clean value.
+    fn expected_pruning_memory() -> (u64, u64, u64) {
+        let table = 1025 * 8 * 4;
+        let output_width = 256 * (18 * 2 + 2);
+        let source = table + output_width * 8 * 2 + output_width * 2;
+        let compute = table + output_width * 8 * 4 + output_width * 4;
+        let retained = (2 * crate::model::MAX_STEPS as u64 + 2) * (output_width + 8) * 4;
+        (source, compute, retained)
+    }
+
+    #[test]
+    fn source_pruned_native_mixed_checkpoint_never_earns_dense_eviction_credit() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(BASE_DIT_PARTITION);
+        let stored = write_pruning_memory_headers(&dir, pruning_memory_headers());
+        let other = tempfile::tempdir().unwrap();
+        let (native_bytes, groups) =
+            gen_core_testkit::h3_memory::write_native_component(other.path(), 2);
+        std::fs::copy(
+            other.path().join("model.safetensors"),
+            dir.join("native.safetensors"),
+        )
+        .unwrap();
+        let (source, compute, retained) = expected_pruning_memory();
+        let shared = groups.iter().map(|g| g * g * 4).sum::<u64>() + (32 << 20);
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        assert_eq!(
+            contract.asset_facts.transformer_bytes,
+            stored - source + compute + retained + native_bytes + shared
+        );
+        assert_eq!(contract.evicted_component_bytes(), 0);
+        let native = contract
+            .phase_facts
+            .as_ref()
+            .unwrap()
+            .native_quant
+            .as_ref()
+            .unwrap();
+        assert!(native.tasks.iter().all(|t| t.evicted_bytes == 0));
+        let rows = candle_gen::gen_core::h3_memory::NativeRows {
+            task: candle_gen::gen_core::h3_memory::NativeTaskSelection::All,
+            packed: 17,
+            conditioning: 9,
+            schedule: 5,
+            visual_elements: 0,
+            global: 0,
+        };
+        assert!(native.denoise_peak_bytes(rows) > contract.asset_facts.transformer_bytes);
+    }
+
+    #[test]
+    fn source_pruned_static_and_loaded_memory_plan_keeps_f32_operands_and_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(BASE_DIT_PARTITION);
+        let stored = write_pruning_memory_headers(&dir, pruning_memory_headers());
+        let (source, compute, retained) = expected_pruning_memory();
+        let sizing = source_prune_sizing(&dir).unwrap().unwrap();
+        assert_eq!(
+            (
+                sizing.source_bytes,
+                sizing.compute_bytes,
+                sizing.retained_bytes
+            ),
+            (source, compute, retained)
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+        let contract = contract_for(&spec).unwrap();
+        assert_eq!(
+            contract.asset_facts.transformer_bytes,
+            stored - source + compute + retained
+        );
+        assert_eq!(
+            contract.evicted_component_bytes(),
+            0,
+            "reduced operands are not released by precompute"
+        );
+        assert_eq!(
+            contract.steady_state_transformer_bytes(),
+            contract.asset_facts.transformer_bytes
+        );
+        let adaln = &contract.resident_components()[0];
+        assert_eq!(adaln.resident_bytes, compute + retained);
+        assert_eq!(adaln.residency, MemoryComponentResidency::WholeRender);
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes,
+            "the typed sub-stack is not a second additive charge"
+        );
+        for (component, document) in [
+            (REFERENCE_DIT_PARTITION, "config.json"),
+            ("text_encoder", "config.json"),
+            ("vae", "config.json"),
+            ("audio_vae", "config.json"),
+            ("tokenizer", "tokenizer.json"),
+            ("FL2VA/audio_vae", "config.json"),
+            ("FL2VA/audio_vae", "config.yaml"),
+            ("FL2VA/audio_vae", "metadata.json"),
+        ] {
+            let directory = root.path().join(component);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(document), "{}").unwrap();
+            std::fs::write(directory.join("empty.safetensors"), []).unwrap();
+        }
+        let loaded = crate::model::load(&spec).unwrap();
+        let loaded = loaded
+            .memory_strategy_contract()
+            .expect("loaded provider publishes actual contract");
+        assert_eq!(loaded.asset_facts, contract.asset_facts);
+        assert_eq!(loaded.evicted_component_bytes(), 0);
+    }
+
+    #[test]
+    fn source_pruned_sibling_override_wins_after_correction_without_dense_eviction_credit() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let reference = staged.path().join(REFERENCE_DIT_PARTITION);
+        let stored = write_pruning_memory_headers(&reference, pruning_memory_headers());
+        let (source, compute, retained) = expected_pruning_memory();
+        let dense_gross = stored + retained / 2;
+        sparse_snapshot(staged.path(), &[(BASE_DIT_PARTITION, dense_gross)]);
+        std::fs::write(
+            staged.path().join(BASE_DIT_PARTITION).join("config.json"),
+            "{}",
+        )
+        .unwrap();
+        // A much larger root-relative source must not override the actual staged task paths.
+        sparse_snapshot(root.path(), &[(BASE_DIT_PARTITION, DIT_BF16_BYTES)]);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+            BASE_DIT_PARTITION,
+            WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
+        );
+        let corrected = stored - source + compute + retained;
+        assert!(
+            stored < dense_gross && dense_gross < corrected,
+            "the corrected peak winner differs from the gross-file winner"
+        );
+        let contract = contract_for(&spec).unwrap();
+        assert_eq!(
+            contract.asset_facts.transformer_bytes, corrected,
+            "Ref2VA-only source pruning is priced at the actual staged sibling"
+        );
+        assert_eq!(contract.evicted_component_bytes(), 0);
+        assert_eq!(contract.steady_state_transformer_bytes(), corrected);
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+    }
+
+    #[test]
+    fn source_pruned_missing_data_or_config_refuses_instead_of_stock_pricing() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(BASE_DIT_PARTITION);
+        for missing in [
+            "adaln_t_table",
+            "transformer_blocks.0.adaln_proj.linear.bias",
+            "norm_out.linear.weight",
+        ] {
+            let mut headers = pruning_memory_headers();
+            headers.as_object_mut().unwrap().remove(missing);
+            write_pruning_memory_headers(&dir, headers);
+            assert!(
+                contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err(),
+                "{missing}"
+            );
+        }
+        write_pruning_memory_headers(&dir, pruning_memory_headers());
+        std::fs::remove_file(dir.join("config.json")).unwrap();
+        assert!(contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err());
+        std::fs::write(dir.join("config.json"), "not JSON").unwrap();
+        assert!(contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err());
+        std::fs::write(dir.join("model.safetensors"), b"broken header").unwrap();
+        assert!(contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).is_err());
+    }
+
+    #[test]
+    fn packed_q4_q8_headers_preserve_stock_contract_and_loaded_constructor() {
+        for bits in [4usize, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join(crate::model::BASE_DIT_PARTITION);
+            let mut headers = pruning_memory_headers();
+            headers.as_object_mut().unwrap().remove("adaln_t_table");
+            // Real MLX-affine code-column geometry, not an opaque stand-in. Large payload is
+            // sparse: metadata only, never mapped/evaluated or downloaded by this test.
+            headers["body"]["shape"] = serde_json::json!([3_000_000_000u64]);
+            for layer in 0..2 {
+                let prefix = format!("transformer_blocks.{layer}.adaln_proj.linear");
+                headers[format!("{prefix}.weight")] = serde_json::json!({"dtype":"U32","shape":[18*256,64/(32/bits)],"data_offsets":[0,0]});
+                headers[format!("{prefix}.scales")] =
+                    serde_json::json!({"dtype":"BF16","shape":[18*256,1],"data_offsets":[0,0]});
+                headers[format!("{prefix}.biases")] =
+                    serde_json::json!({"dtype":"BF16","shape":[18*256,1],"data_offsets":[0,0]});
+            }
+            headers["norm_out.linear.weight"]["shape"] = serde_json::json!([2 * 256, 64]);
+            for leaf in ["linear_1", "linear_2"] {
+                for suffix in ["weight", "bias"] {
+                    headers[format!("time_embedder.{leaf}.{suffix}")] =
+                        serde_json::json!({"dtype":"F32","shape":[1],"data_offsets":[0,0]});
+                }
+            }
+            let stored = write_pruning_memory_headers(&dir, headers);
+            let config_path = dir.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            config["quantization"] = serde_json::json!({"bits":bits,"group_size":64});
+            std::fs::write(config_path, config.to_string()).unwrap();
+            assert!(
+                source_prune_sizing(&dir).unwrap().is_none(),
+                "Q{bits} is full-width packed, not a missing curve table"
+            );
+            let quant = if bits == 4 {
+                candle_gen::gen_core::Quant::Q4
+            } else {
+                candle_gen::gen_core::Quant::Q8
+            };
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_quant(quant);
+            let contract = contract_for(&spec).unwrap();
+            let out = 18 * 256u64;
+            let source_triple = out * 64 * bits as u64 / 8 + out * 4;
+            let packed = out * 64 / 32 * if bits == 4 { 20 } else { 34 };
+            let expected = 2 * (packed + out * 2);
+            assert_eq!(
+                contract.asset_facts.transformer_bytes,
+                stored - 2 * source_triple + 2 * packed
+            );
+            let retained = 2 * out * 2 * (2 * crate::model::MAX_STEPS as u64 + 2);
+            if expected > retained {
+                assert_eq!(
+                    contract.resident_components()[0].resident_bytes,
+                    expected,
+                    "actual affine payload, not a ratio against the stock model population"
+                );
+            } else {
+                assert!(
+                    contract
+                        .resident_components()
+                        .iter()
+                        .all(|c| c.id != ADALN_COMPONENT_ID),
+                    "a cache larger than its projection stack earns no claimed eviction credit"
+                );
+            }
+            assert_eq!(
+                contract.evicted_component_bytes(),
+                expected.saturating_sub(retained)
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{:?}",
+                contract.conformance_errors()
+            );
+            for (component, document) in [
+                (crate::model::REFERENCE_DIT_PARTITION, "config.json"),
+                ("text_encoder", "config.json"),
+                ("vae", "config.json"),
+                ("audio_vae", "config.json"),
+                ("tokenizer", "tokenizer.json"),
+                ("FL2VA/audio_vae", "config.json"),
+                ("FL2VA/audio_vae", "config.yaml"),
+                ("FL2VA/audio_vae", "metadata.json"),
+            ] {
+                let directory = root.path().join(component);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join(document), "{}").unwrap();
+                std::fs::write(directory.join("empty.safetensors"), []).unwrap();
+            }
+
+            let loaded = crate::model::load(&spec).unwrap();
+            let loaded = loaded.memory_strategy_contract().unwrap();
+            assert_eq!(loaded.asset_facts, contract.asset_facts);
+            assert_eq!(
+                loaded.evicted_component_bytes(),
+                contract.evicted_component_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn source_pruned_retained_bound_covers_nondefault_scheduler_shifts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::model::BASE_DIT_PARTITION);
+        write_pruning_memory_headers(&dir, pruning_memory_headers());
+        let sizing = source_prune_sizing(&dir).unwrap().unwrap();
+        let default =
+            crate::denoise::JointSchedule::new(crate::model::MAX_STEPS as usize + 1).unwrap();
+        let default_rows = crate::denoise::adaln_schedule(&default)
+            .unwrap()
+            .distinct_timesteps()
+            .len();
+        let mut exceeds_default = false;
+        for video_shift in [0.1, 1.0, 5.0, 12.01, 17.0, 100.0] {
+            for audio_shift in [0.125, 3.0, 7.0] {
+                let schedule = crate::denoise::JointSchedule::with_shifts(
+                    crate::model::MAX_STEPS as usize + 1,
+                    video_shift,
+                    audio_shift,
+                )
+                .unwrap();
+                let actual = crate::denoise::adaln_schedule(&schedule).unwrap();
+                let distinct = actual.distinct_timesteps().len();
+                exceeds_default |= distinct > default_rows;
+                let actual_retained = distinct as u64 * (256 * (18 * 2 + 2) + 8) * 4;
+                assert!(actual_retained <= sizing.retained_bytes,
+                    "admitted shifts {video_shift}/{audio_shift}: {distinct} rows must fit the declared F32 cache bound");
+            }
+        }
+        assert!(
+            exceeds_default,
+            "the fixture must discriminate the old default-grid underbound"
+        );
+        let contract =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).unwrap();
+        assert_eq!(
+            contract.resident_components()[0].resident_bytes,
+            sizing.compute_bytes + sizing.retained_bytes
+        );
+        assert_eq!(contract.evicted_component_bytes(), 0);
     }
 }

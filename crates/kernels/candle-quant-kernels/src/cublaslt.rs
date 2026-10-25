@@ -38,6 +38,9 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Device allocation held by one shared cuBLASLt context, also used by native admission.
+pub const CUBLASLT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Result of a per-tensor dynamic activation quantization: the packed 8-bit tensor plus the scalar
 /// `scale` such that `dequant = q * scale` (fp8: absmax/448; int8: absmax/127).
 pub struct QuantizedActivation {
@@ -190,6 +193,23 @@ pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::Ker
     src: include_str!("nvfp4_quant.cu"),
     // Standard intrinsics only; sm_70 is the oldest this workspace targets (NVFP4 itself is
     // gated to sm_100+/sm_120 by `meets_nvfp4_floor` before this is ever consulted).
+    cc_floor: (7, 0),
+};
+
+/// Kitchen's dtype-rounded dynamic per-token activation quantizer (sc-26683).
+pub const KITCHEN_INT8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "kitchen_int8_rowwise_v1",
+    src: include_str!("kitchen_int8.cu"),
+    cc_floor: (7, 0),
+};
+
+/// Packed W4A8 → int8 weight decode (sc-26685): nibble unpack + codebook + E4M3FN group scale +
+/// round-half-even clamp `[-127,127]`, compiled once per device through the [`nvrtc`](crate::nvrtc)
+/// seam. This is the on-device twin of the host `gen_core::w4a8_int8::dequant_packed_to_int8`
+/// decode the CPU/test path uses, so the shipped CUDA forward never full-dequants on the host.
+pub const W4A8_DEQUANT_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "w4a8_dequant_int8_v1",
+    src: include_str!("w4a8_dequant.cu"),
     cc_floor: (7, 0),
 };
 
@@ -447,7 +467,7 @@ mod cuda_impl {
 
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
-        const WORKSPACE: usize = 32 * 1024 * 1024;
+        const WORKSPACE: usize = super::CUBLASLT_WORKSPACE_BYTES;
 
         /// Returns the driver-reported identity for the cached NVFP4 algorithm selected for
         /// `(m, k, n)`, if that shape has already run. This is an observation seam for device
@@ -986,8 +1006,22 @@ mod cuda_impl {
             check_alignment(k, n)?;
             let mut out = self.stream.alloc_zeros::<i32>(m * n).map_err(drv_err)?;
             {
-                let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
-                let (b_ptr, _gb) = x.buf.device_ptr(&self.stream);
+                let (ws, _) = w.buf.storage_and_layout();
+                let (xs, _) = x.buf.storage_and_layout();
+                let Storage::Cuda(ws) = &*ws else {
+                    candle_core::bail!("INT8 weight is not on CUDA")
+                };
+                let Storage::Cuda(xs) = &*xs else {
+                    candle_core::bail!("INT8 activation is not on CUDA")
+                };
+                let CudaStorageSlice::U8(wb) = &ws.slice else {
+                    candle_core::bail!("INT8 weight is not bytes")
+                };
+                let CudaStorageSlice::U8(xb) = &xs.slice else {
+                    candle_core::bail!("INT8 activation is not bytes")
+                };
+                let (a_ptr, _ga) = wb.device_ptr(&self.stream);
+                let (b_ptr, _gb) = xb.device_ptr(&self.stream);
                 let (d_ptr, _gd) = out.device_ptr_mut(&self.stream);
                 unsafe {
                     self.run(
@@ -1275,6 +1309,197 @@ mod cuda_impl {
         /// Stage an int8-code tensor (`F32`/`I64`) as an owned device `i8` buffer + its shape.
         pub fn stage_int8(&self, t: &Tensor) -> Result<DevInt8> {
             DevInt8::stage(self, t)
+        }
+        /// Stage exact signed-code bytes without a dense float/i64 intermediate.
+        pub fn stage_int8_bytes(&self, bytes: &Tensor) -> Result<DevInt8> {
+            let (rows, cols) = bytes.dims2()?;
+            if bytes.dtype() != DType::U8 {
+                candle_core::bail!("INT8 codes must be raw U8 byte patterns");
+            }
+            let bytes = bytes
+                .to_device(&Device::Cuda(self.device.clone()))?
+                .flatten_all()?
+                .contiguous()?;
+            let bytes = if bytes.layout().start_offset() != 0 {
+                bytes.force_contiguous()?
+            } else {
+                bytes
+            };
+            Ok(DevInt8 {
+                buf: bytes,
+                rows,
+                cols,
+            })
+        }
+
+        /// Kitchen's activation codes and unrounded F32 row scales, entirely on device.
+        /// `x` already contains the source-dtype rotation result; `dtype` preserves its rounding.
+        pub fn quantize_kitchen_int8(&self, x: &Tensor, dtype: DType) -> Result<(DevInt8, Tensor)> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            if m == 0
+                || k == 0
+                || m > u32::MAX as usize
+                || k > i32::MAX as usize
+                || !x.device().same_device(&Device::Cuda(self.device.clone()))
+            {
+                candle_core::bail!("Kitchen INT8 activation shape/device mismatch");
+            }
+            let dtype = match dtype {
+                DType::F32 => 0i32,
+                DType::BF16 => 1,
+                DType::F16 => 2,
+                _ => candle_core::bail!("Kitchen INT8 source dtype"),
+            };
+            let module = KITCHEN_INT8_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("kitchen_int8_quantize")
+                .map_err(candle_core::Error::wrap)?;
+            let xf = Self::flux3_f32_input(x)?;
+            let (storage, _) = xf.storage_and_layout();
+            let Storage::Cuda(cs) = &*storage else {
+                candle_core::bail!("Kitchen INT8 requires CUDA")
+            };
+            let CudaStorageSlice::F32(xs) = &cs.slice else {
+                candle_core::bail!("Kitchen INT8 requires F32 launch input")
+            };
+            let mut q = unsafe { self.stream.alloc::<u8>(m * k) }.map_err(drv_err)?;
+            let mut scales = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
+            let ki = k as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(xs)
+                    .arg(&mut q)
+                    .arg(&mut scales)
+                    .arg(&ki)
+                    .arg(&dtype)
+                    .launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let scales = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::F32(scales),
+                    device: self.device.clone(),
+                }),
+                (m, 1),
+                BackpropOp::none(),
+                false,
+            );
+            let q = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(q),
+                    device: self.device.clone(),
+                }),
+                (m, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok((
+                DevInt8 {
+                    buf: q,
+                    rows: m,
+                    cols: k,
+                },
+                scales,
+            ))
+        }
+
+        /// Decode one bounded output-row tile of a resident packed W4A8 weight to device int8, for
+        /// the shared cuBLASLt INT8 IGEMM. `packed` (`U8 [out, k/2]`), `s_rel` (`U8 [out, k/g]`) and
+        /// `codebook` (`F32 [16]`) are the **resident** device tensors staged once at load; `out0`
+        /// is the first output feature of `rows` rows. The returned `DevInt8` is a transient
+        /// `[rows, k]` scratch on the device, never a resident model shadow.
+        pub fn dequant_w4a8_packed_tile(
+            &self,
+            packed: &Tensor,
+            s_rel: &Tensor,
+            codebook: &Tensor,
+            tile: W4A8DecodeTile,
+        ) -> Result<DevInt8> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let W4A8DecodeTile {
+                rows,
+                in_features: k,
+                group,
+                out0,
+            } = tile;
+            if rows == 0 || k == 0 || rows.checked_mul(k).is_none() {
+                candle_core::bail!("W4A8 decode tile geometry");
+            }
+            debug_assert!(group == 16);
+            for (name, t) in [("packed", packed), ("s_rel", s_rel), ("codebook", codebook)] {
+                if !t.device().same_device(&Device::Cuda(self.device.clone())) {
+                    candle_core::bail!("W4A8 {name} operand is not on CUDA");
+                }
+            }
+            let module = W4A8_DEQUANT_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("w4a8_dequant_int8")
+                .map_err(candle_core::Error::wrap)?;
+            let (pstorage, _) = packed.storage_and_layout();
+            let Storage::Cuda(pcs) = &*pstorage else {
+                candle_core::bail!("W4A8 packed is not on CUDA");
+            };
+            let CudaStorageSlice::U8(packed_u8) = &pcs.slice else {
+                candle_core::bail!("W4A8 packed is not raw U8");
+            };
+            let (sstorage, _) = s_rel.storage_and_layout();
+            let Storage::Cuda(scs) = &*sstorage else {
+                candle_core::bail!("W4A8 s_rel is not on CUDA");
+            };
+            let CudaStorageSlice::U8(srel_u8) = &scs.slice else {
+                candle_core::bail!("W4A8 s_rel is not raw U8");
+            };
+            let (cstorage, _) = codebook.storage_and_layout();
+            let Storage::Cuda(ccs) = &*cstorage else {
+                candle_core::bail!("W4A8 codebook is not on CUDA");
+            };
+            let CudaStorageSlice::F32(codebook_f32) = &ccs.slice else {
+                candle_core::bail!("W4A8 codebook is not F32");
+            };
+            let mut out = unsafe { self.stream.alloc::<u8>(rows * k) }.map_err(drv_err)?;
+            let (ki, gi, out0i) = (k as i32, group as i32, out0 as i32);
+            let work = (rows * k) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(packed_u8)
+                    .arg(srel_u8)
+                    .arg(codebook_f32)
+                    .arg(&mut out)
+                    .arg(&ki)
+                    .arg(&gi)
+                    .arg(&out0i)
+                    .launch(LaunchConfig {
+                        grid_dim: (work.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let out_t = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(out),
+                    device: self.device.clone(),
+                }),
+                (rows, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok(DevInt8 {
+                buf: out_t,
+                rows,
+                cols: k,
+            })
         }
 
         // --- internals -------------------------------------------------------------------------
@@ -1827,9 +2052,30 @@ mod cuda_impl {
     /// instead of a DtoH copy + CPU round loop + HtoD copy (the dominant cost once the dequant fold
     /// moved on-device). A CPU operand (weights loaded to host, tests) still narrows on the host.
     pub struct DevInt8 {
-        buf: cudarc::driver::CudaSlice<u8>,
+        // Tensor's Arc shares an already compact source; staging must not copy the model's codes.
+        buf: Tensor,
         rows: usize,
         cols: usize,
+    }
+
+    /// Geometry of one bounded W4A8 output-row decode tile: the `rows` output features starting at
+    /// `out0`, each spanning the full `in_features` contraction, with one E4M3FN `s_rel` scale per
+    /// `group` columns.
+    ///
+    /// Four `usize`s passed positionally are indistinguishable to the compiler and to a reader, so
+    /// they travel as one named value (sc-26685 review: `dequant_w4a8_packed_tile` had eight
+    /// arguments). The resident-tensor operands stay separate — they are the kernel's inputs, and
+    /// this is only its launch geometry.
+    #[derive(Clone, Copy, Debug)]
+    pub struct W4A8DecodeTile {
+        /// Output features decoded by this tile (`<=` the caller's output-row tile bound).
+        pub rows: usize,
+        /// Logical contraction width (`in_features`), i.e. the decoded int8 row length.
+        pub in_features: usize,
+        /// Columns per E4M3FN relative scale (`W4A8Int8::group_size`, 16).
+        pub group: usize,
+        /// First output feature of the tile.
+        pub out0: usize,
     }
 
     impl DevInt8 {
@@ -1846,20 +2092,16 @@ mod cuda_impl {
                     .to_dtype(DType::U8)?
                     .flatten_all()?
                     .contiguous()?;
-                let (storage, _l) = u8t.storage_and_layout();
-                let buf = match &*storage {
-                    Storage::Cuda(cs) => match &cs.slice {
-                        CudaStorageSlice::U8(s) => s.try_clone().map_err(drv_err)?,
-                        _ => candle_core::bail!("DevInt8::stage: expected U8 storage"),
-                    },
-                    _ => candle_core::bail!("DevInt8::stage: not a CUDA tensor"),
-                };
-                return Ok(Self { buf, rows, cols });
+                return Ok(Self {
+                    buf: u8t,
+                    rows,
+                    cols,
+                });
             }
             // CPU operand (weights staged from host, tests): narrow on the host to the same byte pattern.
             let host = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
             let bytes: Vec<u8> = host.iter().map(|&v| v.round() as i8 as u8).collect();
-            let buf = lt.stream.clone_htod(&bytes).map_err(drv_err)?;
+            let buf = Tensor::from_vec(bytes, (rows, cols), &Device::Cuda(lt.device.clone()))?;
             Ok(Self { buf, rows, cols })
         }
     }
@@ -2205,7 +2447,7 @@ mod cuda_impl {
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, W4A8DecodeTile};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

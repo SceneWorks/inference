@@ -117,6 +117,8 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    cublaslt::W4A8_DEQUANT_SOURCE,
+    cublaslt::KITCHEN_INT8_SOURCE,
     flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     MOE_GEMV_SRC,

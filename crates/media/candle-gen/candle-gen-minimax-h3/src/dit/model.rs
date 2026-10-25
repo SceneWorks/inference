@@ -43,6 +43,7 @@
 //! not go anywhere. [`crate::dit::adaln`] documents that trap; `load` closes it by construction, by
 //! owning the map and dropping it before returning.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
@@ -52,6 +53,7 @@ use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
 use crate::dit::block::DitBlock;
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
+use crate::dit::curve::CurveAdaLn;
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
 use crate::dit::layers::LinearNoBias;
 use crate::dit::refiner::TokenRefiner;
@@ -68,6 +70,9 @@ pub struct MiniMaxH3Dit {
     refiner: TokenRefiner,
     blocks: Vec<DitBlock>,
     rope: MmRope,
+    /// The direct, centered-curve AdaLN of a pruned (sc-26684) checkpoint; `None` on the stock
+    /// path, where the timestep MLP in [`DitProjections`] drives the projections instead.
+    curve: Option<CurveAdaLn>,
     dtype: DType,
     device: Device,
 }
@@ -87,6 +92,46 @@ impl MiniMaxH3Dit {
         dtype: DType,
     ) -> Result<Self> {
         cfg.validate()?;
+        // The direct-curve inspection runs FIRST and refuses before anything loads: a pruned
+        // checkpoint has no timestep MLP, and loading one of its reduced projections through the
+        // stock path would fail with a shape error that says nothing about why. The map must
+        // carry the curve operands at their stored dtypes — a loader that coerced the F32 table
+        // or the F16 folded biases is refused here (`table must be finite F32`), not silently
+        // rebuilt from the rounded bytes.
+        if let Some(topology) = CurveAdaLn::inspect(w, cfg)? {
+            // The curve is assembled from THIS map — its projections are bound to the identity
+            // hashed from these very bytes — so there is no constructor accepting a curve from
+            // elsewhere: a caller cannot pair a `CurveAdaLn` with an unrelated weight map.
+            let operands = topology
+                .operands()
+                .iter()
+                .map(|o| Ok((o.name.clone(), w.require(&o.name)?)))
+                .collect::<Result<HashMap<String, Tensor>>>()?;
+            let curve = CurveAdaLn::assemble(topology, operands, cfg, device)?;
+            let projections = DitProjections::from_weights_curve(w, cfg)?;
+            let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
+            let blocks = (0..cfg.num_layers)
+                .map(|i| {
+                    DitBlock::from_weights_curve(
+                        w,
+                        &format!("transformer_blocks.{i}"),
+                        cfg,
+                        dtype,
+                        curve.block_projection(i)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Self {
+                cfg: cfg.clone(),
+                projections,
+                refiner,
+                blocks,
+                rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
+                curve: Some(curve),
+                dtype,
+                device: device.clone(),
+            });
+        }
         let projections = DitProjections::from_weights(w, cfg)?;
         let refiner = TokenRefiner::from_weights(w, "token_refiner", cfg, dtype)?;
         let blocks = (0..cfg.num_layers)
@@ -98,6 +143,7 @@ impl MiniMaxH3Dit {
             refiner,
             blocks,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
+            curve: None,
             dtype,
             device: device.clone(),
         })
@@ -140,7 +186,34 @@ impl MiniMaxH3Dit {
         })?;
         let cfg = MiniMaxH3DitConfig::from_diffusers_json(&text)?;
         let shards = candle_gen::loader::sorted_safetensors(dir, "minimax-h3 dit")?;
-        let w = Weights::from_files(&shards, device, dtype)?;
+        // Header-only scan first: a pruned (sc-26684) checkpoint is refused here, from the
+        // safetensors headers alone, if its reduced topology is incomplete or inconsistent —
+        // before any tensor of a ~62 GB checkpoint is materialized. The full topology and value
+        // validation then runs again inside `from_weights` over the loaded map, which is where
+        // the identity is hashed, so the early scan is a load-boundary gate, not a second
+        // authority.
+        let scan = crate::dit::curve::CurveScan::read(&shards)?;
+        if scan.has_curve() {
+            candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect(
+                cfg.hidden_size,
+                cfg.num_layers,
+                cfg.time_embed_dim,
+                |name| scan.lookup(name),
+            )
+            .map_err(CandleError::Msg)?
+            .ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3 dit: the shards carry `adaln_t_table` but the curve topology \
+                     inspect found nothing — an internally inconsistent scan"
+                        .into(),
+                )
+            })?;
+        }
+        // One load, at stored precision: the native loader keeps every float tensor's own dtype
+        // (the F32 table, the BF16 reduced weights, the F16 folded biases included), so
+        // `from_weights`'s curve inspection sees the checkpoint's actual bytes and no curve
+        // operand is ever re-read or re-cast.
+        let w = Weights::from_files_native_int8(&shards, device)?;
         let model = Self::from_weights(&w, &cfg, device, dtype)?;
         // Drop the map here rather than at the call site: every tensor in it shares storage with
         // the model's, and a surviving clone is exactly what makes an eviction free nothing.
@@ -154,6 +227,17 @@ impl MiniMaxH3Dit {
     /// which is the failure mode this list exists to make testable.
     pub fn names(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
         let mut v = DitProjections::names();
+        v.extend(TokenRefiner::names("token_refiner", cfg));
+        for i in 0..cfg.num_layers {
+            v.extend(DitBlock::names(&format!("transformer_blocks.{i}")));
+        }
+        v
+    }
+
+    /// Every tensor name the DiT consumes on the **pruned** (sc-26684) path: the published set
+    /// minus the four `time_embedder` tensors, plus `adaln_t_table` — `50 · 12 + 21 + 14`.
+    pub fn names_curve(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
+        let mut v = DitProjections::names_curve();
         v.extend(TokenRefiner::names("token_refiner", cfg));
         for i in 0..cfg.num_layers {
             v.extend(DitBlock::names(&format!("transformer_blocks.{i}")));
@@ -194,6 +278,46 @@ impl MiniMaxH3Dit {
     /// Whether every block still holds its AdaLN projection.
     pub fn holds_adaln(&self) -> bool {
         self.blocks.iter().all(DitBlock::holds_adaln)
+    }
+
+    /// The direct, centered-curve AdaLN this pruned checkpoint carries, or `None` on the stock
+    /// path.
+    pub fn curve(&self) -> Option<&CurveAdaLn> {
+        self.curve.as_ref()
+    }
+
+    /// **The model's pruning identity** — the content hash of the direct curve's table, every
+    /// reduced projection and every folded bias at their stored dtypes. `None` on the stock path.
+    ///
+    /// This is what a consumer compatibility check or a held-AdaLnCache reuse decision keys on:
+    /// two same-shaped checkpoints with different bases hash differently, and no body weight,
+    /// quant code or filesystem path takes part in the digest. See
+    /// [`crate::dit::curve::CurveAdaLn::identity`] and
+    /// [`AdaLnCache::is_current_for_pruning`].
+    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+        self.curve.as_ref().map(CurveAdaLn::identity)
+    }
+
+    /// Which AdaLN modulation topology this checkpoint presents — the axis the strict adapter
+    /// install ([`crate::adapters`]) classifies unmatched targets against (sc-26688).
+    pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        match self.curve {
+            Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            None => crate::adapters::AdaLnSurface::FullTimestepMlp,
+        }
+    }
+
+    /// Refuse an unpruned model or a different table/basis before serving an expected source.
+    pub fn ensure_pruning_identity(
+        &self,
+        expected: &candle_gen::gen_core::pruned_adaln::PruningIdentity,
+    ) -> Result<()> {
+        match self.pruning_identity() {
+            Some(identity) if &identity == expected => Ok(()),
+            actual => Err(CandleError::Msg(format!(
+                "minimax-h3 pruning identity mismatch: expected {expected:?}, got {actual:?}"
+            ))),
+        }
     }
 
     /// **The adapter addressing seam** (sc-18728) — resolve a dotted module path, pre-split into
@@ -242,8 +366,11 @@ impl MiniMaxH3Dit {
             .count()
     }
 
-    /// Bytes of `adaln_proj` weight the blocks currently hold — the eviction's headline number.
+    /// Resident AdaLN bytes: full block projections, or the pruned table and F32 compute operands.
     pub fn adaln_nbytes(&self) -> usize {
+        if let Some(curve) = &self.curve {
+            return curve.nbytes();
+        }
         self.blocks
             .iter()
             .filter_map(DitBlock::adaln_proj)
@@ -268,9 +395,32 @@ impl MiniMaxH3Dit {
 
     /// The timestep MLP, as the closure [`AdaLnCache::precompute`] consumes.
     pub fn embed_timesteps(&self, timesteps: &[f32]) -> Result<Tensor> {
-        self.projections
-            .time_embedder
-            .forward(timesteps, &self.device)
+        let embedder = self.projections.time_embedder.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "minimax-h3 dit: this checkpoint is modulation-pruned (sc-26684); there is no \
+                 timestep MLP — the direct curve table replaces it, and the coordinates come from \
+                 `curve_coordinates`"
+                    .into(),
+            )
+        })?;
+        embedder.forward(timesteps, &self.device)
+    }
+
+    /// Interpolate the direct curve table at `timesteps` — the pruned (sc-26684) counterpart of
+    /// [`Self::embed_timesteps`], producing `[num_timesteps, rank]` F32 coordinates with **no**
+    /// activation. Errors on the stock path: the two embedding sources must never be mixed on one
+    /// model.
+    pub fn curve_coordinates(&self, timesteps: &[f32]) -> Result<Tensor> {
+        self.curve
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3 dit: this checkpoint carries the full timestep MLP, not a curve \
+                     table — `embed_timesteps` is the embedding source here"
+                        .into(),
+                )
+            })?
+            .coordinates(timesteps, &self.device)
     }
 
     /// **One whole model evaluation**, in the reference's own argument shape.
@@ -301,6 +451,13 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<(Tensor, Tensor)> {
+        if let BlockModulation::Cached(cache) = blocks {
+            if cache.pruning_identity() != self.pruning_identity() {
+                return Err(CandleError::Msg(
+                    "minimax-h3: cached modulation pruning identity mismatch".into(),
+                ));
+            }
+        }
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -332,6 +489,9 @@ impl MiniMaxH3Dit {
             // One table row block per timestep row of `temb` — `AdaLnProjection::forward` rejects
             // a non-rank-2 `temb` later, so a missing first dim here just defers to that error.
             BlockModulation::Temb(temb) => temb.dims().first().copied().unwrap_or(0) * MODALITY_NUM,
+            BlockModulation::CurveCoords(coords) => {
+                coords.dims().first().copied().unwrap_or(0) * MODALITY_NUM
+            }
         };
         crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
         for (layer, block) in self.blocks.iter().enumerate() {
@@ -352,9 +512,16 @@ impl MiniMaxH3Dit {
                     packed.tables,
                     veda.map(|(runtime, step)| (runtime, layer, step)),
                 )?,
+                BlockModulation::CurveCoords(coords) => block.forward_veda(
+                    &x,
+                    &block.curve_modulation(coords)?,
+                    packed.adaln_indices,
+                    &self.rope,
+                    packed.tables,
+                    veda.map(|(runtime, step)| (runtime, layer, step)),
+                )?,
             };
         }
-
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
         //    row-wise affine maps) and skips the text rows' outputs, which it discards.
@@ -406,6 +573,22 @@ pub struct PackedForward<'a> {
     pub audio_indices: &'a [u32],
 }
 
+/// The resident path's per-row AdaLN index (`row_class · MODALITY_NUM + token_tag`) and its
+/// per-row bare row-class index (`norm_out` gathers with), both constant across steps because
+/// neither the class nor the tag of a row ever moves.
+fn resident_local_indices(layout: &PackedLayout, device: &Device) -> Result<(Tensor, Tensor)> {
+    let local: Vec<u32> = layout
+        .row_classes()
+        .iter()
+        .zip(layout.token_tags())
+        .map(|(&c, &t)| c * MODALITY_NUM as u32 + t)
+        .collect();
+    let seq = local.len();
+    let local = Tensor::from_vec(local, (seq,), device)?;
+    let classes = Tensor::from_vec(layout.row_classes().to_vec(), (seq,), device)?;
+    Ok((local, classes))
+}
+
 /// Where a [`MiniMaxH3Dit::forward_packed`] takes its per-block modulation from.
 #[derive(Debug, Clone, Copy)]
 pub enum BlockModulation<'a> {
@@ -413,6 +596,9 @@ pub enum BlockModulation<'a> {
     Cached(&'a AdaLnCache),
     /// A live timestep embedding, projected per block — the resident path.
     Temb(&'a Tensor),
+    /// Live curve coordinates `[row_classes, rank]` — the resident path of a pruned (sc-26684)
+    /// checkpoint, projected per block through the reduced projections with no activation.
+    CurveCoords(&'a Tensor),
 }
 
 /// Scatter `concat(text, video, audio)` into one `[1, seq_len, F]` packed sequence.
@@ -543,55 +729,79 @@ impl JointDit {
         let device = dit.device.clone();
 
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
-            match residency {
-                AdaLnResidency::PrecomputeAndEvict => {
-                    // The timestep embedding is captured out of the closure so `norm_out`'s own
-                    // table is projected from the SAME `temb` the block stack's was — a second
-                    // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
-                    let mut captured: Option<Tensor> = None;
-                    let embedder = dit.projections.time_embedder.clone();
-                    let embed_device = device.clone();
-                    let (cache, released) = AdaLnCache::precompute_and_evict(
-                        &mut dit.blocks,
-                        schedule,
-                        residency,
-                        &device,
-                        |timesteps| {
-                            let temb = embedder.forward(timesteps, &embed_device)?;
-                            captured = Some(temb.clone());
-                            Ok(temb)
-                        },
-                    )?;
-                    let temb = captured.ok_or_else(|| {
-                        CandleError::Msg(
-                            "minimax-h3 dit: the AdaLN precompute did not evaluate the timestep \
-                             embedding"
-                                .into(),
+            if let Some(curve) = &dit.curve {
+                // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
+                // are ~175 MB of F32 compute buffers — so PrecomputeAndEvict releases zero and
+                // Resident simply re-interpolates the table per step; both residencies are
+                // legal, and neither touches a timestep MLP (there is none to call).
+                match residency {
+                    AdaLnResidency::PrecomputeAndEvict => {
+                        let (cache, norm_out) = curve.precompute(&dit.blocks, &schedule)?;
+                        (
+                            Modulation::Cached(Box::new(cache)),
+                            Some(norm_out),
+                            None,
+                            None,
+                            0,
                         )
-                    })?;
-                    let norm_out = dit.projections.norm_out.modulation(&temb)?;
-                    (
-                        Modulation::Cached(Box::new(cache)),
-                        Some(norm_out),
-                        None,
-                        None,
-                        released,
-                    )
+                    }
+                    AdaLnResidency::Resident => {
+                        let local = resident_local_indices(&layout, &device)?;
+                        (Modulation::Resident, None, Some(local.0), Some(local.1), 0)
+                    }
                 }
-                AdaLnResidency::Resident => {
-                    // One temb row per ROW CLASS, rebuilt per step; the index tensors are therefore
-                    // the local `row_class · MODALITY_NUM + tag`, which is constant across steps
-                    // because neither the class nor the tag of a row ever moves.
-                    let local: Vec<u32> = layout
-                        .row_classes()
-                        .iter()
-                        .zip(layout.token_tags())
-                        .map(|(&c, &t)| c * MODALITY_NUM as u32 + t)
-                        .collect();
-                    let seq = local.len();
-                    let local = Tensor::from_vec(local, (seq,), &device)?;
-                    let classes = Tensor::from_vec(layout.row_classes().to_vec(), (seq,), &device)?;
-                    (Modulation::Resident, None, Some(local), Some(classes), 0)
+            } else {
+                match residency {
+                    AdaLnResidency::PrecomputeAndEvict => {
+                        // The timestep embedding is captured out of the closure so `norm_out`'s own
+                        // table is projected from the SAME `temb` the block stack's was — a second
+                        // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
+                        let mut captured: Option<Tensor> = None;
+                        let embedder = dit.projections.time_embedder.clone();
+                        let embed_device = device.clone();
+                        let (cache, released) = AdaLnCache::precompute_and_evict(
+                            &mut dit.blocks,
+                            schedule,
+                            residency,
+                            &device,
+                            |timesteps| {
+                                let temb = embedder
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        CandleError::Msg(
+                                            "minimax-h3 dit: the AdaLN precompute had no \
+                                             timestep embedding to evaluate"
+                                                .into(),
+                                        )
+                                    })?
+                                    .forward(timesteps, &embed_device)?;
+                                captured = Some(temb.clone());
+                                Ok(temb)
+                            },
+                        )?;
+                        let temb = captured.ok_or_else(|| {
+                            CandleError::Msg(
+                                "minimax-h3 dit: the AdaLN precompute did not evaluate the \
+                                 timestep embedding"
+                                    .into(),
+                            )
+                        })?;
+                        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+                        (
+                            Modulation::Cached(Box::new(cache)),
+                            Some(norm_out),
+                            None,
+                            None,
+                            released,
+                        )
+                    }
+                    AdaLnResidency::Resident => {
+                        // One temb row per ROW CLASS, rebuilt per step; the index tensors are
+                        // therefore the local `row_class · MODALITY_NUM + tag`, which is constant
+                        // across steps because neither the class nor the tag of a row ever moves.
+                        let (local, classes) = resident_local_indices(&layout, &device)?;
+                        (Modulation::Resident, None, Some(local), Some(classes), 0)
+                    }
                 }
             };
 
@@ -632,6 +842,12 @@ impl JointDit {
     /// Bytes of `adaln_proj` weight the eviction released — 0 under [`AdaLnResidency::Resident`].
     pub fn released_bytes(&self) -> usize {
         self.released_bytes
+    }
+
+    /// The loaded checkpoint's pruning identity, `None` on the stock path — the compatibility key
+    /// a consumer checks a held [`AdaLnCache`] against ([`AdaLnCache::is_current_for_pruning`]).
+    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+        self.dit.pruning_identity()
     }
 
     /// Model evaluations run so far. The loop must call [`JointVelocity::forward`] exactly once per
@@ -677,14 +893,25 @@ impl JointVelocity for JointDit {
                 (
                     local.clone(),
                     classes.clone(),
-                    Some(self.dit.embed_timesteps(&step.row_timesteps)?),
+                    Some(if self.dit.curve.is_some() {
+                        self.dit.curve_coordinates(&step.row_timesteps)?
+                    } else {
+                        self.dit.embed_timesteps(&step.row_timesteps)?
+                    }),
                 )
             }
         };
+
         // `norm_out`'s table is per-timestep, so under the resident residency it moves every step
         // and is rebuilt from that step's own four row-class timesteps.
         let norm_out = match (&resident_temb, &self.norm_out_modulation) {
-            (Some(temb), _) => self.dit.projections.norm_out.modulation(temb)?,
+            (Some(temb), _) => {
+                if let Some(curve) = &self.dit.curve {
+                    curve.norm_out_modulation(temb)?
+                } else {
+                    self.dit.projections.norm_out.modulation(temb)?
+                }
+            }
             (None, Some(cached)) => cached.clone(),
             (None, None) => {
                 return Err(CandleError::Msg(
@@ -708,7 +935,13 @@ impl JointVelocity for JointDit {
         };
         let blocks = match (&self.modulation, &resident_temb) {
             (Modulation::Cached(cache), _) => BlockModulation::Cached(cache),
-            (Modulation::Resident, Some(temb)) => BlockModulation::Temb(temb),
+            (Modulation::Resident, Some(temb)) => {
+                if self.dit.curve.is_some() {
+                    BlockModulation::CurveCoords(temb)
+                } else {
+                    BlockModulation::Temb(temb)
+                }
+            }
             (Modulation::Resident, None) => {
                 return Err(CandleError::Msg(
                     "minimax-h3 dit: resident residency without a timestep embedding".into(),
@@ -1001,6 +1234,7 @@ mod veda_controls_tests {
         (bits, calls, observed)
     }
     #[test]
+    #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
         for mode in 0..5 {
             for tier in [None, Some(4), Some(8)] {
@@ -1013,6 +1247,7 @@ mod veda_controls_tests {
         }
     }
     #[test]
+    #[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
     fn native_base_and_all_published_turbo_steps_reach_attention() {
         for (name, steps, shift, mode) in [
             ("base", 50, 12.0, 0),

@@ -513,7 +513,7 @@ impl DitAttention {
 /// This is a **correctness guard**, not a memory operating point; it is deliberately much larger
 /// than the memory rung's `CONSTRAINED_ATTN_SCORES_BUDGET` and is not published as a strategy
 /// parameter.
-pub const FFN_INTERMEDIATE_BUDGET: u64 = 1_000_000_000;
+pub const FFN_INTERMEDIATE_BUDGET: u64 = candle_gen::gen_core::h3_memory::FFN_INTERMEDIATE_BUDGET;
 
 /// The planned token-block length for a SwiGLU intermediate of `leading × seq × width` elements —
 /// `seq` itself when the whole intermediate already fits, otherwise a value in `1..seq`.
