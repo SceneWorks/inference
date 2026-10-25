@@ -116,6 +116,66 @@ pub fn convrot_rotate(x: &Tensor, r: &Tensor) -> Result<Tensor> {
     Ok(xr)
 }
 
+/// The **pinned fused ConvRot butterfly**, in F32, off the source-dtype activation.
+///
+/// `int8_linear.cu::quantize_int8_rowwise_convrot_kernel` (blob `4c7d49e7`) does not multiply by a
+/// materialized rotation matrix: it loads the row into shared F32 and runs four radix-4 stages
+/// (strides `1, 4, 16, 64`), each `0.5f * h4_row_dot(d, x0, x1, x2, x3)` — three left-to-right
+/// binary32 additions and one exact `* 0.5` — block-diagonally over 256-column groups. The row
+/// absmax and scale are then taken from those **F32** values, before `quant_div_float_to_float<T>`
+/// rounds anything to the activation dtype.
+///
+/// This is deliberately *not* [`convrot_rotate`]: a dense `x·H` matmul re-associates the per-element
+/// additions (and in the source dtype rounds the rotated values first), so its absmax/scale differ
+/// from the pinned kernel in the last ulps. For a BF16 row whose exact rotated peak is `1/16 +
+/// 1/4096`, the dtype-rounded peak is `0.0625` instead, and the two divisors select different int8
+/// codes.
+///
+/// Each add below is its own elementwise binary32 op, so the per-element summation order is the
+/// kernel's: `((a+b)+c)+(-d)`, `((a+b)-c)+d`, `((a-b)+c)+d`, `((-a)+b+c)+d`. The result is always
+/// F32; the quantizer owns the only source-dtype rounding.
+pub fn convrot_fht_f32(x: &Tensor, group: usize) -> Result<Tensor> {
+    if !is_power_of_four(group) {
+        candle_core::bail!(
+            "ConvRot FHT order {group} is not a power of four (16, 64, 256, 1024, …)"
+        );
+    }
+    let dims = x.dims().to_vec();
+    let k = *dims
+        .last()
+        .expect("convrot_fht_f32: activation has a last dim");
+    if !k.is_multiple_of(group) {
+        candle_core::bail!("ConvRot FHT: K ({k}) is not a multiple of group size ({group})");
+    }
+    let lead: usize = dims[..dims.len() - 1].iter().product();
+    let mut cur = x.to_dtype(DType::F32)?.reshape((lead, k))?;
+    let mut stride = 1usize;
+    while stride < group {
+        let blocks = lead * k / (4 * stride);
+        let view = cur.reshape((blocks, 4, stride))?;
+        let a = view.narrow(1, 0, 1)?;
+        let b = view.narrow(1, 1, 1)?;
+        let c = view.narrow(1, 2, 1)?;
+        let d = view.narrow(1, 3, 1)?;
+        let ab = (&a + &b)?;
+        let o0 = (&(&ab + &c)? - &d)?;
+        let o1 = (&(&ab - &c)? + &d)?;
+        let o2 = (&(&(&a - &b)? + &c)? + &d)?;
+        let o3 = (&(&(&a.neg()? + &b)? + &c)? + &d)?;
+        // `0.5f *` as its own elementwise binary32 multiply (a scalar `affine` would add `+0.0`
+        // and turn a `-0.0` stage result into `+0.0`, which the kernel does not do).
+        let half = Tensor::new(HALF, cur.device())?;
+        cur = Tensor::cat(&[&o0, &o1, &o2, &o3], 1)?
+            .broadcast_mul(&half)?
+            .reshape((lead, k))?;
+        stride *= 4;
+    }
+    cur.reshape(dims)
+}
+
+/// The kernel's per-stage `0.5f *` (an exact binary32 scale, applied as its own rounding step).
+const HALF: f32 = 0.5;
+
 #[cfg(test)]
 mod tests {
     use super::*;

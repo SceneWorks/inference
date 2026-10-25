@@ -1186,6 +1186,66 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
 
+    def assert_moss_positive_transport_budget(self, source: str) -> None:
+        self.assertIn("[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60", source)
+        run = source.split("function Owned-Run(", 1)[1].split("function Check-Device(", 1)[0]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", run)
+        self.assertIn('Require ($watch.Elapsed.TotalSeconds -lt $seconds) "Owned child timeout: $name"', run)
+        self.assertLess(run.index("$p.StandardOutput.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("$p.StandardError.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("Stop-Owned $owned"), run.index("[Threading.Tasks.Task]::WaitAll"))
+        # The two formerly 10-second positive smokes share the existing 60s helper watchdog.
+        for name in ("root-exits-before-pipe-child", "streamed-io"):
+            self.assertIn(f"'{name}' $SelfTestPositiveTimeoutSeconds {{", source)
+        for invariant in (
+            "var deadline = DateTime.UtcNow.AddSeconds(60);",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        ):
+            self.assertIn(invariant, source)
+        # Only SelfTest owns this budget. Product compile/campaign deadlines remain untouched.
+        product = source.split("Exact-Fields $c @('campaign'", 1)[1]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", product)
+        self.assertIn("'build' 10800", product)
+
+    def test_moss_positive_transport_budget_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assert_moss_positive_transport_budget(source)
+        guards = (
+            "[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60",
+            "'root-exits-before-pipe-child' $SelfTestPositiveTimeoutSeconds {",
+            "'streamed-io' $SelfTestPositiveTimeoutSeconds {",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        )
+        for guard in guards:
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_positive_transport_budget(source.replace(guard, ""))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'fake-timeout' 1 {", "'fake-timeout' $SelfTestPositiveTimeoutSeconds {"))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'streamed-io' $SelfTestPositiveTimeoutSeconds {", "'streamed-io' 10 {"))
+
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
     # so a renamed or dropped module would otherwise leave a green step that tests nothing.
@@ -4241,6 +4301,101 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "both Windows CUDA listeners share one 48-thread host; an uncapped Cargo "
                     "process on each listener can overwhelm Windows with rustc launches",
                 )
+
+    def test_heavy_windows_cuda_jobs_clear_only_the_sccache_wrapper(self) -> None:
+        """native-12219: the shared Windows box exports RUSTC_WRAPPER=sccache runner-globally.
+
+        Its daemon resets mid-build on heavy Candle/CUDA graphs (os error 10054) with ZERO rustc
+        diagnostics. The two heavy Candle jobs must clear the wrapper for the job only; every
+        sibling job keeps it, and no job may isolate/purge CARGO_HOME or a cache. See
+        memory `heavy_candle_cuda_lanes_must_disable_sccache.md`.
+        """
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        heavy = ("windows-cuda-check", "synthetic-w4a8-cuda")
+        step_name = "Disable unstable sccache wrapper for the heavy Candle lane"
+        clear_env = "Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='"
+        clear_process = "Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue"
+
+        self.assertNotIn(
+            "RUSTC_WRAPPER",
+            workflow.get("env") or {},
+            "the runner-global wrapper must not be replaced workflow-wide",
+        )
+
+        for name in ("windows-cuda-check", "synthetic-w4a8-cuda"):
+            self.assertIn(name, jobs)
+            with self.subTest(job=name):
+                job = jobs[name]
+                wrappers = [
+                    step
+                    for step in job["steps"]
+                    if step.get("name") == "Disable unstable sccache wrapper for the heavy Candle lane"
+                ]
+                self.assertEqual(
+                    1, len(wrappers), f"{name} needs exactly one job-local sccache clear"
+                )
+                wrapper = wrappers[0]
+                self.assertEqual(
+                    "powershell",
+                    wrapper.get("shell"),
+                    f"{name}: the canonical windows-candle step uses powershell",
+                )
+                run = wrapper.get("run", "")
+                self.assertIn(clear_env, run, f"{name} must write an empty RUSTC_WRAPPER to GITHUB_ENV")
+                self.assertIn(
+                    clear_process,
+                    run,
+                    f"{name} must also remove the already-exported process value",
+                )
+                self.assertNotIn(
+                    "RUSTC_WRAPPER",
+                    job.get("env") or {},
+                    f"{name}: the clear is per-step GITHUB_ENV, never a job env override",
+                )
+                self.assertNotIn(
+                    "CARGO_HOME",
+                    json.dumps(job),
+                    f"{name}: do not copy the STALE CARGO_HOME-isolation premise (70-min re-download)",
+                )
+                commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+                self.assertNotRegex(
+                    commands,
+                    r"(?i)(?:cargo\s+clean|rm\s+-rf|Remove-Item[^\n]*(?:cargo|target))",
+                    f"{name}: caches must stay intact, no purge",
+                )
+                self.assertTrue(
+                    any(
+                        "Swatinem/rust-cache" in str(step.get("uses", ""))
+                        for step in job["steps"]
+                    ),
+                    f"{name}: the registry/git/target cache restore must remain",
+                )
+
+        for name, job in jobs.items():
+            if name in heavy:
+                continue
+            with self.subTest(sibling=name):
+                self.assertNotIn(
+                    "Disable unstable sccache wrapper for the heavy Candle lane",
+                    [step.get("name") for step in job.get("steps", [])],
+                    f"{name} is a sibling job and must keep the runner-global wrapper",
+                )
+                self.assertNotIn(
+                    "RUSTC_WRAPPER",
+                    json.dumps(job),
+                    f"{name} must not disable the wrapper outside the two heavy lanes",
+                )
+
+        # GPU0 binding and the physical-UUID device order are part of the contract this repair
+        # must not disturb.
+        gpu = next(
+            step
+            for step in jobs["synthetic-w4a8-cuda"]["steps"]
+            if step.get("name") == "Bind H3 synthetic proof to physical GPU0 by UUID"
+        )
+        self.assertIn("CUDA_VISIBLE_DEVICES=$gpuUuid", gpu["run"])
+        self.assertIn("CUDA_DEVICE_ORDER=PCI_BUS_ID", gpu["run"])
 
     def test_merge_queue_speculative_ref_can_reach_the_workflow(self) -> None:
         triggers = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))[True]

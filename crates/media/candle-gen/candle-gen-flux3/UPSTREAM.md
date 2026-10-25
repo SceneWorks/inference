@@ -81,3 +81,24 @@ The parity tests read the MLX twin's committed fixtures
 `flux3_text_golden.safetensors`, `flux3_dit_golden.safetensors`, `flux3_ae_golden.safetensors`,
 `flux3_e2e_golden.safetensors`, and the real-weight CPU reference `flux3_real_golden_64.safetensors`
 read by the `#[ignore]`d `real_weights::` cases.
+
+### Prompt-upsampler oracle versus native device behavior (sc-26683)
+
+`tests/pup_parity.rs` runs all four frozen `flux3_pup_golden.safetensors` decoder cases through
+the real native loader on **CPU/F32**, including reference tokenization, public-token projection,
+locked boxes, stopping and raw-token accounting. The fixture generator
+`tools/dump_flux3_pup_golden.py` in the MLX tree computes those IDs and per-step margins with
+Torch CPU/F32. An isolated subprocess sets the existing `CANDLE_LLM_DEVICE=cpu` override;
+the original 0.02 margin allowance and minimum matching prefix are unchanged. The override is
+never applied to production or mutated in the parent test process.
+
+The separate `default_backend_executes_all_modes_with_ordered_references_and_locked_boxes`
+test uses the build-selected native loader (BF16 on CUDA/Metal, F32 on CPU). It executes all four
+modes, exact rendered prompts and prompt/reference token counts, ordered reference images,
+deterministic greedy adapter generation, ordered content progress, exact locked rows, and typed
+pre-cancellation. It does **not** compare BF16 token identities to the F32 oracle. A CPU/F32
+oracle margin is not a confidence certificate for a BF16 argmax; the MLX mixed-precision oracle
+also does not certify Candle CUDA arithmetic. The native loader's compute dtype follows its
+device; `core_llm::LoadSpec` has no F32-on-CUDA override (`quantize` controls weight storage).
+Numeric GPU parity requires a separately dtype/backend-matched oracle, not wider tolerances or
+re-pinning the CPU golden.

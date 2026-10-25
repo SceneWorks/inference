@@ -515,15 +515,19 @@ pub struct RepaTargets {
     pub teacher_grid: (usize, usize),
 }
 
-/// One activation-checkpointing region of a forward: its original inputs (on the tape, or not)
-/// and the boundary `Var`s its tape-free outputs became.
+/// One activation-checkpointing region, or a retained shared-conditioning frontier. Both expose
+/// boundary `Var`s so all readers' cotangents accumulate before their producer is traversed once.
 enum Region {
+    Shared {
+        inputs: Vec<Tensor>,
+        outs: Vec<Var>,
+    },
     Trunk {
         i: usize,
         ctx: TrunkCtx,
         inputs: Vec<Tensor>,
         has_txt: bool,
-        outs: (Var, Var),
+        outs: [Var; 2],
     },
     Pixel {
         i: usize,
@@ -531,6 +535,16 @@ enum Region {
         inputs: Vec<Tensor>,
         out: Var,
     },
+}
+
+impl Region {
+    fn outputs(&self) -> &[Var] {
+        match self {
+            Self::Shared { outs, .. } => outs,
+            Self::Trunk { outs, .. } => outs,
+            Self::Pixel { out, .. } => std::slice::from_ref(out),
+        }
+    }
 }
 
 thread_local! {
@@ -562,7 +576,65 @@ struct TrainHooks<'a> {
     regions: Vec<Region>,
 }
 
+impl TrainHooks<'_> {
+    /// Keep the small conditioning graph on the tape, but put a frontier at its fan-out. Replaying
+    /// each reader through that graph separately rounds its BF16 cotangent once per reader and
+    /// changes the chain rule's accumulation point (including for uncheckpointed selective blocks).
+    fn shared(&mut self, input: Tensor) -> Result<Tensor> {
+        if !self.ac.active() || !input.track_op() {
+            return Ok(input);
+        }
+        // `from_tensor` otherwise reuses an existing Var's ID, aliasing two frontier entries.
+        let out = Var::from_tensor(&input.detach())?;
+        let result = out.as_tensor().clone();
+        self.regions.push(Region::Shared {
+            inputs: vec![input],
+            outs: vec![out],
+        });
+        Ok(result)
+    }
+}
+
 impl ForwardHooks for TrainHooks<'_> {
+    fn timestep(&mut self, embedding: Tensor) -> Result<Tensor> {
+        self.shared(embedding)
+    }
+
+    fn trunk_conditioning(
+        &mut self,
+        image: Tensor,
+        text: Option<Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        if !self.ac.active() || (!image.track_op() && !text.as_ref().is_some_and(Tensor::track_op))
+        {
+            return Ok((image, text));
+        }
+        // The two cores share the timestep SiLU. Traverse them together, after all trunk readers,
+        // so that shared ancestor also receives the sum of its cotangents before its backward.
+        let image_out = Var::from_tensor(&image.detach())?;
+        let text_out = text
+            .as_ref()
+            .map(|t| Var::from_tensor(&t.detach()))
+            .transpose()?;
+        let result = (
+            image_out.as_tensor().clone(),
+            text_out.as_ref().map(|v| v.as_tensor().clone()),
+        );
+        let n = 1 + usize::from(text.is_some());
+        let mut inputs = Vec::with_capacity(n);
+        inputs.push(image);
+        inputs.extend(text);
+        let mut outs = Vec::with_capacity(n);
+        outs.push(image_out);
+        outs.extend(text_out);
+        self.regions.push(Region::Shared { inputs, outs });
+        Ok(result)
+    }
+
+    fn pixel_conditioning(&mut self, conditioning: Tensor) -> Result<Tensor> {
+        self.shared(conditioning)
+    }
+
     fn trunk_block(
         &mut self,
         dit: &IrisDiT,
@@ -596,7 +668,7 @@ impl ForwardHooks for TrainHooks<'_> {
                 ctx: ctx.clone(),
                 inputs,
                 has_txt: core_txt.is_some(),
-                outs: (sv.clone(), yv.clone()),
+                outs: [sv.clone(), yv.clone()],
             });
             (sv.as_tensor().clone(), yv.as_tensor().clone())
         } else {
@@ -678,11 +750,7 @@ fn merge_boundaries(
     regions: &[Region],
 ) -> Result<()> {
     for r in regions {
-        let outs: Vec<&Var> = match r {
-            Region::Trunk { outs, .. } => vec![&outs.0, &outs.1],
-            Region::Pixel { out, .. } => vec![out],
-        };
-        for v in outs {
+        for v in r.outputs() {
             if let Some(g) = store.get(v.as_tensor()) {
                 let id = v.as_tensor().id();
                 let s = match cot.remove(&id) {
@@ -698,8 +766,8 @@ fn merge_boundaries(
 
 /// The gradient of `loss` over `params` through a forward with checkpointed `regions`: the plain
 /// backward to the last boundaries, then, region by region in reverse, its recompute on the tape
-/// (the region's own parameter gradients and its input cotangents) and the propagation of those
-/// cotangents into whatever produced its inputs.
+/// (the region's own parameter gradients and its input cotangents). Retained shared-conditioning
+/// frontiers collect every reader's cotangent before propagating through their original graph.
 ///
 /// `loss` is taken by value and dropped once the plain backward has run: everything downstream of
 /// the last boundaries (the backbone's head, the loss, a task's own loss networks) is then off the
@@ -723,7 +791,15 @@ fn backward_segmented(
         let (earlier, rest) = regions.split_at(idx);
         let region = &rest[0];
         let take = |cot: &mut HashMap<TensorId, Tensor>, v: &Var| cot.remove(&v.as_tensor().id());
-        let (outs, in_vars): (Vec<(Tensor, Option<Tensor>)>, Vec<Var>) = match region {
+        let (outs, in_vars) = match region {
+            Region::Shared { inputs, outs } => (
+                inputs
+                    .iter()
+                    .zip(outs)
+                    .map(|(input, out)| (input.clone(), take(&mut cot, out)))
+                    .collect(),
+                None,
+            ),
             Region::Trunk {
                 i,
                 ctx,
@@ -744,8 +820,11 @@ fn backward_segmented(
                     has_txt.then(|| vars[3].as_tensor()),
                 )?;
                 (
-                    vec![(so, take(&mut cot, &outs.0)), (yo, take(&mut cot, &outs.1))],
-                    vars,
+                    vec![
+                        (so, take(&mut cot, &outs[0])),
+                        (yo, take(&mut cot, &outs[1])),
+                    ],
+                    Some(vars),
                 )
             }
             Region::Pixel {
@@ -760,7 +839,7 @@ fn backward_segmented(
                     .collect::<candle_gen::candle_core::Result<_>>()?;
                 let o =
                     tracked.run_pixel_block(*i, ctx, vars[0].as_tensor(), vars[1].as_tensor())?;
-                (vec![(o, take(&mut cot, out))], vars)
+                (vec![(o, take(&mut cot, out))], Some(vars))
             }
         };
         let Some(sur) = surrogate(&outs)? else {
@@ -768,8 +847,14 @@ fn backward_segmented(
         };
         let st = sur.backward()?;
         merge_params(&mut acc, &st, params)?;
+        let Some(in_vars) = in_vars else {
+            merge_boundaries(&mut cot, &st, earlier)?;
+            continue;
+        };
         let inputs = match region {
-            Region::Trunk { inputs, .. } | Region::Pixel { inputs, .. } => inputs,
+            Region::Shared { inputs, .. }
+            | Region::Trunk { inputs, .. }
+            | Region::Pixel { inputs, .. } => inputs,
         };
         let pairs: Vec<(Tensor, Option<Tensor>)> = inputs
             .iter()
@@ -1021,4 +1106,73 @@ pub fn init_projector(plan: &RepaPlan, seed: u64, device: &Device) -> Result<Par
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_conditioning_accumulates_before_the_bf16_cast_backward() {
+        // The real hooks/backward, with a scalar graph in place of the model's large regions.
+        // The miniature model supplies the replay context; no checkpoint weights are downloaded.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot/iris");
+        let cfg = candle_gen::gen_core::iris::IrisConfig::from_dir(&dir)
+            .unwrap()
+            .model;
+        let weights = random_init(&cfg, 0, false, &Device::Cpu).unwrap();
+        let model = TrainModel {
+            cfg,
+            compute: DType::F32,
+            device: Device::Cpu,
+            trainable: Trainable::Full,
+        };
+        let tracked = model.dit(&super::super::optim::snapshot(&weights)).unwrap();
+        let p = Var::new(1f32, &Device::Cpu).unwrap();
+        let params = Params::from([("p".to_owned(), p.clone())]);
+        let gradient = |ac, frontier| {
+            grads_under_ac(&tracked, Some(&tracked), ac, &params, |hooks| {
+                // Each reader's F32 cotangent is exactly representable in BF16. Their sum is
+                // halfway between BF16 values: cast(sum) != sum(cast(each)), on every CPU.
+                let source = p.to_dtype(DType::BF16)?.to_dtype(DType::F32)?;
+                let source = match frontier {
+                    0 => source, // Control: the old per-reader traversal of the shared graph.
+                    1 => hooks.timestep(source)?,
+                    2 => hooks.trunk_conditioning(source, None)?.0,
+                    3 => hooks.pixel_conditioning(source)?,
+                    _ => unreachable!(),
+                };
+                // These two small retained graphs stand in for separate region input VJPs.
+                let a = hooks.pixel_conditioning(source.affine(1.0, 0.0)?)?;
+                let b = hooks.pixel_conditioning(source.affine(1.0 / 256.0, 0.0)?)?;
+                Ok(a.add(&b)?)
+            })
+            .unwrap()["p"]
+                .to_vec0::<f32>()
+                .unwrap()
+        };
+        let plain = gradient(AcPolicy::None, 0);
+        assert_eq!(plain, 1.0, "round-to-even of the combined BF16 cotangent");
+        assert_ne!(gradient(AcPolicy::Full, 0), plain, "discriminating control");
+        for ac in [AcPolicy::Full, AcPolicy::SelectiveLayer { every: 2 }] {
+            for frontier in 1..=3 {
+                assert_eq!(gradient(ac, frontier), plain, "{ac:?} frontier {frontier}");
+            }
+            // The image/text cores share their own producer, so they must also propagate as
+            // one grouped frontier, not as two independent upstream backward traversals.
+            let grads = grads_under_ac(&tracked, Some(&tracked), ac, &params, |hooks| {
+                let source = p.to_dtype(DType::BF16)?.to_dtype(DType::F32)?;
+                let (image, text) = hooks.trunk_conditioning(
+                    source.affine(1.0, 0.0)?,
+                    Some(source.affine(1.0 / 256.0, 0.0)?),
+                )?;
+                let a = hooks.pixel_conditioning(image)?;
+                let b = hooks.pixel_conditioning(text.unwrap())?;
+                Ok(a.add(&b)?)
+            })
+            .unwrap();
+            assert_eq!(grads["p"].to_vec0::<f32>().unwrap(), plain, "{ac:?} cores");
+        }
+    }
 }

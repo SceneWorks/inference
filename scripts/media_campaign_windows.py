@@ -7,6 +7,7 @@ then resumed. An incompatible enclosing CI Job is an explicit refusal.
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import subprocess
 import time
@@ -43,6 +44,15 @@ class _ExtendedLimits(ctypes.Structure):
         ("BasicLimitInformation", _BasicLimits), ("IoInfo", _IoCounters),
         ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
         ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _BasicAccounting(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+        ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+        ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+        ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD),
     ]
 
 
@@ -95,6 +105,8 @@ def _apis():
     kernel.QueryInformationJobObject.restype = wintypes.BOOL
     kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel.TerminateJobObject.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.restype = wintypes.BOOL
     kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -287,17 +299,123 @@ class WindowsJob:
             raise _failed("QueryInformationJobObject/peak-memory")
         return max(total, limits.PeakJobMemoryUsed)
 
+    def _accounting(self) -> dict[str, int]:
+        accounting = _BasicAccounting()
+        if not self.kernel.QueryInformationJobObject(self.handle, 1, ctypes.byref(accounting),
+                                                      ctypes.sizeof(accounting), None):
+            raise _failed("QueryInformationJobObject/cleanup-accounting")
+        return {"total": int(accounting.TotalProcesses), "active": int(accounting.ActiveProcesses)}
+
     def terminate_and_reap(self, child: subprocess.Popen[bytes], grace: float) -> None:
-        # TerminateJobObject is atomic for every member, including descendants that outlive root.
-        if not self.kernel.TerminateJobObject(self.handle, 1):
-            raise _failed("TerminateJobObject")
-        child.wait(timeout=grace)
+        # Job-list removal is not a process-object exit signal. Retain authenticated handles
+        # before termination, and fence lifetime assignments both before and AFTER release.
+        # Unobserved/vanished births are UNPROVEN cleanup, never inferred dead from an empty list.
         until = time.monotonic() + grace
-        while time.monotonic() < until:
-            if not self.members():
-                return
-            time.sleep(0.01)
-        raise WindowsJobError("owned Job still has live processes after termination")
+        problems = []
+        handles = {}
+        opened = []
+        try:
+            initial = self._accounting()
+        except Exception as error:
+            initial = None
+            problems.append(error)
+
+        def capture(pids):
+            for pid in sorted(pids):
+                try:
+                    process = self.kernel.OpenProcess(0x00100000 | 0x1000, False, pid)
+                    if not process:
+                        if pid not in self.members():
+                            continue  # A missing handle must still balance the assignment fence.
+                        raise _failed(f"OpenProcess/cleanup({pid})")
+                    opened.append(process)
+                    owned = wintypes.BOOL()
+                    if not self.kernel.IsProcessInJob(process, self.handle, ctypes.byref(owned)):
+                        raise _failed("IsProcessInJob/cleanup")
+                    if not owned.value:
+                        raise WindowsJobError("cleanup process handle is not owned by this Job")
+                    handles[pid] = process
+                except Exception as error:
+                    problems.append(error)
+                    # Still acquire/wait other authenticated members. Never wait/kill this PID
+                    # through a handle whose ownership could not be proved.
+
+        def fence(check):
+            try:
+                current = self._accounting()
+                expected = None if initial is None else initial["active"] + current["total"] - initial["total"]
+                if initial is None or current["active"] != 0 or current["total"] < initial["total"] or expected != len(handles):
+                    problems.append(WindowsJobError(
+                        f"owned Job teardown unproven: check={check} job_live={current['active']} "
+                        f"accounted={len(handles)} expected={expected} "
+                        f"initial_live={None if initial is None else initial['active']} "
+                        f"assigned_total={current['total']} "
+                        f"initial_total={None if initial is None else initial['total']}"
+                    ))
+            except Exception as error:
+                problems.append(WindowsJobError(f"owned Job teardown unproven: check={check} accounting-error={error}"))
+
+        try:
+            try:
+                capture(self.members())
+            except Exception as error:
+                problems.append(error)
+            try:
+                if not self.kernel.TerminateJobObject(self.handle, 1):
+                    raise _failed("TerminateJobObject")
+            except Exception as error:
+                problems.append(error)
+            try:
+                child.wait(timeout=max(0.0, until - time.monotonic()))
+            except Exception as error:
+                problems.append(error)
+            waited = set()
+            while True:
+                for pid, process in handles.items():
+                    if pid in waited:
+                        continue
+                    try:
+                        remaining_ms = math.ceil(max(0.0, until - time.monotonic()) * 1000)
+                        status = self.kernel.WaitForSingleObject(process, remaining_ms)
+                        if status == 0x102:  # WAIT_TIMEOUT
+                            raise WindowsJobError("owned process did not signal exit within termination grace")
+                        if status != 0:  # WAIT_OBJECT_0 is the only completed process signal.
+                            raise _failed("WaitForSingleObject/cleanup")
+                    except Exception as error:
+                        problems.append(error)
+                    waited.add(pid)
+                try:
+                    live = self.members()
+                except Exception as error:
+                    problems.append(error)
+                    break
+                late = live - handles.keys()
+                if not late:
+                    if live:
+                        problems.append(WindowsJobError("owned Job still has live processes after termination"))
+                    break
+                if time.monotonic() >= until:
+                    problems.append(WindowsJobError(f"owned Job late-member drain exceeded termination grace: pids={sorted(late)}"))
+                    break
+                capture(late)
+                try:
+                    if not self.kernel.TerminateJobObject(self.handle, 1):
+                        raise _failed("TerminateJobObject/late-members")
+                except Exception as error:
+                    problems.append(error)
+            fence("after-retained-waits")
+        finally:
+            # Retain every acquired handle until ALL authenticated waits were attempted, even
+            # after a timeout, ownership error, or accounting failure. One shared grace, no sleeps.
+            for process in opened:
+                try:
+                    if not self.kernel.CloseHandle(process):
+                        raise _failed("CloseHandle/cleanup")
+                except Exception as error:
+                    problems.append(error)
+        fence("after-handle-release")
+        if problems:
+            raise WindowsJobError("owned Job teardown failed: " + "; ".join(str(error) for error in problems))
 
     def close(self) -> None:
         if self.handle:

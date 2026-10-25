@@ -55,8 +55,17 @@ def validate_generic_ci_context(event_name, payload, environment, expected_repos
                         "workflow-dispatch checkout ref must be a full branch or tag ref")
         feature_epic_policy.validate_event(
             event_name, payload, repository=expected_repository, active_sha=checkout)
-        current.require(payload.get("ref") == ref.removeprefix("refs/heads/").removeprefix(
-            "refs/tags/"), "workflow-dispatch event ref differs from checkout ref")
+        # The real workflow_dispatch payload carries the FULL dispatch ref
+        # (`refs/heads/<branch>`), which is also what GITHUB_REF holds. Older fixtures in this
+        # file use the short form (`main`), so normalize that form to a full ref before the
+        # equality check instead of comparing against the stripped GITHUB_REF.
+        payload_ref = payload.get("ref", "")
+        if payload_ref and not payload_ref.startswith(("refs/heads/", "refs/tags/")):
+            payload_ref = (
+                "refs/tags/" if ref.startswith("refs/tags/") else "refs/heads/"
+            ) + payload_ref
+        current.require(payload_ref == ref,
+                        "workflow-dispatch event ref differs from checkout ref")
     else:
         raise ValueError(f"unsupported source-closure test event {event_name!r}")
 

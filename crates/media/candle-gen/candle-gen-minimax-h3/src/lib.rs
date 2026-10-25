@@ -140,9 +140,10 @@ pub mod vae_encoder;
 pub mod veda;
 
 pub use adapters::{
-    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
-    is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha, resolve_rank,
-    MiniMaxH3LoraReport, BLOCK_TARGETS, DEFAULT_LORA_ALPHA,
+    adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, classify_unmatched_target,
+    convert_comfyui_key_space, is_comfyui_key_space, normalize_minimax_h3_key, resolve_alpha,
+    resolve_rank, AdaLnSurface, MiniMaxH3LoraReport, UnmatchedTargetClass, BLOCK_TARGETS,
+    DEFAULT_LORA_ALPHA,
 };
 pub use alias_free::{kaiser_sinc_filter1d, Activation1d, LowPassFilter1d, SnakeBeta, UpSample1d};
 pub use audio_config::{

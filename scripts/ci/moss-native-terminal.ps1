@@ -1,5 +1,11 @@
 # sc-26325: fixed native Rust acceptance only. No model acquisition or Python execution.
-param([switch]$SelfTest)
+param(
+    [switch]$SelfTest,
+    # Positive transport smokes include process startup, CIM discovery and asynchronous pipe
+    # scheduling on a shared runner. Match the existing fixture watchdog (60s), not throughput.
+    # This parameter never changes Owned-Run, product/campaign limits, or the 1s hung-child test.
+    [ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 function Require($condition, [string]$message) { if (-not $condition) { throw $message } }
@@ -750,7 +756,7 @@ try {
         $script:fixturePipeChildRelease=Join-Path $temp 'release-pipe-child'
         $script:fixturePipeChild=$null; $script:fixturePipeClock=[Diagnostics.Stopwatch]::StartNew()
         try {
-            Owned-Run 'powershell' @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'pipe-root-fixture.ps1')+'"')) 'root-exits-before-pipe-child' 10 {
+            Owned-Run 'powershell' @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'pipe-root-fixture.ps1')+'"')) 'root-exits-before-pipe-child' $SelfTestPositiveTimeoutSeconds {
                 param($ids,$owned)
                 if (-not $script:fixturePipeObserved -and (Test-Path -LiteralPath $script:fixturePipeReady)) {
                     $ready=Get-Content -Raw -LiteralPath $script:fixturePipeReady|ConvertFrom-Json
@@ -818,14 +824,24 @@ public static class MossIdentityFixture {
         $spaceHelper=Join-Path $temp 'native fixture (x86).exe'
         Copy-Item -LiteralPath $helper -Destination $spaceHelper
         $script:fixtureIoRelease=Join-Path $temp 'release io fixture (x86)'
+        $script:fixtureIoClock=[Diagnostics.Stopwatch]::StartNew(); $script:fixtureIoObserved=$false
         try {
-            Owned-Run $spaceHelper @('--io-fixture',('"'+$script:fixtureIoRelease+'"')) 'streamed-io' 10 {
+            Owned-Run $spaceHelper @('--io-fixture',('"'+$script:fixtureIoRelease+'"')) 'streamed-io' $SelfTestPositiveTimeoutSeconds {
                 param($ids)
-                [IO.File]::WriteAllText($script:fixtureIoRelease,'release')
+                if (-not $script:fixtureIoObserved) {
+                    $script:fixtureIoObserved=$true
+                    Write-Output ('Owned stream authenticated/released: '+$script:fixtureIoClock.ElapsedMilliseconds)
+                    [IO.File]::WriteAllText($script:fixtureIoRelease,'release')
+                }
             }
+            Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'
             Require ([IO.File]::ReadAllText((Join-Path $temp 'streamed-io.stdout.log')) -ceq ('O'*131072)) 'Owned stdout lost or changed bytes'
             Require ([IO.File]::ReadAllText((Join-Path $temp 'streamed-io.stderr.log')) -ceq ('E'*131072)) 'Owned stderr lost or changed bytes'
-        } finally { Remove-Variable fixtureIoRelease -Scope Script }
+            Write-Output ('Owned stream byte-identical EOF: '+$script:fixtureIoClock.ElapsedMilliseconds)
+        } finally {
+            Write-Output ('Owned stream returned/finally: elapsed_ms='+$script:fixtureIoClock.ElapsedMilliseconds+' released='+$script:fixtureIoObserved+' budget_seconds='+$SelfTestPositiveTimeoutSeconds)
+            Remove-Variable fixtureIoRelease,fixtureIoClock,fixtureIoObserved -Scope Script
+        }
         $previousPath=$env:PATH
         $script:fixtureRelease=Join-Path $temp 'release-cargo-fixture'; $script:fixtureCargoObserved=$false
         try {

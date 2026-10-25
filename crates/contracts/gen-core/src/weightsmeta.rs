@@ -511,38 +511,12 @@ pub fn safetensors_path_tensor_headers(
             .collect())
     }
 
-    fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                // Same rule as `safetensors_dir_bytes`: a hidden directory is derived data (the
-                // Candle device-format cache) or bookkeeping, never a shard the loader opens.
-                if !is_hidden_dir(&path) {
-                    collect_files(&path, files)?;
-                }
-                continue;
-            }
-            let metadata = std::fs::metadata(&path)?;
-            if metadata.is_dir() {
-                continue;
-            }
-            if path.extension().and_then(|value| value.to_str()) == Some("safetensors")
-                && !is_hidden_file(&path)
-            {
-                files.push(path);
-            }
-        }
-        Ok(())
-    }
-
     let path = path.as_ref();
     if path.is_file() {
         return read_file(path);
     }
     let mut files = Vec::new();
-    collect_files(path, &mut files)?;
+    collect_safetensors_files(path, &mut files)?;
     files.sort();
     if files.is_empty() {
         return Err(Error::Msg(format!(
@@ -557,6 +531,32 @@ pub fn safetensors_path_tensor_headers(
         }
     }
     Ok(tensors.into_values().collect())
+}
+
+fn collect_safetensors_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            // Same rule as `safetensors_dir_bytes`: a hidden directory is derived data (the
+            // Candle device-format cache) or bookkeeping, never a shard the loader opens.
+            if !is_hidden_dir(&path) {
+                collect_safetensors_files(&path, files)?;
+            }
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) == Some("safetensors")
+            && !is_hidden_file(&path)
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// One tensor's header plus where its payload starts in the file (absolute byte offset).
@@ -827,6 +827,32 @@ pub fn read_safetensors_tensor_payloads(
         file.seek(SeekFrom::Start(location.file_offset))?;
         file.read_exact(&mut payload)?;
         payloads.insert(location.header.name, payload);
+    }
+    Ok(payloads)
+}
+
+/// Bounded companion reads over the same sorted, duplicate-resolving inventory as the header
+/// reader. Only selected small payloads are read, never a weight tensor.
+pub fn read_safetensors_path_tensor_payloads(
+    path: impl AsRef<Path>,
+    select: impl Fn(&SafetensorsTensorHeader) -> bool,
+    max_bytes_each: u64,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let path = path.as_ref();
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.to_path_buf());
+    } else {
+        collect_safetensors_files(path, &mut files)?;
+        files.sort();
+    }
+    let mut payloads = BTreeMap::new();
+    for file in files {
+        payloads.extend(read_safetensors_tensor_payloads(
+            file,
+            &select,
+            max_bytes_each,
+        )?);
     }
     Ok(payloads)
 }

@@ -41,6 +41,7 @@ pub mod block_residency;
 // A/B authority and a truthful opt-out for any path that cannot run one.
 pub mod capability;
 pub mod coherence;
+pub mod convrot_int8;
 pub mod error;
 pub mod img2img;
 pub mod logical_weights;
@@ -60,6 +61,9 @@ pub mod sampler;
 pub mod sc20686;
 pub mod scheduler;
 pub mod text_sample;
+// Native packed W4A8 (asym_w4a8_int8) projections (sc-26685): the descriptor-driven consume side of
+// the frozen Comfy Kitchen PR#90 dialect, sharing the S4 ConvRot activation kernels.
+pub mod w4a8_int8;
 pub mod weights;
 
 // Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,

@@ -137,12 +137,17 @@ class WorkflowTests(unittest.TestCase):
     def test_only_selected_numerical_lane_runs_without_operator_inputs(self):
         workflow = yaml.safe_load((gate.ROOT/'.github/workflows/ci.yml').read_text(encoding='utf-8'))
         inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'lanes'})
+        self.assertEqual(set(inputs), {'lanes', 'synthetic_w4a8'})
+        self.assertEqual(inputs['lanes']['default'], 'all')
+        self.assertEqual(inputs['synthetic_w4a8']['default'], 'none')
+        self.assertEqual(inputs['synthetic_w4a8']['options'], ['none', 'cuda', 'mlx', 'both'])
+        self.assertTrue(all(not spec.get('required', False) for spec in inputs.values()))
         self.assertNotIn('moss-edit-metal-lease', workflow['jobs'])
         for lane in ('moss-edit-metal', 'moss-edit-cuda'):
             for selected in (True, False):
                 for fork in (True, False):
-                    self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', lane, selected=selected, fork=fork), {lane})
+                    for synthetic in ('none', 'cuda', 'mlx', 'both'):
+                        self.assertEqual(selected_jobs(workflow, 'workflow_dispatch', lane, selected=selected, fork=fork, synthetic=synthetic), {lane})
             for event in ('push', 'pull_request', 'schedule', 'merge_group'):
                 self.assertNotIn(lane, selected_jobs(workflow, event, lane))
             mutant = copy.deepcopy(workflow)

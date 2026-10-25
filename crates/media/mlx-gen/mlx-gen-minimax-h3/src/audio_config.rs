@@ -49,7 +49,7 @@ pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
 /// Published latent width (`vae_latent_channels` / `latent_channels`).
 pub const AUDIO_LATENT_CHANNELS: usize = 32;
 /// Published output channel count — stereo, decoded as two independent mono waveforms.
-pub const AUDIO_OUTPUT_CHANNELS: u16 = 2;
+pub const AUDIO_OUTPUT_CHANNELS: u16 = mlx_gen::gen_core::h3_memory::AUDIO_OUTPUT_CHANNELS;
 /// Latent token rate: `sample_rate / ∏ upsample_rates` = `32000 / 800`.
 pub const AUDIO_TOKEN_RATE_HZ: u32 = 40;
 /// The `encoder_dim` default `from_pretrained` leaves in place; `latent_dim` derives from it.
