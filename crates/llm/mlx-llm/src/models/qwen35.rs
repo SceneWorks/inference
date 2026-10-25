@@ -64,7 +64,7 @@ impl PrecisionProfile {
             debug_assert!(!prism);
             Ok(add(
                 &weight.as_dtype(Dtype::Float32)?,
-                &Array::from_f32(1.0),
+                Array::from_f32(1.0),
             )?)
         } else {
             checkpoint_norm_weight(weight, prism)
