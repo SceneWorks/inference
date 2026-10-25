@@ -921,9 +921,16 @@ impl MossImageTrainer {
                     .as_ref()
                     .expect("heldout prepared")
                     .loss(&transformer, &set, req)?;
+            let observation = evaluation
+                .as_ref()
+                .expect("heldout prepared")
+                .observation(loss)?;
             probe.update(|r| {
                 r.factor_before = factors;
                 r.evaluation_before = Some(loss);
+                r.prepared_evaluation
+                    .get_or_insert_with(Default::default)
+                    .before = Some(observation);
             })?;
         }
         for step in start + 1..=c.steps {
@@ -1131,9 +1138,16 @@ impl MossImageTrainer {
                     .expect("heldout prepared")
                     .loss(&transformer, &set, req)?;
             let factors = audit::factors(&set)?;
+            let observation = evaluation
+                .as_ref()
+                .expect("heldout prepared")
+                .observation(loss)?;
             probe.update(|r| {
                 r.factor_after = factors;
                 r.evaluation_after = Some(loss);
+                r.prepared_evaluation
+                    .get_or_insert_with(Default::default)
+                    .after = Some(observation);
             })?;
             probe.frozen(
                 "backbone",

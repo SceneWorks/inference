@@ -124,8 +124,54 @@ pub struct FrozenReceipt {
     pub before: String,
     pub after: String,
 }
+/// Canonical hash encoding shared by both native diagnostic implementations.
+pub const EVALUATION_CONTENT_ENCODING: &str = "logical-row-major-f32-le-v1";
+
+/// Streaming canonical serialization: source values converted to F32, visited in
+/// logical row-major order, each serialized with `f32::to_le_bytes` (no header/padding).
+#[derive(Default)]
+pub struct EvaluationContentHasher(Sha256);
+impl EvaluationContentHasher {
+    pub fn update(&mut self, values: impl IntoIterator<Item = f32>) {
+        for value in values {
+            self.0.update(value.to_le_bytes());
+        }
+    }
+    pub fn finish(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
+}
+
+/// Actual prepared tensor metadata; hashes cover logical row-major F32 little-endian
+/// values, not storage padding or a regenerated input. Dtype/strides describe the source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationTensorDescriptor {
+    pub shape: Vec<usize>,
+    pub strides: Vec<usize>,
+    pub dtype: String,
+    pub content_encoding: String,
+    /// SHA256 of the canonical bytes defined by `content_encoding`. Both backends use
+    /// EvaluationContentHasher, but acceptance compares before/after ONLY WITHIN a run;
+    /// cross-backend numerical/hash equality is neither required nor expected. Never
+    /// compare content hashes with different encoding labels.
+    pub content_sha256: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvaluationObservation {
+    pub tensors: BTreeMap<String, EvaluationTensorDescriptor>,
+    pub sigma: f32,
+    pub loss: f32,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PreparedEvaluationReceipt {
+    pub before: Option<EvaluationObservation>,
+    pub after: Option<EvaluationObservation>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RunReceipt {
+    /// Test-support-only evidence, populated exclusively by an attached native probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_evaluation: Option<PreparedEvaluationReceipt>,
     #[serde(default)]
     pub request_identity: Option<gen_core::moss_image_training::recovery::RunIdentity>,
     #[serde(default)]
@@ -742,6 +788,56 @@ pub fn assert_complete_case(probe: &TrainingProbe, masks_required: bool) -> Resu
         // imply universal generalization. Fixed-evaluation learning belongs to the
         // epic's real-weight terminal cases, not this CPU recovery/update contract.
         assert!(before.is_finite() && after.is_finite());
+        let prepared = receipt
+            .prepared_evaluation
+            .as_ref()
+            .expect("prepared evaluation evidence");
+        let observed_before = prepared
+            .before
+            .as_ref()
+            .expect("prepared before evaluation");
+        let observed_after = prepared.after.as_ref().expect("prepared after evaluation");
+        assert_eq!(observed_before.loss.to_bits(), before.to_bits());
+        assert_eq!(observed_after.loss.to_bits(), after.to_bits());
+        assert!(observed_before.loss.is_finite() && observed_after.loss.is_finite());
+        assert!(observed_before.sigma.is_finite());
+        assert_eq!(
+            observed_before.sigma.to_bits(),
+            observed_after.sigma.to_bits()
+        );
+        assert_eq!(
+            observed_before.tensors.keys().collect::<Vec<_>>(),
+            observed_after.tensors.keys().collect::<Vec<_>>(),
+            "prepared evaluation tensor key sets changed"
+        );
+        assert_eq!(
+            observed_before.tensors, observed_after.tensors,
+            "before/after must consume identical prepared tensors"
+        );
+        let expected = if masks_required {
+            vec!["context", "latent", "mask", "noise"]
+        } else {
+            vec!["context", "latent", "noise"]
+        };
+        assert_eq!(
+            observed_before
+                .tensors
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for descriptor in observed_before.tensors.values() {
+            assert!(!descriptor.shape.is_empty() && descriptor.shape.iter().all(|&d| d > 0));
+            assert_eq!(descriptor.shape.len(), descriptor.strides.len());
+            assert!(!descriptor.dtype.is_empty());
+            assert_eq!(descriptor.content_encoding, "logical-row-major-f32-le-v1");
+            assert_eq!(descriptor.content_sha256.len(), 64);
+            assert!(descriptor
+                .content_sha256
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit()));
+        }
     }
     if masks_required {
         assert_eq!(full.masks.get("64x32"), Some(&vec![1., 1., 0.25, 0.25]));
@@ -761,4 +857,36 @@ pub fn assert_complete_case(probe: &TrainingProbe, masks_required: bool) -> Resu
         "evaluation must not advance the original training RNG/cursor/optimizer"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod prepared_evaluation_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_content_hash_is_little_endian_and_chunk_independent() {
+        let expected = format!(
+            "{:x}",
+            Sha256::digest([
+                0x00, 0x00, 0x80, 0x3f, // 1.0
+                0x00, 0x00, 0x00, 0x80, // -0.0
+                0x00, 0x00, 0x20, 0xc0, // -2.5
+            ])
+        );
+        let mut whole = EvaluationContentHasher::default();
+        whole.update([1.0, -0.0, -2.5]);
+        let mut chunks = EvaluationContentHasher::default();
+        chunks.update([1.0]);
+        chunks.update([-0.0, -2.5]);
+        assert_eq!(whole.finish(), expected);
+        assert_eq!(chunks.finish(), expected);
+    }
+
+    #[test]
+    fn unattached_receipt_omits_prepared_evaluation_and_old_receipts_default_to_absent() {
+        let value = serde_json::to_value(RunReceipt::default()).unwrap();
+        assert!(value.get("prepared_evaluation").is_none());
+        let restored: RunReceipt = serde_json::from_value(value).unwrap();
+        assert!(restored.prepared_evaluation.is_none());
+    }
 }

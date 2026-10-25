@@ -1,6 +1,9 @@
 //! Explicit test-support/terminal acceptance observations from the actual native tensors.
 use super::*;
-use gen_core_testkit::moss_training_probe::RunProbe;
+use gen_core_testkit::moss_training_probe::{
+    EvaluationContentHasher, EvaluationObservation, EvaluationTensorDescriptor, RunProbe,
+    EVALUATION_CONTENT_ENCODING,
+};
 use sha2::{Digest, Sha256};
 const CHUNK: usize = 4_194_304;
 
@@ -127,6 +130,43 @@ pub(super) fn prepare(
     })
 }
 impl Evaluation {
+    fn descriptor(tensor: &Tensor) -> Result<EvaluationTensorDescriptor> {
+        let mut hash = EvaluationContentHasher::default();
+        let flat = tensor.flatten_all()?;
+        for start in (0..flat.elem_count()).step_by(CHUNK) {
+            let values = flat
+                .narrow(0, start, CHUNK.min(flat.elem_count() - start))?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            hash.update(values);
+        }
+        Ok(EvaluationTensorDescriptor {
+            shape: tensor.dims().to_vec(),
+            strides: tensor.stride().to_vec(),
+            dtype: format!("{:?}", tensor.dtype()),
+            content_encoding: EVALUATION_CONTENT_ENCODING.into(),
+            content_sha256: hash.finish(),
+        })
+    }
+    pub(super) fn observation(&self, loss: f32) -> Result<EvaluationObservation> {
+        let mut tensors = std::collections::BTreeMap::new();
+        for (name, tensor) in [
+            ("latent", &self.latent),
+            ("context", &self.context),
+            ("noise", &self.noise),
+        ] {
+            tensors.insert(name.into(), Self::descriptor(tensor)?);
+        }
+        if let Some(mask) = &self.mask {
+            tensors.insert("mask".into(), Self::descriptor(mask)?);
+        }
+        Ok(EvaluationObservation {
+            tensors,
+            sigma: self.sigma,
+            loss,
+        })
+    }
+
     pub(super) fn loss(
         &self,
         model: &Transformer,
