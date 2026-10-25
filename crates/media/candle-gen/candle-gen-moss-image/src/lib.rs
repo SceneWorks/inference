@@ -4,6 +4,7 @@ mod edit;
 mod loader;
 pub mod memory_strategy;
 mod pipeline;
+mod release;
 mod text_encoder;
 mod transformer;
 
@@ -15,6 +16,7 @@ use candle_gen::gen_core::{self, moss_image::*, moss_image_edit::*, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
 use loader::Sources;
+use release::release_then_sync;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -38,18 +40,18 @@ impl State {
             .as_ref()
             .is_some_and(|renderer| edit || renderer.mode != mode);
         if release {
-            synchronize()?;
-            self.renderer = None;
+            release_then_sync(self.renderer.take(), synchronize)?;
         }
         Ok(release)
     }
     fn select_renderer(
         &mut self,
         mode: MossImageAcceleration,
+        synchronize: impl FnOnce() -> candle_gen::Result<()>,
         load: impl FnOnce() -> candle_gen::Result<pipeline::Renderer>,
     ) -> candle_gen::Result<()> {
         if self.renderer.as_ref().is_none_or(|r| r.mode != mode) {
-            self.renderer = None;
+            release_then_sync(self.renderer.take(), synchronize)?;
             self.renderer = Some(load()?);
         }
         Ok(())
@@ -209,13 +211,13 @@ impl MossImageGenerator {
             };
             self.run_locked(&mut state, request, inputs, edit, on_progress, admission)
         })();
-        // Edit renderers and reference K/V never survive a request. Synchronize before dropping
-        // owned state on every success/failure/cancellation, including invalid edit attempts.
+        // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
+        // synchronize after release so the next admission sees the recovered driver budget.
         if result.is_err() || edit.is_some() {
-            let sync = self.device.synchronize();
-            state.text = None;
-            state.renderer = None;
-            state.vae = None;
+            let sync = release_then_sync(
+                (state.text.take(), state.renderer.take(), state.vae.take()),
+                || self.device.synchronize(),
+            );
             if result.is_err() || sync.is_err() {
                 state.report = None;
                 state.edit_report = None;
@@ -277,12 +279,11 @@ impl MossImageGenerator {
                 .map_err(candle_gen::CandleError::from)
         })?;
         if staged {
-            self.device
-                .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.text = None;
-            state.renderer = None;
-            state.vae = None;
+            release_then_sync(
+                (state.text.take(), state.renderer.take(), state.vae.take()),
+                || self.device.synchronize(),
+            )
+            .map_err(candle_gen::CandleError::from)?;
         }
         let prompts = if req.prompt_batch.is_empty() {
             vec![req.prompt.clone()]
@@ -337,10 +338,8 @@ impl MossImageGenerator {
         };
         transformer::check_cancel(&req.cancel)?;
         if staged {
-            self.device
-                .synchronize()
+            release_then_sync(state.text.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
-            state.text = None;
         }
         let edit_references = edit
             .map(|e| edit::encode_references(&sources, e, &self.device, &req.cancel))
@@ -353,17 +352,15 @@ impl MossImageGenerator {
             .as_ref()
             .is_none_or(|p| p.mode != r.acceleration)
         {
-            self.device
-                .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
             if staged {
                 on_progress(Progress::Loading(LoadPhase::Renderer));
             }
             transformer::check_cancel(&req.cancel)?;
-            state.select_renderer(r.acceleration, || {
-                pipeline::Renderer::load(&sources, r.acceleration, &self.device)
-            })?;
+            state.select_renderer(
+                r.acceleration,
+                || Ok(self.device.synchronize()?),
+                || pipeline::Renderer::load(&sources, r.acceleration, &self.device),
+            )?;
         }
         if let Some(assets) = &edit_assets {
             assets.install(
@@ -404,10 +401,8 @@ impl MossImageGenerator {
             .adapter_reports
             .clone();
         if staged {
-            self.device
-                .synchronize()
+            release_then_sync(state.renderer.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
         }
         transformer::check_cancel(&req.cancel)?;
         let output = match inputs.output {
@@ -436,12 +431,12 @@ impl MossImageGenerator {
                 )?)
             }
         };
-        self.device
-            .synchronize()
-            .map_err(candle_gen::CandleError::from)?;
         if staged {
             state.vae = None;
         }
+        self.device
+            .synchronize()
+            .map_err(candle_gen::CandleError::from)?;
         transformer::check_cancel(&req.cancel)?;
         let conditioning = positive
             .receipts
@@ -802,14 +797,18 @@ fn verify_numerical_renderer_transitions(
             .release_for_request(mode, false, || Ok(device.synchronize()?))
             .unwrap();
         state
-            .select_renderer(mode, || {
-                Ok(pipeline::Renderer {
-                    mode,
-                    transformer: build(mode),
-                    dataspace: None,
-                    adapter_reports: vec![],
-                })
-            })
+            .select_renderer(
+                mode,
+                || Ok(device.synchronize()?),
+                || {
+                    Ok(pipeline::Renderer {
+                        mode,
+                        transformer: build(mode),
+                        dataspace: None,
+                        adapter_reports: vec![],
+                    })
+                },
+            )
             .unwrap();
         let actual = predict(&state.renderer.as_ref().unwrap().transformer);
         assert_eq!(actual, predict(&build(mode)));

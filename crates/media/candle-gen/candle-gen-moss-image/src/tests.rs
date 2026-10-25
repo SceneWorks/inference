@@ -650,7 +650,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
         })
     };
     state
-        .select_renderer(mode, || make(mode, DType::BF16))
+        .select_renderer(mode, || Ok(()), || make(mode, DType::BF16))
         .unwrap();
     let x = tensor(&ordinary["inputs"]["hidden_states"], DType::F32)
         .narrow(0, 0, 1)
@@ -669,11 +669,11 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
     let first = loader::tensor_f32(&run(&state)).unwrap();
     let accelerated = MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
     state
-        .select_renderer(accelerated, || make(accelerated, DType::F32))
+        .select_renderer(accelerated, || Ok(()), || make(accelerated, DType::F32))
         .unwrap();
     assert_eq!(state.renderer.as_ref().unwrap().mode, accelerated);
     state
-        .select_renderer(mode, || make(mode, DType::BF16))
+        .select_renderer(mode, || Ok(()), || make(mode, DType::BF16))
         .unwrap();
     assert_eq!(first, loader::tensor_f32(&run(&state)).unwrap());
 }
