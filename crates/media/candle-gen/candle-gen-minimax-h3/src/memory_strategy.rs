@@ -97,6 +97,7 @@
 //! is constructed per render. Mixed routes compare corrected task footprints, not gross files
 //! followed by the winner's dense eviction; pure dense/stock sizing remains unchanged.
 
+mod adapters;
 mod conditioning;
 
 use candle_gen::candle_core::quantized::GgmlDType;
@@ -339,6 +340,7 @@ impl ComponentBytes {
         use candle_gen::gen_core::h3_memory::{NativeAllocationFacts, NativeTaskAllocation};
         let mut winner: Option<(std::path::PathBuf, u64)> = None;
         let mut tasks = Vec::new();
+        let mut overlay = 0u64;
         let mut max_adaln = 0;
         let mut resolved = false;
         let mut pruning = None;
@@ -388,7 +390,15 @@ impl ComponentBytes {
                     }
                 }
             }
+            let adapter = if allocation.resolved && !spec.adapters.is_empty() {
+                let profile = adapters::profile(&dir, &spec.adapters, &allocation.projections)?;
+                overlay = overlay.max(profile.resident_bytes);
+                Some(profile)
+            } else {
+                None
+            };
             tasks.push(NativeTaskAllocation {
+                adapter,
                 resident_bytes: bytes,
                 constructor_bytes,
                 patch_size,
@@ -482,7 +492,11 @@ impl ComponentBytes {
                     || materialized_decoder_bytes(&root.join("audio_vae"), 2),
                     |n| n.audio_decode_resident_bytes,
                 ),
-            overlay: adapter_overlay_bytes(spec)?,
+            overlay: if resolved {
+                overlay
+            } else {
+                adapter_source_bytes(spec)?
+            },
             native_quant,
         })
     }
@@ -700,7 +714,13 @@ fn source_prune_sizing(
 /// What remains, and is not closed here, is the narrower window in which a *sized* file is swapped
 /// for a larger one between load and render. No load-time probe can see that; it is the ordinary
 /// time-of-check/time-of-use residual every path that sizes a file before reading it carries.
+/// Actual installed originals and prepared caches over source-selected task targets.
+/// The scalar is a route-independent envelope; request admission uses native.adapter_resident_bytes.
 pub fn adapter_overlay_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
+    Ok(ComponentBytes::resolve(spec)?.overlay)
+}
+
+fn adapter_source_bytes(spec: &LoadSpec) -> candle_gen::gen_core::Result<u64> {
     adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(|| {
         CoreError::Unsupported(format!(
             "{MODEL_ID}: every configured adapter must be on disk with a non-zero load-exact \
@@ -1391,6 +1411,29 @@ pub fn veda_workspace_bound(
     candle_gen::gen_core::veda::workspace::for_video_request(
         req,
         candle_gen::gen_core::veda::workspace::Backend::Cuda,
+    )
+}
+
+/// Loaded-generator sparse bounds use the same selected source geometry as conditioning.
+pub fn veda_workspace_bound_for_contract(
+    req: candle_gen::gen_core::veda::workspace::Request<'_>,
+    contract: &MemoryProviderContract,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>> {
+    if req.veda.is_none_or(|veda| !veda.enabled) {
+        return Ok(None);
+    }
+    let patch = match contract
+        .phase_facts
+        .as_ref()
+        .and_then(|p| p.native_quant.as_ref())
+    {
+        Some(native) => native.selected_patch(req)?,
+        None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
+    };
+    candle_gen::gen_core::veda::workspace::for_video_request_with_patch(
+        req,
+        candle_gen::gen_core::veda::workspace::Backend::Cuda,
+        patch,
     )
 }
 

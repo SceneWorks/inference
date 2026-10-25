@@ -31,13 +31,13 @@ on:
         type: choice
         options: [all, windows-cuda]
         default: all
-      # sc-26685: explicit operator route for the two synthetic W4A8 external-fixture suites. A
+      # sc-26685: explicit operator route for the synthetic H3 native suites (the W4A8
+      # external-fixture cases plus the pruned-AdaLN / adapter-topology complete-model cases). A
       # bare dispatch (`lanes: all`) does not run them, and `lanes: windows-cuda` would drag in the
       # whole manual CUDA lane, so these two commands are selectable on their own. They read only
-      # the committed `tests/fixtures/minimax_h3_w4a8.json` (1 fixture, no weights/Hub) and never
-      # touch a real-weight runner.
+      # committed synthetic fixtures (no weights, no Hub) and never touch a real-weight runner.
       synthetic_w4a8:
-        description: "none = no synthetic W4A8 lane; cuda = Candle CUDA only; mlx = MLX/Metal only; both = both"
+        description: "none = no synthetic H3 native lane; cuda = Candle CUDA only; mlx = MLX/Metal only; both = both"
         type: choice
         options: [none, cuda, mlx, both]
         default: none
@@ -797,26 +797,12 @@ jobs:
           fi
           echo "Testing: $args"
           cargo test --locked --lib --tests "${packages[@]}"
-      - name: Prove H3 pruned AdaLN against pinned CPU reference on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: >-
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration
-          pruned_adaln::native_pruned_adaln_matches_pinned_reference
-          -- --ignored --exact --nocapture
-      - name: Prove H3 adapter topology folding against reference on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: >-
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration
-          adapter_topology::native_pruned_turbo_adapter_residual_matches_reference
-          -- --ignored --exact --nocapture
+      # H3 complete-model/model-stack tests are `#[ignore]`d on both backends: ordinary PR/main
+      # CI compiles them but never executes a complete DiT, block stack, or native projection.
+      # Their only route is the explicit `workflow_dispatch` H3 synthetic lane
+      # (`synthetic-w4a8-mlx` for Metal, the manual `windows-cuda` job for Candle), each guarded by
+      # a positive exact execution count so a filtered/renamed run cannot pass vacuously. Do not
+      # re-add a `-- --ignored` H3 step to this ordinary job.
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -945,18 +931,23 @@ jobs:
       - name: Exercise LLM-only runtime catalog on NAX
         run: cargo test --locked --no-default-features --lib -p runtime-macos
 
-  # sc-26685: synthetic W4A8 native arithmetic on MLX/Metal, dispatch-only via `synthetic_w4a8`.
-  # Ordinary CI compiles these bodies but never executes them (`#[ignore]`), so the only prior
-  # evidence was a host run. The suite reads the committed 2.29 MB
-  # `tests/fixtures/minimax_h3_w4a8.json` through `include_str!` -- no weights, no Hub fetch --
-  # and runs three production-path cases: W4A8 forward vs the external reference, the mixed
-  # W4A8/ConvRot payload, and the loader's refusal cases.
+  # sc-26685: synthetic H3 native suites on MLX/Metal, dispatch-only via `synthetic_w4a8`.
+  # Ordinary CI compiles these bodies but never executes them (`#[ignore]`), so neither ordinary
+  # PR/main CI nor a push can run a complete model or block stack. Two suite families live here:
+  # the W4A8 external-fixture cases (the committed 2.29 MB
+  # `tests/fixtures/minimax_h3_w4a8.json` read through `include_str!`) and the H3 pruned-AdaLN /
+  # adapter-topology complete-model suites (committed synthetic fixtures). No weights and no Hub
+  # fetch in either; the HF_* env is isolated per run anyway.
   #
   # `rw-llm` is registered only on `nax-macos-2` (see real-weights.yml's weight-set table), unlike
   # `rw-chroma`, which is registered on both Macs. That keeps this job off the dev Mac's `nax`
   # listener that `macos-nax` selects.
+  #
+  # Every step below fails on Cargo's own status and then asserts the exact executed-test summary
+  # plus each printed test-name prefix. A renamed, deleted, or filtered-away case changes the
+  # count and reds the route, so a "0 tests ran" run can never pass.
   synthetic-w4a8-mlx:
-    name: Synthetic W4A8 native arithmetic (MLX/Metal, manual)
+    name: Synthetic H3 native suites (MLX/Metal, manual)
     needs: changes
     if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
@@ -1009,6 +1000,191 @@ jobs:
           grep -Fq "test w4a8_compare::native_forward_matches_the_external_reference ..." "$log"
           grep -Fq "test w4a8_compare::invalid_operands_are_refused_by_the_published_contract ..." "$log"
           grep -Fq "test w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic ..." "$log"
+      - name: Prove H3 AdaLN cache complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-adaln-cache-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_cache:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test adaln_cache::the_cache_reproduces_the_reference_modulation_table ..." "$log"
+          grep -Fq "test adaln_cache::the_precomputed_path_reproduces_the_naive_per_step_run ..." "$log"
+          grep -Fq "test adaln_cache::precompute_residual_bounds_the_mutation_floor ..." "$log"
+          grep -Fq "test adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong ..." "$log"
+          grep -Fq "test adaln_cache::a_step_off_by_one_in_the_remap_is_observable ..." "$log"
+          grep -Fq "test adaln_cache::skipping_the_local_to_global_remap_is_observable ..." "$log"
+          grep -Fq "test adaln_cache::the_cache_is_keyed_by_the_whole_schedule ..." "$log"
+          grep -Fq "test adaln_cache::the_cache_size_tracks_the_schedule_and_nothing_else ..." "$log"
+          grep -Fq "test adaln_cache::an_evicted_block_still_runs_but_cannot_project ..." "$log"
+          grep -Fq "test adaln_cache::resident_residency_refuses_to_precompute_and_evict ..." "$log"
+          grep -Fq "test adaln_cache::a_mis_shaped_timestep_embedding_is_rejected_before_eviction ..." "$log"
+      - name: Prove H3 AdaLN eviction memory release on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-adaln-evict-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_evict_memory:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test adaln_evict_memory::the_evicted_adaln_weights_leave_device_memory ..." "$log"
+      - name: Prove H3 adapter topology complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-adapter-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration adapter_topology:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 15 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test adapter_topology::native_pruned_turbo_adapter_residual_matches_reference ..." "$log"
+          grep -Fq "test adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies ..." "$log"
+          grep -Fq "test adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology ..." "$log"
+          grep -Fq "test adapter_topology::real_but_unaddressable_modules_name_the_exclusion ..." "$log"
+          grep -Fq "test adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically ..." "$log"
+          grep -Fq "test adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically ..." "$log"
+          grep -Fq "test adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically ..." "$log"
+          grep -Fq "test adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling ..." "$log"
+          grep -Fq "test adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta ..." "$log"
+          grep -Fq "test adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve ..." "$log"
+          grep -Fq "test adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto ..." "$log"
+          grep -Fq "test adapter_topology::the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint ..." "$log"
+          grep -Fq "test adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies ..." "$log"
+          grep -Fq "test adapter_topology::the_exact_corpus_is_bit_identical_across_partitions ..." "$log"
+          grep -Fq "test adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve ..." "$log"
+      - name: Prove H3 windowed block window complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-block-window-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration block_window:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 5 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test block_window::a_deferred_load_materializes_no_blocks ..." "$log"
+          grep -Fq "test block_window::windowed_and_resident_stacks_agree ..." "$log"
+          grep -Fq "test block_window::the_two_residency_modes_are_mutually_exclusive ..." "$log"
+          grep -Fq "test block_window::the_windowed_adaln_precompute_matches_the_resident_one ..." "$log"
+          grep -Fq "test block_window::every_window_opens_an_independent_view ..." "$log"
+      - name: Prove H3 bounded attention complete block stack on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-bounded-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration bounded_attention:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test bounded_attention::a_bounded_plan_threads_the_whole_block_stack ..." "$log"
+      - name: Prove H3 DiT I/O complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-dit-io-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_io:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test dit_io::the_model_embeds_the_context_before_refining_it ..." "$log"
+          grep -Fq "test dit_io::a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it ..." "$log"
+          grep -Fq "test dit_io::the_whole_model_reproduces_the_reference_velocity ..." "$log"
+      - name: Prove H3 pruned AdaLN complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-pruned-mlx.log"
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 4 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
+          grep -Fq "test pruned_adaln::full_model_live_coordinates_match_cache_and_refuse_foreign_basis ..." "$log"
+          grep -Fq "test pruned_adaln::full_model_detects_pruned_and_checks_pruning_identity ..." "$log"
+          grep -Fq "test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "$log"
+          grep -Fq "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11" "$log"
+      - name: Prove H3 turbo adapter fold complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-turbo-mlx.log"
+          # The five real-weight `#[ignore]`s in this module are SKIPPED by name: they need provided
+          # snapshots and belong to real-weights.yml, and `--ignored` alone would conscript them
+          # into this synthetic route. Exactly the eleven synthetic model bodies must execute.
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration turbo_lora:: -- --ignored --nocapture --test-threads=1 \
+            --skip published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas \
+            --skip the_real_turbo_lora_folds_onto_the_real_dit \
+            --skip turbo_render_records_a_measured_clip \
+            --skip exact_h3_trainer_file_receipt \
+            --skip manual_metal_exact_h3_trainer_runtime_receipt 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test turbo_lora::the_three_published_alphas_fold_at_one_and_one_sixteenth ..." "$log"
+          grep -Fq "test turbo_lora::the_installed_fold_keeps_the_bf16_factor_dtype ..." "$log"
+          grep -Fq "test turbo_lora::the_user_strength_multiplies_the_alpha_fold ..." "$log"
+          grep -Fq "test turbo_lora::every_target_resolves_across_both_stacks ..." "$log"
+          grep -Fq "test turbo_lora::an_unmatched_target_is_loud ..." "$log"
+          grep -Fq "test turbo_lora::a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not ..." "$log"
+          grep -Fq "test turbo_lora::h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation ..." "$log"
+          grep -Fq "test turbo_lora::a_file_matching_nothing_names_the_expected_key_space ..." "$log"
+          grep -Fq "test turbo_lora::every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary ..." "$log"
+          grep -Fq "test turbo_lora::a_peft_blob_rank_disagreeing_with_the_factors_is_refused ..." "$log"
+          grep -Fq "test turbo_lora::the_conversion_leaves_no_comfyui_module_behind ..." "$log"
+      - name: Prove H3 VEDA fixture complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-veda-fixture-mlx.log"
+          # Unit-test (`--lib`) target, not the integration binary. The device self-test is
+          # skipped by name: it is not a complete-model body and does not belong to this route.
+          cargo test --locked -p mlx-gen-minimax-h3 --lib veda_fixture:: -- --ignored --nocapture --test-threads=1 --skip selected_kernel_actual_device_smoke 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 2 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test veda_fixture::native_generator_learned_sparse_off_and_failure_paths ..." "$log"
+          grep -Fq "test veda_fixture::native_veda_controls_preserve_carriers_and_capture_published_schedules ..." "$log"
+      - name: Prove H3 full DitBlock model-block parity on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/h3-dit-parity-mlx.log"
+          # Full DitBlock (attention + FFN) executions. Individual linear/AdaLN/packing
+          # primitives in this module stay ordinary and are not selected by this filter.
+          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_parity:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          grep -Fq "test result: ok. 9 passed; 0 failed; 0 ignored" "$log"
+          grep -Fq "test dit_parity::adaln_modulation_matches_the_reference ..." "$log"
+          grep -Fq "test dit_parity::transformer_block_matches_the_reference ..." "$log"
+          grep -Fq "test dit_parity::every_norm_epsilon_is_wired_through ..." "$log"
+          grep -Fq "test dit_parity::reading_the_ffn_halves_gate_first_breaks_parity ..." "$log"
+          grep -Fq "test dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing ..." "$log"
+          grep -Fq "test dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked ..." "$log"
+          grep -Fq "test dit_parity::every_block_weight_is_load_bearing ..." "$log"
+          grep -Fq "test dit_parity::parity_residuals_bound_the_mutation_floor ..." "$log"
+          grep -Fq "test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "$log"
 
   # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
   # the lane.
@@ -1207,25 +1383,176 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+      # H3 complete-model/model-stack execution is reachable ONLY from this manual
+      # `workflow_dispatch` lane (and the MLX twin `synthetic-w4a8-mlx`); ordinary PR/main CI only
+      # compiles the bodies. Each step fails on Cargo's own status and then asserts the exact
+      # executed-test summary plus every printed test-name prefix, so a renamed, deleted, or
+      # filtered-away case reds the route instead of passing with zero tests.
       - name: Prove H3 ConvRot INT8 native projections against pinned Kitchen oracle
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8::native_projections_match_pinned_kitchen -- --ignored --exact --nocapture
-      - name: Prove H3 pruned AdaLN against pinned CPU reference on CUDA
+          set "LOG=%RUNNER_TEMP%\h3-convrot-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 1 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test convrot_int8::native_projections_match_pinned_kitchen ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 AdaLN eviction memory release on CUDA
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-adaln-evict-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adaln_evict_memory:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test adaln_evict_memory::the_evicted_adaln_weights_leave_memory ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 cross-backend DiT complete model on CUDA
         shell: cmd
         env:
           HF_HUB_OFFLINE: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture
-      - name: Prove H3 adapter topology folding against reference on CUDA
+          set "LOG=%RUNNER_TEMP%\h3-cross-backend-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration cross_backend:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 3 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test cross_backend::dit_agrees_with_the_mlx_lane ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 DiT I/O complete model on CUDA
         shell: cmd
         env:
           HF_HUB_OFFLINE: "1"
         run: |
           call "%VCVARS%"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology::native_adapter_folds_on_the_pruned_curve -- --ignored --exact --nocapture
+          set "LOG=%RUNNER_TEMP%\h3-dit-io-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_io:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 4 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_io::the_model_embeds_the_context_before_refining_it ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_io::the_whole_model_reproduces_the_reference_velocity ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_io::forward_packed_rejects_an_out_of_range_adaln_index ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_io::the_cached_modulation_path_reproduces_the_resident_one ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 pruned AdaLN complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-pruned-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 7 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11" "%LOG%" >nul || exit /b 1
+      - name: Prove H3 adapter topology complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-adapter-cuda.log"
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 13 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::native_adapter_folds_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::real_but_unaddressable_modules_name_the_exclusion ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 turbo adapter fold complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-turbo-cuda.log"
+          rem The three real-weight `#[ignore]`s in this module are SKIPPED by name: they need provided
+          rem snapshots and belong to real-weights.yml, and `--ignored` alone would conscript them.
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration turbo_lora:: -- --ignored --nocapture --test-threads=1 --skip manual_cuda_fabricated_lokr_install_receipt --skip exact_h3_trainer_file_receipt --skip manual_cuda_exact_h3_trainer_runtime_receipt >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 13 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::every_enumerated_target_resolves_through_the_model_tree ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::adaln_and_the_norms_are_not_addressable ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::the_install_folds_at_the_published_strength ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::the_installed_fold_keeps_the_factor_dtype ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::an_unmatched_target_is_surfaced_by_name ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::the_conversion_leaves_no_comfyui_module_behind ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 native VEDA controls complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-veda-model-cuda.log"
+          rem Unit-test (`--lib`) target, not the integration binary; CPU arithmetic on a complete
+          rem synthetic DiT + JointDit built through the production loader.
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --lib dit::model::tests:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit::model::tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit::model::tests::native_base_and_all_published_turbo_steps_reach_attention ..." "%LOG%" >nul || exit /b 1
+      - name: Prove H3 full DitBlock model-block parity on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: |
+          call "%VCVARS%"
+          set "LOG=%RUNNER_TEMP%\h3-dit-parity-cuda.log"
+          rem Full DitBlock (attention + FFN) executions. Individual linear/AdaLN/packing
+          rem primitives in this module stay ordinary and are not selected by this filter.
+          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_parity:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
+          set "RC=%ERRORLEVEL%"
+          type "%LOG%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"test result: ok. 9 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::adaln_modulation_matches_the_reference ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::transformer_block_matches_the_reference ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::every_norm_epsilon_is_wired_through ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::reading_the_ffn_halves_gate_first_breaks_parity ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::every_block_weight_is_load_bearing ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::parity_residuals_bound_the_mutation_floor ..." "%LOG%" >nul || exit /b 1
+          findstr /C:"test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "%LOG%" >nul || exit /b 1
       - name: Test Candle CUDA packages
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run

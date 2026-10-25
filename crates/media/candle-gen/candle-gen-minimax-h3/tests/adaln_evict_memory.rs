@@ -485,6 +485,7 @@ fn warm_up(c: &MiniMaxH3DitConfig, device: &Device) {
 }
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_evicted_adaln_weights_leave_memory() {
     pin_matmul_to_one_thread();
 

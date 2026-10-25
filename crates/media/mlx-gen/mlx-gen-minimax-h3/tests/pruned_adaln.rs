@@ -575,6 +575,7 @@ fn full_pruned_map(json: &serde_json::Value, table_perturb: f64) -> HashMap<Stri
 /// against a matching and a same-shape different-basis model. The pruned operands (table + reduced
 /// projections + folded biases) bind the identity; the synthetic heads/refiner do not.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn full_model_detects_pruned_and_checks_pruning_identity() {
     let json: serde_json::Value = serde_json::from_str(FIXTURE).expect("the pruned oracle fixture");
     let cfg = oracle_cfg();
@@ -615,6 +616,7 @@ fn full_model_detects_pruned_and_checks_pruning_identity() {
 }
 
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn full_model_live_coordinates_match_cache_and_refuse_foreign_basis() {
     use mlx_gen_minimax_h3::dit::model::{BlockModulation, PackedForward};
     use mlx_gen_minimax_h3::TimestepSchedule;
@@ -676,4 +678,208 @@ fn full_model_live_coordinates_match_cache_and_refuse_foreign_basis() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("pruning identity"), "{error}");
+}
+
+#[test]
+#[ignore = "explicit manual full-model numerical proof of selected unit patches and ordered mono/stereo reference conditioning; never ordinary CI"]
+fn manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control() {
+    use mlx_gen_minimax_h3::conditioning::{
+        keyframe_condition_rows, reference_audio_rows, KeyframeNoise,
+    };
+    use mlx_gen_minimax_h3::denoise::{
+        JointGeometry, JointStep, JointVelocity, PackedLayout, TEXT_TAG,
+    };
+    use mlx_gen_minimax_h3::dit::adaln::AdaLnResidency;
+    use mlx_gen_minimax_h3::dit::model::JointDit;
+    use mlx_gen_minimax_h3::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use mlx_gen_minimax_h3::pipeline::{
+        fl2va_layout, prepend_condition_audio_rows, prepend_condition_rows,
+        ref2va_layout_with_audio_channels, RequestGeometry,
+    };
+    use mlx_gen_minimax_h3::reference::ReferenceKind;
+    use mlx_gen_minimax_h3::TimestepSchedule;
+    let device = mlx_rs::Device::try_default().expect("manual proof needs an MLX device");
+    assert!(
+        matches!(device.get_type().unwrap(), mlx_rs::DeviceType::Gpu),
+        "explicit Metal proof must not run on CPU"
+    );
+    println!("H3 geometry/audio device={device}; backend=metal");
+    let json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    let cfg = oracle_cfg();
+    assert_eq!(cfg.patch_size, [1, 1, 1]);
+    let geometry = RequestGeometry {
+        width: 32,
+        height: 32,
+        joint: JointGeometry::new(5, 2, 2).unwrap(),
+    };
+    let target_video = Array::from_slice(
+        &vec![0.1f32; (geometry.joint.num_latent_frames * 4 * cfg.video_patch_dim()) as usize],
+        &[
+            1,
+            geometry.joint.num_latent_frames * 4,
+            cfg.video_patch_dim(),
+        ],
+    );
+    let target_audio = Array::from_slice(
+        &vec![0.2f32; (geometry.joint.num_audio_latents * 2 * cfg.audio_in_channels) as usize],
+        &[
+            1,
+            geometry.joint.num_audio_latents * 2,
+            cfg.audio_in_channels,
+        ],
+    );
+    let condition = Array::from_slice(
+        &vec![0.7f32; (cfg.in_channels * 4) as usize],
+        &[1, cfg.in_channels, 1, 2, 2],
+    );
+    let visual =
+        keyframe_condition_rows(&condition, cfg.patch_size, &KeyframeNoise::Seeded, 0).unwrap();
+    assert_eq!(visual.shape(), &[1, 4, cfg.in_channels]);
+    let context = Array::from_slice(&vec![0.3f32; cfg.text_dim as usize], &[1, 1, cfg.text_dim]);
+    let times = PackedLayout::row_timesteps(0.6, 0.4);
+    let schedule = TimestepSchedule::new(vec![times.to_vec()]).unwrap();
+    let completed = std::cell::Cell::new(0usize);
+    let check = |layout: PackedLayout, video: Array, audio: Array| {
+        assert_eq!(video.shape()[1] as usize, layout.video_indices().len());
+        assert_eq!(audio.shape()[1] as usize, layout.audio_indices().len());
+        assert_eq!(layout.audio_channels(), 2);
+        let indices = schedule
+            .adaln_indices(0, layout.row_classes(), layout.token_tags())
+            .unwrap();
+        let mut outputs = Vec::new();
+        for residency in [AdaLnResidency::Resident, AdaLnResidency::PrecomputeAndEvict] {
+            // Existing complete source-native fixture constructor preserves stored BF16/F16
+            // reduced operands, not coerced copies or a new producer's approximation.
+            let mut weights = Weights::from_map(full_pruned_map(&json, 0.));
+            assert_eq!(
+                weights
+                    .require("transformer_blocks.0.adaln_proj.linear.weight")
+                    .unwrap()
+                    .dtype(),
+                Dtype::Bfloat16
+            );
+            assert!(detect(&weights, &cfg).unwrap().is_some());
+            let model = MiniMaxH3Dit::from_weights(&mut weights, &cfg, Dtype::Float32).unwrap();
+            let mut driver =
+                JointDit::new(model, layout.clone(), &context, schedule.clone(), residency)
+                    .unwrap();
+            let step = JointStep {
+                index: 0,
+                layout: &layout,
+                video_rows: &video,
+                audio_rows: &audio,
+                adaln_indices: &indices,
+                row_timesteps: times,
+            };
+            let output = driver
+                .forward(&step)
+                .expect("actual full native joint model forward");
+            assert_eq!(output.0.shape(), video.shape());
+            assert_eq!(output.1.shape(), audio.shape());
+            mlx_rs::transforms::eval([&output.0, &output.1]).unwrap();
+            outputs.push(output);
+        }
+        for (cached, resident) in [
+            (&outputs[1].0, &outputs[0].0),
+            (&outputs[1].1, &outputs[0].1),
+        ] {
+            let a = cached.as_dtype(Dtype::Float32).unwrap();
+            let b = resident.as_dtype(Dtype::Float32).unwrap();
+            mlx_rs::transforms::eval([&a, &b]).unwrap();
+            assert!(a
+                .as_slice::<f32>()
+                .iter()
+                .chain(b.as_slice::<f32>())
+                .all(|v| v.is_finite()));
+            assert!(a.as_slice::<f32>().iter().any(|v| v.abs() > 1e-12));
+            assert_abs(
+                &a,
+                b.as_slice::<f32>(),
+                2e-5,
+                "unit-patch conditioned full-model cached/resident control",
+            );
+        }
+        completed.set(completed.get() + 1);
+    };
+    for anchors in [
+        vec![KeyframeAnchor::First],
+        vec![KeyframeAnchor::Last],
+        vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+    ] {
+        let layout = fl2va_layout(&geometry, &[TEXT_TAG], &anchors, cfg.patch_size).unwrap();
+        let refs: Vec<&Array> = anchors.iter().map(|_| &visual).collect();
+        let rows = mlx_rs::ops::concatenate_axis(&refs, 1).unwrap();
+        assert_eq!(layout.num_condition_video_rows(), 4 * anchors.len() as i32);
+        let video = prepend_condition_rows(&layout, Some(&rows), &target_video).unwrap();
+        check(layout, video, target_audio.clone());
+    }
+    for (a, b, reverse) in
+        (1i32..=2).flat_map(|a| (1i32..=2).flat_map(move |b| [false, true].map(move |r| (a, b, r))))
+    {
+        let mut references = vec![
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 3,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: 1,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 5,
+            },
+        ];
+        let mut channels = vec![a, 0, b];
+        let standalone = reference_audio_rows(&Array::from_slice(
+            &vec![0.5f32; (a * 3 * cfg.audio_in_channels) as usize],
+            &[a, 3, cfg.audio_in_channels],
+        ))
+        .unwrap();
+        let soundtrack = reference_audio_rows(&Array::from_slice(
+            &vec![0.8f32; (b * 5 * cfg.audio_in_channels) as usize],
+            &[b, 5, cfg.audio_in_channels],
+        ))
+        .unwrap();
+        let audio = if reverse {
+            references.reverse();
+            channels.reverse();
+            mlx_rs::ops::concatenate_axis(&[&soundtrack, &standalone], 1).unwrap()
+        } else {
+            mlx_rs::ops::concatenate_axis(&[&standalone, &soundtrack], 1).unwrap()
+        };
+        let layout = ref2va_layout_with_audio_channels(
+            &geometry,
+            &[TEXT_TAG],
+            &references,
+            &channels,
+            cfg.patch_size,
+        )
+        .unwrap();
+        assert_eq!(layout.num_condition_audio_rows(), a * 3 + b * 5);
+        assert_eq!(layout.num_condition_video_rows(), 8);
+        let video = prepend_condition_rows(
+            &layout,
+            Some(&mlx_rs::ops::concatenate_axis(&[&visual, &visual], 1).unwrap()),
+            &target_video,
+        )
+        .unwrap();
+        let audio = prepend_condition_audio_rows(&layout, Some(&audio), &target_audio).unwrap();
+        check(layout, video, audio);
+    }
+    assert_eq!(
+        completed.get(),
+        11,
+        "every keyframe and mixed-channel ordered case must execute"
+    );
+    println!("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11");
 }

@@ -1234,6 +1234,7 @@ mod veda_controls_tests {
         (bits, calls, observed)
     }
     #[test]
+    #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
         for mode in 0..5 {
             for tier in [None, Some(4), Some(8)] {
@@ -1246,6 +1247,7 @@ mod veda_controls_tests {
         }
     }
     #[test]
+    #[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
     fn native_base_and_all_published_turbo_steps_reach_attention() {
         for (name, steps, shift, mode) in [
             ("base", 50, 12.0, 0),

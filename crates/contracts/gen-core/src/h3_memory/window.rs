@@ -502,6 +502,7 @@ mod tests {
     }
     fn task(projections: Vec<NativeProjection>, table: u64, pruned: bool) -> NativeTaskAllocation {
         NativeTaskAllocation {
+            adapter: None,
             resident_bytes: u64::MAX / 2,
             constructor_bytes: 0,
             patch_size: [1, 2, 2],

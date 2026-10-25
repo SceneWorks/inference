@@ -315,6 +315,7 @@ fn max_abs(a: &Array) -> f32 {
 /// never rederived. The numeric-strength proof lives in the exact dyadic corpus below; this
 /// non-dyadic arm pins engine-to-engine equality on realistic bf16 factor shapes.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn body_deltas_are_identical_across_full_and_pruned_topologies() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -349,6 +350,7 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
 /// the same file on the full topology is refused as a deliberate exclusion. Neither surface folds
 /// the file, and neither drops the targets.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn full_topology_adaln_targets_are_refused_specifically_per_topology() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -427,6 +429,7 @@ fn full_topology_adaln_targets_are_refused_specifically_per_topology() {
 /// An adapter targeting a real module no H3 adapter can ever attach to (the bias-Linear I/O heads,
 /// the RMS norms) names the exclusion instead of a generic miss — actionable, on either topology.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn real_but_unaddressable_modules_name_the_exclusion() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -476,6 +479,7 @@ fn real_but_unaddressable_modules_name_the_exclusion() {
 /// are deliberately absent here: they are what let the per-file zero-match guard stay silent and
 /// concealed this hole.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_adaln_only_file_with_no_body_targets_is_refused_specifically() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -523,6 +527,7 @@ fn an_adaln_only_file_with_no_body_targets_is_refused_specifically() {
 /// H3 adapter can attach to (the I/O heads, the RMS norms) — again with **no** compatible body
 /// target — is refused with the exclusion error that lists them, not the generic zero-match error.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_excluded_only_file_with_no_body_targets_is_refused_specifically() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -566,6 +571,7 @@ fn an_excluded_only_file_with_no_body_targets_is_refused_specifically() {
 /// target — must be refused on the pruned curve as a topology mismatch naming the stem, not with
 /// the generic per-file zero-match error.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn an_adaln_only_lokr_with_no_body_targets_is_refused_specifically() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -618,6 +624,7 @@ fn an_adaln_only_lokr_with_no_body_targets_is_refused_specifically() {
 /// lookup to the table's final interval — and the pruned curve interpolates `adaln_t_table` at
 /// exactly those coordinates, matching the pinned `torch.lerp` addressing elementwise.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling() {
     let cfg = dit_fixture_config();
     let dit = pruned_dit(&cfg);
@@ -689,6 +696,7 @@ fn turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling(
 /// residual is bit-identical to the full-topology fold — the factored path never materializes a
 /// whole-model delta and never depends on the topology.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -732,6 +740,7 @@ fn a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta() {
 /// folds identically on the pruned curve and against an independent reference. The namespace
 /// mapping and the split-offset arithmetic are topology-independent.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -824,6 +833,7 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
 /// partition/topology of the selected checkpoint without coupling to the base weights — and why no
 /// stock-weight substitution can masquerade as an applied adapter.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -959,6 +969,7 @@ fn native_pruned_turbo_adapter_residual_matches_reference() {
 /// production `MiniMaxH3Dit::load(root, partition, …)` directory path, not `from_weights`, with
 /// two genuinely different partitions (`transformer`, `transformer_ref`) staged side by side.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -1348,6 +1359,7 @@ fn exact_probe_targets(cfg: &MiniMaxH3DitConfig) -> Vec<FixtureTarget> {
 /// no tolerance, and the per-target expectations are pairwise distinct so a wrong
 /// row/module/alias/gain mapping cannot hide.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_exact_dyadic_corpus_folds_exactly_on_both_topologies() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -1429,6 +1441,7 @@ fn the_exact_dyadic_corpus_folds_exactly_on_both_topologies() {
 /// partition, …)` path, two genuinely different pruned partitions fold the corpus to the SAME
 /// exact expectation — the delta is a property of the adapter, not of the partition it lands on.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_exact_corpus_is_bit_identical_across_partitions() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");
@@ -1510,6 +1523,7 @@ fn the_exact_corpus_is_bit_identical_across_partitions() {
 /// bf16 reconstruction (with fold `alpha/rank = 8/8 = 1`) and the residual are exact, and a wrong
 /// routing is visible because every output row has a distinct expected value.
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve() {
     let cfg = dit_fixture_config();
     let dir = tempfile::tempdir().expect("fixture dir");

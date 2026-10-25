@@ -204,6 +204,7 @@ use mlx_gen::gen_core::{
     TransformerComponent, WeightsSource,
 };
 
+mod adapters;
 mod conditioning;
 
 use crate::denoise::LEGAL_FRAME_COUNTS;
@@ -937,6 +938,7 @@ impl ComponentBytes {
         let reference = dit.with_file_name(crate::model::REFERENCE_DIT_PARTITION);
         let backend = native_backend();
         let mut tasks = Vec::new();
+        let mut overlay = 0u64;
         let mut dit_bytes = 0;
         let mut pruning = None;
         let mut pruned_resident = 0;
@@ -985,7 +987,20 @@ impl ComponentBytes {
             } else {
                 None
             };
+            let adapter = if allocation.resolved && !spec.adapters.is_empty() {
+                let profile = adapters::profile(
+                    directory,
+                    &spec.adapters,
+                    &allocation.projections,
+                    spec.precision,
+                )?;
+                overlay = overlay.max(profile.resident_bytes);
+                Some(profile)
+            } else {
+                None
+            };
             tasks.push(NativeTaskAllocation {
+                adapter,
                 resident_bytes: bytes,
                 constructor_bytes: 0,
                 patch_size,
@@ -1046,15 +1061,15 @@ impl ComponentBytes {
         // Fails closed rather than guessing: an additive stack whose file cannot be sized would
         // otherwise be charged 0, and a zero overlay on a render that holds 300 MB of factors is an
         // under-declaration in the OOM direction. The shared helper is the same one ltx uses.
-        let Some(overlay) = mlx_gen::gen_core::adapter_stack_resident_bytes(
-            &spec.adapters,
-            AdapterResidencyMode::Additive,
-        ) else {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: every configured adapter must have a non-zero load-exact safetensors \
-                 size before the memory contract can declare its resident overlay"
-            )));
-        };
+        // Only unresolved inventory fixtures retain the compatibility file bound. Real task
+        // partitions use source-selected installed originals/prepared caches above.
+        if !resolved && !spec.adapters.is_empty() {
+            overlay = mlx_gen::gen_core::adapter_stack_resident_bytes(
+                &spec.adapters,
+                AdapterResidencyMode::Additive,
+            )
+            .ok_or_else(|| CoreError::Unsupported("H3 adapter source is unavailable".into()))?;
+        }
         Ok(Self {
             // The Qwen3 condition encoder is built at `Dtype::Bfloat16` on every path
             // (`text_encoder/encoder.rs`), so it does not follow `spec.precision`.
@@ -2084,6 +2099,29 @@ pub fn veda_workspace_bound(
     mlx_gen::gen_core::veda::workspace::for_video_request(
         req,
         mlx_gen::gen_core::veda::workspace::Backend::Mlx,
+    )
+}
+
+/// Loaded-generator sparse bounds use the same selected source geometry as conditioning.
+pub fn veda_workspace_bound_for_contract(
+    req: mlx_gen::gen_core::veda::workspace::Request<'_>,
+    contract: &MemoryProviderContract,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
+    if req.veda.is_none_or(|veda| !veda.enabled) {
+        return Ok(None);
+    }
+    let patch = match contract
+        .phase_facts
+        .as_ref()
+        .and_then(|p| p.native_quant.as_ref())
+    {
+        Some(native) => native.selected_patch(req)?,
+        None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
+    };
+    mlx_gen::gen_core::veda::workspace::for_video_request_with_patch(
+        req,
+        mlx_gen::gen_core::veda::workspace::Backend::Mlx,
+        patch,
     )
 }
 

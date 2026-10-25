@@ -9,7 +9,7 @@
 //! graph retaining unevaluated nodes is not evidence that all evaluated intermediates coexist.
 //! No allocator/RSS observation, currency gate, model loading, or unrelated-family calibration.
 
-use crate::veda::workspace::{h3_visual_grids, Request};
+use crate::veda::workspace::{h3_visual_grids_with_patch, Request};
 use crate::{Conditioning, Error, Result};
 
 /// Facts copied from the selected native VAE configurations and materialized video dtype.
@@ -399,10 +399,21 @@ fn audio_encode(samples: u64, channels: u64, f: &H3ConditioningMemoryFacts) -> R
     ))
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn video_decode(target: [u64; 3], frames: u64, f: &H3ConditioningMemoryFacts) -> Result<u64> {
+    video_decode_with_patch(target, frames, f, [1, 2, 2])
+}
+
+fn video_decode_with_patch(
+    target: [u64; 3],
+    frames: u64,
+    f: &H3ConditioningMemoryFacts,
+    patch: [usize; 3],
+) -> Result<u64> {
     let [lt, ph, pw] = target;
-    let h = mul(&[ph, 32])?;
-    let w = mul(&[pw, 32])?;
+    let h = mul(&[ph, 16, patch[1] as u64])?;
+    let w = mul(&[pw, 16, patch[2] as u64])?;
     let (_, th) = tile_axis(h, f)?;
     let (cols, tw) = tile_axis(w, f)?;
     let chunk = f.clip_length.div_ceil(f.temporal_ratio);
@@ -461,9 +472,9 @@ fn video_decode(target: [u64; 3], frames: u64, f: &H3ConditioningMemoryFacts) ->
     let latent = mul(&[
         add(&[lt, chunk])?,
         ph,
-        2,
+        patch[1] as u64,
         pw,
-        2,
+        patch[2] as u64,
         f.latent_channels,
         f.video_element_bytes,
         4,
@@ -575,8 +586,17 @@ pub fn workspace(
     req: &Request<'_>,
     f: &H3ConditioningMemoryFacts,
 ) -> Result<H3ConditioningWorkspace> {
+    workspace_with_patch(req, f, [1, 2, 2])
+}
+
+/// Selected DiT patches affect packed row counts, not the VAE's physical image dimensions.
+pub fn workspace_with_patch(
+    req: &Request<'_>,
+    f: &H3ConditioningMemoryFacts,
+    patch: [usize; 3],
+) -> Result<H3ConditioningWorkspace> {
     f.validate()?;
-    let (target, refs) = h3_visual_grids(*req)?;
+    let (target, refs) = h3_visual_grids_with_patch(*req, patch)?;
     let mut transient = 0;
     let mut retained = 0;
     for grid in refs {
@@ -585,7 +605,12 @@ pub fn workspace(
         } else {
             u64::from(req.frames)
         };
-        let (peak, keep) = video_encode(frames, mul(&[grid[1], 32])?, mul(&[grid[2], 32])?, f)?;
+        let (peak, keep) = video_encode(
+            frames,
+            mul(&[grid[1], 16, patch[1] as u64])?,
+            mul(&[grid[2], 16, patch[2] as u64])?,
+            f,
+        )?;
         transient = transient.max(peak - keep);
         retained = add(&[retained, keep])?;
     }
@@ -614,14 +639,16 @@ pub fn workspace(
         }
     }
     let encode = add(&[transient, retained])?;
-    let video = video_decode(target, req.frames as u64, f)?;
+    let video = video_decode_with_patch(target, req.frames as u64, f, patch)?;
     let (audio, pcm) = audio_decode(req.frames as u64, f)?;
     let rgb = mul(&[
         req.frames as u64,
         target[1],
-        32,
+        16,
+        patch[1] as u64,
         target[2],
-        32,
+        16,
+        patch[2] as u64,
         f.pixel_channels,
     ])?;
     // fit_audio_to_video pads/trims to round(duration*sample_rate), which can be a
@@ -643,6 +670,31 @@ pub fn workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_patch_changes_rows_not_vae_pixels_or_generated_stereo() {
+        let mut req = crate::GenerationRequest {
+            width: 1344,
+            height: 768,
+            frames: Some(124),
+            ..Default::default()
+        };
+        req.conditioning.push(Conditioning::Reference {
+            image: crate::Image {
+                width: 320,
+                height: 576,
+                pixels: vec![],
+            },
+            strength: None,
+        });
+        let facts = H3ConditioningMemoryFacts::default();
+        let stock = workspace(&Request::from(&req), &facts).unwrap();
+        let unit = workspace_with_patch(&Request::from(&req), &facts, [1, 1, 1]).unwrap();
+        assert_eq!(
+            stock, unit,
+            "VAE work sees identical physical resolution on either DiT patch"
+        );
+    }
+
     #[test]
     fn actual_config_and_tile_temporal_shapes() {
         let f = H3ConditioningMemoryFacts::default();

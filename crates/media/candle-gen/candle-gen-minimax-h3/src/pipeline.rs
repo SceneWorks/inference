@@ -691,17 +691,37 @@ pub fn ref2va_layout(
     patch: [usize; 3],
     device: &Device,
 ) -> Result<PackedLayout> {
+    ref2va_layout_with_audio_channels(
+        geometry,
+        text_token_tags,
+        references,
+        &vec![AUDIO_CHANNELS; references.len()],
+        patch,
+        device,
+    )
+}
+
+/// Preserve each reference encoder's actual channel batch, independently of generated stereo.
+pub fn ref2va_layout_with_audio_channels(
+    geometry: &RequestGeometry,
+    text_token_tags: &[u32],
+    references: &[ReferenceLatentGeometry],
+    reference_audio_channels: &[usize],
+    patch: [usize; 3],
+    device: &Device,
+) -> Result<PackedLayout> {
     if text_token_tags.is_empty() {
         return Err(CandleError::Msg(
             "minimax_h3: the packed sequence needs at least one text row".into(),
         ));
     }
-    PackedLayout::build_ref2va(
+    PackedLayout::build_ref2va_with_audio_channels(
         geometry.joint,
         patch,
         text_token_tags,
         AUDIO_CHANNELS,
         references,
+        reference_audio_channels,
         device,
     )
 }
@@ -787,6 +807,133 @@ mod tests {
 
     /// **The stride is 32, not 16.** A 16-aligned canvas that is an odd number of latent columns has
     /// no patched representation, and the crate's `SIZE_MULTIPLE` advertises the same number.
+    #[test]
+    fn unit_patch_keyframe_and_reference_rows_agree_with_layout() {
+        use crate::conditioning::{keyframe_condition_rows, KeyframeNoise};
+        let d = Device::Cpu;
+        let g = resolve_geometry(64, 64, 124).unwrap();
+        let c = Tensor::ones((1, LATENT_CHANNELS, 1, 4, 4), DType::F32, &d).unwrap();
+        for patch in [[1, 2, 2], [1, 1, 1]] {
+            let rows = keyframe_condition_rows(&c, patch, &KeyframeNoise::Seeded, 0, &d).unwrap();
+            let layout = fl2va_layout(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &[KeyframeAnchor::First],
+                patch,
+                &d,
+            )
+            .unwrap();
+            assert_eq!(rows.dims()[1], layout.num_condition_video_rows());
+            assert_eq!(rows.dims()[2], LATENT_CHANNELS * patch[1] * patch[2]);
+            let (v, _) = initial_latents(&g, patch, 1, &d).unwrap();
+            assert!(prepend_condition_rows(&layout, Some(&rows), &v).is_ok());
+        }
+    }
+
+    #[test]
+    fn mixed_mono_stereo_reference_rows_prepend_in_order_with_stereo_output() {
+        use crate::conditioning::reference_audio_rows;
+        use crate::reference::ReferenceKind;
+        let d = Device::Cpu;
+        let g = resolve_geometry(64, 64, 124).unwrap();
+        let reference = |kind, latents| ReferenceLatentGeometry {
+            kind,
+            num_latent_frames: if kind == ReferenceKind::Audio { 0 } else { 1 },
+            latent_height: 4,
+            latent_width: 4,
+            num_audio_latents: latents,
+        };
+        // Standalone audio, silent image, then a clip soundtrack: every mono/stereo topology, either order.
+        for (standalone_channels, clip_channels, reverse) in (1..=2).flat_map(|a| {
+            (1..=2).flat_map(move |b| [false, true].map(move |reverse| (a, b, reverse)))
+        }) {
+            let expected = 3 * standalone_channels + 5 * clip_channels;
+            let mut refs = vec![
+                reference(ReferenceKind::Audio, 3),
+                reference(ReferenceKind::Image, 0),
+                reference(ReferenceKind::Video, 5),
+            ];
+            let mut channels = vec![standalone_channels, 0, clip_channels];
+            let standalone = reference_audio_rows(
+                &Tensor::ones(
+                    (standalone_channels, 3, AUDIO_LATENT_CHANNELS),
+                    DType::F32,
+                    &d,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let clip = reference_audio_rows(
+                &Tensor::full(2f32, (clip_channels, 5, AUDIO_LATENT_CHANNELS), &d).unwrap(),
+            )
+            .unwrap();
+            let rows = if reverse {
+                refs.reverse();
+                channels.reverse();
+                Tensor::cat(&[&clip, &standalone], 1).unwrap()
+            } else {
+                Tensor::cat(&[&standalone, &clip], 1).unwrap()
+            };
+            let layout = ref2va_layout_with_audio_channels(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &refs,
+                &channels,
+                [1, 1, 1],
+                &d,
+            )
+            .unwrap();
+            assert_eq!(layout.num_condition_audio_rows(), expected);
+            assert_eq!(layout.audio_channels(), 2);
+            let indices = layout.audio_indices();
+            let positions = layout.position_rows();
+            let first_len = if reverse { 5 } else { 3 };
+            assert_eq!(positions[indices[0] as usize][0], 1.0);
+            // Time advances once per reference duration, NOT once per channel row.
+            assert_eq!(
+                positions[layout.generated_audio_rows()[0] as usize][0],
+                10.0
+            );
+            assert_eq!(
+                positions[indices[first_len - 1] as usize][0],
+                first_len as f64
+            );
+            if channels[0] == 2 {
+                assert_eq!(
+                    positions[indices[first_len] as usize][0], 1.0,
+                    "second stereo channel restarts the same reference clock"
+                );
+                assert_ne!(
+                    positions[indices[0] as usize][2],
+                    positions[indices[first_len] as usize][2]
+                );
+            }
+            let (_, generated) = initial_latents(&g, [1, 1, 1], 1, &d).unwrap();
+            assert_eq!(generated.dims()[1], 2 * g.joint.num_audio_latents);
+            let packed = prepend_condition_audio_rows(&layout, Some(&rows), &generated).unwrap();
+            assert_eq!(packed.dims()[1], expected + generated.dims()[1]);
+            assert_eq!(
+                packed
+                    .narrow(1, 0, expected)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                rows.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert!(ref2va_layout_with_audio_channels(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &refs,
+                &[1],
+                [1, 1, 1],
+                &d
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn the_spatial_stride_is_the_vae_ratio_times_the_patch() {
         assert_eq!(SPATIAL_STRIDE, 32);

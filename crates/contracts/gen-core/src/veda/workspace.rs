@@ -498,8 +498,8 @@ impl<'a> From<&'a GenerationRequest> for Request<'a> {
         }
     }
 }
-/// Output pixels per DiT patch edge: 16x VAE spatial compression times the 2x2 spatial patch.
-const PATCH_PIXELS: usize = 32;
+/// Published spatial patch; compatibility entry points preserve this default.
+const STOCK_PATCH: [usize; 3] = [1, 2, 2];
 pub fn for_request(req: &GenerationRequest, backend: Backend) -> Result<Option<WorkspaceBound>> {
     for_video_request(Request::from(req), backend)
 }
@@ -508,10 +508,19 @@ pub fn for_request(req: &GenerationRequest, backend: Backend) -> Result<Option<W
 /// Reference image grids follow short-edge stride rounding; clips use the full generated duration
 /// at their own aspect. These upper envelopes intentionally exceed actual encoded layouts.
 pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<WorkspaceBound>> {
+    for_video_request_with_patch(req, backend, STOCK_PATCH)
+}
+
+/// Price the selected partition's patch geometry, with actual per-reference audio channels.
+pub fn for_video_request_with_patch(
+    req: Request<'_>,
+    backend: Backend,
+    patch: [usize; 3],
+) -> Result<Option<WorkspaceBound>> {
     let Some(r) = req.veda.filter(|r| r.enabled) else {
         return Ok(None);
     };
-    let (plan, grid, layouts) = price_layouts(req)?;
+    let (plan, grid, layouts) = price_layouts_with_patch(req, patch)?;
     bound(
         r,
         backend,
@@ -532,14 +541,27 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
 /// row envelope includes prompt framing, visual tokens and audio; using it for the refiner is
 /// conservative (audio rows do not enter that refiner) without a second set of tokenization rules.
 pub fn h3_row_bound(req: Request<'_>) -> Result<(u64, u64)> {
-    let (_, _, globals, seq) = layout_envelope(req)?;
+    h3_row_bound_with_patch(req, STOCK_PATCH)
+}
+
+pub fn h3_row_bound_with_patch(req: Request<'_>, patch: [usize; 3]) -> Result<(u64, u64)> {
+    let (_, _, globals, seq) = layout_envelope_with_patch(req, patch)?;
     Ok((seq as u64, globals as u64))
 }
 
 /// Target followed by ordered visual reference grids in DiT patch units. Audio-only carriers
 /// contribute no visual grid. Shared with H3's native encoder/decoder workspace accounting.
 pub fn h3_visual_grids(req: Request<'_>) -> Result<([u64; 3], Vec<[u64; 3]>)> {
-    let (grid, spans, _, _) = layout_envelope(req)?;
+    h3_visual_grids_with_patch(req, STOCK_PATCH)
+}
+
+/// Tensor-neutral selected-patch grids. Audio rows use each carrier's own channel count;
+/// generated audio remains stereo. Media normalization still uses its stride-32 pixel lattice.
+pub fn h3_visual_grids_with_patch(
+    req: Request<'_>,
+    patch: [usize; 3],
+) -> Result<([u64; 3], Vec<[u64; 3]>)> {
+    let (grid, spans, _, _) = layout_envelope_with_patch(req, patch)?;
     let refs = spans[..spans.len() - 1]
         .iter()
         .map(|g| g.map(|n| n as u64))
@@ -549,7 +571,16 @@ pub fn h3_visual_grids(req: Request<'_>) -> Result<([u64; 3], Vec<[u64; 3]>)> {
 
 type LayoutEnvelope = ([usize; 3], Vec<[usize; 3]>, usize, usize);
 
-fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
+fn layout_envelope_with_patch(req: Request<'_>, patch: [usize; 3]) -> Result<LayoutEnvelope> {
+    if patch.contains(&0) {
+        return Err(bad("invalid native H3 patch geometry"));
+    }
+    let pixel_h = 16usize
+        .checked_mul(patch[1])
+        .ok_or_else(|| bad("patch size overflow"))?;
+    let pixel_w = 16usize
+        .checked_mul(patch[2])
+        .ok_or_else(|| bad("patch size overflow"))?;
     let frames = req.frames as usize;
     if frames < 5 || req.width == 0 || req.height == 0 {
         return Err(bad("admission requires resolved geometry"));
@@ -558,8 +589,8 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
     // 16x spatial latent divided by the DiT's 2x2 spatial patch, i.e. pixels / 32.
     let grid = [
         (frames - 5).div_ceil(17) * 5 + 2,
-        req.height as usize / PATCH_PIXELS,
-        req.width as usize / PATCH_PIXELS,
+        req.height as usize / pixel_h,
+        req.width as usize / pixel_w,
     ];
     let mut spans = vec![grid];
     let mut globals = req.prompt.len().saturating_add(512).saturating_add(
@@ -576,8 +607,8 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
         // Stride-32 lattice in pixels == one DiT patch per 32 pixels.
         Ok([
             1,
-            (h as f64 * scale / 32.).round_ties_even().max(1.) as usize,
-            (w as f64 * scale / 32.).round_ties_even().max(1.) as usize,
+            ((h as f64 * scale / 32.).round_ties_even().max(1.) as usize * 32).div_ceil(pixel_h),
+            ((w as f64 * scale / 32.).round_ties_even().max(1.) as usize * 32).div_ceil(pixel_w),
         ])
     };
     // Same factor/min/max geometry as native Qwen3-VL preprocessing. Extreme aspects
@@ -613,7 +644,7 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
         }
         Ok(
             ((a.samples.len() as u128 * 40).div_ceil(a.sample_rate as u128 * a.channels as u128))
-                .saturating_mul(crate::h3_memory::AUDIO_OUTPUT_CHANNELS as u128)
+                .saturating_mul(a.channels as u128)
                 .min(usize::MAX as u128) as usize,
         )
     };
@@ -624,9 +655,9 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
                 spans.insert(spans.len() - 1, g);
                 globals = globals.saturating_add(
                     vision_tokens(
-                        g[1].checked_mul(PATCH_PIXELS)
+                        g[1].checked_mul(pixel_h)
                             .ok_or_else(|| bad("image size overflow"))?,
-                        g[2].checked_mul(PATCH_PIXELS)
+                        g[2].checked_mul(pixel_w)
                             .ok_or_else(|| bad("image size overflow"))?,
                     )? + 64,
                 );
@@ -637,9 +668,9 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
                     spans.insert(spans.len() - 1, g);
                     globals = globals.saturating_add(
                         vision_tokens(
-                            g[1].checked_mul(PATCH_PIXELS)
+                            g[1].checked_mul(pixel_h)
                                 .ok_or_else(|| bad("image size overflow"))?,
-                            g[2].checked_mul(PATCH_PIXELS)
+                            g[2].checked_mul(pixel_w)
                                 .ok_or_else(|| bad("image size overflow"))?,
                         )? + 64,
                     );
@@ -663,8 +694,12 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
                 let scale = (1_032_192. / (w * h)).sqrt();
                 let g = [
                     grid[0],
-                    (h * scale / PATCH_PIXELS as f64).ceil() as usize + 1,
-                    (w * scale / PATCH_PIXELS as f64).ceil() as usize + 1,
+                    ((h * scale / 32.).ceil() as usize + 1)
+                        .saturating_mul(32)
+                        .div_ceil(pixel_h),
+                    ((w * scale / 32.).ceil() as usize + 1)
+                        .saturating_mul(32)
+                        .div_ceil(pixel_w),
                 ];
                 spans.insert(spans.len() - 1, g);
                 // 2-fps samples of a 24-fps normalized clip, temporally merged in pairs.
@@ -672,9 +707,9 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
                 globals = globals.saturating_add(
                     blocks.saturating_mul(
                         vision_tokens(
-                            g[1].checked_mul(PATCH_PIXELS)
+                            g[1].checked_mul(pixel_h)
                                 .ok_or_else(|| bad("image size overflow"))?,
-                            g[2].checked_mul(PATCH_PIXELS)
+                            g[2].checked_mul(pixel_w)
                                 .ok_or_else(|| bad("image size overflow"))?,
                         )? + 64,
                     ),
@@ -706,8 +741,16 @@ fn layout_envelope(req: Request<'_>) -> Result<LayoutEnvelope> {
     Ok((grid, spans, globals, seq))
 }
 
+#[cfg(test)]
 fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileShape, LayoutSize>)> {
-    let (grid, spans, globals, seq) = layout_envelope(req)?;
+    price_layouts_with_patch(req, STOCK_PATCH)
+}
+
+fn price_layouts_with_patch(
+    req: Request<'_>,
+    patch: [usize; 3],
+) -> Result<(Plan, [usize; 3], BTreeMap<TileShape, LayoutSize>)> {
+    let (grid, spans, globals, seq) = layout_envelope_with_patch(req, patch)?;
     let volume = |g: &[usize; 3]| {
         g.iter()
             .try_fold(1usize, |n, &axis| n.checked_mul(axis))
@@ -769,6 +812,84 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn selected_unit_patch_prices_all_visual_carriers_without_changing_pixels() {
+        let mut r = req();
+        r.conditioning = vec![
+            Conditioning::Keyframe {
+                image: crate::Image {
+                    width: 1344,
+                    height: 768,
+                    pixels: vec![],
+                },
+                frame_idx: 0,
+                strength: 0.999,
+            },
+            Conditioning::Reference {
+                image: crate::Image {
+                    width: 320,
+                    height: 576,
+                    pixels: vec![],
+                },
+                strength: None,
+            },
+            Conditioning::ReferenceVideo {
+                frames: vec![crate::Image {
+                    width: 640,
+                    height: 480,
+                    pixels: vec![],
+                }],
+                fps: 24.,
+                audio: None,
+            },
+        ];
+        let (stock, stock_refs) = h3_visual_grids(Request::from(&r)).unwrap();
+        let (unit, unit_refs) = h3_visual_grids_with_patch(Request::from(&r), [1, 1, 1]).unwrap();
+        assert_eq!(unit, [stock[0], stock[1] * 2, stock[2] * 2]);
+        assert_eq!(unit_refs.len(), 3);
+        for (a, b) in stock_refs.iter().zip(&unit_refs) {
+            assert_eq!(*b, [a[0], a[1] * 2, a[2] * 2]);
+        }
+        let (_, _, stock_globals, stock_seq) =
+            layout_envelope_with_patch(Request::from(&r), STOCK_PATCH).unwrap();
+        let (_, _, unit_globals, unit_seq) =
+            layout_envelope_with_patch(Request::from(&r), [1, 1, 1]).unwrap();
+        assert_eq!(
+            stock_globals, unit_globals,
+            "vision/text/audio operate on physical pixels, not DiT patch count"
+        );
+        assert_eq!(unit_seq - unit_globals, 4 * (stock_seq - stock_globals));
+    }
+
+    #[test]
+    fn mixed_reference_audio_prices_its_own_channels_not_generated_stereo() {
+        let mut r = req();
+        let audio = |channels| crate::AudioTrack {
+            samples: vec![0.; 32_000 * channels as usize],
+            sample_rate: 32_000,
+            channels,
+            stems: vec![],
+        };
+        let baseline = h3_row_bound_with_patch(Request::from(&r), [1, 1, 1]).unwrap();
+        r.conditioning.push(Conditioning::ReferenceAudio {
+            audio: audio(1),
+            strength: None,
+        });
+        let mono = h3_row_bound_with_patch(Request::from(&r), [1, 1, 1]).unwrap();
+        assert_eq!(mono.1 - baseline.1, 40);
+        r.conditioning.push(Conditioning::ReferenceAudio {
+            audio: audio(2),
+            strength: None,
+        });
+        let mixed = h3_row_bound_with_patch(Request::from(&r), [1, 1, 1]).unwrap();
+        assert_eq!(mixed.1 - mono.1, 80);
+        r.conditioning.reverse();
+        assert_eq!(
+            mixed,
+            h3_row_bound_with_patch(Request::from(&r), [1, 1, 1]).unwrap()
+        );
+    }
+
     fn fixture_choice(grid: [usize; 3]) -> [usize; 3] {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/veda/frozen.json")).unwrap();

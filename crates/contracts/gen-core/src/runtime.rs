@@ -608,13 +608,34 @@ impl ArtifactSeal {
     }
 
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
-        Self::pin_with_store(
+        Self::pin_with_check(path, || Ok(()))
+    }
+
+    /// Pin the same immutable source identity with cooperative cancellation/progress checks.
+    /// Checks bracket bounded hash reads and metadata/memo paths; errors never authorize a pin.
+    /// Digest reuse and once-at-acquisition hashing are identical to [`Self::pin`].
+    pub fn pin_with_check(
+        path: impl AsRef<Path>,
+        mut check: impl FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        Self::pin_with_store_and_check(
             path.as_ref(),
             PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+            &mut check,
         )
     }
 
+    #[cfg(test)]
     fn pin_with_store(path: &Path, store: Option<&Path>) -> crate::Result<Self> {
+        Self::pin_with_store_and_check(path, store, &mut || Ok(()))
+    }
+
+    fn pin_with_store_and_check(
+        path: &Path,
+        store: Option<&Path>,
+        check: &mut impl FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Self> {
+        check()?;
         let loader_path = std::path::absolute(path)?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
         let path_component_fingerprints = path_component_fingerprints(&loader_path)?;
@@ -639,6 +660,7 @@ impl ArtifactSeal {
         // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
+        check()?;
         // Only AFTER that proof is the identity worth trusting as a memo key: the lookup below is
         // allowed to stand in for the content read precisely because everything it compares has just
         // been re-verified against the filesystem.
@@ -650,13 +672,16 @@ impl ArtifactSeal {
             target_fingerprint: pinned.target_fingerprint.clone(),
         };
         if let Some(sha256) = proven_digest(&identity) {
+            check()?;
             return Ok(Self { sha256, ..pinned });
         }
         let persisted = store.and_then(|store| {
             let volume = volume_identity(&pinned.canonical_target_path)?;
             Some(proven_digest_store_entry(store, &identity, &volume))
         });
+        check()?;
         if let Some(sha256) = persisted.as_deref().and_then(stored_proven_digest) {
+            check()?;
             remember_proven_digest(identity, sha256);
             return Ok(Self { sha256, ..pinned });
         }
@@ -665,7 +690,8 @@ impl ArtifactSeal {
             pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
-        let sha256 = pinned.read_unchanged(hash_file_sha256)?;
+        let sha256 = pinned.read_unchanged(|path| hash_file_sha256_with_check(path, check))?;
+        check()?;
         if let Some(entry) = &persisted {
             store_proven_digest(entry, &sha256);
         }
@@ -807,11 +833,22 @@ impl ArtifactSeal {
 const HASH_READ_BYTES: usize = 8 * 1024 * 1024;
 
 fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
+    hash_file_sha256_with_check(path, &mut || Ok(()))
+}
+
+fn hash_file_sha256_with_check(
+    path: &Path,
+    check: &mut impl FnMut() -> crate::Result<()>,
+) -> crate::Result<[u8; 32]> {
+    check()?;
     let mut reader = File::open(path)?;
+    check()?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; HASH_READ_BYTES];
     loop {
+        check()?;
         let read = reader.read(&mut buffer)?;
+        check()?;
         if read == 0 {
             break;
         }
@@ -2542,6 +2579,82 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn checked_artifact_pin_cancels_inside_bounded_hash_and_preserves_digest_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.synthetic");
+        let file = File::create(&path).unwrap();
+        file.set_len((HASH_READ_BYTES * 2 + 17) as u64).unwrap();
+        let mut checks = 0;
+        let aborted = hash_file_sha256_with_check(&path, &mut || {
+            checks += 1;
+            if checks == 4 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(aborted, Err(crate::Error::Canceled)),
+            "cancel after first bounded chunk, not after whole file"
+        );
+        assert_eq!(checks, 4);
+        let mut interrupted_checks = 0;
+        let interrupted = ArtifactSeal::pin_with_check(&path, || {
+            interrupted_checks += 1;
+            if interrupted_checks == 7 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(interrupted, Err(crate::Error::Canceled)));
+        let after_interrupted = test_full_hash_work_count();
+        let mut checks = 0;
+        let first = ArtifactSeal::pin_with_check(&path, || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            test_full_hash_work_count() > after_interrupted,
+            "an interrupted pin must not publish a partial digest to the memo"
+        );
+        assert!(
+            checks >= 11,
+            "metadata and every bounded read must check cancellation"
+        );
+        assert_eq!(first.content_sha256(), &hash_file_sha256(&path).unwrap());
+        let before = test_full_hash_work_count();
+        let mut warm_checks = 0;
+        let warm = ArtifactSeal::pin_with_check(&path, || {
+            warm_checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(warm.content_sha256(), first.content_sha256());
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "checked warm pin must retain once-at-acquisition digest reuse"
+        );
+        assert!(warm_checks >= 3, "warm memo still checks cancellation");
+        assert!(matches!(
+            ArtifactSeal::pin_with_check(&path, || Err(crate::Error::Canceled)),
+            Err(crate::Error::Canceled)
+        ));
+        let mut warm_checks = 0;
+        let canceled_warm = ArtifactSeal::pin_with_check(&path, || {
+            warm_checks += 1;
+            if warm_checks == 3 {
+                Err(crate::Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(canceled_warm, Err(crate::Error::Canceled)));
+    }
 
     #[test]
     fn load_shape_declaration_result_defaults_clones_hashes_and_validates() {

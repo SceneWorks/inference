@@ -258,6 +258,9 @@ pub struct NativeTaskAllocation {
     /// Source-pruned retained tables are included by SourcePruneSizing in resident_bytes instead.
     pub table_bytes_per_timestep: u64,
     pub projections: Vec<NativeProjection>,
+    /// Selected-task adapter originals/caches and allocation lifetimes. Steady overlay is
+    /// reported separately by the provider and added once by the consumer.
+    pub adapter: Option<crate::h3_adapter_memory::H3AdapterMemoryProfile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,6 +283,61 @@ impl NativeAllocationFacts {
         self.tasks
             .iter()
             .filter(move |task| rows.task.includes(task))
+    }
+
+    /// Header-selected partition geometry for conditioning and sparse admission. No weights load.
+    pub fn selected_patch(&self, req: crate::veda::workspace::Request<'_>) -> Result<[usize; 3]> {
+        let rows = request_rows(req, self.default_evaluations)?;
+        let task = self
+            .selected_tasks(rows)
+            .find(|t| t.resident_bytes > 0)
+            .ok_or_else(|| invalid("H3 source omits the partition selected by this request"))?;
+        let patch = task.patch_size.map(|n| usize::try_from(n).unwrap_or(0));
+        if patch.contains(&0) {
+            return Err(invalid("invalid selected H3 patch geometry"));
+        }
+        Ok(patch)
+    }
+
+    pub fn adapter_resident_bytes(&self, rows: NativeRows) -> u64 {
+        self.selected_tasks(rows)
+            .filter_map(|t| t.adapter.as_ref())
+            .map(|p| p.resident_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    // Overlay residency remains separate to preserve existing consumers' exactly-once addition.
+    fn with_adapter_precompute(
+        &self,
+        task: &NativeTaskAllocation,
+        rows: NativeRows,
+        base: u64,
+    ) -> u64 {
+        let Some(adapter) = &task.adapter else {
+            return base;
+        };
+        let work = adapter.forward_working_bytes_for(self.backend, rows, RowDomain::Conditioning);
+        base.saturating_add(work).max(
+            task.resident_bytes
+                .max(task.constructor_bytes)
+                .saturating_add(
+                    adapter
+                        .install_peak_bytes
+                        .saturating_sub(adapter.resident_bytes),
+                ),
+        )
+    }
+
+    fn with_adapter_denoise(
+        &self,
+        task: &NativeTaskAllocation,
+        rows: NativeRows,
+        base: u64,
+    ) -> u64 {
+        base.saturating_add(task.adapter.as_ref().map_or(0, |p| {
+            p.forward_working_bytes_for(self.backend, rows, RowDomain::Packed)
+        }))
     }
 
     pub fn request_rows(
@@ -386,6 +444,9 @@ impl NativeAllocationFacts {
         self.selected_tasks(rows)
             .map(|task| {
                 self.full_precompute(task, Self::task_rows(task, rows))
+                    .map(|base| {
+                        self.with_adapter_precompute(task, Self::task_rows(task, rows), base)
+                    })
                     .unwrap_or(u64::MAX)
             })
             .max()
@@ -395,6 +456,7 @@ impl NativeAllocationFacts {
         self.selected_tasks(rows)
             .map(|task| {
                 self.full_denoise(task, Self::task_rows(task, rows))
+                    .map(|base| self.with_adapter_denoise(task, Self::task_rows(task, rows), base))
                     .unwrap_or(u64::MAX)
             })
             .max()
@@ -408,7 +470,11 @@ impl NativeAllocationFacts {
     ) -> Result<u64> {
         let Some(window) = window else {
             return self.selected_tasks(rows).try_fold(0u64, |peak, task| {
-                Ok(peak.max(self.full_precompute(task, Self::task_rows(task, rows))?))
+                Ok(peak.max(self.with_adapter_precompute(
+                    task,
+                    Self::task_rows(task, rows),
+                    self.full_precompute(task, Self::task_rows(task, rows))?,
+                )))
             });
         };
         self.selected_tasks(rows)
@@ -417,12 +483,16 @@ impl NativeAllocationFacts {
                 let profile = task.window.as_ref().ok_or_else(|| {
                     invalid("H3 source has no native block-window allocation profile")
                 })?;
-                Ok(peak.max(profile.precompute_peak_bytes(
+                Ok(peak.max(self.with_adapter_precompute(
                     task,
-                    self.backend,
                     Self::task_rows(task, rows),
-                    window as usize,
-                )?))
+                    profile.precompute_peak_bytes(
+                        task,
+                        self.backend,
+                        Self::task_rows(task, rows),
+                        window as usize,
+                    )?,
+                )))
             })
     }
 
@@ -433,7 +503,11 @@ impl NativeAllocationFacts {
     ) -> Result<u64> {
         let Some(window) = window else {
             return self.selected_tasks(rows).try_fold(0u64, |peak, task| {
-                Ok(peak.max(self.full_denoise(task, Self::task_rows(task, rows))?))
+                Ok(peak.max(self.with_adapter_denoise(
+                    task,
+                    Self::task_rows(task, rows),
+                    self.full_denoise(task, Self::task_rows(task, rows))?,
+                )))
             });
         };
         self.selected_tasks(rows)
@@ -442,12 +516,16 @@ impl NativeAllocationFacts {
                 let profile = task.window.as_ref().ok_or_else(|| {
                     invalid("H3 source has no native block-window allocation profile")
                 })?;
-                Ok(peak.max(profile.denoise_peak_bytes(
+                Ok(peak.max(self.with_adapter_denoise(
                     task,
-                    self.backend,
                     Self::task_rows(task, rows),
-                    window as usize,
-                )?))
+                    profile.denoise_peak_bytes(
+                        task,
+                        self.backend,
+                        Self::task_rows(task, rows),
+                        window as usize,
+                    )?,
+                )))
             })
     }
 
@@ -1242,6 +1320,7 @@ mod tests {
         let allocation = allocation_from_headers(&headers, &payloads, MLX, 2, |_| None).unwrap();
         let op = allocation.projections[0].clone();
         let task = NativeTaskAllocation {
+            adapter: None,
             patch_size: [1, 2, 2],
             reference_task: false,
             window: None,
@@ -1337,6 +1416,7 @@ mod tests {
             backend: MLX,
             tasks: vec![
                 NativeTaskAllocation {
+                    adapter: None,
                     patch_size: [1, 2, 2],
                     reference_task: false,
                     window: None,
@@ -1347,6 +1427,7 @@ mod tests {
                     projections: vec![],
                 },
                 NativeTaskAllocation {
+                    adapter: None,
                     patch_size: [1, 2, 2],
                     reference_task: false,
                     window: None,
@@ -1402,10 +1483,98 @@ mod tests {
     }
 
     #[test]
+    fn selected_adapter_partition_prices_install_and_forward_without_overlay_double_charge() {
+        use crate::h3_adapter_memory::{
+            H3AdapterMemoryProfile, H3AdapterProjectionMemory, H3AdapterTarget,
+        };
+        let profile = |resident, install, per_row| H3AdapterMemoryProfile {
+            resident_bytes: resident,
+            install_peak_bytes: install,
+            projections: vec![H3AdapterProjectionMemory {
+                target: H3AdapterTarget {
+                    path: "transformer_blocks.0.attn.to_q".into(),
+                    input: 8,
+                    output: 8,
+                    packed: false,
+                    activation_width: 2,
+                    activation_dtype: Dtype::BF16,
+                    rows: RowDomain::Packed,
+                },
+                installed_bytes: resident,
+                resident_bytes: resident,
+                forward_fixed_bytes: 0,
+                forward_bytes_per_row: per_row,
+            }],
+        };
+        let base = NativeTaskAllocation {
+            adapter: Some(profile(40, 200, 8)),
+            resident_bytes: 1000,
+            constructor_bytes: 0,
+            patch_size: [1, 1, 1],
+            reference_task: false,
+            window: None,
+            evicted_bytes: 0,
+            table_bytes_per_timestep: 0,
+            projections: vec![],
+        };
+        let mut reference = base.clone();
+        reference.reference_task = true;
+        reference.patch_size = [1, 2, 2];
+        reference.adapter = Some(profile(10_000, 90_000, 100));
+        let mut facts = NativeAllocationFacts {
+            backend: CUDA,
+            tasks: vec![base, reference],
+            default_evaluations: 4,
+            conditioning: None,
+            conditioning_stream: None,
+            conditioning_resident_bytes: 0,
+            conditioning_load_bytes: 0,
+            video_decode_resident_bytes: 0,
+            video_decode_load_bytes: 0,
+            audio_decode_resident_bytes: 0,
+            audio_decode_load_bytes: 0,
+        };
+        let rows = NativeRows {
+            task: NativeTaskSelection::Base,
+            packed: 3,
+            ..ROWS
+        };
+        assert_eq!(facts.adapter_resident_bytes(rows), 40);
+        assert_eq!(facts.precompute_peak_bytes(rows), 1160);
+        assert_eq!(facts.denoise_peak_bytes(rows), 1024);
+        assert_eq!(
+            facts.precompute_peak_bytes_windowed(rows, None).unwrap(),
+            1160
+        );
+        assert_eq!(facts.denoise_peak_bytes_windowed(rows, None).unwrap(), 1024);
+        assert_eq!(
+            facts.resident_peak_bytes_windowed(rows, None).unwrap(),
+            1000,
+            "overlay is separate; consumers add selected residency exactly once"
+        );
+        facts.tasks[1].adapter.as_mut().unwrap().install_peak_bytes = 1_000_000;
+        facts.tasks[1].adapter.as_mut().unwrap().resident_bytes = 900_000;
+        assert_eq!(facts.adapter_resident_bytes(rows), 40);
+        assert_eq!(
+            facts.peak_bytes(rows),
+            1160,
+            "unselected representation cannot affect admission"
+        );
+        let req = crate::GenerationRequest {
+            width: 256,
+            height: 256,
+            frames: Some(124),
+            ..Default::default()
+        };
+        assert_eq!(facts.selected_patch((&req).into()).unwrap(), [1, 1, 1]);
+    }
+
+    #[test]
     fn source_patch_geometry_controls_rows_and_only_selected_task_validation() {
         let (headers, payloads) = fixture(true, &[256]);
         let allocation = allocation_from_headers(&headers, &payloads, MLX, 2, |_| None).unwrap();
         let base = NativeTaskAllocation {
+            adapter: None,
             resident_bytes: allocation.resident_bytes,
             constructor_bytes: 0,
             patch_size: [1, 2, 2],

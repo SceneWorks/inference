@@ -926,6 +926,18 @@ impl MiniMaxH3 {
         }
     }
 
+    /// Read only the selected partition's JSON header, before any conditioner/VAE weights.
+    /// The resolved tier/sibling directory is the same one the eventual DiT loader uses.
+    pub(crate) fn task_dit_config(
+        &self,
+        task: MiniMaxH3Task,
+    ) -> Result<crate::dit::MiniMaxH3DitConfig> {
+        let path = self.task_dit_dir(task).join("config.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Msg(format!("{MODEL_ID}: {}: {e}", path.display())))?;
+        crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
+    }
+
     /// The block stack's precision.
     pub fn dtype(&self) -> Dtype {
         self.dtype
@@ -1249,6 +1261,7 @@ impl MiniMaxH3 {
         // identical, so this is the only thing standing between a `ref2va` request and a plausible
         // render off the wrong 66 GB. See [`MiniMaxH3Task`].
         let task = MiniMaxH3Task::resolve(!keyframes.is_empty(), references.is_some())?;
+        let patch = self.task_dit_config(task)?.patch_size;
         // The rung-4 admission (sc-18662), resolved once and carried to every heavy phase — the
         // conditioning and denoise residency must agree, or half the request streams while the
         // other half quietly holds a resident stack.
@@ -1319,7 +1332,7 @@ impl MiniMaxH3 {
                         &vae,
                         &pixels,
                         &anchors,
-                        crate::pipeline::PATCH_SIZE,
+                        patch,
                         &crate::conditioning::KeyframeNoise::Seeded,
                     )?;
                     if let Some(r) = &rows {
@@ -1342,7 +1355,7 @@ impl MiniMaxH3 {
             None => self.load_task_dit(task)?,
             Some(_) => self.load_task_dit_deferred(task)?,
         };
-        let patch = dit.config().patch_size;
+        debug_assert_eq!(patch, dit.config().patch_size);
         let layout = if anchors.is_empty() {
             t2va_layout(&geometry, context.shape()[1], patch)?
         } else {
@@ -1499,7 +1512,9 @@ impl MiniMaxH3 {
             reference_clip_to_vae_pixels, KeyframeNoise,
         };
         use crate::dit::positions::ReferenceLatentGeometry;
-        use crate::pipeline::{prepend_condition_audio_rows, ref2va_layout};
+        use crate::pipeline::{prepend_condition_audio_rows, ref2va_layout_with_audio_channels};
+
+        let patch = self.task_dit_config(task)?.patch_size;
 
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
@@ -1553,6 +1568,7 @@ impl MiniMaxH3 {
         let mut condition_rows: Vec<mlx_rs::Array> = Vec::new();
         let mut audio_rows_per_ref: Vec<mlx_rs::Array> = Vec::new();
         let mut geometries: Vec<ReferenceLatentGeometry> = Vec::new();
+        let mut reference_audio_channels = Vec::new();
         {
             let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?;
             let audio_enc = self.load_audio_encoder()?;
@@ -1565,10 +1581,12 @@ impl MiniMaxH3 {
                     let normed = audio_enc.normalize(posterior.mode())?;
                     // `[B, latent_channels, latents]` -> `[channels, latents, features]`.
                     let t = normed.transpose_axes(&[0, 2, 1])?;
+                    reference_audio_channels.push(t.shape()[0]);
                     let latents = t.shape()[1];
                     audio_rows_per_ref.push(reference_audio_rows(&t)?);
                     latents
                 } else {
+                    reference_audio_channels.push(0);
                     0
                 };
 
@@ -1581,7 +1599,7 @@ impl MiniMaxH3 {
                         let s = c.shape().to_vec();
                         condition_rows.push(keyframe_condition_rows(
                             &c,
-                            crate::pipeline::PATCH_SIZE,
+                            patch,
                             &KeyframeNoise::Seeded,
                             i,
                         )?);
@@ -1597,7 +1615,7 @@ impl MiniMaxH3 {
                         let s = c.shape().to_vec();
                         condition_rows.push(keyframe_condition_rows(
                             &c,
-                            crate::pipeline::PATCH_SIZE,
+                            patch,
                             &KeyframeNoise::Seeded,
                             i,
                         )?);
@@ -1637,8 +1655,14 @@ impl MiniMaxH3 {
             None => self.load_task_dit(task)?,
             Some(_) => self.load_task_dit_deferred(task)?,
         };
-        let patch = dit.config().patch_size;
-        let layout = ref2va_layout(geometry, &text_tags, &geometries, patch)?;
+        debug_assert_eq!(patch, dit.config().patch_size);
+        let layout = ref2va_layout_with_audio_channels(
+            geometry,
+            &text_tags,
+            &geometries,
+            &reference_audio_channels,
+            patch,
+        )?;
         let (video_rows, audio_rows) = initial_latents(geometry, patch, seed)?;
         let video_rows = prepend_condition_rows(&layout, condition_video.as_ref(), &video_rows)?;
         let audio_rows =
@@ -1998,7 +2022,7 @@ impl Generator for MiniMaxH3 {
         &self,
         req: mlx_gen::gen_core::veda::workspace::Request<'_>,
     ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
-        crate::memory_strategy::veda_workspace_bound(req)
+        crate::memory_strategy::veda_workspace_bound_for_contract(req, &self.memory_strategy)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -2045,6 +2069,85 @@ mlx_gen::register_generators! {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Complements the real header/packing math tests: a stock literal at the render call site
+    /// must not survive merely because a helper can express the selected geometry.
+    #[test]
+    fn render_wires_selected_patch_and_actual_reference_channels_before_conditioning() {
+        let src = include_str!("model.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .unwrap();
+        assert!(
+            !src.contains("PATCH_SIZE"),
+            "render conditioning cannot use the stock patch constant"
+        );
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact
+                .matches("letpatch=self.task_dit_config(task)?.patch_size;")
+                .count(),
+            2
+        );
+        assert_eq!(
+            compact.matches("keyframe_condition_rows(&c,patch,").count(),
+            2
+        );
+        assert!(compact.contains("build_condition_rows(&vae,&pixels,&anchors,patch,"));
+        assert!(compact.contains("reference_audio_channels.push(t.shape()[0]);"));
+        assert!(compact.contains("ref2va_layout_with_audio_channels(geometry,&text_tags,&geometries,&reference_audio_channels,patch"));
+    }
+
+    #[test]
+    fn selected_task_patch_header_is_resolved_without_tensor_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("tier/transformer");
+        let reference = base.with_file_name("transformer_ref");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&reference).unwrap();
+        let model = generator_at(base.to_str().unwrap());
+        let stock = r#"{"num_attention_heads":56,"attention_head_dim":128,"hidden_size":5376,"num_layers":50,"num_refiner_layers":2,"ffn_dim":14336,"in_channels":24,"audio_in_channels":32,"patch_size":[1,2,2],"text_dim":5120,"freq_dim":256,"time_embed_hidden_dim":5376,"time_embed_dim":2688,"rope_freq_dim":16,"rope_theta":10000.0,"norm_eps":0.00001,"qk_norm_eps":0.00001,"final_norm_eps":0.00001}"#;
+        std::fs::write(base.join("config.json"), stock).unwrap();
+        std::fs::write(
+            reference.join("config.json"),
+            stock.replace("[1,2,2]", "[1,1,1]"),
+        )
+        .unwrap();
+        // These selected tier directories have no shards: any accidental DiT load fails.
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::T2va)
+                .unwrap()
+                .patch_size,
+            [1, 2, 2]
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Fl2va)
+                .unwrap()
+                .patch_size,
+            [1, 2, 2]
+        );
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Ref2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+        std::fs::write(
+            base.join("config.json"),
+            stock.replace("[1,2,2]", "[1,1,1]"),
+        )
+        .unwrap();
+        assert_eq!(
+            model
+                .task_dit_config(MiniMaxH3Task::Fl2va)
+                .unwrap()
+                .patch_size,
+            [1, 1, 1]
+        );
+    }
+
     #[test]
     fn malformed_veda_controls_fail_at_native_request_boundary() {
         for enabled in [false, true] {

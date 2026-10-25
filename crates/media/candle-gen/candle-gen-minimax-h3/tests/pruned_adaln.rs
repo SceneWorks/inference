@@ -453,6 +453,7 @@ fn native(f: &Value, device: &Device) -> Native {
 }
 
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn native_blocks_and_final_outputs_match_the_pinned_reference() {
     let f = fixture();
     let device = dev();
@@ -654,6 +655,7 @@ fn an_incomplete_identity_is_refused() {
 // -------------------------------------------------------------------------------------------
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
     let f = fixture();
     let device = dev();
@@ -741,6 +743,7 @@ fn the_curve_cache_keys_on_the_schedule_and_the_basis() {
 }
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
     let f = fixture();
     let device = dev();
@@ -809,6 +812,7 @@ fn a_mixed_basis_block_stack_is_refused_before_any_projection() {
 // -------------------------------------------------------------------------------------------
 
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_stock_path_is_untouched_and_refuses_curve_coordinates() {
     use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
     let device = dev();
@@ -841,6 +845,7 @@ fn the_stock_path_is_untouched_and_refuses_curve_coordinates() {
 }
 
 #[test]
+#[ignore = "complete synthetic DiT/block-stack execution; dispatched only by the manual H3 native suite"]
 fn load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision() {
     // A synthetic **complete** pruned `transformer/` partition: the fixture's canonical curve
     // operands plus the top-level tensors the fixture omits (the input projections, the text
@@ -1220,4 +1225,270 @@ fn native_pruned_adaln_matches_pinned_reference() {
             &format!("case {i} audio output"),
         );
     }
+}
+
+// Manual-only complete native-model proof. The pinned source fixture supplies every learned
+// pruned operand unchanged; only its already-omitted input heads/refiner receive deterministic
+// fillers, exactly as the complete-partition loader proof above does. No new producer/oracle.
+fn manual_conditioning_model(
+    f: &Value,
+    cfg: &MiniMaxH3DitConfig,
+    d: &Device,
+) -> candle_gen_minimax_h3::dit::MiniMaxH3Dit {
+    let mut map = weight_map(f, d);
+    for (name, shape) in [
+        (
+            "proj_in.weight",
+            vec![cfg.hidden_size, cfg.video_patch_dim()],
+        ),
+        ("proj_in.bias", vec![cfg.hidden_size]),
+        (
+            "audio_proj_in.weight",
+            vec![cfg.hidden_size, cfg.audio_in_channels],
+        ),
+        ("audio_proj_in.bias", vec![cfg.hidden_size]),
+        (
+            "context_embedder.weight",
+            vec![cfg.hidden_size, cfg.text_dim],
+        ),
+        ("context_embedder.bias", vec![cfg.hidden_size]),
+        ("token_refiner.final_norm.weight", vec![cfg.hidden_size]),
+    ] {
+        let count: usize = shape.iter().product();
+        let values: Vec<f32> = (0..count).map(|i| ((i % 7) as f32 - 3.) / 32.).collect();
+        map.insert(name.into(), Tensor::from_vec(values, shape, d).unwrap());
+    }
+    for body in [
+        "norm1.weight",
+        "norm2.weight",
+        "attn.to_q.weight",
+        "attn.to_k.weight",
+        "attn.to_v.weight",
+        "attn.norm_q.weight",
+        "attn.norm_k.weight",
+        "attn.to_out.0.weight",
+        "ff.net.0.proj.weight",
+        "ff.net.2.weight",
+    ] {
+        let value = map[&format!("transformer_blocks.0.{body}")].clone();
+        map.insert(format!("token_refiner.refiner_blocks.0.{body}"), value);
+    }
+    let model = candle_gen_minimax_h3::dit::MiniMaxH3Dit::from_weights(
+        &Weights::from_map(map),
+        cfg,
+        d,
+        DType::F32,
+    )
+    .unwrap();
+    let curve = model.curve().unwrap();
+    assert_eq!(curve.table().dtype(), DType::F32);
+    assert_eq!(
+        curve.block_projection(0).unwrap().source_dtype(),
+        DType::BF16
+    );
+    model
+}
+
+#[test]
+#[ignore = "explicit manual full-model numerical proof of selected unit patches and ordered mono/stereo reference conditioning; never ordinary CI"]
+fn manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control() {
+    use candle_gen_minimax_h3::conditioning::{
+        keyframe_condition_rows, reference_audio_rows, KeyframeNoise,
+    };
+    use candle_gen_minimax_h3::denoise::{
+        JointGeometry, JointStep, JointVelocity, PackedLayout, TEXT_TAG,
+    };
+    use candle_gen_minimax_h3::dit::adaln::AdaLnResidency;
+    use candle_gen_minimax_h3::dit::model::JointDit;
+    use candle_gen_minimax_h3::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use candle_gen_minimax_h3::pipeline::{
+        fl2va_layout, prepend_condition_audio_rows, prepend_condition_rows,
+        ref2va_layout_with_audio_channels, RequestGeometry,
+    };
+    use candle_gen_minimax_h3::reference::ReferenceKind;
+    let f = fixture();
+    let cfg = config();
+    assert_eq!(cfg.patch_size, [1, 1, 1]);
+    #[cfg(feature = "cuda")]
+    let d = Device::new_cuda(0)
+        .expect("explicit CUDA proof requires the workflow-selected CUDA device; no CPU fallback");
+    #[cfg(feature = "cuda")]
+    assert!(d.is_cuda(), "the explicit proof must execute on CUDA");
+    #[cfg(not(feature = "cuda"))]
+    let d = Device::Cpu;
+    println!(
+        "H3 unit-patch/mixed-reference full forward device={d:?}; cuda={}",
+        d.is_cuda()
+    );
+    // The core's minimum exact 17n+5 lattice is enough for a complete two-block forward.
+    let geometry = RequestGeometry {
+        width: 32,
+        height: 32,
+        joint: JointGeometry::new(5, 2, 2).unwrap(),
+    };
+    let target_video = Tensor::full(
+        0.1f32,
+        (
+            1,
+            geometry.joint.num_latent_frames * 4,
+            cfg.video_patch_dim(),
+        ),
+        &d,
+    )
+    .unwrap();
+    let target_audio = Tensor::full(
+        0.2f32,
+        (
+            1,
+            geometry.joint.num_audio_latents * 2,
+            cfg.audio_in_channels,
+        ),
+        &d,
+    )
+    .unwrap();
+    let condition = Tensor::full(0.7f32, (1, cfg.in_channels, 1, 2, 2), &d).unwrap();
+    let visual =
+        keyframe_condition_rows(&condition, cfg.patch_size, &KeyframeNoise::Seeded, 0, &d).unwrap();
+    assert_eq!(visual.dims(), &[1, 4, cfg.in_channels]);
+    let context = Tensor::full(0.3f32, (1, 1, cfg.text_dim), &d).unwrap();
+    let times = PackedLayout::row_timesteps(0.6, 0.4);
+    let schedule = TimestepSchedule::new(vec![times.to_vec()]).unwrap();
+    let completed = std::cell::Cell::new(0usize);
+    let check = |layout: PackedLayout, video: Tensor, audio: Tensor| {
+        assert_eq!(video.dims()[1], layout.video_indices().len());
+        assert_eq!(audio.dims()[1], layout.audio_indices().len());
+        assert_eq!(
+            layout.audio_channels(),
+            2,
+            "generated stereo is independent of references"
+        );
+        let indices = schedule
+            .adaln_indices(0, layout.row_classes(), layout.token_tags(), &d)
+            .unwrap();
+        let mut outputs = Vec::new();
+        for residency in [AdaLnResidency::Resident, AdaLnResidency::PrecomputeAndEvict] {
+            let mut driver = JointDit::new(
+                manual_conditioning_model(&f, &cfg, &d),
+                layout.clone(),
+                &context,
+                schedule.clone(),
+                residency,
+            )
+            .unwrap();
+            let step = JointStep {
+                index: 0,
+                layout: &layout,
+                video_rows: &video,
+                audio_rows: &audio,
+                adaln_indices: &indices,
+                row_timesteps: times,
+            };
+            let output = driver
+                .forward(&step)
+                .expect("actual full native joint model forward");
+            #[cfg(feature = "cuda")]
+            assert!(
+                output.0.device().is_cuda() && output.1.device().is_cuda(),
+                "both full-model outputs must remain on the selected CUDA device"
+            );
+            assert_eq!(output.0.dims(), video.dims());
+            assert_eq!(output.1.dims(), audio.dims());
+            outputs.push(output);
+        }
+        for (cached, resident) in [
+            (&outputs[1].0, &outputs[0].0),
+            (&outputs[1].1, &outputs[0].1),
+        ] {
+            let a = cached.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = resident.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(a.iter().chain(&b).all(|v| v.is_finite()));
+            assert!(a.iter().any(|v| v.abs() > 1e-12));
+            assert_close(
+                &a,
+                &b,
+                BLOCK_ABS,
+                "unit-patch conditioned full-model cached/resident control",
+            );
+        }
+        completed.set(completed.get() + 1);
+    };
+    for anchors in [
+        vec![KeyframeAnchor::First],
+        vec![KeyframeAnchor::Last],
+        vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+    ] {
+        let layout = fl2va_layout(&geometry, &[TEXT_TAG], &anchors, cfg.patch_size, &d).unwrap();
+        let refs: Vec<&Tensor> = anchors.iter().map(|_| &visual).collect();
+        let rows = Tensor::cat(&refs, 1).unwrap();
+        assert_eq!(layout.num_condition_video_rows(), 4 * anchors.len());
+        let video = prepend_condition_rows(&layout, Some(&rows), &target_video).unwrap();
+        check(layout, video, target_audio.clone());
+    }
+    for (a, b, reverse) in (1usize..=2)
+        .flat_map(|a| (1usize..=2).flat_map(move |b| [false, true].map(move |r| (a, b, r))))
+    {
+        let mut references = vec![
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 3,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: 1,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 5,
+            },
+        ];
+        let mut channels = vec![a, 0, b];
+        let standalone =
+            reference_audio_rows(&Tensor::full(0.5f32, (a, 3, cfg.audio_in_channels), &d).unwrap())
+                .unwrap();
+        let soundtrack =
+            reference_audio_rows(&Tensor::full(0.8f32, (b, 5, cfg.audio_in_channels), &d).unwrap())
+                .unwrap();
+        let audio = if reverse {
+            references.reverse();
+            channels.reverse();
+            Tensor::cat(&[&soundtrack, &standalone], 1).unwrap()
+        } else {
+            Tensor::cat(&[&standalone, &soundtrack], 1).unwrap()
+        };
+        let layout = ref2va_layout_with_audio_channels(
+            &geometry,
+            &[TEXT_TAG],
+            &references,
+            &channels,
+            cfg.patch_size,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(layout.num_condition_audio_rows(), a * 3 + b * 5);
+        assert_eq!(layout.num_condition_video_rows(), 8);
+        let video = prepend_condition_rows(
+            &layout,
+            Some(&Tensor::cat(&[&visual, &visual], 1).unwrap()),
+            &target_video,
+        )
+        .unwrap();
+        let audio = prepend_condition_audio_rows(&layout, Some(&audio), &target_audio).unwrap();
+        check(layout, video, audio);
+    }
+    assert_eq!(
+        completed.get(),
+        11,
+        "every keyframe and mixed-channel ordered case must execute"
+    );
+    #[cfg(feature = "cuda")]
+    println!("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11");
 }
