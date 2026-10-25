@@ -23,8 +23,13 @@ adapters into BF16 base. These are validation controls, never accepted alternati
 Resize fixtures compare complete RGB byte arrays with Pillow's separable 22-bit coefficient
 Lanczos path, including upsampling to the /16 lattice, nonmultiple maximum edge and no resize.
 
-adapter_config.json and adapter_header.json are public metadata from
-chinoll/Moss-Image-Edit@e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11. They prove all252
+The original metadata provenance recorded
+chinoll/Moss-Image-Edit@e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11. That revision now
+returns RevisionNotFound. The fixture bytes and historical numerical receipts remain unchanged.
+`upstream_identity.json` records the accessible immutable revision
+3be9c40037e1b89b17aa85ff6f8ee805872aa558 with the same weight SHA256 and byte-identical
+adapter_config.json; it is a metadata correction, not a numerical rerun.
+adapter_config.json and adapter_header.json prove all252
 rank64 module configurations and504 BF16 A/B headers. Runtime also authenticates the complete
 297382216-byte weights payload with SHA256
 17a48b8c605dcffdedb92a2b887d18cf316505be90802717669fb6556098dcdf.

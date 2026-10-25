@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 pub const EDIT_COMPONENT: &str = "moss-image-edit";
 pub const EDIT_REPOSITORY: &str = "chinoll/Moss-Image-Edit";
-pub const EDIT_REVISION: &str = "e19b6ab0fb8fd010cb6f1c7f5b9bfe152252df11";
+pub const EDIT_REVISION: &str = "3be9c40037e1b89b17aa85ff6f8ee805872aa558";
 pub const EDIT_WEIGHTS_SHA256: &str =
     "17a48b8c605dcffdedb92a2b887d18cf316505be90802717669fb6556098dcdf";
 pub const EDIT_CONFIG_SHA256: &str =
