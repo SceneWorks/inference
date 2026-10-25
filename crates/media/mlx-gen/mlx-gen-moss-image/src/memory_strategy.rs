@@ -77,6 +77,24 @@ fn selected_facts_with(
     sum_selected_headers(mode, &headers)
 }
 
+fn frozen_hf_norm(name: &str) -> bool {
+    if name == "language_model.norm.weight" {
+        return true;
+    }
+    name.strip_prefix("language_model.layers.")
+        .and_then(|name| name.split_once('.'))
+        .is_some_and(|(layer, tail)| {
+            layer.parse::<usize>().is_ok()
+                && matches!(
+                    tail,
+                    "input_layernorm.weight"
+                        | "post_attention_layernorm.weight"
+                        | "self_attn.q_norm.weight"
+                        | "self_attn.k_norm.weight"
+                )
+        })
+}
+
 fn sum_selected_headers(
     mode: moss_image::MossImageAcceleration,
     selected: &[(
@@ -108,8 +126,11 @@ fn sum_selected_headers(
                 // delta is priced below; charging their full payload again would double count.
                 _ => continue,
             };
-            // The shared small VAE decoder is explicitly materialized in FP32.
-            let bytes = if *role == MossImageAssetRole::Vae {
+            // The VAE and MOSS-only zero-centered Qwen norm multipliers are F32 resident
+            // arrays. Price the derived arrays, not just their BF16 checkpoint payloads.
+            let bytes = if *role == MossImageAssetRole::Vae
+                || (*role == MossImageAssetRole::TextEncoder && frozen_hf_norm(&h.name))
+            {
                 h.materialized_bytes(4)?
             } else {
                 h.data_bytes
@@ -518,6 +539,52 @@ mod cpu_tests {
         assert_eq!(full.base_bytes, 16 + 4 + 8);
         assert_eq!(full.overlay_bytes, 8); // Q/codes; no second LoRA or time replacement.
     }
+    #[test]
+    fn frozen_hf_text_norm_storage_is_priced_without_widening_other_tensors() {
+        use moss_image::{MossImageAcceleration, MossImageAssetRole};
+        use weightsmeta::{Dtype, SafetensorsTensorHeader};
+        let header = |name: String, elements: usize| SafetensorsTensorHeader {
+            name,
+            dtype: Dtype::BF16,
+            shape: vec![elements],
+            data_bytes: elements as u64 * 2,
+        };
+        // Actual frozen MOSS text geometry:32 blocks,4096 hidden, full attention every4,
+        // head width256. Gated RMSNorm and projections retain their BF16 storage.
+        let mut headers = vec![header("language_model.norm.weight".into(), 4096)];
+        for i in 0..32 {
+            for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                headers.push(header(format!("language_model.layers.{i}.{name}"), 4096));
+            }
+            if i % 4 == 3 {
+                for name in ["q_norm.weight", "k_norm.weight"] {
+                    headers.push(header(
+                        format!("language_model.layers.{i}.self_attn.{name}"),
+                        256,
+                    ));
+                }
+            }
+        }
+        let norm_source_bytes: u64 = headers.iter().map(|h| h.data_bytes).sum();
+        assert_eq!(norm_source_bytes, 540_672);
+        for name in [
+            "language_model.layers.0.linear_attn.norm.weight",
+            "language_model.layers.3.self_attn.q_proj.weight",
+            "language_model.embed_tokens.weight",
+        ] {
+            headers.push(header(name.into(), 128));
+        }
+        headers.push(header("visual.norm.weight".into(), 128));
+        let f = sum_selected_headers(
+            MossImageAcceleration::Off,
+            &[(MossImageAssetRole::TextEncoder, headers)],
+        )
+        .unwrap();
+        assert_eq!(f.conditioning_bytes, norm_source_bytes * 2 + 3 * 128 * 2);
+        assert_eq!(f.base_bytes, f.conditioning_bytes);
+        assert_eq!(f.overlay_bytes, 0);
+    }
+
     #[test]
     fn expanded_batch_context_branch_work_and_overflow_are_priced() {
         let a = request_workspace_bytes(256, 256, 1, 8, 1).unwrap();

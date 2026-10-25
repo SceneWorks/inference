@@ -26,8 +26,12 @@ impl Encoder {
             cancel,
         )?;
         let weights = mlx_llm::primitives::Weights::from_map(w.into_tensors());
-        let model = Qwen35Model::from_weights_headless(&weights, MOSS_TEXT_ENCODER_PREFIX, config)
-            .map_err(|e| Error::Msg(e.to_string()))?;
+        let model = Qwen35Model::from_weights_headless_moss_frozen_hf(
+            &weights,
+            MOSS_TEXT_ENCODER_PREFIX,
+            config,
+        )
+        .map_err(|e| Error::Msg(e.to_string()))?;
         if !weights.unused_keys().is_empty() {
             return Err(Error::Unsupported(format!(
                 "unconsumed MOSS Qwen3.5 language tensors {:?}",

@@ -42,6 +42,24 @@ Each sample's text mask is compacted before text/joint attention. Text
 encoding runs one unpadded fresh-state prompt at a time, with materialized block
 boundaries for cooperative cancellation. The admitted default MLX device is retained.
 
+MOSS selects the headless `MossFrozenHf` intermediate precision profile (v1) in
+`mlx-llm`. BF16 checkpoint values, projections, Q/K L2 normalization and hidden
+outputs remain BF16. Zero-centered norm multipliers are formed in F32; ordinary
+norm normalization/multiplication precede output narrowing. Normalized Q is widened
+before head scaling, and delta decay stays F32 into the existing recurrence.
+Shared Qwen, Flux3 and Prism constructor defaults retain their existing arithmetic.
+The frozen MOSS geometry owns an additional 540,672 bytes of norm multipliers;
+selected admission facts and retained-byte accounting include these actual F32 arrays.
+The execution receipt's `text_encoder: bf16` describes its backbone/output precision,
+not every intermediate operation. This profile corrects three source-level rounding
+boundaries; its effect on actual text/image quality still requires measurement.
+
+There is no persistent text-embedding cache: each prompt starts a fresh decoder cache,
+and conditioning tensors live only within its request. Reference KV is also per edit
+sampling call. Header metadata caches store source facts, not derived model arrays;
+selected residency facts are recalculated. No calibrated memory fingerprint or receipt
+schema revision is asserted for this numerical change.
+
 Numerical unit tests use independently generated CPU author fixtures (FP32/BF16,
 mask compaction, skipped layers, exact low-rank arithmetic and data-space DMD).
 They initialize MLX arrays and require an admitted local Metal lane or normal hosted
