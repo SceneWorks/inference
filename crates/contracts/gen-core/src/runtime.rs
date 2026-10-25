@@ -23,6 +23,7 @@ struct SealHashWork(AtomicUsize);
 #[cfg(test)]
 thread_local! {
     static THREAD_FULL_HASH_WORK: Cell<usize> = const { Cell::new(0) };
+    static THREAD_HASH_BYTES_READ: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -293,6 +294,54 @@ fn path_component_fingerprints(path: &Path) -> std::io::Result<Vec<PathComponent
             })
         })
         .collect()
+}
+
+/// What work an artifact-seal observation actually represents. Metadata is not a content read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactSealAcquisition {
+    Metadata,
+    ColdContentRead,
+    MemoryMemo,
+    PersistedMemo,
+    DriftAudit,
+}
+
+/// Completing a read does not authorize a seal; only Acquired follows identity validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactSealProgressState {
+    Reading,
+    ReadComplete,
+    Acquired,
+    Canceled,
+    Failed,
+}
+
+/// Observational source work, never an authorization token or an estimated fraction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactSealProgress {
+    pub loader_path: PathBuf,
+    pub acquisition: ArtifactSealAcquisition,
+    pub state: ArtifactSealProgressState,
+    /// Actual bytes fed to SHA-256 in this read; memo acquisition always reports zero.
+    pub hashed_bytes: u64,
+    /// Declared file size at capture/open, not a cap on actual reads. Unknown before metadata.
+    pub source_bytes: Option<u64>,
+}
+
+fn seal_progress(
+    path: &Path,
+    acquisition: ArtifactSealAcquisition,
+    state: ArtifactSealProgressState,
+    hashed_bytes: u64,
+    source_bytes: Option<u64>,
+) -> ArtifactSealProgress {
+    ArtifactSealProgress {
+        loader_path: path.to_path_buf(),
+        acquisition,
+        state,
+        hashed_bytes,
+        source_bytes,
+    }
 }
 
 /// A re-openable single-file weights source pinned without canonicalizing its loader path.
@@ -618,22 +667,63 @@ impl ArtifactSeal {
         path: impl AsRef<Path>,
         mut check: impl FnMut() -> crate::Result<()>,
     ) -> crate::Result<Self> {
-        Self::pin_with_store_and_check(
-            path.as_ref(),
-            PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
-            &mut check,
-        )
+        Self::pin_with_progress(path, &mut check, |_| {})
+    }
+
+    /// Acquire the same seal with typed, truthful work observations. The observer cannot authorize
+    /// a source or suppress cancellation. To cancel on progress, latch a token read by `check`.
+    /// Reads report their first chunk, at most 256 MiB between updates, EOF and exact abort bytes.
+    /// Memo acquisitions report zero hashed bytes; metadata checks never fake content progress.
+    pub fn pin_with_progress(
+        path: impl AsRef<Path>,
+        mut check: impl FnMut() -> crate::Result<()>,
+        mut observe: impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let loader_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut last = seal_progress(
+            &loader_path,
+            ArtifactSealAcquisition::Metadata,
+            ArtifactSealProgressState::Reading,
+            0,
+            None,
+        );
+        let result = {
+            let mut record = |progress: &ArtifactSealProgress| {
+                last = progress.clone();
+                observe(progress);
+            };
+            Self::pin_with_store_and_check(
+                path,
+                PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+                &mut check,
+                &mut record,
+            )
+        };
+        if let Err(error) = &result {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            if last.state != state {
+                last.state = state;
+                observe(&last);
+            }
+        }
+        result
     }
 
     #[cfg(test)]
     fn pin_with_store(path: &Path, store: Option<&Path>) -> crate::Result<Self> {
-        Self::pin_with_store_and_check(path, store, &mut || Ok(()))
+        Self::pin_with_store_and_check(path, store, &mut || Ok(()), &mut |_| {})
     }
 
     fn pin_with_store_and_check(
         path: &Path,
         store: Option<&Path>,
         check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
     ) -> crate::Result<Self> {
         check()?;
         let loader_path = std::path::absolute(path)?;
@@ -673,6 +763,13 @@ impl ArtifactSeal {
         };
         if let Some(sha256) = proven_digest(&identity) {
             check()?;
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::MemoryMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
             return Ok(Self { sha256, ..pinned });
         }
         let persisted = store.and_then(|store| {
@@ -683,6 +780,13 @@ impl ArtifactSeal {
         if let Some(sha256) = persisted.as_deref().and_then(stored_proven_digest) {
             check()?;
             remember_proven_digest(identity, sha256);
+            observe(&seal_progress(
+                &pinned.loader_path,
+                ArtifactSealAcquisition::PersistedMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(pinned.target_fingerprint.size),
+            ));
             return Ok(Self { sha256, ..pinned });
         }
         #[cfg(test)]
@@ -690,12 +794,27 @@ impl ArtifactSeal {
             pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
-        let sha256 = pinned.read_unchanged(|path| hash_file_sha256_with_check(path, check))?;
+        let (sha256, hashed_bytes) =
+            pinned.read_unchanged_with_check(check, observe, |path, check, observe| {
+                hash_file_sha256_with_progress(
+                    path,
+                    check,
+                    ArtifactSealAcquisition::ColdContentRead,
+                    observe,
+                )
+            })?;
         check()?;
         if let Some(entry) = &persisted {
             store_proven_digest(entry, &sha256);
         }
         remember_proven_digest(identity, sha256);
+        observe(&seal_progress(
+            &pinned.loader_path,
+            ArtifactSealAcquisition::ColdContentRead,
+            ArtifactSealProgressState::Acquired,
+            hashed_bytes,
+            Some(pinned.target_fingerprint.size),
+        ));
         Ok(Self { sha256, ..pinned })
     }
 
@@ -731,12 +850,22 @@ impl ArtifactSeal {
     }
 
     fn hash_content(&self, path: &Path) -> crate::Result<[u8; 32]> {
+        self.hash_content_with_check(path, &mut || Ok(()), &mut |_| {})
+    }
+
+    fn hash_content_with_check(
+        &self,
+        path: &Path,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<[u8; 32]> {
         #[cfg(test)]
         {
             self.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
-        hash_file_sha256(path)
+        hash_file_sha256_with_progress(path, check, ArtifactSealAcquisition::DriftAudit, observe)
+            .map(|(digest, _)| digest)
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {
@@ -778,17 +907,60 @@ impl ArtifactSeal {
     /// callers therefore never continue after a same-size replacement, including one that preserves
     /// an ordinary mtime. The error grammar is shared by Candle and MLX consumers.
     pub fn verify_unchanged(&self) -> crate::Result<()> {
-        if self.ensure_unchanged().is_ok() {
+        self.verify_unchanged_with_check(&mut || Ok(()), &mut |_| {})
+    }
+
+    fn verify_unchanged_with_check(
+        &self,
+        check: &mut impl FnMut() -> crate::Result<()>,
+        observe: &mut impl FnMut(&ArtifactSealProgress),
+    ) -> crate::Result<()> {
+        check()?;
+        let unchanged = self.ensure_unchanged().is_ok();
+        check()?;
+        if unchanged {
             return Ok(());
         }
 
-        // A mismatch must force a complete verification attempt before it is rejected. The result
-        // cannot re-authorize the path: an identity change alone is fail-closed.
-        let _ = self.hash_content(&self.loader_path);
+        // Identity drift can never re-authorize this seal, even if a full audit agrees.
+        // Preserve the unchecked API's mismatch authority for I/O errors, but do not swallow
+        // cooperative callback errors or silently turn its audit into an unchecked full read.
+        let mut interrupted = false;
+        let audit = self.hash_content_with_check(
+            &self.loader_path,
+            &mut || check().inspect_err(|_| interrupted = true),
+            observe,
+        );
+        if interrupted {
+            return audit.map(|_| ());
+        }
+        check()?;
         Err(crate::Error::Unsupported(format!(
             "artifact seal mismatch after load: {}",
             self.loader_path.display()
         )))
+    }
+
+    fn read_unchanged_with_check<T, C, O>(
+        &self,
+        check: &mut C,
+        observe: &mut O,
+        read: impl FnOnce(&Path, &mut C, &mut O) -> crate::Result<T>,
+    ) -> crate::Result<T>
+    where
+        C: FnMut() -> crate::Result<()>,
+        O: FnMut(&ArtifactSealProgress),
+    {
+        self.verify_unchanged_with_check(check, observe)?;
+        let result = read(&self.loader_path, check, observe);
+        // A canceled acquisition delivers no source bytes or seal. Do not start a post-read
+        // drift audit (or invoke a one-shot callback again) after that terminal cancellation.
+        // The public unchecked read_unchanged retains its stronger post-read mutation priority.
+        if matches!(result, Err(crate::Error::Canceled)) {
+            return result;
+        }
+        self.verify_unchanged_with_check(check, observe)?;
+        result
     }
 
     /// Explicit, operator-requested full-content audit of an otherwise stable seal.
@@ -832,29 +1004,124 @@ impl ArtifactSeal {
 /// ~216 MB/s for 4 MiB reads of the same disk (sc-26610); the sequential hash is I/O-bound there.
 const HASH_READ_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(test)]
 fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
     hash_file_sha256_with_check(path, &mut || Ok(()))
 }
 
+#[cfg(test)]
 fn hash_file_sha256_with_check(
     path: &Path,
     check: &mut impl FnMut() -> crate::Result<()>,
 ) -> crate::Result<[u8; 32]> {
-    check()?;
+    hash_file_sha256_with_progress(
+        path,
+        check,
+        ArtifactSealAcquisition::ColdContentRead,
+        &mut |_| {},
+    )
+    .map(|(digest, _)| digest)
+}
+
+fn hash_file_sha256_with_progress(
+    path: &Path,
+    check: &mut impl FnMut() -> crate::Result<()>,
+    acquisition: ArtifactSealAcquisition,
+    observe: &mut impl FnMut(&ArtifactSealProgress),
+) -> crate::Result<([u8; 32], u64)> {
+    let mut checked = |hashed_bytes, source_bytes| {
+        check().inspect_err(|error| {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+        })
+    };
+    checked(0, None)?;
     let mut reader = File::open(path)?;
-    check()?;
+    let source_bytes = Some(reader.metadata()?.len());
+    checked(0, source_bytes)?;
+    // Release the callback borrow so progress is reported BEFORE the post-read cancellation check.
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; HASH_READ_BYTES];
+    let mut hashed_bytes = 0u64;
+    let mut reported = 0u64;
     loop {
-        check()?;
-        let read = reader.read(&mut buffer)?;
-        check()?;
+        if let Err(error) = check() {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            return Err(error);
+        }
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                observe(&seal_progress(
+                    path,
+                    acquisition,
+                    ArtifactSealProgressState::Failed,
+                    hashed_bytes,
+                    source_bytes,
+                ));
+                return Err(error.into());
+            }
+        };
+        hash.update(&buffer[..read]);
+        hashed_bytes += read as u64;
+        #[cfg(test)]
+        THREAD_HASH_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read));
+        if read == 0 || reported == 0 || hashed_bytes - reported >= 256 * 1024 * 1024 {
+            let state = if read == 0 {
+                ArtifactSealProgressState::ReadComplete
+            } else {
+                ArtifactSealProgressState::Reading
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            reported = hashed_bytes;
+        }
+        if let Err(error) = check() {
+            let state = if matches!(error, crate::Error::Canceled) {
+                ArtifactSealProgressState::Canceled
+            } else {
+                ArtifactSealProgressState::Failed
+            };
+            observe(&seal_progress(
+                path,
+                acquisition,
+                state,
+                hashed_bytes,
+                source_bytes,
+            ));
+            return Err(error);
+        }
         if read == 0 {
             break;
         }
-        hash.update(&buffer[..read]);
     }
-    Ok(hash.finalize().into())
+    Ok((hash.finalize().into(), hashed_bytes))
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
@@ -2579,6 +2846,334 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn artifact_seal_progress_reports_actual_cold_memo_and_partial_cancel_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = (HASH_READ_BYTES * 3 + 17) as u64;
+        let path = dir.path().join("observed-cold.synthetic");
+        File::create(&path).unwrap().set_len(size).unwrap();
+        let mut cold = Vec::new();
+        let seal =
+            ArtifactSeal::pin_with_progress(&path, || Ok(()), |e| cold.push(e.clone())).unwrap();
+        assert_eq!(
+            cold[0].acquisition,
+            ArtifactSealAcquisition::ColdContentRead
+        );
+        assert_eq!(cold[0].state, ArtifactSealProgressState::Reading);
+        assert_eq!(cold[0].hashed_bytes, HASH_READ_BYTES as u64);
+        assert!(cold
+            .iter()
+            .all(|e| e.loader_path == path && e.source_bytes == Some(size)));
+        assert_eq!(
+            cold.last().unwrap().state,
+            ArtifactSealProgressState::Acquired
+        );
+        assert_eq!(cold.last().unwrap().hashed_bytes, size);
+        assert!(cold
+            .iter()
+            .any(|e| e.state == ArtifactSealProgressState::ReadComplete && e.hashed_bytes == size));
+        assert!(cold
+            .windows(2)
+            .all(|w| w[0].hashed_bytes <= w[1].hashed_bytes));
+        let work = test_full_hash_work_count();
+        let mut memo = Vec::new();
+        let again =
+            ArtifactSeal::pin_with_progress(&path, || Ok(()), |e| memo.push(e.clone())).unwrap();
+        assert_eq!(again.content_sha256(), seal.content_sha256());
+        assert_eq!(test_full_hash_work_count(), work);
+        assert_eq!(
+            memo,
+            vec![seal_progress(
+                &path,
+                ArtifactSealAcquisition::MemoryMemo,
+                ArtifactSealProgressState::Acquired,
+                0,
+                Some(size)
+            )]
+        );
+        for chunks in [1, 2] {
+            let path = dir
+                .path()
+                .join(format!("observed-cancel-{chunks}.synthetic"));
+            File::create(&path).unwrap().set_len(size).unwrap();
+            let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+            let cancel = Cell::new(false);
+            let mut events = Vec::new();
+            let result = ArtifactSeal::pin_with_progress(
+                &path,
+                || {
+                    if cancel.get()
+                        || (chunks == 2
+                            && THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes
+                                >= 2 * HASH_READ_BYTES)
+                    {
+                        Err(crate::Error::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |e| {
+                    if chunks == 1
+                        && e.state == ArtifactSealProgressState::Reading
+                        && e.hashed_bytes > 0
+                    {
+                        cancel.set(true); // A consumer can cancel on actual progress, not callback counts.
+                    }
+                    events.push(e.clone());
+                },
+            );
+            assert!(matches!(result, Err(crate::Error::Canceled)));
+            assert_eq!(
+                THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                chunks * HASH_READ_BYTES
+            );
+            let last = events.last().unwrap();
+            assert_eq!(last.state, ArtifactSealProgressState::Canceled);
+            assert_eq!(last.acquisition, ArtifactSealAcquisition::ColdContentRead);
+            assert_eq!(
+                last.hashed_bytes,
+                (chunks * HASH_READ_BYTES) as u64,
+                "cancel bytes must include unreported chunks, not repeat last periodic progress"
+            );
+            assert_eq!(last.source_bytes, Some(size));
+            assert!(!events
+                .iter()
+                .any(|e| e.state == ArtifactSealProgressState::Acquired));
+        }
+    }
+
+    #[test]
+    fn artifact_seal_progress_names_real_persisted_hit_or_actual_cold_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("digests");
+        let path = dir.path().join("persisted.synthetic");
+        std::fs::write(&path, b"synthetic source bytes").unwrap();
+        let first = ArtifactSeal::pin_with_store(&path, Some(&store)).unwrap();
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let mut events = Vec::new();
+        let second =
+            ArtifactSeal::pin_with_store_and_check(&path, Some(&store), &mut || Ok(()), &mut |e| {
+                events.push(e.clone())
+            })
+            .unwrap();
+        assert_eq!(first.content_sha256(), second.content_sha256());
+        let persisted = persists_on_this_volume(dir.path());
+        let last = events.last().unwrap();
+        assert_eq!(last.state, ArtifactSealProgressState::Acquired);
+        assert_eq!(
+            last.acquisition,
+            if persisted {
+                ArtifactSealAcquisition::PersistedMemo
+            } else {
+                ArtifactSealAcquisition::ColdContentRead
+            }
+        );
+        assert_eq!(last.hashed_bytes, if persisted { 0 } else { 22 });
+        if persisted {
+            assert_eq!(events.len(), 1);
+            assert_eq!(test_full_hash_work_count(), before);
+        } else {
+            assert!(test_full_hash_work_count() > before);
+            assert!(events
+                .iter()
+                .any(|e| e.state == ArtifactSealProgressState::ReadComplete));
+        }
+    }
+
+    #[test]
+    fn artifact_seal_progress_read_completion_and_drift_audit_never_authorize_changed_source() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed-drift.synthetic");
+        let size = (HASH_READ_BYTES * 3 + 17) as u64;
+        File::create(&path).unwrap().set_len(size).unwrap();
+        let mut events = Vec::new();
+        let mut changed = false;
+        let result = ArtifactSeal::pin_with_progress(
+            &path,
+            || Ok(()),
+            |e| {
+                if !changed
+                    && e.acquisition == ArtifactSealAcquisition::ColdContentRead
+                    && e.state == ArtifactSealProgressState::Reading
+                {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(&[0xa5])
+                        .unwrap();
+                    changed = true;
+                }
+                events.push(e.clone());
+            },
+        );
+        assert!(matches!(result, Err(crate::Error::Unsupported(_))));
+        assert!(
+            events.iter().any(
+                |e| e.acquisition == ArtifactSealAcquisition::ColdContentRead
+                    && e.state == ArtifactSealProgressState::ReadComplete
+                    && e.hashed_bytes == size + 1
+                    && e.source_bytes == Some(size)
+            ),
+            "actual hashed bytes must not be replaced by the declared source size"
+        );
+        assert!(events
+            .iter()
+            .any(|e| e.acquisition == ArtifactSealAcquisition::DriftAudit && e.hashed_bytes > 0));
+        assert_eq!(
+            events.last().unwrap().state,
+            ArtifactSealProgressState::Failed
+        );
+        assert!(!events
+            .iter()
+            .any(|e| e.state == ArtifactSealProgressState::Acquired));
+    }
+
+    #[test]
+    fn artifact_seal_progress_metadata_cancel_does_not_claim_a_cold_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-opened.synthetic");
+        let before = test_full_hash_work_count();
+        let bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+        let mut events = Vec::new();
+        let result = ArtifactSeal::pin_with_progress(
+            &path,
+            || Err(crate::Error::Canceled),
+            |e| events.push(e.clone()),
+        );
+        assert!(matches!(result, Err(crate::Error::Canceled)));
+        assert_eq!(
+            events,
+            vec![seal_progress(
+                &path,
+                ArtifactSealAcquisition::Metadata,
+                ArtifactSealProgressState::Canceled,
+                0,
+                None
+            )]
+        );
+        assert_eq!(test_full_hash_work_count(), before);
+        assert_eq!(THREAD_HASH_BYTES_READ.with(Cell::get), bytes);
+    }
+
+    #[test]
+    fn checked_artifact_pin_canceled_chunk_with_drift_never_runs_second_audit() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-drift.synthetic");
+        File::create(&path)
+            .unwrap()
+            .set_len((HASH_READ_BYTES * 3 + 17) as u64)
+            .unwrap();
+        let original_identity = SealIdentity {
+            loader_path: std::path::absolute(&path).unwrap(),
+            canonical_target_path: std::fs::canonicalize(&path).unwrap(),
+            path_component_fingerprints: path_component_fingerprints(&path).unwrap(),
+            entry_fingerprint: stat_fingerprint(&path, false).unwrap(),
+            target_fingerprint: stat_fingerprint(&path, true).unwrap(),
+        };
+        let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+        let start_reads = test_full_hash_work_count();
+        let mut canceled = false;
+        let result = ArtifactSeal::pin_with_check(&path, || {
+            if !canceled && THREAD_HASH_BYTES_READ.with(Cell::get) > start_bytes {
+                assert_eq!(
+                    THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                    HASH_READ_BYTES
+                );
+                // Change content AND a fingerprint field after the first real checked read.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[0xa5])
+                    .unwrap();
+                canceled = true;
+                return Err(crate::Error::Canceled);
+            }
+            // Deliberately one-shot: a later callback must not mask an ignored cancellation.
+            Ok(())
+        });
+        assert!(canceled);
+        assert!(matches!(result, Err(crate::Error::Canceled)));
+        assert_eq!(
+            test_full_hash_work_count() - start_reads,
+            1,
+            "a canceled read must never start a second drift audit"
+        );
+        assert_eq!(
+            THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+            HASH_READ_BYTES,
+            "neither the rest of the acquisition nor an unchecked audit may read after cancel"
+        );
+        assert!(
+            proven_digest(&original_identity).is_none(),
+            "no partial/canceled seal may reach the memo"
+        );
+    }
+
+    #[test]
+    fn checked_seal_pre_and_post_drift_audits_check_chunks_and_never_authorize() {
+        use std::io::Write;
+        for pre_drift in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit-drift.synthetic");
+            File::create(&path)
+                .unwrap()
+                .set_len((HASH_READ_BYTES * 3 + 17) as u64)
+                .unwrap();
+            let seal = ArtifactSeal::pin(&path).unwrap();
+            let drift = || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[0xa5])
+                    .unwrap()
+            };
+            if pre_drift {
+                drift();
+            }
+            let start_bytes = THREAD_HASH_BYTES_READ.with(Cell::get);
+            let start_audits = seal.full_hash_work_count();
+            let read_called = Cell::new(false);
+            let mut canceled = false;
+            let result = seal.read_unchanged_with_check(
+                &mut || {
+                    if !canceled && THREAD_HASH_BYTES_READ.with(Cell::get) > start_bytes {
+                        canceled = true;
+                        return Err(crate::Error::Canceled);
+                    }
+                    Ok(())
+                },
+                &mut |_| {},
+                |_, _, _| {
+                    read_called.set(true);
+                    drift();
+                    Ok(42)
+                },
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Canceled)),
+                "drift audit must propagate cancellation, not authorize source bytes"
+            );
+            assert_eq!(
+                read_called.get(),
+                !pre_drift,
+                "pre-verification drift cannot open the requested source read"
+            );
+            assert!(canceled);
+            assert_eq!(seal.full_hash_work_count() - start_audits, 1);
+            assert_eq!(
+                THREAD_HASH_BYTES_READ.with(Cell::get) - start_bytes,
+                HASH_READ_BYTES,
+                "the actual pre/post drift audit must stop at its first checked chunk"
+            );
+        }
+    }
 
     #[test]
     fn checked_artifact_pin_cancels_inside_bounded_hash_and_preserves_digest_memo() {

@@ -939,7 +939,7 @@ mod tests {
         for backend in [MLX, CANDLE] {
             assert!(profile_from_headers(
                 backend,
-                &[f.clone()],
+                std::slice::from_ref(&f),
                 &[target("transformer_blocks.0.attn.to_q", 8, 12, true)]
             )
             .is_err());
