@@ -89,6 +89,9 @@ pub struct MemoryPhaseFacts {
     /// Absent means unknown, never zero resident weights.
     pub transformer_stream: Option<StreamedWeightFacts>,
     pub decoder_workspace: Option<DecoderWorkspaceFacts>,
+    /// H3 native integer stage-local allocations, derived from the resolved source formats.
+    /// None leaves existing providers' estimates unchanged.
+    pub native_quant: Option<crate::h3_memory::NativeAllocationFacts>,
 }
 
 impl MemoryPhaseFacts {
@@ -99,6 +102,7 @@ impl MemoryPhaseFacts {
             staged_weights,
             transformer_stream: None,
             decoder_workspace: None,
+            native_quant: None,
         }
     }
 }

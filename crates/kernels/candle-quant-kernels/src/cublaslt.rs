@@ -38,6 +38,9 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Device allocation held by one shared cuBLASLt context, also used by native admission.
+pub const CUBLASLT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Result of a per-tensor dynamic activation quantization: the packed 8-bit tensor plus the scalar
 /// `scale` such that `dequant = q * scale` (fp8: absmax/448; int8: absmax/127).
 pub struct QuantizedActivation {
@@ -464,7 +467,7 @@ mod cuda_impl {
 
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
-        const WORKSPACE: usize = 32 * 1024 * 1024;
+        const WORKSPACE: usize = super::CUBLASLT_WORKSPACE_BYTES;
 
         /// Returns the driver-reported identity for the cached NVFP4 algorithm selected for
         /// `(m, k, n)`, if that shape has already run. This is an observation seam for device

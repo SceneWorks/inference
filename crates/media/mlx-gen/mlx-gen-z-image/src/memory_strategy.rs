@@ -628,6 +628,7 @@ fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFact
         architecture: Some(mlx_gen::gen_core::ImagePipelineArchitecture::ZImageDit),
         staged_weights: mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
         transformer_stream: None,
+        native_quant: None,
         decoder_workspace: None,
     };
     let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {

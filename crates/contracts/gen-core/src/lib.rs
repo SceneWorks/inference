@@ -33,6 +33,8 @@ pub mod fx_program;
 pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
+pub mod h3_conditioning_memory;
+pub mod h3_memory;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;

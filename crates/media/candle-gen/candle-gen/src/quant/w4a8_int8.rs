@@ -18,7 +18,7 @@ use candle_core::{DType, Device, Tensor};
 use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
 
 /// Output rows decoded at a time; every tile spans the full contraction dimension.
-const TILE_ROWS: usize = 64;
+pub const TILE_ROWS: usize = 64;
 
 /// Immutable packed codebook projection with forward-time additive adapter support.
 pub struct W4A8Linear {
