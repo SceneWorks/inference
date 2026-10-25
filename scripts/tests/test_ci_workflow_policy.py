@@ -1186,6 +1186,66 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
 
+    def assert_moss_positive_transport_budget(self, source: str) -> None:
+        self.assertIn("[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60", source)
+        run = source.split("function Owned-Run(", 1)[1].split("function Check-Device(", 1)[0]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", run)
+        self.assertIn('Require ($watch.Elapsed.TotalSeconds -lt $seconds) "Owned child timeout: $name"', run)
+        self.assertLess(run.index("$p.StandardOutput.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("$p.StandardError.BaseStream.CopyToAsync"), run.index("$root=Capture-Owned $p"))
+        self.assertLess(run.index("Stop-Owned $owned"), run.index("[Threading.Tasks.Task]::WaitAll"))
+        # The two formerly 10-second positive smokes share the existing 60s helper watchdog.
+        for name in ("root-exits-before-pipe-child", "streamed-io"):
+            self.assertIn(f"'{name}' $SelfTestPositiveTimeoutSeconds {{", source)
+        for invariant in (
+            "var deadline = DateTime.UtcNow.AddSeconds(60);",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        ):
+            self.assertIn(invariant, source)
+        # Only SelfTest owns this budget. Product compile/campaign deadlines remain untouched.
+        product = source.split("Exact-Fields $c @('campaign'", 1)[1]
+        self.assertNotIn("SelfTestPositiveTimeoutSeconds", product)
+        self.assertIn("'build' 10800", product)
+
+    def test_moss_positive_transport_budget_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assert_moss_positive_transport_budget(source)
+        guards = (
+            "[ValidateRange(10,60)][int]$SelfTestPositiveTimeoutSeconds=60",
+            "'root-exits-before-pipe-child' $SelfTestPositiveTimeoutSeconds {",
+            "'streamed-io' $SelfTestPositiveTimeoutSeconds {",
+            "'fake-timeout' 1 {",
+            "'never-release-owned'",
+            "'never-release-foreign'",
+            "'Timed-out owned process survived cleanup'",
+            "'Foreign same-name process was terminated'",
+            "[IO.File]::WriteAllText($script:fixtureIoRelease,'release')",
+            "Require $script:fixtureIoObserved 'Owned stream was never authenticated/released'",
+            "'O'*131072",
+            "'E'*131072",
+            "'Owned stdout lost or changed bytes'",
+            "'Owned stderr lost or changed bytes'",
+            "'Owned stream byte-identical EOF: '",
+        )
+        for guard in guards:
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_positive_transport_budget(source.replace(guard, ""))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'fake-timeout' 1 {", "'fake-timeout' $SelfTestPositiveTimeoutSeconds {"))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_positive_transport_budget(source.replace("'streamed-io' $SelfTestPositiveTimeoutSeconds {", "'streamed-io' 10 {"))
+
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
     # so a renamed or dropped module would otherwise leave a green step that tests nothing.

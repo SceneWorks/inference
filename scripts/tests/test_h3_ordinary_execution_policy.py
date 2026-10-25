@@ -911,10 +911,17 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                     self.assertIsNotNone(count, "metadata preflight must never replace the execution count guard")
                     self.assertEqual(int(count[1]), len(runtime_names))
                     if "shell: cmd" in step:
-                        self.assertIn(f'if not "%LIST_COUNT%"=="{len(runtime_names)}" exit /b 1', step)
+                        self.assertIn("-File scripts\\ci\\h3-native-test-list.ps1", step)
+                        self.assertIn(f"-ExpectedCount {len(runtime_names)}", step)
+                        encoded = re.search(r'-ExpectedNames "([^"\n]+)"', step)
+                        self.assertIsNotNone(encoded)
+                        self.assertCountEqual(encoded[1].split("|"), runtime_names)
                         for name in runtime_names:
-                            self.assertIn(f'findstr /L /X /C:"{name}: test"', step)
+                            self.assertIn(f'findstr /L /C:"{name}: test"', step)
                         self.assertIn('type "%LIST%"', step)
+                        self.assertNotIn("LIST_COUNT", step)
+                        self.assertNotIn("findstr /R", step)
+                        self.assertNotIn("findstr /L /X", step)
                     else:
                         self.assertIn(f' -eq {len(runtime_names)}', step)
                         for name in runtime_names:
@@ -922,6 +929,38 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                         self.assertIn('cat "$list_log"', step)
                     seen += len(runtime_names)
         self.assertGreater(seen, 0)
+
+    def test_windows_inventory_validator_is_exact_diagnostic_and_self_tested_before_build(self) -> None:
+        script = (ROOT / "scripts/ci/h3-native-test-list.ps1").read_text(encoding="utf-8")
+        for token in ("[IO.File]::ReadAllLines($path)", "[StringComparer]::Ordinal)",
+                      "actual_count=$actual.Count", "expected_count=$count", "names=$actual",
+                      "missing=$missing", "extra=$extra", "H3_COMPILED_TEST_LIST ",
+                      "if ($actual.Count -ne $count)", "if ($missing.Count -ne 0 -or $extra.Count -ne 0)"):
+            self.assertIn(token, script)
+        self.assertLess(script.index("H3_COMPILED_TEST_LIST ", script.index("$actualSet=")), script.index("if ($actual.Count -ne $count)"))
+        self.assertIn('foreach ($ending in @("`n","`r`n"))', script)
+        for case in ("zero", "partial", "missing", "extra", "wrong-namespace", "substring", "trailing", "case", "duplicate", "nonpositive"):
+            self.assertIn(f"label='{case}'", script)
+        self.assertIn("Running tests\\main.rs", script)
+        self.assertIn("Finished test profile", script)
+        self.assertIn("Invoke-InventorySelfTest $ignoreMissing", script)
+        self.assertIn("H3_COMPILED_TEST_LIST_MUTANT_REJECTED missing-name", script)
+        self.assertIn("actual_count=$null", script)
+        self.assertIn("read_error=$_.Exception.Message", script)
+        self.assertIn("H3 compiled list self-test accepted an unreadable list", script)
+        self.assertIn("self_test=[bool]$SelfTest", script)
+        self.assertIn("Invoke-InventorySelfTest $correct", script)
+        for job in ("windows-cuda-check", "synthetic-w4a8-cuda"):
+            block = jobs(CI.read_text(encoding="utf-8"))[job]
+            self.assertEqual(block.count("run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest"), 1)
+            first_build = re.search(r"(?m)^          cargo (?:build|test|clippy)", block)
+            self.assertIsNotNone(first_build)
+            self.assertLess(block.index("h3-native-test-list.ps1 -SelfTest"), first_build.start())
+            if job == "windows-cuda-check":
+                smoke = next(s for s in steps(block) if "- name: Verify native MOSS transport guards without GPU execution" in s)
+                self.assertIn("timeout-minutes: 5", smoke)
+                self.assertIn("-SelfTest -SelfTestPositiveTimeoutSeconds 60", smoke)
+                self.assertLess(block.index("moss-native-terminal.ps1 -SelfTest"), first_build.start())
 
     def test_real_weights_routes_do_not_select_gated_synthetic_tests(self) -> None:
         body = _strip_comment_lines(REAL_WEIGHTS.read_text(encoding="utf-8"))

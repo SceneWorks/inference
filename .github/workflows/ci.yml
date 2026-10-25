@@ -1397,9 +1397,13 @@ jobs:
         run: |
           Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
           Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
-      - name: Verify native MOSS transport guards without GPU execution
+      - name: Verify H3 compiled-test list parser without GPU execution
         shell: powershell
-        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest
+        run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest
+      - name: Verify native MOSS transport guards without GPU execution
+        timeout-minutes: 5
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest -SelfTestPositiveTimeoutSeconds 60
       - name: Install pinned uv for Windows supervisor smoke
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
@@ -1607,6 +1611,9 @@ jobs:
         run: |
           Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
           Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Verify H3 compiled-test list parser without GPU execution
+        shell: powershell
+        run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest
       - name: Record source revision
         shell: cmd
         run: |
@@ -1669,11 +1676,11 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="2" exit /b 1
-          findstr /L /X /C:"w4a8_compare::native_forward_matches_the_external_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "w4a8_compare::native_forward_matches_the_external_reference|w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"w4a8_compare::native_forward_matches_the_external_reference: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration w4a8_compare:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1691,10 +1698,10 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="1" exit /b 1
-          findstr /L /X /C:"convrot_int8::native_projections_match_pinned_kitchen: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 1 -ExpectedNames "convrot_int8::native_projections_match_pinned_kitchen"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"convrot_int8::native_projections_match_pinned_kitchen: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1711,11 +1718,11 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="2" exit /b 1
-          findstr /L /X /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_memory: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "adaln_evict_memory::the_evicted_adaln_weights_leave_memory|adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_memory: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adaln_evict_memory:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1735,12 +1742,12 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="3" exit /b 1
-          findstr /L /X /C:"cross_backend::dit_agrees_with_the_mlx_lane: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 3 -ExpectedNames "cross_backend::dit_agrees_with_the_mlx_lane|cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes|cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"cross_backend::dit_agrees_with_the_mlx_lane: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration cross_backend:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1761,13 +1768,13 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="4" exit /b 1
-          findstr /L /X /C:"dit_io::the_model_embeds_the_context_before_refining_it: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_io::the_whole_model_reproduces_the_reference_velocity: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_io::forward_packed_rejects_an_out_of_range_adaln_index: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_io::the_cached_modulation_path_reproduces_the_resident_one: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 4 -ExpectedNames "dit_io::the_model_embeds_the_context_before_refining_it|dit_io::the_whole_model_reproduces_the_reference_velocity|dit_io::forward_packed_rejects_an_out_of_range_adaln_index|dit_io::the_cached_modulation_path_reproduces_the_resident_one"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"dit_io::the_model_embeds_the_context_before_refining_it: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_io::the_whole_model_reproduces_the_reference_velocity: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_io::forward_packed_rejects_an_out_of_range_adaln_index: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_io::the_cached_modulation_path_reproduces_the_resident_one: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_io:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1789,16 +1796,16 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="7" exit /b 1
-          findstr /L /X /C:"pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 7 -ExpectedNames "pruned_adaln::native_pruned_adaln_matches_pinned_reference|pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference|pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis|pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection|pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates|pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision|pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1824,22 +1831,22 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="13" exit /b 1
-          findstr /L /X /C:"adapter_topology::native_adapter_folds_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::real_but_unaddressable_modules_name_the_exclusion: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 13 -ExpectedNames "adapter_topology::native_adapter_folds_on_the_pruned_curve|adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies|adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology|adapter_topology::real_but_unaddressable_modules_name_the_exclusion|adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically|adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically|adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically|adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling|adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta|adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve|adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto|adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies|adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"adapter_topology::native_adapter_folds_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::real_but_unaddressable_modules_name_the_exclusion: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1872,22 +1879,22 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="13" exit /b 1
-          findstr /L /X /C:"turbo_lora::every_enumerated_target_resolves_through_the_model_tree: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::adaln_and_the_norms_are_not_addressable: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::the_install_folds_at_the_published_strength: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::the_installed_fold_keeps_the_factor_dtype: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::an_unmatched_target_is_surfaced_by_name: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::the_conversion_leaves_no_comfyui_module_behind: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 13 -ExpectedNames "turbo_lora::every_enumerated_target_resolves_through_the_model_tree|turbo_lora::adaln_and_the_norms_are_not_addressable|turbo_lora::the_install_folds_at_the_published_strength|turbo_lora::the_installed_fold_keeps_the_factor_dtype|turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate|turbo_lora::an_unmatched_target_is_surfaced_by_name|turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results|turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically|turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims|turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target|turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check|turbo_lora::the_conversion_leaves_no_comfyui_module_behind|turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"turbo_lora::every_enumerated_target_resolves_through_the_model_tree: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::adaln_and_the_norms_are_not_addressable: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::the_install_folds_at_the_published_strength: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::the_installed_fold_keeps_the_factor_dtype: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::an_unmatched_target_is_surfaced_by_name: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::the_conversion_leaves_no_comfyui_module_behind: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration turbo_lora:: -- --ignored --nocapture --test-threads=1 --skip manual_cuda_fabricated_lokr_install_receipt --skip exact_h3_trainer_file_receipt --skip manual_cuda_exact_h3_trainer_runtime_receipt >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1920,11 +1927,11 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="2" exit /b 1
-          findstr /L /X /C:"dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack|dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --lib dit::model::veda_controls_tests:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
@@ -1946,18 +1953,18 @@ jobs:
           set "RC=%ERRORLEVEL%"
           type "%LIST%"
           if not "%RC%"=="0" exit /b %RC%
-          set /a LIST_COUNT=0 >nul
-          for /f "delims=" %%N in ('findstr /R /C:": test$" "%LIST%"') do @set /a LIST_COUNT+=1 >nul
-          if not "%LIST_COUNT%"=="9" exit /b 1
-          findstr /L /X /C:"dit_parity::adaln_modulation_matches_the_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::transformer_block_matches_the_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::every_norm_epsilon_is_wired_through: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::reading_the_ffn_halves_gate_first_breaks_parity: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::every_block_weight_is_load_bearing: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::parity_residuals_bound_the_mutation_floor: test" "%LIST%" >nul || exit /b 1
-          findstr /L /X /C:"dit_parity::weight_mapping_is_exhaustive_over_the_block_stack: test" "%LIST%" >nul || exit /b 1
+          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 9 -ExpectedNames "dit_parity::adaln_modulation_matches_the_reference|dit_parity::transformer_block_matches_the_reference|dit_parity::every_norm_epsilon_is_wired_through|dit_parity::reading_the_ffn_halves_gate_first_breaks_parity|dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing|dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked|dit_parity::every_block_weight_is_load_bearing|dit_parity::parity_residuals_bound_the_mutation_floor|dit_parity::weight_mapping_is_exhaustive_over_the_block_stack"
+          set "RC=%ERRORLEVEL%"
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /L /C:"dit_parity::adaln_modulation_matches_the_reference: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::transformer_block_matches_the_reference: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::every_norm_epsilon_is_wired_through: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::reading_the_ffn_halves_gate_first_breaks_parity: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::every_block_weight_is_load_bearing: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::parity_residuals_bound_the_mutation_floor: test" "%LIST%" >nul || exit /b 1
+          findstr /L /C:"dit_parity::weight_mapping_is_exhaustive_over_the_block_stack: test" "%LIST%" >nul || exit /b 1
           cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_parity:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
           set "RC=%ERRORLEVEL%"
           type "%LOG%"
