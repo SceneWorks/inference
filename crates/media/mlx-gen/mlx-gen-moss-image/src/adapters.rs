@@ -266,8 +266,9 @@ pub(crate) fn apply(
                 "MOSS adapter kind does not match its safetensors metadata".into(),
             ));
         }
+        let (metadata_rank, metadata_alpha) = contract::lokr_scaling(&meta)?;
         let scale = if lokr {
-            let (rank, alpha) = contract::lokr_scaling(&meta)?;
+            let (rank, alpha) = (metadata_rank, metadata_alpha);
             let scale = (alpha / rank) * spec.scale;
             if !scale.is_finite() {
                 return Err(Error::Unsupported(
@@ -347,15 +348,18 @@ pub(crate) fn apply(
                         }
                     }
                 }
-                if matches!((rank_a,rank_b),(Some(a),Some(b)) if a!=b) {
-                    return Err(Error::Unsupported("MOSS LoRA A/B ranks disagree".into()));
+                if !matches!((rank_a,rank_b),(Some(a),Some(b)) if a == b && a as f32 == metadata_rank)
+                {
+                    return Err(Error::Unsupported(
+                        "MOSS LoRA factors must agree with native metadata rank".into(),
+                    ));
                 }
             }
         }
-        validated.push((groups, scale));
+        validated.push((groups, scale, metadata_alpha));
     }
     let mut reports = Vec::new();
-    for (spec, (groups, scale)) in specs.iter().zip(validated) {
+    for (spec, (groups, scale, metadata_alpha)) in specs.iter().zip(validated) {
         let weights = mlx_gen::weights::Weights::from_file(&spec.path)?;
         for key in weights.keys() {
             finite(weights.require(key)?, &format!("source tensor {key}"))?;
@@ -371,14 +375,32 @@ pub(crate) fn apply(
                         if scale == 0. { 0. } else { 1. },
                     )?;
                 }
-                let report =
-                    mlx_gen::adapters::loader::apply_lora_peft(host, &weights, scale, None)?;
-                if report.applied != groups.len() || !report.unmatched_paths.is_empty() {
-                    return Err(Error::Unsupported(
-                        "MOSS adapter did not apply every declared target".into(),
-                    ));
+                for path in groups.keys() {
+                    let a = weights.require(&format!("{path}.lora_A.weight"))?;
+                    let b = weights.require(&format!("{path}.lora_B.weight"))?;
+                    let alpha = if groups[path].contains_key("alpha") {
+                        crate::pipeline::logical_f32_readback(
+                            weights.require(&format!("{path}.alpha"))?,
+                        )?[0]
+                    } else {
+                        metadata_alpha
+                    };
+                    let effective = (alpha / a.shape()[0] as f32) * scale;
+                    if !alpha.is_finite() || !effective.is_finite() {
+                        return Err(Error::Unsupported(
+                            "MOSS LoRA effective scale must be finite".into(),
+                        ));
+                    }
+                    validate_lora_factors(a, b, effective)?;
+                    host.adaptable_mut(&path.split('.').collect::<Vec<_>>())
+                        .ok_or_else(|| Error::Unsupported("MOSS LoRA target disappeared".into()))?
+                        .push(Adapter::Lora {
+                            a: a.t(),
+                            b: multiply(b.t(), Array::from_f32(alpha / a.shape()[0] as f32))?,
+                            scale,
+                        });
                 }
-                report.applied
+                groups.len()
             }
             AdapterKind::Lokr => {
                 for (path, group) in &groups {

@@ -292,6 +292,7 @@ fn attention(
         .transpose_axes(&[0, 2, 1, 3])?;
     let v = v.reshape(&shape)?.transpose_axes(&[0, 2, 1, 3])?;
     let scale = 1.0 / (g.dim as f32 / g.heads as f32).sqrt();
+    let value_dtype = v.dtype();
     let out = if training {
         // Explicit differentiable SDPA: no evaluation of traced adapter activations.
         let q = q.as_dtype(Dtype::Float32)?;
@@ -306,6 +307,7 @@ fn attention(
             .expand_dims(2)?
             .matmul(&p.expand_dims(-1)?)?
             .squeeze_axes(&[-1])?
+            .as_dtype(value_dtype)?
     } else if v.dtype() == Dtype::Float32 {
         attention_fp32(&q, &k, &v, scale, cancel)?
     } else {
@@ -1724,130 +1726,138 @@ mod training_bf16_cpu_tests {
             &f["inputs"]["encoder_attention_mask"],
             g.text,
         );
-        for network in [NetworkType::Lora, NetworkType::Lokr] {
-            let mut model =
-                Transformer::load(&weights(&f["weights"], Dtype::Bfloat16), g.clone()).unwrap();
-            let frozen_values = crate::pipeline::logical_f32_readback(&model.video.weight).unwrap();
-            model.cast_training_weights(Dtype::Float32).unwrap();
-            assert!(model
-                .owned_arrays()
-                .iter()
-                .all(|a| a.dtype() == Dtype::Float32));
-            assert_eq!(
-                crate::pipeline::logical_f32_readback(&model.video.weight).unwrap(),
-                frozen_values
-            );
-            model.cast_training_weights(Dtype::Bfloat16).unwrap();
-            assert!(model
-                .owned_arrays()
-                .iter()
-                .all(|a| a.dtype() == Dtype::Bfloat16));
-            let paths =
-                contract::target_paths(g.layers, &["v".into(), "o".into(), "ffn_down".into()])
+        for targets in [
+            vec!["v".into(), "o".into(), "ffn_down".into()],
+            vec!["o".into()],
+        ] {
+            for network in [NetworkType::Lora, NetworkType::Lokr] {
+                let mut model =
+                    Transformer::load(&weights(&f["weights"], Dtype::Bfloat16), g.clone()).unwrap();
+                let frozen_values =
+                    crate::pipeline::logical_f32_readback(&model.video.weight).unwrap();
+                model.cast_training_weights(Dtype::Float32).unwrap();
+                assert!(model
+                    .owned_arrays()
+                    .iter()
+                    .all(|a| a.dtype() == Dtype::Float32));
+                assert_eq!(
+                    crate::pipeline::logical_f32_readback(&model.video.weight).unwrap(),
+                    frozen_values
+                );
+                model.cast_training_weights(Dtype::Bfloat16).unwrap();
+                assert!(model
+                    .owned_arrays()
+                    .iter()
+                    .all(|a| a.dtype() == Dtype::Bfloat16));
+                let paths = contract::target_paths(g.layers, &targets).unwrap();
+                let (adapter, mut params) = match network {
+                    NetworkType::Lora => {
+                        let (t, p) = build_lora_targets(&mut model, &paths, 2, 71).unwrap();
+                        (TrainAdapter::Lora { targets: t }, p)
+                    }
+                    NetworkType::Lokr => {
+                        let (t, p) = build_lokr_targets(&mut model, &paths, 2, 2, 71).unwrap();
+                        (TrainAdapter::Lokr { targets: t }, p)
+                    }
+                };
+                let cfg = TrainingConfig {
+                    rank: 2,
+                    alpha: 3.,
+                    network_type: network,
+                    ..Default::default()
+                };
+                let noise = add(&x, Array::from_f32(0.7)).unwrap();
+                let (_, grad) = crate::training::loss_grads(
+                    &mut model,
+                    &params,
+                    &adapter,
+                    &cfg,
+                    &x,
+                    &context[0],
+                    &noise,
+                    0.41,
+                    None,
+                    &CancelFlag::new(),
+                )
+                .unwrap();
+                assert!(grad.values().all(|g| g.dtype() == Dtype::Float32));
+                assert!(
+                    grad.values()
+                        .map(|a| crate::pipeline::logical_f32_readback(a)
+                            .unwrap()
+                            .iter()
+                            .map(|v| v * v)
+                            .sum::<f32>())
+                        .sum::<f32>()
+                        > 1e-12
+                );
+                let mut optimizer =
+                    mlx_gen::TrainOptimizer::from_config("adamw", 0.01, 0.).unwrap();
+                mlx_gen::train::lora::adapter_optimizer_update(
+                    &mut optimizer,
+                    &mut params,
+                    &grad,
+                    &cfg,
+                    0,
+                    71,
+                )
+                .unwrap();
+                model
+                    .install_training_adapter(&adapter, &params, 3., 2.)
                     .unwrap();
-            let (adapter, mut params) = match network {
-                NetworkType::Lora => {
-                    let (t, p) = build_lora_targets(&mut model, &paths, 2, 71).unwrap();
-                    (TrainAdapter::Lora { targets: t }, p)
-                }
-                NetworkType::Lokr => {
-                    let (t, p) = build_lokr_targets(&mut model, &paths, 2, 2, 71).unwrap();
-                    (TrainAdapter::Lokr { targets: t }, p)
-                }
-            };
-            let cfg = TrainingConfig {
-                rank: 2,
-                alpha: 3.,
-                network_type: network,
-                ..Default::default()
-            };
-            let noise = add(&x, Array::from_f32(0.7)).unwrap();
-            let (_, grad) = crate::training::loss_grads(
-                &mut model,
-                &params,
-                &adapter,
-                &cfg,
-                &x,
-                &context[0],
-                &noise,
-                0.41,
-                None,
-                &CancelFlag::new(),
-            )
-            .unwrap();
-            assert!(grad.values().all(|g| g.dtype() == Dtype::Float32));
-            assert!(
-                grad.values()
-                    .map(|a| crate::pipeline::logical_f32_readback(a)
-                        .unwrap()
-                        .iter()
-                        .map(|v| v * v)
-                        .sum::<f32>())
-                    .sum::<f32>()
-                    > 1e-12
-            );
-            let mut optimizer = mlx_gen::TrainOptimizer::from_config("adamw", 0.01, 0.).unwrap();
-            mlx_gen::train::lora::adapter_optimizer_update(
-                &mut optimizer,
-                &mut params,
-                &grad,
-                &cfg,
-                0,
-                71,
-            )
-            .unwrap();
-            model
-                .install_training_adapter(&adapter, &params, 3., 2.)
-                .unwrap();
-            let before = model
-                .forward(
-                    &x,
-                    &[410.],
-                    std::slice::from_ref(&context[0]),
-                    &[],
-                    &CancelFlag::new(),
+                model.training = true;
+                let before = model
+                    .forward(
+                        &x,
+                        &[410.],
+                        std::slice::from_ref(&context[0]),
+                        &[],
+                        &CancelFlag::new(),
+                    )
+                    .unwrap();
+                let temp = tempfile::tempdir().unwrap();
+                let file = temp.path().join("adapter.safetensors");
+                let metadata = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
+                let extra: Vec<_> = metadata
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                adapter
+                    .save_with_meta(&params, 3., 2., 2, "", &extra, &file)
+                    .unwrap();
+                let kind = match network {
+                    NetworkType::Lora => mlx_gen::runtime::AdapterKind::Lora,
+                    NetworkType::Lokr => mlx_gen::runtime::AdapterKind::Lokr,
+                };
+                let mut reloaded =
+                    Transformer::load(&weights(&f["weights"], Dtype::Bfloat16), g.clone()).unwrap();
+                crate::adapters::apply(
+                    &mut reloaded,
+                    MossImageVariant::Base,
+                    &[mlx_gen::runtime::AdapterSpec::new(file, 1., kind)],
                 )
                 .unwrap();
-            let temp = tempfile::tempdir().unwrap();
-            let file = temp.path().join("adapter.safetensors");
-            let metadata = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
-            let extra: Vec<_> = metadata
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            adapter
-                .save_with_meta(&params, 3., 2., 2, "", &extra, &file)
-                .unwrap();
-            let kind = match network {
-                NetworkType::Lora => mlx_gen::runtime::AdapterKind::Lora,
-                NetworkType::Lokr => mlx_gen::runtime::AdapterKind::Lokr,
-            };
-            let mut reloaded =
-                Transformer::load(&weights(&f["weights"], Dtype::Bfloat16), g.clone()).unwrap();
-            crate::adapters::apply(
-                &mut reloaded,
-                MossImageVariant::Base,
-                &[mlx_gen::runtime::AdapterSpec::new(file, 1., kind)],
-            )
-            .unwrap();
-            let after = reloaded
-                .forward(
-                    &x,
-                    &[410.],
-                    std::slice::from_ref(&context[0]),
-                    &[],
-                    &CancelFlag::new(),
-                )
-                .unwrap();
-            assert_eq!(
-                crate::pipeline::logical_f32_readback(&before).unwrap(),
-                crate::pipeline::logical_f32_readback(&after).unwrap()
-            );
-            assert!(reloaded.custom_owned_bytes > 0);
-            assert_eq!(
-                reloaded.resident_bytes(),
-                reloaded.owned_weight_bytes + reloaded.custom_owned_bytes
-            );
+                let after = reloaded
+                    .forward(
+                        &x,
+                        &[410.],
+                        std::slice::from_ref(&context[0]),
+                        &[],
+                        &CancelFlag::new(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    crate::pipeline::logical_f32_readback(&before).unwrap(),
+                    crate::pipeline::logical_f32_readback(&after).unwrap(),
+                    "BF16 selected-target training/reload diverged: {:?}",
+                    targets
+                );
+                assert!(reloaded.custom_owned_bytes > 0);
+                assert_eq!(
+                    reloaded.resident_bytes(),
+                    reloaded.owned_weight_bytes + reloaded.custom_owned_bytes
+                );
+            }
         }
     }
 }
@@ -2298,6 +2308,69 @@ mod review_structured_math_tests {
                 crate::pipeline::logical_f32_readback(&residual).unwrap(),
                 vec![expected; 16]
             );
+        }
+        // Mirrored Candle/MLX parity oracle: rank=2, global alpha=4, no target alpha
+        // MUST produce residual 17 at strength 1, not the unity-fallback value 8.5.
+        // Per-target alpha overrides global; malformed native rank is a refusal.
+        let a = Array::from_slice(&[0.125f32; 32], &[2, 16]);
+        let b = Array::from_slice(&[0.25f32; 32], &[16, 2]);
+        for (native_rank, target_alpha, expected_alpha) in
+            [(2, None, 4.), (2, Some(1f32), 1.), (3, None, 4.)]
+        {
+            let mut metadata = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
+            metadata.extend([
+                ("networkType".into(), "lora".into()),
+                ("rank".into(), native_rank.to_string()),
+                ("alpha".into(), "4".into()),
+            ]);
+            let metadata: HashMap<_, _> = metadata.into_iter().collect();
+            let mut tensors = vec![
+                ("layers.0.proj.q.lora_A.weight", a.clone()),
+                ("layers.0.proj.q.lora_B.weight", b.clone()),
+            ];
+            if let Some(alpha) = target_alpha {
+                tensors.push(("layers.0.proj.q.alpha", Array::from_slice(&[alpha], &[1])));
+            }
+            let file = temp.path().join("lora-alpha.safetensors");
+            Array::save_safetensors(tensors.iter().map(|(k, v)| (*k, v)), Some(&metadata), &file)
+                .unwrap();
+            for strength in [1f32, -2.] {
+                let mut model = Transformer::load(
+                    &weights(&fixture["weights"], Dtype::Float32),
+                    geometry.clone(),
+                )
+                .unwrap();
+                let result = crate::adapters::apply(
+                    &mut model,
+                    MossImageVariant::Base,
+                    &[mlx_gen::runtime::AdapterSpec::new(
+                        file.clone(),
+                        strength,
+                        mlx_gen::runtime::AdapterKind::Lora,
+                    )],
+                );
+                if native_rank != 2 {
+                    assert!(
+                        result.is_err(),
+                        "LoRA tensor/native metadata rank mismatch accepted"
+                    );
+                    continue;
+                }
+                result.unwrap();
+                let Adapter::Lora { a, b, scale } =
+                    &model.blocks[0].projections[0].custom.adapters()[0]
+                else {
+                    panic!("actual loaded LoRA missing")
+                };
+                let residual = self::scale(
+                    &linear_fp32(&linear_fp32(&x, &a.t()).unwrap(), &b.t()).unwrap(),
+                    *scale,
+                )
+                .unwrap();
+                let expected = 136. * 0.125 * 0.25 * 2. * (expected_alpha / 2.) * strength;
+                assert_eq!(crate::pipeline::logical_f32_readback(&residual).unwrap(), vec![expected;16],
+                    "native LoRA global alpha fallback/target precedence differs from Candle parity oracle");
+            }
         }
     }
 }

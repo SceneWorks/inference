@@ -45,10 +45,18 @@ fn tokenizer(sources: &Sources, limit: u32) -> Result<TextTokenizer> {
 pub(crate) fn token_bound(
     sources: &Sources,
     req: &candle_gen::gen_core::TrainingRequest,
+    host_budget: u64,
 ) -> Result<u64> {
+    candle_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+        req,
+        host_budget,
+        0,
+    )?;
     let tokenizer = tokenizer(sources, 4096)?;
     let mut bound = 0usize;
-    for prompt in candle_gen::gen_core::moss_image_training::recovery::conditioning_prompts(req) {
+    for prompt in
+        candle_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req)
+    {
         check_cancel(&req.cancel)?;
         bound = bound.max(tokenizer.encode_chat_ids(&prompt, true)?.len().min(4096));
     }

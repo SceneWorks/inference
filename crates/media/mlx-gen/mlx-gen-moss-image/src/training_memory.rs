@@ -370,6 +370,17 @@ impl EstimateRequest {
             .max(plan.decode_buffer_bound().map_err(source)?);
         self.dataset_metadata_bytes =
             gen_core::moss_image_training::recovery::DataPlan::metadata_bound(req)
+                .and_then(|metadata| {
+                    metadata
+                        .checked_add(
+                            gen_core::moss_image_training::recovery::conditioning_preprocess_bytes(
+                                req,
+                            )?,
+                        )
+                        .ok_or_else(|| {
+                            gen_core::Error::Unsupported("MOSS prompt host bound overflow".into())
+                        })
+                })
                 .map_err(source)?;
         self.cache_token_count = Some(plan.cached_token_count().map_err(source)?);
         Ok(self)

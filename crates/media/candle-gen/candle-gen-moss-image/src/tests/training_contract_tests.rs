@@ -1022,6 +1022,72 @@ fn strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow() 
         ("layers.0.proj.q.lora_B.weight".into(), t(0.25, (16, 2))),
     ]);
     write_adapter_file(&good_path, &factors, &metadata);
+    // Same rank-2/global-alpha-4 oracle as MLX's actual-loader projection control.
+    // This is explicit model/manual-only coverage, never an ordinary CI forward.
+    for (native_rank, target_alpha, expected_alpha) in
+        [(2, None, 4.), (2, Some(1f32), 1.), (3, None, 4.)]
+    {
+        let mut meta = metadata.clone();
+        meta.insert("rank".into(), native_rank.to_string());
+        meta.insert("alpha".into(), "4".into());
+        let mut tensors = factors.clone();
+        if let Some(alpha) = target_alpha {
+            tensors.insert(
+                "layers.0.proj.q.alpha".into(),
+                Tensor::from_vec(vec![alpha], (1,), &Device::Cpu).unwrap(),
+            );
+        }
+        let file = temp.path().join("lora-alpha.safetensors");
+        write_adapter_file(&file, &tensors, &meta);
+        for strength in [1f32, -2.] {
+            let (mut host, _, _, _) = data(&Device::Cpu, DType::F32);
+            let result = crate::adapters::apply(
+                &mut host,
+                MossImageVariant::Base,
+                &[adapter_spec(file.clone(), false, strength)],
+                &[PinnedWeightsFile::pin(&file).unwrap()],
+            );
+            if native_rank != 2 {
+                assert!(
+                    result.is_err(),
+                    "LoRA tensor/native metadata rank mismatch accepted"
+                );
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(host.adapter_scales(), vec![f64::from(expected_alpha / 2. * strength)],
+                "native LoRA global alpha fallback/target precedence differs from MLX parity oracle");
+            let raw = BTreeMap::from([
+                (
+                    "lora_A.weight".into(),
+                    tensors["layers.0.proj.q.lora_A.weight"].clone(),
+                ),
+                (
+                    "lora_B.weight".into(),
+                    tensors["layers.0.proj.q.lora_B.weight"].clone(),
+                ),
+            ]);
+            let residual = crate::adapters::Residual::from_group(
+                &raw,
+                16,
+                16,
+                false,
+                host.adapter_scales()[0],
+            )
+            .unwrap();
+            let x = Tensor::from_vec(
+                (1..=16).map(|v| v as f32).collect::<Vec<_>>(),
+                (1, 1, 16),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let expected = 136. * 0.125 * 0.25 * 2. * (expected_alpha / 2.) * strength;
+            assert_eq!(
+                values(&residual.forward(&x).unwrap().unwrap()),
+                vec![expected; 16]
+            );
+        }
+    }
     for defect in [
         "orphan",
         "unknown",

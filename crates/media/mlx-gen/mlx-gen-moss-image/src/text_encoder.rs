@@ -23,10 +23,19 @@ fn tokenizer(s: &Sources) -> Result<TextTokenizer> {
     )?;
     Ok(tokenizer)
 }
-pub(crate) fn token_bound(sources: &Sources, req: &mlx_gen::TrainingRequest) -> Result<u64> {
+pub(crate) fn token_bound(
+    sources: &Sources,
+    req: &mlx_gen::TrainingRequest,
+    host_budget: u64,
+) -> Result<u64> {
+    mlx_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+        req,
+        host_budget,
+        0,
+    )?;
     let tokenizer = tokenizer(sources)?;
     let mut bound = 0usize;
-    for prompt in mlx_gen::gen_core::moss_image_training::recovery::conditioning_prompts(req) {
+    for prompt in mlx_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req) {
         crate::transformer::check(&req.cancel)?;
         bound = bound.max(tokenizer.encode_chat_ids(&prompt, false)?.len().min(4096));
     }

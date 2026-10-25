@@ -340,7 +340,9 @@ mod tests {
         gen_core_testkit::moss_training_fixture::assert_ragged_token_bounds(
             &fixture.data,
             &root.path().join("output"),
-            |req| crate::text_encoder::token_bound(&sources, req).map_err(Into::into),
+            |req| {
+                crate::text_encoder::token_bound(&sources, req, HOST_CAP_BYTES).map_err(Into::into)
+            },
             |req| {
                 let prompts = gen_core::moss_image_training::recovery::conditioning_prompts(req);
                 let rows = crate::text_encoder::strings(

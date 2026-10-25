@@ -191,13 +191,16 @@ class CpuReviewProtocolTests(unittest.TestCase):
     def test_mutations_have_unique_exact_live_source_anchors_and_observable_tests(self):
         for backend in fixture.PACKAGES:
             mutations = profile.mutations(backend)
-            self.assertEqual(len(mutations), 9 if backend == "mlx" else 2)
+            self.assertTrue(mutations)
+            if backend == "mlx":
+                self.assertTrue({"native-lora-global-alpha-fallback", "bf16-o-only-attention-output-dtype"}
+                                <= {item["id"] for item in mutations})
             self.assertEqual(len({item["id"] for item in mutations}), len(mutations))
             for mutation in mutations:
                 source = (ROOT / mutation["path"]).read_text(encoding="utf-8")
                 self.assertEqual(source.count(mutation["old"]), 1, mutation["id"])
                 self.assertNotEqual(mutation["old"], mutation["new"])
-                self.assertTrue(mutation["test"].startswith(("training::", "training_memory::", "test_support::")))
+                self.assertTrue(mutation["test"].startswith(("training::", "training_memory::", "test_support::", "transformer::")))
                 self.assertTrue(mutation["panic"])
 
     def test_compile_errors_are_rendered_and_stage_is_not_misreported_as_mutation(self):

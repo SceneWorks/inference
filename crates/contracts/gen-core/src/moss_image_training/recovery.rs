@@ -317,30 +317,99 @@ pub struct RunIdentity {
     pub effective_config: String,
 }
 
-/// Captions actually encoded by training, including trigger injection and selected previews.
-pub fn conditioning_prompts(req: &TrainingRequest) -> Vec<String> {
-    let mut prompts = req
-        .items
-        .iter()
-        .map(|item| {
-            match req
-                .config
-                .trigger_word
-                .as_deref()
-                .filter(|t| !t.trim().is_empty())
-            {
-                Some(trigger) if !item.caption.contains(trigger) => {
-                    format!("{trigger}, {}", item.caption)
-                }
-                _ => item.caption.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
-    if req.config.sample_every > 0 && !req.config.sample_prompts.is_empty() {
-        prompts.extend(req.config.sample_prompts.iter().take(4).cloned());
-        prompts.push(String::new());
+/// Conservative simultaneous host workspace for prompt rendering/tokenizer normalization,
+/// pretokenizer offsets, full token encodings and retained configuration copies. Admission
+/// happens from borrowed byte lengths BEFORE constructing any rendered strings or tokenizer.
+/// The model's 4096-token limit is not a tokenizer-allocation limit.
+pub fn conditioning_preprocess_bytes(req: &TrainingRequest) -> Result<u64> {
+    let trigger = req
+        .config
+        .trigger_word
+        .as_deref()
+        .filter(|t| !t.trim().is_empty());
+    let mut largest = 0u64;
+    for item in &req.items {
+        let prefix = trigger
+            .filter(|t| !item.caption.contains(t))
+            .map_or(0, |t| t.len().saturating_add(2));
+        largest = largest.max(
+            (item.caption.len() as u64)
+                .checked_add(prefix as u64)
+                .ok_or_else(|| Error::Unsupported("MOSS prompt size overflow".into()))?,
+        );
     }
-    prompts
+    let mut config_copies = 0u64;
+    for prompt in &req.config.sample_prompts {
+        config_copies = config_copies
+            .checked_add(prompt.len() as u64)
+            .and_then(|n| n.checked_add(std::mem::size_of::<String>() as u64))
+            .ok_or_else(|| Error::Unsupported("MOSS preview size overflow".into()))?;
+    }
+    if req.config.sample_every > 0 {
+        for prompt in req.config.sample_prompts.iter().take(4) {
+            largest = largest.max(prompt.len() as u64);
+        }
+    }
+    // 256 bytes of scratch per UTF-8 byte: normalized/pretokenized text, offset pairs,
+    // token/word/type/attention vectors and token strings, plus rendered trigger/chat copies.
+    // Fixed slack covers an empty template and tokenizer per-call bookkeeping.
+    largest
+        .checked_add(128)
+        .and_then(|n| n.checked_mul(256))
+        .and_then(|n| n.checked_add(config_copies.checked_mul(4)?))
+        .and_then(|n| n.checked_add(1024 * 1024))
+        .ok_or_else(|| Error::Unsupported("MOSS prompt preprocessing bound overflow".into()))
+}
+pub fn admit_conditioning_preprocess(
+    req: &TrainingRequest,
+    budget: u64,
+    source_metadata: u64,
+) -> Result<()> {
+    let demand = conditioning_preprocess_bytes(req)?
+        .checked_add(DataPlan::metadata_bound(req)?)
+        .and_then(|n| n.checked_add(source_metadata))
+        .ok_or_else(|| Error::Unsupported("MOSS prompt preprocessing demand overflow".into()))?;
+    if demand > budget {
+        return Err(Error::Unsupported(
+            "MOSS prompt preprocessing exceeds admitted host budget before tokenization".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Borrow one conditioning prompt at a time; only trigger injection allocates a single caption.
+/// Call `admit_conditioning_preprocess` before advancing this iterator or tokenizing.
+pub fn conditioning_prompts_iter(
+    req: &TrainingRequest,
+) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    let captions = req.items.iter().map(|item| {
+        match req
+            .config
+            .trigger_word
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            Some(trigger) if !item.caption.contains(trigger) => {
+                std::borrow::Cow::Owned(format!("{trigger}, {}", item.caption))
+            }
+            _ => std::borrow::Cow::Borrowed(item.caption.as_str()),
+        }
+    });
+    let previews = req
+        .config
+        .sample_prompts
+        .iter()
+        .take(if req.config.sample_every > 0 { 4 } else { 0 })
+        .map(|s| std::borrow::Cow::Borrowed(s.as_str()));
+    let negative = (req.config.sample_every > 0 && !req.config.sample_prompts.is_empty())
+        .then_some(std::borrow::Cow::Borrowed(""));
+    captions.chain(previews).chain(negative)
+}
+/// Convenience collection for explicit fixture controls, not the native pre-admission route.
+pub fn conditioning_prompts(req: &TrainingRequest) -> Vec<String> {
+    conditioning_prompts_iter(req)
+        .map(|s| s.into_owned())
+        .collect()
 }
 
 /// All progress needed in addition to raw factors, complete optimizer tensors and pending gradients.
@@ -565,6 +634,102 @@ pub fn effective_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn serialized_studio_square_defaults_schedule_each_image_at_each_resolution() {
+        // Frozen consumer shape: snapshot -> draft -> snapshot emits these exact rows.
+        const DEFAULTS: &str = r#"[{"resolution":256,"repeats":1},{"resolution":512,"repeats":1},{"resolution":768,"repeats":1},{"resolution":1024,"repeats":1}]"#;
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct WireBucket {
+            resolution: u32,
+            repeats: u32,
+        }
+        let wire: Vec<WireBucket> = serde_json::from_str(DEFAULTS).unwrap();
+        assert_eq!(serde_json::to_string(&wire).unwrap(), DEFAULTS);
+        let rows: Vec<crate::ResolutionBucket> = wire
+            .into_iter()
+            .map(|r| crate::ResolutionBucket {
+                resolution: r.resolution,
+                repeats: r.repeats,
+            })
+            .collect();
+        let mut req = TrainingRequest {
+            items: (0..3)
+                .map(|i| {
+                    crate::TrainingItem::captioned(format!("image{i}.png").into(), String::new())
+                })
+                .collect(),
+            output_dir: "unused".into(),
+            file_name: "unused".into(),
+            trigger_words: vec![],
+            config: crate::TrainingConfig {
+                resolution_buckets: rows.clone(),
+                batch_size: 1,
+                ..Default::default()
+            },
+            cancel: crate::CancelFlag::new(),
+        };
+        let dimensions = [(640, 480), (480, 640), (1024, 1024)];
+        let plan = DataPlan::new(&req, &dimensions).unwrap();
+        let mut observed = std::collections::BTreeMap::new();
+        for step in 0..12 {
+            for entry in plan.batch(step).unwrap().entries {
+                let geometry = &plan.entries[entry];
+                assert_eq!(geometry.width, rows[geometry.bucket].resolution);
+                assert_eq!(geometry.height, rows[geometry.bucket].resolution);
+                *observed.entry((geometry.item, geometry.width)).or_insert(0) += 1;
+            }
+        }
+        for item in 0..3 {
+            for row in &rows {
+                assert_eq!(observed.get(&(item, row.resolution)), Some(&1));
+            }
+        }
+        assert_eq!(observed.len(), 12);
+        req.config.resolution_buckets.clear();
+        req.config.aspect_ratio_buckets = rows
+            .iter()
+            .map(|r| AspectRatioBucket {
+                width: r.resolution,
+                height: r.resolution,
+                repeats: r.repeats,
+            })
+            .collect();
+        let tied = DataPlan::new(&req, &dimensions).unwrap();
+        assert_eq!(tied.entries.len(), 3);
+        assert!(tied.entries.iter().all(|e|e.bucket==0 && e.width==256 && e.height==256),
+            "rectangular equal-aspect rows choose the earliest row, NOT the legacy resolution ladder");
+    }
+
+    #[test]
+    fn huge_preview_refuses_before_render_or_tokenizer_and_lazy_prompts_preserve_semantics() {
+        let mut req = TrainingRequest {
+            items: vec![crate::TrainingItem::captioned(
+                "small.png".into(),
+                "caption".into(),
+            )],
+            output_dir: "unused".into(),
+            file_name: "unused".into(),
+            trigger_words: vec![],
+            config: crate::TrainingConfig::default(),
+            cancel: crate::CancelFlag::new(),
+        };
+        req.config.sample_every = 1;
+        req.config.sample_prompts = vec!["short ".repeat(1_000_000)];
+        let budget = 64 * 1024 * 1024;
+        assert!(matches!(admit_conditioning_preprocess(&req, budget, 0),
+            Err(Error::Unsupported(message)) if message.contains("before tokenization")));
+        req.config.sample_prompts = vec!["preview".into()];
+        req.config.trigger_word = Some("ohwx".into());
+        admit_conditioning_preprocess(&req, budget, 0).unwrap();
+        assert_eq!(conditioning_prompts(&req), ["ohwx, caption", "preview", ""]);
+        let mut iter = conditioning_prompts_iter(&req);
+        assert!(matches!(iter.next(), Some(std::borrow::Cow::Owned(_))));
+        assert!(matches!(
+            iter.next(),
+            Some(std::borrow::Cow::Borrowed("preview"))
+        ));
+    }
+
     #[test]
     fn caller_cap_never_raises_physical_and_zero_refuses() {
         assert_eq!(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hosted manual MOSS CPU/Metal model evidence and S4 assertion mutations.
 
-No device inventory or model downloads. Uses the existing owned CPU supervisor unchanged.
+No device inventory or model downloads. Uses the shared session/birth-token CPU supervisor.
 Compilation has the hosted job/45-minute compiler bound; each test keeps 180s/2GiB.
 """
 from __future__ import annotations
@@ -157,6 +157,20 @@ def mutations(backend: str) -> list[dict]:
                "new": "                let difference = 0.0_f64;",
                "test": fixture.CASES[0], "panic": "native portable factors did not numerically update"}]
     if backend == "mlx":
+        result.extend([
+            {"id": "native-lora-global-alpha-fallback",
+             "path": "crates/media/mlx-gen/mlx-gen-moss-image/src/adapters.rs",
+             "old": "                    } else {\n                        metadata_alpha\n                    };",
+             "new": "                    } else {\n                        a.shape()[0] as f32\n                    };",
+             "test": "transformer::review_structured_math_tests::real_loader_uses_nondefault_rank_alpha_and_user_strength_on_the_projection",
+             "panic": "native LoRA global alpha fallback/target precedence differs from Candle parity oracle"},
+            {"id": "bf16-o-only-attention-output-dtype",
+             "path": "crates/media/mlx-gen/mlx-gen-moss-image/src/transformer.rs",
+             "old": "    let value_dtype = v.dtype();",
+             "new": "    let value_dtype = Dtype::Float32;",
+             "test": "transformer::training_bf16_cpu_tests::production_bf16_backbone_keeps_fp32_adapter_gradients_and_portable_reload",
+             "panic": "BF16 selected-target training/reload diverged"},
+        ])
         result.append({"id": "partial-window-cadence", "path": TRAINING,
                        "old": "    if c.sample_every > 0 && !c.sample_prompts.is_empty() && c.sample_steps == 0 {",
                        "new": "    if c.resume && c.save_every > 0 && !c.save_every.is_multiple_of(c.gradient_accumulation) {\n        return Err(Error::Unsupported(\"obsolete complete-window restriction\".into()).into());\n    }\n    if c.sample_every > 0 && !c.sample_prompts.is_empty() && c.sample_steps == 0 {",

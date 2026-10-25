@@ -155,6 +155,70 @@ class OwnedCpuSafetyTests(unittest.TestCase):
             self.assertIsNone(fixture.process_identity(record['pid']))
             self.assertEqual(owner.collect(),{})
 
+    def test_immediate_root_exit_does_not_hide_an_unsampled_orphan(self):
+        from scripts.ci.moss_cuda_unit import PosixOwner
+        for owner_type in [fixture.CpuOwner, PosixOwner]:
+            with self.subTest(owner=owner_type.__name__), tempfile.TemporaryDirectory() as root:
+                marker = Path(root) / "orphan.pid"
+                parent = ("import subprocess,sys;from pathlib import Path;"
+                          "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+                          f"Path({str(marker)!r}).write_text(str(p.pid),encoding='utf-8')")
+                class ExitBeforeFirstSample(owner_type):
+                    def spawn(self, *args):
+                        child = super().spawn(*args)
+                        child.wait(timeout=10)  # Deliberately lose EVERY parentage sample.
+                        return child
+                owner = ExitBeforeFirstSample()
+                pid = None
+                identity = None
+                try:
+                    output = supervise([sys.executable, "-c", parent], owner,
+                        Path(root) / "out.log", deadline=15, rss_cap=128 * 1024**2,
+                        poll=0.01, grace=2)
+                    self.assertTrue(marker.is_file(), "root must actually publish its real child's PID")
+                    pid = int(marker.read_text(encoding="utf-8"))
+                    identity = fixture.process_identity(pid)
+                    self.assertIsNone(identity, "supervisor returned success with an unsampled orphan alive")
+                    contained = owner.owner if isinstance(owner, PosixOwner) else owner
+                    self.assertIn(pid, contained.known, "session anchor must actually discover the orphan")
+                    self.assertGreater(contained.peak, 0, "orphan RSS must be accounted before release")
+                    self.assertEqual(contained.collect(), {})
+                finally:
+                    # Discriminating RED runs must not leak the deliberate fixture child.
+                    if pid is None and marker.exists():
+                        pid = int(marker.read_text(encoding="utf-8"))
+                        identity = fixture.process_identity(pid)
+                    if identity is not None and fixture.process_identity(pid) == identity:
+                        os.kill(pid, 9)
+
+    def test_observed_setsid_child_is_retained_after_immediate_root_exit(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker, seen = Path(root) / "regrouped.pid", Path(root) / "seen"
+            wait_seen = f"while not Path({str(seen)!r}).exists(): time.sleep(0.005)"
+            parent = ("import subprocess,sys,time;from pathlib import Path;"
+                "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],start_new_session=True);"
+                f"Path({str(marker)!r}).write_text(str(p.pid),encoding='utf-8');"
+                f"exec({wait_seen!r})")
+            class ObservedOwner(fixture.CpuOwner):
+                retained_after_exit = False
+                def collect(self):
+                    live = super().collect()
+                    if marker.exists():
+                        pid = int(marker.read_text(encoding="utf-8"))
+                        if pid in live:
+                            seen.touch()
+                            if self.child.poll() is not None:
+                                self.retained_after_exit = True
+                    return live
+            owner = ObservedOwner()
+            supervise([sys.executable,"-c",parent],owner,Path(root)/"out.log",
+                      deadline=10,rss_cap=128*1024**2,poll=0.01,grace=2)
+            pid = int(marker.read_text(encoding="utf-8"))
+            self.assertIn(pid,owner.known)
+            self.assertTrue(owner.retained_after_exit,"known regrouped child must survive root exit until cleanup observes it")
+            self.assertIsNone(fixture.process_identity(pid))
+            self.assertEqual(owner.collect(),{})
+
     def test_changed_birth_or_uid_is_never_signaled(self):
         owner = fixture.CpuOwner()
         owner.known = {12345: (os.geteuid(), 173)}
@@ -163,6 +227,21 @@ class OwnedCpuSafetyTests(unittest.TestCase):
                 with mock.patch.object(fixture, "process_identity", return_value=identity), mock.patch.object(fixture.os, "kill") as kill:
                     owner._signal(15)
                     kill.assert_not_called()
+
+    def test_session_metadata_denial_and_changed_identity_are_unproven(self):
+        owner = fixture.CpuOwner()
+        owner.session = 4242
+        owner.root_identity = (owner.uid,100)
+        table = subprocess.CompletedProcess([],0,f"4242 1 4242 {owner.uid} 1\n","")
+        with mock.patch.object(fixture.subprocess,"run",return_value=table):
+            with mock.patch.object(fixture.os,"getsid",side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(UnitFailure,"session metadata unavailable"):
+                    owner.collect()
+            with mock.patch.object(fixture.os,"getsid",return_value=4242), mock.patch.object(
+                    fixture,"process_identity",side_effect=[(owner.uid,101),(owner.uid,102)]):
+                with self.assertRaisesRegex(UnitFailure,"ownership differs"):
+                    owner.collect()
+        self.assertEqual(owner.known,{})
 
     def test_metadata_denial_is_failure_not_idle(self):
         owner = fixture.CpuOwner()

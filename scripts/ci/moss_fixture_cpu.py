@@ -74,10 +74,15 @@ def process_identity(pid: int) -> tuple[int, int] | None:
 
 
 class CpuOwner:
-    """PID+birth+UID descendant ownership, including descendants changing process groups.
+    """Session containment plus PID+birth+UID ownership, including observed regrouped descendants.
 
     The child first waits at a private stdin gate, so identity is captured before its test binary
     executes. Cleanup rechecks each exact birth/UID immediately before signaling only owned PIDs.
+    Release requires the owned session/group and every observed descendant to be empty.
+    Metadata denial or surviving observed members is UNPROVEN (raises), never successful release.
+    Portable process-table scans cannot discover a child that calls setsid AND loses its parent
+    before ANY scan. That unobservable escape is outside this guarantee; do not claim OS-level
+    lifecycle containment or signal unknown PIDs. Windows uses a non-breakaway Job Object instead.
     """
     def __init__(self):
         self.uid = os.geteuid()
@@ -94,6 +99,8 @@ class CpuOwner:
             if identity is None or identity[0] != self.uid:
                 raise UnitFailure("new CPU child identity unavailable or UID differs")
             self.known[self.child.pid] = identity
+            self.session = self.child.pid  # start_new_session: SID and initial PGID are the owned root.
+            self.root_identity = identity
             self.child.stdin.write(b"R")
             self.child.stdin.flush()
             self.child.stdin.close()
@@ -105,15 +112,38 @@ class CpuOwner:
         return self.child
 
     def collect(self):
-        result = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,rss="], capture_output=True,
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,uid=,rss="], capture_output=True,
                                 text=True, encoding="utf-8", check=True, timeout=10)
         table = {}
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) != 4:
+            if len(fields) != 5:
                 raise UnitFailure("invalid process ownership metadata")
-            pid, parent, uid, rss = map(int, fields)
+            pid, parent, pgid, uid, rss = map(int, fields)
             table[pid] = parent, uid, rss * 1024
+            # Parentage alone is insufficient: an unobserved child may already be an
+            # orphan. The owned session/group survives root exit and regrouping within
+            # the session; descendants observed leaving it remain birth-token owned.
+            if uid == self.uid:
+                try:
+                    session = os.getsid(pid)
+                    anchored = pgid == self.session or session == self.session
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    raise UnitFailure(f"owned session metadata unavailable for {pid}") from error
+                if anchored:
+                    identity = process_identity(pid)
+                    if identity is not None:
+                        try:
+                            stable_session = os.getsid(pid)
+                        except ProcessLookupError:
+                            continue
+                        if (session != self.session or stable_session != self.session
+                                or process_identity(pid) != identity
+                                or identity[0] != self.uid or identity[1] < self.root_identity[1]):
+                            raise UnitFailure("owned session UID/birth ownership differs")
+                        self.known[pid] = identity
         live = {}
         for pid, identity in self.known.items():
             if pid in table and table[pid][1] == self.uid and process_identity(pid) == identity:
@@ -132,6 +162,7 @@ class CpuOwner:
                     self.parents[pid] = parent
                     live[pid] = parent, uid, rss
                     changed = True
+        self.peak = max(self.peak, sum(row[2] for row in live.values()))
         return live
 
     def footprint(self):
@@ -159,9 +190,9 @@ class CpuOwner:
             self._signal(signal.SIGKILL)
         self.child.wait(timeout=grace)
         end = time.monotonic() + grace
-        while self.collect():
+        while live := self.collect():
             if time.monotonic() >= end:
-                raise UnitFailure("owned CPU descendants were not released")
+                raise UnitFailure(f"owned CPU release UNPROVEN; surviving PIDs={sorted(live)}")
             sleep(0.05)
 
     def close(self):
