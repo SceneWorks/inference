@@ -626,9 +626,11 @@ def convrot_rows(case: dict, tensors: dict, w4) -> list[list[float]]:
     n, k = len(weight), len(weight[0])
     if k % CONVROT_GROUP:
         raise Refusal("convrot_group_unsupported", f"{case['id']}: k={k} is not a multiple of {CONVROT_GROUP}")
-    s_channel = vector_f32(tensor_at(tensors, select, f"{base}.weight_scale"), f"{base}.weight_scale")
-    if len(s_channel) != n:
-        raise Refusal("selected_dtype", f"{case['id']}: ConvRot weight_scale length is not {n}")
+    scale = tensor_at(tensors, select, f"{base}.weight_scale")
+    if scale["dtype"] != "F32" or scale["shape"] != [n, 1]:
+        raise Refusal("selected_dtype", f"{case['id']}: ConvRot weight_scale must be F32 [{n}, 1]")
+    # Preserve the stored [N,1] identity. The pinned rowwise epilogue consumes its N values.
+    s_channel = f32_values(scale, f"{base}.weight_scale")
     bias = vector_f32(tensor_at(tensors, select, f"{base}.bias"), f"{base}.bias") if select.get("bias") else None
     if select.get("bias") and len(bias) != n:
         raise Refusal("selected_dtype", f"{case['id']}: ConvRot bias length is not {n}")
@@ -820,23 +822,24 @@ def selected_raw_names(case: dict, backend: str, config: dict) -> list[str]:
             names.extend(raw_for(select, f"{base}.{suffix}") for suffix in suffixes)
             if bias:
                 names.append(raw_for(select, f"{base}.bias"))
+    elif backend == "candle" or select.get("topology"):
+        # Candle assembles and authenticates the complete reduced basis even when the numeric
+        # operation is interpolation only. This must precede the MLX table-only selection.
+        names.append(raw_for(select, "adaln_t_table"))
+        for layer in range(int(config["num_layers"])):
+            for suffix in ("weight", "bias"):
+                names.append(raw_for(select, f"transformer_blocks.{layer}.adaln_proj.linear.{suffix}"))
+        for suffix in ("weight", "bias"):
+            names.append(raw_for(select, f"norm_out.linear.{suffix}"))
     elif kind == KIND_INTERPOLATION:
         names.append(raw_for(select, select.get("table", "adaln_t_table")))
     else:
-        if backend == "candle" or select.get("topology"):
-            names.append(raw_for(select, "adaln_t_table"))
-            for layer in range(int(config["num_layers"])):
-                for suffix in ("weight", "bias"):
-                    names.append(raw_for(select, f"transformer_blocks.{layer}.adaln_proj.linear.{suffix}"))
-            for suffix in ("weight", "bias"):
-                names.append(raw_for(select, f"norm_out.linear.{suffix}"))
-        else:
-            prefix = select.get("prefix")
-            weight_name = select.get("weight") or (f"{prefix}.weight" if prefix else None)
-            bias_name = select.get("bias_tensor") or (f"{prefix}.bias" if prefix else None)
-            if not weight_name or not bias_name:
-                raise Refusal("selection_missing", f"{case['id']}: reduced projection needs weight and bias")
-            names.extend([raw_for(select, weight_name), raw_for(select, bias_name)])
+        prefix = select.get("prefix")
+        weight_name = select.get("weight") or (f"{prefix}.weight" if prefix else None)
+        bias_name = select.get("bias_tensor") or (f"{prefix}.bias" if prefix else None)
+        if not weight_name or not bias_name:
+            raise Refusal("selection_missing", f"{case['id']}: reduced projection needs weight and bias")
+        names.extend([raw_for(select, weight_name), raw_for(select, bias_name)])
     if len(names) > MAX_SELECTED_TENSORS:
         raise Refusal("limits_exceeded", f"{case['id']} selects {len(names)} tensors")
     return names

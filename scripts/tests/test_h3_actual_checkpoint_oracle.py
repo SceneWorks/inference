@@ -405,6 +405,88 @@ class ActualCheckpointBridgeTests(unittest.TestCase):
             for revision in record["upstream_revisions"].values():
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_candle_interpolation_binds_full_raw_basis_before_table_only_selection(self) -> None:
+        from unittest.mock import patch
+        canonical = {"adaln_t_table": [2, 1]}
+        for layer in range(2):
+            canonical[f"transformer_blocks.{layer}.adaln_proj.linear.weight"] = [18, 1]
+            canonical[f"transformer_blocks.{layer}.adaln_proj.linear.bias"] = [18]
+        canonical.update({"norm_out.linear.weight": [2, 1], "norm_out.linear.bias": [2]})
+        aliases = {}
+        stored = []
+        for index, (name, shape) in enumerate(canonical.items()):
+            raw = "model.diffusion_model." + name.replace("transformer_blocks.", "blocks.").replace("norm_out.linear.", "final_layer.adaln_proj.linear.")
+            aliases[raw] = name
+            count = 1
+            for axis in shape:
+                count *= axis
+            stored.append((raw, "F32", shape, f32_bytes([float(index)] * count)))
+        case = {"id": "interpolation", "kind": BRIDGE_MODULE.KIND_INTERPOLATION,
+                "select": {"topology": True, "aliases": aliases}}
+        config = {"num_layers": 2}
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "tiny-pruned.safetensors"
+            write_safetensors(file, stored)
+            tensors = BRIDGE_MODULE.read_selected_safetensors(file)
+            def verify():
+                names = BRIDGE_MODULE.selected_raw_names(case, "candle", config)
+                self.assertEqual(set(names), set(tensors), "Candle interpolation must bind its whole native basis, not table only")
+                entries = BRIDGE_MODULE.selected_entries(names, tensors)
+                self.assertEqual(len(entries), 7)
+                for entry in entries:
+                    self.assertEqual(entry["sha256"], hashlib.sha256(tensors[entry["name"]]["bytes"]).hexdigest())
+            verify()
+            original = BRIDGE_MODULE.selected_raw_names
+            def old_table_only(value, backend, geometry):
+                if value["kind"] == BRIDGE_MODULE.KIND_INTERPOLATION:
+                    return [BRIDGE_MODULE.raw_for(value["select"], "adaln_t_table")]
+                return original(value, backend, geometry)
+            with patch.object(BRIDGE_MODULE, "selected_raw_names", side_effect=old_table_only):
+                with self.assertRaises(AssertionError):
+                    verify()  # Executed old behavior goes RED; no suppressive subTest.
+            verify()  # Restored selection is GREEN over the same actual header and byte hashes.
+            mlx = {**case, "select": {"aliases": aliases}}
+            self.assertEqual(BRIDGE_MODULE.selected_raw_names(mlx, "mlx", config),
+                             [BRIDGE_MODULE.raw_for(mlx["select"], "adaln_t_table")])
+            reduced = {"id": "reduced", "kind": BRIDGE_MODULE.KIND_REDUCED,
+                       "select": {"prefix": "transformer_blocks.0.adaln_proj.linear", "aliases": aliases}}
+            self.assertEqual(len(BRIDGE_MODULE.selected_raw_names(reduced, "mlx", config)), 2)
+            self.assertEqual(set(BRIDGE_MODULE.selected_raw_names(reduced, "candle", config)), set(tensors))
+
+    def test_convrot_column_scale_is_preserved_and_flat_scale_is_refused(self) -> None:
+        n, k = 16, 256
+        scales = [(i + 1) / 16 for i in range(n)]
+        descriptor = json.dumps({"convrot_groupsize": 256}).encode()
+        stored = [
+            ("p.weight", "I8", [n, k], bytes(n * k)),
+            ("p.weight_scale", "F32", [n, 1], f32_bytes(scales)),
+            ("p.comfy_quant", "U8", [len(descriptor)], descriptor),
+        ]
+        class Replay:
+            def to_bf16_rows(self, rows):
+                return rows
+            def quantize_int8_rowwise_convrot_replay(self, rows):
+                return None, [[0] * k], [1.0], None
+            def int_accumulate_replay(self, rows, weight, k_tile):
+                return [[0] * n], None, None
+            def epilogue_replay(self, acc, activation_scale, row_scale, bias):
+                return row_scale  # Wiring witness only, not a replacement arithmetic oracle.
+        case = {"id": "convrot", "select": {"base": "p"},
+                "input": {"dtype": "BF16", "shape": [1, k], "values": [0.0] * k}}
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "tiny-convrot.safetensors"
+            write_safetensors(file, stored)
+            tensors = BRIDGE_MODULE.read_selected_safetensors(file)
+            self.assertEqual(BRIDGE_MODULE.convrot_rows(case, tensors, Replay()), [scales])
+            self.assertEqual(tensors["p.weight_scale"]["shape"], [n, 1])
+            self.assertEqual(tensors["p.weight_scale"]["bytes"], f32_bytes(scales))
+            with self.assertRaises(BRIDGE_MODULE.Refusal):
+                BRIDGE_MODULE.vector_f32(tensors["p.weight_scale"], "old ConvRot scale path")
+            tensors["p.weight_scale"]["shape"] = [n]
+            with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+                BRIDGE_MODULE.convrot_rows(case, tensors, Replay())
+            self.assertEqual(caught.exception.code, "selected_dtype")
+
     def test_bridge_has_no_network_or_gpu_imports(self) -> None:
         source = BRIDGE.read_text()
         for forbidden in (
