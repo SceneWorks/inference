@@ -1241,11 +1241,11 @@ fn native_pruned_adaln_matches_pinned_reference() {
 // Manual-only complete native-model proof. The pinned source fixture supplies every learned
 // pruned operand unchanged; only its already-omitted input heads/refiner receive deterministic
 // fillers, exactly as the complete-partition loader proof above does. No new producer/oracle.
-fn manual_conditioning_model(
+fn manual_conditioning_map(
     f: &Value,
     cfg: &MiniMaxH3DitConfig,
     d: &Device,
-) -> candle_gen_minimax_h3::dit::MiniMaxH3Dit {
+) -> HashMap<String, Tensor> {
     let mut map = weight_map(f, d);
     for (name, shape) in [
         (
@@ -1284,6 +1284,15 @@ fn manual_conditioning_model(
         let value = map[&format!("transformer_blocks.0.{body}")].clone();
         map.insert(format!("token_refiner.refiner_blocks.0.{body}"), value);
     }
+    map
+}
+
+fn manual_conditioning_model(
+    f: &Value,
+    cfg: &MiniMaxH3DitConfig,
+    d: &Device,
+) -> candle_gen_minimax_h3::dit::MiniMaxH3Dit {
+    let map = manual_conditioning_map(f, cfg, d);
     let model = candle_gen_minimax_h3::dit::MiniMaxH3Dit::from_weights(
         &Weights::from_map(map),
         cfg,
@@ -1502,4 +1511,656 @@ fn manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control()
     );
     #[cfg(feature = "cuda")]
     println!("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11");
+    manual_conditioning_causality(&f, &cfg, &d);
+}
+
+// Called ONLY by the ignored manual full-forward proof above. Compare GENERATED rows, never
+// the preserved conditioning prefix: dropping the conditioning in both executions must fail.
+fn causal_signal(shape: &[usize], salt: usize, scale: f32, d: &Device) -> Tensor {
+    let n: usize = shape.iter().product();
+    let values: Vec<f32> = (0..n)
+        .map(|i| (((i * 7 + salt) % 29) as f32 - 14.) * scale)
+        .collect();
+    Tensor::from_vec(values, shape, d).unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn causal_generated_forward(
+    f: &Value,
+    cfg: &MiniMaxH3DitConfig,
+    d: &Device,
+    layout: candle_gen_minimax_h3::denoise::PackedLayout,
+    context: &Tensor,
+    condition_video: Option<&Tensor>,
+    condition_audio: Option<&Tensor>,
+    selected: Option<candle_gen_minimax_h3::dit::MiniMaxH3Dit>,
+) -> Vec<f32> {
+    use candle_gen_minimax_h3::denoise::{JointStep, JointVelocity, PackedLayout};
+    use candle_gen_minimax_h3::dit::adaln::AdaLnResidency;
+    use candle_gen_minimax_h3::dit::model::JointDit;
+    use candle_gen_minimax_h3::pipeline::{prepend_condition_audio_rows, prepend_condition_rows};
+    let cv = layout.num_condition_video_rows();
+    let ca = layout.num_condition_audio_rows();
+    let nv = layout.video_indices().len() - cv;
+    let na = layout.audio_indices().len() - ca;
+    let video = causal_signal(&[1, nv, cfg.video_patch_dim()], 5, 0.03, d);
+    let audio = causal_signal(&[1, na, cfg.audio_in_channels], 9, 0.04, d);
+    let video = prepend_condition_rows(&layout, condition_video, &video).unwrap();
+    let audio = prepend_condition_audio_rows(&layout, condition_audio, &audio).unwrap();
+    let times = PackedLayout::row_timesteps(0.6, 0.4);
+    let schedule = TimestepSchedule::new(vec![times.to_vec()]).unwrap();
+    let indices = schedule
+        .adaln_indices(0, layout.row_classes(), layout.token_tags(), d)
+        .unwrap();
+    let model = selected.unwrap_or_else(|| manual_conditioning_model(f, cfg, d));
+    let mut driver = JointDit::new(
+        model,
+        layout.clone(),
+        context,
+        schedule,
+        AdaLnResidency::Resident,
+    )
+    .unwrap();
+    let output = driver
+        .forward(&JointStep {
+            index: 0,
+            layout: &layout,
+            video_rows: &video,
+            audio_rows: &audio,
+            adaln_indices: &indices,
+            row_timesteps: times,
+        })
+        .unwrap();
+    let mut generated = Vec::new();
+    for (rows, start, count, features) in [
+        (&output.0, cv, nv, cfg.video_patch_dim()),
+        (&output.1, ca, na, cfg.audio_in_channels),
+    ] {
+        let tail = rows
+            .narrow(1, start, count)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_eq!(tail.dims(), &[1, count, features]);
+        generated.extend(tail.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+    }
+    assert!(generated.iter().all(|x| x.is_finite()));
+    generated
+}
+
+fn assert_generated_cause(d: &Device, property: &str, a: &[f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len());
+    assert!(!a.is_empty());
+    assert!(a.iter().chain(b).all(|x| x.is_finite()));
+    let peak = a.iter().chain(b).map(|x| x.abs()).fold(0., f32::max);
+    let delta = a
+        .iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0., f32::max);
+    let floor = 8. * f32::EPSILON * peak;
+    let backend = if d.is_cuda() { "cuda" } else { "cpu" };
+    println!("H3_CONDITIONING_CAUSAL backend={backend} property={property} max_abs={delta:.9e} floor={floor:.9e} generated_only=true");
+    assert!(
+        peak > 0. && delta > floor,
+        "{property}: generated outputs are causally indistinguishable: delta={delta} floor={floor}"
+    );
+}
+
+fn manual_conditioning_causality(f: &Value, cfg: &MiniMaxH3DitConfig, d: &Device) {
+    use candle_gen_minimax_h3::conditioning::{
+        keyframe_condition_rows, reference_audio_rows, KeyframeNoise,
+    };
+    use candle_gen_minimax_h3::denoise::{JointGeometry, TEXT_TAG};
+    use candle_gen_minimax_h3::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use candle_gen_minimax_h3::model::MiniMaxH3Task;
+    use candle_gen_minimax_h3::pipeline::{
+        fl2va_layout, ref2va_layout_with_audio_channels, RequestGeometry,
+    };
+    use candle_gen_minimax_h3::reference::ReferenceKind;
+    let geometry = RequestGeometry {
+        width: 32,
+        height: 32,
+        joint: JointGeometry::new(5, 2, 2).unwrap(),
+    };
+    let context_a = causal_signal(&[1, 1, cfg.text_dim], 13, 0.2, d);
+    let context_b = causal_signal(&[1, 1, cfg.text_dim], 17, 0.35, d);
+    let visual_a = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 1, 2, 2], 3, 0.12, d),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+        d,
+    )
+    .unwrap();
+    let visual_b = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 1, 2, 2], 19, 0.25, d),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+        d,
+    )
+    .unwrap();
+    let run_fl = |anchors: &[KeyframeAnchor], rows: Option<&Tensor>, context: &Tensor| {
+        causal_generated_forward(
+            f,
+            cfg,
+            d,
+            fl2va_layout(&geometry, &[TEXT_TAG], anchors, cfg.patch_size, d).unwrap(),
+            context,
+            rows,
+            None,
+            None,
+        )
+    };
+    let plain_a = run_fl(&[], None, &context_a);
+    let plain_b = run_fl(&[], None, &context_b);
+    assert_eq!(
+        plain_a,
+        run_fl(&[], None, &context_a),
+        "same-input generated control must be deterministic"
+    );
+    assert_generated_cause(d, "context_values", &plain_a, &plain_b);
+    assert_generated_cause(
+        d,
+        "context_vs_zero_same_shape",
+        &plain_a,
+        &run_fl(&[], None, &causal_signal(&[1, 1, cfg.text_dim], 0, 0., d)),
+    );
+    let first_a = run_fl(&[KeyframeAnchor::First], Some(&visual_a), &context_a);
+    let first_b = run_fl(&[KeyframeAnchor::First], Some(&visual_b), &context_a);
+    let last_a = run_fl(&[KeyframeAnchor::Last], Some(&visual_a), &context_a);
+    let last_b = run_fl(&[KeyframeAnchor::Last], Some(&visual_b), &context_a);
+    assert_generated_cause(d, "first_only_values", &first_a, &first_b);
+    let zero_visual = causal_signal(&[1, 4, cfg.in_channels], 0, 0., d);
+    assert_generated_cause(
+        d,
+        "first_only_vs_zero_same_shape",
+        &first_a,
+        &run_fl(&[KeyframeAnchor::First], Some(&zero_visual), &context_a),
+    );
+    assert_generated_cause(d, "last_only_values", &last_a, &last_b);
+    assert_generated_cause(d, "first_vs_last_placement", &first_a, &last_a);
+    assert_generated_cause(d, "first_only_vs_drop", &first_a, &plain_a);
+    assert_generated_cause(d, "last_only_vs_drop", &last_b, &plain_a);
+    let ab = Tensor::cat(&[&visual_a, &visual_b], 1).unwrap();
+    let ba = Tensor::cat(&[&visual_b, &visual_a], 1).unwrap();
+    let anchors = [KeyframeAnchor::First, KeyframeAnchor::Last];
+    let both_ab = run_fl(&anchors, Some(&ab), &context_a);
+    let both_ba = run_fl(&anchors, Some(&ba), &context_a);
+    assert_generated_cause(d, "first_last_swap_values", &both_ab, &both_ba);
+    // Keep BOTH slots, positions and row counts fixed: removing a slot would also change
+    // attention/rotary geometry and could pass even if that slot's VALUES were discarded.
+    let zero_first = Tensor::cat(&[&zero_visual, &visual_b], 1).unwrap();
+    let zero_last = Tensor::cat(&[&visual_a, &zero_visual], 1).unwrap();
+    assert_generated_cause(
+        d,
+        "first_last_drop_first",
+        &both_ab,
+        &run_fl(&anchors, Some(&zero_first), &context_a),
+    );
+    assert_generated_cause(
+        d,
+        "first_last_drop_last",
+        &both_ab,
+        &run_fl(&anchors, Some(&zero_last), &context_a),
+    );
+    let image = ReferenceLatentGeometry {
+        kind: ReferenceKind::Image,
+        num_latent_frames: 1,
+        latent_height: 2,
+        latent_width: 2,
+        num_audio_latents: 0,
+    };
+    let image_layout = ref2va_layout_with_audio_channels(
+        &geometry,
+        &[TEXT_TAG],
+        &[image],
+        &[0],
+        cfg.patch_size,
+        d,
+    )
+    .unwrap();
+    let ref_a = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        image_layout.clone(),
+        &context_a,
+        Some(&visual_a),
+        None,
+        None,
+    );
+    let ref_b = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        image_layout,
+        &context_a,
+        Some(&visual_b),
+        None,
+        None,
+    );
+    assert_generated_cause(d, "reference_image_values", &ref_a, &ref_b);
+    assert_generated_cause(d, "fl2va_vs_ref2va_positioning", &first_a, &ref_a);
+    let ordered = ref2va_layout_with_audio_channels(
+        &geometry,
+        &[TEXT_TAG],
+        &[image, image],
+        &[0, 0],
+        cfg.patch_size,
+        d,
+    )
+    .unwrap();
+    let refs_ab = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        ordered.clone(),
+        &context_a,
+        Some(&ab),
+        None,
+        None,
+    );
+    let refs_ba = causal_generated_forward(f, cfg, d, ordered, &context_a, Some(&ba), None, None);
+    assert_generated_cause(d, "ordered_reference_values", &refs_ab, &refs_ba);
+    let video_geometry = ReferenceLatentGeometry {
+        kind: ReferenceKind::Video,
+        num_latent_frames: 2,
+        ..image
+    };
+    let video_a = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 2, 2, 2], 4, 0.16, d),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+        d,
+    )
+    .unwrap();
+    let video_b = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 2, 2, 2], 21, 0.23, d),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+        d,
+    )
+    .unwrap();
+    let video_layout = ref2va_layout_with_audio_channels(
+        &geometry,
+        &[TEXT_TAG],
+        &[video_geometry],
+        &[0],
+        cfg.patch_size,
+        d,
+    )
+    .unwrap();
+    let video_out_a = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        video_layout.clone(),
+        &context_a,
+        Some(&video_a),
+        None,
+        None,
+    );
+    let video_out_b = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        video_layout,
+        &context_a,
+        Some(&video_b),
+        None,
+        None,
+    );
+    assert_generated_cause(d, "reference_video_only_values", &video_out_a, &video_out_b);
+    // Isolated audio CONDITIONING_ROWS is a low-level packing/DiT witness, NOT an accepted
+    // audio-only Generator request (which requires a companion visual reference).
+    let audio_geometry = ReferenceLatentGeometry {
+        kind: ReferenceKind::Audio,
+        num_latent_frames: 0,
+        latent_height: 0,
+        latent_width: 0,
+        num_audio_latents: 3,
+    };
+    let audio_a =
+        reference_audio_rows(&causal_signal(&[1, 3, cfg.audio_in_channels], 2, 0.14, d)).unwrap();
+    let audio_b =
+        reference_audio_rows(&causal_signal(&[1, 3, cfg.audio_in_channels], 23, 0.27, d)).unwrap();
+    let audio_layout = ref2va_layout_with_audio_channels(
+        &geometry,
+        &[TEXT_TAG],
+        &[audio_geometry],
+        &[1],
+        cfg.patch_size,
+        d,
+    )
+    .unwrap();
+    let audio_out_a = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        audio_layout.clone(),
+        &context_a,
+        None,
+        Some(&audio_a),
+        None,
+    );
+    let audio_out_b = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        audio_layout,
+        &context_a,
+        None,
+        Some(&audio_b),
+        None,
+    );
+    assert_generated_cause(
+        d,
+        "reference_audio_only_CONDITIONING_ROWS",
+        &audio_out_a,
+        &audio_out_b,
+    );
+    let valid_audio_layout = ref2va_layout_with_audio_channels(
+        &geometry,
+        &[TEXT_TAG],
+        &[image, audio_geometry],
+        &[0, 1],
+        cfg.patch_size,
+        d,
+    )
+    .unwrap();
+    let valid_audio_a = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        valid_audio_layout.clone(),
+        &context_a,
+        Some(&visual_a),
+        Some(&audio_a),
+        None,
+    );
+    let valid_audio_b = causal_generated_forward(
+        f,
+        cfg,
+        d,
+        valid_audio_layout,
+        &context_a,
+        Some(&visual_a),
+        Some(&audio_b),
+        None,
+    );
+    assert_generated_cause(
+        d,
+        "reference_audio_values_visual_fixed",
+        &valid_audio_a,
+        &valid_audio_b,
+    );
+    // Post-encoder zero controls keep EVERY layout/position/count fixed. These are deliberate
+    // conditioning-drop mutations at the DiT seam, not a bypass of media degeneracy validation.
+    let run_reference = |refs: &[ReferenceLatentGeometry],
+                         channels: &[usize],
+                         visual: Option<&Tensor>,
+                         sound: Option<&Tensor>| {
+        let layout = ref2va_layout_with_audio_channels(
+            &geometry,
+            &[TEXT_TAG],
+            refs,
+            channels,
+            cfg.patch_size,
+            d,
+        )
+        .unwrap();
+        causal_generated_forward(f, cfg, d, layout, &context_a, visual, sound, None)
+    };
+    let zero_video = causal_signal(&[1, 8, cfg.video_patch_dim()], 0, 0., d);
+    let zero_audio = causal_signal(&[1, 3, cfg.audio_in_channels], 0, 0., d);
+    assert_generated_cause(
+        d,
+        "reference_image_drop_same_layout",
+        &ref_a,
+        &run_reference(&[image], &[0], Some(&zero_visual), None),
+    );
+    assert_generated_cause(
+        d,
+        "reference_video_drop_same_layout",
+        &video_out_a,
+        &run_reference(&[video_geometry], &[0], Some(&zero_video), None),
+    );
+    assert_generated_cause(
+        d,
+        "reference_audio_only_drop_same_layout_CONDITIONING_ROWS",
+        &audio_out_a,
+        &run_reference(&[audio_geometry], &[1], None, Some(&zero_audio)),
+    );
+    // Same geometry per carrier on each side: only its encoded VALUES are reassigned to the
+    // advancing reference clock. Dropping or sorting the ordered values makes these A/B equal.
+    let videos_ab = Tensor::cat(&[&video_a, &video_b], 1).unwrap();
+    let videos_ba = Tensor::cat(&[&video_b, &video_a], 1).unwrap();
+    let ordered_videos_a = run_reference(
+        &[video_geometry, video_geometry],
+        &[0, 0],
+        Some(&videos_ab),
+        None,
+    );
+    let ordered_videos_b = run_reference(
+        &[video_geometry, video_geometry],
+        &[0, 0],
+        Some(&videos_ba),
+        None,
+    );
+    assert_generated_cause(
+        d,
+        "ordered_video_references_AB_vs_BA",
+        &ordered_videos_a,
+        &ordered_videos_b,
+    );
+    let audios_ab = Tensor::cat(&[&audio_a, &audio_b], 1).unwrap();
+    let audios_ba = Tensor::cat(&[&audio_b, &audio_a], 1).unwrap();
+    let ordered_audios_a = run_reference(
+        &[image, audio_geometry, audio_geometry],
+        &[0, 1, 1],
+        Some(&visual_a),
+        Some(&audios_ab),
+    );
+    let ordered_audios_b = run_reference(
+        &[image, audio_geometry, audio_geometry],
+        &[0, 1, 1],
+        Some(&visual_a),
+        Some(&audios_ba),
+    );
+    assert_generated_cause(
+        d,
+        "ordered_audio_references_AB_vs_BA_visual_fixed",
+        &ordered_audios_a,
+        &ordered_audios_b,
+    );
+    // A mixed list has one image, one video carrying its own stereo soundtrack and one mono
+    // standalone audio reference. Reverse BOTH descriptor order and the corresponding modality
+    // streams, never geometry alone. All generated target/context values remain unchanged.
+    let video_with_soundtrack = ReferenceLatentGeometry {
+        num_audio_latents: 5,
+        ..video_geometry
+    };
+    let soundtrack =
+        reference_audio_rows(&causal_signal(&[2, 5, cfg.audio_in_channels], 7, 0.18, d)).unwrap();
+    let zero_soundtrack = causal_signal(&[1, 10, cfg.audio_in_channels], 0, 0., d);
+    let mixed_video = Tensor::cat(&[&visual_a, &video_a], 1).unwrap();
+    let mixed_audio = Tensor::cat(&[&soundtrack, &audio_a], 1).unwrap();
+    let mixed = run_reference(
+        &[image, video_with_soundtrack, audio_geometry],
+        &[0, 2, 1],
+        Some(&mixed_video),
+        Some(&mixed_audio),
+    );
+    let reversed_video = Tensor::cat(&[&video_a, &visual_a], 1).unwrap();
+    let reversed_audio = Tensor::cat(&[&audio_a, &soundtrack], 1).unwrap();
+    let reversed_mixed = run_reference(
+        &[audio_geometry, video_with_soundtrack, image],
+        &[1, 2, 0],
+        Some(&reversed_video),
+        Some(&reversed_audio),
+    );
+    assert_generated_cause(
+        d,
+        "mixed_image_video_soundtrack_audio_reference_order",
+        &mixed,
+        &reversed_mixed,
+    );
+    let no_image = Tensor::cat(&[&zero_visual, &video_a], 1).unwrap();
+    assert_generated_cause(
+        d,
+        "mixed_image_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&no_image),
+            Some(&mixed_audio),
+        ),
+    );
+    let no_video = Tensor::cat(&[&visual_a, &zero_video], 1).unwrap();
+    let no_soundtrack = Tensor::cat(&[&zero_soundtrack, &audio_a], 1).unwrap();
+    assert_generated_cause(
+        d,
+        "mixed_video_carrier_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&no_video),
+            Some(&no_soundtrack),
+        ),
+    );
+    let no_standalone = Tensor::cat(&[&soundtrack, &zero_audio], 1).unwrap();
+    assert_generated_cause(
+        d,
+        "mixed_standalone_audio_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&mixed_video),
+            Some(&no_standalone),
+        ),
+    );
+    assert_generated_cause(
+        d,
+        "mixed_video_soundtrack_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&mixed_video),
+            Some(&no_soundtrack),
+        ),
+    );
+    // One declared hybrid fixture root, with two distinct imported portions. No stock fallback.
+    // The public task partition resolver and production directory loader drive the numeric A/B.
+    let dir = tempfile::tempdir().unwrap();
+    for task in [MiniMaxH3Task::Fl2va, MiniMaxH3Task::Ref2va] {
+        let root = dir.path().join(task.partition());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("config.json"), f["config"].to_string()).unwrap();
+        let mut map = manual_conditioning_map(f, cfg, &Device::Cpu);
+        if task == MiniMaxH3Task::Ref2va {
+            let bias = map["proj_out.bias"].clone();
+            map.insert(
+                "proj_out.bias".into(),
+                bias.add(&causal_signal(
+                    &[cfg.video_patch_dim()],
+                    11,
+                    0.4,
+                    &Device::Cpu,
+                ))
+                .unwrap(),
+            );
+        }
+        candle_gen::candle_core::safetensors::save(&map, root.join("model.safetensors")).unwrap();
+    }
+    let run_portion = |portion: &str| {
+        let path = dir.path().join(portion);
+        let source = candle_gen::candle_core::safetensors::load(
+            path.join("model.safetensors"),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let actual_bias = source["proj_out.bias"]
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let expected_map = manual_conditioning_map(f, cfg, &Device::Cpu);
+        let expected_bias = if portion == "transformer_ref" {
+            expected_map["proj_out.bias"]
+                .add(&causal_signal(
+                    &[cfg.video_patch_dim()],
+                    11,
+                    0.4,
+                    &Device::Cpu,
+                ))
+                .unwrap()
+        } else {
+            expected_map["proj_out.bias"].clone()
+        };
+        assert_eq!(
+            actual_bias,
+            expected_bias.to_vec1::<f32>().unwrap(),
+            "loaded portion must retain its own parameter identity"
+        );
+        let model =
+            candle_gen_minimax_h3::dit::MiniMaxH3Dit::load_from_dir(&path, d, DType::F32).unwrap();
+        causal_generated_forward(
+            f,
+            cfg,
+            d,
+            fl2va_layout(
+                &geometry,
+                &[TEXT_TAG],
+                &[KeyframeAnchor::First],
+                cfg.patch_size,
+                d,
+            )
+            .unwrap(),
+            &context_a,
+            Some(&visual_a),
+            None,
+            Some(model),
+        )
+    };
+    let expected_fl = run_portion("transformer");
+    let expected_ref = run_portion("transformer_ref");
+    let run_task = |keyframes, references, expected_portion: &str| {
+        let task = MiniMaxH3Task::resolve(keyframes, references).unwrap();
+        assert_eq!(
+            dir.path().join(task.partition()),
+            dir.path().join(expected_portion)
+        );
+        run_portion(task.partition())
+    };
+    let selected_fl = run_task(true, false, "transformer");
+    let selected_ref = run_task(false, true, "transformer_ref");
+    assert_eq!(
+        selected_fl, expected_fl,
+        "hybrid-checkpoint FL task must match explicit FL portion baseline"
+    );
+    assert_eq!(
+        selected_ref, expected_ref,
+        "hybrid-checkpoint Ref task must match explicit Ref portion baseline"
+    );
+    assert_generated_cause(
+        d,
+        "hybrid_checkpoint_FL_portion_vs_wrong_REF_portion",
+        &selected_fl,
+        &expected_ref,
+    );
+    assert_generated_cause(
+        d,
+        "hybrid_checkpoint_REF_portion_vs_wrong_FL_portion",
+        &selected_ref,
+        &expected_fl,
+    );
+    println!("H3_CONDITIONING_CAUSAL_BOUNDARY backend=cuda hybrid_checkpoint=two_distinct_portions selected_by=native_task_partition audio_only_generator=refused prompt_seam=context_embedding");
 }

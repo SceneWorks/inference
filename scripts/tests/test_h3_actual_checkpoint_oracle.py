@@ -1,0 +1,423 @@
+"""Pure primitive tests for the actual-checkpoint oracle adapter bridge.
+
+No GPU, no model, no network, no real weights. These tests exercise the bridge's bounded spec /
+mini-safetensors parsing, the exact provenance binding, the BF16-input contract and the byte-to-
+pinned-function wiring. Numeric agreement is NOT re-derived here: the same frozen producer
+functions are called on both sides, which is the point of an adapter test.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import struct
+import tempfile
+import unittest
+from pathlib import Path
+
+BRIDGE = Path(__file__).resolve().parents[1] / "h3_actual_checkpoint_oracle.py"
+SPEC = importlib.util.spec_from_file_location("h3_actual_checkpoint_oracle", BRIDGE)
+BRIDGE_MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(BRIDGE_MODULE)
+
+
+def write_safetensors(path: Path, tensors: list[tuple[str, str, list[int], bytes]]) -> None:
+    header = {}
+    offset = 0
+    for name, dtype, shape, payload in tensors:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len(payload)]}
+        offset += len(payload)
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    while len(encoded) % 8:
+        encoded += b" "
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(t[-1] for t in tensors))
+
+
+def f32_bytes(values: list[float]) -> bytes:
+    return b"".join(struct.pack("<f", value) for value in values)
+
+
+def tiny_w4_tensors() -> dict:
+    k = 256
+    packed = bytes((index % 256) for index in range(k // 2))
+    srel = bytes([0x38] * (k // 16))
+    codebook = f32_bytes([float(index) - 8.0 for index in range(16)])
+    s_channel = f32_bytes([1.0])
+    comfy = json.dumps({"format": "asym_w4a8_int8", "group_size": 16, "convrot_groupsize": 256}).encode()
+    return {
+        "p.weight": {"dtype": "I8", "shape": [1, k // 2], "bytes": packed},
+        "p.weight_s_rel": {"dtype": "F8_E4M3", "shape": [1, k // 16], "bytes": srel},
+        "p.weight_codebook": {"dtype": "F32", "shape": [16], "bytes": codebook},
+        "p.weight_s_channel": {"dtype": "F32", "shape": [1], "bytes": s_channel},
+        "p.comfy_quant": {"dtype": "U8", "shape": [len(comfy)], "bytes": comfy},
+    }
+
+
+def tiny_w4_case() -> dict:
+    return {
+        "id": "w4.tiny",
+        "kind": "w4a8_projection",
+        "select": {"base": "p", "bias": False},
+        "input": {"dtype": "BF16", "shape": [1, 256], "values": [0.125] * 256},
+        "tolerance": {"max_abs": 0.0},
+    }
+
+ARTIFACT_SHA = "ab" * 32
+
+
+def make_manifest(root: Path, cases: list[dict], artifact_tensors=None) -> tuple[Path, Path]:
+    """Write a shared probe manifest + artifact + SHA'd staging projection/parent."""
+    artifact = root / "artifact.safetensors"
+    if artifact_tensors is None:
+        artifact_tensors = tiny_w4_tensor_list()
+    write_safetensors(artifact, artifact_tensors)
+    size = artifact.stat().st_size
+    parent = root / "parent-stage.json"
+    parent.write_bytes(b'{"schema":"h3-finetune-stage-receipt","schema_version":1}')
+    staging = {
+        "schema": "sceneworks.h3.staging_receipt",
+        "schema_version": 1,
+        "producer": "test staging projection",
+        "full_file_digest_verified": True,
+        "artifact_path": str(artifact),
+        "artifact_sha256": ARTIFACT_SHA,
+        "artifact_bytes": size,
+        "parent_receipt_path": str(parent),
+        "parent_receipt_sha256": hashlib.sha256(parent.read_bytes()).hexdigest(),
+    }
+    staging_path = root / "staging-projection.json"
+    staging_path.write_text(json.dumps(staging))
+    manifest = {
+        "schema": BRIDGE_MODULE.MANIFEST_SCHEMA,
+        "schema_version": 1,
+        "backend": "both",
+        "artifact": {"path": str(artifact), "sha256": ARTIFACT_SHA, "bytes": size},
+        "staging": {
+            "receipt_path": str(staging_path),
+            "receipt_sha256": hashlib.sha256(staging_path.read_bytes()).hexdigest(),
+            "verified_artifact_sha256": ARTIFACT_SHA,
+        },
+        "cases": cases,
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    return manifest_path, artifact
+
+
+def tiny_w4_tensor_list() -> list[tuple[str, str, list[int], bytes]]:
+    return [(name, tensor["dtype"], tensor["shape"], tensor["bytes"]) for name, tensor in tiny_w4_tensors().items()]
+
+
+class ActualCheckpointBridgeTests(unittest.TestCase):
+    def test_reader_validates_layout_and_hashes_raw_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selected.safetensors"
+            write_safetensors(path, [("a", "F32", [2], f32_bytes([1.0, 2.0]))])
+            tensors = BRIDGE_MODULE.read_selected_safetensors(path)
+            self.assertEqual(tensors["a"]["dtype"], "F32")
+            self.assertEqual(tensors["a"]["shape"], [2])
+            self.assertEqual(len(tensors["a"]["bytes"]), 8)
+
+    def test_reader_refuses_non_contiguous_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.safetensors"
+            header = json.dumps({"a": {"dtype": "U8", "shape": [2], "data_offsets": [0, 2]}}).encode()
+            while len(header) % 8:
+                header += b" "
+            path.write_bytes(struct.pack("<Q", len(header)) + header + b"ab")
+            self.assertEqual(len(BRIDGE_MODULE.read_selected_safetensors(path)["a"]["bytes"]), 2)
+
+    def test_manifest_refuses_unknown_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _ = make_manifest(
+                root,
+                [{"id": "x", "kind": "dense_projection", "select": {}, "tolerance": {"max_abs": 0.0}, "input": {"dtype": "F32", "shape": [1], "values": [0.0]}}],
+            )
+            with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+                BRIDGE_MODULE.parse_spec(manifest)
+            self.assertEqual(caught.exception.code, "spec_malformed")
+
+    def test_packed_cases_require_bf16_input(self) -> None:
+        case = tiny_w4_case()
+        case["input"]["dtype"] = "F32"
+        with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+            BRIDGE_MODULE.validate_case(case, 0)
+        self.assertEqual(caught.exception.code, "input_dtype")
+
+    def test_w4a8_wiring_calls_the_frozen_replay_functions(self) -> None:
+        w4 = BRIDGE_MODULE.load_frozen(BRIDGE_MODULE.FROZEN_W4A8)
+        tensors = tiny_w4_tensors()
+        case = tiny_w4_case()
+        rows = BRIDGE_MODULE.w4a8_rows(case, tensors, w4)
+        weight = BRIDGE_MODULE.rows_i8(tensors["p.weight"], "p.weight")
+        codebook = BRIDGE_MODULE.vector_f32(tensors["p.weight_codebook"], "codebook")
+        s_channel = BRIDGE_MODULE.vector_f32(tensors["p.weight_s_channel"], "s_channel")
+        decoded = w4.decode_weight_replay(
+            [[byte & 0xFF for byte in row] for row in weight],
+            BRIDGE_MODULE.rows_u8(tensors["p.weight_s_rel"], "s_rel"),
+            codebook,
+            256,
+            group=16,
+        )
+        x = w4.to_bf16_rows(BRIDGE_MODULE.input_rows(case, 256))
+        _, xq, xs, _ = w4.quantize_int8_rowwise_convrot_replay(x)
+        acc, _, _ = w4.int_accumulate_replay(xq, decoded, k_tile=256)
+        expected = [[w4.epilogue_replay(acc[0][0], xs[0], s_channel[0], None)]]
+        self.assertEqual(rows, expected)
+        self.assertTrue(all(value == value for row in rows for value in row))
+
+    def test_convrot_refuses_non_256_group(self) -> None:
+        w4 = BRIDGE_MODULE.load_frozen(BRIDGE_MODULE.FROZEN_W4A8)
+        tensors = {
+            "p.weight": {"dtype": "I8", "shape": [1, 256], "bytes": bytes(256)},
+            "p.weight_scale": {"dtype": "F32", "shape": [1], "bytes": f32_bytes([1.0])},
+            "p.comfy_quant": {
+                "dtype": "U8",
+                "shape": [1],
+                "bytes": json.dumps({"format": "convrot_int8", "convrot_groupsize": 64}).encode(),
+            },
+        }
+        case = {
+            "id": "convrot.tiny",
+            "kind": "convrot_projection",
+            "select": {"base": "p", "bias": False},
+            "input": {"dtype": "BF16", "shape": [1, 256], "values": [0.0] * 256},
+            "tolerance": {"max_abs": 0.0},
+        }
+        with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+            BRIDGE_MODULE.convrot_rows(case, tensors, w4)
+        self.assertEqual(caught.exception.code, "convrot_group_unsupported")
+
+    def test_run_writes_refusal_receipt_and_no_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = {
+                "id": "absent.tiny",
+                "kind": "convrot_projection",
+                "select": {"base": "p", "bias": False},
+                "input": {"dtype": "BF16", "shape": [1, 2], "values": [0.0, 0.0]},
+                "tolerance": {"max_abs": 0.0},
+            }
+            manifest, _ = make_manifest(root, [case], artifact_tensors=[("p.weight", "I8", [1, 2], b"\x00\x01")])
+            selected = root / "selected.safetensors"
+            write_safetensors(selected, [("p.weight", "I8", [1, 2], b"\x00\x01")])
+            output = root / "oracle.json"
+            receipt = root / "receipt.json"
+            code = BRIDGE_MODULE.main(
+                [
+                    "--spec",
+                    str(manifest),
+                    "--selected-tensors",
+                    str(selected),
+                    "--output",
+                    str(output),
+                    "--receipt",
+                    str(receipt),
+                ]
+            )
+            self.assertEqual(code, 2)
+            self.assertFalse(output.exists())
+            written = json.loads(receipt.read_text())
+            self.assertEqual(written["status"], "refused")
+            self.assertEqual(written["code"], "selection_missing")
+            self.assertFalse(written["network_used"])
+            self.assertFalse(written["gpu_used"])
+
+    def test_manifest_refuses_inconsistent_staging_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            staging_path = root / "staging-projection.json"
+            staging = json.loads(staging_path.read_text())
+            staging["artifact_sha256"] = "cd" * 32
+            staging_path.write_text(json.dumps(staging))
+            manifest_json = json.loads(manifest.read_text())
+            manifest_json["staging"]["receipt_sha256"] = hashlib.sha256(staging_path.read_bytes()).hexdigest()
+            manifest.write_text(json.dumps(manifest_json))
+            selected = root / "selected.safetensors"
+            write_safetensors(selected, tiny_w4_tensor_list())
+            receipt = root / "receipt.json"
+            code = BRIDGE_MODULE.main(
+                ["--spec", str(manifest), "--selected-tensors", str(selected),
+                 "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(receipt.read_text())["code"], "staging_binding_mismatch")
+
+    def test_selected_tensor_must_match_actual_artifact_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _ = make_manifest(root, [tiny_w4_case()], artifact_tensors=tiny_w4_tensor_list())
+            selected = root / "selected.safetensors"
+            tensors = tiny_w4_tensors()
+            tensors["p.weight"] = {"dtype": "F32", "shape": [1, 128], "bytes": f32_bytes([0.0] * 128)}
+            write_safetensors(selected, [(n, t["dtype"], t["shape"], t["bytes"]) for n, t in tensors.items()])
+            receipt = root / "receipt.json"
+            code = BRIDGE_MODULE.main(
+                ["--spec", str(manifest), "--selected-tensors", str(selected),
+                 "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(receipt.read_text())["code"], "selection_binding_mismatch")
+
+    def test_artifact_size_mismatch_refuses_before_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            manifest_json = json.loads(manifest.read_text())
+            manifest_json["artifact"]["bytes"] += 1
+            manifest.write_text(json.dumps(manifest_json))
+            selected = root / "selected.safetensors"
+            write_safetensors(selected, tiny_w4_tensor_list())
+            receipt = root / "receipt.json"
+            code = BRIDGE_MODULE.main(
+                ["--spec", str(manifest), "--selected-tensors", str(selected),
+                 "--output", str(root / "oracle.json"), "--receipt", str(receipt)]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(receipt.read_text())["code"], "artifact_size_mismatch")
+
+    def test_manifest_rejects_non_hex_sha_and_invalid_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            broken = json.loads(manifest.read_text())
+            broken["artifact"]["sha256"] = "z" * 64
+            manifest.write_text(json.dumps(broken))
+            with self.assertRaises(BRIDGE_MODULE.Refusal):
+                BRIDGE_MODULE.parse_spec(manifest)
+
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            broken = json.loads(manifest.read_text())
+            broken["cases"][0]["input"]["shape"] = [1, 0]
+            manifest.write_text(json.dumps(broken))
+            with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+                BRIDGE_MODULE.parse_spec(manifest)
+            self.assertEqual(caught.exception.code, "spec_malformed")
+
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            broken = json.loads(manifest.read_text())
+            broken["cases"][0]["input"]["shape"] = [1, True]
+            manifest.write_text(json.dumps(broken))
+            with self.assertRaises(BRIDGE_MODULE.Refusal):
+                BRIDGE_MODULE.parse_spec(manifest)
+
+            manifest, _ = make_manifest(root, [tiny_w4_case()])
+            broken = json.loads(manifest.read_text())
+            broken["cases"][0]["input"]["values"][0] = float("nan")
+            manifest.write_text(json.dumps(broken))
+            with self.assertRaises(BRIDGE_MODULE.Refusal):
+                BRIDGE_MODULE.parse_spec(manifest)
+
+    def test_bounded_read_rejects_oversize_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "big.json"
+            path.write_bytes(b"0123456789")
+            with self.assertRaises(BRIDGE_MODULE.Refusal) as caught:
+                BRIDGE_MODULE.read_bounded(path, 4, "fixture")
+            self.assertEqual(caught.exception.code, "metadata_too_large")
+
+    def test_pruned_projection_uses_actual_rank_on_a_meta_parent(self) -> None:
+        try:
+            import torch
+            import torch.nn as nn
+        except ImportError:
+            self.skipTest("torch is not installed")
+
+        class Adaln:
+            def __init__(self, linear):
+                self.linear = linear
+
+        seen = {}
+
+        class FakeDiTBlock:
+            def __init__(
+                self,
+                hidden_size,
+                num_attention_heads,
+                attention_head_dim,
+                ffn_dim,
+                time_embed_dim,
+                norm_eps,
+                qk_norm_eps,
+                *,
+                apply_silu,
+                adaln_dtype,
+                ffn_chunk_size,
+                dtype,
+                device,
+            ):
+                # A real body would be huge; on meta nothing is allocated.
+                self.body = torch.nn.Parameter(torch.empty(hidden_size, ffn_dim, device=device))
+                self.adaln_proj = Adaln(torch.nn.Linear(time_embed_dim, 18 * hidden_size, bias=True, device=device))
+                seen["device"] = device
+                seen["rank"] = time_embed_dim
+
+        ns = {"DiTBlock": FakeDiTBlock}
+        config = {
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "attention_head_dim": 8,
+            "ffn_dim": 16,
+            "time_embed_dim": 16,  # original unpruned width: must NOT be used for the AdaLN input
+            "text_dim": 8,
+            "in_channels": 4,
+            "audio_in_channels": 4,
+            "patch_size": [1, 1, 1],
+            "norm_eps": 1e-5,
+            "qk_norm_eps": 1e-5,
+            "final_norm_eps": 1e-5,
+        }
+        rank = 8
+        weight = BRIDGE_MODULE._torch().zeros(18 * 8, rank)
+        bias = BRIDGE_MODULE._torch().zeros(18 * 8)
+        linear = BRIDGE_MODULE.projection_linear(
+            ns, config, "transformer_blocks.0.adaln_proj.linear", weight, bias, rank
+        )
+        self.assertEqual(tuple(linear.weight.shape), (18 * 8, 8))
+        self.assertEqual(linear.weight.device.type, "cpu")
+        self.assertEqual(seen["device"], "meta", "the parent body must be constructed on meta")
+        self.assertEqual(seen["rank"], 8, "the actual reduced rank must drive the AdaLN input width")
+        output = linear(BRIDGE_MODULE._torch().zeros(2, rank))
+        self.assertEqual(tuple(output.shape), (2, 18 * 8))
+
+    def test_mixed_concat_preserves_distinct_projection_output_widths(self) -> None:
+        from unittest.mock import patch
+        case = {"id": "mixed", "select": {"base": "w", "convrot_base": "c"}}
+        with patch.object(BRIDGE_MODULE, "w4a8_rows", return_value=[[1.0, 2.0]]) as w4, \
+             patch.object(BRIDGE_MODULE, "convrot_rows", return_value=[[3.0, 4.0, 5.0]]) as conv:
+            result = BRIDGE_MODULE.mixed_rows(case, {}, object())
+        self.assertEqual(result, [[1.0, 2.0, 3.0, 4.0, 5.0]])
+        self.assertEqual(w4.call_count, 1)
+        self.assertEqual(conv.call_count, 1)
+
+    def test_frozen_provenance_records_exact_upstream_revisions(self) -> None:
+        records = BRIDGE_MODULE.frozen_provenance()
+        self.assertEqual(len(records), 3)
+        for record in records:
+            self.assertEqual(record["source_revision_sha256"], record["sha256"])
+            self.assertTrue(record["upstream_revisions"])
+            data = (BRIDGE_MODULE.REPO_ROOT / record["script"]).read_bytes()
+            self.assertEqual(record["sha256"], hashlib.sha256(data).hexdigest())
+            for revision in record["upstream_revisions"].values():
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
+    def test_bridge_has_no_network_or_gpu_imports(self) -> None:
+        source = BRIDGE.read_text()
+        for forbidden in (
+            "import urllib",
+            "import requests",
+            "import http.client",
+            "import socket",
+            "import mlx",
+            "import mlx_rs",
+            "torch.cuda",
+        ):
+            self.assertNotIn(forbidden, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

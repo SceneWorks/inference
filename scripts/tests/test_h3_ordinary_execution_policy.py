@@ -17,6 +17,7 @@ job reds ``test_ordinary_jobs_never_execute_h3_model_tests``.
 """
 
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -572,6 +573,27 @@ def rust_test_body(path: Path, name: str) -> str:
 
 
 class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
+    def test_actual_checkpoint_probe_is_ignored_and_unreachable_from_ordinary_ci(self) -> None:
+        name = "actual_checkpoint_projections_match_pinned_cpu_oracle"
+        # The only executor lives in the explicit SceneWorks terminal campaign. Native
+        # PR/main test commands may compile this module, but must never opt it in.
+        ordinary = _strip_comment_lines(CI.read_text(encoding="utf-8"))
+        self.assertNotIn(f"artifact_probe::{name}", ordinary)
+        self.assertNotIn("H3_ACTUAL_PROBE_MANIFEST", ordinary)
+        for root in (MLX_TESTS, CANDLE_TESTS):
+            source = root / "artifact_probe.rs"
+            with self.subTest(source=source):
+                self.assertTrue(rust_tests(source).get(name), "actual payload/device probe must stay ignored")
+                self.assertGreaterEqual(len(ignore_reason(source, name)), MINIMUM_IGNORE_REASON)
+                self.assertIn("mod artifact_probe;", (root / "main.rs").read_text(encoding="utf-8"))
+                # Execute the source guard against an unignore mutant, not just a token check.
+                mutant = re.sub(r'^\s*#\[ignore[^\n]*\]\s*$', '', source.read_text(encoding="utf-8"), flags=re.MULTILINE)
+                with tempfile.TemporaryDirectory() as directory:
+                    changed = Path(directory) / "artifact_probe.rs"
+                    changed.write_text(mutant, encoding="utf-8")
+                    self.assertIn(name, rust_tests(changed))
+                    self.assertFalse(rust_tests(changed)[name], "unignore mutant escaped the policy")
+
     def test_h3_gpu0_and_main_gpu1_keep_distinct_physical_identity(self) -> None:
         blocks = jobs(CI.read_text(encoding="utf-8"))
         main = blocks["windows-cuda"]

@@ -967,4 +967,603 @@ fn manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control()
         "every keyframe and mixed-channel ordered case must execute"
     );
     println!("H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11");
+    native_conditioning_causality(&json, &cfg, &geometry);
+}
+
+// These helpers execute ONLY from the existing ignored manual proof above. They consume native
+// encoded-conditioning/context seams, not a tokenizer, text encoder, VAE or application dispatcher.
+fn causal_signal(shape: &[i32], salt: usize, scale: f32) -> Array {
+    let n = shape.iter().map(|&x| x as usize).product();
+    let values: Vec<f32> = (0..n)
+        .map(|i| (((i * 7 + salt) % 29) as f32 - 14.) * scale)
+        .collect();
+    Array::from_slice(&values, shape)
+}
+
+fn causal_generated_forward(
+    json: &serde_json::Value,
+    cfg: &MiniMaxH3DitConfig,
+    layout: mlx_gen_minimax_h3::denoise::PackedLayout,
+    context: &Array,
+    condition_video: Option<&Array>,
+    condition_audio: Option<&Array>,
+    selected: Option<MiniMaxH3Dit>,
+) -> Vec<f32> {
+    use mlx_gen_minimax_h3::denoise::{JointStep, JointVelocity, PackedLayout};
+    use mlx_gen_minimax_h3::dit::adaln::AdaLnResidency;
+    use mlx_gen_minimax_h3::dit::model::JointDit;
+    use mlx_gen_minimax_h3::pipeline::{prepend_condition_audio_rows, prepend_condition_rows};
+    let cv = layout.num_condition_video_rows();
+    let ca = layout.num_condition_audio_rows();
+    let nv = layout.video_indices().len() as i32 - cv;
+    let na = layout.audio_indices().len() as i32 - ca;
+    let video = causal_signal(&[1, nv, cfg.video_patch_dim()], 5, 0.03);
+    let audio = causal_signal(&[1, na, cfg.audio_in_channels], 9, 0.04);
+    let video = prepend_condition_rows(&layout, condition_video, &video).unwrap();
+    let audio = prepend_condition_audio_rows(&layout, condition_audio, &audio).unwrap();
+    let times = PackedLayout::row_timesteps(0.6, 0.4);
+    let schedule = mlx_gen_minimax_h3::TimestepSchedule::new(vec![times.to_vec()]).unwrap();
+    let indices = schedule
+        .adaln_indices(0, layout.row_classes(), layout.token_tags())
+        .unwrap();
+    let model = selected.unwrap_or_else(|| {
+        let mut weights = Weights::from_map(full_pruned_map(json, 0.));
+        MiniMaxH3Dit::from_weights(&mut weights, cfg, Dtype::Float32).unwrap()
+    });
+    let mut driver = JointDit::new(
+        model,
+        layout.clone(),
+        context,
+        schedule,
+        AdaLnResidency::Resident,
+    )
+    .unwrap();
+    let output = driver
+        .forward(&JointStep {
+            index: 0,
+            layout: &layout,
+            video_rows: &video,
+            audio_rows: &audio,
+            adaln_indices: &indices,
+            row_timesteps: times,
+        })
+        .unwrap();
+    let mut generated = Vec::new();
+    for (rows, start, count, features) in [
+        (&output.0, cv, nv, cfg.video_patch_dim()),
+        (&output.1, ca, na, cfg.audio_in_channels),
+    ] {
+        let selected = Array::from_slice(&(start..start + count).collect::<Vec<_>>(), &[count]);
+        let tail = rows
+            .take_axis(&selected, 1)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        tail.eval().unwrap();
+        assert_eq!(tail.shape(), &[1, count, features]);
+        generated.extend_from_slice(tail.as_slice::<f32>());
+    }
+    assert!(generated.iter().all(|x| x.is_finite()));
+    generated
+}
+
+fn assert_generated_cause(property: &str, a: &[f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len());
+    assert!(!a.is_empty());
+    assert!(a.iter().chain(b).all(|x| x.is_finite()));
+    let peak = a.iter().chain(b).map(|x| x.abs()).fold(0., f32::max);
+    let delta = a
+        .iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0., f32::max);
+    let floor = 8. * f32::EPSILON * peak;
+    println!("H3_CONDITIONING_CAUSAL backend=metal property={property} max_abs={delta:.9e} floor={floor:.9e} generated_only=true");
+    assert!(
+        peak > 0. && delta > floor,
+        "{property}: generated outputs are causally indistinguishable: delta={delta} floor={floor}"
+    );
+}
+
+fn native_conditioning_causality(
+    json: &serde_json::Value,
+    cfg: &MiniMaxH3DitConfig,
+    geometry: &mlx_gen_minimax_h3::pipeline::RequestGeometry,
+) {
+    use mlx_gen_minimax_h3::conditioning::{
+        keyframe_condition_rows, reference_audio_rows, KeyframeNoise,
+    };
+    use mlx_gen_minimax_h3::denoise::TEXT_TAG;
+    use mlx_gen_minimax_h3::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use mlx_gen_minimax_h3::model::MiniMaxH3Task;
+    use mlx_gen_minimax_h3::pipeline::{fl2va_layout, ref2va_layout_with_audio_channels};
+    use mlx_gen_minimax_h3::reference::ReferenceKind;
+    let context_a = causal_signal(&[1, 1, cfg.text_dim], 13, 0.2);
+    let context_b = causal_signal(&[1, 1, cfg.text_dim], 17, 0.35);
+    let visual_a = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 1, 2, 2], 3, 0.12),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+    )
+    .unwrap();
+    let visual_b = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 1, 2, 2], 19, 0.25),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+    )
+    .unwrap();
+    let run_fl = |anchors: &[KeyframeAnchor], rows: Option<&Array>, context: &Array| {
+        causal_generated_forward(
+            json,
+            cfg,
+            fl2va_layout(geometry, &[TEXT_TAG], anchors, cfg.patch_size).unwrap(),
+            context,
+            rows,
+            None,
+            None,
+        )
+    };
+    let plain_a = run_fl(&[], None, &context_a);
+    let plain_b = run_fl(&[], None, &context_b);
+    assert_eq!(
+        plain_a,
+        run_fl(&[], None, &context_a),
+        "same-input generated control must be deterministic"
+    );
+    assert_generated_cause("context_values", &plain_a, &plain_b);
+    assert_generated_cause(
+        "context_vs_zero_same_shape",
+        &plain_a,
+        &run_fl(&[], None, &causal_signal(&[1, 1, cfg.text_dim], 0, 0.)),
+    );
+    let first_a = run_fl(&[KeyframeAnchor::First], Some(&visual_a), &context_a);
+    let first_b = run_fl(&[KeyframeAnchor::First], Some(&visual_b), &context_a);
+    let last_a = run_fl(&[KeyframeAnchor::Last], Some(&visual_a), &context_a);
+    let last_b = run_fl(&[KeyframeAnchor::Last], Some(&visual_b), &context_a);
+    assert_generated_cause("first_only_values", &first_a, &first_b);
+    let zero_visual = causal_signal(&[1, 4, cfg.in_channels], 0, 0.);
+    assert_generated_cause(
+        "first_only_vs_zero_same_shape",
+        &first_a,
+        &run_fl(&[KeyframeAnchor::First], Some(&zero_visual), &context_a),
+    );
+    assert_generated_cause("last_only_values", &last_a, &last_b);
+    assert_generated_cause("first_vs_last_placement", &first_a, &last_a);
+    assert_generated_cause("first_only_vs_drop", &first_a, &plain_a);
+    assert_generated_cause("last_only_vs_drop", &last_b, &plain_a);
+    let ab = mlx_rs::ops::concatenate_axis(&[&visual_a, &visual_b], 1).unwrap();
+    let ba = mlx_rs::ops::concatenate_axis(&[&visual_b, &visual_a], 1).unwrap();
+    let anchors = [KeyframeAnchor::First, KeyframeAnchor::Last];
+    let both_ab = run_fl(&anchors, Some(&ab), &context_a);
+    let both_ba = run_fl(&anchors, Some(&ba), &context_a);
+    assert_generated_cause("first_last_swap_values", &both_ab, &both_ba);
+    // Keep BOTH slots, positions and row counts fixed: removing a slot would also change
+    // attention/rotary geometry and could pass even if that slot's VALUES were discarded.
+    let zero_first = mlx_rs::ops::concatenate_axis(&[&zero_visual, &visual_b], 1).unwrap();
+    let zero_last = mlx_rs::ops::concatenate_axis(&[&visual_a, &zero_visual], 1).unwrap();
+    assert_generated_cause(
+        "first_last_drop_first",
+        &both_ab,
+        &run_fl(&anchors, Some(&zero_first), &context_a),
+    );
+    assert_generated_cause(
+        "first_last_drop_last",
+        &both_ab,
+        &run_fl(&anchors, Some(&zero_last), &context_a),
+    );
+    let image = ReferenceLatentGeometry {
+        kind: ReferenceKind::Image,
+        num_latent_frames: 1,
+        latent_height: 2,
+        latent_width: 2,
+        num_audio_latents: 0,
+    };
+    let image_layout =
+        ref2va_layout_with_audio_channels(geometry, &[TEXT_TAG], &[image], &[0], cfg.patch_size)
+            .unwrap();
+    let ref_a = causal_generated_forward(
+        json,
+        cfg,
+        image_layout.clone(),
+        &context_a,
+        Some(&visual_a),
+        None,
+        None,
+    );
+    let ref_b = causal_generated_forward(
+        json,
+        cfg,
+        image_layout,
+        &context_a,
+        Some(&visual_b),
+        None,
+        None,
+    );
+    assert_generated_cause("reference_image_values", &ref_a, &ref_b);
+    assert_generated_cause("fl2va_vs_ref2va_positioning", &first_a, &ref_a);
+    let ordered = ref2va_layout_with_audio_channels(
+        geometry,
+        &[TEXT_TAG],
+        &[image, image],
+        &[0, 0],
+        cfg.patch_size,
+    )
+    .unwrap();
+    let refs_ab = causal_generated_forward(
+        json,
+        cfg,
+        ordered.clone(),
+        &context_a,
+        Some(&ab),
+        None,
+        None,
+    );
+    let refs_ba = causal_generated_forward(json, cfg, ordered, &context_a, Some(&ba), None, None);
+    assert_generated_cause("ordered_reference_values", &refs_ab, &refs_ba);
+    let video_geometry = ReferenceLatentGeometry {
+        kind: ReferenceKind::Video,
+        num_latent_frames: 2,
+        ..image
+    };
+    let video_a = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 2, 2, 2], 4, 0.16),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+    )
+    .unwrap();
+    let video_b = keyframe_condition_rows(
+        &causal_signal(&[1, cfg.in_channels, 2, 2, 2], 21, 0.23),
+        cfg.patch_size,
+        &KeyframeNoise::Seeded,
+        0,
+    )
+    .unwrap();
+    let video_layout = ref2va_layout_with_audio_channels(
+        geometry,
+        &[TEXT_TAG],
+        &[video_geometry],
+        &[0],
+        cfg.patch_size,
+    )
+    .unwrap();
+    let video_out_a = causal_generated_forward(
+        json,
+        cfg,
+        video_layout.clone(),
+        &context_a,
+        Some(&video_a),
+        None,
+        None,
+    );
+    let video_out_b = causal_generated_forward(
+        json,
+        cfg,
+        video_layout,
+        &context_a,
+        Some(&video_b),
+        None,
+        None,
+    );
+    assert_generated_cause("reference_video_only_values", &video_out_a, &video_out_b);
+    // Isolated audio CONDITIONING_ROWS is supported by packing/DiT, not by the public Generator:
+    // Ref2VaReferences::new explicitly requires a visual reference alongside standalone audio.
+    let audio_geometry = ReferenceLatentGeometry {
+        kind: ReferenceKind::Audio,
+        num_latent_frames: 0,
+        latent_height: 0,
+        latent_width: 0,
+        num_audio_latents: 3,
+    };
+    let audio_a =
+        reference_audio_rows(&causal_signal(&[1, 3, cfg.audio_in_channels], 2, 0.14)).unwrap();
+    let audio_b =
+        reference_audio_rows(&causal_signal(&[1, 3, cfg.audio_in_channels], 23, 0.27)).unwrap();
+    let audio_layout = ref2va_layout_with_audio_channels(
+        geometry,
+        &[TEXT_TAG],
+        &[audio_geometry],
+        &[1],
+        cfg.patch_size,
+    )
+    .unwrap();
+    let audio_out_a = causal_generated_forward(
+        json,
+        cfg,
+        audio_layout.clone(),
+        &context_a,
+        None,
+        Some(&audio_a),
+        None,
+    );
+    let audio_out_b = causal_generated_forward(
+        json,
+        cfg,
+        audio_layout,
+        &context_a,
+        None,
+        Some(&audio_b),
+        None,
+    );
+    assert_generated_cause(
+        "reference_audio_only_CONDITIONING_ROWS",
+        &audio_out_a,
+        &audio_out_b,
+    );
+    let valid_audio_layout = ref2va_layout_with_audio_channels(
+        geometry,
+        &[TEXT_TAG],
+        &[image, audio_geometry],
+        &[0, 1],
+        cfg.patch_size,
+    )
+    .unwrap();
+    let valid_audio_a = causal_generated_forward(
+        json,
+        cfg,
+        valid_audio_layout.clone(),
+        &context_a,
+        Some(&visual_a),
+        Some(&audio_a),
+        None,
+    );
+    let valid_audio_b = causal_generated_forward(
+        json,
+        cfg,
+        valid_audio_layout,
+        &context_a,
+        Some(&visual_a),
+        Some(&audio_b),
+        None,
+    );
+    assert_generated_cause(
+        "reference_audio_values_visual_fixed",
+        &valid_audio_a,
+        &valid_audio_b,
+    );
+    // Post-encoder zero controls keep EVERY layout/position/count fixed. These are deliberate
+    // conditioning-drop mutations at the DiT seam, not a bypass of media degeneracy validation.
+    let run_reference = |refs: &[ReferenceLatentGeometry],
+                         channels: &[i32],
+                         visual: Option<&Array>,
+                         sound: Option<&Array>| {
+        let layout = ref2va_layout_with_audio_channels(
+            geometry,
+            &[TEXT_TAG],
+            refs,
+            channels,
+            cfg.patch_size,
+        )
+        .unwrap();
+        causal_generated_forward(json, cfg, layout, &context_a, visual, sound, None)
+    };
+    let zero_video = causal_signal(&[1, 8, cfg.video_patch_dim()], 0, 0.);
+    let zero_audio = causal_signal(&[1, 3, cfg.audio_in_channels], 0, 0.);
+    assert_generated_cause(
+        "reference_image_drop_same_layout",
+        &ref_a,
+        &run_reference(&[image], &[0], Some(&zero_visual), None),
+    );
+    assert_generated_cause(
+        "reference_video_drop_same_layout",
+        &video_out_a,
+        &run_reference(&[video_geometry], &[0], Some(&zero_video), None),
+    );
+    assert_generated_cause(
+        "reference_audio_only_drop_same_layout_CONDITIONING_ROWS",
+        &audio_out_a,
+        &run_reference(&[audio_geometry], &[1], None, Some(&zero_audio)),
+    );
+    // Same geometry per carrier on each side: only its encoded VALUES are reassigned to the
+    // advancing reference clock. Dropping or sorting the ordered values makes these A/B equal.
+    let videos_ab = mlx_rs::ops::concatenate_axis(&[&video_a, &video_b], 1).unwrap();
+    let videos_ba = mlx_rs::ops::concatenate_axis(&[&video_b, &video_a], 1).unwrap();
+    let ordered_videos_a = run_reference(
+        &[video_geometry, video_geometry],
+        &[0, 0],
+        Some(&videos_ab),
+        None,
+    );
+    let ordered_videos_b = run_reference(
+        &[video_geometry, video_geometry],
+        &[0, 0],
+        Some(&videos_ba),
+        None,
+    );
+    assert_generated_cause(
+        "ordered_video_references_AB_vs_BA",
+        &ordered_videos_a,
+        &ordered_videos_b,
+    );
+    let audios_ab = mlx_rs::ops::concatenate_axis(&[&audio_a, &audio_b], 1).unwrap();
+    let audios_ba = mlx_rs::ops::concatenate_axis(&[&audio_b, &audio_a], 1).unwrap();
+    let ordered_audios_a = run_reference(
+        &[image, audio_geometry, audio_geometry],
+        &[0, 1, 1],
+        Some(&visual_a),
+        Some(&audios_ab),
+    );
+    let ordered_audios_b = run_reference(
+        &[image, audio_geometry, audio_geometry],
+        &[0, 1, 1],
+        Some(&visual_a),
+        Some(&audios_ba),
+    );
+    assert_generated_cause(
+        "ordered_audio_references_AB_vs_BA_visual_fixed",
+        &ordered_audios_a,
+        &ordered_audios_b,
+    );
+    // A mixed list has one image, one video carrying its own stereo soundtrack and one mono
+    // standalone audio reference. Reverse BOTH descriptor order and the corresponding modality
+    // streams, never geometry alone. All generated target/context values remain unchanged.
+    let video_with_soundtrack = ReferenceLatentGeometry {
+        num_audio_latents: 5,
+        ..video_geometry
+    };
+    let soundtrack =
+        reference_audio_rows(&causal_signal(&[2, 5, cfg.audio_in_channels], 7, 0.18)).unwrap();
+    let zero_soundtrack = causal_signal(&[1, 10, cfg.audio_in_channels], 0, 0.);
+    let mixed_video = mlx_rs::ops::concatenate_axis(&[&visual_a, &video_a], 1).unwrap();
+    let mixed_audio = mlx_rs::ops::concatenate_axis(&[&soundtrack, &audio_a], 1).unwrap();
+    let mixed = run_reference(
+        &[image, video_with_soundtrack, audio_geometry],
+        &[0, 2, 1],
+        Some(&mixed_video),
+        Some(&mixed_audio),
+    );
+    let reversed_video = mlx_rs::ops::concatenate_axis(&[&video_a, &visual_a], 1).unwrap();
+    let reversed_audio = mlx_rs::ops::concatenate_axis(&[&audio_a, &soundtrack], 1).unwrap();
+    let reversed_mixed = run_reference(
+        &[audio_geometry, video_with_soundtrack, image],
+        &[1, 2, 0],
+        Some(&reversed_video),
+        Some(&reversed_audio),
+    );
+    assert_generated_cause(
+        "mixed_image_video_soundtrack_audio_reference_order",
+        &mixed,
+        &reversed_mixed,
+    );
+    let no_image = mlx_rs::ops::concatenate_axis(&[&zero_visual, &video_a], 1).unwrap();
+    assert_generated_cause(
+        "mixed_image_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&no_image),
+            Some(&mixed_audio),
+        ),
+    );
+    let no_video = mlx_rs::ops::concatenate_axis(&[&visual_a, &zero_video], 1).unwrap();
+    let no_soundtrack = mlx_rs::ops::concatenate_axis(&[&zero_soundtrack, &audio_a], 1).unwrap();
+    assert_generated_cause(
+        "mixed_video_carrier_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&no_video),
+            Some(&no_soundtrack),
+        ),
+    );
+    let no_standalone = mlx_rs::ops::concatenate_axis(&[&soundtrack, &zero_audio], 1).unwrap();
+    assert_generated_cause(
+        "mixed_standalone_audio_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&mixed_video),
+            Some(&no_standalone),
+        ),
+    );
+    assert_generated_cause(
+        "mixed_video_soundtrack_drop_same_layout",
+        &mixed,
+        &run_reference(
+            &[image, video_with_soundtrack, audio_geometry],
+            &[0, 2, 1],
+            Some(&mixed_video),
+            Some(&no_soundtrack),
+        ),
+    );
+    // A numeric route control holds conditioning/layout FIXED and loads the actual selected
+    // partition directories. A route-collapse mutation now makes the A/B equal, not just miscounts.
+    let dir = tempfile::tempdir().unwrap();
+    for task in [MiniMaxH3Task::Fl2va, MiniMaxH3Task::Ref2va] {
+        let root = dir.path().join(task.partition());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("config.json"), json["config"].to_string()).unwrap();
+        let mut map = full_pruned_map(json, 0.);
+        if task == MiniMaxH3Task::Ref2va {
+            let bias = map["proj_out.bias"].clone();
+            map.insert(
+                "proj_out.bias".into(),
+                mlx_rs::ops::add(&bias, causal_signal(&[cfg.video_patch_dim()], 11, 0.4)).unwrap(),
+            );
+        }
+        let entries: Vec<(&str, &Array)> = map
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        let metadata = HashMap::new();
+        Array::save_safetensors(entries, Some(&metadata), root.join("model.safetensors")).unwrap();
+    }
+    let run_portion = |portion: &str| {
+        let path = dir.path().join(portion);
+        let source = Weights::from_dir(&path).unwrap();
+        let actual_bias = source
+            .require("proj_out.bias")
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        actual_bias.eval().unwrap();
+        let expected_map = full_pruned_map(json, 0.);
+        let expected_bias = if portion == "transformer_ref" {
+            mlx_rs::ops::add(
+                &expected_map["proj_out.bias"],
+                causal_signal(&[cfg.video_patch_dim()], 11, 0.4),
+            )
+            .unwrap()
+        } else {
+            expected_map["proj_out.bias"].clone()
+        };
+        expected_bias.eval().unwrap();
+        assert_eq!(
+            actual_bias.as_slice::<f32>(),
+            expected_bias.as_slice::<f32>(),
+            "loaded portion must retain its own parameter identity"
+        );
+        let model = MiniMaxH3Dit::load_dir(&path, Dtype::Float32).unwrap();
+        causal_generated_forward(
+            json,
+            cfg,
+            fl2va_layout(
+                geometry,
+                &[TEXT_TAG],
+                &[KeyframeAnchor::First],
+                cfg.patch_size,
+            )
+            .unwrap(),
+            &context_a,
+            Some(&visual_a),
+            None,
+            Some(model),
+        )
+    };
+    let expected_fl = run_portion("transformer");
+    let expected_ref = run_portion("transformer_ref");
+    let run_task = |keyframes, references, expected_portion: &str| {
+        let task = MiniMaxH3Task::resolve(keyframes, references).unwrap();
+        assert_eq!(
+            dir.path().join(task.partition()),
+            dir.path().join(expected_portion)
+        );
+        run_portion(task.partition())
+    };
+    let selected_fl = run_task(true, false, "transformer");
+    let selected_ref = run_task(false, true, "transformer_ref");
+    assert_eq!(
+        selected_fl, expected_fl,
+        "hybrid-checkpoint FL task must match explicit FL portion baseline"
+    );
+    assert_eq!(
+        selected_ref, expected_ref,
+        "hybrid-checkpoint Ref task must match explicit Ref portion baseline"
+    );
+    assert_generated_cause(
+        "hybrid_checkpoint_FL_portion_vs_wrong_REF_portion",
+        &selected_fl,
+        &expected_ref,
+    );
+    assert_generated_cause(
+        "hybrid_checkpoint_REF_portion_vs_wrong_FL_portion",
+        &selected_ref,
+        &expected_fl,
+    );
+    println!("H3_CONDITIONING_CAUSAL_BOUNDARY backend=metal hybrid_checkpoint=two_distinct_portions selected_by=native_task_partition audio_only_generator=refused prompt_seam=context_embedding");
 }
