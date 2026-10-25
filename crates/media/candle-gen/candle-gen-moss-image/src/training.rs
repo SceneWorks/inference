@@ -195,12 +195,17 @@ impl MossImageTrainer {
         } else {
             available
         };
+        contract::recovery::admit_conditioning_preprocess(
+            req,
+            host_budget,
+            self.facts.host_metadata_bytes,
+        )?;
         let plan = contract::recovery::DataPlan::from_request_budget(req, host_budget)?;
         let mut shape = admission::EstimateRequest::from_request(req)
             .map_err(admission_error)?
             .with_plan(req, &plan)
             .map_err(admission_error)?;
-        shape.context_tokens = text_encoder::token_bound(&self.sources, req)?;
+        shape.context_tokens = text_encoder::token_bound(&self.sources, req, host_budget)?;
         #[cfg(feature = "test-support")]
         let evaluation = self
             .test_probe
@@ -209,7 +214,8 @@ impl MossImageTrainer {
             .transpose()?;
         #[cfg(feature = "test-support")]
         if let Some(evaluation) = &evaluation {
-            let tokens = text_encoder::token_bound(&self.sources, &evaluation.request)?;
+            let tokens =
+                text_encoder::token_bound(&self.sources, &evaluation.request, host_budget)?;
             let geometry = &evaluation.plan.entries[0];
             shape.context_tokens = shape.context_tokens.max(tokens);
             shape.evaluation_context_tokens = tokens;

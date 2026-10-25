@@ -1538,6 +1538,12 @@ pub fn validate_training_techniques(
             "training memory cap must be positive; None means no caller cap".into(),
         ));
     }
+    if cfg.memory_limit_bytes.is_some() && desc.family != "moss_image" {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: training memory byte cap is not routed by this trainer",
+            desc.id
+        )));
+    }
     for (name, value) in [
         ("weight_noise_sigma", cfg.weight_noise_sigma),
         ("gradient_noise_eta", cfg.gradient_noise_eta),
@@ -3130,6 +3136,33 @@ mod tests {
             let err = validate_training_techniques(&desc, &r).unwrap_err();
             assert!(matches!(err, crate::Error::Msg(_)), "{bg}/{subj}: {err:?}");
         }
+    }
+
+    #[test]
+    fn sd3_refuses_unimplemented_caller_byte_cap_before_preflight() {
+        let mut desc = trainer_desc(false);
+        desc.family = "sd3";
+        let mut req = TrainingRequest {
+            items: vec![],
+            output_dir: PathBuf::from("unused"),
+            file_name: "unused".into(),
+            trigger_words: vec![],
+            config: TrainingConfig::default(),
+            cancel: crate::CancelFlag::new(),
+        };
+        validate_training_techniques(&desc, &req).unwrap();
+        for bytes in [1, u64::MAX] {
+            req.config.memory_limit_bytes = Some(bytes);
+            assert!(matches!(validate_training_techniques(&desc, &req),
+                Err(crate::Error::Unsupported(message)) if message.contains("byte cap is not routed")));
+        }
+        req.config.memory_limit_bytes = None;
+        req.config.memory_limit_fraction = Some(0.5);
+        assert!(matches!(validate_training_techniques(&desc, &req),
+            Err(crate::Error::Unsupported(message)) if message.contains("memory fraction is not routed")));
+        desc.family = "moss_image";
+        req.config.memory_limit_bytes = Some(1);
+        validate_training_techniques(&desc, &req).unwrap();
     }
 
     fn trainer_desc(supports_control: bool) -> TrainerDescriptor {

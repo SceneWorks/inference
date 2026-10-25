@@ -113,48 +113,27 @@ def verify_output(output: str, expected_uuid: str | None = None) -> None:
 
 
 class PosixOwner:
-    """A new process group; used by the unit tests and any non-Windows host."""
+    """Use the same session + birth-token containment as the native fixture owner."""
 
     def spawn(self, argv: list[str], env: dict[str, str], stdout, stderr) -> subprocess.Popen:
-        self.child = subprocess.Popen(
-            argv, cwd=REPO_ROOT, env=env, stdout=stdout, stderr=stderr, start_new_session=True
-        )
+        # Lazy import avoids the helper's supervise import cycle. Never a second owner.
+        from scripts.ci.moss_fixture_cpu import CpuOwner
+        self.owner = CpuOwner()
+        self.child = self.owner.spawn(argv, env, stdout, stderr)
         self.pgid = self.child.pid
         return self.child
 
     def footprint(self) -> int:
-        table = subprocess.run(
-            ["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True, encoding="utf-8", check=True, timeout=10
-        ).stdout
-        total = 0
-        for row in table.splitlines():
-            fields = row.split()
-            if len(fields) == 2 and fields[0] == str(self.pgid):
-                total += int(fields[1]) * 1024
-        return total
+        return self.owner.footprint()
 
     def alive(self) -> bool:
-        try:
-            os.killpg(self.pgid, 0)
-        except ProcessLookupError:
-            return False
-        return True
+        return bool(self.owner.collect())
 
     def terminate(self, grace: float, sleep: Callable[[float], None] = time.sleep) -> None:
-        """Kill only this group, reap the root, then require the group to be empty."""
-        try:
-            os.killpg(self.pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        self.child.wait(timeout=grace)
-        for _ in range(int(grace / 0.01)):
-            if not self.alive():
-                return
-            sleep(0.01)
-        raise UnitFailure("owned process group still has live processes after termination")
+        self.owner.terminate(grace, sleep)
 
     def close(self) -> None:
-        pass
+        self.owner.close()
 
 
 class WindowsOwner:
