@@ -157,7 +157,7 @@ on:
         default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: ["", model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
+        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -345,11 +345,12 @@ permissions:
 # rw-starvector is runner 2310 / Michaels-MacBook-Pro, physically distinct from
 # secondary Mac runner 5281 and Windows CUDA runner 2313. Its constant group
 # serializes primary Qwen dispatches without holding the other hosts' shared lock.
+# Explicit synthetic proofs also retain each run/attempt queue entry.
 # Every other event, profile and runner retains the shared physical-host group.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' &&
-        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures') &&
+        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures' || inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both' || inputs.profile == 'moss-edit-cuda' || inputs.profile == 'moss-edit-metal') &&
         format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) ||
         github.event_name == 'workflow_dispatch' &&
         inputs.profile == 'qwen-image-2-1-lora-mlx' &&
@@ -1153,22 +1154,7 @@ jobs:
         env:
           SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance
           REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
-        run: |
-          if [[ ! "$REQUESTED_SCENEWORKS_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "sceneworks_revision must be an exact lowercase commit SHA" >&2
-            exit 1
-          fi
-          git init "$SCENEWORKS_PROVENANCE_ROOT"
-          git -C "$SCENEWORKS_PROVENANCE_ROOT" remote add origin https://github.com/SceneWorks/SceneWorks.git
-          git -C "$SCENEWORKS_PROVENANCE_ROOT" fetch --depth=1 -- origin "$REQUESTED_SCENEWORKS_REVISION"
-          git -C "$SCENEWORKS_PROVENANCE_ROOT" checkout --detach FETCH_HEAD
-          resolved="$(git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD)"
-          if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ || "$resolved" != "$REQUESTED_SCENEWORKS_REVISION" ]]; then
-            echo "sceneworks_revision did not resolve to the exact requested commit" >&2
-            exit 1
-          fi
-          test -z "$(git -C "$SCENEWORKS_PROVENANCE_ROOT" status --porcelain --untracked-files=normal)"
-          echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"
+        run: source scripts/ci/real-weights/mlx-memory-evidence-v1/resolve-and-bind-exact-sceneworks-provenance-outside-the-inference-worktree.sh
       - name: Toolchain versions
         run: rustc --version && cargo --version && python3.12 --version
       # Report-only: what this box had free, and which of these snapshots it already holds,
@@ -4100,114 +4086,7 @@ jobs:
         # the baseline again. Sample continuously for the whole render instead, which is the pattern
         # `same-l-cuda`'s `Invoke-SameLProbe` already uses in this file. The release build is done
         # first with `--no-run` so the sampled window contains the render and nothing else.
-        run: |
-          cmd /c "call `"$env:VCVARS`" && set" |
-            ForEach-Object {
-              if ($_ -match "^(.*?)=(.*)$") { Set-Item -Force "env:$($matches[1])" $matches[2] }
-            }
-          $env:SA3_MEDIUM_LONG_SECONDS = "120,300,380"
-          $env:SA3_MEDIUM_LONG_WAV_DIR = $env:RUNNER_TEMP
-          cargo test --locked --release --no-run -p candle-audio-stable-audio-3 --features cuda `
-            --test provider
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $stdout = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stdout"
-          $stderr = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stderr"
-          $stop = Join-Path $env:RUNNER_TEMP "sa3-medium-long-form.stop"
-          Remove-Item $stop -ErrorAction SilentlyContinue
-          $arguments = @(
-            "test", "--locked", "--release",
-            "-p", "candle-audio-stable-audio-3", "--features", "cuda",
-            "--test", "provider", "medium_long_form_renders_are_exact_and_timed",
-            "--", "--ignored", "--nocapture"
-          )
-          # Resolve an absolute path in the parent scope and hand it to the job. `Start-Job` runs the
-          # scriptblock in a separate runspace that resolves commands from its own `PATH`, which is
-          # not guaranteed to be the one the vcvars import above installed into this scope; a bare
-          # `nvidia-smi` inside the job would surface as a CommandNotFound terminating error rather
-          # than a measurement. The bare form does in fact work on this runner today — run
-          # 30196371019's `SAME-L real weights (CUDA)` job logged
-          # `SA3_SAME_L_CUDA_MEMORY case=literal-380s baseline_total_mib=12252 peak_total_mib=28069`
-          # from the identical `Invoke-SameLProbe` sampler, which is proof the job runspace both
-          # resolved the tool and observed a real in-render peak. This binds it explicitly anyway so
-          # the failure mode is a named throw in the parent rather than a dead sampler, and so the
-          # resolved path is in the log. `Invoke-SameLProbe` above is deliberately left as-is: it is
-          # already green in a recorded run and this PR does not re-open it.
-          $nvidiaSmi = (Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1)
-          if (-not $nvidiaSmi) {
-            throw "nvidia-smi is not resolvable on PATH; cannot measure peak CUDA allocation"
-          }
-          $nvidiaSmiPath = $nvidiaSmi.Source
-          Write-Host "nvidia-smi resolved to $nvidiaSmiPath"
-          $baselineOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
-          if ($LASTEXITCODE -ne 0) {
-            throw "nvidia-smi baseline query failed with exit code $LASTEXITCODE"
-          }
-          $baselineMiB = 0
-          $baselineText = [string]($baselineOutput | Select-Object -First 1)
-          if (-not [int]::TryParse($baselineText.Trim(), [ref]$baselineMiB)) {
-            throw "nvidia-smi baseline query returned an invalid value: '$baselineText'"
-          }
-          $sampler = Start-Job -ArgumentList $nvidiaSmiPath, $stop, $baselineMiB -ScriptBlock {
-            param([string]$nvidiaSmiPath, [string]$stopPath, [int]$peakMiB)
-            while (-not (Test-Path $stopPath)) {
-              $sampleOutput = @(& $nvidiaSmiPath --query-gpu=memory.used --format=csv,noheader,nounits)
-              if ($LASTEXITCODE -ne 0) {
-                throw "nvidia-smi sampler query failed with exit code $LASTEXITCODE"
-              }
-              $usedMiB = 0
-              $sampleText = [string]($sampleOutput | Select-Object -First 1)
-              if (-not [int]::TryParse($sampleText.Trim(), [ref]$usedMiB)) {
-                throw "nvidia-smi sampler query returned an invalid value: '$sampleText'"
-              }
-              $peakMiB = [Math]::Max($peakMiB, $usedMiB)
-              Start-Sleep -Milliseconds 250
-            }
-            $peakMiB
-          }
-          try {
-            $process = Start-Process cargo -ArgumentList $arguments -Wait -PassThru `
-              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          } finally {
-            New-Item $stop -ItemType File -Force | Out-Null
-          }
-          Wait-Job $sampler | Out-Null
-          $samplerState = $sampler.State
-          try {
-            $samplerOutput = @(Receive-Job $sampler -ErrorAction Stop)
-          } finally {
-            Remove-Job $sampler -Force
-          }
-          if ($samplerState -ne "Completed") {
-            throw "nvidia-smi sampler job ended in state $samplerState"
-          }
-          if ($samplerOutput.Count -ne 1) {
-            throw "nvidia-smi sampler returned $($samplerOutput.Count) values; expected one"
-          }
-          $peakMiB = 0
-          if (-not [int]::TryParse(([string]$samplerOutput[0]).Trim(), [ref]$peakMiB)) {
-            throw "nvidia-smi sampler returned an invalid peak: '$($samplerOutput[0])'"
-          }
-          Get-Content $stdout
-          Get-Content $stderr
-          Write-Host "SA3_MEDIUM_CUDA_MEMORY baseline_total_mib=$baselineMiB peak_total_mib=$peakMiB peak_delta_mib=$($peakMiB - $baselineMiB)"
-          if ($process.ExitCode -ne 0) {
-            throw "medium long-form render failed with exit code $($process.ExitCode)"
-          }
-          # The sampler seeds its running peak with the baseline, so a sampler that observed nothing
-          # still returns the baseline and reports peak_delta_mib=0 — indistinguishable from "the
-          # render allocated no VRAM". A real medium render allocates gigabytes, so a zero delta
-          # means the probe is broken, not that the render was free.
-          if ($peakMiB -le $baselineMiB) {
-            throw ("nvidia-smi sampler observed no allocation above the $baselineMiB MiB baseline " +
-              "(peak $peakMiB MiB); the peak probe measured nothing")
-          }
-          foreach ($seconds in 120, 300, 380) {
-            Get-FileHash -Algorithm SHA256 (Join-Path $env:RUNNER_TEMP "sa3-medium-${seconds}s.wav")
-          }
-          # Start-Process does not update LASTEXITCODE, and the vcvars bootstrap above can leave a
-          # stale non-zero value that GitHub's PowerShell wrapper would propagate.
-          exit 0
+        run: . ./scripts/ci/real-weights/sa3-medium-cuda/measure-the-long-form-renders-and-peak-cuda-allocation.ps1
       - name: Render a real 30-second eight-step medium CUDA WAV
         shell: powershell
         run: . ./scripts/ci/real-weights/sa3-medium-cuda/render-a-real-30-second-eight-step-medium-cuda-wav.ps1
@@ -4267,32 +4146,13 @@ jobs:
           cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test base_guidance -- --ignored --nocapture || exit /b 1
       - name: Certify the explicit-negative conditioning path itself
         shell: cmd
-        run: |
-          call "%VCVARS%"
-          rem `base_guidance`'s divergence assertion proves the negative prompt reaches the model,
-          rem not that the batch-2 path is wired correctly. This case is the only one that separates
-          rem absent negative conditioning — which zeroes the whole cross context — from an explicit
-          rem all-invalid negative prompt, which keeps its conditioned duration row. It ran in no
-          rem lane before sc-14546. Named rather than `--test dit_oracle -- --ignored`: the other
-          rem ignored cases need all six snapshots on CPU or an explicit SA3_DIT_CASE_ENV selection,
-          rem and wiring the rest of `dit_oracle` is sc-15235.
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test dit_oracle real_weights_detect_conditioning_mutations_and_exercise_cfg_apg -- --ignored --nocapture || exit /b 1
+        run: call scripts\ci\real-weights\sa3-base-identity-cuda\certify-the-explicit-negative-conditioning-path-itself.cmd
       - name: Prove the audio-to-audio restyle path on all six checkpoints
         shell: cmd
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\prove-the-audio-to-audio-restyle-path-on-all-six-checkpoints.cmd
       - name: Prove inpaint, repaint and extend on all six checkpoints
         shell: cmd
-        run: |
-          call "%VCVARS%"
-          rem sc-14548. This job and its Metal twin are the only lanes provisioning all six
-          rem snapshots. All four ignored cases run: exact outside-region preservation plus a
-          rem measured interior divergence (preservation alone passes for a no-op), Repaint/Inpaint
-          rem byte equality, the pinned 10s -> 18s extend with an exact prefix and a seam bound
-          rem derived from the material, and the draw order — which only medium/medium-base can
-          rem falsify, since SAME-S consumes zero draws on encode. This is also the only lane that
-          rem reaches the three weights-only edit sites named in
-          rem docs/migration/SC_14548_AUDIO_EDIT_INPAINT.md.
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test audio_edit -- --ignored --nocapture || exit /b 1
+        run: call scripts\ci\real-weights\sa3-base-identity-cuda\prove-inpaint-repaint-and-extend-on-all-six-checkpoints.cmd
       - name: Prove the load-time adapter fold on all six checkpoints
         shell: cmd
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\prove-the-load-time-adapter-fold-on-all-six-checkpoints.cmd
@@ -4487,35 +4347,7 @@ jobs:
           cargo test --locked --release --no-run -p candle-gen-scail2 --features cuda || exit /b 1
       - name: Load through the production provider, minimally render, and measure the shared package
         shell: bash
-        run: |
-          set -o pipefail
-          evidence_log="$(cygpath -u "$RUNNER_TEMP")/scail2-shared-cuda.log"
-          export PATH="$(cygpath -u "$CUDA_PATH")/bin:$PATH"
-          profile_gpu="${CUDA_VISIBLE_DEVICES%%,*}"
-          profile_gpu="${profile_gpu:-0}"
-          [[ "$profile_gpu" =~ ^[0-9]+$ ]] || {
-            echo "CUDA_VISIBLE_DEVICES must start with a physical GPU ordinal, got ${CUDA_VISIBLE_DEVICES:-<unset>}" >&2
-            exit 1
-          }
-          {
-            echo "[[CUDA_IDLE_RAW]] profileGpu=$profile_gpu visibleDevices=${CUDA_VISIBLE_DEVICES:-<unset>}"
-            nvidia-smi -i "$profile_gpu" \
-              --query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total \
-              --format=csv,noheader
-            for _ in 1 2 3 4 5 6; do
-              nvidia-smi -i "$profile_gpu" --query-gpu=index,memory.used \
-                --format=csv,noheader,nounits
-              sleep 0.2
-            done
-            nvidia-smi pmon -i "$profile_gpu" -c 1 -s um
-          } 2>&1 | tee -a "$evidence_log"
-          cargo test --locked --release -p candle-gen-scail2 --features cuda \
-            pipeline::tests::shared_bf16_real_weights_cuda_loads_and_renders_with_measured_peak \
-            -- --ignored --exact --nocapture 2>&1 | tee -a "$evidence_log"
-          grep -Fq '[[SCAIL2_CUDA_VRAM]]' "$evidence_log" || {
-            echo 'the real-weight test passed without emitting its machine-readable VRAM record' >&2
-            exit 1
-          }
+        run: source scripts/ci/real-weights/candle-scail2-shared/load-through-the-production-provider-minimally-render-and-measure-the-shared-package.sh
       - name: Upload exact SCAIL CUDA evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -4723,14 +4555,7 @@ jobs:
         run: call scripts\ci\real-weights\candle-mmaudio\materialize-and-verify-immutable-snapshots.cmd
       - name: Run mmaudio real-weight renders
         shell: cmd
-        run: |
-          call "%VCVARS%"
-          rem Standalone encoder conformance (sc-13474): the Synchformer sync encoder and the DFN5B-CLIP
-          rem visual+text tower — the two component encoders the video->audio pipeline below composes.
-          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test clip_conformance -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio -- --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-audio-mmaudio --features cuda --release --test conformance_video_to_audio_44k -- --ignored --nocapture || exit /b 1
+        run: call scripts\ci\real-weights\candle-mmaudio\run-mmaudio-real-weight-renders.cmd
       # Standalone component conformance (sc-17266). These three binaries were never invoked by any
       # lane, so the MM-DiT flow/sampler and both decoder stages had ZERO automated coverage even
       # though the manifest declared and pinned their checkpoints.
@@ -4934,45 +4759,14 @@ jobs:
           nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv
       - name: Materialize and verify immutable snapshot
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
-          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
-          rem MiniMaxAI/MiniMax-H3 is a ~196 GB repo; the `minimax-h3` row carries a `download_files`
-          rem allow-list so only the 11.638 GB the tests below read is fetched.
-          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3 --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
-          rem sc-19558 — the DiT component, on its OWN key so the shared row above stays 11.640 GB
-          rem for every lane that does not read it. 132.6 GB for both partitions on a cold box;
-          rem sc-18677 provisioned the full upstream snapshot on THIS runner, so here it verifies
-          rem rather than fetches. It is what makes the two DiT header gates below reachable at all —
-          rem they read headers only, and were unreachable purely because the bytes were in no row.
-          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-dit --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+        run: call scripts\ci\real-weights\candle-minimax-h3\materialize-and-verify-immutable-snapshot.cmd
       # Name-selected with `--exact` AFTER the `--` plus a run-count assertion, for the reasons the
       # `candle-mmaudio` job above spells out: `--exact` before the `--` is rejected by cargo and the
       # rejection is reported as exit 0, and without the count a rename yields "0 passed; N filtered
       # out" and still exits 0.
       - name: Run MiniMax-H3 header and config gates
         shell: cmd
-        run: |
-          call "%VCVARS%"
-          call :run_one declared_tensor_names_match_the_published_checkpoint || exit /b 1
-          call :run_one declared_encoder_shapes_match_the_published_checkpoint || exit /b 1
-          call :run_one declared_audio_tensor_names_match_the_published_checkpoint || exit /b 1
-          call :run_one published_audio_configs_reproduce_the_declared_geometry || exit /b 1
-          call :run_one stored_kaiser_filters_match_the_derivation_on_real_weights || exit /b 1
-          rem sc-19558 — the two DiT header gates. Header-only and device-free, so they cost the
-          rem materialize step above and nothing else; they were listed as NOT COVERED for exactly
-          rem one reason, that `transformer/` was in no row, and `minimax-h3-dit` is that row.
-          call :run_one declared_dit_tensor_names_match_the_published_checkpoint || exit /b 1
-          call :run_one the_adaln_projections_are_the_documented_twenty_six_gigabytes || exit /b 1
-          exit /b 0
-
-          :run_one
-          set "log=%RUNNER_TEMP%\minimax-h3-%~1.log"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
-          type "%log%"
-          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
-          exit /b 0
-
+        run: call scripts\ci\real-weights\candle-minimax-h3\run-minimax-h3-header-and-config-gates.cmd
       # sc-19414 — the f32 decodes, wired on the VRAM measurement recorded in this job's header.
       # A SEPARATE step from the header gates above, for two reasons: a decode failure then reads as
       # a decode failure rather than as one entry in a list of eight, and an operator gets the five
@@ -5589,6 +5383,7 @@ jobs:
   # render. One `cargo test` per name with `--exact` and a run-count assertion. `timeout-minutes: 90`
   # is a runaway guard for a cold `--release --features cuda` build plus a one-time ~1.75 GB fetch.
   candle-supra2:
+    needs: validate-selection
     name: Candle Supra2-IMG real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'supra2'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -5673,6 +5468,7 @@ jobs:
   # One invocation per name with `--exact` and a run-count assertion. Run-scoped CARGO_TARGET_DIR,
   # release profile unstripped (rust-lang/rust#157750).
   mlx-supra2:
+    needs: validate-selection
     name: MLX Supra2-IMG real weights (Metal)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'supra2'
     runs-on: [self-hosted, macOS, ARM64, rw-llm]
@@ -6344,6 +6140,7 @@ jobs:
   # JSON record and every case log go in the evidence artifact. Run-scoped CARGO_TARGET_DIR,
   # build-override profile unstripped (rust-lang/rust#157750).
   mlx-flux3-klein:
+    needs: validate-selection
     name: MLX FLUX 3 Image Klein distilled text-to-image (real weights)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-mlx'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
@@ -6405,6 +6202,7 @@ jobs:
   # true` on the manifest row). The PNG, its JSON record (with the report-only `nvidia-smi` VRAM
   # peak) and every case log go in the evidence artifact.
   candle-flux3-klein:
+    needs: validate-selection
     name: Candle FLUX 3 Image Klein distilled text-to-image (real weights, CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-cuda'
     runs-on: [self-hosted, windows, cuda, real-weights]
@@ -6857,3 +6655,354 @@ jobs:
           name: model-proof-${{ github.sha }}-${{ needs.model-proof-plan.outputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MODEL_PROOF_EVIDENCE }}
           if-no-files-found: error
+
+  # Explicit synthetic model validations, relocated from CI; no schedule/all/automatic route.
+  h3-pruned-hosted-metal:
+    name: H3 precise pruned projection (hosted Metal, manual)
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-both')
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: line-tables-only
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          cmake --version
+      - name: Ensure Metal compiler
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version || true
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup component add clippy
+      - name: Fetch prebuilt MLX (sc-21382)
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Check H3 precise pruned projection on hosted Metal (manual)
+        run: source scripts/ci/real-weights/h3-pruned-hosted-metal/check-h3-precise-pruned-projection-on-hosted-metal-manual.sh
+
+  synthetic-w4a8-mlx:
+    name: Synthetic H3 native suites (MLX/Metal, manual)
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-both')
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      MACOSX_DEPLOYMENT_TARGET: "26.2"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Record source revision
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "W4A8 MLX checked out \`$actual\` (dispatch ref \`${{ github.ref }}\`, sha \`${{ github.sha }}\`)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "${{ github.sha }}"
+      - name: Toolchain and platform versions
+        run: |
+          sw_vers
+          xcrun metal --version
+          rustc --version
+          cargo --version
+      - name: Fetch prebuilt MLX (sc-21382)
+        # Same contract as the `macos-nax` step of this name.
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      # No `save-if: main`: this lane is manual and never runs on `main`. `cache-bin: "false"` is
+      # mandatory on the persistent Mac for the rust-cache/rustup reason documented on `macos-nax`.
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Prove W4A8 native arithmetic against the external fixture
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-w4a8-native-arithmetic-against-the-external-fixture.sh
+      - name: Prove H3 AdaLN cache complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-adaln-cache-complete-model-on-metal.sh
+      - name: Prove H3 AdaLN eviction memory release on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-adaln-eviction-memory-release-on-metal.sh
+      - name: Prove H3 adapter topology complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-adapter-topology-complete-model-on-metal.sh
+      - name: Prove H3 windowed block window complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-windowed-block-window-complete-model-on-metal.sh
+      - name: Prove H3 bounded attention complete block stack on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-bounded-attention-complete-block-stack-on-metal.sh
+      - name: Prove H3 DiT I/O complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-dit-i-o-complete-model-on-metal.sh
+      - name: Prove H3 pruned AdaLN complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-pruned-adaln-complete-model-on-metal.sh
+      - name: Prove H3 turbo adapter fold complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-turbo-adapter-fold-complete-model-on-metal.sh
+      - name: Prove H3 VEDA fixture complete model on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-veda-fixture-complete-model-on-metal.sh
+      - name: Prove H3 full DitBlock model-block parity on Metal
+        env:
+          HF_HOME: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
+          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
+          HF_HUB_OFFLINE: "1"
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-full-ditblock-model-block-parity-on-metal.sh
+
+  synthetic-w4a8-cuda:
+    name: Synthetic H3 native suites (CUDA, manual)
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both')
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
+      # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
+      # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
+      # the registry/git/target caches stay intact. Same step as windows-candle.yml's heavy lane.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Verify H3 compiled-test list parser without GPU execution
+        shell: powershell
+        run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest
+      - name: Record source revision
+        shell: cmd
+        run: |
+          for /f "delims=" %%H in ('git rev-parse HEAD') do set "ACTUAL=%%H"
+          echo W4A8 CUDA checked out %ACTUAL% (dispatch ref ${{ github.ref }}, sha ${{ github.sha }})>>"%GITHUB_STEP_SUMMARY%"
+          if /i not "%ACTUAL%"=="${{ github.sha }}" exit /b 1
+      - name: Isolate persistent-runner HF caches
+        shell: cmd
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\isolate-persistent-runner-hf-caches.cmd
+      # A bare `bash` on these runners is WSL's; the toolchain action shells out with bash.
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # Manual lane: no `save-if: main`; `cache-bin: "false"` per the persistent-box rustup note on
+      # `windows-cuda`.
+      - name: Bind H3 synthetic proof to physical GPU0 by UUID
+        shell: powershell
+        run: . ./scripts/ci/real-weights/synthetic-w4a8-cuda/bind-h3-synthetic-proof-to-physical-gpu0-by-uuid.ps1
+      - name: Cache Cargo and CUDA objects
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+      - name: Prove W4A8 native arithmetic against the external fixture
+        shell: cmd
+        # Redirect instead of piping (cmd has no pipefail), then fail on Cargo's own status and on
+        # the exact executed-test summary/names, so a filtered or skip-as-pass run cannot go green.
+        # `--test-threads=1` keeps the device arithmetic deterministic. The identity checks stop at
+        # the printed name prefix because `--nocapture` output can split the "<name> ... ok" line.
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-w4a8-native-arithmetic-against-the-external-fixture.cmd
+      - name: Prove H3 ConvRot INT8 native projections against pinned Kitchen oracle
+        shell: cmd
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-convrot-int8-native-projections-against-pinned-kitchen-oracle.cmd
+      - name: Prove H3 AdaLN eviction memory release on CUDA
+        shell: cmd
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-adaln-eviction-memory-release-on-cuda.cmd
+      - name: Prove H3 cross-backend DiT complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-cross-backend-dit-complete-model-on-cuda.cmd
+      - name: Prove H3 DiT I/O complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-dit-i-o-complete-model-on-cuda.cmd
+      - name: Prove H3 pruned AdaLN complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-pruned-adaln-complete-model-on-cuda.cmd
+      - name: Prove H3 adapter topology complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-adapter-topology-complete-model-on-cuda.cmd
+      - name: Prove H3 turbo adapter fold complete model on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-turbo-adapter-fold-complete-model-on-cuda.cmd
+      - name: Prove H3 VEDA control flow in the CUDA build (CPU fixture)
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-veda-control-flow-in-the-cuda-build-cpu-fixture.cmd
+      - name: Prove H3 full DitBlock model-block parity on CUDA
+        shell: cmd
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: call scripts\ci\real-weights\synthetic-w4a8-cuda\prove-h3-full-ditblock-model-block-parity-on-cuda.cmd
+
+  moss-edit-cuda:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-cuda'
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CUDA_VISIBLE_DEVICES: "-1"
+      CUDA_COMPUTE_CAP: "120"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+      - name: Reserve an exclusive target for this run and attempt
+        shell: powershell
+        run: . ./scripts/ci/real-weights/moss-edit-cuda/reserve-an-exclusive-target-for-this-run-and-attempt.ps1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: "false"
+          workspaces: ". -> ${{ runner.temp }}/moss-edit-target-${{ github.run_id }}-${{ github.run_attempt }}"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Locate existing reviewed Python without installation
+        shell: cmd
+        run: call scripts\ci\real-weights\moss-edit-cuda\locate-existing-reviewed-python-without-installation.cmd
+      - name: Compile hidden-device tests then run exact GPU1 numerical cases
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          if errorlevel 1 exit /b 1
+          "%REVIEWED_PYTHON%" -m scripts.ci.moss_edit_cuda
+      - name: Preserve bounded numerical and owned-process receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: moss-edit-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+          if-no-files-found: error
+          retention-days: 3
+
+  moss-edit-metal:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'moss-edit-metal'
+    runs-on: [self-hosted, macOS, ARM64, nax]
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      RUSTUP_AUTO_INSTALL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Compile and list the exact oracle without allocating a Metal device
+        run: python3.12 scripts/ci/moss_edit_metal.py prepare
+      - name: Publish prepared source, runtime, binary, and test identities
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: moss-metal-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+          if-no-files-found: error
+          retention-days: 3
+      - name: Run the exact prepared Metal numerical oracle
+        run: python3.12 scripts/ci/moss_edit_metal.py execute
+      - name: Preserve numerical and owned-process receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: moss-metal-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+          if-no-files-found: error
+          retention-days: 3

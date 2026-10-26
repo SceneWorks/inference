@@ -28,20 +28,10 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only; moss-edit-cuda = synthetic MOSS GPU1 tests only; moss-edit-metal = exact synthetic Metal oracle"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; windows-gpu-diagnostic = read-only GPU1 metadata only"
         type: choice
-        options: [all, windows-cuda, windows-gpu-diagnostic, moss-edit-cuda, moss-edit-metal]
+        options: [all, windows-cuda, windows-gpu-diagnostic]
         default: all
-      # sc-26685: explicit operator route for the synthetic H3 native suites (the W4A8
-      # external-fixture cases plus the pruned-AdaLN / adapter-topology complete-model cases). A
-      # bare dispatch (`lanes: all`) does not run them, and `lanes: windows-cuda` would drag in the
-      # whole manual CUDA lane, so these two commands are selectable on their own. They read only
-      # committed synthetic fixtures (no weights, no Hub) and never touch a real-weight runner.
-      synthetic_w4a8:
-        description: "none = no synthetic H3 native lane; cuda = Candle CUDA only; mlx = MLX/Metal only; both = both"
-        type: choice
-        options: [none, cuda, mlx, both]
-        default: none
 
 permissions:
   contents: read
@@ -70,14 +60,12 @@ permissions:
 # one entry and guarantee `check_response_timeout_minutes` evictions. GitHub cancels the run
 # itself when it dissolves a merge group, so nothing here needs to.
 concurrency:
-  # Preserve every explicit numerical run's queue entry for BOTH H3 and MOSS edit.
-  # Ordinary PR/main/tag groups and cancellation policy remain unchanged.
-  group: inference-ci-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.synthetic_w4a8 == 'cuda' || github.event.inputs.synthetic_w4a8 == 'mlx' || github.event.inputs.synthetic_w4a8 == 'both') && format('w4a8-{0}', github.run_id) || github.event_name == 'workflow_dispatch' && (inputs.lanes == 'moss-edit-metal' || inputs.lanes == 'moss-edit-cuda') && format('moss-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
+  group: inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: select affected lanes
     runs-on: ubuntu-latest
     outputs:
@@ -170,7 +158,7 @@ jobs:
   # --all` all failed hard on main until it was found by hand. `--no-deps` keeps this to a
   # fast manifest parse (no dependency resolution, no compile).
   resolve:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: workspace manifest resolution
     runs-on: ubuntu-latest
     steps:
@@ -190,7 +178,7 @@ jobs:
   # formatting can drift in any .rs file. `cargo fmt --all` also invokes `cargo metadata`, so
   # this doubles as a second resolution tripwire — no compile, so it stays fast.
   format:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: workspace formatting
     runs-on: ubuntu-latest
     steps:
@@ -206,7 +194,7 @@ jobs:
     name: workspace graph invariants
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.workspace == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.workspace == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -268,7 +256,7 @@ jobs:
     name: contracts + conformance testkits (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.contracts == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.contracts == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -314,7 +302,7 @@ jobs:
     name: contracts testkit (Windows)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.contracts == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.contracts == 'true')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -364,7 +352,7 @@ jobs:
     name: Candle CPU lint + docs (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -426,7 +414,7 @@ jobs:
     name: Candle CPU package tests (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -562,7 +550,7 @@ jobs:
     name: Candle CPU conformance + SA3 gates (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -592,7 +580,7 @@ jobs:
     name: Candle CPU bundle profiles (Linux)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.candle_cpu == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.candle_cpu == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -621,7 +609,7 @@ jobs:
     name: MLX + Candle Metal packages (macOS)
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.macos_metal == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.macos_metal == 'true')
     runs-on: macos-15
     env:
       # Hosted SDK 15 cannot compile the shipping macOS 26.2 NAX path. The root
@@ -850,26 +838,6 @@ jobs:
           fi
           echo "Testing: $args"
           python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
-      - name: Check H3 precise pruned projection on hosted Metal (manual)
-        if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-pruned-hosted-metal.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 1
-          grep -Fxq "pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln::native_pruned_adaln_matches_pinned_reference -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
-          grep -Fq "H3_PRUNED_ORACLE_DEVICE" "$log"
-          grep -Fq "H3_PRUNED_ORACLE block 0 modulation: max_abs=" "$log"
-      # H3 complete-model/model-stack tests are `#[ignore]`d on both backends: ordinary PR/main
-      # CI compiles them but never executes a complete DiT, block stack, or native projection.
-      # Device suites and the hosted precision margin above run only on explicit workflow_dispatch.
-      # Every such step has positive exact count/name guards; no ignored H3 model step may run
-      # on an ordinary PR/main event.
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -1181,10 +1149,8 @@ jobs:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
-    # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
-    # `synthetic-w4a8-mlx` below.
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true') && inputs.synthetic_w4a8 == 'none'
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true')
     runs-on: [self-hosted, macOS, ARM64, nax]
     env:
       MACOSX_DEPLOYMENT_TARGET: "26.2"
@@ -1240,370 +1206,6 @@ jobs:
       - name: Exercise LLM-only runtime catalog on NAX
         run: python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --lib -p runtime-macos
 
-  # sc-26685: synthetic H3 native suites on MLX/Metal, dispatch-only via `synthetic_w4a8`.
-  # Ordinary CI compiles these bodies but never executes them (`#[ignore]`), so neither ordinary
-  # PR/main CI nor a push can run a complete model or block stack. Two suite families live here:
-  # the W4A8 external-fixture cases (the committed 2.29 MB
-  # `tests/fixtures/minimax_h3_w4a8.json` read through `include_str!`) and the H3 pruned-AdaLN /
-  # adapter-topology complete-model suites (committed synthetic fixtures). No weights and no Hub
-  # fetch in either; the HF_* env is isolated per run anyway.
-  #
-  # `rw-llm` is registered only on `nax-macos-2` (see real-weights.yml's weight-set table), unlike
-  # `rw-chroma`, which is registered on both Macs. That keeps this job off the dev Mac's `nax`
-  # listener that `macos-nax` selects.
-  #
-  # Every step below fails on Cargo's own status and then asserts the exact executed-test summary
-  # plus each printed test-name prefix. A renamed, deleted, or filtered-away case changes the
-  # count and reds the route, so a "0 tests ran" run can never pass.
-  synthetic-w4a8-mlx:
-    name: Synthetic H3 native suites (MLX/Metal, manual)
-    needs: changes
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.macos_metal == 'true' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both'))
-    runs-on: [self-hosted, macOS, ARM64, rw-llm]
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "26.2"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Record source revision
-        run: |
-          set -euo pipefail
-          actual="$(git rev-parse HEAD)"
-          echo "W4A8 MLX checked out \`$actual\` (dispatch ref \`${{ github.ref }}\`, sha \`${{ github.sha }}\`)" | tee -a "$GITHUB_STEP_SUMMARY"
-          test "$actual" = "${{ github.sha }}"
-      - name: Toolchain and platform versions
-        run: |
-          sw_vers
-          xcrun metal --version
-          rustc --version
-          cargo --version
-      - name: Fetch prebuilt MLX (sc-21382)
-        # Same contract as the `macos-nax` step of this name.
-        run: |
-          set +e
-          scripts/fetch-prebuilt-mlx.sh --github-env
-          rc=$?
-          set -e
-          if [ "$rc" = 1 ]; then
-            echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source (see step log)"
-          elif [ "$rc" != 0 ]; then
-            exit "$rc"
-          fi
-      # No `save-if: main`: this lane is manual and never runs on `main`. `cache-bin: "false"` is
-      # mandatory on the persistent Mac for the rust-cache/rustup reason documented on `macos-nax`.
-      - name: Cache Cargo and MLX native build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: "false"
-      - name: Prove W4A8 native arithmetic against the external fixture
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/w4a8-mlx.log"
-          # `--test-threads=1`: MLX stream/device state is thread-local; a parallel libtest run is
-          # not the configuration these native cases were written for.
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration w4a8_compare:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 3
-          grep -Fxq "w4a8_compare::native_forward_matches_the_external_reference: test" "$list_log"
-          grep -Fxq "w4a8_compare::invalid_operands_are_refused_by_the_published_contract: test" "$list_log"
-          grep -Fxq "w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration w4a8_compare:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          # `pipefail` keeps the Cargo status through `tee`. The exact summary proves how many
-          # bodies ran and passed (0 ignored); the bare name prefix proves identity. Do NOT anchor
-          # on "<name> ... ok": with `--nocapture` the test's own output can land between the
-          # printed name and `ok`, so a passing run can split that line.
-          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test w4a8_compare::native_forward_matches_the_external_reference ..." "$log"
-          grep -Fq "test w4a8_compare::invalid_operands_are_refused_by_the_published_contract ..." "$log"
-          grep -Fq "test w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic ..." "$log"
-      - name: Prove H3 AdaLN cache complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-adaln-cache-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_cache:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 11
-          grep -Fxq "adaln_cache::the_cache_reproduces_the_reference_modulation_table: test" "$list_log"
-          grep -Fxq "adaln_cache::the_precomputed_path_reproduces_the_naive_per_step_run: test" "$list_log"
-          grep -Fxq "adaln_cache::precompute_residual_bounds_the_mutation_floor: test" "$list_log"
-          grep -Fxq "adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong: test" "$list_log"
-          grep -Fxq "adaln_cache::a_step_off_by_one_in_the_remap_is_observable: test" "$list_log"
-          grep -Fxq "adaln_cache::skipping_the_local_to_global_remap_is_observable: test" "$list_log"
-          grep -Fxq "adaln_cache::the_cache_is_keyed_by_the_whole_schedule: test" "$list_log"
-          grep -Fxq "adaln_cache::the_cache_size_tracks_the_schedule_and_nothing_else: test" "$list_log"
-          grep -Fxq "adaln_cache::an_evicted_block_still_runs_but_cannot_project: test" "$list_log"
-          grep -Fxq "adaln_cache::resident_residency_refuses_to_precompute_and_evict: test" "$list_log"
-          grep -Fxq "adaln_cache::a_mis_shaped_timestep_embedding_is_rejected_before_eviction: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_cache:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test adaln_cache::the_cache_reproduces_the_reference_modulation_table ..." "$log"
-          grep -Fq "test adaln_cache::the_precomputed_path_reproduces_the_naive_per_step_run ..." "$log"
-          grep -Fq "test adaln_cache::precompute_residual_bounds_the_mutation_floor ..." "$log"
-          grep -Fq "test adaln_cache::a_cache_from_another_schedule_is_stale_and_observably_wrong ..." "$log"
-          grep -Fq "test adaln_cache::a_step_off_by_one_in_the_remap_is_observable ..." "$log"
-          grep -Fq "test adaln_cache::skipping_the_local_to_global_remap_is_observable ..." "$log"
-          grep -Fq "test adaln_cache::the_cache_is_keyed_by_the_whole_schedule ..." "$log"
-          grep -Fq "test adaln_cache::the_cache_size_tracks_the_schedule_and_nothing_else ..." "$log"
-          grep -Fq "test adaln_cache::an_evicted_block_still_runs_but_cannot_project ..." "$log"
-          grep -Fq "test adaln_cache::resident_residency_refuses_to_precompute_and_evict ..." "$log"
-          grep -Fq "test adaln_cache::a_mis_shaped_timestep_embedding_is_rejected_before_eviction ..." "$log"
-      - name: Prove H3 AdaLN eviction memory release on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adaln-evict-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-adaln-evict-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_evict_memory:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 1
-          grep -Fxq "adaln_evict_memory::the_evicted_adaln_weights_leave_device_memory: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adaln_evict_memory:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test adaln_evict_memory::the_evicted_adaln_weights_leave_device_memory ..." "$log"
-      - name: Prove H3 adapter topology complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-adapter-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-adapter-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adapter_topology:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 15
-          grep -Fxq "adapter_topology::native_pruned_turbo_adapter_residual_matches_reference: test" "$list_log"
-          grep -Fxq "adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies: test" "$list_log"
-          grep -Fxq "adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology: test" "$list_log"
-          grep -Fxq "adapter_topology::real_but_unaddressable_modules_name_the_exclusion: test" "$list_log"
-          grep -Fxq "adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically: test" "$list_log"
-          grep -Fxq "adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically: test" "$list_log"
-          grep -Fxq "adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically: test" "$list_log"
-          grep -Fxq "adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling: test" "$list_log"
-          grep -Fxq "adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta: test" "$list_log"
-          grep -Fxq "adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve: test" "$list_log"
-          grep -Fxq "adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto: test" "$list_log"
-          grep -Fxq "adapter_topology::the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint: test" "$list_log"
-          grep -Fxq "adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies: test" "$list_log"
-          grep -Fxq "adapter_topology::the_exact_corpus_is_bit_identical_across_partitions: test" "$list_log"
-          grep -Fxq "adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration adapter_topology:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 15 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test adapter_topology::native_pruned_turbo_adapter_residual_matches_reference ..." "$log"
-          grep -Fq "test adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies ..." "$log"
-          grep -Fq "test adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology ..." "$log"
-          grep -Fq "test adapter_topology::real_but_unaddressable_modules_name_the_exclusion ..." "$log"
-          grep -Fq "test adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically ..." "$log"
-          grep -Fq "test adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically ..." "$log"
-          grep -Fq "test adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically ..." "$log"
-          grep -Fq "test adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling ..." "$log"
-          grep -Fq "test adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta ..." "$log"
-          grep -Fq "test adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve ..." "$log"
-          grep -Fq "test adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto ..." "$log"
-          grep -Fq "test adapter_topology::the_same_adapter_installs_on_every_partition_of_the_selected_checkpoint ..." "$log"
-          grep -Fq "test adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies ..." "$log"
-          grep -Fq "test adapter_topology::the_exact_corpus_is_bit_identical_across_partitions ..." "$log"
-          grep -Fq "test adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve ..." "$log"
-      - name: Prove H3 windowed block window complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-block-window-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-block-window-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration block_window:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 5
-          grep -Fxq "block_window::a_deferred_load_materializes_no_blocks: test" "$list_log"
-          grep -Fxq "block_window::windowed_and_resident_stacks_agree: test" "$list_log"
-          grep -Fxq "block_window::the_two_residency_modes_are_mutually_exclusive: test" "$list_log"
-          grep -Fxq "block_window::the_windowed_adaln_precompute_matches_the_resident_one: test" "$list_log"
-          grep -Fxq "block_window::every_window_opens_an_independent_view: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration block_window:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 5 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test block_window::a_deferred_load_materializes_no_blocks ..." "$log"
-          grep -Fq "test block_window::windowed_and_resident_stacks_agree ..." "$log"
-          grep -Fq "test block_window::the_two_residency_modes_are_mutually_exclusive ..." "$log"
-          grep -Fq "test block_window::the_windowed_adaln_precompute_matches_the_resident_one ..." "$log"
-          grep -Fq "test block_window::every_window_opens_an_independent_view ..." "$log"
-      - name: Prove H3 bounded attention complete block stack on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-bounded-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-bounded-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration bounded_attention:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 1
-          grep -Fxq "bounded_attention::a_bounded_plan_threads_the_whole_block_stack: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration bounded_attention:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test bounded_attention::a_bounded_plan_threads_the_whole_block_stack ..." "$log"
-      - name: Prove H3 DiT I/O complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-io-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-dit-io-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_io:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 3
-          grep -Fxq "dit_io::the_model_embeds_the_context_before_refining_it: test" "$list_log"
-          grep -Fxq "dit_io::a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it: test" "$list_log"
-          grep -Fxq "dit_io::the_whole_model_reproduces_the_reference_velocity: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_io:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 3 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test dit_io::the_model_embeds_the_context_before_refining_it ..." "$log"
-          grep -Fq "test dit_io::a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it ..." "$log"
-          grep -Fq "test dit_io::the_whole_model_reproduces_the_reference_velocity ..." "$log"
-      - name: Prove H3 pruned AdaLN complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-pruned-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-pruned-mlx.log"
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 4
-          grep -Fxq "pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "$list_log"
-          grep -Fxq "pruned_adaln::full_model_live_coordinates_match_cache_and_refuse_foreign_basis: test" "$list_log"
-          grep -Fxq "pruned_adaln::full_model_detects_pruned_and_checks_pruning_identity: test" "$list_log"
-          grep -Fxq "pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration pruned_adaln:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 4 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "$log"
-          grep -Fq "test pruned_adaln::full_model_live_coordinates_match_cache_and_refuse_foreign_basis ..." "$log"
-          grep -Fq "test pruned_adaln::full_model_detects_pruned_and_checks_pruning_identity ..." "$log"
-          grep -Fq "test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "$log"
-          grep -Fq "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11" "$log"
-      - name: Prove H3 turbo adapter fold complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-turbo-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-turbo-mlx.log"
-          # The five real-weight `#[ignore]`s in this module are SKIPPED by name: they need provided
-          # snapshots and belong to real-weights.yml, and `--ignored` alone would conscript them
-          # into this synthetic route. Exactly the eleven synthetic model bodies must execute.
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration turbo_lora:: -- --ignored --skip published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas --skip the_real_turbo_lora_folds_onto_the_real_dit --skip turbo_render_records_a_measured_clip --skip exact_h3_trainer_file_receipt --skip manual_metal_exact_h3_trainer_runtime_receipt --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 11
-          grep -Fxq "turbo_lora::the_three_published_alphas_fold_at_one_and_one_sixteenth: test" "$list_log"
-          grep -Fxq "turbo_lora::the_installed_fold_keeps_the_bf16_factor_dtype: test" "$list_log"
-          grep -Fxq "turbo_lora::the_user_strength_multiplies_the_alpha_fold: test" "$list_log"
-          grep -Fxq "turbo_lora::every_target_resolves_across_both_stacks: test" "$list_log"
-          grep -Fxq "turbo_lora::an_unmatched_target_is_loud: test" "$list_log"
-          grep -Fxq "turbo_lora::a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not: test" "$list_log"
-          grep -Fxq "turbo_lora::h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation: test" "$list_log"
-          grep -Fxq "turbo_lora::a_file_matching_nothing_names_the_expected_key_space: test" "$list_log"
-          grep -Fxq "turbo_lora::every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary: test" "$list_log"
-          grep -Fxq "turbo_lora::a_peft_blob_rank_disagreeing_with_the_factors_is_refused: test" "$list_log"
-          grep -Fxq "turbo_lora::the_conversion_leaves_no_comfyui_module_behind: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration turbo_lora:: -- --ignored --nocapture --test-threads=1 \
-            --skip published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas \
-            --skip the_real_turbo_lora_folds_onto_the_real_dit \
-            --skip turbo_render_records_a_measured_clip \
-            --skip exact_h3_trainer_file_receipt \
-            --skip manual_metal_exact_h3_trainer_runtime_receipt 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 11 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test turbo_lora::the_three_published_alphas_fold_at_one_and_one_sixteenth ..." "$log"
-          grep -Fq "test turbo_lora::the_installed_fold_keeps_the_bf16_factor_dtype ..." "$log"
-          grep -Fq "test turbo_lora::the_user_strength_multiplies_the_alpha_fold ..." "$log"
-          grep -Fq "test turbo_lora::every_target_resolves_across_both_stacks ..." "$log"
-          grep -Fq "test turbo_lora::an_unmatched_target_is_loud ..." "$log"
-          grep -Fq "test turbo_lora::a_genuine_lokr_routes_to_the_shared_seam_and_the_turbo_files_do_not ..." "$log"
-          grep -Fq "test turbo_lora::h3_trainer_metadata_cannot_route_mixed_lokr_factors_around_validation ..." "$log"
-          grep -Fq "test turbo_lora::a_file_matching_nothing_names_the_expected_key_space ..." "$log"
-          grep -Fq "test turbo_lora::every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary ..." "$log"
-          grep -Fq "test turbo_lora::a_peft_blob_rank_disagreeing_with_the_factors_is_refused ..." "$log"
-          grep -Fq "test turbo_lora::the_conversion_leaves_no_comfyui_module_behind ..." "$log"
-      - name: Prove H3 VEDA fixture complete model on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-veda-fixture-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-veda-fixture-mlx.log"
-          # Unit-test (`--lib`) target, not the integration binary. The device self-test is
-          # skipped by name: it is not a complete-model body and does not belong to this route.
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --lib veda_fixture:: -- --ignored --skip selected_kernel_actual_device_smoke --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 2
-          grep -Fxq "veda_fixture::native_generator_learned_sparse_off_and_failure_paths: test" "$list_log"
-          grep -Fxq "veda_fixture::native_veda_controls_preserve_carriers_and_capture_published_schedules: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --lib veda_fixture:: -- --ignored --nocapture --test-threads=1 --skip selected_kernel_actual_device_smoke 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 2 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test veda_fixture::native_generator_learned_sparse_off_and_failure_paths ..." "$log"
-          grep -Fq "test veda_fixture::native_veda_controls_preserve_carriers_and_capture_published_schedules ..." "$log"
-      - name: Prove H3 full DitBlock model-block parity on Metal
-        env:
-          HF_HOME: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hf-home
-          HF_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HUGGINGFACE_HUB_CACHE: ${{ runner.temp }}/h3-dit-parity-${{ github.run_id }}-${{ github.run_attempt }}/hub
-          HF_HUB_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/h3-dit-parity-mlx.log"
-          # Full DitBlock (attention + FFN) executions. Individual linear/AdaLN/packing
-          # primitives in this module stay ordinary and are not selected by this filter.
-          list_log="$log.list"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_parity:: -- --ignored --list --color never >"$list_log" 2>&1
-          cat "$list_log"
-          test "$(awk '/: test$/{n++} END{print n+0}' "$list_log")" -eq 9
-          grep -Fxq "dit_parity::adaln_modulation_matches_the_reference: test" "$list_log"
-          grep -Fxq "dit_parity::transformer_block_matches_the_reference: test" "$list_log"
-          grep -Fxq "dit_parity::every_norm_epsilon_is_wired_through: test" "$list_log"
-          grep -Fxq "dit_parity::reading_the_ffn_halves_gate_first_breaks_parity: test" "$list_log"
-          grep -Fxq "dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing: test" "$list_log"
-          grep -Fxq "dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked: test" "$list_log"
-          grep -Fxq "dit_parity::every_block_weight_is_load_bearing: test" "$list_log"
-          grep -Fxq "dit_parity::parity_residuals_bound_the_mutation_floor: test" "$list_log"
-          grep -Fxq "dit_parity::weight_mapping_is_exhaustive_over_the_block_stack: test" "$list_log"
-          cargo test --locked -p mlx-gen-minimax-h3 --test integration dit_parity:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
-          grep -Fq "test result: ok. 9 passed; 0 failed; 0 ignored" "$log"
-          grep -Fq "test dit_parity::adaln_modulation_matches_the_reference ..." "$log"
-          grep -Fq "test dit_parity::transformer_block_matches_the_reference ..." "$log"
-          grep -Fq "test dit_parity::every_norm_epsilon_is_wired_through ..." "$log"
-          grep -Fq "test dit_parity::reading_the_ffn_halves_gate_first_breaks_parity ..." "$log"
-          grep -Fq "test dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing ..." "$log"
-          grep -Fq "test dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked ..." "$log"
-          grep -Fq "test dit_parity::every_block_weight_is_load_bearing ..." "$log"
-          grep -Fq "test dit_parity::parity_residuals_bound_the_mutation_floor ..." "$log"
-          grep -Fq "test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "$log"
-
   # Non-executing gate for the CUDA feature (compile, lint, docs) — runs on every PR/push that touches
   # the lane.
   #
@@ -1631,7 +1233,7 @@ jobs:
     # keyed on `!= 'pull_request'` rather than an allowlist of trusted events, so a new trusted
     # event does not silently lose CUDA coverage.
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.windows_cuda == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, windows, cuda]
     env:
       # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
@@ -1769,10 +1371,8 @@ jobs:
   windows-cuda:
     name: Candle CUDA packages (Windows, manual)
     needs: changes
-    # A `synthetic_w4a8` dispatch replaces the heavy manual lanes with the synthetic suite; see
-    # `synthetic-w4a8-cuda` below.
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true') && inputs.synthetic_w4a8 == 'none'
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true')
     runs-on: [self-hosted, windows, cuda]
     env:
       # Keep manual runs inside the same per-listener budget as the automatic compile check.
@@ -1846,11 +1446,7 @@ jobs:
         run: |
           call "%VCVARS%"
           cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
-      # H3 complete-model/model-stack execution is reachable ONLY from this manual
-      # `workflow_dispatch` lane (and the MLX twin `synthetic-w4a8-mlx`); ordinary PR/main CI only
-      # compiles the bodies. Each step fails on Cargo's own status and then asserts the exact
-      # executed-test summary plus every printed test-name prefix, so a renamed, deleted, or
-      # filtered-away case reds the route instead of passing with zero tests.
+      # Learned bodies stay compiled and ignored here; explicit model validation lives in real-weights.yml.
       - name: Test Candle CUDA packages
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
@@ -1876,403 +1472,8 @@ jobs:
           call "%VCVARS%"
           python3 -I scripts/ci/check_compiled_model_ignores.py -- cargo test --locked --no-default-features --features audio --lib -p runtime-cuda
 
-  # Explicit H3 native proofs on physical GPU0; main's broad manual CUDA lane retains GPU1.
-  # Includes the committed W4A8 external oracle and every ignored H3 model/block suite below.
-  # No pretrained weights or Hub fetches. Ordinary CI compiles these tests but never runs them.
-  # Exact positive counts/names and backend completion markers prevent filtered or CPU evidence
-  # from masquerading as current CUDA execution.
-  synthetic-w4a8-cuda:
-    name: Synthetic H3 native suites (CUDA, manual)
-    needs: changes
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (github.event_name == 'workflow_dispatch' && needs.changes.outputs.windows_cuda == 'true' && (inputs.synthetic_w4a8 == 'cuda' || inputs.synthetic_w4a8 == 'both'))
-    runs-on: [self-hosted, windows, cuda]
-    env:
-      CARGO_BUILD_JOBS: "12"
-      CUDA_COMPUTE_CAP: "80"
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
-      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      # The runner service exports RUSTC_WRAPPER=sccache globally (it appears nowhere in the repo's
-      # CI config); its daemon resets mid-build on heavy Candle/CUDA graphs ("os error 10054" with
-      # zero rustc diagnostics). Clear the wrapper for THIS job only; sibling jobs keep sccache and
-      # the registry/git/target caches stay intact. Same step as windows-candle.yml's heavy lane.
-      - name: Disable unstable sccache wrapper for the heavy Candle lane
-        shell: powershell
-        run: |
-          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
-          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
-      - name: Verify H3 compiled-test list parser without GPU execution
-        shell: powershell
-        run: ./scripts/ci/h3-native-test-list.ps1 -SelfTest
-      - name: Record source revision
-        shell: cmd
-        run: |
-          for /f "delims=" %%H in ('git rev-parse HEAD') do set "ACTUAL=%%H"
-          echo W4A8 CUDA checked out %ACTUAL% (dispatch ref ${{ github.ref }}, sha ${{ github.sha }})>>"%GITHUB_STEP_SUMMARY%"
-          if /i not "%ACTUAL%"=="${{ github.sha }}" exit /b 1
-      - name: Isolate persistent-runner HF caches
-        shell: cmd
-        run: |
-          set "HF_OUTER=%RUNNER_TEMP%\inference-ci-w4a8-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%"
-          if not exist "%HF_OUTER%" mkdir "%HF_OUTER%"
-          if errorlevel 1 exit /b 1
-          echo HF_HOME=%HF_OUTER%\hf-home>>"%GITHUB_ENV%"
-          echo HF_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
-          echo HUGGINGFACE_HUB_CACHE=%HF_OUTER%\hub>>"%GITHUB_ENV%"
-      # A bare `bash` on these runners is WSL's; the toolchain action shells out with bash.
-      - name: Select Git Bash
-        shell: cmd
-        run: |
-          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
-          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
-      # Manual lane: no `save-if: main`; `cache-bin: "false"` per the persistent-box rustup note on
-      # `windows-cuda`.
-      - name: Bind H3 synthetic proof to physical GPU0 by UUID
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $identity = @(& nvidia-smi -i 0 --query-gpu=index,uuid,name,pci.bus_id,driver_version,memory.total,memory.used --format=csv,noheader,nounits)
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to query physical GPU0 identity' }
-          $identity = @($identity | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          if ($identity.Count -ne 1) { throw 'Physical GPU0 identity is missing or ambiguous' }
-          $fields = @($identity[0].Split(',') | ForEach-Object { $_.Trim() })
-          if ($fields.Count -ne 7 -or $fields[0] -ne '0' -or $fields[1] -notmatch '^GPU-[0-9a-fA-F-]+$') {
-            throw "Invalid physical GPU0 identity: $($identity[0])"
-          }
-          $gpuUuid = $fields[1]
-          Write-Host "H3 physical GPU0 identity (index, UUID, name, PCI bus, driver, total MiB, used MiB): $($identity[0])"
-          "CUDA_VISIBLE_DEVICES=$gpuUuid" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          'CUDA_DEVICE_ORDER=PCI_BUS_ID' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          'SCENEWORKS_GPU_ID=0' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "H3 logical CUDA device 0 maps only to physical GPU0 UUID $gpuUuid"
-      - name: Cache Cargo and CUDA objects
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: "false"
-      - name: Prove W4A8 native arithmetic against the external fixture
-        shell: cmd
-        # Redirect instead of piping (cmd has no pipefail), then fail on Cargo's own status and on
-        # the exact executed-test summary/names, so a filtered or skip-as-pass run cannot go green.
-        # `--test-threads=1` keeps the device arithmetic deterministic. The identity checks stop at
-        # the printed name prefix because `--nocapture` output can split the "<name> ... ok" line.
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\w4a8-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration w4a8_compare:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "w4a8_compare::native_forward_matches_the_external_reference|w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"w4a8_compare::native_forward_matches_the_external_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration w4a8_compare:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test w4a8_compare::native_forward_matches_the_external_reference ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test w4a8_compare::mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 ConvRot INT8 native projections against pinned Kitchen oracle
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-convrot-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 1 -ExpectedNames "convrot_int8::native_projections_match_pinned_kitchen"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"convrot_int8::native_projections_match_pinned_kitchen: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration convrot_int8:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 1 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test convrot_int8::native_projections_match_pinned_kitchen ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 AdaLN eviction memory release on CUDA
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-adaln-evict-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adaln_evict_memory:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "adaln_evict_memory::the_evicted_adaln_weights_leave_memory|adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_memory: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adaln_evict_memory:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test adaln_evict_memory::the_evicted_adaln_weights_leave_memory ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adaln_evict_memory::the_evicted_adaln_weights_leave_the_cuda_pool ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 cross-backend DiT complete model on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-cross-backend-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration cross_backend:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 3 -ExpectedNames "cross_backend::dit_agrees_with_the_mlx_lane|cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes|cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"cross_backend::dit_agrees_with_the_mlx_lane: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration cross_backend:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 3 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test cross_backend::dit_agrees_with_the_mlx_lane ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test cross_backend::the_dit_cross_backend_floor_is_also_the_mlx_lanes ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test cross_backend::a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 DiT I/O complete model on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-dit-io-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_io:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 4 -ExpectedNames "dit_io::the_model_embeds_the_context_before_refining_it|dit_io::the_whole_model_reproduces_the_reference_velocity|dit_io::forward_packed_rejects_an_out_of_range_adaln_index|dit_io::the_cached_modulation_path_reproduces_the_resident_one"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"dit_io::the_model_embeds_the_context_before_refining_it: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_io::the_whole_model_reproduces_the_reference_velocity: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_io::forward_packed_rejects_an_out_of_range_adaln_index: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_io::the_cached_modulation_path_reproduces_the_resident_one: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_io:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 4 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_io::the_model_embeds_the_context_before_refining_it ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_io::the_whole_model_reproduces_the_reference_velocity ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_io::forward_packed_rejects_an_out_of_range_adaln_index ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_io::the_cached_modulation_path_reproduces_the_resident_one ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 pruned AdaLN complete model on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-pruned-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 7 -ExpectedNames "pruned_adaln::native_pruned_adaln_matches_pinned_reference|pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference|pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis|pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection|pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates|pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision|pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"pruned_adaln::native_pruned_adaln_matches_pinned_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration pruned_adaln:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 7 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::native_pruned_adaln_matches_pinned_reference ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::native_blocks_and_final_outputs_match_the_pinned_reference ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::the_curve_cache_keys_on_the_schedule_and_the_basis ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::a_mixed_basis_block_stack_is_refused_before_any_projection ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::the_stock_path_is_untouched_and_refuses_curve_coordinates ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::load_from_dir_builds_the_pruned_model_with_its_identity_at_stored_precision ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test pruned_adaln::manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"H3_GEOMETRY_AUDIO_FULL_FORWARD backend=cuda cases=11" "%LOG%" >nul || exit /b 1
-      - name: Prove H3 adapter topology complete model on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-adapter-cuda.log"
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 13 -ExpectedNames "adapter_topology::native_adapter_folds_on_the_pruned_curve|adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies|adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology|adapter_topology::real_but_unaddressable_modules_name_the_exclusion|adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically|adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically|adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically|adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling|adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta|adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve|adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto|adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies|adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"adapter_topology::native_adapter_folds_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::real_but_unaddressable_modules_name_the_exclusion: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration adapter_topology:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 13 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::native_adapter_folds_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::body_deltas_are_identical_across_full_and_pruned_topologies ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::full_topology_adaln_targets_are_refused_specifically_per_topology ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::real_but_unaddressable_modules_name_the_exclusion ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::an_adaln_only_file_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::an_excluded_only_file_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::an_adaln_only_lokr_with_no_body_targets_is_refused_specifically ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::turbo_schedule_coordinates_drive_the_pruned_curve_without_a_thousand_scaling ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::the_delta_is_independent_of_the_body_weights_it_folds_onto ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::the_exact_dyadic_corpus_folds_exactly_on_both_topologies ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test adapter_topology::the_exact_lokr_corpus_folds_exactly_on_the_pruned_curve ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 turbo adapter fold complete model on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-turbo-cuda.log"
-          rem The three real-weight `#[ignore]`s in this module are SKIPPED by name: they need provided
-          rem snapshots and belong to real-weights.yml, and `--ignored` alone would conscript them.
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration turbo_lora:: -- --ignored --skip manual_cuda_fabricated_lokr_install_receipt --skip exact_h3_trainer_file_receipt --skip manual_cuda_exact_h3_trainer_runtime_receipt --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 13 -ExpectedNames "turbo_lora::every_enumerated_target_resolves_through_the_model_tree|turbo_lora::adaln_and_the_norms_are_not_addressable|turbo_lora::the_install_folds_at_the_published_strength|turbo_lora::the_installed_fold_keeps_the_factor_dtype|turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate|turbo_lora::an_unmatched_target_is_surfaced_by_name|turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results|turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically|turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims|turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target|turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check|turbo_lora::the_conversion_leaves_no_comfyui_module_behind|turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"turbo_lora::every_enumerated_target_resolves_through_the_model_tree: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::adaln_and_the_norms_are_not_addressable: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::the_install_folds_at_the_published_strength: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::the_installed_fold_keeps_the_factor_dtype: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::an_unmatched_target_is_surfaced_by_name: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::the_conversion_leaves_no_comfyui_module_behind: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration turbo_lora:: -- --ignored --nocapture --test-threads=1 --skip manual_cuda_fabricated_lokr_install_receipt --skip exact_h3_trainer_file_receipt --skip manual_cuda_exact_h3_trainer_runtime_receipt >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 13 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::every_enumerated_target_resolves_through_the_model_tree ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::adaln_and_the_norms_are_not_addressable ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::the_install_folds_at_the_published_strength ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::the_installed_fold_keeps_the_factor_dtype ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::a_file_that_folds_nothing_is_refused_per_spec_not_in_aggregate ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::an_unmatched_target_is_surfaced_by_name ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::lokr_matches_an_independent_dense_kron_and_rejects_mutant_results ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::lokr_rejects_unknown_partial_unmatched_and_false_kind_claims ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::direct_lokr_reaches_every_trunk_and_token_refiner_adapter_target ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::the_conversion_leaves_no_comfyui_module_behind ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test turbo_lora::clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 VEDA control flow in the CUDA build (CPU fixture)
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-veda-model-cuda.log"
-          rem Unit-test (`--lib`) target, not the integration binary; CPU arithmetic on a complete
-          rem synthetic DiT + JointDit built through the production loader.
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --lib dit::model::veda_controls_tests:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 2 -ExpectedNames "dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack|dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --lib dit::model::veda_controls_tests:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 2 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention ..." "%LOG%" >nul || exit /b 1
-      - name: Prove H3 full DitBlock model-block parity on CUDA
-        shell: cmd
-        env:
-          HF_HUB_OFFLINE: "1"
-        run: |
-          call "%VCVARS%"
-          set "LOG=%RUNNER_TEMP%\h3-dit-parity-cuda.log"
-          rem Full DitBlock (attention + FFN) executions. Individual linear/AdaLN/packing
-          rem primitives in this module stay ordinary and are not selected by this filter.
-          set "LIST=%LOG%.list"
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_parity:: -- --ignored --list --color never >"%LIST%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LIST%"
-          if not "%RC%"=="0" exit /b %RC%
-          powershell -NoProfile -NonInteractive -File scripts\ci\h3-native-test-list.ps1 -ListPath "%LIST%" -ExpectedCount 9 -ExpectedNames "dit_parity::adaln_modulation_matches_the_reference|dit_parity::transformer_block_matches_the_reference|dit_parity::every_norm_epsilon_is_wired_through|dit_parity::reading_the_ffn_halves_gate_first_breaks_parity|dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing|dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked|dit_parity::every_block_weight_is_load_bearing|dit_parity::parity_residuals_bound_the_mutation_floor|dit_parity::weight_mapping_is_exhaustive_over_the_block_stack"
-          set "RC=%ERRORLEVEL%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /L /C:"dit_parity::adaln_modulation_matches_the_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::transformer_block_matches_the_reference: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::every_norm_epsilon_is_wired_through: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::reading_the_ffn_halves_gate_first_breaks_parity: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::every_block_weight_is_load_bearing: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::parity_residuals_bound_the_mutation_floor: test" "%LIST%" >nul || exit /b 1
-          findstr /L /C:"dit_parity::weight_mapping_is_exhaustive_over_the_block_stack: test" "%LIST%" >nul || exit /b 1
-          cargo test --locked -p candle-gen-minimax-h3 --features cuda --test integration dit_parity:: -- --ignored --nocapture --test-threads=1 >"%LOG%" 2>&1
-          set "RC=%ERRORLEVEL%"
-          type "%LOG%"
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"test result: ok. 9 passed; 0 failed; 0 ignored" "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::adaln_modulation_matches_the_reference ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::transformer_block_matches_the_reference ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::every_norm_epsilon_is_wired_through ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::reading_the_ffn_halves_gate_first_breaks_parity ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::the_modality_term_of_the_adaln_index_is_load_bearing ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::the_adaln_table_is_reshaped_before_it_is_chunked ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::every_block_weight_is_load_bearing ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::parity_residuals_bound_the_mutation_floor ..." "%LOG%" >nul || exit /b 1
-          findstr /C:"test dit_parity::weight_mapping_is_exhaustive_over_the_block_stack ..." "%LOG%" >nul || exit /b 1
-
   supply-chain:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
     name: dependency policy + advisories
     runs-on: ubuntu-latest
     steps:
@@ -2299,7 +1500,7 @@ jobs:
     name: repository documentation
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.docs == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.docs == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -2310,7 +1511,7 @@ jobs:
     name: runtime manifest + SPDX SBOM
     needs: changes
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (needs.changes.outputs.release == 'true')
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (needs.changes.outputs.release == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -2330,7 +1531,7 @@ jobs:
     name: tagged source archive + external smoke
     needs: [changes, release-metadata]
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (startsWith(github.ref, 'refs/tags/runtime-'))
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (startsWith(github.ref, 'refs/tags/runtime-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -2384,19 +1585,15 @@ jobs:
       - macos-metal
       - ios-build
       - macos-nax
-      - synthetic-w4a8-mlx
       - windows-cuda-check
       - windows-cuda
-      - synthetic-w4a8-cuda
       - windows-gpu-diagnostic
-      - moss-edit-cuda
-      - moss-edit-metal
       - supply-chain
       - docs
       - release-metadata
       - release-artifacts
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to have succeeded or been skipped
@@ -2438,100 +1635,6 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  moss-edit-cuda:
-    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-edit-cuda'
-    runs-on: [self-hosted, windows, cuda]
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "4"
-      CUDA_VISIBLE_DEVICES: "-1"
-      CUDA_COMPUTE_CAP: "120"
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
-      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Select Git Bash
-        shell: cmd
-        run: |
-          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
-          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: 1.96.0
-      - name: Reserve an exclusive target for this run and attempt
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $target = Join-Path $env:RUNNER_TEMP "moss-edit-target-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          if (Test-Path -LiteralPath $target) { throw 'Target directory already exists' }
-          New-Item -ItemType Directory -Path $target | Out-Null
-          "CARGO_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: "false"
-          workspaces: ". -> ${{ runner.temp }}/moss-edit-target-${{ github.run_id }}-${{ github.run_attempt }}"
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: "0.12.3"
-          enable-cache: false
-      - name: Locate existing reviewed Python without installation
-        shell: cmd
-        run: |
-          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
-          if not defined REVIEWED_PYTHON exit /b 1
-          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
-          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
-      - name: Compile hidden-device tests then run exact GPU1 numerical cases
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          if errorlevel 1 exit /b 1
-          "%REVIEWED_PYTHON%" -m scripts.ci.moss_edit_cuda
-      - name: Preserve bounded numerical and owned-process receipts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: moss-edit-cuda-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.json
-            ${{ runner.temp }}/moss-edit-${{ github.run_id }}-${{ github.run_attempt }}/*.log
-          if-no-files-found: error
-          retention-days: 3
 
 
   # Manual synthetic gate: Actions schedules preparation and direct execution.
-  moss-edit-metal:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-edit-metal')
-    runs-on: [self-hosted, macOS, ARM64, nax]
-    timeout-minutes: 50
-    permissions:
-      contents: read
-    env:
-      RUSTUP_AUTO_INSTALL: "0"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-      - name: Compile and list the exact oracle without allocating a Metal device
-        run: python3 scripts/ci/moss_edit_metal.py prepare
-      - name: Publish prepared source, runtime, binary, and test identities
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: moss-metal-prepared-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
-            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
-          if-no-files-found: error
-          retention-days: 3
-      - name: Run the exact prepared Metal numerical oracle
-        run: python3 scripts/ci/moss_edit_metal.py execute
-      - name: Preserve numerical and owned-process receipts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: moss-metal-result-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.json
-            ${{ runner.temp }}/moss-edit-metal-${{ github.run_id }}-${{ github.run_attempt }}/*.log
-          if-no-files-found: error
-          retention-days: 3

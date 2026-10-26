@@ -45,6 +45,33 @@ resource policy. There are no hidden RAM defaults, free Cargo arguments, or
 unfiltered parameter/measurement grids. Obtain execution authorization and use
 approved caps/reserves/deadlines before dispatch; no dispatch is recorded here.
 
+Synthetic H3 and MOSS validation also lives in the separate explicit
+`real-weights.yml` workflow. The former ordinary-CI dispatch inputs map as follows:
+
+| Former `ci.yml` input | `real-weights.yml` profile | Preserved execution route |
+|---|---|---|
+| `synthetic_w4a8=mlx` | `synthetic-w4a8-mlx` | Hosted macOS 15 precise projection plus self-hosted `rw-llm` Metal suite |
+| `synthetic_w4a8=cuda` | `synthetic-w4a8-cuda` | Self-hosted Windows CUDA H3 suite, physical GPU0 UUID binding |
+| `synthetic_w4a8=both` | `synthetic-w4a8-both` | All three H3 routes above |
+| `lanes=moss-edit-cuda` | `moss-edit-cuda` | Exact four synthetic cases on the pinned physical GPU1 UUID/PCI identity |
+| `lanes=moss-edit-metal` | `moss-edit-metal` | Exact prepared NAX Metal oracle with immutable source/runtime/binary receipts |
+
+Dispatch against the intended source ref, for example:
+
+```sh
+gh workflow run real-weights.yml --repo SceneWorks/inference --ref <source-ref> -f profile=synthetic-w4a8-both
+```
+
+These profiles never run through `all`, schedule, PR, push, merge group or an
+ordinary CI dependency. Every run/attempt keeps its own queue entry with
+cancellation disabled. Existing exact test counts, named assertions, fixture and
+source controls, backend markers, device restrictions and MOSS evidence artifacts
+are preserved. Tests remain compiled and ignored in ordinary CI; the dedicated
+MOSS CUDA runner verifies ignored membership before explicitly selecting those
+same cases. `ci.yml` retains its ordinary build/lint/non-model manual lanes and
+the read-only GPU1 diagnostic. An empty or obsolete model selector cannot schedule
+model execution from that workflow.
+
 For source-conditional SD35 cases, optional request `configuration` selects only a
 name declared in that case's fixed `configurations` map; omission selects its explicit
 `default_configuration`. One canonical case identity is retained. Each recipe binds
