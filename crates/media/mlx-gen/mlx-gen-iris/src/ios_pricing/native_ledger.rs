@@ -26,6 +26,9 @@
 use super::*;
 use std::collections::HashMap;
 
+#[path = "host_mutex.rs"]
+mod host_mutex;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeBackend {
     Cpu,
@@ -3361,7 +3364,7 @@ pub(super) struct MetadataHostBound {
 const TOKENIZER_HOST_GAP: &str =
     "tokenizer/regex cold-construction and first-search host allocation upper unproved (aa011)";
 const METADATA_HOST_GAP: &str =
-    "Iris metadata host allocation upper unproved: exact libc0.2.183 Apple cfg-chain / pthread_mutex_t requested layout missing";
+    "Iris metadata host allocation upper unproved: complete execution-time parser/key/container allocation coverage missing";
 
 /// Known requested-layout contributions, not a certificate. All fields are checked u64 sums;
 /// provenance is a closed bit set, never a caller-controlled path or diagnostic string.
@@ -3375,6 +3378,8 @@ pub struct KnownHostFragments {
     pub inventory_vectors: u64,
     pub payload: u64,
     pub callbacks: u64,
+    /// Cold native mutex box requests, conditional on the requested-host-layout premise.
+    pub mutexes: u64,
     /// Bit 0: retained inventory; 1: held config; 2: held backbone header;
     /// 3: held empty-prompt header; 4: held task-stamp header.
     pub provenance: u8,
@@ -3391,6 +3396,7 @@ impl KnownHostFragments {
             self.inventory_vectors,
             self.payload,
             self.callbacks,
+            self.mutexes,
         ]
         .into_iter()
         .try_fold(0, plus)
@@ -3435,7 +3441,9 @@ impl IrisHostAnalysis {
             callback_events: CallbackEventUpper::default(),
             source_guard_gap: None,
             missing: [
-                Some(IrisHostGap::AppleMutexAbi),
+                host_mutex::requested_bytes(0)
+                    .is_none()
+                    .then_some(IrisHostGap::AppleMutexAbi),
                 Some(IrisHostGap::CapturedMetadata),
                 None,
                 None,
@@ -3475,7 +3483,7 @@ impl IrisHostAnalysis {
     }
 
     /// Bounded formatting: static keys/reasons and at most 20 decimal digits per u64 field.
-    /// The known sum is diagnostic ONLY. The missing Mutex term is never replaced with zero.
+    /// The known sum is diagnostic ONLY. Unknown metadata terms never become zero credits.
     pub fn refusal(self) -> Error {
         let prefix = match self.missing.into_iter().flatten().next() {
             Some(IrisHostGap::CallerCallbacks) => CALLBACK_HOST_GAP,
@@ -3484,9 +3492,9 @@ impl IrisHostAnalysis {
         };
         let k = self.known;
         Error::Unsupported(format!(
-            "{prefix}; known_requested_fragments[not_certificate]: input={:020},normalized={:020},yaml={:020},keys={:020},json={:020},inventory={:020},payload={:020},callbacks={:020},provenance={:03}; missing={:?}; native_replay_upper={:?}; worker_stack_request_bytes={:020}; source_guard_gap={:?}",
+            "{prefix}; known_requested_fragments[not_certificate]: input={:020},normalized={:020},yaml={:020},keys={:020},json={:020},inventory={:020},payload={:020},callbacks={:020},mutexes={:020},provenance={:03}; missing={:?}; native_replay_upper={:?}; worker_stack_request_bytes={:020}; source_guard_gap={:?}",
             k.input_buffers, k.normalized_headers, k.yaml_trees, k.streamed_keys,
-            k.json_layouts, k.inventory_vectors, k.payload, k.callbacks, k.provenance,
+            k.json_layouts, k.inventory_vectors, k.payload, k.callbacks, k.mutexes, k.provenance,
             self.missing, self.native_replay_upper, self.worker_stack_request_bytes, self.source_guard_gap,
         ))
     }
@@ -3681,6 +3689,17 @@ pub(super) fn host_analysis_from_sources(
     analysis.known.provenance |= 1;
     analysis.known.payload = host_payload_growth_upper(req, Some(sources))?;
     analysis.callback_events = callback_events_from_sources(req, sources)?;
+    // Both native source replays call pixel_embed_body -> pixel_pos once per forward.
+    // Charge each lock, even when the model's OnceBox is already initialized.
+    let locks = match &sources.task {
+        GuardedTask::Depth { .. } => 1,
+        GuardedTask::Restoration { plan, .. } => plan.forward_count().map_err(Error::from)?,
+    };
+    if let Some(bytes) = host_mutex::requested_bytes(locks) {
+        analysis.known.mutexes = bytes;
+    } else if host_mutex::requested_bytes(0).is_some() {
+        return Err(overflow());
+    }
     if let GuardedTask::Restoration { plan, .. } = &sources.task {
         if plan.color_fix {
             analysis.worker_stack_request_bytes = product(&[
@@ -3710,8 +3729,8 @@ fn required_tokenizer_host_bytes(
 
 /// Finite complete requested HOST-layout bound only when every input term is proved. No
 /// request-scaled parser/tokenizer/plan/container allocation may hide in a fixed empirical reserve.
-/// Today generation fails at aa011, and depth/restoration retain the named exact-version
-/// Apple Mutex ABI gap. Recovered parser/table components are independently source-priced below.
+/// Today generation fails at aa011, and depth/restoration retain incomplete execution-time
+/// metadata coverage. Recovered parser/table/mutex fragments are independently source-priced.
 /// The plane/tap/axis payload recipes below remain available separately, but are NOT certificates.
 pub(super) fn host_growth_upper(
     req: &IosPricingRequest<'_>,
@@ -4550,7 +4569,10 @@ mod host_payload {
                 Err(Error::Unsupported(reason)) => {
                     assert!(reason.starts_with(METADATA_HOST_GAP));
                     assert!(reason.contains("known_requested_fragments[not_certificate]"));
-                    assert!(reason.contains("AppleMutexAbi"));
+                    assert_eq!(
+                        reason.contains("AppleMutexAbi"),
+                        host_mutex::requested_bytes(0).is_none()
+                    );
                     assert!(reason.contains("CapturedMetadata"));
                 }
                 other => panic!("missing metadata proof accepted: {other:?}"),
@@ -4594,7 +4616,10 @@ mod host_payload {
                 Err(Error::Unsupported(reason)) => {
                     assert!(reason.starts_with(METADATA_HOST_GAP));
                     assert!(reason.contains("known_requested_fragments[not_certificate]"));
-                    assert!(reason.contains("AppleMutexAbi"));
+                    assert_eq!(
+                        reason.contains("AppleMutexAbi"),
+                        host_mutex::requested_bytes(0).is_none()
+                    );
                     assert!(reason.contains("CapturedMetadata"));
                 }
                 other => panic!("depth metadata proof accepted: {other:?}"),
@@ -4646,7 +4671,10 @@ mod host_payload {
                 Err(Error::Unsupported(reason)) => {
                     assert!(reason.starts_with(METADATA_HOST_GAP));
                     assert!(reason.contains("known_requested_fragments[not_certificate]"));
-                    assert!(reason.contains("AppleMutexAbi"));
+                    assert_eq!(
+                        reason.contains("AppleMutexAbi"),
+                        host_mutex::requested_bytes(0).is_none()
+                    );
                     assert!(reason.contains("CapturedMetadata"));
                 }
                 other => panic!("tokenizer-only bound accepted: {other:?}"),

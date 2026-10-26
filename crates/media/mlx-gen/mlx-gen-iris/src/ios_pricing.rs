@@ -59,7 +59,7 @@ pub use bounder::{
 /// The request's finite source/request-derived HOST (Rust heap) growth upper outside the MLX
 /// counter, including the caller-stated callback term. Refuses with the exact named gap while
 /// any term is unproved (today: generation's tokenizer/regex upper; depth/restoration's
-/// exact-version metadata/Apple Mutex layout); never a partial sum.
+/// complete execution-time metadata coverage); never a partial sum.
 pub fn host_growth_upper(
     req: &IosPricingRequest<'_>,
     callback: Option<mlx_gen::ios_pricing::IosCallbackHost>,
@@ -5857,7 +5857,7 @@ mod guarded_source_tests {
         .unwrap();
         assert_eq!(analysis.known, KnownHostFragments::default());
         let reason = analysis.refusal().to_string();
-        assert!(reason.contains("exact libc0.2.183 Apple cfg-chain"));
+        assert!(reason.contains("complete execution-time parser/key/container allocation coverage"));
         assert!(reason.contains("SourceMetadataCapacity"));
         assert!(!reason.contains("this-Iris-source"));
         assert!(reason.len() < 2048);
