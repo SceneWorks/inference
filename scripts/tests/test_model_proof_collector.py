@@ -218,9 +218,11 @@ class Collector(unittest.TestCase):
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
         (root / 'case.rs').write_text('// test fixture; no actual Rust execution', encoding="utf-8")
         def toolchain(env, **_kwargs):
+            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
             env['CARGO_ENCODED_RUSTFLAGS'] = 'MOCK_NATIVE_LINKER_FLAGS'
             return {'toolchain': 'MOCK; no compiler invoked'}
         def preparation(_row, env):
+            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
             self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
             return {'prebuilt': 'MOCK; not executed'}
         def guarded(argv, **kwargs):
@@ -299,6 +301,15 @@ class Collector(unittest.TestCase):
             self.assertEqual(calls, 1)
             self.assertFalse(receipt['cases'][0]['accepted'])
             self.assertFalse(verified['accepted_model_run'])
+
+    def test_registered_mlx_deployment_precedes_toolchain_sdk_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            row = case()
+            row['deployment_target'] = '26.2'
+            status, _receipt, _verified, calls, _output = self._mock_run(
+                Path(temporary).resolve(), row_override=row)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
 
     def test_failed_child_keeps_failure_receipt_and_known_logs_not_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:

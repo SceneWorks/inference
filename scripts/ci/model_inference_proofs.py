@@ -25,6 +25,7 @@ from scripts.ci.model_proof_parent_helpers import validate_parent_helpers
 from scripts.ci.model_proof_resources import validate_child_visibility
 from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validate_contract
 from scripts.ci import model_proof_multi_cuda as multi_cuda
+from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
 
 REGISTRY_PATH = Path(__file__).with_name('model-inference-proofs.json')
@@ -762,7 +763,7 @@ def configure_native_darwin_build(env, rustc, *, root, system):
 
     Cargo's encoded flags preserve paths containing spaces and take precedence over
     plain/target Rust flags. The proof controller builds only its native host target.
-    SDK selection, deployment and native MLX artifact verification remain independent.
+    Probe SDK/linker compatibility before discovery; native MLX verification stays independent.
     """
     if system != "Darwin":
         return {"mechanism": "not applicable"}
@@ -783,13 +784,6 @@ def configure_native_darwin_build(env, rustc, *, root, system):
     linker = sysroot / "lib/rustlib" / host / "bin/rust-lld"
     if not sysroot.is_absolute() or not linker.is_file():
         raise ValueError("selected Rust toolchain lacks its native Darwin rust-lld")
-    sdk = env.get("SDKROOT")
-    if not sdk:
-        sdk = subprocess.run(["xcrun", "--sdk", "macosx", "--show-sdk-path"],
-                             cwd=root, env=env, check=True, capture_output=True,
-                             text=True, encoding="utf-8", timeout=30).stdout.strip()
-    if not Path(sdk).is_absolute() or not Path(sdk).is_dir():
-        raise ValueError("native Mac build requires an existing selected macOS SDK")
     target_flags = "CARGO_TARGET_" + host.upper().replace("-", "_") + "_RUSTFLAGS"
     if "CARGO_ENCODED_RUSTFLAGS" in env:
         flags = env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if env["CARGO_ENCODED_RUSTFLAGS"] else []
@@ -797,15 +791,18 @@ def configure_native_darwin_build(env, rustc, *, root, system):
         # Cargo splits plain RUSTFLAGS on whitespace, rather than shell syntax.
         flags = env.get("RUSTFLAGS", env.get(target_flags, "")).split()
     flags += ["-C", "linker-flavor=ld64.lld", "-C", "linker=" + str(linker)]
-    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
-    env["SDKROOT"] = sdk
+    selected = env.copy()
+    selected["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     for profile in ("DEV", "TEST"):
-        env[f"CARGO_PROFILE_{profile}_STRIP"] = "none"
-        env[f"CARGO_PROFILE_{profile}_BUILD_OVERRIDE_STRIP"] = "none"
+        selected[f"CARGO_PROFILE_{profile}_STRIP"] = "none"
+        selected[f"CARGO_PROFILE_{profile}_BUILD_OVERRIDE_STRIP"] = "none"
+    sdk, sdk_preflight = select_native_darwin_sdk(rustc, selected, root=root)
+    selected["SDKROOT"] = sdk
+    env.update(selected)
     return {"mechanism": "selected-toolchain native Darwin rust-lld",
             "host": host, "sysroot": str(sysroot), "linker": str(linker),
             "linker_sha256": hashlib.sha256(linker.read_bytes()).hexdigest(),
-            "sdk": sdk, "rustflags": flags, "strip": "none"}
+            "sdk": sdk, "rustflags": flags, "strip": "none", "sdk_preflight": sdk_preflight}
 
 
 def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
@@ -977,6 +974,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         raise ValueError('missing authenticated Iris asset preflight receipt')
                     result['asset_preflight'] = validate_iris_asset_receipt(
                         json.loads(Path(path).read_text(encoding='utf-8')), backend, env)
+                if backend == 'mlx':
+                    env['MACOSX_DEPLOYMENT_TARGET'] = mlx_build_deployment(row)
                 result['toolchain'] = verified_toolchain(env, root=ROOT)
                 result['build_preparation'] = prepare_build(row, env)
                 for discover in (True, False):
@@ -1119,13 +1118,18 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 stream.write(text)
 
 
+def mlx_build_deployment(row: dict) -> str:
+    deployment = row.get('deployment_target', '15.0')
+    if deployment not in ('15.0', '26.2'):
+        raise ValueError('unregistered MLX deployment configuration')
+    return deployment
+
+
 def prepare_build(row: dict, env: dict[str, str]) -> dict:
     """Use the existing published-native helper; never download or copy a model checkpoint."""
     if not any(device.startswith('mlx-') for device in device_set(row)) and row.get('backend') != 'mlx':
         return {'prebuilt': 'not applicable'}
-    deployment = row.get('deployment_target', '15.0')
-    if deployment not in ('15.0', '26.2'):
-        raise ValueError('unregistered MLX deployment configuration')
+    deployment = mlx_build_deployment(row)
     env['MACOSX_DEPLOYMENT_TARGET'] = deployment
     env.pop('PMETAL_MLX_PREBUILT_DIR', None)
     env.pop('PMETAL_METALLIB_PATH', None)

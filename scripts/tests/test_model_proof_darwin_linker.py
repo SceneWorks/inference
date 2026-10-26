@@ -11,6 +11,15 @@ from scripts.ci import model_inference_proofs as proof
 
 
 class DarwinLinkerTests(unittest.TestCase):
+    def setUp(self):
+        def select(_rustc, env, *, root):
+            self.assertIn("linker-flavor=ld64.lld", env["CARGO_ENCODED_RUSTFLAGS"])
+            self.assertEqual(env["CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP"], "none")
+            return env.get("SDKROOT", str(self.sdk.resolve())), {"fixture_probe": "passed"}
+        selector = patch.object(proof, "select_native_darwin_sdk", side_effect=select)
+        selector.start()
+        self.addCleanup(selector.stop)
+
     def fixture(self, root):
         sysroot = root / "custom rustup home/toolchains/selected"
         linker = sysroot / "lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
@@ -18,6 +27,7 @@ class DarwinLinkerTests(unittest.TestCase):
         linker.write_bytes(b"fixture selected linker; never executed")
         sdk = root / "selected SDK/MacOSX.sdk"
         sdk.mkdir(parents=True)
+        self.sdk = sdk
         return sysroot, linker, sdk
 
     def inspector(self, sysroot, sdk):
@@ -57,7 +67,7 @@ class DarwinLinkerTests(unittest.TestCase):
                 self.assertEqual(env[f"CARGO_PROFILE_{profile}_STRIP"], "none")
                 self.assertEqual(env[f"CARGO_PROFILE_{profile}_BUILD_OVERRIDE_STRIP"], "none")
 
-    def test_encoded_flags_take_precedence_and_missing_sdk_uses_selected_xcrun(self):
+    def test_encoded_flags_take_precedence_and_missing_sdk_uses_preflight(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sysroot, linker, sdk = self.fixture(root)
@@ -65,10 +75,10 @@ class DarwinLinkerTests(unittest.TestCase):
             with patch.object(proof.subprocess, "run", side_effect=self.inspector(sysroot, sdk)) as run:
                 receipt = proof.configure_native_darwin_build(
                     env, ["/selected/rustc"], root=root, system="Darwin")
-            self.assertEqual(run.call_count, 3)
+            self.assertEqual(run.call_count, 2)
             self.assertEqual(receipt["rustflags"][:2], ["-C", "link-arg=has a space"])
             self.assertNotIn("ignored-plain", env["CARGO_ENCODED_RUSTFLAGS"])
-            self.assertEqual(env["SDKROOT"], str(sdk))
+            self.assertEqual(env["SDKROOT"], str(sdk.resolve()))
             self.assertEqual(receipt["linker"], str(linker))
 
     def test_target_flags_are_retained_only_when_no_global_flags_are_present(self):
@@ -95,6 +105,18 @@ class DarwinLinkerTests(unittest.TestCase):
                     proof.configure_native_darwin_build(env, ["rustc"], root=root, system="Darwin")
             self.assertEqual(run.call_count, 2)
             self.assertEqual(env, {"SDKROOT": str(sdk)})
+
+    def test_incompatible_explicit_sdk_refuses_without_committing_any_build_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sysroot, _linker, sdk = self.fixture(root)
+            env = {"SDKROOT": str(sdk), "RUSTFLAGS": "--cfg original"}
+            original = env.copy()
+            with patch.object(proof.subprocess, "run", side_effect=self.inspector(sysroot, sdk)), \
+                    patch.object(proof, "select_native_darwin_sdk", side_effect=ValueError("explicit SDKROOT: bad TAPI")):
+                with self.assertRaisesRegex(ValueError, "explicit SDKROOT: bad TAPI"):
+                    proof.configure_native_darwin_build(env, ["rustc"], root=root, system="Darwin")
+            self.assertEqual(env, original)
 
     def test_cross_target_refuses_and_other_platforms_are_unchanged(self):
         env = {"CARGO_BUILD_TARGET": "aarch64-apple-ios", "RUSTFLAGS": "old"}
