@@ -197,9 +197,7 @@ fn bounder_impl(
         BTreeMap::new();
     let mut pages = BTreeSet::new();
     for (capture_index, capture) in anchor_pricing.observations.iter().enumerate() {
-        if capture.domain != IosMemoryDomain::NativeAllocatorGrowth
-            || capture.coordinate != IosMemoryCoordinate::BeforeModelLoad
-        {
+        if !capture.has_source_witness_coordinate() {
             continue;
         }
         for (check_index, check) in capture.checks.iter().enumerate() {

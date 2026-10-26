@@ -184,6 +184,18 @@ pub struct IosAnchorObservation {
     /// A gap invalidates phase attribution; the law uses the whole-run kernel upper instead.
     pub telemetry_complete: bool,
 }
+impl IosAnchorObservation {
+    /// Whether this capture can identify source checks at the admission baseline.
+    /// Metadata/check provenance is independent of its measured counter: accepting a process
+    /// capture here never converts a native numeric certificate into process-growth authority.
+    pub fn has_source_witness_coordinate(&self) -> bool {
+        matches!(
+            self.domain,
+            IosMemoryDomain::NativeAllocatorGrowth | IosMemoryDomain::ProcessGrowth
+        ) && self.coordinate == IosMemoryCoordinate::BeforeModelLoad
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IosAnchorWitness {
     pub capture: u32,

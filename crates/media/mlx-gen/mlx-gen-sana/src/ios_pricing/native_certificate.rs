@@ -73,9 +73,7 @@ fn observed_page(
         .and_then(|n| n.checked_mul(u64::try_from(d.latent_channels).ok()?))
         .ok_or_else(|| invalid("source unscaled latent extent overflow"))?;
     for capture in &pricing.observations {
-        if capture.domain != IosMemoryDomain::NativeAllocatorGrowth
-            || capture.coordinate != IosMemoryCoordinate::BeforeModelLoad
-        {
+        if !capture.has_source_witness_coordinate() {
             return Err(invalid("incompatible observation domain/baseline"));
         }
         for check in &capture.checks {

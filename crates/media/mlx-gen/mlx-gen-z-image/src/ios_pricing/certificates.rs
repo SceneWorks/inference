@@ -213,11 +213,7 @@ fn bind_prefixes(
                 // The witness only names an ACTUAL anchor check at this coordinate; the bound
                 // stays native. A process-domain anchor can consume it ONLY through an approved
                 // native-to-process premise, which the law's domain check otherwise refuses.
-                if !matches!(
-                    observation.domain,
-                    IosMemoryDomain::NativeAllocatorGrowth | IosMemoryDomain::ProcessGrowth
-                ) || observation.coordinate != IosMemoryCoordinate::BeforeModelLoad
-                {
+                if !observation.has_source_witness_coordinate() {
                     continue;
                 }
                 for (check, observed) in observation.checks.iter().enumerate() {

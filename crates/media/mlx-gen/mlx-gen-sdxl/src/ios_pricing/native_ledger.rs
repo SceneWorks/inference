@@ -3988,9 +3988,7 @@ fn anchor_witnesses(
     let elements = p!(latent_h, latent_w, 4);
     let steps = execution_steps(anchor)?;
     for (ci, capture) in pricing.observations.iter().enumerate() {
-        if capture.domain != IosMemoryDomain::NativeAllocatorGrowth
-            || capture.coordinate != IosMemoryCoordinate::BeforeModelLoad
-        {
+        if !capture.has_source_witness_coordinate() {
             continue;
         }
         for (ki, check) in capture.checks.iter().enumerate() {
