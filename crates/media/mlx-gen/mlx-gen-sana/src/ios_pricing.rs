@@ -331,6 +331,34 @@ fn dcae_block_quanta(
 fn decode_quanta(cfg: &DcAeConfig, lh: u64, lw: u64, tiling: Option<(i32, i32)>, out: &mut Quanta) {
     decode_quanta_in_regime(cfg, lh, lw, tiling, SanaPricingRegime::Ordinary, out)
 }
+
+/// Largest mandatory upsample guard in the actual decoder plan. Upsample quanta are identical
+/// in ordinary and native-retirement execution. Reuse the same traversal as source pricing,
+/// including its real tail tiling/extents; no tokenizer, weight payload or model is constructed.
+/// This is a conservative guard formula, never an observed physical allocation.
+pub(crate) fn planned_decode_upsample_guard(
+    cfg: &DcAeConfig,
+    width: u32,
+    height: u32,
+    tiling: Option<(i32, i32)>,
+) -> u64 {
+    let mut quanta = Quanta::default();
+    decode_quanta(
+        cfg,
+        u64::from(height / LATENT_SCALE),
+        u64::from(width / LATENT_SCALE),
+        tiling,
+        &mut quanta,
+    );
+    quanta
+        .0
+        .iter()
+        .filter(|q| q.1 == labels::DECODER_UPSAMPLE)
+        .map(|q| q.0)
+        .max()
+        .unwrap_or(0)
+}
+
 fn decode_quanta_in_regime(
     cfg: &DcAeConfig,
     lh: u64,

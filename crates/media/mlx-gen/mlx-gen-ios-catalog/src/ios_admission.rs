@@ -3024,22 +3024,36 @@ fn capture_permit_using_key_capacity(
     if !simulator_functional
         && matches!(permit.provider.as_str(), "sana_1600m" | "sana_sprint_1600m")
     {
-        // The real key/inventory already exists. This header-only union check must precede
+        // The real key/inventory already exists. This header/decoder-plan preflight must precede
         // runtime capture observers, whose source-event planning may construct a tokenizer.
+        let IosWork::Generate(request) = &candidate.work else {
+            return Err(AdmissionError::refused(
+                RefusalKind::Mode,
+                "SANA capture needs generation work",
+            ));
+        };
         match next {
             Some(next) => with_source_inventory_capacity(next, |core_next| {
                 permit
                     .spec
                     .read_prepared_files_unchanged_with_capacity(core_next, |_| {
-                        mlx_gen_sana::model::preflight_resident_load(&permit.spec, &permit.provider)
-                            .map_err(Error::from)
+                        mlx_gen_sana::model::preflight_resident_request(
+                            &permit.spec,
+                            &permit.provider,
+                            request,
+                        )
+                        .map_err(Error::from)
                     })
             }),
             None => permit
                 .spec
                 .read_prepared_files_unchanged(|| {
-                    mlx_gen_sana::model::preflight_resident_load(&permit.spec, &permit.provider)
-                        .map_err(Error::from)
+                    mlx_gen_sana::model::preflight_resident_request(
+                        &permit.spec,
+                        &permit.provider,
+                        request,
+                    )
+                    .map_err(Error::from)
                 })
                 .map_err(AdmissionError::Failed),
         }?;

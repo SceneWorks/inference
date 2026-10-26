@@ -691,8 +691,17 @@ For SANA resident captures, the catalog checks the mandatory header-derived unio
 Gemma, the transformer and the complete VAE before the observation planner constructs
 its tokenizer. An over-headroom union produces a typed `capture_refused` with the real
 source/key and structured refused quantum; it does not deliberately load the first
-component of an already known nonfit resident configuration. This load floor and the
-existing reserve are not a physical-memory upper bound for optimized execution.
+component of an already known nonfit resident configuration. The request-aware preflight
+also checks the largest mandatory decoder upsample formula from the actual resolved
+plan, using the existing source-pricing traversal. It checks the maximum of that future
+scratch and the weight floor, without adding the resident weights again. For an untiled
+1024² SANA request, the existing 1024², 256→128-channel upsample formula is
+13,962,842,112 bytes before the unchanged 512 MiB reserve: its eventual refusal can
+therefore be returned before any weights load. These are conservative guard bytes,
+not measured physical demand or proof of a termination cause. Tiled and smaller plans
+use their actual extents; sequential optimized capture keeps its existing path. The
+later per-quantum headroom check remains in place. This floor/lookahead and reserve
+are not a physical-memory upper bound for optimized execution.
 
 The harness atomically overwrites one bounded `Documents/campaign-progress.txt` record
 at preparation, observation, load, batch materialization and coherence transitions. Its
@@ -701,8 +710,8 @@ anchor or a substitute for a typed refusal. A last transition can narrow an inte
 run's stage without proving its termination cause. Per-batch telemetry adds no new
 capacity charge, and compiles to a no-op on desktop and simulator builds.
 
-CI_IMPACT: the bootstrap guard adds only focused header/key/refusal/sidecar tests and
-native compilation/lint checks. These construct no model and execute no learned layer;
+CI_IMPACT: the bootstrap guard and resident lookahead add only focused
+plan/header/key/refusal/sidecar tests and native compilation/lint checks. These construct no model and execute no learned layer;
 normal CI gains no inference campaign or model-compute requirement.
 
 The following are **future session recipes, not instructions to run now**. Phone

@@ -753,36 +753,53 @@ fn resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokeniza
         "ios_admission::tests::resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokenization",
         || {
             let registry = crate::provider_registry().unwrap();
-            let root = tempfile::tempdir().unwrap();
-            let mut candidate = build_candidate(
-                &registry,
-                "sana_1600m",
-                sana(root.path()).with_offload_policy(mlx_gen::OffloadPolicy::Resident),
-                None,
-                MemoryStrategy::Resident,
-                generation(512, vec![]),
-            ).unwrap();
-            // Only the three tiny, real header/payload files exist: no tokenizer or model config.
-            let mut next = |_| Ok(());
-            let key = capture_evidence_key_with_key_capacity(
-                &registry, &mut candidate, DEVICE, &mut next,
-            ).unwrap();
-            assert_eq!(key.token_window, 0);
-            let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
-                mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES + 767,
-                || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).is_err()),
-            ).unwrap();
-            assert!(refused, "the 768-byte mandatory resident union cannot fit");
-            let refusal = mlx_gen::ios_quantum::take_refusal().unwrap();
-            assert_eq!(refusal.label, mlx_gen_sana::quantum::labels::RESIDENT_LOAD);
-            assert_eq!(refusal.scratch_bytes, 768);
-            // Raising only the fixture headroom to the exact union permits the same real key.
-            let permit = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
-                mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES + 768,
-                || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).unwrap()),
-            ).unwrap();
-            assert_eq!(permit.evidence_key(), &key);
-            assert!(permit.is_capture());
+            for quant in [None, Some(mlx_gen::Quant::Q4)] {
+                let root = tempfile::tempdir().unwrap();
+                let mut spec = sana(root.path()).with_offload_policy(mlx_gen::OffloadPolicy::Resident);
+                if quant.is_some() {
+                    // Real affine group-64 packed headers, not a quantization tag on dense data.
+                    for (file, base) in [
+                        ("transformer/a.safetensors", "proj"),
+                        ("text_encoder/gemma-2-2b-it.safetensors", "model.embed_tokens"),
+                    ] {
+                        let names = [format!("{base}.weight"), format!("{base}.scales"), format!("{base}.biases")];
+                        gen_core_testkit::wan_i2v::write_safetensors(&root.path().join(file), &[
+                            (&names[0], "U32", &[8, 8]),
+                            (&names[1], "BF16", &[8, 1]),
+                            (&names[2], "BF16", &[8, 1]),
+                        ]);
+                    }
+                }
+                spec.quantize = quant;
+                let mut candidate = build_candidate(&registry, "sana_1600m", spec, None,
+                    MemoryStrategy::Resident, generation(1024, vec![])).unwrap();
+                // Only tiny real header/payload files exist: no tokenizer/model configuration.
+                let mut next = |_| Ok(());
+                let key = capture_evidence_key_with_key_capacity(
+                    &registry, &mut candidate, DEVICE, &mut next,
+                ).unwrap();
+                assert_eq!(key.token_window, 0);
+                assert_eq!(key.tier, if quant.is_some() { "q4" } else { "bf16" });
+                let future = mlx_gen_sana::quantum::dcae_upsample_bytes(1, 1024, 1024, 256, 128);
+                assert_eq!(future, 13_962_842_112);
+                let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
+                    6144 << 20,
+                    || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).is_err()),
+                ).unwrap();
+                assert!(refused, "a mandatory future raw guard already exceeds the phone ceiling");
+                let refusal = mlx_gen::ios_quantum::take_refusal().unwrap();
+                assert_eq!(refusal.label, mlx_gen_sana::quantum::labels::RESIDENT_LOAD);
+                assert_eq!(refusal.scratch_bytes, future);
+                assert_eq!(refusal.reserve_bytes, mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES);
+                assert_eq!(refusal.available_bytes, Some(6144 << 20));
+                // Synthetic threshold equality only, not a claim that this phone has that headroom.
+                let permit = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
+                    mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES + future,
+                    || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).unwrap()),
+                ).unwrap();
+                assert_eq!(permit.evidence_key(), &key);
+                assert!(permit.is_capture());
+            }
         },
     );
 }

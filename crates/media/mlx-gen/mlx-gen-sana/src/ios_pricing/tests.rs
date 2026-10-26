@@ -1,5 +1,27 @@
 use super::*;
 
+#[test]
+fn resident_lookahead_uses_the_actual_decode_upsample_plan() {
+    let cfg = DcAeConfig::sana_f32c32();
+    let full = planned_decode_upsample_guard(&cfg, 1024, 1024, None);
+    assert_eq!(full, 13_962_842_112);
+    assert_eq!(full, quantum::dcae_upsample_bytes(1, 1024, 1024, 256, 128));
+    assert_eq!(
+        planned_decode_upsample_guard(&cfg, 512, 256, None),
+        quantum::dcae_upsample_bytes(1, 256, 512, 256, 128)
+    );
+    assert!(planned_decode_upsample_guard(&cfg, 1024, 1024, Some((192, 48))) < full);
+    // The traversal follows its actual configuration, rather than encoding SANA's last stage.
+    let mut smaller = cfg;
+    smaller.block_out_channels = vec![16, 32];
+    smaller.block_types = vec![BlockType::Res; 2];
+    smaller.layers_per_block = vec![1, 1];
+    assert_eq!(
+        planned_decode_upsample_guard(&smaller, 1024, 1024, None),
+        quantum::dcae_upsample_bytes(1, 64, 64, 32, 16)
+    );
+}
+
 /// Actual tokenizer/parser path only: no tensor, stream, model or admission.
 /// Fresh paths ensure the successful per-path memo cannot mask source corruption.
 #[test]

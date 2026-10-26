@@ -242,6 +242,54 @@ pub fn preflight_resident_load(spec: &LoadSpec, provider: &str) -> Result<()> {
     )
 }
 
+/// Catalog capture lookahead, after its real request/source key is bound. A resident render must
+/// eventually execute its actual decoder plan. Hoist an already required upsample guard before
+/// weights load, so a programme known to refuse later never first warms the resident pair and
+/// denoises. The maximum does not add held weights twice, invent a new cap, or claim that these
+/// conservative formula bytes are measured physical demand. Sequential capture is unchanged.
+pub fn preflight_resident_request(
+    spec: &LoadSpec,
+    provider: &str,
+    request: &GenerationRequest,
+) -> Result<()> {
+    if spec.offload_policy != mlx_gen::OffloadPolicy::Resident {
+        return Ok(());
+    }
+    let descriptor = match provider {
+        MODEL_ID => descriptor(),
+        SPRINT_MODEL_ID => sprint_descriptor(),
+        _ => return Err(Error::Unsupported("unknown SANA capture provider".into())),
+    };
+    validate_request(&descriptor, request)?;
+    if let Some(memory) = &request.memory {
+        crate::memory_strategy::validate_request_memory(provider, spec, memory)
+            .map_err(|error| Error::Unsupported(error.to_string()))?;
+    }
+    let root = load_components(spec, provider)?;
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let load = mlx_gen::ios_quantum::load_floor_bytes(
+        &[
+            root.join("text_encoder"),
+            root.join("transformer"),
+            root.join("vae"),
+        ],
+        |_| true,
+    )?;
+    let tiling = crate::pipeline::resolved_decode_plan(request.memory, false)
+        .map(|plan| (plan.edge, plan.overlap));
+    let future = crate::ios_pricing::planned_decode_upsample_guard(
+        &DcAeConfig::sana_f32c32(),
+        request.width,
+        request.height,
+        tiling,
+    );
+    // Keep the one existing pre-invocation Checked event/label. The future guard remains in the
+    // decoder as well; this early check is not permission to skip its later fresh headroom check.
+    mlx_gen::ios_quantum::before(crate::quantum::labels::RESIDENT_LOAD, load.max(future))
+}
+
 /// Shared load body for [`load`] / [`load_sprint`]: fail-fast on the unsupported precision / adapter
 /// overrides (via [`load_components`]) up front for BOTH residencies, then build the [`Residency`]
 /// seam. `Resident` (default) builds the Gemma text encoder + heavy bundle now and holds them warm;
@@ -1044,6 +1092,36 @@ mod tests {
                     preflight_resident_load(&spec, provider)
                 })
                 .unwrap();
+                let request = GenerationRequest {
+                    prompt: "metadata-only lookahead".into(),
+                    width: 1024,
+                    height: 1024,
+                    memory: Some(mlx_gen::gen_core::GenerationMemory {
+                        tile_vae_decode: true,
+                        decode_tile_edge: Some(192),
+                        decode_overlap: Some(48),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let planned = crate::ios_pricing::planned_decode_upsample_guard(
+                    &DcAeConfig::sana_f32c32(),
+                    1024,
+                    1024,
+                    Some((192, 48)),
+                );
+                assert!(planned > 32);
+                with_cpu_diagnostic_headroom(PROCESS_RESERVE_BYTES + planned, || {
+                    preflight_resident_request(&spec, provider, &request)
+                })
+                .unwrap();
+                assert!(
+                    with_cpu_diagnostic_headroom(PROCESS_RESERVE_BYTES + planned - 1, || {
+                        preflight_resident_request(&spec, provider, &request)
+                    })
+                    .is_err()
+                );
+                assert_eq!(take_refusal().unwrap().scratch_bytes, planned);
             }
         }
         let missing = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
@@ -1051,6 +1129,18 @@ mod tests {
         ))
         .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
         with_cpu_diagnostic_headroom(0, || preflight_resident_load(&missing, MODEL_ID)).unwrap();
+        with_cpu_diagnostic_headroom(0, || {
+            preflight_resident_request(
+                &missing,
+                MODEL_ID,
+                &GenerationRequest {
+                    width: 1024,
+                    height: 1024,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
     }
 
     fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
