@@ -292,7 +292,9 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
         for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
             for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
                 primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
-                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures"}
+                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures",
+                    "synthetic-w4a8-mlx", "synthetic-w4a8-cuda", "synthetic-w4a8-both",
+                    "moss-edit-cuda", "moss-edit-metal"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
@@ -553,6 +555,26 @@ def windows_reviewed_interpreter_exemption_errors(job: str, lines: list[str]) ->
     return errors
 
 
+def workflow_run_commands(lines: list[str]) -> list[str]:
+    """Mask YAML metadata while retaining executable run-line ordering."""
+    commands = [""] * len(lines)
+    block_indent = None
+    for index, line in enumerate(lines):
+        if block_indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip()) > block_indent:
+                commands[index] = line.split("#", 1)[0].strip()
+                continue
+            block_indent = None
+        match = re.fullmatch(r"(\s*)(?:-\s+)?run:\s*(.*)", line)
+        if match:
+            value = match[2].strip()
+            if value in {"|", "|-", "|+", ">", ">-", ">+"}:
+                block_indent = len(match[1])
+            else:
+                commands[index] = value
+    return commands
+
+
 def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     """Pin every Windows real-weight Python command to the reviewed CPython 3.12.
 
@@ -562,7 +584,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     prompt, which unattended CI cannot satisfy. Guard the no-registry uv provisioning plus every
     producer and consumer, not only pip: mixing interpreters around a shared ``PYTHONPATH`` is
     equally unsafe. ``cmd`` also continues after a failed command, so every hash-locked install must
-    explicitly terminate the step.
+    explicitly terminate the step. Jobs without Python commands need no Python provisioner.
+    A managed interpreter already on the runner may be resolved without installation only when
+    a missing path and an exact-version mismatch both abort before exporting the interpreter.
 
     Jobs in ``WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS`` answer the same hazard with their own
     hard interpreter validation instead; they are checked by
@@ -587,6 +611,13 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
             continue
         if job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
             errors.extend(windows_reviewed_interpreter_exemption_errors(job, lines))
+            continue
+        exact_commands = workflow_run_commands(lines)
+        if not any(interpreter.search(command) or re.search(
+            r"\buv\s+python\b|\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE
+        ) for command in exact_commands) and not any(
+            re.search(r"\buses:\s*actions/setup-python@", line) for line in lines
+        ):
             continue
         setup_indices = [
             index
@@ -618,7 +649,6 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
                 f"{job}: Windows jobs must not invoke the registry-dependent setup-python"
             )
 
-        exact_commands = [line.split("#", 1)[0].strip() for line in lines]
         install_indices = [
             index for index, command in enumerate(exact_commands) if command == WINDOWS_UV_INSTALL
         ]
@@ -630,10 +660,16 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
             for index, command in enumerate(exact_commands)
             if command == WINDOWS_PYTHON_EXPORT
         ]
-        if len(install_indices) != 1:
+        existing_guard = 'if not defined REVIEWED_PYTHON exit /b 1'
+        existing_version = (f'{WINDOWS_INTERPRETER} -c "import sys; assert '
+                            'sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1')
+        guard_indices = [i for i, command in enumerate(exact_commands) if command == existing_guard]
+        version_indices = [i for i, command in enumerate(exact_commands) if command == existing_version]
+        existing_only = not install_indices and len(guard_indices) == len(version_indices) == 1
+        if len(install_indices) != 1 and not existing_only:
             errors.append(
-                f"{job}: expected exactly one fail-fast managed CPython 3.12.10 install, "
-                f"found {len(install_indices)}"
+                f"{job}: require one fail-fast managed CPython install or a fail-closed "
+                "existing-interpreter lookup with exact version validation"
             )
         if len(find_indices) != 1:
             errors.append(
@@ -648,12 +684,13 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
         install_index = install_indices[0] if len(install_indices) == 1 else len(lines)
         find_index = find_indices[0] if len(find_indices) == 1 else len(lines)
         export_index = export_indices[0] if len(export_indices) == 1 else len(lines)
-        if not setup_index < install_index < find_index < export_index:
+        ordered = (setup_index < find_index < guard_indices[0] < version_indices[0] < export_index
+                   if existing_only else setup_index < install_index < find_index < export_index)
+        if not ordered:
             errors.append(
                 f"{job}: setup-uv, managed install, path resolution, and export are out of order"
             )
-        for index, line in enumerate(lines):
-            command = line.split("#", 1)[0]
+        for index, command in enumerate(exact_commands):
             stripped = command.strip()
             if stripped in {WINDOWS_UV_INSTALL, WINDOWS_UV_FIND}:
                 continue
@@ -1493,7 +1530,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ]
         # Shape, not population. `real_weight_windows_interpreter_errors` already enforces, per
         # Windows job, exactly one pinned setup-uv at the reviewed version with the cache off, one
-        # managed CPython 3.12.10 install, one path resolution, one reviewed-Python export, their
+        # managed CPython 3.12.10 install (or fail-closed existing lookup), one path resolution,
+        # one reviewed-Python export, their
         # ordering, and `|| exit /b 1` on every pip install. The file-wide totals that used to sit
         # here (`len(windows_python_lines) == 76` and six `workflow.count(...) == 11`) restated that
         # per-job claim as a frozen corpus: they went RED whenever a Windows job was legitimately
@@ -1574,6 +1612,46 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             1,
         )
         self.assertTrue(real_weight_windows_interpreter_errors(wrong_version_comment_decoy))
+
+    def test_windows_interpreter_guard_traces_commands_and_existing_lookup(self) -> None:
+        # Classification follows executable content: a renamed job has the same requirements.
+        no_python = """jobs:
+  arbitrary-name:
+    runs-on: [self-hosted, windows, cuda]
+    steps:
+      - name: Python is mentioned only in metadata
+        shell: cmd
+        run: cargo test --locked -p pure-metadata
+"""
+        self.assertEqual(real_weight_windows_interpreter_errors(no_python), [])
+        self.assertTrue(real_weight_windows_interpreter_errors(
+            no_python.replace("cargo test --locked -p pure-metadata", "python -c exit()")))
+        self.assertTrue(real_weight_windows_interpreter_errors(
+            no_python.replace("      - name:", "      - uses: actions/setup-python@v5\n      - name:")))
+        lookup = "\n".join((
+            "jobs:", "  differently-named-job:",
+            "    runs-on: [self-hosted, windows, cuda]", "    steps:",
+            f"      - uses: {WINDOWS_SETUP_ACTION}", "        with:",
+            f"          {WINDOWS_UV_VERSION}", f"          {WINDOWS_UV_CACHE}",
+            "      - name: Locate Python without installation", "        shell: cmd",
+            "        run: |", f"          {WINDOWS_UV_FIND}",
+            "          if not defined REVIEWED_PYTHON exit /b 1",
+            f'          {WINDOWS_INTERPRETER} -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1',
+            f"          {WINDOWS_PYTHON_EXPORT}",
+            f'          {WINDOWS_INTERPRETER} scripts/check_metadata.py',
+        ))
+        self.assertEqual(real_weight_windows_interpreter_errors(lookup), [])
+        for before, after in (
+            ("if not defined REVIEWED_PYTHON exit /b 1", ""),
+            ("== (3, 12, 10)", "== (3, 14, 0)"),
+            ("sys.version\" || exit /b 1", "sys.version\""),
+            (" --managed-python", ""),
+            (WINDOWS_PYTHON_EXPORT, ""),
+        ):
+            with self.subTest(before=before):
+                mutant = lookup.replace(before, after)
+                self.assertNotEqual(mutant, lookup)
+                self.assertTrue(real_weight_windows_interpreter_errors(mutant))
 
     def test_windows_reviewed_interpreter_exemption_still_requires_its_own_pinning(self) -> None:
         """The sc-18804 exemption for `candle-scail2-shared` must not be a blank hole.
