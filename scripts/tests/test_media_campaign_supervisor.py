@@ -30,6 +30,20 @@ class FixtureDeadlineClock:
         self.ready_at = self.now()
 
 
+def published_fixture_pid(path):
+    """Read only the closed/renamed PID record, within bounded bootstrap polling."""
+    try:
+        published = path.read_text(encoding="ascii")
+    except (FileNotFoundError, PermissionError):
+        # Atomic rename prevents partial publication, but a Windows sharing/access
+        # denial can still make the published name temporarily unreadable. This is
+        # not readiness; the caller's existing bootstrap deadline remains in force.
+        return None
+    if not published.isdecimal() or int(published) <= 0:
+        raise AssertionError("malformed published fixture PID")
+    return int(published)
+
+
 class FixtureDeadlineClockTests(unittest.TestCase):
     def test_bootstrap_is_bounded_separately_from_three_second_teardown_budget(self):
         now = [0.0]
@@ -49,6 +63,65 @@ class FixtureDeadlineClockTests(unittest.TestCase):
             clock.admit(lambda: False, timeout=.05)
         self.assertIsNone(clock.ready_at)
         self.assertLess(now[0], .1)
+
+
+class PublishedFixturePidTests(unittest.TestCase):
+    def clock(self):
+        now = [0.0]
+        return FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def test_access_denial_is_not_ready_until_a_valid_record_is_read(self):
+        clock, observed = self.clock(), []
+        def ready():
+            pid = published_fixture_pid(Path("grandchild-pid"))
+            if pid is not None:
+                observed.append(pid)
+            return pid is not None
+        with patch.object(Path, "read_text", side_effect=[PermissionError(13, "sharing denial"), "1234"]) as read:
+            clock.admit(ready)
+        self.assertEqual(observed, [1234])
+        self.assertEqual(read.call_count, 2)
+        self.assertIsNotNone(clock.ready_at)
+
+    def test_permanent_access_denial_fails_at_the_existing_bootstrap_deadline(self):
+        clock = self.clock()
+        with patch.object(Path, "read_text", side_effect=PermissionError(13, "persistent denial")), \
+             self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+            clock.admit(lambda: published_fixture_pid(Path("grandchild-pid")) is not None, timeout=.05)
+        self.assertIsNone(clock.ready_at)
+
+    def test_partial_temporary_record_is_never_used_as_published_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grandchild-pid"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text("12", encoding="ascii")
+            self.assertIsNone(published_fixture_pid(path))
+            temporary.write_text("1234", encoding="ascii")
+            os.replace(temporary, path)
+            self.assertEqual(published_fixture_pid(path), 1234)
+
+    def test_malformed_published_records_and_unrelated_io_errors_remain_terminal(self):
+        for record in ("", "0", "-1", "123partial", "123\n"):
+            with self.subTest(record=record), patch.object(Path, "read_text", return_value=record), \
+                 self.assertRaisesRegex(AssertionError, "malformed published fixture PID"):
+                published_fixture_pid(Path("grandchild-pid"))
+        with patch.object(Path, "read_text", side_effect=OSError(5, "I/O failure")), self.assertRaises(OSError):
+            published_fixture_pid(Path("grandchild-pid"))
+
+    def test_reaping_assertions_use_only_the_validated_invocation_snapshot(self):
+        case = WindowsSupervisorTests()
+        case.root, case.sampled = Path("fixture"), [1]
+        case._has_exited = lambda pid: pid == 1234
+        observed = []
+        case._assert_exited = observed.append
+        def run(script, *, on_spawn, clock):
+            on_spawn(1234, None)
+            raise safety.SupervisionError("deadline", "fixture deadline")
+        case._run = run
+        with patch.object(Path, "read_text", side_effect=["1234", "5678", AssertionError("reopened PID publication")]) as read:
+            case._deadline_reaps_root_and_grandchild_after_root_exit()
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(observed, [1234, 5678])
 
 
 class Probe:
@@ -1514,24 +1587,29 @@ class WindowsSupervisorTests(unittest.TestCase):
             f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}])"
         )
         clock = FixtureDeadlineClock()
+        ready_pids = None
         def fixture_ready(pid, _pgid):
             def ready():
-                try:
-                    root_pid = int((self.root / "root-pid").read_text(encoding="ascii"))
-                    grandchild_pid = int((self.root / "grandchild-pid").read_text(encoding="ascii"))
-                except FileNotFoundError:
+                nonlocal ready_pids
+                root_pid = published_fixture_pid(self.root / "root-pid")
+                grandchild_pid = published_fixture_pid(self.root / "grandchild-pid")
+                if root_pid is None or grandchild_pid is None:
                     return False
                 self.assertEqual(root_pid, pid)
                 self.assertGreater(grandchild_pid, 0)
                 self.assertNotEqual(grandchild_pid, root_pid)
-                return self._has_exited(root_pid)
+                if not self._has_exited(root_pid):
+                    return False
+                ready_pids = (root_pid, grandchild_pid)
+                return True
             clock.admit(ready)  # Independent 30s bootstrap bound, not an extended teardown limit.
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
             self._run(script, on_spawn=fixture_ready, clock=clock)
         self.assertIsNotNone(clock.ready_at)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
-        self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
+        self.assertIsNotNone(ready_pids)
+        for pid in ready_pids:
+            self._assert_exited(pid)
 
     def test_repeated_reaping_case_rejects_skip_descendant_reap_mutant(self):
         from scripts import media_campaign_windows as windows
