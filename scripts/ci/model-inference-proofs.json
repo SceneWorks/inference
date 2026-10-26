@@ -30750,6 +30750,76 @@
     }
   },
   {
+    "package": "candle-gen-flux2",
+    "target": "candle_gen_flux2",
+    "target_kind": "lib",
+    "fqn": "vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cpu",
+    "source": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux2",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_encode oracle JSON with deterministic source-seeded miniature encoder weights; crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cpu",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cpu",
+    "required_environment": [],
+    "device_witness": "Successful learned Flux2 VAE encoder output observed inside encode",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cpu",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-flux2",
+    "target": "candle_gen_flux2",
+    "target_kind": "lib",
+    "fqn": "vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda",
+    "source": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux2",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_encode oracle JSON with deterministic source-seeded miniature encoder weights; crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda",
+    "required_environment": [],
+    "device_witness": "Successful learned Flux2 VAE encoder output observed inside encode",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux2/src/vae/moss_edit_encoder_tests.rs::vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda",
+      "requirements": []
+    },
+    "required_cuda_physical_index": 1
+  },
+  {
     "package": "candle-gen-ideogram",
     "target": "candle_gen_ideogram",
     "target_kind": "lib",
@@ -62711,60 +62781,6 @@
     "package": "candle-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
-    "fqn": "cross_backend::joint_denoise_agrees_with_the_mlx_lane",
-    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs",
-    "cargo_target_metadata": {
-      "name": "integration",
-      "kind": [
-        "test"
-      ],
-      "crate_types": [
-        "bin"
-      ]
-    },
-    "execution_role": "direct",
-    "backend": "candle-cpu",
-    "expected_devices": [
-      "candle-cpu"
-    ],
-    "cargo_features": [
-      "model-inference-proof"
-    ],
-    "fixture_identity": "Committed converted H3 video/audio/DiT/LoRA goldens or deterministic synthetic learned modules, CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs::cross_backend::joint_denoise_agrees_with_the_mlx_lane",
-    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs::cross_backend::joint_denoise_agrees_with_the_mlx_lane",
-    "required_environment": [],
-    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
-    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_controls": [],
-    "default_configuration": "fixed_cpu",
-    "configurations": {
-      "fixed_cpu": {
-        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs::cross_backend::joint_denoise_agrees_with_the_mlx_lane/fixed_cpu",
-        "environment": {},
-        "cargo_features": [
-          "model-inference-proof"
-        ],
-        "backend": "candle-cpu",
-        "expected_devices": [
-          "candle-cpu"
-        ],
-        "scope": "whole selected source case",
-        "required_work": [
-          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
-      }
-    },
-    "configuration_kind": "feature-only",
-    "input_contract": {
-      "fixture_kind": "source-defined",
-      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs::cross_backend::joint_denoise_agrees_with_the_mlx_lane",
-      "requirements": []
-    }
-  },
-  {
-    "package": "candle-gen-minimax-h3",
-    "target": "integration",
-    "target_kind": "test",
     "fqn": "cross_backend::the_cross_backend_floor_is_the_mlx_lanes_own_reduced_precision",
     "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/cross_backend.rs",
     "cargo_target_metadata": {
@@ -69589,6 +69605,146 @@
         }
       ]
     }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::edit::tests::frozen_edit_oracle_cpu",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_edit_v1/v2/multi/v4 oracle JSON plus source-built miniature Transformer and edit adapter; crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cpu",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cpu",
+    "required_environment": [],
+    "device_witness": "Successful learned Transformer edit output observed in forward_edit",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cpu",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::edit::tests::frozen_edit_oracle_cuda",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_edit_v1/v2/multi/v4 oracle JSON plus source-built miniature Transformer and edit adapter; crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cuda",
+    "required_environment": [],
+    "device_witness": "Successful learned Transformer edit output observed in forward_edit",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_oracle_cuda",
+      "requirements": []
+    },
+    "required_cuda_physical_index": 1
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::edit::tests::frozen_edit_strict_f32_sampler_cpu",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_edit_v1/v2/multi/v4 oracle JSON plus source-built miniature Transformer and edit adapter; crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cpu",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cpu",
+    "required_environment": [],
+    "device_witness": "Successful learned Transformer edit output observed in forward_edit",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cpu",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "candle_gen_moss_image",
+    "target_kind": "lib",
+    "fqn": "transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_moss_image",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed MOSS tiny_edit_v1/v2/multi/v4 oracle JSON plus source-built miniature Transformer and edit adapter; crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda",
+    "required_environment": [],
+    "device_witness": "Successful learned Transformer edit output observed in forward_edit",
+    "output_contract": "Original frozen-oracle numerical assertions, precision/control/cancellation checks where source declares them, one successful libtest summary, one late exact BODY and actual learned DEVICE set",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/src/transformer/edit/tests.rs::transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda",
+      "requirements": []
+    },
+    "required_cuda_physical_index": 1
   },
   {
     "package": "candle-gen-perceptual",

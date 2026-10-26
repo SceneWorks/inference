@@ -15,6 +15,7 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 
 [features]
+model-inference-proof = ["candle-gen/model-inference-proof"]
 default = []
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]
 metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-llm/metal"]

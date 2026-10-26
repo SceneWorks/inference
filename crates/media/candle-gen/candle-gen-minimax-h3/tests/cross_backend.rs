@@ -788,7 +788,6 @@ fn dit_agrees_with_the_mlx_lane() {
 /// bookkeeping — the two sigma shifts, the reversed velocity sign, the two-source σ, and the
 /// conditioning rows the loop must not touch.
 #[test]
-#[ignore = "model inference; explicit model workflow only"]
 fn joint_denoise_agrees_with_the_mlx_lane() {
     use candle_gen::gen_core::CancelFlag;
     use candle_gen_minimax_h3::denoise::{
@@ -865,11 +864,6 @@ fn joint_denoise_agrees_with_the_mlx_lane() {
         worst = worst.max(peak);
     }
     println!("DENOISE cross-backend worst peak-relative: {worst:.3e} (bound {CROSS_TOL:.0e})");
-
-    #[cfg(feature = "model-inference-proof")]
-    println!(
-        "\nMODEL_INFERENCE_BODY_COMPLETED cross_backend::joint_denoise_agrees_with_the_mlx_lane"
-    );
 }
 
 /// **The DiT half of the floor, measured — and it is a different number from the VAE half.**

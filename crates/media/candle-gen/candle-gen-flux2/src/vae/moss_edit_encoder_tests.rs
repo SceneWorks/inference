@@ -92,12 +92,18 @@ fn run(device: &Device) {
     device.synchronize().unwrap();
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_moss_edit_encoder_cpu() {
     run(&Device::Cpu);
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cpu");
 }
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_moss_edit_encoder_cuda() {
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32());
     run(&Device::new_cuda(0).expect("admitted CUDA lane logical device 0"));
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED vae::moss_edit_encoder_tests::frozen_moss_edit_encoder_cuda");
 }

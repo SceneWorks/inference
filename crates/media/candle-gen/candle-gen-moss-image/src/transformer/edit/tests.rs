@@ -734,24 +734,34 @@ fn run(device: &Device) {
     ));
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_edit_oracle_cpu() {
     run(&Device::Cpu);
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::edit::tests::frozen_edit_oracle_cpu");
 }
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_edit_oracle_cuda() {
     // Do not mutate process-global precision flags shared by other GPU tests.
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32());
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_bf16());
     run(&Device::new_cuda(0).expect("admitted CUDA lane logical device 0"));
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::edit::tests::frozen_edit_oracle_cuda");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_edit_strict_f32_sampler_cpu() {
     sampler_precision(&multi_fixture(), &Device::Cpu, true);
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::edit::tests::frozen_edit_strict_f32_sampler_cpu");
 }
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_edit_strict_f32_sampler_cuda() {
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_f32());
     assert!(!candle_gen::candle_core::cuda_backend::gemm_reduced_precision_bf16());
@@ -760,4 +770,6 @@ fn frozen_edit_strict_f32_sampler_cuda() {
         &Device::new_cuda(0).expect("admitted CUDA lane logical device 0"),
         true,
     );
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::edit::tests::frozen_edit_strict_f32_sampler_cuda");
 }
