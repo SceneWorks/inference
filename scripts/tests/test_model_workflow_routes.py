@@ -4,6 +4,7 @@ import os
 import copy
 import posixpath
 import shlex
+import re
 import subprocess
 import tempfile
 import unittest
@@ -95,6 +96,8 @@ class ModelWorkflowRoutes(unittest.TestCase):
             self.assertIn("@('cargo', 'rustc')", windows['run'])
             self.assertIn('MODEL_PROOF_RUST_BIN=', windows['run'])
             self.assertIn('$env:GITHUB_PATH', windows['run'])
+            self.assertIn('$proofRustupHome', windows['run'])
+            self.assertIsNone(re.search(r'(?im)^\s*\$(?:home|env:home)\s*=', windows['run']))
             self.assertNotIn('CARGO_HOME', windows['run'])
             self.assertLess(steps.index(posix), steps.index(report))
             self.assertLess(steps.index(windows), steps.index(report))
