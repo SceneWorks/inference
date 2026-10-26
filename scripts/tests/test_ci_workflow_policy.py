@@ -1072,6 +1072,22 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
+        self.assertIn("ios-prequant", dispatch["profile"]["options"])
+        job = workflow["jobs"]["ios-prequant"]
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'")
+        self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(job["env"]["IOS_PREQUANT_BINDING"], "${{ inputs.ios_pricing_compile_binding }}")
+        self.assertEqual([step["run"] for step in job["steps"] if "run" in step][-1],
+                         "python3.12 -I scripts/ci/ios_prequant.py")
+        uploads = [step for step in job["steps"] if "actions/upload-artifact@" in step.get("uses", "")]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["if"], "always()")
+        self.assertEqual(uploads[0]["with"]["path"], "${{ runner.temp }}/ios-prequant-receipt.json")
+        self.assertEqual(uploads[0]["with"]["if-no-files-found"], "error")
+
     def test_native_terminal_initializes_evidence_without_job_runner_context(self):
         # Job env is evaluated before a runner exists. Step env may use runner context;
         # parse the context boundary so a different path/name or wrapped expression fails too.

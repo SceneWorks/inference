@@ -329,6 +329,32 @@ confined relative directories within that slot, e.g.
 silently resolves a sibling artifact. Existing source inventories, deferred-read
 checks and admitted request binding are preserved.
 
+The dedicated host conversion route is `real-weights.yml` profile `ios-prequant`.
+Dispatch one route at a time from a published frozen branch or tag whose HEAD equals
+`source_sha`; it runs only on the primary `nax-macos` real-weights Mac. The typed
+`route` values are `sana-1600m-q4/q8`, `sana-sprint-q4/q8`,
+`iris-generation-q4/q8`, `iris-restoration-q4/q8`, `iris-depth-q4/q8`, and
+`iris-text-encoder-q4/q8`. The latter uses the shared pinned Qwen3-VL language
+tower. No route defaults to all tiers. For example:
+
+```sh
+gh workflow run real-weights.yml --ref FROZEN_REF -f profile=ios-prequant \
+  -f ios_pricing_compile_binding='{"source_sha":"FROZEN_40_HEX_SHA","route":"iris-generation-q4"}'
+```
+
+The runner needs the pinned snapshots in `~/.cache/huggingface/hub`, SDK 26.5,
+Rust 1.96, and the matching prebuilt MLX directory and metallib configured in
+the workflow (from the CI repair validation receipt), plus free space on the cache
+volume. The controller compiles with four jobs, zero debug information, offline
+dependencies and the pinned native linker; it checks the compiled CLI's
+argument refusal before invoking conversion. Each dispatch writes a new
+`sceneworks-ios-prequant/RUN_ID-ATTEMPT/ROUTE` directory beside the resolved
+Hugging Face cache on the same volume. A source-keyed Cargo target on that volume
+reuses compilation across serial dispatches. The Actions artifact contains only
+`ios-prequant-receipt.json` with source/output identity, hashes, headers, CPU
+and guard evidence. A failed or missing receipt is not a packed tier. Review
+the on-host output and component mapping before copying it to a phone slot.
+
 ```sh
 # After the host app has been installed (no campaign is started by pushing):
 scripts/ios/push_model.sh "$SNAPSHOT" --campaign-route iris_3b --tier q8 --device "$DEVICE"

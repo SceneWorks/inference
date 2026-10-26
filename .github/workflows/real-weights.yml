@@ -146,7 +146,7 @@ on:
       # this existing JSON input to {"confirm_all": true}; no extra keys are accepted.
       # Every other profile, including the iOS profiles, retains its existing meaning/default.
       ios_pricing_compile_binding:
-        description: 'ios-selected-captures: JSON selection (all/family/exact package/FQN), omitted defaults iris. ios-pricing-compile-only: owner-bound JSON exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe'
+        description: 'ios-selected-captures: JSON selection (all/family/exact package/FQN), omitted defaults iris. ios-pricing-compile-only: owner-bound JSON exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe. ios-prequant: exact source_sha and one typed route (see runbook).'
         type: string
         required: false
         default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
@@ -157,7 +157,7 @@ on:
         default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
+        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -478,6 +478,37 @@ jobs:
         with:
           name: ios-pricing-compile-${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}-${{ fromJSON(inputs.ios_pricing_compile_binding).host }}
           path: ${{ runner.temp }}/ios-pricing-compile-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+
+  ios-prequant:
+    needs: validate-selection
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'
+    runs-on: [self-hosted, macOS, ARM64, nax, real-weights]
+    timeout-minutes: 540
+    env:
+      IOS_PREQUANT_BINDING: ${{ inputs.ios_pricing_compile_binding }}
+      SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+      PMETAL_MLX_PREBUILT_DIR: /Users/michael/.codex/worktrees/sc16774-ci-repair/target/debug/build/pmetal-mlx-sys-c58d948260eefc63/out/build/lib
+      PMETAL_METALLIB_PATH: /Users/michael/.codex/worktrees/sc16774-ci-repair/target/debug/build/pmetal-mlx-sys-c58d948260eefc63/out/build/lib/mlx.metallib
+    steps:
+      - name: Require primary Mac before checkout
+        shell: bash
+        run: |
+          [[ "$RUNNER_NAME" == nax-macos ]]
+          command -v python3.12 >/dev/null
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Convert one pinned CPU tier with external limits
+        shell: bash
+        run: python3.12 -I scripts/ci/ios_prequant.py
+      - name: Upload receipt only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-prequant-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-prequant-receipt.json
           if-no-files-found: error
 
   # SC-16462: build the complete packed Chroma tier from the exact currently-shipped bf16 source,
