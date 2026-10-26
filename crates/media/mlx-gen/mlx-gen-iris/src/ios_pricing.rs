@@ -2384,6 +2384,18 @@ fn guarded_source_read<T>(
     capacity: &mut dyn FnMut(u64) -> Result<()>,
     read: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> Result<T>,
 ) -> Result<T> {
+    source_read_with_capacity(inventory, req.spec, capacity, read, |error| {
+        native_ledger::source_guard_refusal(req, error).unwrap_or_else(std::convert::identity)
+    })
+}
+
+fn source_read_with_capacity<T>(
+    inventory: &mlx_gen::gen_core::SourceInventory,
+    spec: &mlx_gen::LoadSpec,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+    read: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> Result<T>,
+    source_error: impl FnOnce(Error) -> Error,
+) -> Result<T> {
     // Preserve the original provider callback error over the neutral core error boundary.
     // Once denied, no second callback invocation or subsequent guarded allocation is allowed.
     let mut original_error = None;
@@ -2408,7 +2420,7 @@ fn guarded_source_read<T>(
         };
         (|| {
             inventory
-                .verify_for_with_capacity(req.spec, &mut checked)
+                .verify_for_with_capacity(spec, &mut checked)
                 .map_err(Error::from)?;
             inventory.read_unchanged_with_capacity(&mut checked, |next| {
                 let mut provider_next = |bytes| next(bytes).map_err(Error::from);
@@ -2418,9 +2430,7 @@ fn guarded_source_read<T>(
     };
     match original_error {
         Some(error) => Err(error),
-        None => result.map_err(|error| {
-            native_ledger::source_guard_refusal(req, error).unwrap_or_else(std::convert::identity)
-        }),
+        None => result.map_err(source_error),
     }
 }
 
@@ -2465,7 +2475,18 @@ pub fn check_replay_source_capacity_for_provider(
     token: &str,
     capacity: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<()> {
-    let prefix = match provider {
+    let prefix = replay_prefix(provider)?;
+    if !token.starts_with(prefix) {
+        return Ok(());
+    }
+    if provider == crate::model::MODEL_ID {
+        return native_ledger::require_guarded_generation_gap();
+    }
+    check_replay_source_capacity(token, capacity)
+}
+
+fn replay_prefix(provider: &str) -> Result<&'static str> {
+    Ok(match provider {
         crate::model::MODEL_ID => "iris-sampling-v1:",
         crate::restoration::MODEL_ID => "iris-restoration-v1:",
         crate::depth::DEPTH_MODEL_ID => "iris-depth-v1:",
@@ -2474,14 +2495,122 @@ pub fn check_replay_source_capacity_for_provider(
                 "not an Iris guarded replay route".into(),
             ))
         }
-    };
-    if !token.starts_with(prefix) {
+    })
+}
+
+/// Provenance of a caller's explicitly empirical preparation envelope. This does not assert
+/// a source-derived allocation bound or approve the engineering policy that consumes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcePreparationEstimateProvenance {
+    /// Measured whole-process growth above the actual BeforeRequestConstruction baseline,
+    /// plus the engineering policy's margin. The capture must begin before preparation in a
+    /// fresh process; an AfterModelLoad baseline or an unbound lifetime peak is insufficient.
+    /// The caller verifies checkpoint/source, device, OS and execution identity before reuse.
+    BeforeRequestConstructionPeakWithMargin,
+}
+
+/// An engineering estimate checked before compatibility metadata/tokenizer parsing.
+/// This is deliberately distinct from the private complete-HOST source proof inputs.
+/// Constructing it does not authorize a policy, certify its bytes, or alter default refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EstimatedSourcePreparation {
+    bytes: u64,
+    provenance: SourcePreparationEstimateProvenance,
+}
+
+impl EstimatedSourcePreparation {
+    pub fn new(bytes: u64, provenance: SourcePreparationEstimateProvenance) -> Result<Self> {
+        if bytes == 0 {
+            return Err(Error::Unsupported(
+                "Iris estimated source preparation needs a nonzero measured envelope".into(),
+            ));
+        }
+        Ok(Self { bytes, provenance })
+    }
+
+    pub fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    pub fn provenance(self) -> SourcePreparationEstimateProvenance {
+        self.provenance
+    }
+
+    fn check(self, capacity: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        capacity(self.bytes)
+    }
+}
+
+/// Empirical-policy counterpart of the source-only replay preflight. A wrong prefix still
+/// reaches the token constructor's original error without parsing. A valid prefix checks the
+/// measured preparation envelope before the existing JSON-layout check. Generation's default
+/// source-certified route continues to refuse at aa011.
+pub fn check_replay_with_estimated_preparation(
+    provider: &str,
+    token: &str,
+    estimate: EstimatedSourcePreparation,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    if !token.starts_with(replay_prefix(provider)?) {
         return Ok(());
     }
-    if provider == crate::model::MODEL_ID {
-        return native_ledger::require_guarded_generation_gap();
-    }
+    estimate.check(capacity)?;
     check_replay_source_capacity(token, capacity)
+}
+
+/// Price under an explicitly selected empirical preparation policy. The caller must verify
+/// the estimate's capture identity and policy approval. Check its whole preparation envelope
+/// before inventory verification and again immediately before compatibility parsing; preserve
+/// the retained inventory's before/after identity checks and capacity-check error precedence.
+///
+/// Compatibility readers are not per-allocation instrumented. This path checks an estimated
+/// aggregate envelope, not a mathematical parser/tokenizer bound. Its returned HOST analysis
+/// remains incomplete, and it never constructs a MetadataHostBound or TokenizerHostBound.
+pub fn pricing_facts_with_estimated_preparation(
+    req: &IosPricingRequest<'_>,
+    replay: Option<IrisReplay<'_>>,
+    estimate: EstimatedSourcePreparation,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<PricingFacts> {
+    req.validate_work_context()?;
+    let mut facts =
+        with_estimated_source_preparation(req.spec, estimate, capacity, || match replay {
+            None => pricing_facts(req),
+            Some(IrisReplay::Generation(token)) => pricing_facts_with_token(req, token),
+            Some(IrisReplay::Restoration(token)) => {
+                pricing_facts_with_restoration_token(req, token)
+            }
+            Some(IrisReplay::Depth(token)) => pricing_facts_with_depth_token(req, token),
+        })?;
+    facts.host_analysis = Some(host_analysis_without_facts(req, None)?);
+    Ok(facts)
+}
+
+/// Apply the same empirical preparation envelope and retained-source checks to an existing
+/// metadata/key producer (for example token-window or canonical sampling-key preparation).
+/// The closure must perform only source metadata work covered by the caller's measured envelope;
+/// this is not a model-execution allowance or a source proof. The caller owns policy/identity
+/// qualification exactly as for [`pricing_facts_with_estimated_preparation`].
+fn with_estimated_source_preparation<T>(
+    spec: &mlx_gen::LoadSpec,
+    estimate: EstimatedSourcePreparation,
+    capacity: &mut dyn FnMut(u64) -> Result<()>,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    estimate.check(capacity)?;
+    let inventory = spec.source_inventory().ok_or_else(|| {
+        Error::Unsupported("Iris estimated metadata requires retained SourceInventory".into())
+    })?;
+    source_read_with_capacity(
+        inventory,
+        spec,
+        capacity,
+        |next| {
+            estimate.check(next)?;
+            read()
+        },
+        std::convert::identity,
+    )
 }
 
 /// Guarded source pricing for SDK/catalog callers that possess the actual metadata-capacity
@@ -5609,6 +5738,182 @@ mod guarded_source_tests {
         MemoryGeometry, MemoryNumericTier, MemorySelection, MemoryStrategy,
         MemoryStrategyParameters,
     };
+
+    fn preparation_estimate() -> EstimatedSourcePreparation {
+        // An explicitly synthetic envelope exercises capacity forwarding, not phone evidence.
+        EstimatedSourcePreparation::new(
+            123_456_789,
+            SourcePreparationEstimateProvenance::BeforeRequestConstructionPeakWithMargin,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn estimated_replay_checks_capacity_before_parsing_without_changing_default() {
+        assert!(EstimatedSourcePreparation::new(
+            0,
+            SourcePreparationEstimateProvenance::BeforeRequestConstructionPeakWithMargin,
+        )
+        .is_err());
+        let estimate = preparation_estimate();
+        assert_eq!(estimate.bytes(), 123_456_789);
+        assert_eq!(
+            estimate.provenance(),
+            SourcePreparationEstimateProvenance::BeforeRequestConstructionPeakWithMargin
+        );
+        let mut calls = 0;
+        let denied = check_replay_with_estimated_preparation(
+            crate::model::MODEL_ID,
+            "iris-sampling-v1:{invalid",
+            estimate,
+            &mut |bytes| {
+                calls += 1;
+                assert_eq!(bytes, estimate.bytes());
+                Err(Error::Canceled)
+            },
+        );
+        assert!(matches!(denied, Err(Error::Canceled)));
+        assert_eq!(calls, 1);
+        check_replay_with_estimated_preparation(
+            crate::model::MODEL_ID,
+            "iris-depth-v1:{}",
+            estimate,
+            &mut |_| panic!("wrong prefix must not parse or check an envelope"),
+        )
+        .unwrap();
+        check_replay_with_estimated_preparation(
+            crate::model::MODEL_ID,
+            "iris-sampling-v1:{}",
+            estimate,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(check_replay_source_capacity_for_provider(
+            crate::model::MODEL_ID,
+            "iris-sampling-v1:{}",
+            &mut |_| panic!("default generation source gap must still refuse first"),
+        )
+        .is_err());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn estimated_preparation_preserves_second_check_and_after_read_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let mut spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(directory.path().to_path_buf()));
+        let inventory = mlx_gen::gen_core::SourceInventory::capture(&spec).unwrap();
+        spec.bind_source_inventory(inventory).unwrap();
+        let estimate = preparation_estimate();
+        let mut envelope_checks = 0;
+        let denied = with_estimated_source_preparation(
+            &spec,
+            estimate,
+            &mut |bytes| {
+                if bytes == estimate.bytes() {
+                    envelope_checks += 1;
+                    if envelope_checks == 2 {
+                        return Err(Error::Canceled);
+                    }
+                }
+                Ok(())
+            },
+            || -> Result<()> { panic!("second capacity denial must precede parsing") },
+        );
+        assert!(matches!(denied, Err(Error::Canceled)));
+        assert_eq!(envelope_checks, 2);
+        let changed = with_estimated_source_preparation(&spec, estimate, &mut |_| Ok(()), || {
+            std::fs::write(&path, b"{\"changed\":true}")?;
+            Ok(())
+        });
+        assert!(
+            changed.is_err(),
+            "post-read identity failure must reject the result"
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn estimated_generation_pricing_keeps_inventory_and_incomplete_host() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot");
+        let mut spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(fixtures.join("iris")));
+        spec.components.insert(
+            "text_encoder".into(),
+            mlx_gen::WeightsSource::Dir(fixtures.join("text_encoder")),
+        );
+        let work = GenerationRequest {
+            prompt: "host metadata".into(),
+            width: 16,
+            height: 16,
+            steps: Some(1),
+            guidance: Some(1.0),
+            ..Default::default()
+        };
+        let memory = GenerationMemory::default();
+        let selected = selection();
+        let request = |spec| IosPricingRequest {
+            provider: crate::model::MODEL_ID,
+            spec,
+            mode: &MemoryMode::TextToImage,
+            selection: &selected,
+            execution: &memory,
+            geometry: MemoryGeometry {
+                width: 16,
+                height: 16,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            generation: Some(&work),
+            transform: None,
+            depth: None,
+            token_window: 0,
+        };
+        let estimate = preparation_estimate();
+        assert!(matches!(
+            pricing_facts_with_estimated_preparation(&request(&spec), None, estimate, &mut |_| {
+                Err(Error::Canceled)
+            }),
+            Err(Error::Canceled)
+        ));
+        let missing =
+            pricing_facts_with_estimated_preparation(&request(&spec), None, estimate, &mut |_| {
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert!(missing.to_string().contains("retained SourceInventory"));
+        let mut bound_spec = spec.clone();
+        let inventory = mlx_gen::gen_core::SourceInventory::capture(&bound_spec).unwrap();
+        bound_spec.bind_source_inventory(inventory).unwrap();
+        let req = request(&bound_spec);
+        let mut estimate_checks = 0;
+        let facts = pricing_facts_with_estimated_preparation(&req, None, estimate, &mut |bytes| {
+            estimate_checks += usize::from(bytes == estimate.bytes());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(estimate_checks, 2);
+        let host = facts.host_analysis.unwrap();
+        assert!(host.missing.contains(&Some(IrisHostGap::TokenizerRegex)));
+        assert!(host.missing.contains(&Some(IrisHostGap::CapturedMetadata)));
+        assert!(pricing_facts_with_source_capacity(&req, None, &mut |_| Ok(())).is_err());
+        // A changed configured source cannot borrow the bound inventory.
+        let mut changed = bound_spec.clone();
+        changed.components.insert(
+            "text_encoder".into(),
+            mlx_gen::WeightsSource::Dir(fixtures.join("not-the-bound-encoder")),
+        );
+        assert!(pricing_facts_with_estimated_preparation(
+            &request(&changed),
+            None,
+            estimate,
+            &mut |_| Ok(()),
+        )
+        .is_err());
+    }
 
     /// HOST-only fixture construction, NOT a served proof issuer. The test deliberately compares
     /// already-held source arithmetic against legacy loading arithmetic; guarded identity and

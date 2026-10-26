@@ -127,3 +127,48 @@ The new ordinary test is pure layout/arithmetic and remains in the existing
 library test target. Build provenance adds one `rustc -vV` invocation when the
 Iris build script runs. No new CI lane, inference test, measurement matrix or
 physical proof is introduced.
+
+## Explicit engineering preparation route
+
+The approved engineering contract permits source/checkpoint/device/OS-scoped
+pressure estimates with measured spread, a minimum 32 MiB margin, and live
+headroom checks. It does not assert a mathematical physical-memory guarantee.
+`EstimatedSourcePreparation` is a distinct input to
+`pricing_facts_with_estimated_preparation` and
+`check_replay_with_estimated_preparation`; no existing default caller changes
+policy merely because these APIs exist. Its constructor checks that bytes are
+nonzero; it does not attest the capture or approve an arbitrary byte value.
+The catalog policy owns validation of exact artifact/source, device, OS,
+execution, and measured-margin provenance before constructing this input.
+
+The named provenance is `BeforeRequestConstructionPeakWithMargin`: actual
+whole-process growth above the first baseline before request preparation in a
+fresh process, plus the approved policy margin. This whole-process peak is an
+empirical preparation upper estimate; it is not inferred from post-load demand
+or an unrelated lifetime peak. Changes to bound identities invalidate reuse.
+Missing or mismatched evidence must not admit a request. The catalog must check
+its selected preparation envelope before its own first source verification or
+capture, including token/key preparation preceding Iris pricing.
+
+Iris checks that envelope before retained-source verification and again just
+before compatibility parsing. The existing inventory still verifies configured
+paths and source identity before and after the read, and preserves capacity
+callback errors. The pricing API supports generation, restoration, and depth,
+including their replay tokens. The replay API preserves wrong-prefix rejection
+ordering, and checks capacity before JSON preflight for valid prefixes. These
+checks cover the aggregate empirical preparation estimate; the compatibility
+readers are not individually instrumented allocation proofs.
+
+Returned HOST analysis remains incomplete. Neither API constructs a
+`MetadataHostBound` or `TokenizerHostBound`; the source-certified generation
+route still refuses at aa011. General native tokenizer/Array input support is
+unchanged, and this API supplies no phone-fit certification for arbitrary
+inputs outside the measured catalog/model scope.
+
+Six focused pure tests passed (0 failed, 0 ignored; runtime 0.04 seconds):
+estimated replay cancellation/prefix/default behavior; estimated generation
+pricing with retained inventory and incomplete HOST analysis; cancellation at
+the second envelope check and after-read source mutation rejection; and the
+existing replay-gap, complete-HOST-gap, and no-source-open refusal regressions.
+The fixtures use synthetic preparation bytes explicitly marked as test data,
+not phone measurements.
