@@ -30,6 +30,15 @@ class FixtureDeadlineClock:
         self.ready_at = self.now()
 
 
+def _published_pid(path):
+    try:
+        return int(path.read_text(encoding="ascii"))
+    except (FileNotFoundError, PermissionError):
+        # Windows may briefly deny a read while the child atomically replaces the
+        # publication file. Readiness remains bounded by FixtureDeadlineClock.admit.
+        return None
+
+
 class FixtureDeadlineClockTests(unittest.TestCase):
     def test_bootstrap_is_bounded_separately_from_three_second_teardown_budget(self):
         now = [0.0]
@@ -49,6 +58,16 @@ class FixtureDeadlineClockTests(unittest.TestCase):
             clock.admit(lambda: False, timeout=.05)
         self.assertIsNone(clock.ready_at)
         self.assertLess(now[0], .1)
+
+    def test_pid_publication_read_denial_retries_within_bootstrap_bound(self):
+        now = [0.0]
+        clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
+        with patch.object(Path, "read_text", side_effect=[PermissionError(13, "denied"), "123"]):
+            clock.admit(lambda: _published_pid(Path("pid")) == 123, timeout=.05)
+        self.assertAlmostEqual(clock.ready_at, .01)
+        with patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
+                clock.admit(lambda: _published_pid(Path("pid")) == 123, timeout=.05)
 
 
 class Probe:
@@ -1516,10 +1535,11 @@ class WindowsSupervisorTests(unittest.TestCase):
         clock = FixtureDeadlineClock()
         def fixture_ready(pid, _pgid):
             def ready():
-                try:
-                    root_pid = int((self.root / "root-pid").read_text(encoding="ascii"))
-                    grandchild_pid = int((self.root / "grandchild-pid").read_text(encoding="ascii"))
-                except FileNotFoundError:
+                root_pid = _published_pid(self.root / "root-pid")
+                if root_pid is None:
+                    return False
+                grandchild_pid = _published_pid(self.root / "grandchild-pid")
+                if grandchild_pid is None:
                     return False
                 self.assertEqual(root_pid, pid)
                 self.assertGreater(grandchild_pid, 0)
