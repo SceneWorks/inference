@@ -1100,3 +1100,19 @@ only after captures, with this schema:
 A successful diagnostic capture does not populate an admitted-success row.
 Do not invent measurements, infer safe caps from launch headroom, or silently
 mark the explicitly deferred Supra2 iOS registration complete.
+
+## Supported engineering capture build composition
+
+`ios-host/smoke` and `runtime-ios` are explicit members of the same inference root Cargo
+workspace and share its single `Cargo.lock`. The harness no longer creates a nested workspace
+or owns a second lock. Existing `--manifest-path ios-host/smoke/Cargo.toml` commands select that
+package in the root workspace. `run_smoke.sh` explicitly retains `ios-host/smoke/target` for the
+staticlib/metallib paths Xcode already uses; CI can retain its explicit job target directory.
+
+The empirical policy binds the actual compiled dependency units, target/toolchain/features,
+source closure, native artifacts and phone/OS. Reuse is supported between the root-workspace
+SDK and this harness, including an identical relocated checkout and reviewed evidence/policy
+DATA-only changes. A separate nested workspace or Git consumer is a different Cargo composition
+and conservatively receives `no_evidence` for these captures. Public registries, unbound
+file-backed candidates and arbitrary public Array inputs retain their native behavior; this
+boundary grants no phone-fit certification to a different compiled composition.

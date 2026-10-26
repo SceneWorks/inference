@@ -140,7 +140,6 @@ fn source_closure(root: &Path) -> String {
         "rust-toolchain.toml",
         ".cargo/config.toml",
         "ios-host/smoke/Cargo.toml",
-        "ios-host/smoke/Cargo.lock",
         "ios-host/smoke/src",
         "scripts/ios/run_smoke.sh",
         "scripts/ios/bundle_metallib.py",

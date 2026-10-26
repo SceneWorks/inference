@@ -6,14 +6,10 @@ description = "On-device MLX smoke test: proves the bundled metallib resolves an
 license = "Apache-2.0"
 publish = false
 
-# Deliberately NOT a workspace member (the root manifest excludes it, and check-workspace.py ignores
-# `ios-host/`). This is host-app scaffolding for the device harness (epic 16774, sc-16780), not part
-# of the shipped runtime graph. mlx-rs is pinned to the SAME rev as the workspace's
-# `[workspace.dependencies] mlx-rs`; bump both together.
-
-# Its own workspace root, so cargo never adopts it into an enclosing checkout (an agent worktree is
-# nested inside the main clone, whose root manifest does not list it).
-[workspace]
+# Build the file-backed device harness in the SAME root workspace as runtime-ios. Cargo's
+# compiled dependency identity is then stable across root SDK/capture builds and relocated
+# checkouts. Separate external Cargo compositions conservatively require their own evidence.
+# This test harness remains an explicit package; product bundles do not depend on it.
 
 [lib]
 # staticlib for linking into the .app; rlib so `cargo test` can exercise the same code on macOS.
@@ -66,9 +62,3 @@ mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", default
 tempfile = "3"
 # The production Qwen3-4B encoder contract fixture a Z-Image Turbo campaign case validates.
 sceneworks-gen-core-testkit = { path = "../../crates/contracts/gen-core-testkit" }
-
-# This harness is a separate workspace: root patches are not inherited.
-[patch.crates-io]
-regex = { path = "../../vendor/clip-regex/regex" }
-regex-automata = { path = "../../vendor/clip-regex/regex-automata" }
-regex-syntax = { path = "../../vendor/clip-regex/regex-syntax" }

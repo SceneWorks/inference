@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 115
+EXPECTED_MEMBER_COUNT = 116
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -89,10 +89,9 @@ IOS_FORBIDDEN_FEATURE = ("mlx-gen", "training")
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
 # be swept into the single-lockfile / single-manifest invariants below.
 #
-# `ios-host` joins them for a different reason: it is host-app scaffolding for on-device testing
-# (an Xcode project plus a small Rust staticlib, sc-16780), deliberately EXCLUDED from the workspace
-# in the root Cargo.toml so it never enters the shipped runtime graph. Being excluded, it resolves
-# its own Cargo.lock -- legitimately, not as drift.
+# `ios-host` is device-app scaffolding with its one Rust package explicitly in the root
+# workspace for identical SDK/capture compilation identity. Its membership and absence of a
+# nested workspace/lock are checked separately; source lints below still target runtime crates.
 IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex", "ios-host"})
 # The Rust-source lints below additionally skip `vendor/` subtrees: those are upstream crates
 # copied verbatim (candle-kernels, candle-core — each with a VENDORED.md) that a [patch] points
@@ -1068,12 +1067,7 @@ def _within_workspace(path: Path) -> bool:
 
 
 def check_ios_host_mlx_pin(root: Path) -> None:
-    """The excluded iOS harness (ios-host/smoke, own Cargo.lock) must pin the workspace's mlx-rs.
-
-    Being outside the workspace it cannot say `workspace = true`, so a workspace pin bump would
-    otherwise leave the device harness building a different MLX than the runtime it exercises
-    (epic 16774, E1; the branch it was ported from pinned a since-deleted fork rev).
-    """
+    """The device harness must use the root workspace's exact MLX pin."""
     harness = root / "ios-host" / "smoke" / "Cargo.toml"
     if not harness.is_file():
         return
@@ -1088,31 +1082,22 @@ def check_ios_host_mlx_pin(root: Path) -> None:
         )
 
 
-def check_ios_host_lock_drift(root: Path) -> None:
-    """Every non-path package in ios-host/smoke/Cargo.lock must be locked identically in the root.
-
-    The harness carries its own lockfile (it is excluded from the workspace), so without this a
-    root `cargo update` would leave the device harness building different third-party code than the
-    runtime it exercises. Compared on (name, version, source); path packages have no source.
-    """
-    harness = root / "ios-host" / "smoke" / "Cargo.lock"
-    if not harness.is_file():
+def check_ios_host_shared_workspace(root: Path) -> None:
+    """Capture and the root SDK share Cargo's unit identity, workspace and single lockfile."""
+    directory = root / "ios-host" / "smoke"
+    manifest = directory / "Cargo.toml"
+    if not manifest.is_file():
         return
-    locked = {
-        (package["name"], package["version"], package.get("source"))
-        for package in tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))["package"]
-    }
-    drift = sorted(
-        f"{package['name']} {package['version']} ({package['source']})"
-        for package in tomllib.loads(harness.read_text(encoding="utf-8")).get("package", [])
-        if "source" in package
-        and (package["name"], package["version"], package["source"]) not in locked
-    )
-    if drift:
-        fail(
-            "ios-host/smoke/Cargo.lock locks packages the root Cargo.lock does not "
-            f"(re-lock the harness against the root): {drift}"
-        )
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    if "ios-host/smoke" not in workspace.get("members", []):
+        fail("ios-host/smoke must be an explicit root workspace member for SDK/capture identity")
+    if "ios-host/smoke" in workspace.get("exclude", []):
+        fail("ios-host/smoke cannot be excluded from the root SDK workspace")
+    if "workspace" in tomllib.loads(manifest.read_text(encoding="utf-8")):
+        fail("ios-host/smoke must not create a nested Cargo workspace")
+    if (directory / "Cargo.lock").exists():
+        fail("ios-host/smoke must share the root Cargo.lock, not retain a nested lock")
+
 
 
 # Published upstream lockfiles are retained as archive/source provenance, NOT independent
@@ -1209,8 +1194,10 @@ def check_graph(metadata: dict) -> None:
         manifest = Path(package["manifest_path"]).resolve()
         if package["source"] is not None:
             fail(f"workspace member {package['name']} unexpectedly has source {package['source']}")
-        if ROOT / "crates" not in manifest.parents:
-            fail(f"workspace member is outside crates/: {manifest}")
+        if ROOT / "crates" not in manifest.parents and not (
+            package["name"] == "ios-smoke" and manifest == ROOT / "ios-host/smoke/Cargo.toml"
+        ):
+            fail(f"workspace member is outside crates/ and the exact device harness: {manifest}")
 
     for name in sorted(INTERNAL_PACKAGES):
         matches = [package for package in packages if package["name"] == name]
@@ -3320,7 +3307,7 @@ def main() -> int:
     try:
         check_filesystem()
         check_ios_host_mlx_pin(ROOT)
-        check_ios_host_lock_drift(ROOT)
+        check_ios_host_shared_workspace(ROOT)
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)

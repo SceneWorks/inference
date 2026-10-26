@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "ios-host/smoke",
     "crates/audio/candle-audio",
     "crates/audio/candle-audio-acestep",
     "crates/audio/candle-audio-catalog",
@@ -32,9 +33,6 @@ members = [
     "crates/media/candle-gen/candle-gen*",
 ]
 exclude = [
-    # iOS host-app scaffolding (epic 16774, sc-16780): the on-device smoke harness. Own Cargo.lock;
-    # kept out so workspace builds and the single-lockfile invariant describe the product surface.
-    "ios-host/smoke",
     "crates/media/candle-gen/vendor/candle-core",
     "crates/media/candle-gen/vendor/candle-kernels",
     "crates/media/candle-gen/vendor/candle-metal-kernels",

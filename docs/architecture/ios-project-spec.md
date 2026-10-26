@@ -12,7 +12,7 @@ Architecture rationale: [strategy](ios-strategy.md). Operation:
 |---|---|
 | `crates/bundles/runtime-ios` | MLX LLM/preparer registries, narrow media composition, platform allocator/cache limits and pre-load admission |
 | `crates/media/mlx-gen/mlx-gen-ios-catalog` | Explicit iOS provider registration, provider-owned memory selections, artifact applicability |
-| `ios-host/smoke` | Separate Cargo workspace, static diagnostic bridge into the runtime bundle |
+| `ios-host/smoke` | Explicit root-workspace package sharing the SDK lock and compiled dependency units; static diagnostic bridge |
 | `ios-host/App` and `ios-host/project.yml` | Generated Xcode host, launch-memory observation and persistent diagnostic reports |
 | `scripts/ios/run_smoke.sh` | Build, verify metallib, package, install, launch, reject stale outputs and pull reports |
 | `scripts/ios/push_model.sh` | Move caller-provisioned snapshot trees into the selected app container; no downloads |

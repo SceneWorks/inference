@@ -116,7 +116,7 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
         if _is_ios_bound(path):
             lanes["ios_build"] = True
 
-        # `ios-host/` is the device harness (`ios-host/smoke`, its own cargo workspace and lockfile)
+        # `ios-host/` is the explicit root-workspace device-harness package
         # plus the Xcode host app. `ios_build` cross-builds and iOS-Clippies the harness; its
         # weights-free unit tests and host Clippy ride `macos_metal`. No shipped crate depends on
         # it, so no other lane can observe a change here.

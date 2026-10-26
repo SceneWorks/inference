@@ -2020,7 +2020,7 @@ class RootTrainTwinTests(unittest.TestCase):
 
 
 class IosHostMlxPinTests(unittest.TestCase):
-    """sc-16780: the excluded iOS harness must build the workspace's MLX, not a stale fork rev."""
+    """sc-16780: the root-member iOS harness must build the workspace's MLX, not a stale fork rev."""
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
@@ -2047,45 +2047,34 @@ class IosHostMlxPinTests(unittest.TestCase):
                 self.gate.check_ios_host_mlx_pin(Path(tmp))
 
 
-class IosHostLockDriftTests(unittest.TestCase):
-    """sc-16780: the harness's own Cargo.lock must lock third-party packages as the root does."""
+class IosHostSharedWorkspaceTests(unittest.TestCase):
+    """SDK and capture use one Cargo package source composition and root lockfile."""
 
-    def setUp(self) -> None:
+    def setUp(self):
         self.gate = load_gate_module()
 
-    @staticmethod
-    def lock(*packages: str) -> str:
-        return "version = 4\n" + "".join(f"\n[[package]]\n{p}\n" for p in packages)
+    def write(self, root, *, member=True, excluded=False, nested=False, own_lock=False):
+        (root / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ' + ('["ios-host/smoke"]' if member else '[]') + '\nexclude = '
+            + ('["ios-host/smoke"]' if excluded else '[]') + '\n')
+        harness = root / "ios-host/smoke"
+        harness.mkdir(parents=True)
+        (harness / "Cargo.toml").write_text('[package]\nname = "ios-smoke"\n' + ('[workspace]\n' if nested else ''))
+        if own_lock:
+            (harness / "Cargo.lock").write_text('version = 4\n')
 
-    def write(self, root: Path, harness_version: str) -> None:
-        registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"'
-        (root / "Cargo.lock").write_text(
-            self.lock('name = "libc"\nversion = "0.2.1"\n' + registry),
-            encoding="utf-8",
-        )
-        (root / "ios-host" / "smoke").mkdir(parents=True)
-        (root / "ios-host" / "smoke" / "Cargo.lock").write_text(
-            self.lock(
-                f'name = "libc"\nversion = "{harness_version}"\n' + registry,
-                # A path package (no source) is the harness's own crate; never compared.
-                'name = "ios-smoke"\nversion = "0.0.0"',
-            ),
-            encoding="utf-8",
-        )
+    def test_shared_workspace_passes_and_each_drift_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.write(Path(directory))
+            self.gate.check_ios_host_shared_workspace(Path(directory))
+        for mutation in ({"member": False}, {"excluded": True}, {"nested": True}, {"own_lock": True}):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                self.write(Path(directory), **mutation)
+                with self.assertRaises(AssertionError):
+                    self.gate.check_ios_host_shared_workspace(Path(directory))
 
-    def test_matching_lock_passes_and_drift_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            self.write(Path(tmp), "0.2.1")
-            self.gate.check_ios_host_lock_drift(Path(tmp))
-        with tempfile.TemporaryDirectory() as tmp:
-            self.write(Path(tmp), "0.2.2")
-            with self.assertRaises(AssertionError):
-                self.gate.check_ios_host_lock_drift(Path(tmp))
-
-    def test_the_real_harness_lock_matches_the_root(self) -> None:
-        self.gate.check_ios_host_lock_drift(self.gate.ROOT)
-
-
+    def test_real_harness_shares_root_workspace(self):
+        self.gate.check_ios_host_shared_workspace(self.gate.ROOT)
 
 
 class RegexArchiveLockTests(unittest.TestCase):

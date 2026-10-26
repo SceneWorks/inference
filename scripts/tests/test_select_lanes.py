@@ -223,7 +223,7 @@ class SelectLanesTests(unittest.TestCase):
     def test_every_crate_on_the_harness_graph_selects_both_harness_lanes(self) -> None:
         """Every crate the device harness compiles must select both lanes that build it.
 
-        The harness (`ios-host/smoke`) is its own cargo workspace with a wider graph than
+        The explicit harness package (`ios-host/smoke`) has a wider graph than
         runtime-ios (core-llm-testkit, and z-image behind `zimage`), so a crate on it but not on
         runtime-ios's graph would otherwise reach neither the harness cross-build nor its tests.
         """

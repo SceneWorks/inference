@@ -993,12 +993,9 @@ jobs:
         run: >-
           python3 -I scripts/ci/check_compiled_model_ignores.py -- python3 scripts/ci/run_ci_collection.py -- cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
-      # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
-      # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
-      # it. Two settings make it reuse this job's `target/` instead of building a second one:
-      # `CARGO_TARGET_DIR` points it at the workspace target, and the root manifest's
-      # `[profile.dev.package."*"] opt-level = 3` (which the harness manifest lacks) is supplied by
-      # `--config`, so its registry/git units, pmetal-mlx-sys included, hash identically.
+      # Epic 16774 E3: the explicit device-harness package now shares the root SDK workspace
+      # and Cargo.lock, preserving compiled dependency identity across SDK/capture and relocation.
+      # Keep these named package lanes and target directory; --config matches the root profile.
       # Only weights-free, CPU-only tests run here. MLX has no environment switch to a CPU default
       # device, so the one test that drives the GPU, `smoke_passes_on_the_host` (the whole device
       # smoke: GEMMs, softmax, metallib load), is skipped by name; it is the device harness's own
@@ -1114,11 +1111,9 @@ jobs:
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --all-targets -- -D warnings
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --no-default-features --all-targets -- -D warnings
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --features device-capture --all-targets -- -D warnings
-      # The device harness `ios-host/smoke` (own `[workspace]` and Cargo.lock) is what
-      # `scripts/ios/run_smoke.sh` links into the app: the default (LLM smoke) and `media` profiles.
-      # It shares this job's `target/` (`CARGO_TARGET_DIR`), and `--config` supplies the root
-      # manifest's `[profile.dev.package."*"] opt-level = 3`, so its registry/git units hash like
-      # the workspace's and the iOS libmlx built above is reused rather than rebuilt by cmake.
+      # The root-workspace device harness `ios-host/smoke` is what run_smoke.sh links into
+      # the app. Its default/media profiles share the SDK lock and compiled dependency units;
+      # these explicit package lanes retain the job's target and native build artifacts.
       - name: Build iOS device harness (media) for ${{ matrix.target }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target

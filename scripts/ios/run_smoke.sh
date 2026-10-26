@@ -21,6 +21,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
+# The harness shares the SDK workspace; keep Xcode's existing explicit artifact location.
+export CARGO_TARGET_DIR="$ROOT/ios-host/smoke/target"
 
 PROFILE=release
 CARGO_PROFILE_FLAG=--release
@@ -125,7 +127,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   [ "$MEMORY_ENTITLEMENT" = on ] || say "NOTE: --memory-entitlement is ignored on the simulator (unsigned; no jetsam cap)"
 
   SIM_TRIPLE=aarch64-apple-ios-sim
-  SMOKE_TARGET="$ROOT/ios-host/smoke/target"
+  SMOKE_TARGET="$CARGO_TARGET_DIR"
   LIB="$SMOKE_TARGET/$SIM_TRIPLE/$PROFILE/libios_smoke.a"
   say "building ios-smoke for $SIM_TRIPLE ($PROFILE${CARGO_FEATURES:+, $CARGO_FEATURES})"
   # shellcheck disable=SC2086  # both flag vars are deliberately word-split
@@ -275,9 +277,9 @@ export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml floors the iOS triples (per-target
 # rustflags, not [env] -- see the note there), and this script is
 # also a check that a clean invocation needs no environment help.
-# ios-host/smoke is excluded from the workspace, so it has its OWN target directory rather than
-# the root one. The metallib it builds lives there too.
-SMOKE_TARGET="$ROOT/ios-host/smoke/target"
+# SDK and capture share the root workspace/lock. The explicit target directory above keeps
+# Xcode's staticlib and metallib lookup independent of Cargo's workspace target default.
+SMOKE_TARGET="$CARGO_TARGET_DIR"
 LIB="$SMOKE_TARGET/aarch64-apple-ios/$PROFILE/libios_smoke.a"
 
 say "building ios-smoke for aarch64-apple-ios ($PROFILE${CARGO_FEATURES:+, $CARGO_FEATURES})"

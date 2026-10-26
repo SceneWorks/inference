@@ -5,7 +5,11 @@
 //! pinned Cargo/rustc toolchain their crate disambiguators include Cargo's recursive unit
 //! metadata, including features unified by downstream users of local, registry and git crates.
 //! This is a build-system identity, not a stable Rust ABI: compiler/Cargo identity is bound too,
-//! and the regression verifies transitive feature changes, rebuild and checkout stability.
+//! and the regression verifies transitive feature changes, rebuild and checkout stability for
+//! the supported root-workspace composition: runtime-ios/catalog SDK and the root-member smoke
+//! harness. Separate nested workspaces and arbitrary Git consumers carry different Cargo source
+//! identities and cannot reuse these captures, even when their Rust source bytes match. Do not
+//! treat TypeId as a transport-independent feature manifest or extend that compatibility claim.
 //! Native MLX artifacts remain separately bound. The catalog itself has no anchor so its
 //! capture-only permit and evidence/policy DATA do not invalidate the production closure.
 

@@ -4405,7 +4405,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 )
 
     def test_ios_device_harness_is_built_linted_and_tested_without_the_gpu_smoke(self) -> None:
-        """Epic 16774 E3: `ios-host/smoke` is outside the workspace, so only these steps reach it."""
+        """Epic 16774 E3: the root-workspace harness retains its explicit guarded build/test lanes."""
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
         manifest = "--manifest-path ios-host/smoke/Cargo.toml"
 

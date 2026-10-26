@@ -2171,6 +2171,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ios-smoke"
+version = "0.0.0"
+dependencies = [
+ "core-llm-testkit",
+ "image",
+ "libc",
+ "mlx-gen",
+ "mlx-gen-sana",
+ "mlx-gen-z-image",
+ "pmetal-mlx-rs",
+ "runtime-ios",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
