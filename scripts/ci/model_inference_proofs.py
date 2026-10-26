@@ -25,6 +25,7 @@ from scripts.ci.model_proof_parent_helpers import validate_parent_helpers
 from scripts.ci.model_proof_resources import validate_child_visibility
 from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validate_contract
 from scripts.ci import model_proof_multi_cuda as multi_cuda
+from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
 
 REGISTRY_PATH = Path(__file__).with_name('model-inference-proofs.json')
 IGNORE_PREFIX = 'model inference; explicit model-proof workflow'
@@ -877,6 +878,12 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 missing = [name for name in row.get('required_environment', []) if not env.get(name)]
                 if missing:
                     raise ValueError('missing declared model/fixture prerequisites: ' + ','.join(missing))
+                if identity(row) in IRIS_QUANT_PROOFS:
+                    path = env.get('MODEL_PROOF_ASSET_RECEIPT')
+                    if not path:
+                        raise ValueError('missing authenticated Iris asset preflight receipt')
+                    result['asset_preflight'] = validate_iris_asset_receipt(
+                        json.loads(Path(path).read_text(encoding='utf-8')), backend, env)
                 result['toolchain'] = verified_toolchain(env, root=ROOT)
                 result['build_preparation'] = prepare_build(row, env)
                 for discover in (True, False):
@@ -1040,7 +1047,7 @@ def prepare_build(row: dict, env: dict[str, str]) -> dict:
 
 
 def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
-                     approved_rows: tuple[dict, ...]) -> dict:
+                     approved_rows: tuple[dict, ...], backend: str | None = None) -> dict:
     """Upload only exact approved source cases/known outputs, after the outer resource seal.
 
     Stream budgets are per command: discovery and body each get those explicit limits.
@@ -1161,6 +1168,8 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
     for index, case in enumerate(cases):
         if not case['accepted']:
             continue
+        if identity(approved_rows[index]) in IRIS_QUANT_PROOFS:
+            validate_iris_asset_receipt(case.get('asset_preflight'), backend)
         logs = [f'{index:05d}/body.stdout.log', f'{index:05d}/body.stderr.log']
         if any(name not in hashes for name in logs):
             raise ValueError('accepted input claims require their exact bounded body logs')
@@ -1213,7 +1222,7 @@ def main() -> int:
         if args.verify_artifacts:
             if args.output is None:
                 raise ValueError('owned evidence output is required')
-            print(json.dumps(verify_artifacts(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows)))
+            print(json.dumps(verify_artifacts(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend)))
             return 0
         if args.plan:
             for row in rows:
