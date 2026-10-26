@@ -41,7 +41,10 @@ fn field(mark: impl ScalarMetadata, name: &str) -> Result<u64> {
 fn is_load(label: &str) -> bool {
     matches!(
         label,
-        labels::TEXT_LOAD | labels::REFERENCE_ENCODER_LOAD | labels::HEAVY_LOAD
+        labels::RESIDENT_LOAD
+            | labels::TEXT_LOAD
+            | labels::REFERENCE_ENCODER_LOAD
+            | labels::HEAVY_LOAD
     )
 }
 /// Full actual receipt chronology, shared by native certificate observations

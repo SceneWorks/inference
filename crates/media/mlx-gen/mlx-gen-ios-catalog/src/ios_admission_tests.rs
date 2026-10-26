@@ -749,6 +749,46 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
 /// empty) but only exists where quanta are bounded; it is labelled and never an admission.
 #[cfg(feature = "device-capture")]
 #[test]
+fn resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokenization() {
+    in_cpu_child(
+        "ios_admission::tests::resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokenization",
+        || {
+            let registry = crate::provider_registry().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let mut candidate = build_candidate(
+                &registry,
+                "sana_1600m",
+                sana(root.path()).with_offload_policy(mlx_gen::OffloadPolicy::Resident),
+                None,
+                MemoryStrategy::Resident,
+                generation(512, vec![]),
+            ).unwrap();
+            // Only the three tiny, real header/payload files exist: no tokenizer or model config.
+            let mut next = |_| Ok(());
+            let key = capture_evidence_key_with_key_capacity(
+                &registry, &mut candidate, DEVICE, &mut next,
+            ).unwrap();
+            assert_eq!(key.token_window, 0);
+            let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
+                mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES + 767,
+                || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).is_err()),
+            ).unwrap();
+            assert!(refused, "the 768-byte mandatory resident union cannot fit");
+            let refusal = mlx_gen::ios_quantum::take_refusal().unwrap();
+            assert_eq!(refusal.label, mlx_gen_sana::quantum::labels::RESIDENT_LOAD);
+            assert_eq!(refusal.scratch_bytes, 768);
+            // Raising only the fixture headroom to the exact union permits the same real key.
+            let permit = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(
+                mlx_gen::ios_quantum::PROCESS_RESERVE_BYTES + 768,
+                || Ok(capture_permit_with_key_capacity(&registry, &candidate, DEVICE, &mut next).unwrap()),
+            ).unwrap();
+            assert_eq!(permit.evidence_key(), &key);
+            assert!(permit.is_capture());
+        },
+    );
+}
+
+#[test]
 fn capture_permit_needs_bounded_quanta_not_evidence() {
     let registry = crate::provider_registry().unwrap();
     let root = tempfile::tempdir().unwrap();

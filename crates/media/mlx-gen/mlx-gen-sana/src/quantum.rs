@@ -29,6 +29,8 @@ pub const MAX_RATIO: f64 = 1.5;
 /// label may be shared between two phases (the DC-AE encoder's blocks are labelled apart from the
 /// decoder's for exactly that reason).
 pub mod labels {
+    /// Capture preflight: the full mandatory eager resident warm pair, before any component loads.
+    pub const RESIDENT_LOAD: &str = "SANA resident load";
     /// Gemma-2 caption encoder load floor.
     pub const TEXT_LOAD: &str = "SANA text load";
     /// Joined selected captions/masks, before the text encoder can be shed.
@@ -85,6 +87,7 @@ pub mod labels {
 
     /// Every label above.
     pub const ALL: &[&str] = &[
+        RESIDENT_LOAD,
         TEXT_LOAD,
         TEXT_SELECTED,
         REFERENCE_ENCODER_LOAD,

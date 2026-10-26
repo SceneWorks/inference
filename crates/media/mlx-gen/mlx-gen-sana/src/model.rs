@@ -222,6 +222,26 @@ pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_from(spec, sprint_descriptor(), true)
 }
 
+/// Header-only capture preflight for the mandatory resident warm pair. The shared residency
+/// driver calls the heavy loader with `needs_encoder=true`, including for text-only work, so
+/// Gemma, the trunk and BOTH DC-AE halves must coexist. Reject an already known nonfit before
+/// observation tokenization or the first component's materialization. This uses the existing
+/// live load-floor/reserve check; it is not a new physical-memory upper or a model-fit claim.
+pub fn preflight_resident_load(spec: &LoadSpec, provider: &str) -> Result<()> {
+    if spec.offload_policy != mlx_gen::OffloadPolicy::Resident {
+        return Ok(());
+    }
+    let root = load_components(spec, provider)?;
+    mlx_gen::ios_quantum::before_load(
+        crate::quantum::labels::RESIDENT_LOAD,
+        &[
+            root.join("text_encoder"),
+            root.join("transformer"),
+            root.join("vae"),
+        ],
+    )
+}
+
 /// Shared load body for [`load`] / [`load_sprint`]: fail-fast on the unsupported precision / adapter
 /// overrides (via [`load_components`]) up front for BOTH residencies, then build the [`Residency`]
 /// seam. `Resident` (default) builds the Gemma text encoder + heavy bundle now and holds them warm;
@@ -964,6 +984,74 @@ mod tests {
     use crate::pipeline::{DEFAULT_GUIDANCE, DEFAULT_STEPS};
     use mlx_gen::Quant;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn resident_capture_refuses_the_whole_warm_pair_before_any_tokenizer_or_model_read() {
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().unwrap());
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        use mlx_gen::ios_quantum::{
+            take_refusal, with_cpu_diagnostic_headroom, PROCESS_RESERVE_BYTES,
+        };
+        use std::io::Write;
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let root = tempfile::tempdir().unwrap();
+            for (component, keys) in [
+                ("text_encoder", vec!["model.embed_tokens.weight"]),
+                ("transformer", vec!["weight"]),
+                ("vae", vec!["encoder.weight", "decoder.weight"]),
+            ] {
+                let dir = root.path().join(component);
+                std::fs::create_dir(&dir).unwrap();
+                let mut offset = 0;
+                let mut fields = Vec::new();
+                for key in keys {
+                    fields.push(format!(
+                        r#""{key}":{{"dtype":"F32","shape":[2],"data_offsets":[{offset},{}]}}"#,
+                        offset + 8
+                    ));
+                    offset += 8;
+                }
+                let header = format!("{{{}}}", fields.join(",")).into_bytes();
+                let mut file = std::fs::File::create(dir.join("weights.safetensors")).unwrap();
+                file.write_all(&(header.len() as u64).to_le_bytes())
+                    .unwrap();
+                file.write_all(&header).unwrap();
+                file.set_len(8 + header.len() as u64 + offset).unwrap();
+            }
+            // No tokenizer or executable model config exists. Each component fits alone, while
+            // their mandatory resident union does not. No Array/model constructor is involved.
+            let mut spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.path().into()));
+            spec.quantize = quant;
+            spec.precision = mlx_gen::Precision::Bf16;
+            assert_eq!(spec.offload_policy, mlx_gen::OffloadPolicy::Resident);
+            for provider in [MODEL_ID, SPRINT_MODEL_ID] {
+                let _ = take_refusal();
+                let result = with_cpu_diagnostic_headroom(PROCESS_RESERVE_BYTES + 31, || {
+                    preflight_resident_load(&spec, provider)
+                });
+                assert!(result.is_err());
+                let refused = take_refusal()
+                    .unwrap_or_else(|| panic!("expected typed pre-allocation refusal: {result:?}"));
+                assert_eq!(refused.label, crate::quantum::labels::RESIDENT_LOAD);
+                assert_eq!(refused.scratch_bytes, 32);
+                with_cpu_diagnostic_headroom(PROCESS_RESERVE_BYTES + 32, || {
+                    preflight_resident_load(&spec, provider)
+                })
+                .unwrap();
+            }
+        }
+        let missing = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+            "missing-sequential-source".into(),
+        ))
+        .with_offload_policy(mlx_gen::OffloadPolicy::Sequential);
+        with_cpu_diagnostic_headroom(0, || preflight_resident_load(&missing, MODEL_ID)).unwrap();
+    }
 
     fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
         let start = source

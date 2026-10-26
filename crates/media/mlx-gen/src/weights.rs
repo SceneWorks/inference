@@ -116,9 +116,19 @@ __input_path,
     /// (`kIOGPUCommandBufferCallbackErrorTimeout`; sd3, ideogram and seedvr2 in the sc-24245
     /// campaign). Reading the loads first means the GPU only ever sees resident inputs.
     fn materialize_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        let bytes = || {
+            batch.iter().fold(0usize, |total, (_, array)| {
+                total.saturating_add(array.nbytes())
+            })
+        };
+        crate::ios_quantum::diagnostic_load_stage(0, bytes);
         mlx_rs::transforms::eval_pending_loads(batch.iter().map(|(_, array)| *array))?;
+        crate::ios_quantum::diagnostic_load_stage(1, bytes);
         mlx_rs::transforms::eval(batch.iter().map(|(_, array)| *array))?;
-        crate::coherence::verify_gpu_view(batch.iter().copied())
+        crate::ios_quantum::diagnostic_load_stage(2, bytes);
+        crate::coherence::verify_gpu_view(batch.iter().copied())?;
+        crate::ios_quantum::diagnostic_load_stage(3, bytes);
+        Ok(())
     }
 
     /// Evaluate only tensors read through [`Self::get`] / [`Self::require`] since the last drain.

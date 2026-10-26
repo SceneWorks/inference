@@ -408,6 +408,29 @@ impl Drop for Scope {
 mod allocation_scope_tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn phone_load_stage_does_not_evaluate_metadata_or_change_host_execution() {
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().unwrap());
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        diagnostic_load_stage(0, || {
+            panic!("host must not query array metadata for phone telemetry")
+        });
+        with_cpu_diagnostic_headroom(1, || {
+            diagnostic_load_stage(0, || {
+                panic!("CPU fixture cannot enable physical-phone telemetry")
+            });
+            Ok(())
+        })
+        .unwrap();
+    }
     // Synthetic native-control faults exercise production setup/RAII, not backing physics.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
@@ -659,6 +682,19 @@ pub fn diagnostic_metadata<'a>(provider: &'a str, kind: &'a str, fields: &'a [(&
         kind,
         fields,
     });
+}
+
+/// Physical-phone load progress only. The harness persists this separately from its source and
+/// memory witnesses. This changes neither materialization nor pricing and is a no-op elsewhere.
+pub(crate) fn diagnostic_load_stage(stage: u64, bytes: impl FnOnce() -> usize) {
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    diagnostic_metadata(
+        "mlx",
+        "load-stage",
+        &[("stage", stage), ("bytes", bytes() as u64)],
+    );
+    #[cfg(any(not(target_os = "ios"), target_abi = "sim"))]
+    let _ = (stage, bytes);
 }
 
 type Listener = Box<dyn Fn(QuantumMark<'_>) + Send + Sync>;

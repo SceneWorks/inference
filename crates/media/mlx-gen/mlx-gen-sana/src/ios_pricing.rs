@@ -43,7 +43,7 @@ pub const GEMMA_LABELS: [&str; 3] = ["Gemma embedding/mask", "Gemma layer", "Gem
 pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     use labels::*;
     match label {
-        TEXT_LOAD | REFERENCE_ENCODER_LOAD | HEAVY_LOAD => Some(IosPhase::Load),
+        RESIDENT_LOAD | TEXT_LOAD | REFERENCE_ENCODER_LOAD | HEAVY_LOAD => Some(IosPhase::Load),
         TEXT_SELECTED => Some(IosPhase::Conditioning),
         l if GEMMA_LABELS.contains(&l) => Some(IosPhase::Conditioning),
         ENCODER_INPUT | ENCODER_BLOCK | ENCODER_DOWNSAMPLE | ENCODER_STITCH | ENCODER_OUTPUT

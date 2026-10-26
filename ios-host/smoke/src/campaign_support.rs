@@ -329,12 +329,14 @@ pub(super) fn capture_listener_callback_host(
         name.checked_mul(2),
     ])?;
     let fixed = sum(&[
-        // Installation: the provider String clone, both Arcs and the boxed closure (two Arcs
-        // and one String captured).
+        // Installation: provider, bounded diagnostic nonce/case Strings, two Arcs, and the
+        // boxed closure (three Strings and a bool). Sidecar I/O is diagnostic only; these
+        // requested-layout terms do not certify its physical/OS allocator response.
         Some(provider.len() as u64),
+        Some(32 + 128),
         Some((size_of::<std::sync::Mutex<CaptureMarks>>() + 16) as u64),
         Some((size_of::<std::sync::atomic::AtomicBool>() + 16) as u64),
-        Some((2 * size_of::<usize>() + size_of::<String>()) as u64),
+        Some((3 * size_of::<usize>() + 3 * size_of::<String>()) as u64),
         marks.checked_mul(per_accepted),
         vec_growth_bytes(marks, size_of::<SamplingMark>()),
         // `counts` / `latest`: outer maps (≤ one entry per accepted mark) and inner maps

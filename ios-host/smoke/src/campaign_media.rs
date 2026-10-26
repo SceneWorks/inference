@@ -21,6 +21,73 @@ use std::time::{Duration, Instant};
 #[path = "campaign_support.rs"]
 mod support;
 use support::{case_timeout, classify, Deadline};
+
+/// Crash-surviving diagnostic only, never a capture/capacity witness. One small last-transition
+/// record is replaced atomically, so a failed write cannot replace the previous transition.
+/// The driver nonce prevents an old sidecar from being mistaken for this cold launch.
+fn stage(enabled: bool, run_id: &str, case_stem: &str, label: &str, bytes: u64) {
+    if !enabled {
+        return;
+    }
+    let Some(docs) = super::dirs_documents() else {
+        return;
+    };
+    let _ = write_stage(
+        &docs,
+        run_id,
+        case_stem,
+        label,
+        bytes,
+        runtime_ios::process_memory(),
+        option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_stage(
+    docs: &Path,
+    run_id: &str,
+    case_stem: &str,
+    label: &str,
+    bytes: u64,
+    memory: runtime_ios::ProcessMemory,
+    build: &str,
+) -> std::io::Result<()> {
+    if run_id.len() != 32 || !run_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    if case_stem.is_empty()
+        || case_stem.len() > 128
+        || !case_stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let next = docs.join("campaign-progress.next");
+    let current = docs.join("campaign-progress.txt");
+    use std::io::Write;
+    let mut buffer = [0u8; 512];
+    let mut line = std::io::Cursor::new(buffer.as_mut_slice());
+    writeln!(line, "run_id={run_id} build={build} case={case_stem} stage={label:.128} bytes={bytes} footprint={:?} available={:?}",
+        memory.footprint, memory.available)?;
+    let len = line.position() as usize;
+    std::fs::write(&next, &buffer[..len])?;
+    std::fs::rename(next, current)
+}
+
+fn record_quantum_refusal(
+    refusal: runtime_ios::media::ios_quantum::QuantumRefusal,
+    edge: u32,
+) -> Value {
+    json!({
+        "label": refusal.label,
+        "scratch_bytes": refusal.scratch_bytes,
+        "reserve_bytes": refusal.reserve_bytes,
+        "available_bytes": refusal.available_bytes,
+        "edge": edge,
+    })
+}
 #[path = "campaign_primitive.rs"]
 mod primitive;
 
@@ -1629,13 +1696,7 @@ impl DeviceProvider<'_> {
         // Typed by the quantum mechanism / the capacity recheck, never by the message.
         if let Some(refusal) = runtime_ios::media::ios_quantum::take_refusal() {
             self.refusal_kind = Some("capacity");
-            self.refused_quantum = Some(json!({
-                "label": refusal.label,
-                "scratch_bytes": refusal.scratch_bytes,
-                "reserve_bytes": refusal.reserve_bytes,
-                "available_bytes": refusal.available_bytes,
-                "edge": c.edge,
-            }));
+            self.refused_quantum = Some(record_quantum_refusal(refusal, c.edge));
             return Err(ExecuteError::QuantumRefused(error));
         }
         if runtime_ios::media::take_capacity_refusal() {
@@ -1647,6 +1708,16 @@ impl DeviceProvider<'_> {
 }
 impl Provider for DeviceProvider<'_> {
     fn admit(&mut self, c: &Case, diagnostic: bool) -> Result<(), AdmissionError> {
+        let _ = runtime_ios::media::ios_quantum::take_refusal();
+        let run_id = std::env::var("IOS_CAMPAIGN_RUN_ID").unwrap_or_default();
+        let stage_case = runtime_ios::media::capture_artifact_stem(&c.key());
+        stage(
+            diagnostic,
+            &run_id,
+            &stage_case,
+            "prepare-source-inventory-and-key",
+            0,
+        );
         if !self.device_allowed {
             return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
         }
@@ -1734,6 +1805,7 @@ impl Provider for DeviceProvider<'_> {
             })?;
         }
         self.prepare_for_programme(c, diagnostic)?;
+        stage(diagnostic, &run_id, &stage_case, "prepared-source-key", 0);
         // Provenance storage exists before the real counter boundary. Both capture ledger and
         // SDK sidecar use THIS query, not a second arbitrarily timed footprint or budget guess.
         let baseline_source =
@@ -1814,6 +1886,33 @@ impl Provider for DeviceProvider<'_> {
             |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
         if diagnostic {
             // CAPTURE: labelled, bounded per quantum, no evidence row consulted or created.
+            stage(
+                diagnostic,
+                &run_id,
+                &stage_case,
+                "capture-permit-and-observation-plan",
+                0,
+            );
+            let mut observer = |view: runtime_ios::media::SelectedAdmissionView<'_>| {
+                stage(
+                    diagnostic,
+                    &run_id,
+                    &stage_case,
+                    "observation-plan-before-tokenizer",
+                    0,
+                );
+                let result = observe_selected_sana_capture(view);
+                if result.is_ok() {
+                    stage(
+                        diagnostic,
+                        &run_id,
+                        &stage_case,
+                        "observation-plan-complete",
+                        0,
+                    );
+                }
+                result
+            };
             let permit = runtime_ios::media::capture_permit_with_observer(
                 candidate,
                 runtime_ios::media::SourceCapacityBoundary {
@@ -1822,10 +1921,19 @@ impl Provider for DeviceProvider<'_> {
                     premise_policy,
                     source_metadata_capacity: &mut source_next,
                 },
-                &mut observe_selected_sana_capture,
+                &mut observer,
             )
-            .map_err(|e| classify(&mut self.refusal_kind, e))?;
+            .map_err(|error| {
+                if let Some(refusal) = runtime_ios::media::ios_quantum::take_refusal() {
+                    self.refusal_kind = Some("capacity");
+                    self.refused_quantum = Some(record_quantum_refusal(refusal, c.edge));
+                    AdmissionError::QuantumRefused(error.to_string())
+                } else {
+                    classify(&mut self.refusal_kind, error)
+                }
+            })?;
             self.permit = Some(permit);
+            stage(diagnostic, &run_id, &stage_case, "capture-permit-ready", 0);
             return Ok(());
         }
         // ADMITTED: the same single seam the facades use, against the reviewed table, before load.
@@ -1896,6 +2004,13 @@ impl Provider for DeviceProvider<'_> {
         if self.cancel.is_cancelled() || Instant::now() >= self.deadline {
             return Err("cooperative case deadline reached before loading".into());
         }
+        stage(
+            self.permit.is_some(),
+            &std::env::var("IOS_CAMPAIGN_RUN_ID").unwrap_or_default(),
+            &runtime_ios::media::capture_artifact_stem(&c.key()),
+            "model-load-and-execute",
+            0,
+        );
         match self.permit.take() {
             Some((registry, permit)) => self.run_work(c, Some(permit), &registry),
             None => {
@@ -2091,6 +2206,24 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             let listener_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let failed = Arc::clone(&listener_failed);
             let provider = case.provider.clone();
+            let stage_run_id = if diagnostic {
+                std::env::var("IOS_CAMPAIGN_RUN_ID")
+                    .ok()
+                    .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let stage_case = if diagnostic {
+                let stem = runtime_ios::media::capture_artifact_stem(value);
+                if stem.len() <= 128 {
+                    stem
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
                 let (label, opens, scratch) = match mark {
                     runtime_ios::media::ios_quantum::QuantumMark::Metadata {
@@ -2098,6 +2231,30 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                         kind,
                         fields,
                     } => {
+                        if provider == "mlx" && kind == "load-stage" {
+                            let code = fields
+                                .iter()
+                                .find(|(key, _)| *key == "stage")
+                                .map(|(_, value)| *value);
+                            let bytes = fields
+                                .iter()
+                                .find(|(key, _)| *key == "bytes")
+                                .map(|(_, value)| *value)
+                                .unwrap_or(0);
+                            let label = match code {
+                                Some(0) => "weights-pending-loads",
+                                Some(1) => "weights-derived-evaluation",
+                                Some(2) => "weights-coherence-verification",
+                                Some(3) => "weights-batch-complete",
+                                Some(4) => "coherence-cpu-checksum",
+                                Some(5) => "coherence-gpu-checksum",
+                                Some(6) => "coherence-checksum-returned",
+                                _ => "unknown-load-stage",
+                            };
+                            stage(diagnostic, &stage_run_id, &stage_case, label, bytes);
+                            // Separate last-stage telemetry, not a source/counter witness.
+                            return;
+                        }
                         match sink.lock() {
                             Ok(mut captured) => captured.metadata(provider, kind, fields),
                             Err(_) => failed.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -2111,6 +2268,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                         (label, false, 0)
                     }
                 };
+                stage(diagnostic, &stage_run_id, &stage_case, label, scratch);
                 let reading = phys_footprint();
                 match sink.lock() {
                     Ok(mut captured) => {

@@ -2986,7 +2986,7 @@ fn capture_permit_using_key_capacity(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
     machine: &str,
-    next: Option<KeyCapacity<'_>>,
+    mut next: Option<KeyCapacity<'_>>,
     simulator_functional: bool,
 ) -> AdmissionResult<Admission> {
     if !mlx_gen::ios_quantum::enabled() && !simulator_functional {
@@ -2997,7 +2997,7 @@ fn capture_permit_using_key_capacity(
         )));
     }
     let premise_policy = PremisePolicy::default();
-    admit_one_with_retirement(
+    let permit = admit_one_with_retirement(
         registry,
         0,
         candidate,
@@ -3018,9 +3018,33 @@ fn capture_permit_using_key_capacity(
                 execution_facts: None,
                 premise_policy: &premise_policy,
             },
-            next,
+            next: next.as_mut().map(|next| &mut **next as KeyCapacity<'_>),
         },
-    )
+    )?;
+    if !simulator_functional
+        && matches!(permit.provider.as_str(), "sana_1600m" | "sana_sprint_1600m")
+    {
+        // The real key/inventory already exists. This header-only union check must precede
+        // runtime capture observers, whose source-event planning may construct a tokenizer.
+        match next {
+            Some(next) => with_source_inventory_capacity(next, |core_next| {
+                permit
+                    .spec
+                    .read_prepared_files_unchanged_with_capacity(core_next, |_| {
+                        mlx_gen_sana::model::preflight_resident_load(&permit.spec, &permit.provider)
+                            .map_err(Error::from)
+                    })
+            }),
+            None => permit
+                .spec
+                .read_prepared_files_unchanged(|| {
+                    mlx_gen_sana::model::preflight_resident_load(&permit.spec, &permit.provider)
+                        .map_err(Error::from)
+                })
+                .map_err(AdmissionError::Failed),
+        }?;
+    }
+    Ok(permit)
 }
 
 impl Admission {

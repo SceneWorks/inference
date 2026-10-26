@@ -687,6 +687,24 @@ size. At q4 / 1024 / text the walk refuses the 7 `dit` and 7 `te` selections and
 the staged `s_t512_o64_c67108864_w1_dit` (Michael's Mac configuration, tile 512)
 predicts 5963 MiB.
 
+For SANA resident captures, the catalog checks the mandatory header-derived union of
+Gemma, the transformer and the complete VAE before the observation planner constructs
+its tokenizer. An over-headroom union produces a typed `capture_refused` with the real
+source/key and structured refused quantum; it does not deliberately load the first
+component of an already known nonfit resident configuration. This load floor and the
+existing reserve are not a physical-memory upper bound for optimized execution.
+
+The harness atomically overwrites one bounded `Documents/campaign-progress.txt` record
+at preparation, observation, load, batch materialization and coherence transitions. Its
+nonce, compiled build and case identify the attempt; it is diagnostic only, never an
+anchor or a substitute for a typed refusal. A last transition can narrow an interrupted
+run's stage without proving its termination cause. Per-batch telemetry adds no new
+capacity charge, and compiles to a no-op on desktop and simulator builds.
+
+CI_IMPACT: the bootstrap guard adds only focused header/key/refusal/sidecar tests and
+native compilation/lint checks. These construct no model and execute no learned layer;
+normal CI gains no inference campaign or model-compute requirement.
+
 The following are **future session recipes, not instructions to run now**. Phone
 availability alone does not authorize a full-model diagnostic. Use a fresh evidence
 directory and save the checkout SHA, OS, entitlement, conversion/source receipts

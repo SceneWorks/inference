@@ -679,14 +679,7 @@ pub fn capture_observation_plan(
     }
     // Real production Resident loads precede invocation; Sequential loads are
     // inside it. All loads still produce ordinary Checked/listener events.
-    let loads = 2 + u64::from(plan.sequential && plan.img2img);
-    let load_bytes = labels::TEXT_LOAD.len() as u64
-        + labels::HEAVY_LOAD.len() as u64
-        + if plan.sequential && plan.img2img {
-            labels::REFERENCE_ENCODER_LOAD.len() as u64
-        } else {
-            0
-        };
+    let (loads, load_bytes) = capture_load_events(plan.sequential, plan.img2img);
     labels_bytes = labels_bytes
         .checked_add(load_bytes)
         .ok_or_else(|| invalid("capture load label sum overflow"))?;
@@ -715,6 +708,26 @@ pub fn capture_observation_plan(
         native_root_marks: 2 + u64::from(plan.sequential && plan.img2img),
         ordinary_sampling_marks,
     })
+}
+
+/// Physical catalog captures additionally preflight the complete resident union before their
+/// observation planner. Sequential captures do not execute that guard. These are listener
+/// events only, not additional native allocation epochs or graph execution.
+fn capture_load_events(sequential: bool, img2img: bool) -> (u64, u64) {
+    let loads = 2 + u64::from(sequential && img2img) + u64::from(!sequential);
+    let bytes = labels::TEXT_LOAD.len()
+        + labels::HEAVY_LOAD.len()
+        + if sequential && img2img {
+            labels::REFERENCE_ENCODER_LOAD.len()
+        } else {
+            0
+        }
+        + if !sequential {
+            labels::RESIDENT_LOAD.len()
+        } else {
+            0
+        };
+    (loads, bytes as u64)
 }
 
 pub(super) fn ordinary_source_marks(
@@ -792,6 +805,22 @@ pub(super) fn fixture_sampling(
 mod tests {
     use super::*;
     use mlx_gen::ios_pricing::IosObservedMetadata;
+
+    #[test]
+    fn resident_capture_counts_the_union_guard_and_sequential_does_not() {
+        let base = (labels::TEXT_LOAD.len() + labels::HEAVY_LOAD.len()) as u64;
+        for reference in [false, true] {
+            assert_eq!(
+                capture_load_events(false, reference),
+                (3, base + labels::RESIDENT_LOAD.len() as u64)
+            );
+        }
+        assert_eq!(capture_load_events(true, false), (2, base));
+        assert_eq!(
+            capture_load_events(true, true),
+            (3, base + labels::REFERENCE_ENCODER_LOAD.len() as u64)
+        );
+    }
 
     // Protocol tests only: these synthetic marks are NEVER passed to the
     // certificate builder or represented as observed production execution.

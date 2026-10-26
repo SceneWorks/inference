@@ -583,6 +583,8 @@ impl Status {
 /// orchestration with a fake provider, rather than testing a second implementation of the gate.
 #[derive(Debug)]
 pub enum AdmissionError {
+    /// A real pre-construction quantum refusal during capture preparation.
+    QuantumRefused(String),
     Refused(String),
     Failure(String),
 }
@@ -626,6 +628,14 @@ pub trait Provider {
 pub fn run(provider: &mut impl Provider, case: &Case, diagnostic: bool) -> (Status, String) {
     if let Err(error) = provider.admit(case, diagnostic) {
         return match error {
+            AdmissionError::QuantumRefused(reason) => (
+                if diagnostic {
+                    Status::CaptureRefused
+                } else {
+                    Status::DiagnosticFailure
+                },
+                reason,
+            ),
             AdmissionError::Refused(reason) => (
                 if diagnostic {
                     Status::DiagnosticFailure
@@ -1095,5 +1105,23 @@ mod tests {
         p.refused = true;
         assert_eq!(run(&mut p, &c, false).0, Status::AdmittedRefused);
         assert_eq!(run(&mut p, &c, true).0, Status::DiagnosticFailure);
+    }
+
+    #[test]
+    fn an_early_typed_capture_quantum_refusal_never_enters_weight_loading() {
+        struct Early;
+        impl Provider for Early {
+            fn admit(&mut self, _: &Case, _: bool) -> Result<(), AdmissionError> {
+                Err(AdmissionError::QuantumRefused(
+                    "resident union exceeds live headroom".into(),
+                ))
+            }
+            fn execute(&mut self, _: &Case) -> Result<(), ExecuteError> {
+                panic!("pre-allocation refusal must not load weights")
+            }
+        }
+        let case = enumerate(&[surface()]).remove(0).case;
+        assert_eq!(run(&mut Early, &case, true).0, Status::CaptureRefused);
+        assert_eq!(run(&mut Early, &case, false).0, Status::DiagnosticFailure);
     }
 }

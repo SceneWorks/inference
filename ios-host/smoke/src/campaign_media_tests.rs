@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn stage_sidecar_is_bounded_nonce_bound_and_preserves_prior_transition_on_write_failure() {
+    let docs = tempfile::tempdir().unwrap();
+    let nonce = "1".repeat(32);
+    let case = format!("recipe-{}", "2".repeat(64));
+    let build = "3".repeat(40);
+    let memory = runtime_ios::ProcessMemory {
+        footprint: Some(u64::MAX),
+        available: Some(u64::MAX),
+    };
+    write_stage(
+        docs.path(),
+        &nonce,
+        &case,
+        "before-tokenizer",
+        0,
+        memory,
+        &build,
+    )
+    .unwrap();
+    let path = docs.path().join("campaign-progress.txt");
+    let first = std::fs::read_to_string(&path).unwrap();
+    assert!(first.contains(&format!(
+        "run_id={nonce} build={build} case={case} stage=before-tokenizer"
+    )));
+    assert!(write_stage(docs.path(), "bad", &case, "wrong", 0, memory, &build).is_err());
+    assert!(write_stage(
+        docs.path(),
+        &nonce,
+        &case,
+        "wrong",
+        0,
+        memory,
+        &"x".repeat(1024)
+    )
+    .is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+    write_stage(
+        docs.path(),
+        &nonce,
+        &case,
+        &"z".repeat(1024),
+        u64::MAX,
+        memory,
+        &build,
+    )
+    .unwrap();
+    let last = std::fs::read_to_string(&path).unwrap();
+    assert!(last.len() <= 512);
+    assert!(last.contains(&format!("stage={} bytes=", "z".repeat(128))));
+    assert!(!docs.path().join("campaign-progress.next").exists());
+}
+
+#[test]
 fn campaign_grouping_uses_actual_control_carriers_not_lossy_mode_labels() {
     let catalog = runtime_ios::catalog().unwrap();
     let registry = catalog.media();

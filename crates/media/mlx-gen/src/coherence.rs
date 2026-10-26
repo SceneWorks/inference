@@ -130,10 +130,13 @@ pub(crate) fn verify_gpu_view_with<'a>(
     for (name, a) in arrays {
         // The reference. MLX's CPU reduce accumulates `uint32` through `int32_t` (wrapping in
         // practice; the 8 MiB agreement test below is what pins that across a pin bump).
+        crate::ios_quantum::diagnostic_load_stage(4, || a.nbytes());
         let cpu = byte_checksum(a, StreamOrDevice::cpu())?;
         let mut attempt = 0u32;
         loop {
+            crate::ios_quantum::diagnostic_load_stage(5, || a.nbytes());
             let gpu = gpu_checksum(a)?;
+            crate::ios_quantum::diagnostic_load_stage(6, || a.nbytes());
             if gpu == cpu {
                 break;
             }
