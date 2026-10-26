@@ -256,6 +256,9 @@ class Collector(unittest.TestCase):
                                     1000000000, None, 0.01, (), {'mode': 'mock'})
         @contextlib.contextmanager
         def incomplete_controller(*_args, **_kwargs):
+            if preseal == 'claim':
+                raise resources.CudaClaimRejected({'requested_uuid': 'GPU-12345678-1234-1234-1234-123456789abc',
+                                                   'predicates': {'unique_uuid': True, 'selected_process_types_allowed': False}})
             yield {'mechanism': 'MOCK controller', 'post_execution_verified': False}
             if preseal == 'cancel':
                 raise KeyboardInterrupt('MOCK cancellation before physical seal')
@@ -287,6 +290,7 @@ class Collector(unittest.TestCase):
             self.assertEqual(receipt['completed'], 1)
             self.assertTrue(receipt['accepted'])
             self.assertEqual(receipt['cases'][0]['actual_devices'], ['mlx-cpu'])
+            self.assertNotIn('cuda_claim_diagnostic', receipt['cases'][0])
             self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY, temp tree removed.
             self.assertTrue((output / '00000/body.events.jsonl').is_file())
             self.assertFalse(any(path.suffix == '.safetensors' for path in output.rglob('*')))
@@ -358,6 +362,23 @@ class Collector(unittest.TestCase):
                 self.assertFalse(case['accepted'])
                 self.assertFalse(verified['accepted_model_run'])
                 self.assertEqual(len(case['commands']), 2)
+
+    def test_prebody_claim_diagnostic_survives_existing_failed_artifact_without_acceptance(self):
+        # CI_IMPACT: collector mock only; no model, CUDA, Cargo, or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), preseal='claim')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 1)  # discovery only; body never starts
+            self.assertFalse(receipt['accepted'])
+            self.assertEqual(receipt['completed'], 0)
+            case = receipt['cases'][0]
+            self.assertFalse(case['accepted'])
+            self.assertFalse(case['body_proof_accepted'])
+            self.assertTrue(case['resource_verification_pending'])
+            self.assertEqual(case['cuda_claim_diagnostic']['predicates']['selected_process_types_allowed'], False)
+            self.assertEqual(json.loads((output / '00000/result.json').read_text(encoding='utf-8')), case)
+            self.assertFalse(verified['accepted_model_run'])
+            self.assertFalse((output / '00000/body.stdout.log').exists())
 
     def test_final_upload_rejects_unknown_files_changed_results_and_wrong_source(self):
         with tempfile.TemporaryDirectory() as temporary:

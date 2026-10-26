@@ -182,6 +182,48 @@ class ChildCudaVisibility(unittest.TestCase):
                 self.assertEqual(locked, [False])
                 self.assertEqual(environment, original)
 
+    def test_rejected_fresh_claim_records_bounded_driver_predicates_without_process_names(self):
+        # CI_IMPACT: fake Windows lock and inventory only; no GPU, process, model, or Cargo.
+        for card, processes, expected in (
+            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 2048,
+              'utilization_percent': 0}, [[APPROVED, '123', 'private.exe', 'G']], 'graphics_memory_below_limit'),
+            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
+              'utilization_percent': 5}, [[APPROVED, '123', 'private.exe', 'G']], 'utilization_below_limit'),
+            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
+              'utilization_percent': 0}, [[APPROVED, '123', 'private.exe', 'C']], 'selected_process_types_allowed'),
+            ({'uuid': OTHER, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
+              'utilization_percent': 0}, [], 'unique_uuid'),
+        ):
+            with self.subTest(predicate=expected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                environment = {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': APPROVED}
+                policy = SimpleNamespace(cuda_device_uuid=APPROVED, deadline_seconds=5, poll_millis=1)
+                locks = []
+                def locking(_descriptor, operation, _count):
+                    locks.append(operation)
+                fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+                fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
+                with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                        patch.object(guard, 'inventory', return_value=([card], processes)) as inventory, \
+                        patch.object(guard, 'sample_baseline') as baseline:
+                    with self.assertRaises(resources.CudaClaimRejected) as caught:
+                        with resources.execution_claim('candle-cuda', policy, root, environment):
+                            self.fail('refused claim must never execute a body')
+                inventory.assert_called_once_with(root, 'model-proof-claimed-device')
+                baseline.assert_not_called()
+                self.assertEqual(locks, [1, 2])
+                diagnostic = caught.exception.diagnostic
+                self.assertFalse(diagnostic['predicates'][expected])
+                self.assertEqual(diagnostic['requested_uuid'], APPROVED)
+                self.assertNotIn('private.exe', json.dumps(diagnostic))
+                self.assertLess(len(json.dumps(diagnostic)), 4096)
+
+        many = [[APPROVED, str(i), 'private.exe', 'C'] for i in range(100)]
+        diagnostic = resources.cuda_claim_diagnostic(APPROVED, [card | {'uuid': APPROVED}], many)
+        self.assertEqual(diagnostic['selected_process_count'], 100)
+        self.assertEqual(len(diagnostic['selected_processes']), 64)
+        self.assertTrue(diagnostic['process_list_truncated'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -17,6 +17,40 @@ CUDA_METADATA_HELPER_SHA256 = '0eaa7a4f32a0c0d686544b9736505584875a6d2f8c9319a5e
 CUDA_METADATA_ABI_CHECKSUM = '1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc'
 
 
+class CudaClaimRejected(ValueError):
+    def __init__(self, diagnostic: dict):
+        super().__init__('claimed CUDA UUID is absent or occupied; no model execution')
+        self.diagnostic = diagnostic
+
+
+def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[str]]) -> dict:
+    """Bounded facts from the already-read driver snapshot; never process command lines."""
+    from scripts.release import veda_cuda_guard as guard
+    matched = [device for device in devices if device['uuid'] == uuid]
+    selected = matched[0] if len(matched) == 1 else None
+    rows = [row for row in processes if row and row[0] == uuid]
+    def safe_uuid(value: str) -> str:
+        return value if re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', value) else 'invalid-uuid'
+    types = [row[3] if len(row) == 4 and row[3] in ('G', 'C+G', 'C', 'unknown') else 'malformed-or-other' for row in rows]
+    return {'requested_uuid': safe_uuid(uuid), 'matched_uuid_count': len(matched),
+            'observed_uuids': [safe_uuid(device['uuid']) for device in devices[:8]],
+            'observed_gpu_count': len(devices),
+            'selected_card': (None if selected is None else {
+                key: selected[key] for key in ('index', 'total_mib', 'used_mib', 'utilization_percent')}),
+            'idle_limits': {'max_graphics_baseline_mib_exclusive': guard.MAX_GRAPHICS_BASELINE_MIB,
+                            'max_utilization_percent_exclusive': guard.MAX_BASELINE_UTILIZATION_PERCENT,
+                            'allowed_process_types': ['G', 'C+G']},
+            'selected_process_count': len(rows),
+            'selected_process_type_counts': {kind: types.count(kind) for kind in ('G', 'C+G', 'C', 'unknown', 'malformed-or-other')},
+            'selected_processes': [{'pid': row[1] if len(row) == 4 and row[1].isdecimal() and len(row[1]) <= 10 else 'invalid',
+                                    'driver_type': kind} for row, kind in zip(rows[:64], types[:64])],
+            'process_list_truncated': len(rows) > 64,
+            'predicates': {'unique_uuid': len(matched) == 1,
+                           'graphics_memory_below_limit': selected is not None and selected['used_mib'] < guard.MAX_GRAPHICS_BASELINE_MIB,
+                           'utilization_below_limit': selected is not None and selected['utilization_percent'] < guard.MAX_BASELINE_UTILIZATION_PERCENT,
+                           'selected_process_types_allowed': all(len(row) == 4 and row[3] in ('G', 'C+G') and row[1] for row in rows)}}
+
+
 def validate_child_visibility(row: dict) -> None:
     fixed = {'package': 'candle-gen-iris', 'target': 'integration', 'target_kind': 'test',
              'fqn': 'train_distributed::a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in',
@@ -177,7 +211,7 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         devices, processes = veda_cuda_guard.inventory(output, 'model-proof-claimed-device')
         matched = [device for device in devices if device['uuid'] == uuid]
         if len(matched) != 1 or not veda_cuda_guard.idle(matched[0], processes):
-            raise ValueError('claimed CUDA UUID is absent or occupied; no model execution')
+            raise CudaClaimRejected(cuda_claim_diagnostic(uuid, devices, processes))
         required_index = constraints.get('required_cuda_physical_index')
         if required_index is not None and matched[0]['index'] != required_index:
             raise ValueError('claimed UUID violates this case fixed physical-index restriction')
