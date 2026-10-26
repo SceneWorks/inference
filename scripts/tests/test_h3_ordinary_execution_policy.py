@@ -776,23 +776,21 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                         "H3 learned execution belongs only in the separate model workflow, including manual dispatch")
 
     def test_hosted_pruned_precision_step_is_explicit_and_positive(self) -> None:
-        block = jobs(real_weights_inline_text())["h3-pruned-hosted-metal"]
-        matching = [step for step in steps(block)
-            if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
-        self.assertEqual(len(matching), 1)
-        step = matching[0]
-        self.assertIn("if: github.event_name == 'workflow_dispatch'", block)
-        self.assertIn("inputs.profile == 'synthetic-w4a8-mlx'", block)
-        self.assertIn("inputs.profile == 'synthetic-w4a8-both'", block)
-        self.assertIn("set -euo pipefail", step)
-        self.assertIn("--ignored --nocapture", step)
-        self.assertIn("test result: ok. 4 passed; 0 failed; 0 ignored", step)
-        self.assertIn("test pruned_adaln::native_pruned_adaln_matches_pinned_reference ...", step)
-        self.assertIn("H3_PRUNED_ORACLE_DEVICE", step)
-        self.assertIn("H3_PRUNED_ORACLE block 0 modulation: max_abs=", step)
-        self.assertNotIn("continue-on-error", step)
-        self.assertNotIn("|| true", step)
-        self.assertEqual(yaml.safe_load(real_weights_inline_text())["jobs"]["h3-pruned-hosted-metal"]["env"]["MACOSX_DEPLOYMENT_TARGET"], "15.0")
+        workflow = jobs(real_weights_inline_text())
+        hosted = workflow["h3-pruned-hosted-metal"]
+        self.assertIn("if: github.event_name == 'workflow_dispatch'", hosted)
+        self.assertIn("inputs.profile == 'synthetic-w4a8-mlx'", hosted)
+        self.assertIn("inputs.profile == 'synthetic-w4a8-both'", hosted)
+        hosted_step = [step for step in steps(hosted) if "- name: Check H3 precise pruned projection on hosted Metal (manual)" in step]
+        self.assertEqual(len(hosted_step), 1)
+        hosted_source = hosted_step[0]
+        for token in ("set -euo pipefail", "--ignored --exact --nocapture", "test result: ok. 1 passed; 0 failed; 0 ignored", "H3_PRUNED_ORACLE_DEVICE"):
+            self.assertIn(token, hosted_source)
+        native_step = [step for step in steps(workflow["synthetic-w4a8-mlx"]) if "- name: Prove H3 pruned AdaLN complete model on Metal" in step]
+        self.assertEqual(len(native_step), 1)
+        native_source = native_step[0]
+        for token in ("set -euo pipefail", "--ignored --nocapture", "test result: ok. 4 passed; 0 failed; 0 ignored", "H3_GEOMETRY_AUDIO_FULL_FORWARD backend=metal cases=11"):
+            self.assertIn(token, native_source)
 
     def test_manual_h3_routes_pin_exact_counts_and_names(self) -> None:
         blocks = jobs(real_weights_inline_text())

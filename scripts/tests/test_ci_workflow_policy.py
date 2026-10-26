@@ -294,7 +294,8 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
                 primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
                 proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures", "ios-prequant", "ios-simulator-sana",
                     "synthetic-w4a8-mlx", "synthetic-w4a8-cuda", "synthetic-w4a8-both",
-                    "moss-edit-cuda", "moss-edit-metal"}
+                    "moss-edit-cuda", "moss-edit-metal", "moss-cpu-fixture",
+                    "moss-metal-fixture", "llm-decoder-fixture", "moss-cuda-unit"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
                 # Separate runs, revisions and phases on the primary must all share one group.
                 variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),

@@ -3,7 +3,7 @@
 
 Routine CI executes every default test except exact, reviewed exhaustive cases in
 test_suites.json. Explicit exhaustive validation executes every registered case,
-never `--ignored` (real-weight tests and dedicated numerical lanes are separate).
+using `--ignored --exact` only for registered bodies already ignored by the ordinary CI policy.
 Suite partitioning preserves Rust test bodies, ignore attributes, compilation
 targets and package scopes. The separate Iris CUDA fixture repair preserves its
 parent GPU1 binding; see docs/ci-test-suites.md for that necessary exception.
@@ -146,9 +146,9 @@ def listed(output: str) -> set[str]:
 
 def validate_cases(cases: list[dict], names: set[str], ignored: set[str]) -> set[str]:
     selected = {case["test"] for case in cases}
-    if selected - names or selected & ignored:
+    if selected - names or not ignored <= names:
         raise ValueError(
-            f"stale/ignored exhaustive cases: missing={selected - names}, ignored={selected & ignored}"
+            f"stale exhaustive cases: missing={selected - names}, invalid_ignored={ignored - names}"
         )
     # libtest --skip is a substring filter. Prove it excludes only exact registered
     # names instead of letting a new similarly named regression disappear silently.
@@ -254,7 +254,7 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
                 result = run([binary, "--test-threads=1"] + args, remaining(900), **context)
                 print(result, flush=True)
                 count = len(names - ignored - selected)
-                verify_result(result, count, len(ignored))
+                verify_result(result, count, len(ignored - selected))
                 executed += count
             except (ValueError, RuntimeError, TimeoutError) as error:
                 if "--no-fail-fast" not in command:
@@ -264,7 +264,8 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
             for name in sorted(selected):
                 try:
                     require_windows_gpu1_before_model_case()
-                    result = run([binary, "--exact", name, "--test-threads=1"], remaining(600), **context)
+                    filter_args = ["--ignored"] if name in ignored else []
+                    result = run([binary, "--exact", name, *filter_args, "--test-threads=1"], remaining(600), **context)
                     print(result, flush=True)
                     verify_result(result, 1, 0)
                     executed += 1

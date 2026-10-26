@@ -385,7 +385,7 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertEqual(step["env"]["TEST_SCOPE"], "${{ needs.changes.outputs.test_scope }}")
                     run = step["run"]
                     self.assertIn('scripts/ci/test_scope.py select --scope "$TEST_SCOPE"', run)
-                    cargo = [line for line in run.splitlines() if "cargo test" in line]
+                    cargo = [line for line in run.splitlines() if "cargo test" in line and "check_compiled_model_ignores.py" not in line]
                     self.assertEqual(len(cargo), 1, run)
                     self.assertTrue(cargo[0].rstrip().endswith('"${packages[@]}"'), cargo[0])
                     self.assertNotIn(" -p ", cargo[0])

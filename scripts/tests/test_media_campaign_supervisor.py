@@ -68,11 +68,11 @@ class FixtureDeadlineClockTests(unittest.TestCase):
         now = [0.0]
         clock = FixtureDeadlineClock(lambda: now[0], lambda delay: now.__setitem__(0, now[0] + delay))
         with patch.object(Path, "read_text", side_effect=[PermissionError(13, "denied"), "123"]):
-            clock.admit(lambda: _published_pid(Path("pid")) == 123, timeout=.05)
+            clock.admit(lambda: published_fixture_pid(Path("pid")) == 123, timeout=.05)
         self.assertAlmostEqual(clock.ready_at, .01)
         with patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
             with self.assertRaisesRegex(AssertionError, "fixture startup readiness deadline"):
-                clock.admit(lambda: _published_pid(Path("pid")) == 123, timeout=.05)
+                clock.admit(lambda: published_fixture_pid(Path("pid")) == 123, timeout=.05)
 
 
 class PublishedFixturePidTests(unittest.TestCase):

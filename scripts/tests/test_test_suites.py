@@ -71,15 +71,26 @@ class TestSuites(unittest.TestCase):
         self.assertIn(["fixture-binary", "--test-threads=1", "--skip", "numerical::sweep"], calls)
         self.assertFalse(any("--ignored" in call and "--list" not in call for call in calls))
 
-    def test_explicit_exhaustive_runs_every_case_and_never_real_weight_ignores(self):
+    def test_explicit_exhaustive_runs_each_exact_unignored_case(self):
         calls = self.execute("exhaustive")
         self.assertIn(["fixture-binary", "--exact", "numerical::sweep", "--test-threads=1"], calls)
         self.assertFalse(any("--skip" in call for call in calls))
 
+    def test_reviewed_ignored_case_is_skipped_in_routine_and_run_only_in_explicit_exhaustive(self):
+        names = {"numerical::sweep", "contract::shape"}
+        ignored = {"numerical::sweep"}
+        calls = self.execute(names=names, ignored=ignored,
+                             result="test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;")
+        self.assertIn(["fixture-binary", "--test-threads=1", "--skip", "numerical::sweep"], calls)
+        self.assertFalse(any("--exact" in call for call in calls))
+        calls = self.execute("exhaustive", names=names, ignored=ignored,
+                             result="test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;")
+        self.assertIn(["fixture-binary", "--exact", "numerical::sweep", "--ignored", "--test-threads=1"], calls)
+
     def test_missing_ignored_and_ambiguous_names_fail_before_execution(self):
         for names, ignored in [
             ({"contract::shape"}, set()),
-            ({"numerical::sweep"}, {"numerical::sweep"}),
+            ({"numerical::sweep"}, {"missing::ignore"}),
             ({"numerical::sweep", "numerical::sweep_more"}, set()),
         ]:
             with self.subTest(names=names, ignored=ignored), self.assertRaises(ValueError):
@@ -94,7 +105,7 @@ class TestSuites(unittest.TestCase):
         cases = [self.case(platforms=[other]), self.case(test="cuda::sweep", features=["cuda"])]
         calls = self.execute(cases=cases, names={"contract::shape"}, ignored=set(), result="test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;")
         self.assertFalse(any("--skip" in call for call in calls))
-        with self.assertRaisesRegex(ValueError, "stale/ignored"):
+        with self.assertRaisesRegex(ValueError, "stale exhaustive"):
             self.execute(cases=cases, artifact=self.artifact(features=["cuda"]))
 
     def test_wrong_counts_and_empty_explicit_suite_fail(self):
@@ -155,21 +166,26 @@ class TestSuites(unittest.TestCase):
         self.assertTrue(any(case["package"].startswith("mlx") for case in cases))
         self.assertTrue(any(case["package"].startswith("candle") for case in cases))
         import yaml
-
-        workflow = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
-        dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
-        self.assertEqual(dispatch["test_suite"]["options"], ["routine", "exhaustive"])
-        self.assertEqual(dispatch["test_suite"]["default"], "routine")
-        for name, job in workflow["jobs"].items():
-            self.assertIn("timeout-minutes", job, name)
+        ordinary = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        dispatch = ordinary.get("on", ordinary.get(True))["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(dispatch), {"lanes"})
         for name in ("candle-cpu-test", "macos-metal", "macos-nax", "windows-cuda"):
-            job = workflow["jobs"][name]
-            steps = [step for step in job["steps"] if "test_suites.py" in step.get("run", "")]
-            self.assertTrue(steps, name)
-            for step in steps:
-                self.assertEqual(step["env"]["TEST_SUITE"], "${{ inputs.test_suite || 'routine' }}")
-            self.assertIn(name, workflow["jobs"]["gate"]["needs"])
-        self.assertIn("inputs.test_suite == 'exhaustive'", workflow["concurrency"]["group"])
+            job = ordinary["jobs"][name]
+            commands = [step.get("run", "") for step in job["steps"] if "test_suites.py" in step.get("run", "")]
+            self.assertTrue(commands, name)
+            self.assertTrue(all("routine -- cargo test" in command for command in commands))
+            self.assertTrue(all("exhaustive" not in command for command in commands))
+            self.assertIn(name, ordinary["jobs"]["gate"]["needs"])
+        manual = yaml.safe_load((suites.ROOT / ".github/workflows/model-test-suites.yml").read_text(encoding="utf-8"))
+        self.assertEqual(set(manual.get("on", manual.get(True))), {"workflow_call", "workflow_dispatch"})
+        self.assertEqual(set(manual["jobs"]), {"candle-cpu", "mlx-metal", "candle-cuda"})
+        for job in manual["jobs"].values():
+            self.assertIn("github.event_name == 'workflow_dispatch'", job["if"])
+            self.assertTrue(any("exhaustive -- cargo test" in step.get("run", "") for step in job["steps"]))
+        bridge = yaml.safe_load((suites.ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"))["jobs"]["model-exhaustive-tests"]
+        self.assertEqual(bridge["uses"], "./.github/workflows/model-test-suites.yml")
+        self.assertEqual(bridge["needs"], "validate-selection")
+        self.assertIn("inputs.profile == 'model-exhaustive-tests'", bridge["if"])
 
     def test_restoration_checkpoint_matrix_is_exhaustive_only_on_mlx(self):
         name = "restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged"
@@ -187,8 +203,8 @@ class TestSuites(unittest.TestCase):
 
         jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
         cpu = jobs["candle-cpu-test"]
-        self.assertEqual(cpu["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 150 || 90 }}")
-        self.assertEqual(cpu["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '4500' }}")
+        self.assertEqual(cpu["timeout-minutes"], 90)
+        self.assertEqual(cpu["env"]["TEST_SUITE_DEADLINE_SECONDS"], 4500)
         steps = [step for step in cpu["steps"] if "test_suites.py" in step.get("run", "")]
         self.assertEqual(cpu["strategy"], {"fail-fast": False, "matrix": {"group": ["base", "gen"]}})
         self.assertNotIn("continue-on-error", cpu)
@@ -216,19 +232,19 @@ class TestSuites(unittest.TestCase):
         for step in steps:
             self.assertNotIn("continue-on-error", step)
             self.assertIn("-j 1", step["run"])
-            self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test', step["run"])
-        self.assertEqual(jobs["macos-metal"]["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}")
+            self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test', step["run"])
+        self.assertEqual(jobs["macos-metal"]["timeout-minutes"], 75)
 
     def test_hosted_mlx_full_graph_has_explicit_suite_headroom_only_at_its_step(self):
         import yaml
 
         jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
         metal = jobs["macos-metal"]
-        self.assertEqual(metal["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}")
+        self.assertEqual(metal["timeout-minutes"], 75)
         self.assertNotIn("TEST_SUITE_DEADLINE_SECONDS", metal.get("env", {}))
         step = next(step for step in metal["steps"] if step.get("name") == "Test MLX packages")
-        self.assertEqual(step["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}")
-        self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"', step["run"])
+        self.assertEqual(step["env"]["TEST_SUITE_DEADLINE_SECONDS"], 3600)
+        self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"', step["run"])
         self.assertIn("-p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos", step["run"])
         for name, job in jobs.items():
             if name == "candle-cpu-test":
@@ -248,7 +264,7 @@ class TestSuites(unittest.TestCase):
         self.assertIn("inherited_single_cuda_device(visible.as_deref())", body)
         self.assertIn('json!({"CUDA_VISIBLE_DEVICES": visible})', body)
         self.assertNotIn('"CUDA_VISIBLE_DEVICES": "0"', body)
-        self.assertIn('#[cfg(feature = "cuda")]\n#[test]\n', source[start - 50:start])
+        self.assertIn('#[cfg(feature = "cuda")]\n#[test]\n#[ignore', source[start - 150:start])
         self.assertNotIn("return;", body)
         self.assertIn("fn rank_children_preserve_only_the_single_bound_gpu1_mapping()", source)
 

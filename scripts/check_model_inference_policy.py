@@ -694,7 +694,7 @@ class RunGraph:
         # which this graph cannot resolve statically; bind the entire source body and CLI
         # mode instead of blessing arbitrary dynamic subprocess calls.
         if relative == 'scripts/ci/test_suites.py':
-            reviewed_sha = '688450dc2b0debbcb017a4460a3c425580667b3ee4319e29131d1be539a51d7f'
+            reviewed_sha = 'a4b0d80b4c34becb98b056ee9351eec4bbf622c6ca72865e54c4c7ac488aa488'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
