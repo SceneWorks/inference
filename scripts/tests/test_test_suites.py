@@ -171,6 +171,17 @@ class TestSuites(unittest.TestCase):
             self.assertIn(name, workflow["jobs"]["gate"]["needs"])
         self.assertIn("inputs.test_suite == 'exhaustive'", workflow["concurrency"]["group"])
 
+    def test_restoration_checkpoint_matrix_is_exhaustive_only_on_mlx(self):
+        name = "restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged"
+        cases = {
+            (case["package"], case["kind"], case["target"], case["test"]): case
+            for case in suites.registry()
+        }
+        mlx = ("mlx-gen-iris", "test", "integration", name)
+        self.assertIn(mlx, cases)
+        self.assertEqual(cases[mlx]["platforms"], ["darwin"])
+        self.assertNotIn(("candle-gen-iris", "test", "integration", name), cases)
+
     def test_cuda_rank_fixture_preserves_the_parent_device_binding(self):
         source = (suites.ROOT / "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs").read_text(encoding="utf-8")
         start = source.index("fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in()")

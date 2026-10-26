@@ -2,7 +2,7 @@
 
 Ordinary PR, merge-group, main and tag CI compile the original selected test
 targets and execute bounded regressions. `scripts/ci/test_suites.json` identifies
-166 exhaustive synthetic training and numerical cases by package, Cargo target,
+167 exhaustive synthetic training and numerical cases by package, Cargo target,
 exact libtest name, source and body/helper rationale. These cases execute only
 when an operator selects `test_suite: exhaustive`. Existing real-weight ignores,
 scheduled/dispatch real-weight routes and the dedicated H3/MOSS numerical routes
@@ -37,6 +37,10 @@ They belong to exhaustive validation on both backends. The two stored-gradient
 AdamW replay cases only update small factor tensors twice and remain ordinary,
 as do Candle's fixed tiny chunked-attention and additive-mask/stride contracts.
 Large memory/artifact contract fixtures remain ordinary even when they are slow.
+Iris' MLX `restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged`
+is exhaustive: full/LoRA/LoKr × plain/checkpointed runs six four-step training
+trajectories, then checks export/reload and whole-tensor equality. Its same-named
+Candle counterpart compares only two two-step trajectories and remains routine.
 
 ## Operator validation
 

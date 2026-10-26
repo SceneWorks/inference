@@ -1415,6 +1415,17 @@
       "package": "mlx-gen-iris",
       "kind": "test",
       "target": "integration",
+      "test": "restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+      "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
+      "reason": "Full/LoRA/LoKr x plain/checkpointed restoration training: six four-step trajectories (24 training steps), export/reload, and whole-tensor equality comparisons.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-iris",
+      "kind": "test",
+      "target": "integration",
       "test": "restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit",
       "source": "crates/media/mlx-gen/mlx-gen-iris/tests/restoration_train_lifecycle.rs",
       "reason": "16-step uninterrupted restoration trajectory compared with cancellation/checkpoint/resume.",
