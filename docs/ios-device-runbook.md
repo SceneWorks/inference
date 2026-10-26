@@ -1,7 +1,9 @@
 # iOS device runbook
 
-Updated 2026-10-18 against inference feature base `509aa1c1b` plus Z-Image (#1290)
-and the sc-26270 ANCHOR campaign (two measured anchors per family + derivation). These are implemented harness commands, not a claim the epic
+Reconciled 2026-10-26 against candidate `2697693a981f` and the sc-26270
+ANCHOR campaign (two endpoint configurations per family, with two optimized
+repeats). Source repairs and terminal device evidence remain in progress. These
+are implemented harness commands, not a claim the epic
 is on main or that all models render on the phone. See [strategy](architecture/ios-strategy.md),
 [specification](architecture/ios-project-spec.md), and [remaining work](ios-epics.md).
 
@@ -16,7 +18,7 @@ has been recorded. Registration is not admission or demonstrated fit.
 | Anima Turbo | Registered without training; Base/Aesthetic excluded | No demonstrated phone fit |
 | Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 merged | No demonstrated phone fit; depth access is explicitly diagnostic |
 | SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 merged | No demonstrated phone fit |
-| Supra2-IMG | sc-26269 requires epic 24212 on inference main; not started | No implementation/fit claim here |
+| Supra2-IMG | Provider delivered separately; iOS registration sc-26269 is explicitly user-deferred and non-blocking for this general delivery | No iOS registration/fit claim here |
 | Z-Image Turbo (`z_image_turbo` text / img2img / LoRA+LoKr; `z_image_turbo_control` pose/canny/depth) | Registered without training at its stored q4/q8/bf16 tiers (sc-26433); every quantum bounded; host-derived reachable sizes below | No demonstrated phone fit. Michael's 8 GB **Mac** q4 run is Mac evidence, not device evidence |
 
 The legacy S3 image check drives SANA. The sc-26270 campaign protocol below now
@@ -285,13 +287,12 @@ the capture profile by the JSON selection above.
 
 ## Campaign protocol and command matrix (sc-26270)
 
-**Mechanism only; no new device measurements are recorded here.** No full-model
-diagnostic is cleared to execute. Independently bounded primitive characterization
-must precede any such experiment; a diagnostic flag, launch headroom, tensor byte
-sum, engineering reserve, MLX allocator limit or a cap increase is not a permit.
-The current empty artifact-bound evidence remains fail-closed. Anima/Iris have no
-admitted iPhone footprint facade; their cases explicitly refuse before loading,
-not via a raw registry bypass. Unsupported strategy/tier/task combinations remain
+**Mechanism only; no new device measurements are recorded here.** Diagnostic
+endpoint captures use the source-owned capture permit and per-quantum guards;
+they do not establish admitted execution. A primitive result, launch headroom,
+tensor byte sum or soft MLX allocator limit does not establish model fit or a
+validated physical-memory cap. The current empty artifact-bound evidence remains
+fail-closed for admitted execution. Unsupported strategy/tier/task combinations remain
 visible instead of being silently omitted. Malformed/missing snapshots are
 `diagnostic_failure`, **not** next-up admission-refusal evidence.
 
@@ -431,41 +432,41 @@ Both anchors sit at the **reference geometry 1024²** (Supra2: 256²) and run **
 * 1024² is the largest ladder size. The fully optimized configuration must fit at every ladder size
   (see the fit table below), so it completes here by requirement, and this is the tightest cell —
   where an accurate low end matters — so it is measured, not derived.
-* Derivation from 1024² is safe and tight: SceneWorks `docs/sc-16195` (the desktop MLX activation
-  transient, 7 tiers × 5 geometries) is linear in area above 1024² (≤ 2.0% error from a 1024²
-  anchor) and floored below (a smaller request is never credited, so it errs large). From a 512²
-  anchor the same data shows a fixed-1024²-knee law would **under**-predict 1024² by 49–70%.
+* Desktop activation measurements do not prove an iPhone process-footprint transfer law.
+  Intermediate geometry and optimization claims require the actual source certificate,
+  applicable process model and matching endpoint evidence described below.
 * Two steps, not N: one denoise step's working set is released before the next, so a short run's
   peak is a long run's; two steps also cross a step-to-step release. The `validation_steps` case
   checks this on one model.
 
-**Derivation (the anchor law, `mlx-gen-ios-catalog/src/anchor.rs`).** The architecture facts are
-the providers' own COUNTED iOS pricing (`mlx_gen::ios_pricing`): per phase (load, conditioning,
-encode, denoise, decode) the component bytes resident under a regime plus the phase's largest
-counted quantum — the very formulas the per-quantum guards check, read from safetensors headers.
-Per phase `p`: `residue = M_p − C_p(anchor regime)`; the part a formula prices, `s = min(residue,
-S_p(anchor))`, calibrates that formula (`κ = s / S_p(anchor)`, applied only when the request's
-binding quantum IS the anchor's — another quantum gets its formula unscaled); the rest is unpriced
-overhead (driver, allocator), scaled by `λ = max(A_request, A_anchor) / A_anchor`. Then
-`D_p = C_p(request regime) + overhead × λ + S_p(request) × κ` and `demand = max_p D_p`. At the
-anchor's own configuration this IS the measurement. Requests are derived **upward from the
-optimized anchor** toward resident; a completed resident anchor only prices its own regime at
-other geometries. A phase the anchor never ran (an additive mode's encode) is its counted formula
-plus the anchor's largest unpriced overhead. Not derivable → typed `no_evidence` (fail closed):
-another architecture (decoder, base components) / tier / non-additive mode / device; execution
-levers outside the iOS ladder; a configuration the provider's pricing declines (adapters, PiD); a
-phase whose measured growth is below its resident components (outside the law's domain); a
-provider with no counted pricing (only its anchors' own keys admit).
+**Derivation (`mlx-gen/src/ios_anchor_law.rs` and catalog `ios_admission.rs`).**
+The former fitted scratch-ratio/resident-subtraction law is disabled. Do not
+subtract a native upper bound from a process measurement, borrow an unmeasured
+phase's overhead, or transfer a receipt between different family keys.
 
-**Self-check.** When both anchors completed, the optimized anchor predicts the resident anchor's
-own configuration. An under-prediction beyond **12.6%** (the measured same-cell MLX recapture
-spread, SceneWorks `MLX_ACTIVE_RECAPTURE_SPREAD`) fails every derivation of the family closed;
-an over-prediction beyond it is flagged (derivations then err large).
+Provider certificates bind the actual source inventory, request and execution
+facts. A native-allocation certificate remains a native-allocation result; it is
+not a process-footprint result. Mapping it to process growth additionally needs
+the declared physical/process and HOST/layout premises with their actual scope.
+Missing source terms remain unproved. The SDK and campaign default policy does
+not approve these premises. The engineering-model proposal in sc-26270 activity
+26569 remains a separate unresolved acceptance decision at this snapshot.
+
+Exact measured keys and intermediate derivations are distinct evidence routes.
+A typed resident refusal is permitted by epic acceptance and supplies no measured
+resident peak. The terminal repair must support that contract without inventing
+a resident observation. No completed phone endpoint or complete intermediate
+admission claim exists yet.
+
+**Self-check.** Applicable completed endpoint observations must satisfy the
+certified consistency checks. Any underprediction fails; the retired desktop
+recapture percentage is not an allowed underprediction tolerance. A refusal or
+unexecuted body cannot serve as a numeric consistency pass.
 
 **Low end: admission is the measurement.** At the optimized anchor's own key admission charges the
 largest of its 2 repeats' growth (kernel lifetime `phys_footprint` peak − the capture's starting
 footprint) **plus the margin = the repeats' measured spread (max − min), floored at 32 MiB** (an
-engineering floor so three identical repeats never claim a zero margin; ~0.5% of the 6142 MiB
+engineering floor so identical repeats never claim a zero margin; ~0.5% of the historical 6142 MiB
 launch headroom). No counted-formula scratch and no 512 MiB formula reserve is stacked on a
 measured anchor: `demand + margin` must fit live headroom (`runtime-ios`'s incremental recheck,
 unchanged: only growth realized since admission is credited). The admitted load and every render
@@ -474,16 +475,12 @@ process stays within it, a quantum guard needs only the envelope's remaining byt
 less than its formula price; past the envelope every guard is back on its formula (the runtime
 safety net). Captures run on the formula guards alone.
 
-**Per-formula DEVICE calibration.** CPU proofs cannot reproduce the device's retention (an
-~11-op Metal command window with buffer donation), so every capture also records, per quantum
-label, the guard's priced scratch against the kernel-footprint growth the device observed across
-that quantum (lifetime peak at its end − footprint at its check; `exact` only when the peak rose
-inside it). `campaign.py evidence` prints that table across all anchors (priced vs observed,
-ratio, and whether the formula over-prices the device beyond the low-end margin), and the anchor
-row keeps it. Inside an admitted envelope a quantum whose formula has an exact device observation
-is guarded at its ANCHOR-DERIVED peak — `scratch × observed / priced` + the anchor's margin — when
-that is below its formula price, so a guard never refuses a configuration the device showed fits.
-Past the envelope every guard is back on its formula.
+**Per-formula DEVICE observations.** Captures record each quantum's priced scratch
+and observed kernel-footprint growth, with exact versus masked attribution.
+`campaign.py evidence` reports these diagnostics. A ratio between a measured
+interval and a formula is not by itself a source proof or a general permission
+to discount future allocations. Preserve the source/phase/window identities and
+the admission envelope's actual policy when interpreting these rows.
 
 **Per-phase capture.** Every quantum check and synchronization reads the kernel lifetime peak
 (`task_vm_info` REV3); growth inside an opened quantum belongs to that quantum's phase (the
@@ -497,14 +494,12 @@ slots' architecture digests and plans <!-- COUNT --> Without `--snapshots` the l
 weights-free and conservative: every route is its own family. The 20,000-case budget is gone by
 construction (`--max-cases` is an optional cap).
 
-Which checkpoints collapse (host header evidence, 2026-10-18, `IOS_CAMPAIGN_SNAPSHOTS` over the
-cached SceneWorks snapshots):
-
-| Collapsed into one family per tier | Kept separate (header evidence) |
-|---|---|
-| SDXL-family fine-tunes `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (identical tensor names, shapes, dtypes; Lightning's distillation changed values only) | `sdxl` base: 1385 dense tensors stored F16 where the fine-tunes store F32 (U-Net 937, text encoders 448) — different resident bytes |
-| `z_image_turbo_control` joins `z_image_turbo` (the ControlNet is a mode-added component; the base architecture is identical) | `sana_sprint_1600m` vs `sana_1600m`: Sprint's transformer carries a guidance embedder (96 extra tensors) and BF16 where base has F16 (228 tensors) |
-| | Anima, Iris (generation, restore, depth): one route each |
+Use the current catalog's family keys over the actual provisioned snapshots.
+Header similarity alone does not authorize borrowing between text, reference,
+control or init graphs. Retain architecture, tier, sampling-allocation class and
+accepted mode distinctions, including the SANA/Sprint, SDXL-family, Anima, Iris
+generation/restoration/depth and Z-Image variants. Share endpoint captures only
+where the source-owned catalog establishes the same family.
 
 **Validation cases (part of the campaign, not optional).** For the first optimized family in
 catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
@@ -1041,7 +1036,7 @@ its active+cache values are **not** kernel `phys_footprint`, and it is not the
 ## 8. Terminal device campaign — not yet measured
 
 sc-26270 owns the ANCHOR campaign (per served provider route × tier × mode: the
-resident anchor and the 3x optimized anchor at 1024² with 2 steps, plus the two
+resident anchor once and the optimized anchor twice at 1024² with 2 steps, plus the
 validation cases), feature review, pin and main integration. Retain every
 registered mode; report explicit refusals, not missing cells. Add real rows here
 only after captures, with this schema:
@@ -1052,4 +1047,4 @@ only after captures, with this schema:
 
 A successful diagnostic capture does not populate an admitted-success row.
 Do not invent measurements, infer safe caps from launch headroom, or silently
-mark Supra2 complete while epic 24212 is outstanding.
+mark the explicitly deferred Supra2 iOS registration complete.
