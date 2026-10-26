@@ -1016,7 +1016,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         if physical.get('post_execution_verified') is not True:
                             raise ValueError('outer physical controller did not seal resource completion')
                         result['resource_verification_pending'] = False
-                    result['gpu_peak_observation'] = 'unknown/not-attributed-before-exit' if guarded.peak_gpu_bytes is None else 'sampled'
+                    result['gpu_peak_observation'] = gpu_peak_observation(guarded)
                     text = stdout.read_text(encoding='utf-8', errors='replace') + '\n' + stderr.read_text(encoding='utf-8', errors='replace')
                     if guarded.returncode:
                         raise ValueError('proof child returned nonzero')
@@ -1116,6 +1116,19 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as stream:
                 stream.write(text)
+
+
+def gpu_peak_observation(guarded: object) -> str:
+    """Keep a global card upper bound distinct from attributed child GPU use."""
+    upper_bound_sampled = any(sample.get('phase') == 'cuda-global-used-upper-bound-sample'
+                              for sample in guarded.samples)
+    if hasattr(guarded, 'cuda_devices'):
+        upper_bound_sampled |= any(device.get('globalUsedUpperBoundSampleCount', 0) > 0
+                                   for device in guarded.cuda_devices)
+    if guarded.peak_gpu_bytes is None:
+        return ('global-used-upper-bound-sampled/not-child-attributed'
+                if upper_bound_sampled else 'unknown/not-attributed-before-exit')
+    return 'attributed-and-global-upper-bound-sampled' if upper_bound_sampled else 'sampled'
 
 
 def mlx_build_deployment(row: dict) -> str:

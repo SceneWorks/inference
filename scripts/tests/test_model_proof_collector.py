@@ -58,6 +58,20 @@ def external_case(grade='reader-binding'):
 
 
 class Collector(unittest.TestCase):
+    def test_global_cuda_card_bound_is_labeled_without_attributed_peak(self):
+        # CI_IMPACT: pure result-label check; adds no model, Cargo, GPU or process work.
+        bounded = safety.RunResult(1, 0, 0, None, 0, 0, 0.1,
+                                   ({'phase': 'cuda-global-used-upper-bound-sample',
+                                     'globalUsedUpperBoundBytes': 1024},), {})
+        self.assertEqual(proof.gpu_peak_observation(bounded),
+                         'global-used-upper-bound-sampled/not-child-attributed')
+        self.assertEqual(proof.gpu_peak_observation(safety.RunResult(1, 0, 0, 1024, 0, 0, 0.1, (), {})),
+                         'sampled')
+        multi = safety.MultiCudaRunResult(1, 0, 0, None, 0, 0, 0.1, (), {},
+                                         ({'globalUsedUpperBoundSampleCount': 1},))
+        self.assertEqual(proof.gpu_peak_observation(multi),
+                         'global-used-upper-bound-sampled/not-child-attributed')
+
     def test_toolchain_uses_declaration_and_verified_proxies_for_actual_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

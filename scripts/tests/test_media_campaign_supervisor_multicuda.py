@@ -252,6 +252,39 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         self.assertFalse(hasattr(result, "cuda_devices"))
         self.assertEqual(dataclasses.asdict(safety.RunResult(*(getattr(result, name) for name in names))), dataclasses.asdict(result))
 
+    def test_windows_global_upper_bound_enforces_cap_without_faking_owned_peak(self):
+        data = json.loads(self.policies[0].canonical_bytes)
+        data['backend'] = 'windows-cuda'
+        data['childGpuCapBytes'] = 1000
+        path = self.root / 'wddm-policy.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        policy = safety.load_policy(path)
+        class UpperBoundProbe(DeviceProbe):
+            def gpu_free_and_tree_bytes(self, owner):
+                self.gpu_usage_basis = 'global-used-upper-bound'
+                return super().gpu_free_and_tree_bytes(owner)
+
+        timeline = Timeline()
+        probe = UpperBoundProbe(policy, timeline, 0, use=900)
+        result = self.run_fake(timeline, [probe], [policy], require_gpu_sample=False)
+        self.assertIsNone(result.peak_gpu_bytes)
+        bounds = [sample for sample in result.samples if sample.get('phase') == 'cuda-global-used-upper-bound-sample']
+        self.assertTrue(bounds)
+        self.assertTrue(all(sample['globalUsedUpperBoundBytes'] == 900 for sample in bounds))
+        self.assertTrue(all('ownedGpuBytes' not in sample for sample in bounds))
+        self.assertEqual(timeline.stopped, [])
+
+        timeline = Timeline()
+        probe = UpperBoundProbe(policy, timeline, 0, use=1001)
+        with self.assertRaisesRegex(safety.SupervisionError, 'device-memory'):
+            self.run_fake(timeline, [probe], [policy], require_gpu_sample=False)
+        self.assertEqual(len(timeline.stopped), 1)
+
+        timeline = Timeline()
+        probe = UpperBoundProbe(policy, timeline, 0, use=900)
+        with self.assertRaisesRegex(safety.SupervisionError, 'no attributable GPU-memory sample'):
+            self.run_fake(timeline, [probe], [policy])
+
     def test_legacy_unaccepted_schema_has_no_multi_fields(self):
         error = safety.SupervisionError("preflight-memory", "CPU fixture")
         path = self.root / "legacy.json"

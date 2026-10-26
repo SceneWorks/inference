@@ -1121,7 +1121,9 @@ class SupervisorTests(unittest.TestCase):
             owner = type("Owner", (), {"members": lambda self: {123}})()
             self.assertEqual(probe.gpu_free_and_tree_bytes(owner), (8192 * 1024**2, 256 * 1024**2))
 
-    def test_windows_policy_and_unknown_gpu_memory_refuse(self):
+    def test_windows_wddm_unknown_owned_memory_uses_validated_global_upper_bound(self):
+        # CI_IMPACT: pure mocked SMI/Job regression for the actual Windows proof
+        # parser failure; no native device, model, checkpoint, or process launch.
         data = json.loads(self.policy.canonical_bytes)
         data.update({"backend": "windows-cuda",
                      "cudaDeviceUuid": "GPU-12345678-1234-1234-1234-123456789abc",
@@ -1130,17 +1132,81 @@ class SupervisorTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         policy = safety.load_policy(path)
         self.assertEqual(policy.backend, "windows-cuda")
+        gpu = data['cudaDeviceUuid']
+        queries = []
         def output(argv, **_kwargs):
+            queries.append(argv)
             if "--query-gpu=uuid,memory.free" in argv:
-                return "GPU-12345678-1234-1234-1234-123456789abc, 8192\n"
-            return "123, N/A, GPU-12345678-1234-1234-1234-123456789abc\n"
+                return f"{gpu}, 99000\n"
+            if "--query-compute-apps=pid,used_gpu_memory,gpu_uuid" in argv:
+                return f"123, N/A, {gpu}\n456, N/A, {gpu}\n"
+            return f"{gpu}, WDDM, 100000, 1000, 99000\n"
         with patch.object(safety.platform, "system", return_value="Windows"), \
              patch.object(safety.windows, "trusted_nvidia_smi", return_value="C:\\Windows\\System32\\nvidia-smi.exe"), \
              patch.object(safety, "_bounded_output", side_effect=output):
             probe = safety.SystemProbe(policy)
             owner = type("Owner", (), {"members": lambda self: {123}})()
-            with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
-                probe.gpu_free_and_tree_bytes(owner)
+            free, bound = probe.gpu_free_and_tree_bytes(owner)
+            self.assertEqual((free, bound), (99000 * 1024**2, 1001 * 1024**2))
+            self.assertEqual(probe.gpu_usage_basis, 'global-used-upper-bound')
+            self.assertEqual(sum('--query-gpu=uuid,driver_model.current,memory.total,memory.used,memory.free' in q
+                                 for q in queries), 1)
+            self.assertTrue(any(f'--id={gpu}' in q for q in queries))
+
+    def test_windows_wddm_unowned_na_does_not_replace_exact_owned_usage(self):
+        data = json.loads(self.policy.canonical_bytes)
+        gpu = 'GPU-12345678-1234-1234-1234-123456789abc'
+        data.update(backend='windows-cuda', cudaDeviceUuid=gpu,
+                    gpuFreeReserveBytes=1024, childGpuCapBytes=1024)
+        path = self.root / 'windows-unowned-policy.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        def output(argv, **_kwargs):
+            if '--query-gpu=uuid,memory.free' in argv:
+                return f'{gpu}, 8192\n'
+            if '--query-compute-apps=pid,used_gpu_memory,gpu_uuid' in argv:
+                return f'456, N/A, {gpu}\n123, 256, {gpu}\n'
+            raise AssertionError('global fallback must not run for an unowned N/A row')
+        with patch.object(safety.platform, 'system', return_value='Windows'), \
+             patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'), \
+             patch.object(safety, '_bounded_output', side_effect=output):
+            probe = safety.SystemProbe(safety.load_policy(path))
+            owner = type('Owner', (), {'members': lambda self: {123}})()
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner), (8192 * 1024**2, 256 * 1024**2))
+            self.assertEqual(probe.gpu_usage_basis, 'owned-process-attributed')
+
+    def test_windows_wddm_unsafe_process_or_card_rows_refuse_with_bounded_detail(self):
+        data = json.loads(self.policy.canonical_bytes)
+        gpu = 'GPU-12345678-1234-1234-1234-123456789abc'
+        data.update(backend='windows-cuda', cudaDeviceUuid=gpu,
+                    gpuFreeReserveBytes=1024, childGpuCapBytes=1024)
+        path = self.root / 'windows-invalid-policy.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        cases = (
+            (f'123, N/A, broken-uuid\n', '', 'malformed PID/UUID'),
+            (f'123, 1, {gpu}\n123, 1, {gpu}\n', '', 'duplicates PID/UUID'),
+            (f'123, ???, {gpu}\n', '', 'unknown usage'),
+            (f'123, N/A, {gpu}\n', 'GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, WDDM, 100000, 1000, 99000\n', 'invalid identity/counters'),
+            (f'123, N/A, {gpu}\n', f'{gpu}, TCC, 100000, 1000, 99000\n', 'invalid identity/counters'),
+            (f'123, N/A, {gpu}\n', f'{gpu}, WDDM, 100000, N/A, 99000\n', 'invalid identity/counters'),
+            (f'123, N/A, {gpu}\n', f'{gpu}, WDDM, 100000, 5000, 99000\n', 'inconsistent'),
+            (f'123, N/A, {gpu}\n', f'{gpu}, WDDM, 100000, 1000, 99000\n{gpu}, WDDM, 100000, 1000, 99000\n', 'missing or duplicate'),
+        )
+        with patch.object(safety.platform, 'system', return_value='Windows'), \
+             patch.object(safety.windows, 'trusted_nvidia_smi', return_value='C:\\Windows\\System32\\nvidia-smi.exe'):
+            for usage, card, reason in cases:
+                with self.subTest(reason=reason, usage=usage[:20]):
+                    def output(argv, **_kwargs):
+                        if '--query-gpu=uuid,memory.free' in argv:
+                            return f'{gpu}, 99000\n'
+                        if '--query-compute-apps=pid,used_gpu_memory,gpu_uuid' in argv:
+                            return usage
+                        return card
+                    with patch.object(safety, '_bounded_output', side_effect=output):
+                        probe = safety.SystemProbe(safety.load_policy(path))
+                        owner = type('Owner', (), {'members': lambda self: {123}})()
+                        with self.assertRaisesRegex(safety.SupervisionError, reason) as caught:
+                            probe.gpu_free_and_tree_bytes(owner)
+                        self.assertLess(len(str(caught.exception)), 300)
 
 
 class OperatorStopTests(unittest.TestCase):

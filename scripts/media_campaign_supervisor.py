@@ -599,19 +599,70 @@ class SystemProbe:
         usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
                                  "--format=csv,noheader,nounits"])
         used = 0
-        for line in usage.splitlines():
+        unknown_owned = False
+        seen: set[tuple[int, str]] = set()
+        for number, line in enumerate(usage.splitlines(), 1):
             parts = [item.strip() for item in line.split(",")]
-            if len(parts) != 3 or not parts[0].isdecimal() or not parts[1].isdecimal():
-                raise SupervisionError("probe-failure", "CUDA process-memory row is malformed")
-            if int(parts[0]) in pids:
+            if (len(parts) != 3 or not parts[0].isdecimal() or len(parts[0]) > 10 or int(parts[0]) <= 0
+                    or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", parts[2])):
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has malformed PID/UUID: {line[:160]!r}")
+            pid = int(parts[0])
+            key = (pid, parts[2].casefold())
+            if key in seen:
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} duplicates PID/UUID {pid}/{parts[2]}")
+            seen.add(key)
+            if pid in pids:
                 # A multi-device run declares its exact UUID set on the SAME owned tree.
                 # Attribute only this probe's UUID; still reject any undeclared device.
                 allowed = getattr(owner, "cuda_device_uuids", (uuid,))
                 if parts[2] not in allowed:
                     raise SupervisionError("probe-failure", "child used an unexpected GPU")
-                if parts[2] == uuid:
+            if parts[1].isdecimal() and len(parts[1]) <= 20:
+                if pid in pids and parts[2] == uuid:
                     used += int(parts[1]) * 1024**2
+            elif parts[1] in {"N/A", "[N/A]"}:
+                if self.policy.backend != "windows-cuda":
+                    raise SupervisionError("probe-failure", f"CUDA process-memory row {number} is unavailable: {line[:160]!r}")
+                if pid in pids:
+                    if parts[2] == uuid:
+                        unknown_owned = True
+                # An exact, unique PID outside the owned Job is not child usage.
+                # WDDM commonly reports its graphics processes with N/A memory.
+            else:
+                raise SupervisionError("probe-failure", f"CUDA process-memory row {number} has unknown usage: {line[:160]!r}")
+        if unknown_owned:
+            free, used = self._windows_global_used_upper_bound()
+            self.gpu_usage_basis = "global-used-upper-bound"
+        else:
+            self.gpu_usage_basis = "owned-process-attributed"
         return free, used
+
+    def _windows_global_used_upper_bound(self) -> tuple[int, int]:
+        """One exact WDDM card sample bounds child use when its per-PID value is N/A.
+
+        Total minus free includes all allocations, including the owned child and
+        reserved/unattributed memory. The extra MiB covers rounded SMI counters.
+        This is a conservative cap input, never an attributed child peak.
+        """
+        if self.policy.backend != "windows-cuda":
+            raise SupervisionError("probe-failure", "global-used bound requires Windows CUDA")
+        assert self.policy.cuda_device_uuid
+        uuid = self.policy.cuda_device_uuid
+        raw = _bounded_output([self._smi, f"--id={uuid}",
+                               "--query-gpu=uuid,driver_model.current,memory.total,memory.used,memory.free",
+                               "--format=csv,noheader,nounits"])
+        rows = [line.split(",") for line in raw.splitlines()]
+        if len(rows) != 1:
+            raise SupervisionError("probe-failure", "WDDM global-used card sample is missing or duplicate")
+        fields = [value.strip() for value in rows[0]]
+        if (len(fields) != 5 or fields[0] != uuid or fields[1] != "WDDM"
+                or any(not value.isdecimal() or len(value) > 20 for value in fields[2:])):
+            raise SupervisionError("probe-failure", f"WDDM global-used card sample has invalid identity/counters: {raw[:160]!r}")
+        total, used, free = map(int, fields[2:])
+        if (total <= 0 or used > total or free > total or used + free > total + 2):
+            raise SupervisionError("probe-failure", f"WDDM global-used card counters are inconsistent: {raw[:160]!r}")
+        mib = 1024**2
+        return free * mib, (max(used, total - free) + 1) * mib
 
     def gpu_free(self) -> int:
         assert self.policy.cuda_device_uuid
@@ -958,15 +1009,23 @@ class _CudaWatch:
     def __init__(self, policy: SafetyPolicy, probe: object, admission: dict[str, object], role: int):
         self.policy, self.probe, self.admission, self.role = policy, probe, admission, role
         self.peak = 0
+        self.global_upper_bound_peak = 0
+        self.global_upper_bound_samples = 0
         self.samples: list[dict[str, object]] = []
         self.failed = FailedTicks(f"CUDA probe {policy.cuda_device_uuid}")
 
     def evidence(self) -> dict[str, object]:
-        return {"role": self.role, "cudaDeviceUuid": self.policy.cuda_device_uuid,
+        result = {"role": self.role, "cudaDeviceUuid": self.policy.cuda_device_uuid,
                 "admission": self.admission, "samples": tuple(self.samples),
                 "peakGpuBytes": self.peak if self.peak > 0 else None,
                 "peakGpuUnknownReason": None if self.peak > 0 else "no attributable positive GPU-memory sample",
                 "policySha256": self.policy.sha256}
+        if self.global_upper_bound_samples:
+            result["peakGlobalUsedUpperBoundBytes"] = self.global_upper_bound_peak
+            result["globalUsedUpperBoundSampleCount"] = self.global_upper_bound_samples
+            if self.peak == 0:
+                result["peakGpuUnknownReason"] = "global GPU used upper bound sampled; no attributable child GPU-memory sample"
+        return result
 
 
 def _cuda_pairs(policy: SafetyPolicy, probe: object | None,
@@ -1305,13 +1364,35 @@ def _run_admitted(
                             failures.failed(error)
                             continue  # other explicit UUIDs still get this tick's checks
                         failures.succeeded()
-                        state.peak = max(state.peak, device_used)
+                        basis = getattr(sampler, "gpu_usage_basis", "owned-process-attributed")
+                        if basis == "global-used-upper-bound":
+                            if device.backend != "windows-cuda":
+                                raise SupervisionError("probe-failure", "global-used bound is only valid for Windows WDDM")
+                            state.global_upper_bound_peak = max(state.global_upper_bound_peak, device_used)
+                            state.global_upper_bound_samples += 1
+                            if not multi_cuda:
+                                samples.append({"phase": "cuda-global-used-upper-bound-sample",
+                                                "cudaDeviceUuid": device.cuda_device_uuid,
+                                                "globalUsedUpperBoundBytes": device_used,
+                                                "gpuFreeBytes": device_free, "at_ns": time.time_ns()})
+                                gpu_sample_bytes += len(canonical(samples[-1]))
+                                if len(samples) * 160 + gpu_sample_bytes > policy.event_cap_bytes:
+                                    raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
+                        elif basis == "owned-process-attributed":
+                            state.peak = max(state.peak, device_used)
+                        else:
+                            raise SupervisionError("probe-failure", "CUDA sample has unknown usage basis")
                         if state.role == 0:
                             peak_gpu = state.peak
                         if multi_cuda:
-                            state.samples.append({"phase": "device-sample", "cudaDeviceUuid": device.cuda_device_uuid,
-                                                  "gpuFreeBytes": device_free, "ownedGpuBytes": device_used,
-                                                  "rootExited": status is not None, "at_ns": time.time_ns()})
+                            sample = {"phase": "device-sample", "cudaDeviceUuid": device.cuda_device_uuid,
+                                      "gpuFreeBytes": device_free, "rootExited": status is not None, "at_ns": time.time_ns()}
+                            if basis == "global-used-upper-bound":
+                                sample["globalUsedUpperBoundBytes"] = device_used
+                                sample["gpuUsageBasis"] = basis
+                            else:
+                                sample["ownedGpuBytes"] = device_used
+                            state.samples.append(sample)
                             gpu_sample_bytes += len(canonical(state.samples[-1]))
                             if len(samples) * 160 + gpu_sample_bytes > policy.event_cap_bytes:
                                 raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
