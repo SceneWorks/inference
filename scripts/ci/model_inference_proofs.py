@@ -757,6 +757,57 @@ def configuration_bindings(row: dict, env: dict[str, str]) -> dict:
                    else redact(env[name], env) if name in env else None} for name in sorted(names)}
 
 
+def configure_native_darwin_build(env, rustc, *, root, system):
+    """Avoid Apple's malformed proc-macro LINKEDIT output; never configure a cross target.
+
+    Cargo's encoded flags preserve paths containing spaces and take precedence over
+    plain/target Rust flags. The proof controller builds only its native host target.
+    SDK selection, deployment and native MLX artifact verification remain independent.
+    """
+    if system != "Darwin":
+        return {"mechanism": "not applicable"}
+
+    def inspect(arguments):
+        return subprocess.run([*rustc, *arguments], cwd=root, env=env, check=True,
+                              capture_output=True, text=True, encoding="utf-8",
+                              timeout=30).stdout.strip()
+
+    version = inspect(["-vV"])
+    match = re.search(r"^host: (\S+)$", version, re.M)
+    if not match or not match.group(1).endswith("-apple-darwin"):
+        raise ValueError("native Mac build requires the selected Darwin Rust host")
+    host = match.group(1)
+    if env.get("CARGO_BUILD_TARGET", host) != host:
+        raise ValueError("native Mac proof cannot configure a cross target")
+    sysroot = Path(inspect(["--print", "sysroot"]))
+    linker = sysroot / "lib/rustlib" / host / "bin/rust-lld"
+    if not sysroot.is_absolute() or not linker.is_file():
+        raise ValueError("selected Rust toolchain lacks its native Darwin rust-lld")
+    sdk = env.get("SDKROOT")
+    if not sdk:
+        sdk = subprocess.run(["xcrun", "--sdk", "macosx", "--show-sdk-path"],
+                             cwd=root, env=env, check=True, capture_output=True,
+                             text=True, encoding="utf-8", timeout=30).stdout.strip()
+    if not Path(sdk).is_absolute() or not Path(sdk).is_dir():
+        raise ValueError("native Mac build requires an existing selected macOS SDK")
+    target_flags = "CARGO_TARGET_" + host.upper().replace("-", "_") + "_RUSTFLAGS"
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if env["CARGO_ENCODED_RUSTFLAGS"] else []
+    else:
+        # Cargo splits plain RUSTFLAGS on whitespace, rather than shell syntax.
+        flags = env.get("RUSTFLAGS", env.get(target_flags, "")).split()
+    flags += ["-C", "linker-flavor=ld64.lld", "-C", "linker=" + str(linker)]
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
+    env["SDKROOT"] = sdk
+    for profile in ("DEV", "TEST"):
+        env[f"CARGO_PROFILE_{profile}_STRIP"] = "none"
+        env[f"CARGO_PROFILE_{profile}_BUILD_OVERRIDE_STRIP"] = "none"
+    return {"mechanism": "selected-toolchain native Darwin rust-lld",
+            "host": host, "sysroot": str(sysroot), "linker": str(linker),
+            "linker_sha256": hashlib.sha256(linker.read_bytes()).hexdigest(),
+            "sdk": sdk, "rustflags": flags, "strip": "none"}
+
+
 def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
     """Bind compiler commands to this checkout's declaration, not a host PATH report."""
     declaration = root / 'rust-toolchain.toml'
@@ -795,11 +846,14 @@ def verified_toolchain(env: dict[str, str], *, root: Path = ROOT) -> dict:
             raise ValueError(name + ' differs from verified repository Rustup compiler')
     # RUSTC takes precedence over Cargo configuration, including a host build.rustc setting.
     env['RUSTC'] = str(proxies['rustc'])
+    native_linker = configure_native_darwin_build(
+        env, [str(proxies['rustc'])], root=root, system=platform.system())
     return {'declaration': 'rust-toolchain.toml', 'declaration_sha256': hashlib.sha256(raw).hexdigest(),
             'channel': channel, 'inherited_rustup_toolchain': override,
             'proxies': {name: str(path) for name, path in proxies.items()}, 'binaries': binaries,
             'cargo_version': inspect([str(proxies['cargo']), '--version', '--verbose']),
-            'rustc_version': inspect([str(proxies['rustc']), '-vV'])}
+            'rustc_version': inspect([str(proxies['rustc']), '-vV']),
+            'native_linker': native_linker}
 
 
 def verified_windows_toolchain(env: dict[str, str], root: Path, declaration: bytes,

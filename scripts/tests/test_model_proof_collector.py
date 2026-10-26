@@ -83,8 +83,13 @@ class Collector(unittest.TestCase):
                     self.assertEqual(kwargs['env']['RUSTC'], str(bin_dir / ('rustc' + suffix)))
                     output = 'MOCK compiler version; not actually run'
                 return subprocess.CompletedProcess(argv, 0, stdout=output + '\n')
-            with patch.object(proof.subprocess, 'run', side_effect=inspect):
+            with patch.object(proof.subprocess, 'run', side_effect=inspect), \
+                    patch.object(proof, 'configure_native_darwin_build',
+                                 return_value={'mechanism': 'MOCK linker; not executed'}) as native:
                 value = proof.verified_toolchain(env, root=root)
+            native.assert_called_once_with(env, [str(bin_dir / ('rustc' + suffix))],
+                                           root=root, system=proof.platform.system())
+            self.assertEqual(value['native_linker']['mechanism'], 'MOCK linker; not executed')
             self.assertEqual(value['channel'], 'repository-channel')
             self.assertEqual(value['inherited_rustup_toolchain'], 'repository-channel')
             self.assertEqual(env['PATH'].split(os.pathsep)[0], str(bin_dir))
@@ -212,7 +217,14 @@ class Collector(unittest.TestCase):
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
         (root / 'case.rs').write_text('// test fixture; no actual Rust execution', encoding="utf-8")
+        def toolchain(env, **_kwargs):
+            env['CARGO_ENCODED_RUSTFLAGS'] = 'MOCK_NATIVE_LINKER_FLAGS'
+            return {'toolchain': 'MOCK; no compiler invoked'}
+        def preparation(_row, env):
+            self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
+            return {'prebuilt': 'MOCK; not executed'}
         def guarded(argv, **kwargs):
+            self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
             discovery = '--list' in argv
             text = (row['fqn'] + ': test\n\n1 test, 0 benchmarks\n') if discovery else (
                 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
@@ -235,8 +247,8 @@ class Collector(unittest.TestCase):
                'GITHUB_EVENT_NAME': 'workflow_dispatch', 'MODEL_PROOF_RUNNER_ENVIRONMENT': 'github-hosted'}
         with patch.dict(os.environ, env), patch.object(proof, 'ROOT', root), \
                 patch.object(proof, 'repository_identity', return_value={'revision': expected, 'tree': '2' * 40}), \
-                patch.object(proof, 'verified_toolchain', return_value={'toolchain': 'MOCK; no compiler invoked'}), \
-                patch.object(proof, 'prepare_build', return_value={'prebuilt': 'MOCK; not executed'}), \
+                patch.object(proof, 'verified_toolchain', side_effect=toolchain), \
+                patch.object(proof, 'prepare_build', side_effect=preparation), \
                 patch.object(safety, 'run_guarded', side_effect=guarded) as guard, claim_patch:
             output = root / 'evidence'
             try:
