@@ -171,6 +171,19 @@ class TestSuites(unittest.TestCase):
             self.assertIn(name, workflow["jobs"]["gate"]["needs"])
         self.assertIn("inputs.test_suite == 'exhaustive'", workflow["concurrency"]["group"])
 
+    def test_cuda_rank_fixture_preserves_the_parent_device_binding(self):
+        source = (suites.ROOT / "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs").read_text(encoding="utf-8")
+        start = source.index("fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in()")
+        end = source.index("fn inherited_single_cuda_device(", start)
+        body = source[start:end]
+        self.assertIn('std::env::var("CUDA_VISIBLE_DEVICES")', body)
+        self.assertIn("inherited_single_cuda_device(visible.as_deref())", body)
+        self.assertIn('json!({"CUDA_VISIBLE_DEVICES": visible})', body)
+        self.assertNotIn('"CUDA_VISIBLE_DEVICES": "0"', body)
+        self.assertIn('#[cfg(feature = "cuda")]\n#[test]\n', source[start - 50:start])
+        self.assertNotIn("return;", body)
+        self.assertIn("fn rank_children_preserve_only_the_single_bound_gpu1_mapping()", source)
+
 
 if __name__ == "__main__":
     unittest.main()
