@@ -66,6 +66,8 @@ fn real_tiers_shrink_the_resident_weights() {
         )
         .unwrap();
         dit_bytes.push(dit.resident_weight_bytes());
+        #[cfg(target_os = "macos")]
+        crate::common::metal_guard::record_model_inference_device();
         eprintln!(
             "[[IRIS_QUANT]] backbone {quant:?} load {:.1}s",
             start.elapsed().as_secs_f32()
@@ -79,6 +81,8 @@ fn real_tiers_shrink_the_resident_weights() {
         let te = IrisTextEncoder::load_quantized(&tower, &config.text_encoder, quant).unwrap();
         assert_eq!(te.is_quantized(), quant.is_some());
         te_bytes.push(te.resident_weight_bytes());
+        #[cfg(target_os = "macos")]
+        crate::common::metal_guard::record_model_inference_device();
         eprintln!(
             "[[IRIS_QUANT]] text encoder {quant:?} load {:.1}s",
             start.elapsed().as_secs_f32()
@@ -93,6 +97,9 @@ fn real_tiers_shrink_the_resident_weights() {
     let pair = |i: usize| dit_bytes[i] + te_bytes[i];
     assert_ratio("backbone + text encoder q8", pair(1), pair(0), 0.48, 0.58);
     assert_ratio("backbone + text encoder q4", pair(2), pair(0), 0.25, 0.34);
+
+    #[cfg(feature = "model-inference-proof")]
+    eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::real_tiers_shrink_the_resident_weights");
 }
 
 /// Luminance of an RGB8 image box-averaged to a `cells x cells` grid.

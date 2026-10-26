@@ -50,6 +50,19 @@ fn assert_ratio(what: &str, measured: u64, dense: u64, lo: f64, hi: f64) {
     );
 }
 
+#[cfg(feature = "model-inference-proof")]
+fn record_resident_device(device: &candle_gen::candle_core::Device) {
+    let backend = if device.is_cuda() {
+        "candle-cuda"
+    } else if device.is_metal() {
+        "candle-metal"
+    } else {
+        assert!(device.is_cpu(), "unknown resident model device");
+        "candle-cpu"
+    };
+    println!("\nMODEL_INFERENCE_DEVICE quant_real_weights::real_tiers_shrink_the_resident_weights {backend}");
+}
+
 /// The resident weight bytes of each component at each tier, measured from the LOADED model (the
 /// backbone's built tensors, the tower's weight census), one component resident at a time, and
 /// never above the contract's pricing.
@@ -83,6 +96,8 @@ fn real_tiers_shrink_the_resident_weights() {
         )
         .unwrap();
         assert_eq!(dit.is_quantized(), quant.is_some());
+        #[cfg(feature = "model-inference-proof")]
+        record_resident_device(dit.resident_device());
         eprintln!(
             "[[IRIS_QUANT]] backbone {quant:?} load {:.1}s",
             start.elapsed().as_secs_f32()
@@ -94,6 +109,8 @@ fn real_tiers_shrink_the_resident_weights() {
         let te =
             IrisTextEncoder::load_quantized(&tower, &config.text_encoder, &device, quant).unwrap();
         assert_eq!(te.is_quantized(), quant.is_some());
+        #[cfg(feature = "model-inference-proof")]
+        record_resident_device(te.resident_device());
         eprintln!(
             "[[IRIS_QUANT]] text encoder {quant:?} load {:.1}s",
             start.elapsed().as_secs_f32()
@@ -123,6 +140,9 @@ fn real_tiers_shrink_the_resident_weights() {
     let pair = |i: usize| dit_bytes[i] + te_bytes[i];
     assert_ratio("backbone + text encoder q8", pair(1), pair(0), 0.48, 0.58);
     assert_ratio("backbone + text encoder q4", pair(2), pair(0), 0.25, 0.34);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED quant_real_weights::real_tiers_shrink_the_resident_weights");
 }
 
 /// Luminance of an RGB8 image box-averaged to a `cells x cells` grid.

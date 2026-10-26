@@ -288,6 +288,12 @@ impl IrisTextEncoder {
         self.lm.weight_census().total().resident_bytes
     }
 
+    /// Device of the loaded decoder's head weight, for explicit residency proofs.
+    #[cfg(feature = "model-inference-proof")]
+    pub fn resident_device(&self) -> &Device {
+        self.lm.device()
+    }
+
     /// The tower's projections by the representation each became at load — including how many
     /// GGML projections are served weight-only (`ggml_weight_only`, sc-26266).
     pub fn projection_census(&self) -> candle_llm::primitives::ProjectionCensus {

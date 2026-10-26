@@ -231,7 +231,9 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
         if not isinstance(name, str) or not NAME.fullmatch(name):
             raise ValueError('invalid fixed configuration name')
         required = {'source_identity', 'environment', 'backend', 'expected_devices', 'scope', 'required_work', 'cargo_features'}
-        optional = {'backend_compatibility', 'source_guard'} | ({'execution_lane'} if feature_only or source_controls else set())
+        optional = {'backend_compatibility', 'source_guard'}
+        if feature_only or source_controls:
+            optional |= {'execution_lane', 'required_cuda_physical_index'}
         if not isinstance(recipe, dict) or not required <= set(recipe) or not set(recipe) <= required | optional:
             raise ValueError('configuration must bind source, flags, devices and required work')
         if any(not isinstance(recipe[field], str) or not recipe[field] for field in ('backend_compatibility', 'source_guard') if field in recipe):
@@ -268,7 +270,11 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
             for feature in declared_features:
                 if feature.removeprefix(row['package'] + '/') not in source_features:
                     raise ValueError('configuration feature is absent from actual source manifest: ' + feature)
-        configuration_route(row, recipe)
+        route = configuration_route(row, recipe)
+        physical_index = recipe.get('required_cuda_physical_index')
+        if physical_index is not None and (type(physical_index) is not int or physical_index < 0
+                                           or route != 'candle-cuda'):
+            raise ValueError('fixed physical CUDA index requires a CUDA source recipe')
         if kind == 'source-flags':
             if frozenset(devices) != sd35_source_devices(row, environment):
                 raise ValueError('configuration devices differ from actual source-selected SD35 work')
@@ -298,6 +304,10 @@ def configured_case(row: dict, name: str | None = None) -> dict:
     recipe = row['configurations'][selected]
     result = {**row, 'backend': recipe['backend'], 'expected_devices': recipe['expected_devices'],
               'cargo_features': recipe['cargo_features'], 'selected_configuration': {'name': selected, **recipe}}
+    if 'required_cuda_physical_index' in recipe:
+        result['required_cuda_physical_index'] = recipe['required_cuda_physical_index']
+    else:
+        result.pop('required_cuda_physical_index', None)
     if 'execution_lane' in recipe:
         result['execution_lane'] = recipe['execution_lane']
     return result
@@ -315,9 +325,15 @@ def apply_configuration(row: dict, env: dict[str, str]) -> None:
     declared = row['configurations'][recipe['name']]
     if (recipe != {'name': recipe['name'], **declared} or row['backend'] != declared['backend']
             or row.get('expected_devices') != declared['expected_devices'] or features(row) != features(declared)
-            or row.get('execution_lane') != declared.get('execution_lane')):
+            or row.get('execution_lane') != declared.get('execution_lane')
+            or row.get('required_cuda_physical_index') != declared.get('required_cuda_physical_index')):
         raise ValueError('effective configuration differs from the exact source declaration')
     base = {key: value for key, value in row.items() if key not in ('selected_configuration', 'execution_lane')}
+    default_recipe = row['configurations'].get(row['default_configuration'], {})
+    if 'required_cuda_physical_index' not in default_recipe:
+        base.pop('required_cuda_physical_index', None)
+    else:
+        base['required_cuda_physical_index'] = default_recipe['required_cuda_physical_index']
     if row['default_configuration'] is None:
         base.update(backend=None, expected_devices=[], cargo_features=[])
     else:

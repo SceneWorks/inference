@@ -35331,7 +35331,8 @@
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 1
       },
       "source_selected_metal": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512/source_selected_metal",
@@ -35412,6 +35413,123 @@
         }
       ]
     }
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "integration",
+    "target_kind": "test",
+    "source": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights",
+      "requirements": [
+        {
+          "slot": "iris-resident-backbone",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-config",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::IrisConfig::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-text-shards",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "fqn": "quant_real_weights::real_tiers_shrink_the_resident_weights",
+    "fixture_identity": "External Iris generation backbone and Qwen3-VL text encoder loaded at bf16, q8 and q4; resident bytes measured from both loaded components",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights",
+    "required_environment": [
+      "IRIS_WEIGHTS_DIR",
+      "IRIS_TEXT_ENCODER_DIR"
+    ],
+    "device_witness": "Device of a resident backbone tensor and loaded decoder head weight observed after each successful component load",
+    "output_contract": "Exactly one successful libtest summary, six original component/pair ratio assertions and Candle pricing assertions where present, one late exact BODY, exact observed resident-device set; missing-work event invalidates proof",
+    "required_cuda_physical_index": 1,
+    "configuration_kind": "feature-only",
+    "default_configuration": "source_selected_cuda",
+    "configurations": {
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "All three source tiers, original loaded resident-byte pricing and component/pair ratios"
+        ],
+        "required_cuda_physical_index": 1
+      }
+    },
+    "configuration_controls": []
   },
   {
     "package": "candle-gen-iris",
@@ -155558,6 +155676,99 @@
         }
       ]
     }
+  },
+  {
+    "package": "mlx-gen-iris",
+    "target": "integration",
+    "target_kind": "test",
+    "source": "crates/media/mlx-gen/mlx-gen-iris/tests/quant_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "metal",
+    "expected_devices": [
+      "mlx-metal"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/mlx-gen/mlx-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights",
+      "requirements": [
+        {
+          "slot": "iris-resident-backbone",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen::Weights::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-config",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::IrisConfig::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/config.rs::from_dir::std::fs::read_to_string@49555"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-resident-text-tower",
+          "role": "model-weights",
+          "readers": [
+            "mlx-gen-iris::IrisTextEncoder::load_quantized"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "fqn": "quant_real_weights::real_tiers_shrink_the_resident_weights",
+    "fixture_identity": "External Iris generation backbone and Qwen3-VL text encoder loaded at bf16, q8 and q4; resident bytes measured from both loaded components",
+    "configuration_source": "crates/media/mlx-gen/mlx-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_tiers_shrink_the_resident_weights",
+    "required_environment": [
+      "IRIS_WEIGHTS_DIR",
+      "IRIS_TEXT_ENCODER_DIR"
+    ],
+    "device_witness": "Selected MLX execution stream observed after each successful backbone and text-tower load",
+    "output_contract": "Exactly one successful libtest summary, six original component/pair ratio assertions and Candle pricing assertions where present, one late exact BODY, exact observed resident-device set; missing-work event invalidates proof"
   },
   {
     "package": "mlx-gen-iris",

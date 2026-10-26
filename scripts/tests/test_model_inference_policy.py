@@ -1,4 +1,5 @@
 """Ordinary CI checks only: source/schema/protocol/filesystem mocks, never NN execution."""
+import copy
 import importlib.util
 import json
 import os
@@ -482,6 +483,26 @@ class PrebuiltAssignmentParser(unittest.TestCase):
 
 
 class ExactProofProtocol(unittest.TestCase):
+    def test_iris_cuda_physical_index_is_recipe_bound(self):
+        rows = proof.load_registry()
+        resident = next(item for item in rows if item['package'] == 'candle-gen-iris'
+                        and item['fqn'] == 'quant_real_weights::real_tiers_shrink_the_resident_weights')
+        render = next(item for item in rows if item['package'] == 'candle-gen-iris'
+                      and item['fqn'] == 'quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512')
+        for item in (resident, render):
+            cuda = proof.configured_case(item, 'source_selected_cuda')
+            self.assertEqual(cuda['expected_devices'], ['candle-cuda'])
+            self.assertEqual(cuda['required_cuda_physical_index'], 1)
+            with self.assertRaisesRegex(ValueError, 'effective configuration differs'):
+                proof.apply_configuration({**cuda, 'required_cuda_physical_index': 0}, {})
+        cpu = proof.configured_case(render, 'source_default_cpu')
+        self.assertEqual(cpu['expected_devices'], ['candle-cpu'])
+        self.assertNotIn('required_cuda_physical_index', cpu)
+        invalid = copy.deepcopy(render)
+        invalid['configurations']['source_default_cpu']['required_cuda_physical_index'] = 1
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA source recipe'):
+            proof.validate_configurations(invalid)
+
     def test_direct_and_cpu_roles_are_exact_not_any_nonzero_summary(self):
         proof.verify_execution(row(), output(row()))
         child = row(execution_role='cpu_child')

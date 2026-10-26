@@ -530,6 +530,12 @@ impl IrisDiT {
         &self.device
     }
 
+    /// Device of a parameter retained by the loaded backbone, for explicit residency proofs.
+    #[cfg(feature = "model-inference-proof")]
+    pub fn resident_device(&self) -> &Device {
+        self.y_pos_embedding.device()
+    }
+
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
     fn timestep_embedding(&self, t: &Tensor) -> Result<Tensor> {
