@@ -1163,10 +1163,12 @@ fn append_breadcrumb(name: &str, line: &str) {
 #[cfg(feature = "media")]
 fn check_image_generation(media_dir: Option<&Path>) -> Check {
     const NAME: &str = "SANA image generation (E5)";
+    let simulator_functional = cfg!(all(feature = "simulator-functional", target_abi = "sim"))
+        && std::env::var("IOS_SIMULATOR_SANA").as_deref() == Ok("1");
     let Some(dir) = media_dir else {
         return Check {
             name: NAME,
-            passed: true,
+            passed: !simulator_functional,
             detail: "skipped -- no SANA snapshot in Documents/ (see docs/ios-epics.md E5)"
                 .to_string(),
         };
@@ -1278,14 +1280,23 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         return Check { name: NAME, passed: false,
             detail: "SANA capture requires a real device and explicit IOS_SMOKE_UNADMITTED=1; no weights loaded".into() };
     }
-    let diagnostic = capture || std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
+    let diagnostic =
+        capture || simulator_functional || std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
     const CAPTURE: &[(&str, u32, Option<u32>, bool)] = &[(
         "256 tile128 UNADMITTED evidence capture",
         256,
         Some(128),
         false,
     )];
-    let configs: &[(&str, u32, Option<u32>, bool)] = if capture {
+    const SIMULATOR: &[(&str, u32, Option<u32>, bool)] = &[(
+        "256 tile128 SIMULATOR FUNCTIONAL ONLY",
+        256,
+        Some(128),
+        false,
+    )];
+    let configs: &[(&str, u32, Option<u32>, bool)] = if simulator_functional {
+        SIMULATOR
+    } else if capture {
         CAPTURE
     } else if diagnostic {
         DIAGNOSTIC
@@ -1419,23 +1430,30 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 continue;
             }
         };
-        // Admitted lane: the evidence facade. Diagnostic lanes: the labelled bounded capture permit
-        // (every quantum checks live headroom before construction), never an unadmitted load.
+        // Admitted lane: the evidence facade. Device diagnostics use bounded capture quanta;
+        // the simulator-only functional route relies on its external process supervisor.
         let admission = if diagnostic {
+            #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+            if simulator_functional {
+                runtime_ios::media::simulator_functional_permit(&candidate).map(|_| ())
+            } else {
+                runtime_ios::media::capture_permit(&candidate).map(|_| ())
+            }
+            #[cfg(not(all(feature = "simulator-functional", target_abi = "sim")))]
             runtime_ios::media::capture_permit(&candidate).map(|_| ())
         } else {
             runtime_ios::media::load_sana(std::slice::from_ref(&candidate)).map(|_| ())
         };
         if let Err(refusal) = &admission {
-            let line = format!(
-                "{label}: refused before load (observed entitled process ceiling {} MiB; {}): {refusal}",
-                runtime_ios::IOS_APP_MEMORY_CAP_MIB,
-                if diagnostic {
-                    "bounded capture"
-                } else {
-                    "admitted"
-                }
-            );
+            let line = if simulator_functional {
+                format!("{label}: simulator functional permit refused before load: {refusal}")
+            } else {
+                format!(
+                    "{label}: refused before load (observed entitled process ceiling {} MiB; {}): {refusal}",
+                    runtime_ios::IOS_APP_MEMORY_CAP_MIB,
+                    if diagnostic { "bounded capture" } else { "admitted" }
+                )
+            };
             append_breadcrumb("sana-progress.txt", &line);
             details.push(line);
             continue;
@@ -1458,7 +1476,22 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             debug_assert_eq!(candidate.spec.offload_policy, OffloadPolicy::Sequential);
             // Through the REGISTRY via the bundle's facades, not a direct loader: this is the path a
             // product takes. The returned generator is bound to this exact request.
-            let generator: Box<dyn runtime_ios::gen_core::Generator> = if diagnostic {
+            let generator: Box<dyn runtime_ios::gen_core::Generator> = if simulator_functional {
+                #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+                {
+                    let (registry, permit) = runtime_ios::media::simulator_functional_permit(
+                        &candidate,
+                    )
+                    .map_err(|e| format!("{label}: simulator functional permit refused: {e}"))?;
+                    Box::new(
+                        permit
+                            .load_generator(&registry, |_| Ok(()))
+                            .map_err(|e| format!("{label}: simulator load failed: {e}"))?,
+                    )
+                }
+                #[cfg(not(all(feature = "simulator-functional", target_abi = "sim")))]
+                return Err("simulator functional route is unavailable on this target".into());
+            } else if diagnostic {
                 let (registry, permit) = runtime_ios::media::capture_permit(&candidate)
                     .map_err(|e| format!("{label}: capture refused: {e}"))?;
                 Box::new(
@@ -1540,10 +1573,18 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
                     Some(buf) => match buf.save(docs.join(&name)) {
                         Ok(()) => append_breadcrumb(RENDERS_MANIFEST, &name),
+                        Err(e) if simulator_functional => {
+                            return Err(format!("simulator PNG write failed: {e}"))
+                        }
                         Err(e) => eprintln!("could not write {name}: {e}"),
                     },
+                    None if simulator_functional => {
+                        return Err("simulator RGB buffer shape mismatch".into())
+                    }
                     None => eprintln!("{name}: pixel buffer does not match {edge}x{edge}"),
                 }
+            } else if simulator_functional {
+                return Err("simulator Documents directory is unavailable for PNG evidence".into());
             }
 
             let secs = started.elapsed().as_secs_f64();
@@ -1561,7 +1602,13 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             // whether the configuration is comfortable or one step from a kill, and unlike a
             // percentage-of-assumed-cap it comes from the OS.
             let headroom = available_memory_mib()
-                .map(|m| format!(", {m:.0} MiB still available"))
+                .map(|m| {
+                    if simulator_functional {
+                        format!(", simulator-reported {m:.0} MiB available")
+                    } else {
+                        format!(", {m:.0} MiB still available")
+                    }
+                })
                 .unwrap_or_default();
             Ok(format!(
                 "{label}: {secs:.1}s, MLX peak {mlx_peak:.0} MiB, process RSS peak {:.0} MiB{headroom}, \
@@ -1657,6 +1704,37 @@ fn check_zimage_generation() -> Check {
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
 /// parsing the body.
 pub fn run_report() -> String {
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    if std::env::var("IOS_SIMULATOR_SANA").as_deref() != Ok("1") {
+        return "SMOKE: FAIL\n  [XX] simulator supervisor missing; no model loaded\n".into();
+    }
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    if std::env::var("IOS_SIMULATOR_SANA").as_deref() == Ok("1") {
+        let nonce = std::env::var("IOS_SIMULATOR_SANA_NONCE").unwrap_or_default();
+        let source = std::env::var("IOS_CAMPAIGN_BUILD_SHA").unwrap_or_default();
+        if nonce.len() != 32
+            || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
+            || source.len() != 40
+            || !source.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return "SMOKE: FAIL\n  [XX] simulator nonce/source identity missing\n".into();
+        }
+        let compiled_source = option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or_default();
+        if compiled_source != source {
+            return "SMOKE: FAIL\n  [XX] simulator compiled source identity mismatch\n".into();
+        }
+        if let Some(docs) = dirs_documents() {
+            let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));
+        }
+        // The controller verifies the copied `Documents/sana` content inventory. Do not use the
+        // ordinary first-match finder here: a second sana-named directory could bind the receipt
+        // to one payload while the app loaded another.
+        let snapshot = dirs_documents().map(|docs| docs.join("sana"));
+        let check = check_image_generation(snapshot.as_deref());
+        return format!("SMOKE: {}\nSIMULATOR_NONCE {nonce}\nSOURCE_SHA {compiled_source}\n  [{}] {} -- {}\nSIMULATOR FUNCTIONAL ONLY; no phone admission, memory fit, or performance claim\n",
+            if check.passed { "PASS" } else { "FAIL" },
+            if check.passed { "ok" } else { "XX" }, check.name, check.detail);
+    }
     #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
     if let Some(docs) = dirs_documents() {
         let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));

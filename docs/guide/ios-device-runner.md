@@ -42,6 +42,33 @@ State a bounded loan and obtain approval each session before Mac real-weight
 measurements; use an external RSS/physical-footprint guard, and return the GPU
 at the agreed deadline. This documentation change runs neither devices nor GPUs.
 
+## Separately dispatched SANA simulator image
+
+S3's simulator image is a manual `real-weights.yml` profile on a provisioned
+Mac runner. Use an already provisioned immutable `sana-1600m-mlx` snapshot and an
+exact iPhone simulator model name available on that runner. The workflow selects
+its runtime there, creates and later deletes its own simulator without touching
+the template's apps or data. Until the dedicated reusable
+workflow is on the default branch, dispatch through the registered workflow at
+the exact feature ref:
+
+```sh
+gh workflow run real-weights.yml --ref <feature-ref> \
+  -f profile=ios-simulator-sana \
+  -f ios_pricing_compile_binding='{"source_sha":"<40-hex-feature-head>","simulator":"iPhone 17 Pro Max","snapshot":"~/.cache/huggingface/hub/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/ac421696dd6eb0b41f446f4c45a53ccc057d82a1"}'
+```
+
+The route checks out that SHA, verifies the canonical snapshot root and the BF16
+component files against the pinned public Hub metadata, then copies its
+BF16 component tree into a fresh simulator app container and compares every file
+against the source inventory. It builds a simulator metallib and installs without
+launching. The controller then claims the exact app PID before releasing its
+model-load gate, samples physical footprint and host reserve, and accepts only a
+nonce-bound SANA report with a nondegenerate 256×256 PNG. Its artifact includes
+the source, snapshot inventory, binary and PNG identities. This witness proves
+simulator image functionality only; it establishes no physical-phone memory
+admission, fit, kernel correctness, or performance claim.
+
 ## Optional tooling is not campaign evidence
 
 `scripts/ios/soak.sh --secs 300 --device <identifier>` exists for sustained LLM

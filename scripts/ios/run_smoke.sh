@@ -31,6 +31,8 @@ SIMULATOR=""
 MEMORY_ENTITLEMENT=on
 CARGO_FEATURES=""
 INSTALL_ONLY=0
+SIMULATOR_FUNCTIONAL=0
+OTHER_MEDIA_MODE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --debug)  PROFILE=debug; CARGO_PROFILE_FLAG=""; shift ;;
@@ -45,26 +47,34 @@ while [ $# -gt 0 ]; do
     # E5: also run the SANA image-generation check. Needs a SANA snapshot pushed to
     # Documents/<any-subdir>/ (scripts/ios/push_model.sh <dir> sana); without one the check
     # reports "skipped" rather than failing.
-    --media)  CARGO_FEATURES="--features media"; shift ;;
+    --media)  OTHER_MEDIA_MODE=1; CARGO_FEATURES="--features media"; shift ;;
     # One bounded CAPTURE of a Z-Image Turbo campaign case (IOS_SMOKE_ZIMAGE_CASE, default
     # z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1) through the capture
     # permit (sc-26433); off-device or without a provisioned slot it skips; needs the
     # campaign slot (scripts/ios/push_model.sh <tier-dir> --campaign-route z_image_turbo --tier q4).
-    --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
+    --zimage) OTHER_MEDIA_MODE=1; CARGO_FEATURES="--features media,zimage"; shift ;;
     # The measurement lane: LLM loads have no footprint estimate, so iOS admission
     # refuses them by default (the report says "refused before load"). This runs them UNADMITTED to
     # produce that estimate, and the report's "iOS admission lane" line says so.
     --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;
     --campaign-case)
       [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung/selection/steps" >&2; exit 2; }
-      export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
+      OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
+    --simulator-functional) SIMULATOR_FUNCTIONAL=1; shift ;;
     --campaign-timeout) export IOS_CAMPAIGN_TIMEOUT_SECONDS="$2"; shift 2 ;;
-    --campaign-list) export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
+    --campaign-list) OTHER_MEDIA_MODE=1; export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
     --campaign-diagnostic) export IOS_CAMPAIGN_DIAGNOSTIC=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[ "$SIMULATOR_FUNCTIONAL" -eq 0 ] || { [ -n "$SIMULATOR" ] && [ "$INSTALL_ONLY" -eq 1 ]; } \
+  || { echo "--simulator-functional is build/install-only; use the dispatch-only simulator controller to launch" >&2; exit 2; }
+if [ "$SIMULATOR_FUNCTIONAL" -eq 1 ]; then
+  [ "$OTHER_MEDIA_MODE" -eq 0 ] && [ -z "${IOS_SMOKE_IMAGE_ONLY:-}${IOS_SMOKE_SANA_CAPTURE:-}${IOS_SMOKE_UNADMITTED:-}" ] \
+    || { echo "--simulator-functional cannot combine with other model modes" >&2; exit 2; }
+  CARGO_FEATURES="--features simulator-functional"
+fi
 
 if [ -n "${IOS_CAMPAIGN_CASE:-}${IOS_CAMPAIGN_LIST:-}" ]; then
   [ -z "${IOS_SMOKE_UNADMITTED:-}${IOS_SMOKE_SANA_CAPTURE:-}" ] || { echo "campaign cannot inherit legacy unadmitted/capture bypass flags" >&2; exit 2; }
@@ -96,6 +106,9 @@ say() { printf '\n=== %s\n' "$1"; }
 # again — several GB. Change it only if signing actually fails, not defensively.
 SMOKE_BUNDLE_ID=${SMOKE_BUNDLE_ID:-com.idkplay.SceneWorksSmoke}
 export SMOKE_BUNDLE_ID
+
+# Stamp the exact compiled checkout for both device and simulator artifacts.
+export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
 
 if [ -n "$SIMULATOR" ]; then
   [ -z "$DEVICE" ] || { echo "--device and --simulator are mutually exclusive" >&2; exit 2; }
@@ -174,6 +187,10 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   DATA=$(xcrun simctl get_app_container "$SIMULATOR" "$SMOKE_BUNDLE_ID" data)
   mkdir -p "$DATA/Documents"
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
+  if [ "$INSTALL_ONLY" -eq 1 ]; then
+    say "installed only; no simulator app launch or model execution"
+    exit 0
+  fi
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
   for var in IOS_CAMPAIGN_TIMEOUT_SECONDS IOS_CAMPAIGN_BUILD_SHA IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
@@ -269,9 +286,6 @@ else
   ENTITLEMENT_OVERRIDES=(CODE_SIGN_ENTITLEMENTS=App/SceneWorksSmoke-NoIncreasedLimit.entitlements SMOKE_INCREASED_MEMORY_LIMIT=NO)
 fi
 say "increased-memory-limit entitlement: $MEMORY_ENTITLEMENT (${ENTITLEMENT_OVERRIDES[*]})"
-
-# Stamp the exact compiled checkout, not a caller label on a stale installed app.
-export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
 
 # --- rust staticlib ---------------------------------------------------------------------------
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml floors the iOS triples (per-target

@@ -40,6 +40,7 @@ media = ["dep:mlx-gen-ios-catalog"]
 # The labelled bounded DEVICE CAPTURE path (`media::capture_permit` / `capture_capacity`). Never in
 # a product build: only `ios-host/smoke` (the device harness) enables it.
 device-capture = ["media", "mlx-gen-ios-catalog/device-capture"]
+simulator-functional = ["device-capture", "mlx-gen-ios-catalog/simulator-functional"]
 
 # NOTE: no `audio` feature, and that is deliberate rather than an omission: the Candle audio lane's
 # cross-backend seam (sc-12835) is a sanctioned exception for the platforms that ship it and is not

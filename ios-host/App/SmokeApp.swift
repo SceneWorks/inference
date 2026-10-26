@@ -104,7 +104,27 @@ struct ContentView: View {
         // Off the main thread: the first Metal library load plus kernel dispatch takes long
         // enough to hang the UI, and a hung main thread risks a watchdog kill.
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = runSmokeTest()
+            // simctl launch reparents the app to launchd_sim. The external supervisor must first
+            // verify and claim that exact PID before the app can load a model. A missing gate is
+            // a hard refusal, never an automatic launch after a timeout.
+            let environment = ProcessInfo.processInfo.environment
+            let gate = environment["IOS_SIMULATOR_SANA_NONCE"].flatMap { nonce -> URL? in
+                guard nonce.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil,
+                      let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                else { return nil }
+                return dir.appendingPathComponent("simulator-go-\(nonce)")
+            }
+            var admitted = environment["IOS_SIMULATOR_SANA"] != "1"
+            if environment["IOS_SIMULATOR_SANA"] == "1", let gate {
+                for _ in 0..<300 {
+                    if FileManager.default.fileExists(atPath: gate.path) {
+                        admitted = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            }
+            let result = admitted ? runSmokeTest() : "SMOKE: FAIL\n  [XX] simulator supervisor gate unavailable\n"
             print(result)
             writeReport(result)
             // Campaign cases are one-shot processes. Rust has returned from generation, stopped

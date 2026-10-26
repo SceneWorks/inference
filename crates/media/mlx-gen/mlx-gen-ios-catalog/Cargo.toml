@@ -41,6 +41,7 @@ model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-sana/model-in
 # The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only
 # `runtime-ios/device-capture`, which only the device harness (`ios-host/smoke`) enables, turns it on.
 device-capture = []
+simulator-functional = ["device-capture"]
 
 [build-dependencies]
 sha2 = { workspace = true }

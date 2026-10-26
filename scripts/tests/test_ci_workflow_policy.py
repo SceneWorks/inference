@@ -292,7 +292,7 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
         for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
             for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
                 primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
-                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures", "ios-prequant",
+                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures", "ios-prequant", "ios-simulator-sana",
                     "synthetic-w4a8-mlx", "synthetic-w4a8-cuda", "synthetic-w4a8-both",
                     "moss-edit-cuda", "moss-edit-metal"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
@@ -1072,6 +1072,21 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_simulator_sana_is_manual_reusable_route_with_exact_binding(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
+        self.assertIn("ios-simulator-sana", dispatch["profile"]["options"])
+        job = workflow["jobs"]["ios-simulator-sana"]
+        self.assertEqual(job["needs"], "validate-selection")
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-simulator-sana'")
+        self.assertEqual(job["uses"], "./.github/workflows/ios-simulator-sana.yml")
+        self.assertEqual(set(job["with"]), {"source_sha", "simulator", "snapshot"})
+        for key in job["with"]:
+            self.assertEqual(job["with"][key], "${{ fromJSON(inputs.ios_pricing_compile_binding)." + key + " }}")
+        called = yaml.safe_load((REAL_WEIGHTS_WORKFLOW.parent / "ios-simulator-sana.yml").read_text(encoding="utf-8"))
+        self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
+        self.assertEqual(called["jobs"]["image"]["if"], "github.event_name == 'workflow_dispatch'")
+
     def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]

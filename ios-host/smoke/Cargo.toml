@@ -24,6 +24,9 @@ model-inference-proof = ["runtime-ios/model-inference-proof", "mlx-gen-sana?/mod
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
 media = ["runtime-ios/media", "runtime-ios/device-capture", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
+# Functional simulator image validation only. The APIs behind this feature are additionally
+# target-abi gated; it never changes physical-iOS admission or its quantum guards.
+simulator-functional = ["media", "runtime-ios/simulator-functional"]
 # The Z-Image Turbo lane (`run_smoke.sh --zimage`): Z-Image Turbo is in the iOS catalog (sc-26433),
 # so this lane is a bounded device CAPTURE of one Z-Image campaign case through
 # `runtime_ios::media::capture_permit` — the same admitted/capture path every other model runs, no

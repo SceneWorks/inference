@@ -577,6 +577,21 @@ pub mod media {
         Ok((registry, permit))
     }
 
+    /// Simulator-only functional execution under the external app-PID supervisor. No production
+    /// admission or physical-device capacity evidence is implied by this permit.
+    #[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+    pub fn simulator_functional_permit(
+        candidate: &IosCandidate,
+    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let permit = mlx_gen_ios_catalog::simulator_functional_permit(
+            &registry,
+            candidate,
+            &super::device_machine(),
+        )?;
+        Ok((registry, permit))
+    }
+
     /// Labelled capture with the caller's ACTUAL source boundary and a synchronous
     /// pre-load metadata observer. Uses the same next-layout callback for capture
     /// key construction and observation. This remains a bounded diagnostic permit,

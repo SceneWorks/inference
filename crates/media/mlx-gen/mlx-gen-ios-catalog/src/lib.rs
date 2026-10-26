@@ -70,6 +70,8 @@ mod refusal;
 pub mod sampling;
 pub mod source_identity;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform, GeneratorAdmissionInfo};
+#[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+pub use ios_admission::simulator_functional_permit;
 pub use ios_admission::{
     admit, admit_with_baseline, admit_with_boundary, admit_with_boundary_and_key_capacity,
     admit_with_sana_lifecycle_fallback, bind_sana_retirement_key, build_candidate, capacity_budget,

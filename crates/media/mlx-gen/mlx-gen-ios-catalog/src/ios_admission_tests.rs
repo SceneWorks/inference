@@ -813,6 +813,44 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     assert_eq!(refused, Some(RefusalKind::Strategy));
 }
 
+/// CI_IMPACT: simulator-only metadata/permit check; no tensor or model execution. The manual
+/// simulator image workflow supplies the separate real-weight body and PNG witness.
+#[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+#[test]
+fn simulator_permit_seals_ordinary_retirement_and_reaches_loader() {
+    let registry = crate::provider_registry().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let candidate = build_candidate(
+        &registry,
+        "sana_1600m",
+        sana(root.path()),
+        None,
+        MemoryStrategy::BoundedDecode,
+        generation(256, vec![]),
+    )
+    .unwrap();
+    let permit = simulator_functional_permit(&registry, &candidate, "non-device-host").unwrap();
+    assert!(permit.is_capture());
+    assert_eq!(
+        permit.native_retirement_execution(),
+        mlx_gen::ios_pricing::IosNativeRetirementExecution::Ordinary
+    );
+    permit.check_load_form().unwrap();
+    let called = Cell::new(false);
+    let result = permit.load_generator_using(
+        |_| {
+            called.set(true);
+            Err(Error::Unsupported("metadata-only loader stop".into()))
+        },
+        Box::new(|_| Ok(())),
+    );
+    assert!(result.is_err());
+    assert!(
+        called.get(),
+        "the permit must reach the provider loader boundary"
+    );
+}
+
 /// E4: the anchor's peak is the CAPTURE process's absolute peak, including its own baseline. Only
 /// the render's growth (peak - capture baseline) plus the anchor's measured margin is charged, and
 /// what this process already holds is committed, never credited: an unrelated resident (e.g.

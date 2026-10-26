@@ -2282,12 +2282,46 @@ fn admit_one_using_key_capacity(
     rows: Option<&[AnchorRow]>,
     attempt: AdmissionAttempt<'_, '_>,
 ) -> AdmissionResult<Admission> {
+    admit_one_with_retirement(
+        registry,
+        index,
+        candidate,
+        machine,
+        budget,
+        RetirementInput {
+            rows,
+            simulator_functional: false,
+        },
+        attempt,
+    )
+}
+
+struct RetirementInput<'a> {
+    rows: Option<&'a [AnchorRow]>,
+    simulator_functional: bool,
+}
+
+fn admit_one_with_retirement(
+    registry: &ProviderRegistry,
+    index: usize,
+    candidate: &IosCandidate,
+    machine: &str,
+    budget: MemoryBudget,
+    retirement: RetirementInput<'_>,
+    attempt: AdmissionAttempt<'_, '_>,
+) -> AdmissionResult<Admission> {
+    let RetirementInput {
+        rows,
+        simulator_functional,
+    } = retirement;
     let AdmissionAttempt { evidence, mut next } = attempt;
     validate_actual(registry, candidate)?;
-    let native_retirement = if matches!(
-        candidate.provider.as_str(),
-        "sana_1600m" | "sana_sprint_1600m"
-    ) && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some())
+    let native_retirement = if !simulator_functional
+        && matches!(
+            candidate.provider.as_str(),
+            "sana_1600m" | "sana_sprint_1600m"
+        )
+        && matches!(&candidate.work,IosWork::Generate(request) if request.memory.is_some())
         && (rows.is_none()
             || evidence.execution_facts.is_some_and(|facts| {
                 facts.native_retirement
@@ -2921,7 +2955,7 @@ pub fn capture_permit(
     candidate: &IosCandidate,
     machine: &str,
 ) -> AdmissionResult<Admission> {
-    capture_permit_using_key_capacity(registry, candidate, machine, None)
+    capture_permit_using_key_capacity(registry, candidate, machine, None, false)
 }
 
 /// The served device-capture route, guarded before fresh key tokenization.
@@ -2932,8 +2966,19 @@ pub fn capture_permit_with_key_capacity(
     machine: &str,
     next: KeyCapacity<'_>,
 ) -> AdmissionResult<Admission> {
-    capture_permit_using_key_capacity(registry, candidate, machine, Some(next))
+    capture_permit_using_key_capacity(registry, candidate, machine, Some(next), false)
         .map_err(source_metadata_gap_refusal)
+}
+
+/// Functional-only simulator permit. It has no phone admission, cap, or quantum claim. The
+/// separately dispatched simulator controller must own and bound the app before release.
+#[cfg(all(feature = "simulator-functional", target_abi = "sim"))]
+pub fn simulator_functional_permit(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    machine: &str,
+) -> AdmissionResult<Admission> {
+    capture_permit_using_key_capacity(registry, candidate, machine, None, true)
 }
 
 #[cfg(feature = "device-capture")]
@@ -2942,8 +2987,9 @@ fn capture_permit_using_key_capacity(
     candidate: &IosCandidate,
     machine: &str,
     next: Option<KeyCapacity<'_>>,
+    simulator_functional: bool,
 ) -> AdmissionResult<Admission> {
-    if !mlx_gen::ios_quantum::enabled() {
+    if !mlx_gen::ios_quantum::enabled() && !simulator_functional {
         return Err(AdmissionError::Failed(Error::Unsupported(
             "iOS capture requires bounded per-quantum execution (a physical iOS device); \
              no weights loaded"
@@ -2951,7 +2997,7 @@ fn capture_permit_using_key_capacity(
         )));
     }
     let premise_policy = PremisePolicy::default();
-    admit_one_using_key_capacity(
+    admit_one_with_retirement(
         registry,
         0,
         candidate,
@@ -2962,7 +3008,10 @@ fn capture_permit_using_key_capacity(
             reclaimable_bytes: 0,
             reserved_headroom_bytes: 0,
         },
-        None,
+        RetirementInput {
+            rows: None,
+            simulator_functional,
+        },
         AdmissionAttempt {
             evidence: AdmissionEvidence {
                 request_baseline: None,
