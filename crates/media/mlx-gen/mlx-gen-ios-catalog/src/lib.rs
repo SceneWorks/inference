@@ -61,6 +61,8 @@ pub use source_work::{
 mod bound;
 mod capture_config;
 pub use capture_config::capture_adapters;
+pub mod engineering;
+pub mod source_identity;
 pub mod evidence;
 pub mod ios_admission;
 mod layout;

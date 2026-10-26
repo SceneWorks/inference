@@ -616,6 +616,52 @@ pub(crate) fn price_metadata_with_source_capacity(
     price_metadata_using_source_capacity(req, token, mask_count, control_count, source, Some(next))
 }
 
+/// Opt-in empirical preparation guard. Default/source-certified metadata paths still pass None.
+pub(crate) fn price_metadata_with_estimated_preparation(
+    req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
+    token: &str,
+    mask_count: u32,
+    control_count: u32,
+    source: Option<&mlx_gen_sdxl::sampling::SamplingSourceFacts>,
+    estimate: Option<mlx_gen_iris::ios_pricing::EstimatedSourcePreparation>,
+    next: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<mlx_gen::ios_pricing::IosPricing> {
+    #[cfg(test)]
+    if crate::pricing::test_pricing_active() {
+        return price_metadata_with_source_capacity(
+            req,
+            token,
+            mask_count,
+            control_count,
+            source,
+            next,
+        );
+    }
+    if let (true, Some(estimate)) = (
+        matches!(
+            req.provider,
+            "iris_3b" | crate::ios_admission::IRIS_RESTORE_ID | crate::ios_admission::IRIS_DEPTH_ID
+        ),
+        estimate,
+    ) {
+        mlx_gen_iris::ios_pricing::check_replay_with_estimated_preparation(
+            req.provider,
+            token,
+            estimate,
+            next,
+        )?;
+        let replay = IrisAnchorReplay::parse(req.provider, token)?;
+        return mlx_gen_iris::ios_pricing::pricing_facts_with_estimated_preparation(
+            req,
+            Some(replay.as_replay()),
+            estimate,
+            next,
+        )
+        .map(|facts| facts.pricing);
+    }
+    price_metadata_with_source_capacity(req, token, mask_count, control_count, source, next)
+}
+
 fn price_metadata_using_source_capacity(
     req: &mlx_gen::ios_pricing::IosPricingRequest<'_>,
     token: &str,

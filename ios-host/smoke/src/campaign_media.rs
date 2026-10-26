@@ -1744,7 +1744,8 @@ impl Provider for DeviceProvider<'_> {
         );
         let facts = runtime_ios::media::execution_facts(Some(callbacks))
             .map_err(|e| classify(&mut self.refusal_kind, e))?;
-        let premise_policy = runtime_ios::media::PremisePolicy::default();
+        let premise_policy = runtime_ios::media::admission_policy()
+            .map_err(|error| classify(&mut self.refusal_kind, error))?;
         let mut source_next =
             |bytes| runtime_ios::media::source_metadata_capacity(bytes).map_err(Into::into);
         if diagnostic {
@@ -1754,7 +1755,7 @@ impl Provider for DeviceProvider<'_> {
                 runtime_ios::media::SourceCapacityBoundary {
                     request_baseline: &baseline,
                     execution_facts: &facts,
-                    premise_policy: &premise_policy,
+                    premise_policy,
                     source_metadata_capacity: &mut source_next,
                 },
                 &mut observe_selected_sana_capture,
@@ -1782,7 +1783,7 @@ impl Provider for DeviceProvider<'_> {
             runtime_ios::media::SourceCapacityBoundary {
                 request_baseline: &baseline,
                 execution_facts: &facts,
-                premise_policy: &premise_policy,
+                premise_policy,
                 source_metadata_capacity: &mut source_next,
             },
         )
@@ -1796,7 +1797,7 @@ impl Provider for DeviceProvider<'_> {
             boundary: runtime_ios::media::SourceCapacityBoundary {
                 request_baseline: &baseline,
                 execution_facts: &facts,
-                premise_policy: &premise_policy,
+                premise_policy,
                 source_metadata_capacity: &mut source_next,
             },
         })
@@ -1965,6 +1966,24 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             }
             if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
                 return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
+            }
+            // Optional explicit engineering approval, parsed before capture/admission baselines.
+            // The execution owner binds the reviewed model to its compiled source identity and
+            // the runtime checks the actual hardware/OS. No policy is activated by default.
+            if let Some(json) = std::env::var_os("IOS_CAMPAIGN_ADMISSION_POLICY") {
+                if diagnostic {
+                    return Err(
+                        "engineering admission policy cannot relabel a diagnostic capture".into(),
+                    );
+                }
+                let json = json
+                    .into_string()
+                    .map_err(|_| "engineering admission policy is not UTF-8")?;
+                let config: runtime_ios::media::engineering::EngineeringPolicyConfig =
+                    serde_json::from_str(&json)
+                        .map_err(|e| format!("invalid engineering admission policy: {e}"))?;
+                runtime_ios::media::install_admission_policy(config.into_policy()?)
+                    .map_err(|e| e.to_string())?;
             }
             let root = super::dirs_documents()
                 .ok_or("no Documents directory")?
@@ -2278,6 +2297,8 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "refusal_kind":adapter.refusal_kind, "refusal_only":adapter.refusal_only,
             "expected_render_count":expected_render_count,
             "build_sha":option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
+            "build_identity":runtime_ios::media::source_identity::BuildIdentity::current(),
+            "os_build":runtime_ios::os_build(),
             "entitlement":std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok(),
             "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() });
             e.write(&mut row);

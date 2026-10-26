@@ -944,6 +944,8 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
                 },
                 run_id: "r".into(),
                 build_sha: "s".into(),
+                build_identity: None,
+                os_build: None,
             },
             // A refused endpoint has no completed capture or demand. Construct it directly;
             // a zero-growth completed intermediate is invalid even if its outcome is replaced.
@@ -1233,5 +1235,350 @@ fn declared_host_growth_needs_its_own_premise_and_is_added_not_subtracted() {
                 Ok(admitted) => panic!("unproved host growth admitted: {:?}", admitted.basis()),
             }
         });
+    });
+}
+
+/// Transport a catalog capture through the shared production witness selector. The observation
+/// stays PROCESS and the certificate stays NATIVE; source metadata acceptance grants no mapping.
+#[test]
+fn catalog_process_metadata_reaches_native_witness_selectors_without_numeric_conversion() {
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let c = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let row = optimized_anchor(&registry, &c);
+    let mut pricing = IosPricing::default();
+    anchor::attach_observations(&mut pricing, &row).unwrap();
+    assert!(!pricing.observations.is_empty());
+    for observation in &mut pricing.observations {
+        assert_eq!(observation.domain, IosMemoryDomain::ProcessGrowth);
+        assert!(observation.has_source_witness_coordinate());
+        assert!(!observation.checks.is_empty());
+        for domain in [
+            IosMemoryDomain::Unspecified,
+            IosMemoryDomain::NativeAllocatorAbsolute,
+        ] {
+            observation.domain = domain;
+            assert!(!observation.has_source_witness_coordinate());
+        }
+        observation.domain = IosMemoryDomain::NativeAllocatorGrowth;
+        assert!(observation.has_source_witness_coordinate());
+        observation.coordinate = IosMemoryCoordinate::BeforeRequestConstruction;
+        assert!(!observation.has_source_witness_coordinate());
+    }
+    let native = IosCertifiedBounds::proven(vec![IosWindowBound::RawPhysical {
+        domain: IosMemoryDomain::NativeAllocatorGrowth,
+        coordinate: IosMemoryCoordinate::BeforeModelLoad,
+        request_class: "source-native-only".into(),
+        growth_upper: 1,
+    }]);
+    assert!(in_anchor_domain(
+        native,
+        &anchor::measured_anchor(&row).unwrap(),
+        &PremisePolicy::default()
+    )
+    .unwrap_err()
+    .contains(NATIVE_TO_PROCESS_PREMISE_ID));
+}
+
+fn engineering_policy() -> PremisePolicy {
+    use crate::engineering::*;
+    PremisePolicy::approving([
+        PROCESS_PRESSURE_PREMISE_ID.into(),
+        PROCESS_RESIDUAL_PREMISE_ID.into(),
+        PROCESS_PREPARATION_PREMISE_ID.into(),
+    ])
+    .with_engineering_process(EngineeringProcessModel {
+        machine: DEVICE.into(),
+        os_build: "fixture-os".into(),
+        build_identity: crate::engineering::test_identity(),
+        approval_reference: "synthetic policy test, not target evidence".into(),
+    })
+}
+fn engineering_source(mut row: AnchorRow) -> AnchorRow {
+    match &mut row.outcome {
+        AnchorOutcome::Completed { captures } => {
+            for capture in captures {
+                capture.build_sha = "a".repeat(40);
+                capture.build_identity = Some(crate::engineering::test_identity());
+                capture.os_build = Some("fixture-os".into());
+            }
+        }
+        AnchorOutcome::Refused {
+            build_sha,
+            build_identity,
+            os_build,
+            ..
+        } => {
+            *build_sha = "a".repeat(40);
+            *build_identity = Some(Box::new(crate::engineering::test_identity()));
+            *os_build = Some("fixture-os".into());
+        }
+    }
+    row
+}
+
+fn admit_under_engineering(
+    registry: &ProviderRegistry,
+    c: &IosCandidate,
+    available_mib: u64,
+    rows: &[AnchorRow],
+    policy: &PremisePolicy,
+) -> AdmissionResult<Admission> {
+    let baseline = IosMemoryBaseline {
+        domain: IosMemoryDomain::ProcessGrowth,
+        coordinate: IosMemoryCoordinate::BeforeModelLoad,
+        bytes: FIXTURE_BML_BYTES,
+        source: "synthetic-estimated-sdk-before-model-load".into(),
+    };
+    let mut next = |_| Ok(());
+    admit_rows_with_facts_using_key_capacity(
+        registry,
+        std::slice::from_ref(c),
+        DEVICE,
+        budget(available_mib),
+        rows,
+        AdmissionEvidence {
+            request_baseline: Some(&baseline),
+            execution_facts: Some(&cpu_scoped()),
+            premise_policy: policy,
+        },
+        Some(&mut next),
+    )
+}
+
+/// An explicit empirical estimate accepts a refused resident as endpoint provenance, without
+/// manufacturing its demand or source HOST bound. Ordinary certified derivation remains closed.
+#[test]
+fn engineering_estimate_preserves_refused_resident_and_unknown_host_provenance() {
+    use crate::engineering::*;
+    let registry = crate::provider_registry().unwrap();
+    let root = fixture();
+    let opt = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let res = at(
+        &registry,
+        root.path(),
+        1024,
+        MemoryStrategy::Resident,
+        "text_to_image",
+    );
+    let small = at(
+        &registry,
+        root.path(),
+        512,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    let mut refused = resident_anchor(&registry, &res, 3100);
+    refused.outcome = AnchorOutcome::Refused {
+        refused_quantum: RefusedQuantum {
+            label: "source resident load".into(),
+            scratch_bytes: 5000 * MIB,
+            reserve_bytes: 512 * MIB,
+            available_bytes: Some(4000 * MIB),
+        },
+        run_id: "fixture-refused".into(),
+        build_sha: "a".repeat(40),
+        build_identity: Some(Box::new(crate::engineering::test_identity())),
+        os_build: Some("fixture-os".into()),
+    };
+    let rows = [
+        engineering_source(optimized_anchor(&registry, &opt)),
+        refused,
+    ];
+    priced(|| {
+        crate::pricing::with_test_bounder(None, || {
+            assert_eq!(
+                kind(admit_under_engineering(
+                    &registry,
+                    &res,
+                    8192,
+                    &rows,
+                    &engineering_policy()
+                )),
+                Some(RefusalKind::Capacity)
+            );
+            let admitted =
+                admit_under_engineering(&registry, &small, 4096, &rows, &engineering_policy())
+                    .unwrap();
+            assert_eq!(admitted.basis(), AdmissionBasis::EngineeringEstimate);
+            assert_eq!(admitted.demand_bytes(), 2500 * MIB);
+            assert_eq!(admitted.margin_bytes(), 32 * MIB);
+            let IosWork::Generate(mut other_factory) = small.work.clone() else {
+                unreachable!()
+            };
+            other_factory.sampler = Some("heun".into());
+            let other_factory = build_candidate(
+                &registry,
+                crate::sdxl::SDXL_ID,
+                small.spec.clone(),
+                Some(small.context.selection),
+                small.context.selection.strategy,
+                IosWork::Generate(other_factory),
+            )
+            .unwrap();
+            let other_key = evidence_key(&registry, &other_factory, DEVICE).unwrap();
+            assert_ne!(
+                rows[0].key.family().unwrap(),
+                other_key.family().unwrap(),
+                "native factory families remain distinct"
+            );
+            assert!(crate::engineering::same_pressure_family(
+                &rows[0].key,
+                &other_key
+            ));
+            let other_admitted = admit_under_engineering(
+                &registry,
+                &other_factory,
+                4096,
+                &rows,
+                &engineering_policy(),
+            )
+            .unwrap();
+            assert_eq!(other_admitted.basis(), AdmissionBasis::EngineeringEstimate);
+            assert_eq!(other_admitted.demand_bytes(), 2500 * MIB);
+            let premises = admitted.certificate_premises();
+            assert!(premises.iter().any(|p| p.id == PROCESS_PRESSURE_PREMISE_ID
+                && p.statement.contains("no second numeric endpoint")));
+            assert!(premises.iter().any(|p| p.id == PROCESS_RESIDUAL_PREMISE_ID
+                && p.statement
+                    .contains("no finite source HOST/driver certificate claim")));
+            let unapproved = PremisePolicy::default().with_engineering_process(
+                engineering_policy().engineering_process().unwrap().clone(),
+            );
+            assert!(no_evidence_reason(admit_under_engineering(
+                &registry,
+                &small,
+                4096,
+                &rows,
+                &unapproved
+            ))
+            .contains(PROCESS_PREPARATION_PREMISE_ID));
+            let mut masked_preparation = rows[0].clone();
+            if let AnchorOutcome::Completed { captures } = &mut masked_preparation.outcome {
+                for capture in captures {
+                    let masked = capture.baseline_footprint_bytes + 900 * MIB;
+                    capture
+                        .before_request_snapshot
+                        .as_mut()
+                        .unwrap()
+                        .lifetime_peak_bytes = Some(masked);
+                    capture
+                        .before_model_load_snapshot
+                        .as_mut()
+                        .unwrap()
+                        .lifetime_peak_bytes = Some(masked);
+                }
+            }
+            assert_eq!(engineering_policy().engineering_process().unwrap().preparation_estimate(&masked_preparation).unwrap(),932*MIB,"masked preparation is a labelled interval upper, not rejected or called exact demand");
+            let baseline = IosMemoryBaseline {
+                domain: IosMemoryDomain::ProcessGrowth,
+                coordinate: IosMemoryCoordinate::BeforeModelLoad,
+                bytes: FIXTURE_BML_BYTES,
+                source: "source-preparation refusal fixture".into(),
+            };
+            let calls = std::cell::Cell::new(0);
+            let mut denied = |_| {
+                calls.set(calls.get() + 1);
+                Err(mlx_gen::Error::Unsupported(
+                    "source preparation refused".into(),
+                ))
+            };
+            let refusal = admit_rows_with_facts_using_key_capacity(
+                &registry,
+                std::slice::from_ref(&small),
+                DEVICE,
+                budget(4096),
+                &rows,
+                AdmissionEvidence {
+                    request_baseline: Some(&baseline),
+                    execution_facts: Some(&cpu_scoped()),
+                    premise_policy: &engineering_policy(),
+                },
+                Some(&mut denied),
+            );
+            assert_eq!(kind(refusal), Some(RefusalKind::Capacity));
+            assert_eq!(
+                calls.get(),
+                1,
+                "denial precedes any guarded source/key/pricing reads"
+            );
+            let mut provenance_only = rows.clone();
+            if let AnchorOutcome::Completed { captures } = &mut provenance_only[0].outcome {
+                for capture in captures {
+                    capture.build_sha = "b".repeat(40);
+                }
+            }
+            assert_eq!(
+                admit_under_engineering(
+                    &registry,
+                    &small,
+                    4096,
+                    &provenance_only,
+                    &engineering_policy()
+                )
+                .unwrap()
+                .demand_bytes(),
+                2500 * MIB
+            );
+            let mut wrong_source = rows.clone();
+            if let AnchorOutcome::Completed { captures } = &mut wrong_source[0].outcome {
+                captures[0]
+                    .build_identity
+                    .as_mut()
+                    .unwrap()
+                    .source_closure_sha256 = "b".repeat(64);
+            }
+            assert!(no_evidence_reason(admit_under_engineering(
+                &registry,
+                &small,
+                4096,
+                &wrong_source,
+                &engineering_policy()
+            ))
+            .contains("source/native identity"));
+
+            let mut wrong_inventory = rows.clone();
+            wrong_inventory[0].key.layout_sha256 = "b".repeat(64);
+            assert!(no_evidence_reason(admit_under_engineering(
+                &registry,
+                &small,
+                4096,
+                &wrong_inventory,
+                &engineering_policy()
+            ))
+            .contains("captured header/config/tokenizer/adapter inventory"));
+            let underpredicted = [
+                rows[0].clone(),
+                engineering_source(resident_anchor(&registry, &res, 8000)),
+            ];
+            assert!(no_evidence_reason(admit_under_engineering(
+                &registry,
+                &small,
+                16384,
+                &underpredicted,
+                &engineering_policy()
+            ))
+            .contains("under-predicts completed resident"));
+            assert!(no_evidence_reason(admit_under(
+                &registry,
+                &small,
+                4096,
+                &rows,
+                &engineering_policy()
+            ))
+            .contains("capacity callback"));
+        })
     });
 }

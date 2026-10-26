@@ -1447,6 +1447,8 @@ mod tests {
                 },
                 run_id: "fixture-run".into(),
                 build_sha: "ab".repeat(20),
+                build_identity: None,
+                os_build: None,
             },
             evidence_class: "device_capture".into(),
         };

@@ -769,6 +769,11 @@ impl KernelFootprintSnapshot {
 pub struct Capture {
     pub run_id: String,
     pub build_sha: String,
+    /// Actual executable closure/native identity; original capture build_sha remains provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<crate::source_identity::BuildIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_build: Option<String>,
     /// Resolved requested denoise steps; actual callback/update coverage is recorded separately.
     /// Short reference recipes must still exercise their class's required warm-up/terminal epochs.
     pub steps: u32,
@@ -891,6 +896,10 @@ pub enum AnchorOutcome {
         refused_quantum: RefusedQuantum,
         run_id: String,
         build_sha: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_identity: Option<Box<crate::source_identity::BuildIdentity>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        os_build: Option<String>,
     },
 }
 
@@ -1119,6 +1128,7 @@ pub(crate) fn validate_rows(rows: &[AnchorRow]) -> Result<(), String> {
                 refused_quantum,
                 run_id,
                 build_sha,
+                ..
             } => {
                 // The fully optimized anchor must fit: its refusal is a defect, never evidence.
                 if row.anchor_kind == AnchorKind::Optimized {
@@ -1367,6 +1377,8 @@ pub(crate) mod fixture {
         Capture {
             run_id: run.into(),
             build_sha: "synthetic".into(),
+            build_identity: None,
+            os_build: None,
             steps: 1,
             baseline_footprint_bytes: baseline,
             before_request_snapshot: Some(snapshot(baseline, baseline)),
@@ -1650,6 +1662,8 @@ mod tests {
                 },
                 run_id: "r".into(),
                 build_sha: "s".into(),
+                build_identity: None,
+                os_build: None,
             },
             evidence_class: DEVICE_CAPTURE_CLASS.into(),
         };

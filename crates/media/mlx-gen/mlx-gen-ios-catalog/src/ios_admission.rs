@@ -12,7 +12,12 @@
 //!    DERIVED from the family's anchors (the optimized anchor, or a same-regime resident one), after
 //!    the two anchors' self-check. Derivation consumes ONLY a registered provider bounder for the
 //!    execution facts stated at the boundary ([`admit_with_boundary`]), through the certified law;
-//!    missing facts, bounders or certificates in the anchors' counter domain refuse exactly. No anchor family, an underivable request, or a self-check
+//!    missing facts, bounders or certificates in the anchors' counter domain refuse exactly.
+//!    Alternatively, an explicitly approved [`crate::engineering`] policy uses measured process
+//!    endpoints and source-generated phase pressure, labelled [`AdmissionBasis::EngineeringEstimate`].
+//!    It preserves typed resident refusal and records separate process, HOST/residual and source-
+//!    preparation assumptions; it supplies no mathematical physical/native certificate.
+//!    No compatible family, an underivable request, or a self-check
 //!    failure refuses ([`RefusalKind::NoEvidence`]); a measured resident refusal at its own key is
 //!    [`RefusalKind::Capacity`];
 //! 4. checks the execution implements the selected ladder ([`RefusalKind::Strategy`]);
@@ -952,6 +957,8 @@ pub enum AdmissionBasis {
     Measured(AnchorKind),
     /// Derived by the anchor law from this anchor of the family.
     Derived { from: AnchorKind },
+    /// An explicitly approved empirical process-pressure estimate, not a physical certificate.
+    EngineeringEstimate,
     /// A labelled device-capture permit: no evidence, bounded per quantum.
     CapturePermit,
 }
@@ -1051,6 +1058,7 @@ pub struct PremisePolicy {
     approved: std::collections::BTreeSet<String>,
     /// The activity-26569 engineering model; consulted only if its premise id is ALSO approved.
     native_to_process: Option<IosNativeToProcessModel>,
+    engineering_process: Option<crate::engineering::EngineeringProcessModel>,
 }
 
 impl PremisePolicy {
@@ -1059,6 +1067,7 @@ impl PremisePolicy {
         Self {
             approved: ids.into_iter().collect(),
             native_to_process: None,
+            engineering_process: None,
         }
     }
     /// Supply the target-device native-to-process model. It takes effect only when
@@ -1066,6 +1075,19 @@ impl PremisePolicy {
     pub fn with_native_to_process(mut self, model: IosNativeToProcessModel) -> Self {
         self.native_to_process = Some(model);
         self
+    }
+    /// Attach the reviewable empirical model. Both separately named engineering premises must
+    /// ALSO be approved. This does not approve physical, HOST or source-certificate premises.
+    pub fn with_engineering_process(
+        mut self,
+        model: crate::engineering::EngineeringProcessModel,
+    ) -> Self {
+        self.engineering_process = Some(model);
+        self
+    }
+    /// The runtime verifies the model's hardware/OS/build scope before installation.
+    pub fn engineering_process(&self) -> Option<&crate::engineering::EngineeringProcessModel> {
+        self.engineering_process.as_ref()
     }
     fn approved_native_to_process(&self) -> Option<&IosNativeToProcessModel> {
         self.native_to_process
@@ -1309,6 +1331,32 @@ fn anchor_context<'row>(
     })
 }
 
+fn validate_engineering_inventory(
+    candidate: &IosCandidate,
+    key: &EvidenceKey,
+    row: &AnchorRow,
+    context: &AnchorContext<'_>,
+) -> AdmissionResult<()> {
+    if row.key.provider != candidate.provider
+        || row.key.route != key.route
+        || row.key.mode != key.mode
+    {
+        return Err(no_evidence(
+            "engineering estimate cannot borrow a different provider, route or mode's endpoint"
+                .into(),
+        ));
+    }
+    let layout = if context.provider.starts_with("sana_") {
+        artifact(crate::admission::sana_snapshot_profile(&context.spec))?.layout_sha256
+    } else {
+        artifact(crate::layout::artifact_layout_digest(&context.spec))?
+    };
+    if crate::layout::hex(&layout) != row.key.layout_sha256 {
+        return Err(no_evidence("engineering estimate requires the exact captured header/config/tokenizer/adapter inventory".into()));
+    }
+    Ok(())
+}
+
 /// Count the ANCHOR's own resolved recipe/roles, selection, load form and geometry on the
 /// matched artifact/configured semantic graph. A mode label never decides which configured
 /// overlay is loaded: the actual provider factory/pricer owns that interpretation.
@@ -1324,7 +1372,17 @@ fn price_anchor_using_source_capacity<'row>(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
     row: &'row AnchorRow,
+    next: Option<KeyCapacity<'_>>,
+) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
+    price_anchor_using_estimated_preparation(registry, candidate, row, next, None)
+}
+
+fn price_anchor_using_estimated_preparation<'row>(
+    registry: &ProviderRegistry,
+    candidate: &IosCandidate,
+    row: &'row AnchorRow,
     mut next: Option<KeyCapacity<'_>>,
+    estimate: Option<mlx_gen_iris::ios_pricing::EstimatedSourcePreparation>,
 ) -> AdmissionResult<(AnchorContext<'row>, IosPricing)> {
     let context = match next.as_mut() {
         Some(next) => anchor_context(registry, candidate, row, Some(&mut **next))?,
@@ -1332,12 +1390,13 @@ fn price_anchor_using_source_capacity<'row>(
     };
     let mut pricing = match next {
         Some(next) => with_source_metadata_capacity(next, |next| {
-            crate::sampling::price_metadata_with_source_capacity(
+            crate::sampling::price_metadata_with_estimated_preparation(
                 &context.request(),
                 context.token,
                 context.mask_count,
                 context.control_count,
                 context.recorded_source,
+                estimate,
                 next,
             )
         })?,
@@ -1651,7 +1710,11 @@ fn anchored_demand_using_source_capacity(
         };
     }
     let family = key.family().map_err(no_evidence)?;
-    let (resident, optimized) = evidence::family_anchors(rows, &family);
+    let (resident, optimized) = if premise_policy.engineering_process().is_some() {
+        crate::engineering::pressure_family_anchors(rows, key).map_err(no_evidence)?
+    } else {
+        evidence::family_anchors(rows, &family)
+    };
     let Some(optimized) = optimized.filter(|r| completed(r)) else {
         return Err(no_evidence(format!(
             "no completed optimized anchor for {family:?} in {EVIDENCE_TABLE_PATH}: another \
@@ -1675,6 +1738,32 @@ fn anchored_demand_using_source_capacity(
             "{}: no counted iOS pricing, so only its anchors' own keys are admitted",
             candidate.provider
         )));
+    };
+    let engineering_preparation = if let Some(model) = premise_policy.engineering_process() {
+        if source_metadata_capacity.is_none() {
+            return Err(no_evidence(
+                "engineering estimate requires the actual source-preparation capacity callback"
+                    .into(),
+            ));
+        }
+        let resident = resident.ok_or_else(|| no_evidence("engineering estimate requires a recorded resident endpoint (completed or typed refusal)".into()))?;
+        let premises = model.premises(
+            optimized,
+            resident,
+            &IosHostGrowth::Unproved(format!(
+                "{}: this empirical path makes no finite source HOST/driver certificate claim",
+                candidate.provider
+            )),
+        );
+        premise_policy.accept(&premises).map_err(no_evidence)?;
+        let bytes = model.preparation_estimate(optimized).map_err(no_evidence)?;
+        if let Some(next) = source_metadata_capacity.as_mut() {
+            with_source_metadata_capacity(&mut **next, |next| next(bytes))?;
+        }
+        Some(mlx_gen_iris::ios_pricing::EstimatedSourcePreparation::new(bytes,
+            mlx_gen_iris::ios_pricing::SourcePreparationEstimateProvenance::BeforeRequestConstructionPeakWithMargin).map_err(pricing_error)?)
+    } else {
+        None
     };
     let request_context = IosPricingRequest {
         provider: &candidate.provider,
@@ -1721,11 +1810,21 @@ fn anchored_demand_using_source_capacity(
     } else {
         match (iris_source_pricing, source_metadata_capacity.as_mut()) {
             (true, Some(next)) => with_source_metadata_capacity(&mut **next, |next| {
-                mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
-                    &request_context,
-                    None,
-                    next,
-                )
+                match engineering_preparation {
+                    Some(estimate) => {
+                        mlx_gen_iris::ios_pricing::pricing_facts_with_estimated_preparation(
+                            &request_context,
+                            None,
+                            estimate,
+                            next,
+                        )
+                    }
+                    None => mlx_gen_iris::ios_pricing::pricing_facts_with_source_capacity(
+                        &request_context,
+                        None,
+                        next,
+                    ),
+                }
                 .map(|facts| facts.pricing)
             })?,
             _ => pricer(&request_context).map_err(pricing_error)?,
@@ -1733,6 +1832,7 @@ fn anchored_demand_using_source_capacity(
     };
     // A fact from the SDK boundary, not an inferred budget/zero or a process-transfer proof.
     request.request_baseline = request_baseline.cloned();
+    let resident_endpoint = resident;
     let resident = resident.filter(|r| completed(r));
     // Derive UPWARD from the optimized anchor; a measured resident anchor prices only its own
     // regime at other geometries (never derived downward toward the optimized end).
@@ -1740,8 +1840,9 @@ fn anchored_demand_using_source_capacity(
         Some(r) if r.key.execution == key.execution => r,
         _ => optimized,
     };
-    // Certified derivation (sc-26270). The ONLY derivation authority is a registered source-owned
-    // provider bounder for the STATED execution, consumed by the complete certified law. Legacy
+    // Certified derivation (sc-26270) requires a registered source-owned provider bounder for
+    // the STATED execution, consumed by the complete certified law. The explicitly approved
+    // empirical path below has a distinct basis and never claims those certificates. Legacy
     // logical derive/consistency carry no authority and are not consulted. Measured anchors are
     // ProcessGrowth; native-allocator certificates reach that domain ONLY through the explicitly
     // approved activity-26569 engineering premise, validated against both endpoint anchors.
@@ -1751,6 +1852,111 @@ fn anchored_demand_using_source_capacity(
              facts (stream, iOS quantum scope) at the admission boundary"
         ))
     })?;
+    if let Some(model) = premise_policy.engineering_process() {
+        if !execution_facts.ios_quantum_scope {
+            return Err(no_evidence(
+                "engineering estimate requires the actual iOS quantum scope".into(),
+            ));
+        }
+        let baseline = request_baseline.ok_or_else(|| {
+            no_evidence(
+                "engineering estimate requires the actual SDK BeforeModelLoad process baseline"
+                    .into(),
+            )
+        })?;
+        if baseline.domain != IosMemoryDomain::ProcessGrowth
+            || baseline.coordinate != IosMemoryCoordinate::BeforeModelLoad
+            || baseline.bytes == 0
+            || baseline.source.is_empty()
+        {
+            return Err(no_evidence(
+                "engineering estimate has an incompatible request baseline".into(),
+            ));
+        }
+        let resident = resident_endpoint.ok_or_else(|| no_evidence(
+            "engineering estimate requires a recorded resident endpoint (completed or typed refusal)".into()
+        ))?;
+        let mut premises = model.premises(
+            optimized,
+            resident,
+            &IosHostGrowth::Unproved(format!(
+                "{}: this empirical path makes no finite source HOST/driver certificate claim",
+                candidate.provider
+            )),
+        );
+        premise_policy.accept(&premises).map_err(no_evidence)?;
+        let (optimized_context, at_optimized) = match source_metadata_capacity.as_mut() {
+            Some(next) => price_anchor_using_estimated_preparation(
+                registry,
+                candidate,
+                optimized,
+                Some(&mut **next),
+                engineering_preparation,
+            )?,
+            None => price_anchor_using_estimated_preparation(
+                registry,
+                candidate,
+                optimized,
+                None,
+                engineering_preparation,
+            )?,
+        };
+        // This path consumes the actual source-generated phase pressure and measured process
+        // endpoints. It neither requests nor manufactures mathematical native/HOST certificates.
+        // The separate certified path below retains all its source-proof requirements.
+        let (demand, margin) = model
+            .estimate(optimized, &at_optimized, &request)
+            .map_err(no_evidence)?;
+        let resident_pricing = if completed(resident) {
+            Some(match source_metadata_capacity.as_mut() {
+                Some(next) => {
+                    price_anchor_using_estimated_preparation(
+                        registry,
+                        candidate,
+                        resident,
+                        Some(&mut **next),
+                        engineering_preparation,
+                    )?
+                    .1
+                }
+                None => {
+                    price_anchor_using_estimated_preparation(
+                        registry,
+                        candidate,
+                        resident,
+                        None,
+                        engineering_preparation,
+                    )?
+                    .1
+                }
+            })
+        } else {
+            None
+        };
+        model
+            .validate_resident(
+                optimized,
+                &at_optimized,
+                resident,
+                resident_pricing.as_ref(),
+            )
+            .map_err(no_evidence)?;
+        validate_engineering_inventory(candidate, key, optimized, &optimized_context)?;
+        let resident_context = match source_metadata_capacity.as_mut() {
+            Some(next) => anchor_context(registry, candidate, resident, Some(&mut **next))?,
+            None => anchor_context(registry, candidate, resident, None)?,
+        };
+        validate_engineering_inventory(candidate, key, resident, &resident_context)?;
+        premises.sort();
+        premises.dedup();
+        return Ok((
+            demand,
+            margin,
+            AdmissionBasis::EngineeringEstimate,
+            optimized.quantum_calibration(),
+            premises,
+        ));
+    }
     // A provider's premise-mode bounder is selected ONLY when the policy approves its exact
     // premise id; its certificates then carry that premise, which the policy re-checks.
     let Some((bounder, gate, _premise_mode)) =
@@ -2017,6 +2223,50 @@ fn admit_one_using_key_capacity(
                 ),
             ));
         }
+    }
+    if let (Some(model), Some(rows)) = (evidence.premise_policy.engineering_process(), rows) {
+        use crate::engineering::{
+            PROCESS_PREPARATION_PREMISE_ID, PROCESS_PRESSURE_PREMISE_ID,
+            PROCESS_RESIDUAL_PREMISE_ID,
+        };
+        for id in [
+            PROCESS_PREPARATION_PREMISE_ID,
+            PROCESS_PRESSURE_PREMISE_ID,
+            PROCESS_RESIDUAL_PREMISE_ID,
+        ] {
+            if !evidence.premise_policy.approved.contains(id) {
+                return Err(no_evidence(format!(
+                    "engineering source preparation has unapproved premise {id}"
+                )));
+            }
+        }
+        let mut envelope = None;
+        for row in rows.iter().filter(|row| {
+            row.anchor_kind == AnchorKind::Optimized
+                && row.key.machine == machine
+                && row.key.provider == candidate.provider
+                && row.key.route == route
+                && row.key.mode == candidate.context.mode.as_key()
+                && row.key.tier == tier_label(&candidate.spec)
+        }) {
+            let bytes = model.preparation_estimate(row).map_err(no_evidence)?;
+            envelope = Some(envelope.map_or(bytes, |old: u64| old.max(bytes)));
+        }
+        let bytes = envelope.ok_or_else(|| {
+            no_evidence(
+                "no scoped optimized source-preparation capture exists before source inspection"
+                    .into(),
+            )
+        })?;
+        let Some(next) = next.as_mut() else {
+            return Err(no_evidence(
+                "engineering estimate requires the actual source-preparation capacity callback"
+                    .into(),
+            ));
+        };
+        with_source_metadata_capacity(&mut **next, |next| next(bytes))?;
+        // This is an approved empirical preparation check, not a parser/HOST allocation proof.
+        // Existing source verification and the same read_unchanged callback remain below.
     }
     let fresh_source;
     let guard = if let Some(source) = candidate.spec.source_inventory() {

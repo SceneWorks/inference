@@ -780,9 +780,11 @@ dependencies = [
  "mlx-gen-sana",
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
+ "pmetal-mlx-sys",
  "serde",
  "serde_json",
  "sha2",
+ "toml_edit",
 ]
 
 [[package]]

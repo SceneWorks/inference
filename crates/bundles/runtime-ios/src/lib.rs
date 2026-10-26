@@ -91,12 +91,61 @@ pub mod media {
         evidence_key, evidence_key_with_key_capacity, sana_capture_observation_plan,
         SanaCaptureObservationPlan,
     };
+    pub use mlx_gen_ios_catalog::{engineering, source_identity};
     pub use mlx_gen_ios_catalog::{
         IosCallbackHost, IosExecutionFacts, IosExecutionStream, IosNativeRetirementExecution,
     };
     pub use mlx_gen_ios_catalog::{IosMemoryBaseline, IosMemoryCoordinate, IosMemoryDomain};
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
+
+    static INSTALLED_ADMISSION_POLICY: std::sync::OnceLock<
+        std::result::Result<PremisePolicy, String>,
+    > = std::sync::OnceLock::new();
+
+    /// Install an explicitly reviewed policy before the first admission. Original capture commits
+    /// remain provenance; the executable/native closure, actual hardware and OS determine reuse.
+    /// Hardware and OS build come from the live runtime. Approval is never inferred from a model
+    /// file or capture. Source certificates, model margins and live guards remain independent.
+    pub fn install_admission_policy(policy: PremisePolicy) -> Result<()> {
+        if let Some(model) = policy.engineering_process() {
+            model
+                .validate_runtime(
+                    &super::device_machine(),
+                    &super::os_build(),
+                    &source_identity::BuildIdentity::current(),
+                )
+                .map_err(Error::Unsupported)?;
+        }
+        match INSTALLED_ADMISSION_POLICY.set(Ok(policy.clone())) {
+            Ok(()) => Ok(()),
+            Err(_) if INSTALLED_ADMISSION_POLICY.get() == Some(&Ok(policy)) => Ok(()),
+            Err(_) => Err(Error::Unsupported(
+                "iOS admission policy is already fixed by an earlier installation or admission"
+                    .into(),
+            )),
+        }
+    }
+
+    /// The same immutable policy is consumed by product facades and the explicit campaign.
+    /// Without installation it approves nothing. First admission fixes that default atomically,
+    /// so a racing or late install cannot change the policy of an already admitted request.
+    pub fn admission_policy() -> AdmissionResult<&'static PremisePolicy> {
+        INSTALLED_ADMISSION_POLICY
+            .get_or_init(|| {
+                let policy = engineering::reviewed_policy()?;
+                if let Some(model) = policy.engineering_process() {
+                    model.validate_runtime(
+                        &super::device_machine(),
+                        &super::os_build(),
+                        &source_identity::BuildIdentity::current(),
+                    )?;
+                }
+                Ok(policy)
+            })
+            .as_ref()
+            .map_err(|reason| AdmissionError::refused(RefusalKind::NoEvidence, reason.clone()))
+    }
 
     fn require_limits_bound() -> AdmissionResult<()> {
         if super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
@@ -231,6 +280,7 @@ pub mod media {
         observer: &mut dyn FnMut(SelectedAdmissionView<'_>) -> AdmissionResult<()>,
     ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
         require_limits_bound()?;
+        let premise_policy = admission_policy()?;
         if let Some(c) = candidates
             .iter()
             .find(|c| !providers.contains(&c.provider.as_str()))
@@ -301,7 +351,7 @@ pub mod media {
         facts.ios_quantum_scope = ios_quantum::enabled();
         facts.analysis_budget_bytes = super::process_memory().available.unwrap_or(0);
         let mut key_next = |bytes| source_metadata_capacity(bytes).map_err(Into::into);
-        let premise_policy = PremisePolicy::default();
+
         let admission = mlx_gen_ios_catalog::admit_with_sana_lifecycle_fallback(
             &registry,
             candidates,
@@ -310,7 +360,7 @@ pub mod media {
             mlx_gen_ios_catalog::SourceCapacityBoundary {
                 request_baseline: &baseline,
                 execution_facts: &facts,
-                premise_policy: &premise_policy,
+                premise_policy,
                 source_metadata_capacity: &mut key_next,
             },
         )?;
@@ -326,7 +376,7 @@ pub mod media {
             boundary: SourceCapacityBoundary {
                 request_baseline: &baseline,
                 execution_facts: &facts,
-                premise_policy: &premise_policy,
+                premise_policy,
                 source_metadata_capacity: &mut key_next,
             },
         })?;
@@ -789,6 +839,35 @@ pub fn device_machine() -> String {
             }
         }
         "unknown-ios-device".into()
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    {
+        "non-device-host".into()
+    }
+}
+
+/// Actual Darwin OS build, used to invalidate explicitly installed engineering admission models.
+#[cfg(feature = "media")]
+pub fn os_build() -> String {
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    {
+        let mut buffer = [0u8; 128];
+        let mut size = buffer.len();
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"kern.osversion".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 && size > 1 && size <= buffer.len() {
+            if let Ok(value) = std::str::from_utf8(&buffer[..size - 1]) {
+                return value.to_owned();
+            }
+        }
+        "unknown-ios-os-build".into()
     }
     #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
     {
