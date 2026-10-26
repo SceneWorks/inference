@@ -1080,6 +1080,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'ios-prequant'")
         self.assertEqual(job["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
         self.assertEqual(job["env"]["IOS_PREQUANT_BINDING"], "${{ inputs.ios_pricing_compile_binding }}")
+        resolver = next(step["run"] for step in job["steps"] if step.get("name") == "Resolve matching MLX native artifact")
+        self.assertIn("scripts/fetch-prebuilt-mlx.sh --target aarch64-apple-darwin --build-type Debug --github-env", resolver)
+        self.assertIn("IOS_PREQUANT_NATIVE_MODE=prebuilt", resolver)
+        self.assertIn("IOS_PREQUANT_NATIVE_MODE=source", resolver)
+        self.assertNotIn(".codex/worktrees", resolver)
         self.assertEqual([step["run"] for step in job["steps"] if "run" in step][-1],
                          "python3.12 -I scripts/ci/ios_prequant.py")
         uploads = [step for step in job["steps"] if "actions/upload-artifact@" in step.get("uses", "")]

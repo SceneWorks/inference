@@ -488,8 +488,7 @@ jobs:
     env:
       IOS_PREQUANT_BINDING: ${{ inputs.ios_pricing_compile_binding }}
       SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
-      PMETAL_MLX_PREBUILT_DIR: /Users/michael/.codex/worktrees/sc16774-ci-repair/target/debug/build/pmetal-mlx-sys-c58d948260eefc63/out/build/lib
-      PMETAL_METALLIB_PATH: /Users/michael/.codex/worktrees/sc16774-ci-repair/target/debug/build/pmetal-mlx-sys-c58d948260eefc63/out/build/lib/mlx.metallib
+      MACOSX_DEPLOYMENT_TARGET: '26.2'
     steps:
       - name: Require primary Mac before checkout
         shell: bash
@@ -500,6 +499,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Resolve matching MLX native artifact
+        shell: bash
+        run: |
+          if scripts/fetch-prebuilt-mlx.sh --target aarch64-apple-darwin --build-type Debug --github-env; then
+            echo 'IOS_PREQUANT_NATIVE_MODE=prebuilt' >> "$GITHUB_ENV"
+          else
+            rc=$?
+            [[ "$rc" == 1 ]] || exit "$rc"
+            echo 'IOS_PREQUANT_NATIVE_MODE=source' >> "$GITHUB_ENV"
+          fi
       - name: Convert one pinned CPU tier with external limits
         shell: bash
         run: python3.12 -I scripts/ci/ios_prequant.py
