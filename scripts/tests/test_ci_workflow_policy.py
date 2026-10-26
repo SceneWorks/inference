@@ -4184,8 +4184,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
     def test_windows_cuda_compile_bypasses_only_the_job_local_shared_sccache(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         job = workflow["jobs"]["windows-cuda-check"]
-        self.assertEqual(job["env"]["RUSTC_WRAPPER"], "")
         self.assertNotIn("RUSTC_WRAPPER", workflow.get("env", {}))
+        if job.get("env", {}).get("RUSTC_WRAPPER") != "":
+            clears = [step for step in job["steps"]
+                      if "Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='" in step.get("run", "")
+                      and "Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue" in step.get("run", "")]
+            self.assertEqual(len(clears), 1)
+            compile_index = next(index for index, step in enumerate(job["steps"])
+                                 if step.get("name") == "Compile Candle CUDA packages and test binaries (no GPU required)")
+            self.assertLess(job["steps"].index(clears[0]), compile_index)
         # Clearing the inherited wrapper must retain the actual compiler and strict lint gates.
         steps = {step.get("name"): step for step in job["steps"]}
         compile = steps["Compile Candle CUDA packages and test binaries (no GPU required)"]
@@ -4227,7 +4234,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic", "moss-edit-cuda", "moss-edit-metal"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "windows-gpu-diagnostic"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4417,7 +4424,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         memory `heavy_candle_cuda_lanes_must_disable_sccache.md`.
         """
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        jobs = workflow["jobs"]
+        validation = yaml.safe_load(real_weights_inline_text())
+        jobs = {**workflow["jobs"], "synthetic-w4a8-cuda": validation["jobs"]["synthetic-w4a8-cuda"]}
+        self.assertNotIn("synthetic-w4a8-cuda", workflow["jobs"])
+        self.assertNotIn("RUSTC_WRAPPER", validation.get("env") or {})
         heavy = ("windows-cuda-check", "synthetic-w4a8-cuda")
         step_name = "Disable unstable sccache wrapper for the heavy Candle lane"
         clear_env = "Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='"
@@ -4559,7 +4569,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             changes.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal')",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
             "topology remains unconditional except explicitly isolated manual dispatches",
         )
         for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
@@ -4614,7 +4624,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # check -- so the gate would report green on exactly the runs it exists to block.
         self.assertEqual(
             gate["if"],
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-cuda') && (github.event_name != 'workflow_dispatch' || inputs.lanes != 'moss-edit-metal') && (always())",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())",
         )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))

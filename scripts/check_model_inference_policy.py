@@ -601,8 +601,19 @@ class RunGraph:
                 elif args[1] not in ('unittest', 'pip', 'venv', 'compileall'):
                     self.script(args[1].replace('.', '/') + '.py', args[2:], chain, base)
                 return
-            self.script(args[0], args[1:], chain, base)
-            return
+            return self.script(args[0], args[1:], chain, base)
+        if leaf.lower() in ('powershell', 'powershell.exe', 'pwsh', 'pwsh.exe'):
+            # PowerShell also accepts a positional script after its host options. Normalize
+            # that spelling to -File, retaining every argument for source/switch analysis.
+            if not any(str(word).lower() in ('-file', '-command', '-c') for word in args):
+                index = 0
+                while index < len(args) and str(args[index]).lower() in ('-nologo', '-noexit', '-noprofile', '-noninteractive', '-sta', '-mta', '-executionpolicy', '-windowstyle', '-inputformat', '-outputformat'):
+                    takes_value = str(args[index]).lower() in ('-executionpolicy', '-windowstyle', '-inputformat', '-outputformat')
+                    index += 2 if takes_value else 1
+                if index < len(args) and str(args[index]).lower().endswith('.ps1'):
+                    args = [*args[:index], '-File', *args[index:]]
+            quoted = ["'" + str(word).replace("'", "''") + "'" for word in [head, *args]]
+            return self.powershell('& ' + ' '.join(quoted), chain, base)
         if leaf in self.SHELL:
             if not args:
                 self.finding('unknown', chain, 'shell code from stdin')
@@ -686,12 +697,15 @@ class RunGraph:
         chain = (*chain, relative)
         text = path.read_text(encoding='utf-8')
         if path.suffix == '.py':
-            self.python(text, chain, args)
+            output = self.python(text, chain, args)
+        elif path.suffix.lower() == '.ps1':
+            output = self.powershell(text, chain, path.parent, args)
         else:
-            self.shell(text, chain, path.parent, args, windows=path.suffix.lower() == '.cmd')
+            output = self.shell(text, chain, path.parent, args, windows=path.suffix.lower() == '.cmd')
         if not any(kind in ('model', 'proof', 'unknown') for kind, _ in self.findings[before:]):
             self.finding('ordinary', chain, 'source-resolved script has no model or unresolved executable edges')
         self.active.remove(key)
+        return output
 
     def python(self, text, chain, args=(), entry="__main__", function_args=()):
         import ast
@@ -721,6 +735,30 @@ class RunGraph:
                     return node
             return tree
 
+        # CLI identity comes from argparse declarations, including subparser and append options.
+        append_options = {}
+        subparser_options = {}
+        parser_names = set()
+        for item in ast.walk(tree):
+            if isinstance(item, ast.Assign) and isinstance(item.value, ast.Call) and isinstance(item.value.func, ast.Attribute) and item.value.func.attr == 'parse_args':
+                parser_names.update(target.id for target in item.targets if isinstance(target, ast.Name))
+            if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Attribute): continue
+            keywords = {part.arg: part.value.value for part in item.keywords if isinstance(part.value, ast.Constant)}
+            flags = [part.value for part in item.args if isinstance(part, ast.Constant) and isinstance(part.value, str)]
+            if item.func.attr == 'add_argument' and keywords.get('action') == 'append' and flags:
+                destination = keywords.get('dest', flags[-1].lstrip('-').replace('-', '_'))
+                append_options[destination] = flags
+            if item.func.attr == 'add_subparsers' and keywords.get('dest'):
+                subparser_options[keywords['dest']] = {part.args[0].value for part in ast.walk(tree)
+                    if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and part.func.attr == 'add_parser'
+                    and part.args and isinstance(part.args[0], ast.Constant)}
+
+        mutated_parser_attributes = set()
+        for item in ast.walk(tree):
+            target = item.func.value if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr in ('append', 'extend', 'insert', 'pop', 'remove', 'clear', 'reverse', 'sort') else item if isinstance(item, ast.Attribute) and isinstance(item.ctx, ast.Store) else None
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id in parser_names:
+                mutated_parser_attributes.add((target.value.id, target.attr))
+
         artifact_schema = any(isinstance(item, ast.If) and all(piece in ast.unparse(item.test) for piece in ("get('reason') == 'compiler-artifact'", "get('profile', {}).get('test')", "get('executable')")) for item in ast.walk(tree))
         assignments = {}
         for node in ast.walk(tree):
@@ -747,6 +785,7 @@ class RunGraph:
                     if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
                         assignments.setdefault((scope(node), target.value.id), []).append(ast.Constant(value=UNKNOWN))
         resolving = set()
+        resolving_functions = set()
         bindings = {}
 
         class Choices:
@@ -772,6 +811,65 @@ class RunGraph:
                     except (TypeError, IndexError, ValueError): results.append(UNKNOWN)
                     if len(results) > 128: return UNKNOWN
             return merge(results)
+
+        def package_pairs(function):
+            """Prove stdout package selection is only -p/name pairs, never arbitrary Cargo flags.
+
+            Both direct caller patterns and scope words filtered by stdlib fnmatch to those
+            patterns are overapproximated by the complete declared package universe. This is
+            source analysis only: CI still receives the actual narrowed selector output.
+            """
+            returns = [item.value for item in ast.walk(function) if isinstance(item, ast.Return)]
+            if not returns: return UNKNOWN
+            if any(isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store) and item.id == function.name for item in ast.walk(tree)): return UNKNOWN
+            if any(isinstance(item, (ast.AugAssign, ast.Delete)) or isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Store) for item in ast.walk(function)): return UNKNOWN
+            parameters = {item.arg for item in function.args.args}
+            assigned = {}
+            for item in ast.walk(function):
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name): assigned.setdefault(target.id, []).append(item.value)
+            def patterns(node):
+                if isinstance(node, ast.Name) and node.id in parameters:
+                    values = value(node, function)
+                    if isinstance(values, list) and values and all(isinstance(part, str) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_*-]*', part) for part in values):
+                        return values
+                if not isinstance(node, ast.Name) or len(assigned.get(node.id, [])) != 1: return None
+                expression = assigned[node.id][0]
+                if not (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name) and expression.func.id == 'sorted' and len(expression.args) == 1): return None
+                generator = expression.args[0]
+                if not (isinstance(generator, ast.GeneratorExp) and isinstance(generator.elt, ast.Name) and len(generator.generators) == 1): return None
+                outer = generator.generators[0]
+                if not (isinstance(outer.target, ast.Name) and outer.target.id == generator.elt.id and len(outer.ifs) == 1): return None
+                if not (isinstance(outer.iter, ast.Call) and isinstance(outer.iter.func, ast.Attribute) and outer.iter.func.attr == 'split' and not outer.iter.args and not outer.iter.keywords): return None
+                condition = outer.ifs[0]
+                if not (isinstance(condition, ast.Call) and isinstance(condition.func, ast.Name) and condition.func.id == 'any' and len(condition.args) == 1): return None
+                matches = condition.args[0]
+                if not (isinstance(matches, ast.GeneratorExp) and len(matches.generators) == 1 and isinstance(matches.elt, ast.Call)): return None
+                inner = matches.generators[0]
+                call = matches.elt
+                if not (isinstance(inner.target, ast.Name) and not inner.ifs and ast.unparse(call.func) == 'fnmatch.fnmatchcase'
+                        and len(call.args) == 2 and ast.unparse(call.args[0]) == outer.target.id and ast.unparse(call.args[1]) == inner.target.id): return None
+                # The qualified matcher must be the stdlib import, not a rebound helper.
+                if not any(isinstance(item, ast.Import) and any(alias.name == 'fnmatch' and alias.asname in (None, 'fnmatch') for alias in item.names) for item in tree.body): return None
+                if any(isinstance(item, (ast.FunctionDef, ast.ClassDef)) and item.name in ('fnmatch', 'any', 'sorted') for item in ast.walk(tree)): return None
+                if any(isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store) and item.id in ('fnmatch', 'any', 'sorted') for item in ast.walk(tree)): return None
+                return patterns(inner.iter)
+            domains = []
+            for returned in returns:
+                if not (isinstance(returned, ast.ListComp) and isinstance(returned.elt, ast.Name) and len(returned.generators) == 2): return UNKNOWN
+                outer, inner = returned.generators
+                if not (isinstance(outer.target, ast.Name) and isinstance(inner.target, ast.Name)
+                        and not outer.ifs and not inner.ifs and returned.elt.id == inner.target.id
+                        and isinstance(inner.iter, (ast.Tuple, ast.List)) and len(inner.iter.elts) == 2
+                        and isinstance(inner.iter.elts[0], ast.Constant) and inner.iter.elts[0].value == '-p'
+                        and isinstance(inner.iter.elts[1], ast.Name) and inner.iter.elts[1].id == outer.target.id): return UNKNOWN
+                domain = patterns(outer.iter)
+                if domain is None: return UNKNOWN
+                domains.extend(domain)
+            # Mutating selector data after filtering would invalidate the bounded domain.
+            if any(isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr in ('append', 'extend', 'insert', 'pop', 'remove', 'clear', 'reverse', 'sort') for item in ast.walk(function)): return UNKNOWN
+            return [argument for name in dict.fromkeys(domains) for argument in ('-p', name)]
 
         def value(node, context=None):
             context = context or scope(node)
@@ -814,6 +912,7 @@ class RunGraph:
             if isinstance(node, ast.Attribute):
                 name = ast.unparse(node)
                 if name == 'sys.executable': return 'python3'
+                if isinstance(node.value, ast.Name) and (node.value.id, node.attr) in mutated_parser_attributes: return UNKNOWN
                 option = '--' + node.attr.replace('_', '-')
                 if isinstance(node.value, ast.Name) and node.value.id == 'args' and option in args:
                     at = args.index(option)
@@ -821,6 +920,12 @@ class RunGraph:
                         return Path(args[at + 1]) if any(isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == 'add_argument' and any(isinstance(arg, ast.Constant) and arg.value == option for arg in item.args) and any(keyword.arg == 'type' and isinstance(keyword.value, ast.Name) and keyword.value.id == 'Path' for keyword in item.keywords) for item in ast.walk(tree)) else args[at + 1]
                 if remainder and node.attr == 'command' and '--' in args:
                     return list(args[args.index('--'):])
+                if isinstance(node.value, ast.Name) and node.value.id in parser_names:
+                    if node.attr in append_options:
+                        flags = append_options[node.attr]
+                        return [args[index + 1] for index, flag in enumerate(args[:-1]) if flag in flags]
+                    if node.attr in subparser_options and args and args[0] in subparser_options[node.attr]:
+                        return args[0]
                 parent = value(node.value, context)
                 if isinstance(parent, Path):
                     if node.attr == 'parent': return parent.parent
@@ -865,11 +970,22 @@ class RunGraph:
                 if isinstance(node.func, ast.Attribute) and node.func.attr in ('resolve', 'absolute'):
                     item = value(node.func.value, context)
                     if isinstance(item, Path): return item
+                if isinstance(node.func, ast.Attribute) and node.func.attr == 'join' and node.args:
+                    separator, parts = value(node.func.value, context), value(node.args[0], context)
+                    if isinstance(separator, str) and isinstance(parts, list) and all(isinstance(part, str) for part in parts):
+                        return separator.join(parts)
                 if isinstance(node.func, ast.Name) and node.func.id in functions:
                     function = functions[node.func.id]
-                    # Resolve pure argv constructors by substituting their source parameters.
-                    returns = [item.value for item in ast.walk(function) if isinstance(item, ast.Return) and item.value is not None]
-                    return merge([value(item, function) for item in returns])
+                    if function in resolving_functions: return UNKNOWN
+                    resolving_functions.add(function)
+                    try:
+                        packages = package_pairs(function)
+                        if packages != UNKNOWN: return packages
+                        # Resolve pure argv constructors by substituting their source parameters.
+                        returns = [item.value for item in ast.walk(function) if isinstance(item, ast.Return) and item.value is not None]
+                        return merge([value(item, function) for item in returns])
+                    finally:
+                        resolving_functions.remove(function)
             return UNKNOWN
 
         # Follow the script entrypoint and local calls. CLI store_true branches are
@@ -895,6 +1011,12 @@ class RunGraph:
             if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == '__name__' and len(node.ops) == 1 and isinstance(node.comparators[0], ast.Constant):
                 equal = ('__main__' if entry == '__main__' else '<imported>') == node.comparators[0].value
                 return not equal if isinstance(node.ops[0], ast.NotEq) else equal
+            if (isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.left, ast.Attribute)
+                    and isinstance(node.left.value, ast.Name) and node.left.value.id in parser_names):
+                left, right = value(node.left), value(node.comparators[0])
+                if isinstance(left, (str, int, bool)) and isinstance(right, (str, int, bool)) and UNKNOWN not in (left, right):
+                    if isinstance(node.ops[0], ast.Eq): return left == right
+                    if isinstance(node.ops[0], ast.NotEq): return left != right
             return None
 
         function_aliases = {}
@@ -1075,6 +1197,15 @@ class RunGraph:
             if isinstance(candidate, list): self.command([str(piece) for piece in candidate], where)
             elif isinstance(candidate, str) and candidate != UNKNOWN: self.shell(candidate, where)
             else: self.finding('unknown', where, 'dynamic Python process argv')
+        outputs = [value(item.args[0]) for item in reachable if isinstance(item, ast.Call)
+                   and isinstance(item.func, ast.Name) and item.func.id == 'print' and len(item.args) == 1]
+        if (len(outputs) == 1 and isinstance(outputs[0], str) and UNKNOWN not in outputs[0]
+                and not any(isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store) and item.id == 'print' for item in ast.walk(tree))):
+            return outputs[0]
+
+    def powershell(self, text, chain=(), base=None, args=()):
+        from scripts.ci.model_policy_powershell import analyze
+        return analyze(self, text, chain, base, args)
 
     def shell(self, text, chain=(), base=None, args=(), variables=None, windows=False):
         """Tokenize complete shell text (not individual YAML lines).
@@ -1093,14 +1224,16 @@ class RunGraph:
         self.functions = functions
 
         pending_substitutions = {}
+        arrays = {}
+        command_outputs = []
 
         def expand(word):
             for symbol, code in pending_substitutions.items():
                 if symbol in word:
-                    self.shell(code, (*chain, "command substitution"), base, args, variables)
+                    output = self.shell(code, (*chain, "command substitution"), base, args, variables)
                     lookup = re.fullmatch(r"\s*command\s+-v\s+([\w.-]+)\s*", code)
                     managed = re.fullmatch(r'\s*uv python find [0-9.]+ --managed-python(?: --no-project)? --no-config\s*', code)
-                    result = lookup[1] if lookup else 'python3' if managed else UNKNOWN
+                    result = lookup[1] if lookup else 'python3' if managed else output if isinstance(output, str) else UNKNOWN
                     # Build stdout is a compiler-artifact JSON record, filtered to exactly one
                     # test executable by a metadata-only Python reader before being copied.
                     if all(piece in code for piece in ('cargo test ', '--no-run', '--message-format=json', 'compiler-artifact', 'm.get("profile", {}).get("test")', 'm.get("executable")', 'print(found[-1] if len(found) == 1 else "")')):
@@ -1283,6 +1416,7 @@ class RunGraph:
                 words.pop(0)
             while words and re.match(r'^\w+=', words[0]):
                 key, value = words.pop(0).split('=', 1); variables[key] = expand(value)
+                if key in arrays: arrays[key] = [UNKNOWN]
             if declaration:
                 for word in words:
                     if '=' in word:
@@ -1290,8 +1424,18 @@ class RunGraph:
                 return
             if words and words[0] in ('$@', '${@}'):
                 words = list(args) + words[1:]
-            words = [expand(word) for word in words]
+            expanded = []
+            for word in words:
+                array = re.fullmatch(r'\$\{([A-Za-z_]\w*)\[@\]\}', word)
+                if array and array[1] in arrays:
+                    expanded.extend(arrays[array[1]])
+                else:
+                    expanded.append(expand(word))
+            words = expanded
             if not words: return
+            if words[0] == 'unset':
+                for variable in words[1:]:
+                    if variable in arrays: arrays[variable] = [UNKNOWN]
             name = words[0]
             if name in functions:
                 key = ('shell-function', name, tuple(words[1:]))
@@ -1299,13 +1443,14 @@ class RunGraph:
                     self.finding('unknown', chain, 'recursive shell function: ' + name); return
                 self.active.add(key)
                 body, directory = functions[name]
-                self.shell(body, (*chain, name + '()'), directory, words[1:], variables)
+                command_outputs.append(self.shell(body, (*chain, name + '()'), directory, words[1:], variables))
                 self.active.remove(key)
             else:
                 self.variables.update(variables)
-                self.command(words, chain, base)
+                command_outputs.append(self.command(words, chain, base))
                 variables.update(self.variables)
         redirection = False
+        here_string = False
         arithmetic = 0
         array_depth = 0
         for token in [*tokens, '\n']:
@@ -1316,14 +1461,23 @@ class RunGraph:
                 else: expand(token)
                 continue
             if token == '(' and command and re.fullmatch(r'\w+\+?=', command[-1]):
-                variables[command[-1].rstrip('=+')] = UNKNOWN
+                name = command[-1].rstrip('=+')
+                variables[name] = UNKNOWN
+                arrays[name] = [UNKNOWN]
                 command = []; array_depth = 1; continue
             if redirection:
+                if here_string and command[:1] == ['read'] and '-a' in command:
+                    at = command.index('-a')
+                    if at + 1 < len(command):
+                        source = expand(token)
+                        arrays[command[at + 1]] = shlex.split(source) if UNKNOWN not in source else [UNKNOWN]
                 redirection = False
+                here_string = False
                 continue
             if token in ('>', '>>', '<', '<<', '<<<', '>&', '<&', '>>&'):
                 if command and command[-1].isdigit(): command.pop()
                 redirection = True
+                here_string = token == '<<<'
                 continue
             if token == '((' or arithmetic:
                 if token == '((': arithmetic += 1
@@ -1361,6 +1515,8 @@ class RunGraph:
         self.variables.update(variables)
         for match in re.finditer(r'echo\s+[\"\']?([A-Za-z_]\w*)=([^\"\n]*?)[\"\']?\s*>>\s*[\"\']?(?:%GITHUB_ENV%|\$GITHUB_ENV|\$\{GITHUB_ENV\})', original_text):
             self.env_exports[match[1]] = expand(match[2])
+        if len(command_outputs) == 1:
+            return command_outputs[0]
 
 def selection_error(profile: str, confirm_all: bool = False) -> str | None:
     if not profile:
@@ -1458,7 +1614,10 @@ def workflow_errors(workflow: dict, name: str, root: Path = ROOT, evidence: list
                     graph = RunGraph(root)
                     if 'run' in step:
                         graph.variables = {key: str(value) for environment in (workflow.get('env', {}), job.get('env', {}), step.get('env', {})) for key, value in environment.items()}
-                        graph.shell(step['run'], (f'{name}/{job_name}',), windows=step.get('shell') == 'cmd')
+                        if step.get('shell', '').lower() in ('powershell', 'pwsh'):
+                            graph.powershell(step['run'], (f'{name}/{job_name}',))
+                        else:
+                            graph.shell(step['run'], (f'{name}/{job_name}',), windows=step.get('shell') == 'cmd')
                     elif 'uses' in job or str(step.get('uses', '')).startswith('./'):
                         graph.finding('unknown', (name, job_name), 'selection barrier does not dominate reusable execution')
                     if any(kind in ('model', 'proof', 'unknown') for kind, _ in graph.findings):
@@ -1473,7 +1632,10 @@ def workflow_errors(workflow: dict, name: str, root: Path = ROOT, evidence: list
             graph = RunGraph(root)
             if 'run' in step:
                 graph.variables = {key: str(value) for env in (workflow.get('env', {}), job.get('env', {}), job_environment, step.get('env', {})) for key, value in env.items()}
-                graph.shell(step['run'], (f'{name}/{job_name}',), windows=step.get('shell') == 'cmd')
+                if step.get('shell', '').lower() in ('powershell', 'pwsh'):
+                    graph.powershell(step['run'], (f'{name}/{job_name}',))
+                else:
+                    graph.shell(step['run'], (f'{name}/{job_name}',), windows=step.get('shell') == 'cmd')
                 job_environment.update(graph.env_exports)
             elif str(step.get('uses', '')).startswith('./'):
                 target = str(step['uses'])[2:]
