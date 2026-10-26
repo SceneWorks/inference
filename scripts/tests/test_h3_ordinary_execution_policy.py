@@ -593,9 +593,9 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
     def test_h3_and_moss_manual_queue_keys_both_preserve_each_run(self) -> None:
         workflow = CI.read_text(encoding="utf-8")
         expression = re.search(r"^  group: inference-ci-\$\{\{ (.+) \}\}$", workflow, re.M).group(1)
-        def key(event, synthetic, lane, run):
+        def key(event, synthetic, lane, run, suite="routine"):
             values = {"github.event_name": event, "github.event.inputs.synthetic_w4a8": synthetic,
-                      "inputs.lanes": lane, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
+                      "inputs.lanes": lane, "inputs.test_suite": suite, "github.run_id": run, "github.ref": "refs/pull/7/merge", "github.sha": "source-sha"}
             rendered = expression
             for name in sorted(values, key=len, reverse=True):
                 rendered = rendered.replace(name, repr(values[name]))
@@ -608,6 +608,7 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
         self.assertEqual(key("pull_request", "none", "all", 1), "refs/pull/7/merge")
         self.assertEqual(key("push", "none", "all", 1), "source-sha")
         self.assertEqual(key("workflow_dispatch", "none", "all", 1), "source-sha")
+        self.assertNotEqual(key("workflow_dispatch", "none", "all", 1, "exhaustive"), key("workflow_dispatch", "none", "all", 2, "exhaustive"))
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", workflow)
         library = (ROOT / "crates/contracts/gen-core/src/lib.rs").read_text(encoding="utf-8")
         for module in ("moss_image_edit", "pruned_adaln", "h3_adapter_memory", "h3_conditioning_memory", "h3_memory"):
