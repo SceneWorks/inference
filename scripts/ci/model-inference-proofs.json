@@ -35366,7 +35366,16 @@
     ],
     "fixture_identity": "Native Iris generator/depth/restoration/trainer/control/preview through explicit registry or build-device helper; crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512",
     "configuration_source": "crates/media/candle-gen/candle-gen-iris/tests/quant_real_weights.rs::quant_real_weights::real_quantized_renders_track_the_bf16_render_at_512",
-    "required_environment": [],
+    "required_environment": [
+      "IRIS_WEIGHTS_DIR",
+      "IRIS_TEXT_ENCODER_DIR",
+      "IRIS_OUT"
+    ],
+    "output_artifacts": [
+      "iris_3b_candle_bf16_512.png",
+      "iris_3b_candle_q8_512.png",
+      "iris_3b_candle_q4_512.png"
+    ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
@@ -155767,6 +155776,11 @@
       "IRIS_WEIGHTS_DIR",
       "IRIS_TEXT_ENCODER_DIR",
       "IRIS_OUT"
+    ],
+    "output_artifacts": [
+      "iris_3b_bf16_512.png",
+      "iris_3b_q8_512.png",
+      "iris_3b_q4_512.png"
     ],
     "cargo_features": [
       "model-inference-proof"

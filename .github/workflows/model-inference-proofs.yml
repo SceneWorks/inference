@@ -54,7 +54,7 @@ jobs:
           "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
-          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\n")'
+          "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\n")'
 
   prove:
     name: Explicit ${{ inputs.backend }} model tests
@@ -147,6 +147,16 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: command -v python3.12
+      - name: Verify pinned Iris quant snapshots on the secondary Mac
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'macOS'
+        shell: bash
+        run: python3.12 -I scripts/ci/prepare_iris_quant_proof_assets.py --backend mlx
+      - name: Verify pinned Iris quant snapshots on Windows
+        if: matrix.asset_setup == 'iris-quant' && runner.os == 'Windows'
+        shell: cmd
+        env:
+          CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

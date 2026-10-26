@@ -42,6 +42,12 @@ RUNNERS = {
 }
 POLICY_BACKENDS = {'mlx': 'darwin-mlx', 'candle-metal': 'darwin-mlx',
                    'candle-cpu': 'linux-cpu', 'candle-cuda': 'windows-cuda'}
+IRIS_QUANT_PROOFS = frozenset(
+    f'{package}/integration/quant_real_weights::{test}'
+    for package in ('mlx-gen-iris', 'candle-gen-iris')
+    for test in ('real_tiers_shrink_the_resident_weights',
+                 'real_quantized_renders_track_the_bf16_render_at_512')
+)
 
 
 def identity(row: dict) -> str:
@@ -845,6 +851,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             generated.mkdir()
             env = dict(os.environ, MODEL_INFERENCE_CASE_FQN=row['fqn'], MODEL_PROOF_OUTPUT_DIR=str(generated))
             apply_configuration(row, env)
+            if identity(row) in IRIS_QUANT_PROOFS and row['fqn'].endswith('real_quantized_renders_track_the_bf16_render_at_512'):
+                env['IRIS_OUT'] = str(generated)
             if backend == 'candle-cuda':
                 env['CUDA_VISIBLE_DEVICES'] = ','.join(approved_uuids) if approved_uuids else policy.cuda_device_uuid
                 env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -1222,7 +1230,11 @@ def main() -> int:
                     write_json(extra_path, secondary)
                     load_policy(extra_path)
             runner = ['self-hosted', 'macOS', 'ARM64', 'rw-llm'] if value.get('runner') == 'nax' else RUNNERS[args.backend]
-            plan = {'runner': runner, 'backend': args.backend, 'request': value, 'selected': len(rows),
+            iris_route = ((args.backend == 'mlx' and value.get('runner') == 'nax')
+                          or args.backend == 'candle-cuda')
+            asset_setup = ('iris-quant' if iris_route and len(rows) == 1
+                           and identity(rows[0]) in IRIS_QUANT_PROOFS else 'none')
+            plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
             if configured:
