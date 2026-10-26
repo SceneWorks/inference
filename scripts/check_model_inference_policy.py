@@ -505,7 +505,7 @@ class RunGraph:
     SYSTEM = set('echo printf exit return true false set export unset local readonly shift test '
                  'cd pwd mkdir rm cp mv ln chmod touch cat head tail tee grep egrep fgrep sed awk '
                  'cut sort uniq wc tr find du df date sleep read basename dirname realpath '
-                 'shasum sha256sum md5sum stat readlink mktemp uname hostname id ps pgrep '
+                 'shasum sha256sum md5sum stat strings readlink mktemp uname hostname id ps pgrep '
                  'sysctl sw_vers vm_stat pmset lsof kill wait disown command type hash '
                  'git rustup rustc cmake ninja make xcodebuild xcode-select xcrun '
                  'curl wget tar unzip zip zstd gzip gunzip install file security codesign '
@@ -1150,6 +1150,26 @@ class RunGraph:
             filtered.append(line)
             index += 1
         text = ''.join(filtered)
+        # shlex consumes the newline along with an inline comment. That merges the next
+        # executable into the previous command's argv (e.g. echo ... # comment\npython ...),
+        # hiding its source edge. Mask comments first, retaining command boundaries and quoted,
+        # escaped, or word-internal hashes; then disable shlex's newline-eating comment handler.
+        masked = []
+        index = 0
+        quote = None
+        while index < len(text):
+            char = text[index]
+            if char == '\\' and quote != "'" and index + 1 < len(text):
+                masked.append(text[index:index + 2]); index += 2; continue
+            if char in ('"', "'"):
+                if quote == char: quote = None
+                elif quote is None: quote = char
+            if char == '#' and quote is None and (index == 0 or text[index - 1] in ' \t\r\n;&|()<>'):
+                while index < len(text) and text[index] != '\n':
+                    masked.append(' '); index += 1
+                continue
+            masked.append(char); index += 1
+        text = ''.join(masked)
         original_text = text
         if windows:
             # Managed CPython discovery is a tool-identity proof, not a variable-name rule.
@@ -1237,6 +1257,7 @@ class RunGraph:
             if windows: lexer.escape = ''
             lexer.whitespace = ' \t\r'
             lexer.whitespace_split = True
+            lexer.commenters = ''
             tokens = list(lexer)
         except ValueError:
             self.finding('unknown', chain, 'unparseable shell execution'); return

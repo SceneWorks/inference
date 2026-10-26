@@ -812,42 +812,105 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
         work(&odd, &CancelFlag::new(), catalog.media()),
         Err(AdmissionError::Refused(_))
     ));
-    // Families (weights-free listing: no checkpoint collapse): the base route's text and reference
-    // share its text-anchored family at every tier; the control route's six modes (one per accepted
-    // kind, no plain text mode) share one family of their own; every family has both anchors.
+    // The source role graphs remain distinct until a class-specific proof permits sharing.
+    // All registered modes still need their own family and both measurement endpoints.
     let listing: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
     let families = listing["families"].as_array().unwrap();
+    let cases = listing["cases"].as_array().unwrap();
+    let registered = surfaces(catalog.media()).unwrap();
     for tier in ["q4", "q8", "bf16"] {
-        let family = |anchor: &str| {
-            families
+        let mode_families = |provider: &str, mode: &str| {
+            let member = format!("{provider}/{provider}/{mode}");
+            let homes: Vec<_> = families
                 .iter()
-                .find(|f| f["tier"] == tier && f["anchor"].as_str().unwrap().starts_with(anchor))
-                .unwrap_or_else(|| panic!("{anchor} {tier}"))
-        };
-        let base = family("z_image_turbo/z_image_turbo/");
-        assert_eq!(base["anchor"], "z_image_turbo/z_image_turbo/text");
-        assert_eq!(
-            base["members"],
-            json!([
-                "z_image_turbo/z_image_turbo/text",
-                "z_image_turbo/z_image_turbo/reference"
-            ])
-        );
-        let control = family("z_image_turbo_control/");
-        let members: Vec<&str> = control["members"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m.as_str().unwrap())
-            .collect();
-        for kind in ["pose", "canny", "depth"] {
-            for mode in ["control", "reference"] {
-                assert!(members.contains(
-                    &format!("z_image_turbo_control/z_image_turbo_control/{mode}_{kind}").as_str()
-                ));
+                .filter(|f| {
+                    f["tier"] == tier && f["members"].as_array().unwrap().contains(&json!(member))
+                })
+                .collect();
+            assert!(!homes.is_empty(), "{member} {tier}: mode omitted");
+            // The provider's accepted representative inventory is independent of the listing.
+            // One canonical representative per allocation/configuration class needs a family.
+            let surface = registered.iter().find(|s| s.provider == provider).unwrap();
+            let mut representatives = std::collections::BTreeMap::new();
+            for recipe in &surface.recipes[&(provider.into(), tier.into(), mode.into())] {
+                if recipe.refusal.is_none() {
+                    representatives
+                        .entry((&recipe.memory_class, &recipe.configured_variant))
+                        .or_insert(recipe.token.as_deref());
+                }
             }
+            let expected: std::collections::BTreeSet<_> =
+                representatives.values().copied().collect();
+            let observed: std::collections::BTreeSet<_> = homes
+                .iter()
+                .map(|home| home["sampling_recipe"].as_str())
+                .collect();
+            assert_eq!(
+                observed, expected,
+                "{member} {tier}: sampling class coverage"
+            );
+            assert_eq!(
+                homes.len(),
+                observed.len(),
+                "{member} {tier}: duplicate family"
+            );
+            for home in &homes {
+                let anchor = home["anchor"].as_str().unwrap();
+                let (provider_route, anchor_mode) = anchor.rsplit_once('/').unwrap();
+                for (purpose, rung) in [("resident", 0), ("optimized", 4)] {
+                    assert!(
+                        cases.iter().any(|case| {
+                            let planned = Case::parse(case["case"].as_str().unwrap()).unwrap();
+                            case["purpose"] == purpose
+                                && format!("{}/{}", planned.provider, planned.route)
+                                    == provider_route
+                                && planned.tier == tier
+                                && planned.edge == campaign::reference_edge(provider)
+                                && planned.mode == anchor_mode
+                                && planned.rung == rung
+                                && planned.recipe.as_deref() == home["sampling_recipe"].as_str()
+                        }),
+                        "{member} {tier}: missing {purpose} anchor for {}",
+                        home["variant"]
+                    );
+                }
+            }
+            homes
+        };
+        let variants = |homes: &[&Value]| -> std::collections::BTreeSet<String> {
+            homes
+                .iter()
+                .map(|home| home["variant"].as_str().unwrap().into())
+                .collect()
+        };
+        let base = mode_families("z_image_turbo", "text");
+        let reference = mode_families("z_image_turbo", "reference");
+        assert!(base
+            .iter()
+            .all(|home| home["anchor"] == "z_image_turbo/z_image_turbo/text"));
+        assert!(reference
+            .iter()
+            .all(|home| home["anchor"] == "z_image_turbo/z_image_turbo/reference"));
+        assert!(variants(&base).is_disjoint(&variants(&reference)));
+        let mut controls = Vec::new();
+        let mut inits = Vec::new();
+        for kind in ["pose", "canny", "depth"] {
+            let control = mode_families("z_image_turbo_control", &format!("control_{kind}"));
+            let init = mode_families("z_image_turbo_control", &format!("reference_{kind}"));
+            assert!(variants(&control).is_disjoint(&variants(&init)));
+            controls.push(control);
+            inits.push(init);
         }
-        assert!(!members.iter().any(|m| m.ends_with("/text")));
+        // Accepted control kinds share topology, while an actual init image is a different graph.
+        assert!(controls.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(inits.windows(2).all(|pair| pair[0] == pair[1]));
+        for family in controls.into_iter().chain(inits).flatten() {
+            assert!(!family["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member.as_str().unwrap().ends_with("/text")));
+        }
     }
 }
 

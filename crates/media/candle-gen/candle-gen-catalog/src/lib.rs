@@ -1690,7 +1690,7 @@ mod preview_advertising {
     /// names of the out-of-line `mod NAME;` declarations that were removed with them.
     struct Stripped {
         code: String,
-        test_only_mods: Vec<String>,
+        test_only_mods: Vec<ModuleDeclaration>,
     }
 
     /// What a `cfg(…)` predicate says about `test`.
@@ -1803,7 +1803,7 @@ mod preview_advertising {
     fn code_only(file: &str, source: &str) -> Stripped {
         let chars: Vec<char> = source.chars().collect();
         let mut out = String::with_capacity(source.len());
-        let mut test_only_mods: Vec<String> = Vec::new();
+        let mut test_only_mods = Vec::new();
         let mut i = 0usize;
         // `Some((bracket depth, has opened its top-level block))` while consuming the item a
         // test-only `cfg` attribute applies to, alongside the text consumed so far — an out-of-line
@@ -1835,6 +1835,17 @@ mod preview_advertising {
                     }
                 }
                 assert_eq!(nesting, 0, "{file}: unterminated block comment");
+                continue;
+            }
+            // Module paths are source edges, so retain their literals for the module walk.
+            // Ordinary strings still disappear before sampler/emission detection.
+            if let Some((_, end)) = path_attribute(file, &chars, i) {
+                if skipping.is_some() {
+                    skipped.extend(chars[i..end].iter());
+                } else {
+                    out.extend(chars[i..end].iter());
+                }
+                i = end;
                 continue;
             }
             if let Some(end) = raw_string_end(file, &chars, i) {
@@ -1953,7 +1964,13 @@ mod preview_advertising {
                 }
                 if finished {
                     skipping = None;
-                    test_only_mods.extend(module_declarations(&skipped));
+                    // Include any attributes preceding cfg(test), e.g. #[path] before #[cfg].
+                    let prefix = out.rfind([';', '{', '}']).map_or(0, |at| at + 1);
+                    let attributes = &out[prefix..];
+                    let removed = format!("{attributes}{skipped}");
+                    test_only_mods.extend(module_declarations(&removed));
+                    // Break the attribute chain so a removed path cannot attach to the next item.
+                    out.push(';');
                     skipped.clear();
                 }
                 i += 1;
@@ -2198,12 +2215,77 @@ mod preview_advertising {
     /// Only depth-0 declarations are resolved: one nested inside an inline `mod` block resolves
     /// against a different directory, so it is deliberately left alone and the file it names then
     /// shows up as unreachable, which `module_tree` reports rather than skipping.
-    fn module_declarations(code: &str) -> Vec<String> {
+    #[derive(Debug)]
+    struct ModuleDeclaration {
+        name: String,
+        path: Option<String>,
+    }
+
+    /// Read the ordinary quoted path literals used by module declarations. Unknown Rust string
+    /// escapes fail closed rather than resolving a different file. JSON and ordinary path escapes
+    /// agree for the paths in this tree.
+    fn path_attribute(file: &str, chars: &[char], at: usize) -> Option<(String, usize)> {
+        if !matches_at(chars, at, "#[path") || is_ident_char(chars.get(at + 6)) {
+            return None;
+        }
+        let mut i = at + 6;
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        assert_eq!(
+            chars.get(i),
+            Some(&'='),
+            "{file}: unsupported path attribute"
+        );
+        i += 1;
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        let start = i;
+        assert_eq!(chars.get(i), Some(&'"'), "{file}: unsupported path literal");
+        i += 1;
+        while i < chars.len() {
+            if chars[i] == '\\' {
+                i += 2;
+            } else if chars[i] == '"' {
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(i < chars.len(), "{file}: unterminated path literal");
+        let literal: String = chars[start..=i].iter().collect();
+        let path = serde_json::from_str(&literal)
+            .unwrap_or_else(|error| panic!("{file}: unsupported path literal {literal}: {error}"));
+        i += 1;
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        assert_eq!(
+            chars.get(i),
+            Some(&']'),
+            "{file}: unsupported path attribute"
+        );
+        Some((path, i + 1))
+    }
+
+    fn module_declarations(code: &str) -> Vec<ModuleDeclaration> {
         let chars: Vec<char> = code.chars().collect();
         let mut names = Vec::new();
+        let mut path = None;
         let mut depth = 0i32;
         let mut i = 0usize;
         while i < chars.len() {
+            if depth == 0 {
+                if let Some((value, end)) = path_attribute("module declaration", &chars, i) {
+                    path = Some(value);
+                    i = end;
+                    continue;
+                }
+                if matches!(chars[i], ';' | '{' | '}') {
+                    path = None;
+                }
+            }
             match chars[i] {
                 '{' => {
                     depth += 1;
@@ -2237,7 +2319,10 @@ mod preview_advertising {
                         j += 1;
                     }
                     if chars.get(j) == Some(&';') {
-                        names.push(name);
+                        names.push(ModuleDeclaration {
+                            name,
+                            path: path.take(),
+                        });
                         i = j + 1;
                         continue;
                     }
@@ -2264,7 +2349,25 @@ mod preview_advertising {
     }
 
     /// Resolve `mod NAME;` declared in `parent` against the declaring file's module directory.
-    fn resolve_module(parent: &str, module_dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    fn resolve_module(
+        parent: &Path,
+        module_dir: &Path,
+        declaration: &ModuleDeclaration,
+    ) -> (PathBuf, PathBuf) {
+        if let Some(path) = &declaration.path {
+            // An explicit path is relative to the declaring file, not its conventional child
+            // module directory. Its children are beside that file (Rust's #[path] semantics).
+            let target = parent.parent().expect("module has a parent").join(path);
+            assert!(
+                target.is_file(),
+                "{}: missing #[path] module {}",
+                parent.display(),
+                target.display()
+            );
+            let children = target.parent().expect("module has a parent").to_path_buf();
+            return (target, children);
+        }
+        let name = &declaration.name;
         let flat = module_dir.join(format!("{name}.rs"));
         if flat.is_file() {
             return (flat, module_dir.join(name));
@@ -2274,8 +2377,9 @@ mod preview_advertising {
             return (nested, module_dir.join(name));
         }
         panic!(
-            "{parent}: `mod {name};` resolves to neither {} nor {} — the scan cannot read the \
+            "{}: `mod {name};` resolves to neither {} nor {} — the scan cannot read the \
              module's sources, and an unread file's emission fact would silently be `no`",
+            parent.display(),
             flat.display(),
             nested.display()
         )
@@ -2307,10 +2411,10 @@ mod preview_advertising {
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let stripped = code_only(&relative, &source);
             for name in module_declarations(&stripped.code) {
-                pending.push(resolve_module(&relative, &module_dir, &name));
+                pending.push(resolve_module(&path, &module_dir, &name));
             }
             for name in &stripped.test_only_mods {
-                test_roots.push(resolve_module(&relative, &module_dir, name));
+                test_roots.push(resolve_module(&path, &module_dir, name));
             }
             shipped.insert(relative, stripped.code);
         }
@@ -2328,7 +2432,7 @@ mod preview_advertising {
                 .into_iter()
                 .chain(stripped.test_only_mods)
             {
-                test_roots.push(resolve_module(&relative, &module_dir, &name));
+                test_roots.push(resolve_module(&path, &module_dir, &name));
             }
         }
 
@@ -3007,6 +3111,66 @@ mod preview_advertising {
             code.contains("run_flow_sampler"),
             "an inner attribute below shipped code must not blank the file, got {code:?}"
         );
+    }
+
+    #[test]
+    fn path_modules_are_scanned_and_test_only_paths_stay_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(src.join("redirect")).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"
+                #[path = "../shared.rs"] mod proof_observer;
+                #[cfg(test)] #[path = "test_first.rs"] mod test_first;
+                #[path = "path_first.rs"] #[cfg(test)] mod path_first;
+                mod shipped;
+                #[path = "redirect/provider.rs"] mod renamed;
+            "#,
+        )
+        .unwrap();
+        for file in [
+            "test_first.rs",
+            "path_first.rs",
+            "shipped.rs",
+            "redirect/child.rs",
+        ] {
+            std::fs::write(src.join(file), "fn metadata() {} ").unwrap();
+        }
+        std::fs::write(src.join("redirect/provider.rs"), "mod child;").unwrap();
+        // The external helper must be read too, even though it sits outside the crate's src.
+        std::fs::write(
+            temp.path().join("shared.rs"),
+            "fn observed() { emit_preview(); }",
+        )
+        .unwrap();
+        let tree = module_tree("fixture", &src);
+        for file in [
+            "lib.rs",
+            "../shared.rs",
+            "shipped.rs",
+            "redirect/provider.rs",
+            "redirect/child.rs",
+        ] {
+            assert!(
+                tree.shipped.contains_key(file),
+                "missing shipped edge: {file}"
+            );
+        }
+        assert!(tree.shipped["../shared.rs"].contains("emit_preview("));
+        for file in ["test_first.rs", "path_first.rs"] {
+            assert!(tree.test_only.contains(file), "missing test edge: {file}");
+            assert!(
+                !tree.shipped.contains_key(file),
+                "test code was shipped: {file}"
+            );
+        }
+        // Neither a missing path edge nor an unreferenced source may silently mean no emission.
+        std::fs::write(src.join("stray.rs"), "fn missed() { emit_preview(); }").unwrap();
+        assert!(std::panic::catch_unwind(|| module_tree("fixture", &src)).is_err());
+        std::fs::remove_file(src.join("stray.rs")).unwrap();
+        std::fs::remove_file(temp.path().join("shared.rs")).unwrap();
+        assert!(std::panic::catch_unwind(|| module_tree("fixture", &src)).is_err());
     }
 
     /// A wired crate must be wired **everywhere**, not just somewhere: once a crate emits at all,

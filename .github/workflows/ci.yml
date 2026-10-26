@@ -1172,6 +1172,10 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, windows, cuda]
     env:
+      # The service's shared sccache daemon can reset mid-build (os error 10054) without a
+      # rustc diagnostic. Use the existing heavy Candle lane policy for this job only;
+      # registry/git/target caches and other listeners keep their current configuration.
+      RUSTC_WRAPPER: ""
       # Two listeners share this 48-thread host. Leaving Cargo at its per-process default lets
       # overlapping CI runs launch roughly 96 compilers and trigger Windows DLL-init failures.
       # Twelve jobs per listener leaves headroom for sccache, linkers, nvcc, and the runner itself.

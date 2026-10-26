@@ -146,6 +146,28 @@ class WorkflowExecutionGraph(unittest.TestCase):
         errors = self.errors(self.workflow('bash scripts/outer.sh'))
         self.assertTrue(any('model' in error and 'scripts/outer.sh' in error and 'scripts/inner.sh' in error for error in errors))
 
+    def test_inline_shell_comment_cannot_hide_the_next_source_edge(self):
+        self.script('scripts/model.py', 'import mlx.core as mx\nmx.eval(mx.array([1]))\n')
+        for shell in ('bash', 'pwsh'):
+            with self.subTest(shell=shell):
+                extension = 'sh' if shell == 'bash' else 'ps1'
+                path = self.script('scripts/driver.' + extension,
+                                   'echo metadata # harmless comment\npython3 scripts/model.py\n')
+                errors = self.errors(self.workflow(f'{shell} {path}'))
+                self.assertTrue(any('scripts/model.py' in error and 'learned-framework' in error
+                                    for error in errors), errors)
+
+    def test_comment_boundary_keeps_metadata_tool_substitutions_ordinary(self):
+        self.script('scripts/metadata.sh', 'echo check # metadata only\nvalues=$(strings fixture.metallib)\necho "$values"\n')
+        self.assertEqual(self.errors(self.workflow('bash scripts/metadata.sh')), [])
+
+    def test_shell_comments_preserve_quoted_escaped_and_word_internal_hashes(self):
+        self.script('scripts/model.py', 'import mlx.core as mx\n')
+        for text in ('echo "#literal" foo#bar \\#escaped # python3 scripts/model.py\n',
+                     "echo '#literal' # cargo test -- --ignored\necho metadata\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.errors(self.workflow(text)), [])
+
     def test_python_process_edge_reaches_model(self):
         self.script('scripts/driver.py', 'import subprocess\ncommand = ["cargo", "test", "--", "--ignored"]\nsubprocess.run(command)\n')
         self.assertTrue(any('model' in error for error in self.errors(self.workflow('python3 scripts/driver.py'))))

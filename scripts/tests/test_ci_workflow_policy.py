@@ -3935,6 +3935,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_windows_cuda_compile_bypasses_only_the_job_local_shared_sccache(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        job = workflow["jobs"]["windows-cuda-check"]
+        self.assertEqual(job["env"]["RUSTC_WRAPPER"], "")
+        self.assertNotIn("RUSTC_WRAPPER", workflow.get("env", {}))
+        # Clearing the inherited wrapper must retain the actual compiler and strict lint gates.
+        steps = {step.get("name"): step for step in job["steps"]}
+        compile = steps["Compile Candle CUDA packages and test binaries (no GPU required)"]
+        lint = steps["Clippy Candle CUDA packages (no GPU required)"]
+        self.assertIn("--no-run", compile["run"])
+        self.assertIn("-- -D warnings", lint["run"])
+        for step in [compile, lint]:
+            self.assertFalse(step.get("continue-on-error", False))
+
     def test_windows_cuda_check_exercises_real_supervisor_without_gpu(self) -> None:
         job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]
         steps = job["steps"]
