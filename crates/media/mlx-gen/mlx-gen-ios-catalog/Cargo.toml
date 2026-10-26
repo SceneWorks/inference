@@ -8,6 +8,8 @@ repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 sha2 = { workspace = true }
+# Exposes DEP_MLX_METALLIB to build.rs: identify the native libraries actually linked.
+mlx-sys = { workspace = true }
 # The reviewed device-evidence table (`evidence/ios_device_evidence.json`) is parsed at runtime.
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,6 +41,11 @@ model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-sana/model-in
 # The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only
 # `runtime-ios/device-capture`, which only the device harness (`ios-host/smoke`) enables, turns it on.
 device-capture = []
+
+[build-dependencies]
+sha2 = { workspace = true }
+# Already resolved in the workspace; parse manifests to follow the narrow iOS path graph.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [dev-dependencies]
 # CPU-native stream pinning before the Metal-trapped admission fixtures.
