@@ -761,10 +761,11 @@ or a capture's typed quantum refusal); missing footprint evidence, unsupported
 modes/rungs, malformed sources and termination never prove it. Layout-profile
 and request-binding errors are failures before admission, not capacity refusals.
 Commit the actual measured anchors only after the terminal campaign, not this
-harness change. The 4096 MiB budget remains provisional (admission still checks a
-projected absolute footprint against it, so until sc-16780 measures the cap a
-measured demand above it is a typed capacity refusal); 6142/3374 MiB launch
-readings remain unvalidated diagnostics, and no cap/table is invented here.
+harness change. The runtime ceiling is now the observed **6144 MiB entitled OS process limit**
+for iPhone17,2 / iOS 26.6.2 (23G90), from the 2026-10-26 A/B below. It is not a safe
+render budget: reviewed model demand plus margin, exact device/OS/source applicability,
+live headroom and quantum guards remain necessary. Empty anchor/policy DATA still refuses
+admitted work; no model fit follows from the OS limit.
 
 ### Bounded synthetic primitive characterization (sc-16780)
 
@@ -886,11 +887,15 @@ The control entitlement retains extended virtual addressing and removes only
 increased-memory-limit. Use `--memory-entitlement off`, not an invented
 `SMOKE_ENTITLEMENTS` override.
 
-Observed S3 launch readings: **6142 MiB on**, **3374 MiB off**, three identical
-readings each. These are `os_proc_available_memory()` at launch, not a validated
-safe working-set cap. The runtime's provisional budget constants remain
-unchanged. Do not replace them with 6142 or derive a safe render budget from the
-entitlement delta. MLX allocator limits are not a proven jetsam barrier.
+Historical S3 launch headroom was **6142 MiB on / 3374 MiB off**, three readings each.
+The fresh 2026-10-26 A/B measured available memory **plus current process footprint**:
+all three pairs per launch totaled **6144 MiB entitled / 3376 MiB off**; restored-on
+again totaled 6144 MiB on iPhone17,2, iOS 26.6.2 (23G90). The runtime ceiling now uses
+that observed entitled OS process limit. Preserve the [original e49f5345 receipts](evidence/ios-process-limit-2026-10-26/README.md).
+This source repair requires a final rebuilt SDK/harness before weighted capture, while the
+source-independent OS/entitlement A/B observations remain valid. Neither the limit nor the
+entitlement delta certifies a safe render working set. Existing live guards, margins and
+no-evidence refusals remain unchanged; MLX allocator limits are not a proven jetsam barrier.
 
 ## 3. Provision and inspect the actual SANA snapshot
 
@@ -949,7 +954,7 @@ activations, allocator/cache and driver/process overhead. Compare that bound
 conservatively with the available capacity for this attempt. The header-only
 payload/profile and the harness's automated payload/cap/headroom preflight
 **DO NOT satisfy this prerequisite**: they cannot bound these transients.
-Neither launch headroom nor the provisional constant establishes such a bound.
+Neither launch headroom nor the observed OS process ceiling establishes such a bound.
 **Do not execute capture if this independent bound is missing or unsupported.**
 No numerical safe bound is supplied by this runbook, and none is asserted to
 exist for the target snapshot. Merely creating a receipt file is not evidence.

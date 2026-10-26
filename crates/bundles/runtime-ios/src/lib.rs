@@ -737,19 +737,17 @@ pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = 1024;
 
 /// The iOS per-app memory cap admission refuses against, MiB (epic 16774, E4).
 ///
-/// **PROVISIONAL — UNMEASURED.** With `media` this IS `mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB`
-/// (the one cap constant; see its docs): 4096 is an *assumed* 8 GB-device cap carried from the
-/// `claude/ios-strategy` branch. The iPhone 16 Pro Max launch readings were 6142 MiB entitled
-/// and 3374 MiB unentitled (three identical readings each). Those are diagnostics, not a validated
-/// safe rendering envelope: DO NOT replace this provisional cap with a launch reading.
+/// **Observed entitled OS process limit, not a safe render budget.** On iPhone17,2,
+/// iOS 26.6.2 (23G90), the 2026-10-26 available-memory + footprint A/B observed 6144 MiB
+/// entitled and 3376 MiB off; restoration confirmed 6144 MiB. Original e49f5345 receipts:
+/// `docs/evidence/ios-process-limit-2026-10-26/`. With `media` this IS the catalog's constant.
+/// Live OS headroom and the existing evidence, growth/margin and quantum guards still apply.
 #[cfg(feature = "media")]
 pub const IOS_APP_MEMORY_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB;
-/// The iOS per-app memory cap admission refuses against, MiB. **PROVISIONAL — UNMEASURED.**
-///
-/// An LLM-only build does not compile the catalog, so it carries the value itself; a test asserts it
-/// equals the catalog's constant, so the two cannot drift.
+/// The same observed entitled-target OS process ceiling, MiB; not a safe model working budget.
+/// An LLM-only build omits the catalog and carries the value; a test prevents mirror drift.
 #[cfg(not(feature = "media"))]
-pub const IOS_APP_MEMORY_CAP_MIB: u32 = 4096;
+pub const IOS_APP_MEMORY_CAP_MIB: u32 = 6144;
 
 /// Admit a request whose footprint estimate is `estimate_mib`, against [`IOS_APP_MEMORY_CAP_MIB`].
 ///
@@ -1103,12 +1101,14 @@ mod tests {
             super::admit_within_headroom(1223, Some(1223.0)).unwrap(),
             1223
         );
-        assert_eq!(super::admit_within_headroom(4096, None).unwrap(), 4096);
+        let cap = super::IOS_APP_MEMORY_CAP_MIB;
+        assert_eq!(super::admit_within_headroom(cap, None).unwrap(), cap);
     }
 
     /// There is ONE cap constant: the LLM-only literal must equal the catalog's.
     #[test]
     fn the_app_memory_cap_is_the_catalogs_single_constant() {
+        assert_eq!(super::IOS_APP_MEMORY_CAP_MIB, 6144);
         assert_eq!(
             super::IOS_APP_MEMORY_CAP_MIB,
             mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB
@@ -1490,8 +1490,21 @@ mod tests {
             available: Some(3900 * MIB),
         };
         incremental_capacity(required, blind, fresh).unwrap();
-        // Over the single cap: 3000 held + 1400 to come > 4096.
-        assert!(incremental_capacity(required, read(3000, 9000), read(1600, 9000)).is_err());
+        // Isolate the absolute process ceiling while live headroom remains ample: the
+        // baseline plus required growth fits exactly, then one MiB more refuses.
+        let at_cap_baseline = u64::from(super::IOS_APP_MEMORY_CAP_MIB) - 3400;
+        incremental_capacity(
+            required,
+            read(at_cap_baseline + 1400, 9000),
+            read(at_cap_baseline, 9000),
+        )
+        .unwrap();
+        assert!(incremental_capacity(
+            required,
+            read(at_cap_baseline + 1401, 9000),
+            read(at_cap_baseline + 1, 9000)
+        )
+        .is_err());
         // Off-device (no live reading): only the cap applies.
         incremental_capacity(required, ProcessMemory::default(), ProcessMemory::default()).unwrap();
     }

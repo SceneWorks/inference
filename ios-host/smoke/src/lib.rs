@@ -187,10 +187,9 @@ fn peak_rss_mib() -> f64 {
 
 /// The per-app memory the OS will still let this process allocate, in MiB — or `None` off iOS.
 ///
-/// Every memory conclusion on this branch has been measured against an *assumed* cap: "~6 GB on a
-/// 12 GB device, ~4 GB on 8 GB". Those are folklore. `os_proc_available_memory` is the number iOS
-/// actually enforces, read from the process it applies to, and it is the only way to know whether a
-/// measured peak has headroom or is one allocation from a jetsam kill.
+/// The configured ceiling records the entitled iPhone17,2 / 23G90 process-limit observation.
+/// `os_proc_available_memory` still supplies the live remaining capacity of THIS process; the
+/// recorded ceiling does not replace this check or establish a safe render working set.
 ///
 /// It reports memory *remaining*, not the total limit, so it must be sampled at a known point —
 /// here, at the start of the report, before anything large is resident. Sampling it again after a
@@ -460,8 +459,8 @@ fn check_memory_headroom() -> Check {
             detail: format!(
                 "os_proc_available_memory = {mib:.0} MiB available at start of run \
                  ({:.2} GiB), increased-memory-limit entitlement = {entitlement}; runtime-ios \
-                 IOS_APP_MEMORY_CAP_MIB = {cap} (PROVISIONAL, unmeasured) -- the OS number is \
-                 launch headroom only, NOT a validated safe rendering ceiling",
+                 IOS_APP_MEMORY_CAP_MIB = {cap} (observed entitled iPhone17,2 / 23G90 process limit) -- \
+                 the current OS number is remaining headroom, NOT a validated safe render budget",
                 mib / 1024.0
             ),
         },
@@ -471,7 +470,7 @@ fn check_memory_headroom() -> Check {
             detail: format!(
                 "not applicable on this platform (no per-app cap); increased-memory-limit \
                  entitlement = {entitlement}; runtime-ios IOS_APP_MEMORY_CAP_MIB = {cap} \
-                 (PROVISIONAL, unmeasured)"
+                 (observed entitled iPhone17,2 / 23G90 process limit; not a safe render budget)"
             ),
         },
     }
@@ -1361,7 +1360,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             if payload_mib > u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB)
                 || payload_mib as f64 > headroom
             {
-                return Check { name: NAME, passed: false, detail: format!("capture payload exceeds provisional cap/live headroom; refused before load: {}", details.join(" | ")) };
+                return Check { name: NAME, passed: false, detail: format!("capture payload exceeds observed process ceiling/live headroom; refused before load: {}", details.join(" | ")) };
             }
         }
         // One candidate per configuration, built from the provider's own contract: a tiled config is
@@ -1429,7 +1428,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         };
         if let Err(refusal) = &admission {
             let line = format!(
-                "{label}: refused before load (cap {} MiB, PROVISIONAL; {}): {refusal}",
+                "{label}: refused before load (observed entitled process ceiling {} MiB; {}): {refusal}",
                 runtime_ios::IOS_APP_MEMORY_CAP_MIB,
                 if diagnostic {
                     "bounded capture"

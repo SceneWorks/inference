@@ -57,7 +57,7 @@ Every registered image model and mode loads through ONE admission seam
   family a resident and a fully optimized anchor; at an anchor's own key its measured growth, else
   an applicable certified transfer or explicitly approved engineering estimate
   over the providers' actual source pricing), runs the provider's registered `standard_memory_strategy_safety_check` with that demand
-  plus the anchor's measured repeat-spread margin against the provisional cap and live headroom,
+  plus the anchor's measured repeat-spread margin against the observed entitled OS process ceiling and live headroom,
   and only then loads, inside the admission's measured envelope (`ios_quantum`). The bound wrapper rechecks the exact
   request (geometry, tile, mode, conditioning, prompt, execution), live capacity and source pins
   before every provider call and preserves cancellation.
@@ -65,7 +65,7 @@ Every registered image model and mode loads through ONE admission seam
   table is empty, so every product load currently refuses `no_evidence`. Modes a provider does
   not serve are refused `mode`, never dropped.
 - `runtime_ios::load_admitted(estimate_mib, closure)` rejects absent estimates, estimates over the
-  provisional budget, or over current OS headroom before invoking its closure.
+  observed process ceiling, or over current OS headroom before invoking its closure.
 - `runtime_ios::catalog()` and raw catalog registries are composition/inspection surfaces, not
   admission authority. Raw LLM loading is likewise unadmitted.
 - `runtime_ios::media::capture_permit(candidate)` is the explicitly labelled DEVICE CAPTURE path:
@@ -79,10 +79,12 @@ Every registered image model and mode loads through ONE admission seam
 
 ## Evidence and measurement contract
 
-The 8 GB iPhone 16 Pro Max is the actual target. Entitled/unentitled launch
-headroom (6142/3374 MiB, three readings each, iOS 26.6.2) is diagnostic only.
-The existing budget constants are provisional and unchanged. A validated safe
-working-set envelope still needs device captures; neither launch headroom nor
+The 8 GB iPhone 16 Pro Max is the actual target. The 2026-10-26 A/B on iPhone17,2,
+iOS 26.6.2 (23G90), observed current OS process limits
+of 6144 MiB entitled and 3376 MiB off (available memory plus current footprint, three pairs
+each; restored-on confirmed). The runtime uses the entitled limit as a ceiling, not a safe
+render budget; [original receipts](../evidence/ios-process-limit-2026-10-26/README.md)
+remain diagnostic model-independent evidence. A validated safe working-set envelope still needs device captures; neither launch headroom nor
 old active+cache observations can supply it.
 
 The 2026-10-26 approved contract permits a practical scoped engineering estimate

@@ -153,11 +153,14 @@ pub const IOS_OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 /// cap constant: the iOS default tile choice here and `runtime-ios`'s admission
 /// (`IOS_APP_MEMORY_CAP_MIB`, which is this constant) both read it (epic 16774, E4).
 ///
-/// **PROVISIONAL — UNMEASURED.** 4096 is the `claude/ios-strategy` branch's *assumed* 8 GB cap,
-/// not a validated rendering ceiling. Entitled launch headroom on iPhone 16 Pro Max was
-/// 6142 MiB (three launches), versus 3374 MiB without the entitlement (three launches). These
-/// are diagnostics, NOT a safe peak working-set budget. Do not substitute a launch reading.
-pub const IOS_MEMORY_BUDGET_MIB: u32 = 4096;
+/// **Observed entitled OS process limit, not a safe render budget.** On 2026-10-26, three
+/// available-memory + current-footprint pairs on iPhone17,2, iOS 26.6.2 (23G90), each totaled
+/// 6144 MiB with increased-memory-limit; the off control totaled 3376 MiB, and restoring the
+/// entitlement restored 6144 MiB. Original e49f5345 receipts are retained under
+/// `docs/evidence/ios-process-limit-2026-10-26/`. Live headroom, reviewed measured demand plus
+/// margin, source/device/OS compatibility and quantum guards remain required; absent model
+/// evidence still refuses. Other devices/OS builds do not inherit a measured fit from this limit.
+pub const IOS_MEMORY_BUDGET_MIB: u32 = 6144;
 
 /// The square output edges (px) every iOS default must fit at.
 pub const IOS_IMAGE_EDGES: &[u32] = &[512, 1024];
@@ -194,7 +197,7 @@ pub struct SanaDeviceFootprint {
 /// |---|---:|---:|
 /// | 1024², tile 192 | 2733 MiB | 2860 MiB |
 /// | 1024², tile 128 | 2839 MiB | 2904 MiB |
-/// | 512², tile 256 | 3093 MiB | **4113 MiB** — over a 4 GiB budget |
+/// | 512², tile 256 | 3093 MiB | **4113 MiB** — over the historical 4 GiB planning budget |
 pub const SANA_DEVICE_FOOTPRINTS: &[SanaDeviceFootprint] = &[
     SanaDeviceFootprint {
         image_edge: 1024,
@@ -547,13 +550,14 @@ mod tests {
 
     /// The selected iOS plan: tile 192. At 1024² its bound is measured (2860 MiB); 512² at tile
     /// 192 was never measured, so its bound is INFERRED — 1024²/192's live peak (2733) plus the
-    /// 1 GiB iOS cache ceiling = 3757 MiB — and both fit 4 GiB. The larger 256 is excluded by its
-    /// measured 4113 MiB at 512², and 512/384 have no bound at all.
+    /// 1 GiB iOS cache ceiling = 3757 MiB. Both are below the observed 6144 MiB process limit.
+    /// Tile 256 also fits at 512², but lacks a 1024² bound; 512/384 have no bound at all.
+    /// This host-data planning choice remains separate from reviewed phone admission.
     #[test]
-    fn ios_sana_plan_selects_the_largest_tile_that_fits_4_gib_at_512_and_1024() {
+    fn ios_sana_plan_selects_the_largest_bounded_tile_under_the_process_limit() {
         use super::FootprintBound::{Inferred, Measured};
 
-        assert_eq!(super::IOS_MEMORY_BUDGET_MIB, 4096);
+        assert_eq!(super::IOS_MEMORY_BUDGET_MIB, 6144);
         assert_eq!(super::IOS_IMAGE_EDGES, [512, 1024]);
 
         let plan = super::sana_decode_plan().expect("an iOS SANA plan is selected");
@@ -569,8 +573,8 @@ mod tests {
             let bound = super::sana_footprint_bound(image, plan.edge as u32)
                 .unwrap_or_else(|| panic!("no footprint bound for {image}² at tile 192"));
             assert!(
-                bound.mib() <= 4096,
-                "{image}² at tile {} is bounded at {bound:?}, over 4 GiB",
+                bound.mib() <= super::IOS_MEMORY_BUDGET_MIB,
+                "{image}² at tile {} is bounded at {bound:?}, over the observed process limit",
                 plan.edge
             );
         }
@@ -590,8 +594,8 @@ mod tests {
                 [512, 1024]
                     .iter()
                     .any(|&image| super::sana_footprint_bound(image, *larger)
-                        .is_none_or(|bound| bound.mib() > 4096)),
-                "tile {larger} fits 4 GiB at every iOS size and should have been selected"
+                        .is_none_or(|bound| bound.mib() > super::IOS_MEMORY_BUDGET_MIB)),
+                "tile {larger} has a bound below the process limit at every iOS size and should have been selected"
             );
         }
 

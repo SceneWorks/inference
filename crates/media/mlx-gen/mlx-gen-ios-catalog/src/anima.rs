@@ -30,14 +30,15 @@
 //! which counts MLX's reuse cache, and the host figure is live allocation only. The cache term is
 //! bounded only after `runtime-ios`'s `bound_mlx_to_platform_limits` has run.
 //!
-//! # What gets selected at 1024² under 4 GiB
+//! # What gets planned at 1024² under the observed 6 GiB process limit
 //!
 //! Staged residency with a tiled decode at **192**, plus the rungs that measurement ran with: chunked
 //! attention and the one-block DiT window (rung 4, which needs a
 //! [`DeferredMaterialization`](LoadShape::DeferredMaterialization) load — [`anima_turbo_load_spec`]).
 //! Rung 4 is not optional here. Staged + tiled *without* the window keeps the whole DiT resident
 //! through the denoise, which the provider measured at 5.378 GiB (rung 2) and 5.229 GiB (rung 3) at
-//! bf16 — over the budget at every tile edge, since the tile does not touch the denoise phase.
+//! bf16; adding the 1 GiB cache allowance exceeds even the observed 6 GiB process limit at every
+//! tile edge. This host-data plan remains separate from reviewed device admission.
 //!
 //! Among admitted candidates the one with the **most headroom** wins (ties to the larger tile). That
 //! is not SANA's largest-tile rule, on purpose: the provider documents that its request peaks below
@@ -157,7 +158,7 @@ fn mib(value: u32) -> u64 {
 }
 
 /// The iOS budget the defaults are chosen against: [`IOS_MEMORY_BUDGET_MIB`], nothing committed, no
-/// reclaim credited. The measured cap of the target device replaces it at admission time (E4).
+/// reclaim credited. Admission separately checks actual live headroom and reviewed device demand.
 pub fn ios_memory_budget() -> MemoryBudget {
     MemoryBudget {
         total_bytes: mib(IOS_MEMORY_BUDGET_MIB),
@@ -404,18 +405,18 @@ mod tests {
         contract.engages_selection(selection, rung)
     }
 
-    /// Under the 4 GiB fixture budget at 1024², the selection is staged with a tiled decode at 192
+    /// Under the observed 6 GiB process ceiling at 1024², the selection is staged with a tiled decode at 192
     /// (plus the window and chunked attention it was measured with), bounded at 2.680 GiB live +
     /// 1 GiB cache, and the provider's own resolver turns it into exactly that request memory.
     #[test]
-    fn anima_turbo_selects_staged_tiled_192_under_4_gib_at_1024() {
+    fn anima_turbo_selects_staged_tiled_192_under_the_process_limit() {
         let registry = crate::provider_registry().expect("iOS media catalog builds");
         let spec = spec();
         let contract = contract(&registry, &spec);
 
-        assert_eq!(crate::IOS_MEMORY_BUDGET_MIB, 4096);
+        assert_eq!(crate::IOS_MEMORY_BUDGET_MIB, 6144);
         let selection = anima_turbo_ios_selection(&registry, &spec, &contract)
-            .expect("an iOS Anima Turbo selection fits 4 GiB at 1024²");
+            .expect("an iOS Anima Turbo plan fits below the observed process limit at 1024²");
 
         assert!(engages(
             &contract,
@@ -448,7 +449,7 @@ mod tests {
     }
 
     /// A resident-everything request is refused before load by the provider's safety check — on
-    /// the budget, not for want of evidence: its measured floor alone (7.921 GiB) is twice the cap.
+    /// the budget, not for want of evidence: its host-derived floor alone (7.921 GiB) exceeds the observed 6 GiB ceiling.
     #[test]
     fn anima_turbo_refuses_a_resident_request_before_load() {
         let registry = crate::provider_registry().expect("iOS media catalog builds");
@@ -468,7 +469,7 @@ mod tests {
         )
         .expect("admission runs weights-free");
         let MemorySafetyDecision::Reject { reason } = decision else {
-            panic!("a resident Anima Turbo request was admitted under 4 GiB");
+            panic!("a resident Anima Turbo plan was accepted under the observed process limit");
         };
         assert!(
             reason.contains("exceeds effective budget"),
@@ -478,9 +479,9 @@ mod tests {
 
     /// Staged + tiled without the DiT window keeps the DiT resident through the denoise; its
     /// measured floor is over the cap at every tile edge, so it is refused on the budget — never
-    /// for want of a measurement. The window is what makes 4 GiB fit.
+    /// for want of a measurement. The window makes the host-data plan fit the 6 GiB ceiling.
     #[test]
-    fn staged_tiled_without_the_window_is_refused_under_4_gib() {
+    fn staged_tiled_without_the_window_is_refused_under_the_process_limit() {
         let registry = crate::provider_registry().expect("iOS media catalog builds");
         let spec = spec();
         let contract = contract(&registry, &spec);
@@ -501,7 +502,7 @@ mod tests {
             .unwrap();
             let MemorySafetyDecision::Reject { reason } = decision else {
                 panic!(
-                    "{:?} at tile {:?} was admitted under 4 GiB",
+                    "{:?} at tile {:?} was accepted under the observed process limit",
                     candidate.strategy, candidate.parameters.decode_tile_edge
                 );
             };
@@ -530,7 +531,7 @@ mod tests {
         let spec = spec().with_load_shape(LoadShape::EagerMaterialization);
         let contract = contract(&registry, &spec);
         let error = anima_turbo_ios_selection(&registry, &spec, &contract)
-            .expect_err("nothing measured fits 4 GiB without the DiT window");
+            .expect_err("no host-data plan fits the process limit without the DiT window");
         assert!(error.to_string().contains("nothing fits"), "{error}");
     }
 

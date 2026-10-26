@@ -1,0 +1,60 @@
+# Current iPhone smoke host preparation
+
+UTC 2026-10-26. Source checkout `/Users/michael/.codex/worktrees/sc16774-phone-session`, branch `codex/sc16774-phone-session`, clean at `e49f5345bd254936f20c15c5ea84e76656faf01f`. No source edit, checkout, commit, push, CI dispatch, model transfer, model run, or simulator run occurred.
+
+## Build diagnosis and bounded local workaround
+
+Initial maintained command was `python3 scripts/ios/campaign.py primitive --device 00008140-000C09803AD3001C --memory-entitlement on --timeout-seconds 3600 --output .../primitive.jsonl` with `SMOKE_BUNDLE_ID=com.michaeltrefry.SceneWorksSmoke`, `DEVELOPMENT_TEAM=R2526H7YN9`, `CARGO_BUILD_JOBS=4`, `CARGO_PROFILE_RELEASE_DEBUG=0`, `CARGO_INCREMENTAL=0`. Its `run_smoke.sh --media --install-only` Rust build stopped at `zerocopy` E0463, unable to load `zerocopy_derive`. The freshly built host dylib failed direct `ctypes.CDLL` with `mis-aligned LINKEDIT string pool, fileOffset=0x00243054`. This is a demonstrated local host-linker artifact failure, not a demonstrated source defect.
+
+One task-local retry used the same maintained primitive command and constraints plus `CARGO_PROFILE_RELEASE_STRIP=none`, `CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none`, `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`, and `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS='-C linker-flavor=ld64.lld -C linker=/Users/michael/.rustup/toolchains/1.96.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-lld'`. The replacement host proc-macro dylib loaded successfully; its LC_SYMTAB string offset was 2412216, divisible by 8. The iOS target retained `.cargo/config.toml` target flags and the maintained MLX SDK/CMake path. No host-global setting changed.
+
+## Built and installed identity
+
+- Rust iOS staticlib: `ios-host/smoke/target/aarch64-apple-ios/release/libios_smoke.a`, SHA-256 `1667e810ed44e0510f413d554a1fb786d8bf165491744732f3d92024c9037713`.
+- Fresh native MLX metallib: `ios-host/smoke/target/aarch64-apple-ios/release/build/pmetal-mlx-sys-e6031406159f04a9/out/build/lib/mlx.metallib`, 134151912 bytes, SHA-256 `8f6769c39cbac35ae6f4a95e1788f838c5f6cad01d12087d1a6fbeb14a3014b6`. Its strings contain `apple-ios18.0.0`; none report a macOS or simulator triple. The app-bundled metallib has the same SHA-256.
+- Signed app: `target/ios-derived/Build/Products/Release-iphoneos/SceneWorksSmoke.app`, bundle `com.michaeltrefry.SceneWorksSmoke`, executable SHA-256 `9370337a2508b2a0c69616ec71143b8e46e396dc0c45257f6c62b6a7f799161d`, arm64 UUID `77A32F9F-6BF5-3CA0-B2F9-AC69D3C4FB0F`, CDHash `704bb5506bdc8ca7a60d2a2ce00f491746510ff5`, TeamIdentifier `R2526H7YN9`. `codesign --verify --deep --strict` passed. Signed entitlements include increased-memory-limit and extended-virtual-addressing. Info.plist marker `SWSmokeIncreasedMemoryLimit=YES`. Executable strings contain exact source SHA `e49f5345bd254936f20c15c5ea84e76656faf01f`.
+- CoreDevice app listing after install shows developer-built `SW Smoke` 1.0(1), bundle `com.michaeltrefry.SceneWorksSmoke`, container-accessible, installed bundle UUID `CCEB42F8-977E-43B8-9612-9FFE8ABCCDA0` on the physical iPhone 16 Pro Max (`iPhone17,2`, UDID `00008140-000C09803AD3001C`). This and the maintained install path show that the current signed app installed; CoreDevice app listing does not independently hash the installed executable bytes.
+
+## Primitive launch status
+
+The maintained primitive command reached the installed app launch but SpringBoard denied it: `FBSOpenApplicationErrorDomain 7`, `Locked`. A fresh `devicectl device info lockState` returned `passcodeRequired:true`, `unlockedSinceBoot:true`. The `primitive-retry1.jsonl` row is `diagnostic_failure`; it contains no current process footprint, available-memory, kernel peak, or MLX peak. It proves no primitive execution or model fit. No fresh cap or safe render budget is claimed. Device free storage remains unknown: `devicectl device info details` exposes no free-space field. The user has been asked through the coordinator to unlock the phone; retain this installed app and retry only the bounded primitive when unlocked. No source/build retry is needed for the lock denial.
+
+Raw receipts: `primitive-command.log`, `primitive-retry1-command.log`, `primitive-retry1.jsonl`, `apps-after-install.json`, `lock-state-after-install.json`, `lock-state-latest.json`, `details-after-install.json`. The initial `primitive.jsonl` is intentionally empty because installation failed before launch.
+
+## Unlocked launch-only primitive receipt
+
+After Michael unlocked the phone, `devicectl device info lockState` returned `passcodeRequired:false`. The installed app was launched once without Cargo, Xcode, reinstall, or any source change. A task-private Python invocation imported the maintained `scripts/ios/campaign.py` `DeviceSession`, called `run_case(PRIMITIVE_KEY)` and `validate_primitive`, and wrote `primitive-launch-only.jsonl`. Its actual device command was the session driver's `devicectl device process launch --device 00008140-000C09803AD3001C --environment-variables ... com.michaeltrefry.SceneWorksSmoke`, with `IOS_CAMPAIGN_CASE=primitive/sana_block_quantum`, diagnostic=1, timeout=180, exact build SHA and nonce. The driver checked the app was not running before launch; it verified fresh report and launch-memory files, matching nonce/SHA/YES entitlement, and natural process exit. The raw files are in `primitive-launch-only.artifacts/recipe-9dcc8930f446331abccd27a16147d689d62d15744c3dfce7ed9842360c7c573b/`.
+
+Result: `diagnostic_success`, elapsed primitive time 0.251 s, `iPhone17,2`, iOS 26.6.2 (23G90), source SHA `e49f5345bd254936f20c15c5ea84e76656faf01f`, run nonce `36d4917ad4b4460dbc879d58b94afcf8`, increased-memory entitlement YES. `allocation_attempted:true`, `model_admission_evidence:false`, `cap_validated:false`, `production_success:false`.
+
+| Phase | `os_proc_available_memory` B | Current physical footprint B | Sum B |
+|---|---:|---:|---:|
+| before | 6,428,409,056 | 14,041,888 | 6,442,450,944 |
+| resident | 6,350,240,968 | 92,209,976 | 6,442,450,944 |
+| after | 6,246,890,672 | 195,560,272 | 6,442,450,944 |
+
+The Xcode iPhoneOS 27.1 SDK's `os/proc.h` documents `os_proc_available_memory` as bytes remaining before the process memory limit. Three separately sampled pairs summing exactly to 6 GiB give **high confidence** that this app's *current OS dirty-memory limit* is 6 GiB with increased-memory entitlement on this device/OS. Because the readings are separate samples and the OS can change limits, this does not establish a universally fixed limit. It is not a safe render budget or a phone-fit admission proof.
+
+Kernel lifetime footprint peak was 195,576,656 B; MLX peak was 153,976,832 B. Process growth over baseline was 181,518,384 B, leaving 27,541,552 B beyond MLX's peak by the primitive's accounting. Minimum sampled OS headroom was 5,957.484 MiB. These are synthetic primitive measurements only. The 512 MiB engineering reserve remained a configured estimate, not a measured driver bound. No weighted model loaded or image generated.
+
+The entitlement-off A/B and restoration were completed later in this same authorized session; see below. Any model cap/admission decision still needs the planned representative endpoint captures and safety validation.
+
+## Frozen-source entitlement A/B and restoration
+
+The original entitled app bundle was copied to `entitled-host/SceneWorksSmoke.app` and its signature and SHA-256 reverified before the control build. With the same `e49f5345bd254936f20c15c5ea84e76656faf01f` source, same 152 MiB iOS Rust staticlib and same iOS metallib, Xcode built an entitlement-off app using `xcodebuild -project ios-host/SceneWorksSmoke.xcodeproj -scheme SceneWorksSmoke -configuration Release -sdk iphoneos -destination id=00008140-000C09803AD3001C -derivedDataPath .../off-derived -allowProvisioningUpdates -jobs 4 CODE_SIGN_ENTITLEMENTS=App/SceneWorksSmoke-NoIncreasedLimit.entitlements SMOKE_INCREASED_MEMORY_LIMIT=NO build`. Build succeeded. Its signed app is retained independently at `off-host/SceneWorksSmoke.app`; executable SHA-256 `769960483f79d061429e6a6850441240c0da41847f80a8c60bc8f4f48c5b5aa4`, CDHash `7054ed87579bb93c37def5870fcecd359bd8171f`, TeamIdentifier `R2526H7YN9`, Info.plist marker `NO`. Entitlements retain extended virtual addressing and omit increased-memory-limit. The bundled metallib SHA-256 is the same `8f6769c39cbac35ae6f4a95e1788f838c5f6cad01d12087d1a6fbeb14a3014b6`. Its executable strings retain the exact source SHA.
+
+`devicectl device install app` upgraded the same bundle ID without uninstalling or deleting its container. The retained off-signed app launched once through the maintained `campaign.DeviceSession.run_case(PRIMITIVE_KEY)` path, with `memory-entitlement=off`, fresh host nonce `a4adacd635c44d8db12803857464f9e2`, matching source SHA, fresh `launch-memory.txt` ending `increased-memory-limit = NO`, and natural process exit. The raw diagnostic row is `off-primitive.jsonl`; report and launch-memory are under `off-primitive.artifacts/`. Status was `diagnostic_success`, `cap_validated:false`, `model_admission_evidence:false`. No weighted model was opened.
+
+| Actual launch | Entitlement | OS process limit inferred from each of before/resident/after samples | Kernel footprint lifetime peak B | MLX peak B | Process growth over baseline B | Beyond-MLX term B |
+|---|---|---:|---:|---:|---:|---:|
+| first on | YES | 6,442,450,944 B (6,144 MiB) | 195,576,656 | 153,976,832 | 181,518,384 | 27,541,552 |
+| off control | NO | 3,539,992,576 B (3,376 MiB) | 196,264,808 | 153,976,832 | 181,846,064 | 27,869,232 |
+| restored on | YES | 6,442,450,944 B (6,144 MiB) | 196,035,480 | 153,976,832 | 181,698,608 | 27,721,776 |
+
+The off control's three separately sampled available/footprint pairs were respectively `3,525,573,832 + 14,418,744`, `3,447,373,000 + 92,619,576`, and `3,343,727,768 + 196,264,808` bytes; each sums to 3,539,992,576 B. Thus the entitlement changed this app's observed *current OS process limit* by 2,902,458,368 B (2,768 MiB), with the same source/native library and synthetic primitive. Confidence is **high** for this device/OS/signing configuration. `os_proc_available_memory` is current remaining process memory, and the separate footprint samples may move with the OS; neither limit is a safe render budget.
+
+After the off probe exited, `devicectl device install app` restored the saved signed `entitled-host/SceneWorksSmoke.app`; install URL was `file:///private/var/containers/Bundle/Application/3144E679-AC8F-4EA6-BF22-0D625A91DCB6/SceneWorksSmoke.app/`. A final launch-only primitive verified fresh `YES` entitlement, source SHA, nonce `04c8f739810341bd9ede5e2f5230a31a`, and natural exit. Its row is `restored-on-primitive.jsonl` with raw report/launch-memory under `restored-on-primitive.artifacts/`. Three available+footprint pairs again each summed to 6,442,450,944 B. This verifies the installed restoration behavior as well as the successful install receipt. The source branch remains clean at `e49f5345`.
+
+## Simulator SANA readiness, inspection only
+
+The maintained path is `scripts/ios/run_smoke.sh --media --simulator <simulator-UDID>`; it builds a separate `aarch64-apple-ios-sim` staticlib, checks the simulator metallib marker, builds an unsigned simulator app, installs it, launches it and reads a fresh report. Before a SANA image can result, a complete previously converted SANA component tree must be copied into that app's `Documents/sana/` with `scripts/ios/push_model.sh <snapshot-dir> sana --simulator <simulator-UDID>` **after** the app is initially installed, then the maintained smoke command must run again, preferably with `IOS_SMOKE_ONLY=sana`. A missing snapshot yields an explicit SANA skip and cannot satisfy the story's simulator-image acceptance. Current available simulator runtime is iOS 26.5, with shutdown iPhone 17 Pro/Pro Max and others; there is no booted simulator. The simulator is a packaging/correctness lane, not phone cap/footprint evidence. No simulator boot/build/install, model copy, or SANA run occurred in this inspection.
