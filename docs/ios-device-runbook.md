@@ -548,8 +548,8 @@ accepted recipe per provider, route, architecture, tier and source-resolved
 mode/configured role graph, then plans one resident and two optimized captures
 per representative. The schema-3 `recipe_coverage` records every discovered
 accepted recipe and allocation class beside its representative. Unresolved
-settings and unserved routes remain explicit. The controller rejects stale or
-incomplete coverage mappings. `--max-cases` is an optional execution cap, not
+settings and unserved routes remain explicit. The controller validates the schema
+and recipe-to-representative references. `--max-cases` is an optional execution cap, not
 permission to claim completion from partial coverage.
 
 Exact native evidence identities still retain sampling-allocation classes. The
