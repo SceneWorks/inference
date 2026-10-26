@@ -3,7 +3,8 @@ name: iOS simulator SANA functional image
 # E8: never called by PR/push CI. The simulator image is a functional witness only; it does not
 # establish physical-iPhone admission, memory fit, timing, or kernel correctness.
 # CI_IMPACT: one separately dispatched job, no added PR/push cost; cold iOS SDK compile and
-# snapshot transfer cost are host/asset dependent (unknown). Hard job timeout: 240 minutes.
+# snapshot transfer cost are host/asset dependent (unknown). Pinned job-local XcodeGen adds
+# 4,286,070 download bytes plus a version probe; no Homebrew/global install. Timeout: 240 minutes.
 on:
   workflow_call:
     inputs:
@@ -52,18 +53,22 @@ jobs:
       CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
       CARGO_INCREMENTAL: '0'
     steps:
-      - name: Require the provisioned primary Mac and exact local simulator
+      - name: Require an allowed Mac and exact simulator dispatch identity
         shell: bash
         run: |
           [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ( "$RUNNER_NAME" == nax-macos || "$RUNNER_NAME" == nax-macos-2 ) && "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64 ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]
           [[ "$SIMULATOR_SELECTOR" == iPhone\ * ]]
-          command -v python3.12
-          command -v xcodegen
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        id: checkout
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Provision the pinned job-local project generator after checkout
+        shell: bash
+        run: |
+          command -v python3.12
+          python3.12 -I scripts/ci/provision_simulator_xcodegen.py
       - name: Resolve the pinned snapshot under this runner's own home
         shell: bash
         run: |
@@ -157,12 +162,22 @@ jobs:
       - name: Retire only this workflow attempt's disposable simulator
         if: always()
         shell: bash
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
         run: |
           mkdir -p "$RUNNER_TEMP/ios-simulator-sana"
-          python3.12 -I scripts/ci/ios_simulator_sana_device.py cleanup \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
-            --receipt "$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json" \
-            --output "$RUNNER_TEMP/ios-simulator-sana/simulator-cleanup.json"
+          receipt="$RUNNER_TEMP/ios-simulator-sana/owned-simulator.json"
+          output="$RUNNER_TEMP/ios-simulator-sana/simulator-cleanup.json"
+          if [[ ! -e "$receipt" ]]; then
+            printf '%s\n' '{"status":"no-owned-simulator-receipt","resource_cleanup_performed":false,"model_validation":"not-established"}' > "$output"
+          elif [[ "$CHECKOUT_OUTCOME" != success ]]; then
+            printf '%s\n' '{"status":"cleanup-refused","reason":"checkout-unavailable","resource_cleanup_performed":false,"model_validation":"not-established"}' > "$output"
+            exit 1
+          else
+            python3.12 -I scripts/ci/ios_simulator_sana_device.py cleanup \
+              --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+              --receipt "$receipt" --output "$output"
+          fi
       - name: Upload result, source inventory and refusal logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
