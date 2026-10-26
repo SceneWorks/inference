@@ -175,6 +175,29 @@ class FixtureWorkspace(unittest.TestCase):
             self.affected("crates/other/fixtures/x.json"), {"other", "mlx-gen-catalog", "mlx-gen-a"}
         )
 
+    def test_path_attributed_test_modules_keep_reads_local_to_the_reader(self) -> None:
+        for attributes in (
+            '#[cfg(test)]\n#[path = "cases.rs"]',
+            '#[path = "cases.rs"]\n#[cfg(all(test, feature = "fixture"))]',
+        ):
+            with self.subTest(attributes=attributes):
+                _write(self.root, "crates/gen/mlx-gen-a/src/lib.rs", attributes + '\nmod cases;\n')
+                _write(self.root, "crates/gen/mlx-gen-a/src/cases.rs",
+                       'mod child;\nfn input() { include_str!("../../../other/fixtures/x.json"); }\n')
+                _write(self.root, "crates/gen/mlx-gen-a/src/cases/child.rs",
+                       'fn input() { include_str!("../../../../other/fixtures/x.json"); }\n')
+                self.test_reads, self.lib_reads = file_reads(self.root, self.ws.members)
+                self.assertEqual(self.lib_reads["mlx-gen-a"], set())
+                self.assertIn("crates/other/fixtures/x.json", self.test_reads["mlx-gen-a"])
+                self.assertEqual(self.affected("crates/other/fixtures/x.json"),
+                                 {"other", "mlx-gen-catalog", "mlx-gen-a"})
+                # Reusing exactly that module in shipping code must restore reverse propagation.
+                with (self.root / "crates/gen/mlx-gen-a/src/lib.rs").open("a") as output:
+                    output.write('#[path = "cases.rs"]\nmod shipping;\n')
+                self.test_reads, self.lib_reads = file_reads(self.root, self.ws.members)
+                self.assertIn("crates/other/fixtures/x.json", self.lib_reads["mlx-gen-a"])
+                self.assertIn("mlx-gen-b", self.affected("crates/other/fixtures/x.json"))
+
     def test_a_read_outside_every_crate_selects_its_reader(self) -> None:
         self.assertEqual(self.affected("docs/ref/table.json"), {"mlx-gen-a"})
         self.assertEqual(self.affected("docs/unread.md", "crates/stray/notes.rs"), set())
@@ -268,13 +291,37 @@ class RealWorkspaceTests(unittest.TestCase):
             expected = {dep["name"] for dep in package["dependencies"] if "path" in dep}
             self.assertEqual(self.ws.deps[package["name"]], expected, package["name"])
 
-    def test_a_one_model_change_does_not_select_the_other_models(self) -> None:
-        affected = self.affected("crates/media/candle-gen/candle-gen-krea/src/lib.rs")
-        self.assertIn("candle-gen-krea", affected)
-        self.assertIn("candle-gen-catalog", affected)
-        self.assertIn("runtime-cpu", affected)
+    def test_a_model_change_keeps_source_reader_tests_without_their_dependents(self) -> None:
+        changed = "crates/media/candle-gen/candle-gen-krea/src/lib.rs"
+        affected = self.affected(changed)
+        self.assertEqual(affected, {
+            "candle-gen-krea", "candle-gen-catalog", "runtime-cpu", "runtime-cuda",
+            # Conservative literal readers: these run their OWN tests, not their dependents.
+            "candle-gen", "candle-gen-flux3", "candle-gen-qwen-image", "candle-llm", "mlx-gen", "mlx-gen-sdxl",
+        })
+        self.assertIn("crates/media", self.test_reads["mlx-gen-sdxl"])
+        self.assertNotIn("crates/media", self.lib_reads["mlx-gen-sdxl"])
+        self.assertNotIn("mlx-gen-clip", affected)
+        self.assertNotIn("mlx-gen-ios-catalog", affected)
         self.assertNotIn("candle-gen-flux2", affected)
-        self.assertFalse({name for name in affected if name.startswith("mlx-gen-")})
+
+    def test_a_shared_encoder_change_keeps_real_reverse_model_edges(self) -> None:
+        self.assertEqual(self.ws.deps["mlx-gen-clip"], {"mlx-gen", "mlx-gen-sdxl"})
+        self.assertIn("mlx-gen-sdxl", self.ws.deps["mlx-gen-ios-catalog"])
+        affected = self.affected("crates/media/mlx-gen/mlx-gen-sdxl/src/lib.rs")
+        self.assertEqual({name for name in affected if name.startswith("mlx-gen-")}, {
+            "mlx-gen-sdxl", "mlx-gen-clip", "mlx-gen-flux", "mlx-gen-chroma", "mlx-gen-instantid",
+            "mlx-gen-kolors", "mlx-gen-mochi", "mlx-gen-pulid", "mlx-gen-sd3", "mlx-gen-supra2", "mlx-gen-svd",
+            "mlx-gen-catalog", "mlx-gen-ios-catalog",
+            # Independent tests that conservatively read their containing MLX source tree.
+            "mlx-gen-ltx", "mlx-gen-mage", "mlx-gen-sensenova", "mlx-gen-wan",
+        })
+        for reader in ("mlx-gen-ltx", "mlx-gen-mage", "mlx-gen-sensenova", "mlx-gen-wan"):
+            self.assertIn("crates/media/mlx-gen", self.test_reads[reader])
+            self.assertNotIn("crates/media/mlx-gen", self.lib_reads[reader])
+        self.assertTrue({"runtime-macos", "runtime-ios", "ios-smoke"}.issubset(affected))
+        self.assertNotIn("mlx-gen-iris", affected)
+        self.assertNotIn("candle-gen-flux2", affected)
 
     def test_a_contract_change_runs_shared_crates_bundles_and_exact_source_readers(self) -> None:
         changed = "crates/contracts/gen-core/src/lib.rs"

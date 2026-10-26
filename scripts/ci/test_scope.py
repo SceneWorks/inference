@@ -175,6 +175,63 @@ def _check_workspace():
     return module
 
 
+def _test_module_files(root: Path, members: dict[str, str], checks) -> set[str]:
+    """Classify external modules with attributes, retaining any production inclusion route.
+
+    The shared lint's legacy helper handles only adjacent ``#[cfg(test)] mod name;``.
+    In particular, ``#[cfg(test)] #[path = "cases.rs"] mod tests;`` must not turn its
+    fixture literals into library reads that fan out to all the reader's dependents.
+    """
+    test_files = {_posix(str(path.relative_to(root))) for path in checks._test_only_files(root)}
+    edges: list[tuple[str, str, bool]] = []
+    declaration = re.compile(
+        r'(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?'
+        r'mod\s+(?P<name>\w+)\s*;'
+    )
+    for member, package in members.items():
+        for source in (root / member).rglob("*.rs"):
+            rel = _posix(str(source.relative_to(root)))
+            if owner(rel, members) != package or "/target/" in f"/{rel}":
+                continue
+            if PurePosixPath(rel).relative_to(member).parts[0] in ("tests", "benches", "examples"):
+                test_files.add(rel)
+            text = source.read_text(encoding="utf-8", errors="replace")
+            # Most Rust files declare no external module; avoid masking all their bodies twice.
+            if not re.search(r"\bmod\b[^;{}]*;", text):
+                continue
+            spans = checks._cfg_test_spans(text)
+            syntax = checks.strip_rust_comments(text, strip_literals=True)
+            for match in declaration.finditer(syntax):
+                attrs = text[match.start("attrs"):match.end("attrs")]
+                path = re.search(r'#\[\s*path\s*=\s*"([^"\n]+)"\s*\]', attrs)
+                name = match["name"]
+                candidates = [source.parent / path[1]] if path else [
+                    source.with_name(f"{name}.rs"), source.parent / name / "mod.rs",
+                    source.parent / source.stem / f"{name}.rs",
+                ]
+                in_test = any(start <= match.start("name") < end for start, end in spans)
+                for candidate in candidates:
+                    target = _resolve(".", _posix(os.path.relpath(candidate, root)), root)
+                    if target is not None:
+                        edges.append((rel, target, in_test))
+                        if in_test:
+                            test_files.add(target)
+    # Test-only context follows child modules too. A file included by BOTH test and shipping
+    # modules is library code, and its ordinary child modules retain that production route.
+    def closure(seeds: set[str], links: list[tuple[str, str]]) -> set[str]:
+        reached = set(seeds)
+        while True:
+            extra = {target for source, target in links if source in reached} - reached
+            if not extra:
+                return reached
+            reached |= extra
+
+    test_files = closure(test_files, [(source, target) for source, target, _ in edges])
+    production = {target for source, target, test in edges if source not in test_files and not test}
+    production = closure(production, [(source, target) for source, target, test in edges if not test])
+    return test_files - production
+
+
 def file_reads(
     root: Path, members: dict[str, str]
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
@@ -190,7 +247,7 @@ def file_reads(
     execute, so it propagates to dependents like a source change does.
     """
     checks = _check_workspace()
-    test_only = {_posix(str(path.relative_to(root))) for path in checks._test_only_files(root)}
+    test_only = _test_module_files(root, members, checks)
     test_reads: dict[str, set[str]] = {name: set() for name in members.values()}
     lib_reads: dict[str, set[str]] = {name: set() for name in members.values()}
     for member, name in members.items():
