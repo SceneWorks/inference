@@ -187,8 +187,8 @@ class TestSuites(unittest.TestCase):
 
         jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
         cpu = jobs["candle-cpu-test"]
-        self.assertEqual(cpu["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 150 || 75 }}")
-        self.assertEqual(cpu["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}")
+        self.assertEqual(cpu["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 150 || 90 }}")
+        self.assertEqual(cpu["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '4500' }}")
         steps = [step for step in cpu["steps"] if "test_suites.py" in step.get("run", "")]
         self.assertEqual(cpu["strategy"], {"fail-fast": False, "matrix": {"group": ["base", "gen"]}})
         self.assertNotIn("continue-on-error", cpu)

@@ -426,7 +426,7 @@ jobs:
         run: bash crates/media/candle-gen/scripts/check-gen-core-skew.sh candle-gen
 
   candle-cpu-test:
-    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 75 }}
+    timeout-minutes: ${{ inputs.test_suite == 'exhaustive' && 150 || 90 }}
     name: Candle CPU package tests (Linux, ${{ matrix.group }})
     needs: changes
     if: >-
@@ -437,9 +437,9 @@ jobs:
       matrix:
         group: [base, gen]
     env:
-      # Run 40310828863 projects ~48m for gen alone. Independent groups retain
-      # 60m invocation budgets plus setup/cache headroom; see docs/ci-test-suites.md.
-      TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}
+      # Cold gen took ~55m29s in run 40329999413. Allow a 75m invocation
+      # budget plus setup/cache time; see docs/ci-test-suites.md.
+      TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '4500' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install pinned Rust toolchain

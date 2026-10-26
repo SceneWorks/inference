@@ -87,12 +87,12 @@ Healthy retained Candle CPU artifact/memory targets took 411s (`candle-gen-flux2
 40240078690. Routine target execution has a 900s ceiling, above those observations;
 exhaustive cases have a 600s ceiling each. Listing and metadata calls are bounded
 to 60s/120s, compilation to 2400s, and whole suite invocations to 2700s routine or
-7200s exhaustive by default. The two Candle CPU matrix members and hosted
-`Test MLX packages` step explicitly allow 3600s routine and 7200s exhaustive per
-invocation for their full native package graphs. A timeout terminates
-the child process tree, including rank fixtures. All CI jobs also have explicit
-deadlines; ordinary Candle CPU members and hosted Metal are bounded to 75 minutes,
-with larger explicit exhaustive budgets of 150 and 180 minutes respectively.
+7200s exhaustive by default. For full native package graphs, the two Candle CPU
+matrix members explicitly allow 4500s routine per invocation, and hosted
+`Test MLX packages` allows 3600s routine. Both retain 7200s exhaustive. A timeout
+terminates the child process tree, including rank fixtures. All CI jobs also have explicit
+deadlines; ordinary Candle CPU members and hosted Metal are bounded to 90 and
+75 minutes, with explicit exhaustive budgets of 150 and 180 minutes respectively.
 
 The CPU split preserves the existing full graph: 20 base native targets and 76 gen
 native targets, with the original package selectors, `--lib`/`--tests` flags and
@@ -108,10 +108,13 @@ had finished and 13 remained or were active; those 13 baseline runtimes sum to
 337.90s. The matched completed targets ran at 1.509 times the baseline aggregate
 duration. Applying that observed ratio to the remaining work estimates about
 64 minutes for the serial job and 48 minutes for gen's invocation. These are
-estimates, not completion measurements. The independent 60-minute invocation
-budgets and 75-minute job bounds allow headroom above that gen estimate, including
-setup and cache restoration, while retaining the 900s target watchdog. Metal job
-and explicit exhaustive budgets are unchanged.
+estimates, not completion measurements. The subsequent cold split run 40329999413
+passed: base finished in 21m04s and gen in 56m05s, with gen's test step taking
+approximately 55m29s. That leaves only about 4m31s below the initial 60-minute
+invocation limit. The CPU routine invocation limit is therefore 75 minutes,
+about 35% above that observed cold step, and its job limit is 90 minutes for
+setup/cache headroom. The 900s target watchdog, Metal job bounds and explicit
+exhaustive budgets are unchanged. This is deadline headroom, not a latency claim.
 
 The pinned `Swatinem/rust-cache` action includes `key: ${{ matrix.group }}` in
 both primary and restore prefixes, alongside the job, platform and Rust environment.
@@ -119,8 +122,8 @@ Base and gen therefore save distinct main-only dependency caches: a fast base ru
 cannot fill gen's immutable key with only base dependencies. This changes the
 previous cache prefix, so the first runs will be cold until main saves each group;
 PR runs still only restore. Gen also loses dependencies compiled by the old prior
-base step. The first split run must measure that extra compilation and confirm the
-bounds; no cache-hit or exact wall-clock reduction is claimed in advance.
+base step. The cold split timing above includes that extra compilation; future
+runner and cache variance remains possible, and no warm-cache speedup is assumed.
 
 Hosted Metal job 121596995674 passed in 54m29s; `Test MLX packages` ran from
 13:32:14 to 14:13:21 (41m07s), compared with 36m55s in the prior run. That leaves
