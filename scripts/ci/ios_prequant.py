@@ -20,13 +20,16 @@ import subprocess
 import sys
 import time
 import tomllib
-import urllib.request
 
 _guard_spec = importlib.util.spec_from_file_location(
     "ios_pricing_compile_only", Path(__file__).with_name("ios_pricing_compile_only.py"))
 _guard = importlib.util.module_from_spec(_guard_spec)
 _guard_spec.loader.exec_module(_guard)
 descendants, process_rows = _guard.descendants, _guard.process_rows
+_hub_spec = importlib.util.spec_from_file_location(
+    "pinned_hub_source", Path(__file__).with_name("pinned_hub_source.py"))
+_hub = importlib.util.module_from_spec(_hub_spec)
+_hub_spec.loader.exec_module(_hub)
 
 GIB = 1024**3
 MIB = 1024**2
@@ -181,61 +184,11 @@ def file_receipts(root):
             for file in sorted(root.rglob("*")) if file.is_file()]
 
 
-def git_blob_sha1(path):
-    digest = hashlib.sha1(f"blob {path.stat().st_size}\0".encode())
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * MIB), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def verify_hub_source(name, source, source_files):
     owner, repository, revision, suffix = PINS[name]
-    identity = f"{owner}/{repository}"
-    url = f"https://huggingface.co/api/models/{identity}/revision/{revision}?blobs=true"
-    request = urllib.request.Request(url, headers={"User-Agent": "SceneWorks-ios-prequant/1"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        raw = response.read(16 * MIB + 1)
-    if len(raw) > 16 * MIB:
-        raise ValueError("Hub pinned manifest exceeds bound")
-    document = json.loads(raw)
-    if (document.get("id") != identity or document.get("sha") != revision
-            or document.get("private") is not False or document.get("gated") is not False):
-        raise ValueError("Hub readback does not authenticate public pinned source")
-    siblings = document.get("siblings")
-    if not isinstance(siblings, list) or not siblings:
-        raise ValueError("Hub readback lacks expanded sibling inventory")
-    inventory = {}
-    for sibling in siblings:
-        path = sibling.get("rfilename") if isinstance(sibling, dict) else None
-        if (not isinstance(path, str) or not path or path.startswith("/") or ".." in path.split("/")
-                or "\\" in path or path in inventory):
-            raise ValueError("Hub readback has unsafe or repeated sibling path")
-        inventory[path] = sibling
-    verified = []
-    for file in source_files:
-        relative = "/".join(filter(None, (suffix, file.relative_to(source).as_posix())))
-        sibling = inventory.get(relative)
-        if sibling is None or sibling.get("size") != file.stat().st_size:
-            raise ValueError(f"Hub pinned inventory size/path mismatch: {relative}")
-        lfs = sibling.get("lfs")
-        if lfs is not None:
-            expected = lfs.get("sha256") if isinstance(lfs, dict) else None
-            if not isinstance(lfs, dict) or lfs.get("size") != file.stat().st_size or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
-                raise ValueError(f"Hub pinned LFS metadata invalid: {relative}")
-            actual = sha(file)
-            kind = "lfs_sha256"
-        else:
-            expected = sibling.get("blobId")
-            if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}", expected):
-                raise ValueError(f"Hub pinned Git blob metadata invalid: {relative}")
-            actual = git_blob_sha1(file)
-            kind = "git_blob_sha1"
-        if actual != expected:
-            raise ValueError(f"Hub pinned content mismatch: {relative}")
-        verified.append({"path": relative, "bytes": file.stat().st_size, "kind": kind, "digest": expected})
-    return {"status": "hub_content_verified", "repository": identity, "revision": revision,
-            "readback_url": url, "manifest_sha256": hashlib.sha256(raw).hexdigest(), "files": verified}
+    snapshot = source.parent if suffix else source
+    relative_files = tuple(file.relative_to(snapshot).as_posix() for file in source_files)
+    return _hub.verify_pinned_hub_files(f"{owner}/{repository}", revision, snapshot, relative_files)
 
 
 def converter_arguments(name, source, destination, bits, budget):

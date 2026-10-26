@@ -1,6 +1,7 @@
 """No-model checks for the manual iOS CPU conversion selector."""
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -110,16 +111,16 @@ class IosPrequantTests(unittest.TestCase):
                 def __enter__(self): return self
                 def __exit__(self, *_): pass
                 def read(self, size): return json.dumps(document).encode()
-            original = MODULE.urllib.request.urlopen
+            original = MODULE._hub.urllib.request.urlopen
             try:
-                MODULE.urllib.request.urlopen = lambda *_, **__: Response()
+                MODULE._hub.urllib.request.urlopen = lambda *_, **__: Response()
                 result = MODULE.verify_hub_source("iris-generation", source, [file])
                 self.assertEqual(result["status"], "hub_content_verified")
                 file.write_bytes(b"different bytes")
                 with self.assertRaisesRegex(ValueError, "size/path mismatch|content mismatch"):
                     MODULE.verify_hub_source("iris-generation", source, [file])
             finally:
-                MODULE.urllib.request.urlopen = original
+                MODULE._hub.urllib.request.urlopen = original
 
     def test_git_blob_sidecar_and_bounded_log_guard(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -129,17 +130,17 @@ class IosPrequantTests(unittest.TestCase):
             owner, repo, revision, _ = MODULE.PINS["iris-generation"]
             document = {"id": f"{owner}/{repo}", "sha": revision, "private": False,
                         "gated": False, "siblings": [{"rfilename": file.name,
-                        "size": 2, "blobId": MODULE.git_blob_sha1(file)}]}
+                        "size": 2, "blobId": hashlib.sha1(b"blob 2\0{}").hexdigest()}]}
             class Response:
                 def __enter__(self): return self
                 def __exit__(self, *_): pass
                 def read(self, size): return json.dumps(document).encode()
-            old_open = MODULE.urllib.request.urlopen
+            old_open = MODULE._hub.urllib.request.urlopen
             old_host = MODULE.host_memory
             old_limit = MODULE.MAX_LOG_BYTES
             old_floor = MODULE.DISK_FLOOR_BYTES
             try:
-                MODULE.urllib.request.urlopen = lambda *_, **__: Response()
+                MODULE._hub.urllib.request.urlopen = lambda *_, **__: Response()
                 self.assertEqual(MODULE.verify_hub_source("iris-generation", source, [file])["files"][0]["kind"],
                                  "git_blob_sha1")
                 MODULE.host_memory = lambda: {"available_bytes": 100 * MODULE.GIB}
@@ -151,10 +152,32 @@ class IosPrequantTests(unittest.TestCase):
                                        None, log, 5, MODULE.GIB, MODULE.GIB)
                 self.assertLess(log.stat().st_size, 4096)
             finally:
-                MODULE.urllib.request.urlopen = old_open
+                MODULE._hub.urllib.request.urlopen = old_open
                 MODULE.host_memory = old_host
                 MODULE.MAX_LOG_BYTES = old_limit
                 MODULE.DISK_FLOOR_BYTES = old_floor
+
+    def test_shared_hub_verifier_receives_repo_relative_subdirectory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "split_files"
+            source.mkdir()
+            file = source / "model.safetensors"
+            file.write_bytes(b"pinned")
+            owner, repo, revision, _ = MODULE.PINS["anima-turbo"]
+            document = {"id": f"{owner}/{repo}", "sha": revision, "private": False,
+                        "gated": False, "siblings": [{"rfilename": "split_files/model.safetensors",
+                        "size": 6, "lfs": {"size": 6, "sha256": MODULE.sha(file)}}]}
+            class Response:
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def read(self, size): return json.dumps(document).encode()
+            original = MODULE._hub.urllib.request.urlopen
+            try:
+                MODULE._hub.urllib.request.urlopen = lambda *_, **__: Response()
+                receipt = MODULE.verify_hub_source("anima-turbo", source, [file])
+                self.assertEqual(receipt["files"][0]["path"], "split_files/model.safetensors")
+            finally:
+                MODULE._hub.urllib.request.urlopen = original
 
 
 if __name__ == "__main__":
