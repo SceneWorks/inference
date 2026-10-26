@@ -1,10 +1,11 @@
-"""CI_IMPACT: ~0.1 s pure Python; no simulator, Metal, model, or download.
+"""CI_IMPACT: ~0.1 s pure Python and a mocked shell command; no simulator, Metal, model, or download.
 
 Covers the mandatory dispatch boundary and independent PNG-content witness for sc-16780.
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 import struct
@@ -130,6 +131,24 @@ class SimulatorSanaTests(unittest.TestCase):
                                  '--simulator', 'not-used', '--media'], capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 2)
         self.assertIn('cannot combine with other model modes', result.stderr)
+
+    def test_simulator_app_build_uses_generic_arm64_destination_then_exact_install(self):
+        source = (sim.ROOT / 'scripts/ios/run_smoke.sh').read_text(encoding='utf-8')
+        start = source.index('  xcodebuild \\', source.index('say "generating and building the app (iphonesimulator)"'))
+        end = source.index('    build 2>&1 | tail -20', start) + len('    build 2>&1 | tail -20')
+        with tempfile.TemporaryDirectory() as directory:
+            args_file = Path(directory) / 'xcodebuild-args.txt'
+            script = 'set -euo pipefail\nxcodebuild() { printf "%s\\n" "$@" > "$ARGS_FILE"; }\n' + source[start:end]
+            result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, encoding='utf-8',
+                                    env={**os.environ, 'CONFIG': 'Release', 'DERIVED': directory,
+                                         'ARGS_FILE': str(args_file), 'SIMULATOR': '11111111-1111-1111-1111-111111111111'})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = args_file.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(args[args.index('-destination') + 1], 'generic/platform=iOS Simulator')
+        self.assertEqual(args[args.index('-sdk') + 1], 'iphonesimulator')
+        self.assertIn('ARCHS=arm64', args)
+        self.assertNotIn('id=11111111-1111-1111-1111-111111111111', args)
+        self.assertIn('xcrun simctl install "$SIMULATOR" "$APP"', source)
 
     def test_dispatch_only_exact_runner(self):
         good = dict(GITHUB_EVENT_NAME='workflow_dispatch', RUNNER_NAME='nax-macos',

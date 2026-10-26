@@ -166,13 +166,16 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   CONFIG=Release
   [ "$PROFILE" = debug ] && CONFIG=Debug
   DERIVED="$ROOT/target/ios-derived-sim"
+  # A freshly created simulator may not yet appear in xcodebuild destinations. Package the
+  # arm64 simulator app generically; the selected UUID is still required for boot/install.
   xcodebuild \
     -project ios-host/SceneWorksSmoke.xcodeproj \
     -scheme SceneWorksSmoke \
     -configuration "$CONFIG" \
     -sdk iphonesimulator \
-    -destination "id=$SIMULATOR" \
+    -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath "$DERIVED" \
+    ARCHS=arm64 \
     CODE_SIGNING_ALLOWED=NO \
     build 2>&1 | tail -20
   APP=$(find "$DERIVED/Build/Products/$CONFIG-iphonesimulator" -name "SceneWorksSmoke.app" -print -quit)
