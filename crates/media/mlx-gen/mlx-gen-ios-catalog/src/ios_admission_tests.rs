@@ -745,8 +745,7 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
     assert_eq!(calls.get(), 1);
 }
 
-/// Finding 1: the capture permit is NON-circular (no evidence row consulted, the table stays
-/// empty) but only exists where quanta are bounded; it is labelled and never an admission.
+/// Resident bootstrap refuses a known nonfit before observation or tokenization.
 #[cfg(feature = "device-capture")]
 #[test]
 fn resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokenization() {
@@ -788,6 +787,9 @@ fn resident_capture_uses_the_real_key_and_refuses_before_observation_or_tokeniza
     );
 }
 
+/// Finding 1: the capture permit is NON-circular (no evidence row consulted, the table stays
+/// empty) but only exists where quanta are bounded; it is labelled and never an admission.
+#[cfg(feature = "device-capture")]
 #[test]
 fn capture_permit_needs_bounded_quanta_not_evidence() {
     let registry = crate::provider_registry().unwrap();
