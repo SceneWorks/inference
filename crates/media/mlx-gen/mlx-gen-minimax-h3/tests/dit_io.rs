@@ -145,6 +145,7 @@ fn the_context_embedder_reproduces_the_reference_projection() {
 /// `token_refiner`, which is the order the reference's `forward` applies and the order a port that
 /// refined before embedding would get wrong at the same shapes.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_model_embeds_the_context_before_refining_it() {
     let mut w = fixture();
     let cfg = dit_fixture_config();
@@ -283,7 +284,10 @@ fn the_seventeen_load_at_the_published_geometry() {
     let tiny = dit_fixture_config();
     let p = projections(&mut w, &tiny);
     assert_eq!(
-        p.time_embedder.time_embed_dim(),
+        p.time_embedder
+            .as_ref()
+            .expect("full fixture has a time embedder")
+            .time_embed_dim(),
         tiny.time_embed_dim,
         "the AdaLN projections consume this width"
     );
@@ -320,6 +324,7 @@ fn the_seventeen_load_at_the_published_geometry() {
 /// `released_bytes > 0` both still pass. Mis-partition a key (`adaln_proj` into `body`) — the
 /// `[38, 4, 20]` split reds.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() {
     use mlx_gen_minimax_h3::denoise::{adaln_schedule, JointSchedule};
     use mlx_gen_minimax_h3::{
@@ -385,6 +390,7 @@ fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() 
 /// scatter into the packed sequence, the row-major patch order, the two distinct index tensors, and
 /// the output heads' row selection. Each of those is a shape-identical mistake on its own.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_whole_model_reproduces_the_reference_velocity() {
     let mut w = fixture();
     let cfg = dit_fixture_config();

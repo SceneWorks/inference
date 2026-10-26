@@ -358,6 +358,7 @@ impl Sources {
         for key in spec.components.keys() {
             if ![
                 MOSS_SHARED_SNAPSHOT_COMPONENT,
+                mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT,
                 DMD_LORA_COMPONENT,
                 DMD_TIME_COMPONENT,
                 DMD_DATASPACE_COMPONENT,
@@ -369,10 +370,10 @@ impl Sources {
             }
         }
         if variant == MossImageVariant::Base
-            && spec
-                .components
-                .keys()
-                .any(|id| id != MOSS_SHARED_SNAPSHOT_COMPONENT)
+            && spec.components.keys().any(|id| {
+                id != MOSS_SHARED_SNAPSHOT_COMPONENT
+                    && id != mlx_gen::gen_core::moss_image_edit::EDIT_COMPONENT
+            })
         {
             return Err(Error::Unsupported("Base cannot load SFT-only DMD components; use the exact SFT parent for optional acceleration".into()));
         }

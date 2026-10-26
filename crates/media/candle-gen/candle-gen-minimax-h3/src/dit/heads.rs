@@ -311,22 +311,46 @@ pub struct NormOutModulation {
 #[derive(Debug, Clone)]
 pub struct AdaLayerNormOut {
     norm: RmsNorm,
-    linear: LinearBias,
+    /// `None` on the pruned (sc-26684) path, where `norm_out.linear` is the reduced curve
+    /// projection held by [`crate::dit::curve::CurveAdaLn`] — the full-width linear is absent from
+    /// the checkpoint, and a `None` here is the typed statement of that instead of a fabricated
+    /// shape.
+    linear: Option<LinearBias>,
     hidden_size: usize,
 }
 
 impl AdaLayerNormOut {
     /// Load `{prefix}.norm` / `{prefix}.linear` (e.g. `norm_out`).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+        Self::load(w, prefix, cfg, true)
+    }
+
+    /// [`Self::from_weights`] for a pruned checkpoint: the norm loads, the full-width `linear`
+    /// does not exist to load.
+    pub fn from_weights_curve(w: &Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+        Self::load(w, prefix, cfg, false)
+    }
+
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &MiniMaxH3DitConfig,
+        with_linear: bool,
+    ) -> Result<Self> {
         let dtype = w.require(&format!("{prefix}.norm.weight"))?.dtype();
-        Ok(Self {
-            norm: RmsNorm::from_weights(w, &format!("{prefix}.norm"), cfg.final_norm_eps, dtype)?,
-            linear: LinearBias::from_weights(
+        let linear = if with_linear {
+            Some(LinearBias::from_weights(
                 w,
                 &format!("{prefix}.linear"),
                 cfg.time_embed_dim,
                 2 * cfg.hidden_size,
-            )?,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            norm: RmsNorm::from_weights(w, &format!("{prefix}.norm"), cfg.final_norm_eps, dtype)?,
+            linear,
             hidden_size: cfg.hidden_size,
         })
     }
@@ -340,7 +364,7 @@ impl AdaLayerNormOut {
 
     /// Device bytes held.
     pub fn nbytes(&self) -> usize {
-        self.linear.nbytes()
+        self.linear.as_ref().map(LinearBias::nbytes).unwrap_or(0)
     }
 
     /// Project the timestep embedding into `(shift, scale)` — **shift is the FIRST half**.
@@ -348,6 +372,15 @@ impl AdaLayerNormOut {
     /// As in [`crate::dit::block::AdaLnProjection::forward`], the activation runs at `temb`'s own
     /// (float32) precision and only its result is cast to the projection's dtype.
     pub fn modulation(&self, temb: &Tensor) -> Result<NormOutModulation> {
+        let linear = self.linear.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "minimax-h3 dit norm_out: this checkpoint is modulation-pruned (sc-26684); the \
+                 reduced `norm_out.linear` lives on the curve loader, whose \
+                 `CurveAdaLn::norm_out_modulation` projects it — there is no full-width linear to \
+                 run here"
+                    .into(),
+            )
+        })?;
         let s = temb.dims();
         if s.len() != 2 {
             return Err(CandleError::Msg(format!(
@@ -355,7 +388,7 @@ impl AdaLayerNormOut {
                  {s:?}"
             )));
         }
-        let projected = self.linear.forward(&silu(temb)?)?;
+        let projected = linear.forward(&silu(temb)?)?;
         Ok(NormOutModulation {
             shift: projected.narrow(1, 0, self.hidden_size)?.contiguous()?,
             scale: projected
@@ -451,8 +484,10 @@ pub struct DitProjections {
     /// The text encoder's 5120-wide context → the residual stream. bfloat16, and it runs **before**
     /// the token refiner.
     pub context_embedder: LinearBias,
-    /// `time_proj` + `time_embedder`. **float32**.
-    pub time_embedder: TimestepEmbedder,
+    /// `time_proj` + `time_embedder`. **float32**. `None` on the pruned (sc-26684) path, where the
+    /// direct curve table replaces the timestep MLP — reading it there is a typed error, never a
+    /// fallback to reconstructed weights.
+    pub time_embedder: Option<TimestepEmbedder>,
     /// The packed sequence's final modulated norm. bfloat16.
     pub norm_out: AdaLayerNormOut,
     /// The residual stream → the video patch dim. **float32**.
@@ -462,8 +497,11 @@ pub struct DitProjections {
 }
 
 impl DitProjections {
-    /// Tensors this module owns — exactly 17 in the published checkpoint.
+    /// Tensors this module owns — exactly 17 in the published checkpoint; 14 on the pruned path,
+    /// where the four `time_embedder` tensors are one `adaln_t_table`.
     pub const TENSOR_COUNT: usize = 17;
+    /// Tensors this module owns on the pruned (sc-26684) path.
+    pub const CURVE_TENSOR_COUNT: usize = 14;
 
     /// Load all 17, at their stored dtypes.
     pub fn from_weights(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
@@ -487,8 +525,48 @@ impl DitProjections {
                 cfg.text_dim,
                 cfg.hidden_size,
             )?,
-            time_embedder: TimestepEmbedder::from_weights(w, "time_embedder", cfg)?,
+            time_embedder: Some(TimestepEmbedder::from_weights(w, "time_embedder", cfg)?),
             norm_out: AdaLayerNormOut::from_weights(w, "norm_out", cfg)?,
+            proj_out: LinearBias::from_weights(
+                w,
+                "proj_out",
+                cfg.hidden_size,
+                cfg.video_patch_dim(),
+            )?,
+            audio_proj_out: LinearBias::from_weights(
+                w,
+                "audio_proj_out",
+                cfg.hidden_size,
+                cfg.audio_in_channels,
+            )?,
+        })
+    }
+
+    /// Load the pruned (sc-26684) set: no `time_embedder`, and `norm_out.linear` is the reduced
+    /// curve projection held by [`crate::dit::curve::CurveAdaLn`].
+    pub fn from_weights_curve(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+        cfg.validate()?;
+        Ok(Self {
+            proj_in: LinearBias::from_weights(
+                w,
+                "proj_in",
+                cfg.video_patch_dim(),
+                cfg.hidden_size,
+            )?,
+            audio_proj_in: LinearBias::from_weights(
+                w,
+                "audio_proj_in",
+                cfg.audio_in_channels,
+                cfg.hidden_size,
+            )?,
+            context_embedder: LinearBias::from_weights(
+                w,
+                "context_embedder",
+                cfg.text_dim,
+                cfg.hidden_size,
+            )?,
+            time_embedder: None,
+            norm_out: AdaLayerNormOut::from_weights_curve(w, "norm_out", cfg)?,
             proj_out: LinearBias::from_weights(
                 w,
                 "proj_out",
@@ -516,12 +594,30 @@ impl DitProjections {
         v
     }
 
+    /// Every tensor name these projections consume — the pruned (sc-26684) set: the table in
+    /// place of the four `time_embedder` tensors, and `norm_out.linear` reduced.
+    pub fn names_curve() -> Vec<String> {
+        let mut v = LinearBias::names("proj_in").to_vec();
+        v.extend(LinearBias::names("audio_proj_in"));
+        v.extend(LinearBias::names("context_embedder"));
+        v.push(candle_gen::gen_core::pruned_adaln::TABLE_KEY.to_string());
+        v.extend(RmsNorm::names("norm_out.norm"));
+        v.extend(LinearBias::names("norm_out.linear"));
+        v.extend(LinearBias::names("proj_out"));
+        v.extend(LinearBias::names("audio_proj_out"));
+        v
+    }
+
     /// Device bytes the 17 hold — small next to the stack, and the only float32 weights in the DiT.
     pub fn nbytes(&self) -> usize {
         self.proj_in.nbytes()
             + self.audio_proj_in.nbytes()
             + self.context_embedder.nbytes()
-            + self.time_embedder.nbytes()
+            + self
+                .time_embedder
+                .as_ref()
+                .map(TimestepEmbedder::nbytes)
+                .unwrap_or(0)
             + self.norm_out.nbytes()
             + self.proj_out.nbytes()
             + self.audio_proj_out.nbytes()

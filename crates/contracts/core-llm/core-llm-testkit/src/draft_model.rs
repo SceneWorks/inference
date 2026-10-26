@@ -1318,6 +1318,7 @@ pub fn check_draft_model_stop_token(
         .ok_or("a resident draft does not advertise `draft_model`")?;
     let penalized = Sampling {
         presence_penalty: 0.01,
+        presence_penalty_generated_only: false,
         ..Sampling::greedy()
     };
     let cold = Sampling {

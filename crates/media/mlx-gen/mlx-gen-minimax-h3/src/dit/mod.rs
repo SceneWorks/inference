@@ -48,6 +48,7 @@ pub mod heads;
 pub mod layers;
 pub mod model;
 pub mod positions;
+pub mod pruned_adaln;
 pub mod qkv;
 pub mod refiner;
 pub mod rope;
@@ -60,11 +61,16 @@ pub use heads::{
     TimestepEmbedder,
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
+pub use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 pub use model::{JointDit, MiniMaxH3Dit, PUBLISHED_DIT_TENSORS};
 pub use positions::{
     audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids, spatial_axis_grid,
     temporal_grid, text_position_ids, video_position_ids, KeyframeAnchor, AUDIO_CHANNELS,
     ROPE_FRAMES_PER_LATENT, ROPE_FRAME_RESCALE, ROPE_SPATIAL_SCALE,
+};
+pub use pruned_adaln::{
+    detect, PrunedAdaLnProjection, PrunedAdaLnRuntime, PrunedFinalProjection, PrunedReducedLinear,
+    PrunedTable,
 };
 pub use refiner::{TokenRefiner, TokenRefinerBlock};
 pub use rope::{MmRope, MmRopeTables};

@@ -1,9 +1,9 @@
 //! MOSS FP32 arithmetic must stay FP32 even when MLX enables TF32 on NAX hardware.
 use mlx_gen::attention::slice_axis;
 use mlx_gen::{CancelFlag, Result};
-use mlx_rs::ops::{concatenate_axis, multiply, softmax_axis};
+use mlx_rs::ops::{concatenate_axis, divide, multiply, softmax_axis, subtract};
 use mlx_rs::transforms::eval;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// Compute x W^T with independent column vectors, so the pinned Metal dispatcher retains N=1
 /// and uses float-accumulating GEMV. W broadcasts as a view; it is not replicated per token.
@@ -51,10 +51,142 @@ pub(crate) fn attention_fp32(
     Ok(concatenate_axis(&refs, 2)?)
 }
 
+/// Query tiling bounds the source-faithful BF16 fallback without truncating keys.
+/// Eight reuses the existing F32 correctness bound; it is not a measured throughput optimum.
+const EDIT_QUERY_ROWS: usize = 8;
+
+fn edit_query_chunks(
+    rows: i32,
+    cancel: &CancelFlag,
+    mut run: impl FnMut(i32, i32) -> Result<()>,
+) -> Result<()> {
+    for start in (0..rows).step_by(EDIT_QUERY_ROWS) {
+        super::transformer::check(cancel)?;
+        run(start, (EDIT_QUERY_ROWS as i32).min(rows - start))?;
+        super::transformer::check(cancel)?;
+    }
+    Ok(())
+}
+
+/// Upper bound for this function's additional arrays, excluding the borrowed BF16 Q/K/V.
+/// Per tile: dot, scaled/centered scores, exponential, rounded BF16 operand and widened
+/// operand = 22 bytes per score. Q cast, numerator and normalized result = 12 bytes
+/// per query channel; max/sum reductions = 8 bytes per query/head. BF16 results are
+/// counted with the retained outputs below.
+/// Persistent K/V casts = 8 bytes per key channel; retained chunks plus concatenation
+/// = 2 bytes per output channel during tiles, 4 during concatenation. Those phases
+/// cannot overlap: the tile graph is evaluated and dropped before advancing.
+pub(crate) fn edit_attention_workspace(rows: u64, keys: u64, dim: u64, heads: u64) -> Option<u64> {
+    let tile = rows.min(EDIT_QUERY_ROWS as u64);
+    let scores = tile
+        .checked_mul(keys)?
+        .checked_mul(heads)?
+        .checked_mul(22)?;
+    let query = tile.checked_mul(dim)?.checked_mul(12)?;
+    let reductions = tile.checked_mul(heads)?.checked_mul(8)?;
+    let casts = keys.checked_mul(dim)?.checked_mul(8)?;
+    let outputs = rows.checked_mul(dim)?.checked_mul(2)?;
+    let tile_peak = scores
+        .checked_add(query)?
+        .checked_add(reductions)?
+        .checked_add(outputs)?;
+    casts.checked_add(tile_peak.max(outputs.checked_mul(2)?))
+}
+
+/// Match the frozen PyTorch BF16 SDPA operand boundary, also used by Candle edit.
+/// Exponentials are rounded BEFORE the value product, while the normalization sum
+/// and products remain F32. GEMV avoids NAX TF32 arithmetic; K/V broadcast as views.
+/// This is edit-only: ordinary/DMD attention and the existing F32 path are unchanged.
+pub(crate) fn attention_edit_bf16(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    cancel: &CancelFlag,
+) -> Result<Array> {
+    super::transformer::check(cancel)?;
+    let keys = k.as_dtype(Dtype::Float32)?;
+    let values = v.as_dtype(Dtype::Float32)?.transpose_axes(&[0, 1, 3, 2])?;
+    eval([&keys, &values])?;
+    let divisor = Array::from_slice(&[(q.shape()[3] as f32).sqrt()], &[1]);
+    let mut outputs = Vec::new();
+    edit_query_chunks(q.shape()[2], cancel, |start, length| {
+        let output = {
+            let query = slice_axis(q, 2, start, length)?.as_dtype(Dtype::Float32)?;
+            let dot = keys
+                .expand_dims(2)?
+                .matmul(&query.expand_dims(-1)?)?
+                .squeeze_axes(&[-1])?;
+            let scores = divide(&dot, &divisor)?;
+            let centered = subtract(&scores, scores.max_axis(-1, true)?)?;
+            let exponentials = centered.exp()?;
+            let denominator = exponentials.sum_axis(-1, true)?;
+            let rounded = exponentials.as_dtype(Dtype::Bfloat16)?;
+            let operand = rounded.as_dtype(Dtype::Float32)?;
+            let numerator = values
+                .expand_dims(2)?
+                .matmul(&operand.expand_dims(-1)?)?
+                .squeeze_axes(&[-1])?;
+            let normalized = divide(&numerator, &denominator)?;
+            let output = normalized.as_dtype(Dtype::Bfloat16)?;
+            eval([&output])?;
+            // All named tile arrays and their completed lazy graph leave this scope.
+            output
+        };
+        outputs.push(output);
+        Ok(())
+    })?;
+    let refs: Vec<_> = outputs.iter().collect();
+    let output = concatenate_axis(&refs, 2)?;
+    eval([&output])?;
+    super::transformer::check(cancel)?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pipeline::logical_f32_readback;
+
+    #[test]
+    fn edit_attention_chunk_geometry_and_cancellation_cpu() {
+        let cancel = CancelFlag::new();
+        let mut chunks = Vec::new();
+        edit_query_chunks(19, &cancel, |start, count| {
+            chunks.push((start, count));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(chunks, [(0, 8), (8, 8), (16, 3)]);
+        let mut calls = 0;
+        assert!(matches!(
+            edit_query_chunks(19, &cancel, |_, _| {
+                calls += 1;
+                cancel.cancel();
+                Ok(())
+            }),
+            Err(mlx_gen::Error::Canceled)
+        ));
+        assert_eq!(calls, 1, "cancellation stops before another tile");
+        assert!(matches!(
+            edit_query_chunks(19, &cancel, |_, _| panic!("cancelled work started")),
+            Err(mlx_gen::Error::Canceled)
+        ));
+    }
+
+    #[test]
+    fn edit_attention_workspace_checked_cpu() {
+        // Independently sum live byte widths for H2,D16,Q19,K23 and an 8-query tile.
+        assert_eq!(
+            edit_attention_workspace(19, 23, 16, 2),
+            Some(22 * 8 * 23 * 2 + 12 * 8 * 16 + 8 * 8 * 2 + 8 * 23 * 16 + 2 * 19 * 16)
+        );
+        assert_eq!(
+            edit_attention_workspace(3, 23, 16, 2),
+            Some(22 * 3 * 23 * 2 + 12 * 3 * 16 + 8 * 3 * 2 + 8 * 23 * 16 + 2 * 3 * 16)
+        );
+        assert!(edit_attention_workspace(19, u64::MAX, 16, 2).is_none());
+        assert!(edit_attention_workspace(u64::MAX, 23, 16, 2).is_none());
+    }
 
     fn values(n: usize, phase: f32) -> Vec<f32> {
         (0..n)

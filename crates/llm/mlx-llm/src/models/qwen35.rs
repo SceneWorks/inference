@@ -19,7 +19,9 @@
 
 use std::cell::Cell;
 
-use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
+use mlx_rs::ops::{
+    add, concatenate_axis, mean_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis,
+};
 use mlx_rs::transforms::async_eval;
 use mlx_rs::{Array, Dtype};
 
@@ -27,7 +29,8 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, causal_depthwise_conv_traced_f32_accum, compute_g,
+    rms_norm_gated, ConvTrace, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -46,6 +49,91 @@ fn checkpoint_norm_weight(weight: Array, prism: bool) -> Result<Array> {
             &weight,
             &Array::from_f32(1.0).as_dtype(weight.dtype())?,
         )?)
+    }
+}
+
+/// The shared decoder keeps its established MLX-LM arithmetic. MOSS explicitly selects
+/// the frozen Transformers intermediate precision without changing BF16 projections/outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PrecisionProfile {
+    #[default]
+    Native,
+    MossFrozenHf,
+}
+
+impl PrecisionProfile {
+    fn norm_weight(self, weight: Array, prism: bool) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            debug_assert!(!prism);
+            Ok(add(
+                &weight.as_dtype(Dtype::Float32)?,
+                Array::from_f32(1.0),
+            )?)
+        } else {
+            checkpoint_norm_weight(weight, prism)
+        }
+    }
+
+    fn norm(self, x: &Array, weight: &Array, eps: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            // Both fused-kernel inputs are F32, so normalization AND multiplication precede
+            // the single output narrowing, without relying on mixed-input promotion.
+            Ok(rms_norm(&x.as_dtype(Dtype::Float32)?, weight, eps)?.as_dtype(x.dtype())?)
+        } else {
+            rms_norm(x, weight, eps)
+        }
+    }
+
+    fn scaled_query(self, normalized: &Array, inverse_head_dim: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            scale(&normalized.as_dtype(Dtype::Float32)?, inverse_head_dim)
+        } else {
+            scale(normalized, inverse_head_dim)
+        }
+    }
+
+    fn gated_norm(self, x: &Array, weight: &Array, gate: &Array, eps: f32) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            // Frozen Qwen3_5RMSNormGated differs from its zero-centered RMSNorm:
+            // narrow the normalized values BEFORE the direct weight multiplication,
+            // then apply the F32 SiLU gate before the final narrowing.
+            let x32 = x.as_dtype(Dtype::Float32)?;
+            let variance = mean_axis(&multiply(&x32, &x32)?, -1, true)?;
+            let normalized = multiply(&x32, &rsqrt(&add(&variance, Array::from_f32(eps))?)?)?
+                .as_dtype(x.dtype())?;
+            let weighted = multiply(weight, &normalized)?;
+            Ok(multiply(
+                &weighted.as_dtype(Dtype::Float32)?,
+                &silu(&gate.as_dtype(Dtype::Float32)?)?,
+            )?
+            .as_dtype(x.dtype())?)
+        } else {
+            rms_norm_gated(x, weight, gate, eps)
+        }
+    }
+
+    fn convolve(self, x: &Array, weight: &Array, state: &Array) -> Result<(Array, ConvTrace)> {
+        if self == Self::MossFrozenHf {
+            causal_depthwise_conv_traced_f32_accum(x, weight, state)
+        } else {
+            causal_depthwise_conv_traced(x, weight, state)
+        }
+    }
+
+    fn silu(self, x: &Array) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            Ok(silu(&x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
+        } else {
+            silu(x)
+        }
+    }
+
+    fn decay(self, a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
+        if self == Self::MossFrozenHf {
+            compute_g(&a.as_dtype(Dtype::Float32)?, a_log, dt_bias)
+        } else {
+            compute_g(a, a_log, dt_bias)
+        }
     }
 }
 
@@ -363,6 +451,7 @@ fn l2norm(x: &Array, eps: f32) -> Result<Array> {
 /// `[key_dim, key_dim, value_dim]` channels (no head interleaving).
 #[derive(Debug)]
 struct GatedDeltaNet {
+    precision: PrecisionProfile,
     in_proj_qkv: Projection, // [key_dim·2 + value_dim, hidden]  → conv'd
     in_proj_z: Projection,   // [value_dim, hidden]              → output gate
     in_proj_a: Projection,   // [Hv, hidden]                     → decay input
@@ -384,6 +473,11 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn normalize_output(&self, x: &Array, gate: &Array) -> Result<Array> {
+        self.precision
+            .gated_norm(x, &self.norm_weight, gate, self.eps)
+    }
+
     fn push_arrays(&self, out: &mut Vec<Array>) {
         for p in [
             &self.in_proj_qkv,
@@ -423,7 +517,8 @@ impl GatedDeltaNet {
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
         let (conv_out, conv_trace) =
-            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
+            self.precision
+                .convolve(&mixed, &self.conv_weight, &conv_state)?;
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -431,7 +526,7 @@ impl GatedDeltaNet {
 
         // L2-normalize q/k (eps 1e-6), then scale q by 1/√head_k_dim — `use_qk_l2norm_in_kernel`.
         let inv = (self.head_k_dim as f32).powf(-0.5);
-        let qn = scale(&l2norm(&qc, 1e-6)?, inv)?;
+        let qn = self.precision.scaled_query(&l2norm(&qc, 1e-6)?, inv)?;
         let kn = l2norm(&kc, 1e-6)?;
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA
@@ -439,7 +534,7 @@ impl GatedDeltaNet {
         // The cache advances itself: an armed (speculative verify) forward also keeps every
         // token's state for the checkpoint ring (sc-24435).
         let beta = sigmoid(&b_in)?;
-        let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
+        let g = self.precision.decay(&a_in, &self.a_log, &self.dt_bias)?;
         let f32 = Dtype::Float32;
         let y = cache.advance(
             conv_trace,
@@ -451,7 +546,7 @@ impl GatedDeltaNet {
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
-        let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
+        let out = self.normalize_output(&y.as_dtype(dt)?, &z)?;
         self.out_proj
             .forward(&out.reshape(&[b, s, self.value_dim])?)
     }
@@ -460,6 +555,7 @@ impl GatedDeltaNet {
 /// The gated full-attention layer (`Qwen3NextAttention`).
 #[derive(Debug)]
 struct Qwen35Attention {
+    precision: PrecisionProfile,
     q_proj: Projection, // out = num_heads · head_dim · 2 (queries ‖ gate)
     k_proj: Projection,
     v_proj: Projection,
@@ -490,10 +586,10 @@ impl Qwen35Attention {
             .forward(x)?
             .reshape(&[b, s, self.num_heads, 2 * self.head_dim])?;
         let qp = split_sections(&qg, &[self.head_dim], 3)?;
-        let q = rms_norm(&qp[0], &self.q_norm, self.eps)?; // [B,S,H,hd]
+        let q = self.precision.norm(&qp[0], &self.q_norm, self.eps)?; // [B,S,H,hd]
         let gate = qp[1].reshape(&[b, s, self.num_heads * self.head_dim])?;
 
-        let k = rms_norm(
+        let k = self.precision.norm(
             &self
                 .k_proj
                 .forward(x)?
@@ -537,8 +633,8 @@ impl Mlp {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let gate = silu(&self.gate.forward(x)?)?;
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
+        let gate = precision.silu(&self.gate.forward(x)?)?;
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&gate, &up)?)
     }
@@ -563,9 +659,9 @@ impl Ffn {
         }
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array, precision: PrecisionProfile) -> Result<Array> {
         match self {
-            Ffn::Dense(m) => m.forward(x),
+            Ffn::Dense(m) => m.forward(x, precision),
             Ffn::Moe(m) => m.forward(x),
         }
     }
@@ -579,6 +675,7 @@ enum Mixer {
 
 #[derive(Debug)]
 struct DecoderLayer {
+    precision: PrecisionProfile,
     input_ln: Array,
     post_ln: Array,
     mixer: Mixer,
@@ -605,14 +702,17 @@ impl DecoderLayer {
         sin: &Array,
         cache: &mut Qwen35LayerCache,
     ) -> Result<Array> {
-        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let normed = self.precision.norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
             (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
             (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(&normed, cos, sin, c)?,
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
         let h = add(x, &r)?;
-        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        let m = self.ffn.forward(
+            &self.precision.norm(&h, &self.post_ln, self.eps)?,
+            self.precision,
+        )?;
         Ok(add(&h, &m)?)
     }
 }
@@ -1030,6 +1130,7 @@ impl Qwen35Cache {
 /// A loaded Qwen3.6 (`qwen3_5`) hybrid decoder.
 #[derive(Debug)]
 pub struct Qwen35Model {
+    precision: PrecisionProfile,
     embed_tokens: TokenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Array,
@@ -1252,7 +1353,7 @@ impl Qwen35Model {
             |h, (layer, slot)| layer.forward(&h, &cos, &sin, slot),
             &mut *hook,
         )?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         hook(self.layers.len() + 1, &normalized)?;
         Ok(normalized)
     }
@@ -1274,7 +1375,7 @@ impl Qwen35Model {
         offset: i32,
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
@@ -1287,7 +1388,7 @@ impl Qwen35Model {
         offset: i32,
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
         let logits = self.language_head()?.forward(&last)?;
@@ -1326,7 +1427,7 @@ impl Qwen35Model {
             layers.len(),
             |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
@@ -1355,7 +1456,7 @@ impl Qwen35Model {
             layers.len(),
             |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
-        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        let normalized = self.precision.norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
         let logits = self.language_head()?.forward(&last)?;
@@ -1485,7 +1586,7 @@ impl Qwen35Model {
 
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
     fn project(&self, h: &Array) -> Result<Array> {
-        let normed = rms_norm(h, &self.norm, self.eps)?;
+        let normed = self.precision.norm(h, &self.norm, self.eps)?;
         self.language_head()?.forward(&normed)
     }
 
@@ -1693,9 +1794,33 @@ impl Qwen35Model {
         Self::materialized(w, Self::build_headless_lazy(w, prefix, cfg)?)
     }
 
+    /// Headless dense BF16 decoder with the frozen MOSS Transformers precision boundaries.
+    /// Norms, normalized-Q scaling, delta decay and depthwise convolution follow the frozen HF
+    /// intermediate casts; weights/projections and hidden outputs remain BF16.
+    /// Shared constructors retain their native arithmetic. This profile does not support
+    /// quantized, MoE or Prism decoders.
+    pub fn from_weights_headless_moss_frozen_hf(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+    ) -> Result<Self> {
+        Self::materialized(
+            w,
+            Self::from_weights_layout(
+                w,
+                prefix,
+                cfg,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )?,
+        )
+    }
+
     // Keep headless graph construction private: production loads cross the same coherence boundary.
     fn build_headless_lazy(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, None, None, false)
+        Self::from_weights_layout(w, prefix, cfg, None, None, false, PrecisionProfile::Native)
     }
 
     /// Build from a loaded checkpoint, optionally quantizing the large projections on load.
@@ -1730,7 +1855,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, quant, None, true)
+        Self::from_weights_layout(w, prefix, cfg, quant, None, true, PrecisionProfile::Native)
     }
 
     /// [`Qwen35Model::from_prism_weights`] without evaluating anything (see
@@ -1740,7 +1865,15 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         pack: &PrismMlxPack,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack), true)
+        Self::from_weights_layout(
+            w,
+            "language_model.model",
+            cfg,
+            None,
+            Some(pack),
+            true,
+            PrecisionProfile::Native,
+        )
     }
 
     /// The caller-owned-map load boundary: every source this constructor read is verified
@@ -1759,14 +1892,28 @@ impl Qwen35Model {
         quant: Option<QuantSpec>,
         prism: Option<&PrismMlxPack>,
         with_lm_head: bool,
+        precision: PrecisionProfile,
     ) -> Result<Self> {
+        if precision == PrecisionProfile::MossFrozenHf
+            && (with_lm_head
+                || prism.is_some()
+                || quant.is_some()
+                || cfg.quantization.is_some()
+                || cfg.moe.is_some()
+                || compute() != Dtype::Bfloat16)
+        {
+            return Err(Error::Config(
+                "MOSS frozen-HF precision requires a dense unquantized BF16 headless decoder"
+                    .into(),
+            ));
+        }
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
         // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Array> {
             let t = req(key)?;
-            checkpoint_norm_weight(t, prism.is_some())
+            precision.norm_weight(t, prism.is_some())
         };
         let stored_quant = cfg.quantization;
         if prism.is_some() && (stored_quant.is_some() || quant.is_some()) {
@@ -1840,6 +1987,7 @@ impl Qwen35Model {
                 let conv_weight = req(lp("linear_attn.conv1d.weight"))?
                     .reshape(&[conv_dim, cfg.linear_conv_kernel_dim])?;
                 Mixer::Delta(GatedDeltaNet {
+                    precision,
                     in_proj_qkv: proj_q(lp("linear_attn.in_proj_qkv.weight"))?,
                     in_proj_z: proj_q(lp("linear_attn.in_proj_z.weight"))?,
                     in_proj_a: proj_dense(lp("linear_attn.in_proj_a.weight"))?,
@@ -1861,6 +2009,7 @@ impl Qwen35Model {
                 })
             } else {
                 Mixer::Attn(Qwen35Attention {
+                    precision,
                     q_proj: proj_q(lp("self_attn.q_proj.weight"))?,
                     k_proj: proj_q(lp("self_attn.k_proj.weight"))?,
                     v_proj: proj_q(lp("self_attn.v_proj.weight"))?,
@@ -1876,6 +2025,7 @@ impl Qwen35Model {
             };
             let ffn = build_ffn(w, &dp(&format!("layers.{i}.")), &cfg, quant, &proj_q)?;
             layers.push(DecoderLayer {
+                precision,
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
                 mixer,
@@ -1923,6 +2073,7 @@ impl Qwen35Model {
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
         let model = Self {
+            precision,
             embed_tokens,
             layers,
             norm,
@@ -2135,9 +2286,11 @@ fn build_mtp_predictor(
     let eps = cfg.rms_norm_eps;
     let lp = |s: &str| format!("{prefix}layers.0.{s}");
     let layer = DecoderLayer {
+        precision: PrecisionProfile::Native,
         input_ln: norm(lp("input_layernorm.weight"))?,
         post_ln: norm(lp("post_attention_layernorm.weight"))?,
         mixer: Mixer::Attn(Qwen35Attention {
+            precision: PrecisionProfile::Native,
             q_proj: proj(lp("self_attn.q_proj.weight"))?,
             k_proj: proj(lp("self_attn.k_proj.weight"))?,
             v_proj: proj(lp("self_attn.v_proj.weight"))?,
@@ -2624,6 +2777,374 @@ pub(crate) mod tests {
             let repeated = encoder.forward_hidden(&ids, &mut cache, 0).unwrap();
             assert_eq!(host(&repeated), host(&hidden));
             assert!(encoder.forward(&ids, &mut encoder.new_cache(), 0).is_err());
+        });
+    }
+
+    #[test]
+    fn moss_frozen_hf_precision_matches_independent_cpu_cast_fixtures() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_precision.json")).unwrap();
+            let data = |case: &str, key: &str| -> Vec<f32> {
+                fixture["cases"][case][key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+                    .collect()
+            };
+            let bf = |v: &[f32], shape: &[i32]| {
+                Array::from_slice(v, shape)
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let check = |case: &str, got: &Array, tolerance: f32| {
+                let expected = data(case, "expected");
+                let old = data(case, "old");
+                assert!(expected
+                    .iter()
+                    .zip(&old)
+                    .any(|(a, b)| (a - b).abs() > tolerance));
+                for (actual, expected) in host(got).iter().zip(&expected) {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{case}: {actual} != {expected}"
+                    );
+                }
+            };
+            let hf = PrecisionProfile::MossFrozenHf;
+            let native = PrecisionProfile::default();
+            assert_eq!(native, PrecisionProfile::Native);
+            let a = bf(&data("decay", "a"), &[1, 1, 16]);
+            let log = bf(&data("decay", "a_log"), &[16]);
+            let bias = bf(&data("decay", "bias"), &[16]);
+            let decay = hf.decay(&a, &log, &bias).unwrap();
+            assert_eq!(decay.dtype(), Dtype::Float32);
+            check("decay", &decay, 2e-7);
+            assert_eq!(
+                host(&native.decay(&a, &log, &bias).unwrap()),
+                host(&compute_g(&a, &log, &bias).unwrap())
+            );
+            assert_ne!(host(&decay), host(&native.decay(&a, &log, &bias).unwrap()));
+
+            let q = bf(&data("query", "normalized"), &[1, 128]);
+            let inverse = fixture["cases"]["query"]["inverse_head_dim"]
+                .as_f64()
+                .unwrap() as f32;
+            let scaled = hf.scaled_query(&q, inverse).unwrap();
+            assert_eq!(scaled.dtype(), Dtype::Float32);
+            check("query", &scaled, 1e-8);
+            assert_eq!(
+                host(&native.scaled_query(&q, inverse).unwrap()),
+                host(&scale(&q, inverse).unwrap())
+            );
+            assert_ne!(
+                host(&scaled),
+                host(&native.scaled_query(&q, inverse).unwrap())
+            );
+
+            let x = bf(&data("norm", "x"), &[2, 8]);
+            let source = bf(&data("norm", "weight"), &[8]);
+            let multiplier = hf.norm_weight(source.clone(), false).unwrap();
+            let old_multiplier = native.norm_weight(source.clone(), false).unwrap();
+            assert_eq!(multiplier.dtype(), Dtype::Float32);
+            assert_eq!(old_multiplier.dtype(), Dtype::Bfloat16);
+            assert_eq!(
+                host(&old_multiplier),
+                host(&checkpoint_norm_weight(source.clone(), false).unwrap())
+            );
+            assert_eq!(
+                host(&native.norm_weight(source.clone(), true).unwrap()),
+                host(&source)
+            );
+            let norm = hf.norm(&x, &multiplier, 1e-6).unwrap();
+            assert_eq!(norm.dtype(), Dtype::Bfloat16);
+            check("norm", &norm, 0.0);
+            assert_ne!(
+                host(&norm),
+                host(
+                    &hf.norm(&x, &old_multiplier.as_dtype(Dtype::Float32).unwrap(), 1e-6)
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                host(&native.norm(&x, &old_multiplier, 1e-6).unwrap()),
+                host(&rms_norm(&x, &old_multiplier, 1e-6).unwrap())
+            );
+        });
+    }
+
+    #[test]
+    fn moss_delta_output_norm_matches_frozen_hf_cpu_and_preserves_native() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_gated_norm.json")).unwrap();
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let weights = Weights::from_map(synthetic_tensors_with_prefix(&cfg, prefix));
+            let mut model = Qwen35Model::from_weights_layout(
+                &weights,
+                prefix,
+                cfg,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )
+            .unwrap();
+            let delta = model
+                .layers
+                .iter_mut()
+                .find_map(|layer| {
+                    if let Mixer::Delta(delta) = &mut layer.mixer {
+                        Some(delta)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(delta.precision, PrecisionProfile::MossFrozenHf);
+            let mut distinguished_native = false;
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| {
+                            value.as_array().map_or_else(
+                                || vec![value.as_f64().unwrap() as f32],
+                                |row| row.iter().map(|x| x.as_f64().unwrap() as f32).collect(),
+                            )
+                        })
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 2]);
+                let gate = bf("gate", &[1, 2]);
+                delta.norm_weight = bf("weight", &[2]);
+                delta.eps = case["eps"].as_f64().unwrap() as f32;
+                let expected = values("expected");
+                assert_ne!(
+                    expected,
+                    values("wrong_fused_norm_early_gate"),
+                    "fixture must reject incorrect casts"
+                );
+                delta.precision = PrecisionProfile::MossFrozenHf;
+                let actual = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), expected, "{}", case["name"]);
+                delta.precision = PrecisionProfile::Native;
+                let native = delta.normalize_output(&x, &gate).unwrap();
+                assert_eq!(
+                    host(&native),
+                    host(&rms_norm_gated(&x, &delta.norm_weight, &gate, delta.eps).unwrap()),
+                );
+                distinguished_native |= host(&native) != expected;
+                if case["name"] == "sigmoid_rounding_dense_ffn" {
+                    let identity = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let gates = values("gate");
+                    let gate_weight = Array::from_slice(&[gates[0], 0., 0., gates[1]], &[2, 2])
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap();
+                    let ffn = Ffn::Dense(Mlp {
+                        gate: Projection::load(gate_weight, None).unwrap(),
+                        up: Projection::load(identity.clone(), None).unwrap(),
+                        down: Projection::load(identity, None).unwrap(),
+                    });
+                    assert_eq!(
+                        host(&ffn.forward(&x, PrecisionProfile::MossFrozenHf).unwrap()),
+                        expected,
+                    );
+                    let native = ffn.forward(&x, PrecisionProfile::Native).unwrap();
+                    assert_eq!(host(&native), values("wrong_fused_norm_early_gate"));
+                }
+            }
+            assert!(
+                distinguished_native,
+                "fixtures must discriminate the unchanged Native path"
+            );
+        });
+    }
+
+    #[test]
+    fn moss_frozen_hf_conv_matches_cpu_oracle_and_preserves_native_trace() {
+        on_cpu(|| {
+            let fixture: serde_json::Value =
+                serde_json::from_str(include_str!("testdata/moss_qwen_conv.json")).unwrap();
+            for case in fixture["cases"].as_array().unwrap() {
+                let values = |key: &str| -> Vec<f32> {
+                    case[key]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_f64().unwrap() as f32)
+                        .collect()
+                };
+                let bf = |key: &str, shape: &[i32]| {
+                    Array::from_slice(&values(key), shape)
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap()
+                };
+                let x = bf("x", &[1, 4, 1]);
+                let weight = bf("weight", &[1, 4]);
+                let state = bf("state", &[1, 3, 1]);
+                let (actual, trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                assert_eq!(actual.dtype(), Dtype::Bfloat16);
+                assert_eq!(actual.shape(), x.shape());
+                assert_eq!(host(&actual), values("expected"));
+                if case["name"] == "tap_rounding" {
+                    assert_ne!(host(&actual), values("old"));
+                } else {
+                    assert_ne!(host(&actual), values("wrong_post_silu_narrowing"));
+                }
+                let (native, native_trace) = PrecisionProfile::Native
+                    .convolve(&x, &weight, &state)
+                    .unwrap();
+                let (old, old_trace) = causal_depthwise_conv_traced(&x, &weight, &state).unwrap();
+                assert_eq!(host(&native), values("old"));
+                assert_eq!(host(&native), host(&old));
+                assert_eq!(trace.tokens(), 4);
+                assert_eq!(trace.tail_len(), 3);
+                for token in 0..4 {
+                    let tail = trace.tail_after(token).unwrap();
+                    assert_eq!(tail.dtype(), Dtype::Bfloat16);
+                    assert_eq!(tail.shape(), &[1, 3, 1]);
+                    assert_eq!(host(&tail), host(&native_trace.tail_after(token).unwrap()));
+                    assert_eq!(host(&tail), host(&old_trace.tail_after(token).unwrap()));
+                }
+                assert_eq!(host(&trace.tail_after(3).unwrap()), values("tail"));
+                let first = x.take_axis(Array::from_slice(&[0i32, 1], &[2]), 1).unwrap();
+                let second = x.take_axis(Array::from_slice(&[2i32, 3], &[2]), 1).unwrap();
+                let (head, head_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&first, &weight, &state)
+                    .unwrap();
+                let (tail, tail_trace) = PrecisionProfile::MossFrozenHf
+                    .convolve(&second, &weight, &head_trace.tail_after(1).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    host(&concatenate_axis(&[head, tail], 1).unwrap()),
+                    values("expected")
+                );
+                assert_eq!(host(&tail_trace.tail_after(1).unwrap()), values("tail"));
+            }
+        });
+    }
+
+    #[test]
+    fn moss_frozen_hf_headless_profile_is_scoped_and_accounts_all_norm_arrays() {
+        on_cpu(|| {
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let mut tensors = synthetic_tensors_with_prefix(&cfg, prefix);
+            tensors.remove("lm_head.weight");
+            let w = Weights::from_map(tensors);
+            let native = Qwen35Model::build_headless_lazy(&w, prefix, cfg.clone()).unwrap();
+            let hf = Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                cfg.clone(),
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf,
+            )
+            .unwrap();
+            assert_eq!(native.precision, PrecisionProfile::Native);
+            assert_eq!(hf.precision, PrecisionProfile::MossFrozenHf);
+            assert!(hf.lm_head.is_none() && hf.mtp.is_none() && !hf.prism && !hf.quantized);
+            assert_eq!(hf.norm.dtype(), Dtype::Float32);
+            let mut norm_elements = cfg.hidden_size as usize;
+            for layer in &hf.layers {
+                assert_eq!(layer.precision, PrecisionProfile::MossFrozenHf);
+                assert_eq!(layer.input_ln.dtype(), Dtype::Float32);
+                assert_eq!(layer.post_ln.dtype(), Dtype::Float32);
+                norm_elements += 2 * cfg.hidden_size as usize;
+                match &layer.mixer {
+                    Mixer::Attn(a) => {
+                        assert_eq!(a.precision, PrecisionProfile::MossFrozenHf);
+                        assert_eq!(a.q_norm.dtype(), Dtype::Float32);
+                        assert_eq!(a.k_norm.dtype(), Dtype::Float32);
+                        norm_elements += 2 * cfg.head_dim as usize;
+                    }
+                    Mixer::Delta(d) => {
+                        assert_eq!(d.precision, PrecisionProfile::MossFrozenHf);
+                        assert_eq!(d.norm_weight.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.conv_weight.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.a_log.dtype(), Dtype::Bfloat16);
+                        assert_eq!(d.dt_bias.dtype(), Dtype::Bfloat16);
+                    }
+                }
+            }
+            let bytes = |m: &Qwen35Model| {
+                m.param_groups()
+                    .iter()
+                    .flatten()
+                    .map(Array::nbytes)
+                    .sum::<usize>()
+            };
+            assert_eq!(bytes(&hf) - bytes(&native), norm_elements * 2);
+            let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+            let hidden = hf.forward_hidden(&ids, &mut hf.new_cache(), 0).unwrap();
+            assert_eq!(hidden.dtype(), Dtype::Bfloat16);
+            assert_eq!(hidden.shape(), &[1, 3, cfg.hidden_size]);
+            assert!(host(&hidden).iter().all(|x| x.is_finite()));
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                cfg.clone(),
+                None,
+                None,
+                true,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            let mut quantized = cfg.clone();
+            quantized.quantization = Some(QuantSpec {
+                group_size: 64,
+                bits: 4,
+            });
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                quantized,
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            assert!(Qwen35Model::from_weights_layout(
+                &w,
+                prefix,
+                Qwen35Config::from_json(&cfg_json_moe()).unwrap(),
+                None,
+                None,
+                false,
+                PrecisionProfile::MossFrozenHf
+            )
+            .is_err());
+            assert!(
+                with_compute_dtype(Dtype::Float32, || Qwen35Model::from_weights_layout(
+                    &w,
+                    prefix,
+                    cfg,
+                    None,
+                    None,
+                    false,
+                    PrecisionProfile::MossFrozenHf
+                ))
+                .is_err()
+            );
         });
     }
 
@@ -3161,6 +3682,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3494,6 +4017,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3598,6 +4123,8 @@ pub(crate) mod tests {
                 top_p: 0.95,
                 top_k: 20,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3675,6 +4202,8 @@ pub(crate) mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },
@@ -3857,6 +4386,7 @@ pub(crate) mod tests {
         let mk = |k: &str, shape: &[i32]| Array::from_slice(&arr(k), shape);
         let proj = |k: &str, shape: &[i32]| Projection::load(mk(k, shape), None).unwrap();
         let layer = GatedDeltaNet {
+            precision: PrecisionProfile::Native,
             in_proj_qkv: proj("in_proj_qkv", &[conv_dim, h]),
             in_proj_z: proj("in_proj_z", &[value_dim, h]),
             in_proj_a: proj("in_proj_a", &[hv, h]),
@@ -4264,8 +4794,11 @@ pub(crate) mod tests {
             let model = load_moe_mtp(&cfg, m);
             let ffn = &model.mtp.as_ref().unwrap().layers[0].ffn;
             let got = host_f32(
-                &ffn.forward(&Array::from_slice(&arr("x"), &[1, 1, h]))
-                    .unwrap(),
+                &ffn.forward(
+                    &Array::from_slice(&arr("x"), &[1, 1, h]),
+                    PrecisionProfile::Native,
+                )
+                .unwrap(),
             );
             let exp = arr("expected_output");
             let md = got

@@ -399,6 +399,7 @@ fn quant_name(q: Quant) -> &'static str {
         Quant::Q4 => "q4",
         Quant::Q8 => "q8",
         Quant::Nvfp4 => "nvfp4",
+        Quant::Fp8Rowwise => "fp8r",
     }
 }
 

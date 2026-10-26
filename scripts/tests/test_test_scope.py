@@ -221,7 +221,7 @@ class FixtureWorkspace(unittest.TestCase):
             self.assertIsNone(self.affected("Cargo.toml"), edit)
 
     def test_build_and_ci_wiring_paths_run_everything(self) -> None:
-        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py"):
+        for path in ("rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/ci.yml", "scripts/ci/test_scope.py", "scripts/ci/test_suites.py", "scripts/ci/test_suites.json"):
             self.assertIsNone(self.affected("crates/core/src/lib.rs", path), path)
         self.assertIsNone(self.affected())
 
@@ -276,11 +276,28 @@ class RealWorkspaceTests(unittest.TestCase):
         self.assertNotIn("candle-gen-flux2", affected)
         self.assertFalse({name for name in affected if name.startswith("mlx-gen-")})
 
-    def test_a_contract_change_runs_shared_crates_and_bundles_but_no_model(self) -> None:
-        affected = self.affected("crates/contracts/gen-core/src/lib.rs")
-        for shared in ("sceneworks-gen-core", "mlx-gen", "candle-gen", "mlx-gen-catalog", "runtime-macos", "runtime-cpu"):
-            self.assertIn(shared, affected)
-        self.assertFalse({name for name in affected if is_model(name)})
+    def test_a_contract_change_runs_shared_crates_bundles_and_exact_source_readers(self) -> None:
+        changed = "crates/contracts/gen-core/src/lib.rs"
+        affected = self.affected(changed)
+        shared = ("sceneworks-gen-core", "mlx-gen", "candle-gen", "mlx-gen-catalog", "runtime-macos", "runtime-cpu")
+        for name in shared:
+            self.assertIn(name, affected)
+        # FLUX3's nn.rs no-DMMV source guard recursively reads every Rust file under crates/.
+        # This is a genuine test-input edge, not propagation through the shared dependency graph.
+        reader = "candle-gen-flux3"
+        self.assertIn("crates", self.test_reads[reader])
+        self.assertEqual({name for name in affected if is_model(name)}, {reader})
+
+        # Remove ONLY that read edge on a copy: no model should remain selected, while the
+        # contract/shared/catalog/bundle dependency route stays intact. Never mutate the cache
+        # used by the other real-workspace tests.
+        without_guard = {name: set(targets) for name, targets in self.test_reads.items()}
+        without_guard[reader].remove("crates")
+        without_read = affected_packages([changed], self.ws, without_guard, self.lib_reads)
+        self.assertFalse({name for name in without_read if is_model(name)})
+        for name in shared:
+            self.assertIn(name, without_read)
+        self.assertIn("crates", self.test_reads[reader])
 
     def test_a_cross_backend_file_read_selects_the_reader(self) -> None:
         # candle-gen-minimax-h3 checks its port against mlx-gen-minimax-h3's reference source.
@@ -314,6 +331,10 @@ class WorkflowWiringTests(unittest.TestCase):
             for name in names:
                 with self.subTest(step=name):
                     step = steps[name]
+                    if job == "candle-cpu-test":
+                        group = "base" if name == "Test Candle packages" else "gen"
+                        self.assertIn(group, self.workflow["jobs"][job]["strategy"]["matrix"]["group"])
+                        self.assertEqual(step["if"], f"matrix.group == '{group}'")
                     self.assertEqual(step["env"]["TEST_SCOPE"], "${{ needs.changes.outputs.test_scope }}")
                     run = step["run"]
                     self.assertIn('scripts/ci/test_scope.py select --scope "$TEST_SCOPE"', run)

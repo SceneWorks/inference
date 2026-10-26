@@ -477,6 +477,17 @@ impl Flux2Vae {
     fn build(vb: VarBuilder, with_encoder: bool, config: &Flux2VaeDecoderConfig) -> Result<Self> {
         Self::build_profile(vb, with_encoder, config, BLOCK_OUT)
     }
+    // Private geometry seam for the independent source encoder oracle. Public constructors
+    // retain the frozen standard encoder widths, independently of decoder configuration.
+    #[cfg(test)]
+    fn build_with_encoder_channels(
+        vb: VarBuilder,
+        with_encoder: bool,
+        config: &Flux2VaeDecoderConfig,
+        encoder_channels: &[usize; 4],
+    ) -> Result<Self> {
+        Self::build_profile(vb, with_encoder, config, *encoder_channels)
+    }
     fn build_profile(
         vb: VarBuilder,
         with_encoder: bool,
@@ -864,3 +875,6 @@ mod tests {
         assert_eq!(back.flatten_all().unwrap().to_vec1::<f32>().unwrap(), data);
     }
 }
+
+#[cfg(test)]
+mod moss_edit_encoder_tests;

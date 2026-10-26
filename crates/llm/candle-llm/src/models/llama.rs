@@ -254,6 +254,8 @@ pub struct CausalLm {
     rope_full: Option<Rope>,
     cfg: ModelConfig,
     dtype: DType,
+    /// Explicit HF training buffer rounding; None preserves generation's F32 frequencies.
+    training_frequency_storage: Option<DType>,
     device: Device,
     /// Per-layer compute device — every entry equals `device` for a single-device model, and differs
     /// when the model is **pipeline-sharded** across GPUs (contiguous layer blocks per device). Drives
@@ -755,6 +757,7 @@ impl CausalLm {
             rope,
             rope_full,
             dtype,
+            training_frequency_storage: None,
             device,
             layer_devices,
             quantized: format.is_some(),
@@ -1146,6 +1149,47 @@ impl CausalLm {
         self.dtype
     }
 
+    /// Enable the pinned HF teacher's explicit Module.to(dtype) frequency-buffer
+    /// rounding. Call only on a fresh dense Qwen3-VL teacher BEFORE any forward/cache.
+    /// Ordinary constructors and generation keep their existing schedule unchanged.
+    pub fn with_training_frequency_storage(mut self) -> Result<Self> {
+        if !self.cfg.architecture.is_qwen3_vl() || self.quantized {
+            return Err(Error::Unsupported(
+                "training frequency profile requires a dense Qwen3-VL teacher".into(),
+            ));
+        }
+        if self.training_frequency_storage == Some(self.dtype) {
+            return Ok(self);
+        }
+        self.rope = self.rope.with_training_frequency_storage(self.dtype)?;
+        self.rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| r.with_training_frequency_storage(self.dtype))
+            .transpose()?;
+        // The staged-device-position path must use the SAME rounded frequencies.
+        self.device_rope = DeviceRope::new(&self.rope, &self.device)?;
+        self.device_rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| DeviceRope::new(r, &self.device))
+            .transpose()?;
+        self.training_frequency_storage = Some(self.dtype);
+        Ok(self)
+    }
+
+    pub fn training_frequency_storage_dtype(&self) -> Option<DType> {
+        self.training_frequency_storage
+    }
+
+    /// Training hidden-state cache identities must bind both compute and frequency policy.
+    pub fn precision_profile_key(&self) -> String {
+        format!(
+            "compute={:?};hf_training_frequency={:?}",
+            self.dtype, self.training_frequency_storage
+        )
+    }
+
     /// Build per-row RoPE tables for a `[rows, cols]` grid of absolute positions (row-major flat
     /// `positions`, length `rows * cols`) — the **per-sequence** position tables the batched decode
     /// (story 7255) feeds [`CausalLm::decode_logits_masked`]. Each `(cos, sin)` is
@@ -1256,6 +1300,49 @@ impl CausalLm {
     ) -> Result<Vec<Tensor>> {
         let embeds = self.embed(input_ids)?;
         self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
+    }
+
+    /// [`CausalLm::hidden_states_with_mask`] from **explicit absolute positions** rather than the
+    /// contiguous `offset..offset + seq` run — the text-encoder twin of
+    /// [`CausalLm::decode_logits_masked`] over [`CausalLm::rope_tables`]. `positions` is a
+    /// row-major `[batch, seq]` grid, so a right-padded window whose pads all sit at one position
+    /// (FLUX 3's `positions.masked_fill(mask == 0, 1)`) rotates exactly as upstream's
+    /// `position_ids`, and the additive `mask` keeps the pads out of every query's keys. Every
+    /// layer type's RoPE tables are built from the same grid, so a per-layer-type model (Gemma 4)
+    /// is served too.
+    ///
+    /// Returns the same `num_layers + 1` HF-ordered stack as [`CausalLm::hidden_states`].
+    pub fn hidden_states_with_mask_at(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Tensor>> {
+        let (b, s) = input_ids.dims2()?;
+        if positions.len() != b * s {
+            return Err(Error::Msg(format!(
+                "hidden_states_with_mask_at: {} positions for a {b}x{s} window",
+                positions.len()
+            )));
+        }
+        let embeds = self.embed(input_ids)?;
+        let tables = self.rope_tables(positions, b as i32, s as i32)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            &embeds,
+            cache,
+            &tables,
+            mask,
+            Some(&mut out),
+            self.attn_formulation,
+            false,
+            false,
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        }
+        Ok(out)
     }
 
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
@@ -2976,6 +3063,10 @@ fn join(prefix: &str, suffix: &str) -> String {
         format!("{prefix}.{suffix}")
     }
 }
+
+#[cfg(test)]
+#[path = "llama/training_precision_tests.rs"]
+mod training_precision_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -685,6 +685,7 @@ fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFact
         architecture: Some(mlx_gen::gen_core::ImagePipelineArchitecture::SdxlUnetWithDualClip),
         staged_weights: StagedWeightSchedule::TwoStage,
         transformer_stream: None,
+        native_quant: None,
         // load_vae casts to f32; the upsampling constructor uses this same preset.
         decoder_workspace: Some(DecoderWorkspaceFacts {
             tiling: DecoderTilingRealization::LayerwiseConvolution,

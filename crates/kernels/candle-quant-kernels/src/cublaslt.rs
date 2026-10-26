@@ -38,6 +38,9 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+/// Device allocation held by one shared cuBLASLt context, also used by native admission.
+pub const CUBLASLT_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Result of a per-tensor dynamic activation quantization: the packed 8-bit tensor plus the scalar
 /// `scale` such that `dequant = q * scale` (fp8: absmax/448; int8: absmax/127).
 pub struct QuantizedActivation {
@@ -190,6 +193,23 @@ pub(crate) const NVFP4_QUANT_SRC: crate::nvrtc::KernelSource = crate::nvrtc::Ker
     src: include_str!("nvfp4_quant.cu"),
     // Standard intrinsics only; sm_70 is the oldest this workspace targets (NVFP4 itself is
     // gated to sm_100+/sm_120 by `meets_nvfp4_floor` before this is ever consulted).
+    cc_floor: (7, 0),
+};
+
+/// Kitchen's dtype-rounded dynamic per-token activation quantizer (sc-26683).
+pub const KITCHEN_INT8_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "kitchen_int8_rowwise_v1",
+    src: include_str!("kitchen_int8.cu"),
+    cc_floor: (7, 0),
+};
+
+/// Packed W4A8 → int8 weight decode (sc-26685): nibble unpack + codebook + E4M3FN group scale +
+/// round-half-even clamp `[-127,127]`, compiled once per device through the [`nvrtc`](crate::nvrtc)
+/// seam. This is the on-device twin of the host `gen_core::w4a8_int8::dequant_packed_to_int8`
+/// decode the CPU/test path uses, so the shipped CUDA forward never full-dequants on the host.
+pub const W4A8_DEQUANT_SOURCE: crate::nvrtc::KernelSource = crate::nvrtc::KernelSource {
+    name: "w4a8_dequant_int8_v1",
+    src: include_str!("w4a8_dequant.cu"),
     cc_floor: (7, 0),
 };
 
@@ -447,7 +467,7 @@ mod cuda_impl {
 
     impl CublasLt {
         /// 32 MiB workspace — enough for the Split-K / stream-K algos cuBLASLt picks at DiT shapes.
-        const WORKSPACE: usize = 32 * 1024 * 1024;
+        const WORKSPACE: usize = super::CUBLASLT_WORKSPACE_BYTES;
 
         /// Returns the driver-reported identity for the cached NVFP4 algorithm selected for
         /// `(m, k, n)`, if that shape has already run. This is an observation seam for device
@@ -986,8 +1006,22 @@ mod cuda_impl {
             check_alignment(k, n)?;
             let mut out = self.stream.alloc_zeros::<i32>(m * n).map_err(drv_err)?;
             {
-                let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
-                let (b_ptr, _gb) = x.buf.device_ptr(&self.stream);
+                let (ws, _) = w.buf.storage_and_layout();
+                let (xs, _) = x.buf.storage_and_layout();
+                let Storage::Cuda(ws) = &*ws else {
+                    candle_core::bail!("INT8 weight is not on CUDA")
+                };
+                let Storage::Cuda(xs) = &*xs else {
+                    candle_core::bail!("INT8 activation is not on CUDA")
+                };
+                let CudaStorageSlice::U8(wb) = &ws.slice else {
+                    candle_core::bail!("INT8 weight is not bytes")
+                };
+                let CudaStorageSlice::U8(xb) = &xs.slice else {
+                    candle_core::bail!("INT8 activation is not bytes")
+                };
+                let (a_ptr, _ga) = wb.device_ptr(&self.stream);
+                let (b_ptr, _gb) = xb.device_ptr(&self.stream);
                 let (d_ptr, _gd) = out.device_ptr_mut(&self.stream);
                 unsafe {
                     self.run(
@@ -1275,6 +1309,197 @@ mod cuda_impl {
         /// Stage an int8-code tensor (`F32`/`I64`) as an owned device `i8` buffer + its shape.
         pub fn stage_int8(&self, t: &Tensor) -> Result<DevInt8> {
             DevInt8::stage(self, t)
+        }
+        /// Stage exact signed-code bytes without a dense float/i64 intermediate.
+        pub fn stage_int8_bytes(&self, bytes: &Tensor) -> Result<DevInt8> {
+            let (rows, cols) = bytes.dims2()?;
+            if bytes.dtype() != DType::U8 {
+                candle_core::bail!("INT8 codes must be raw U8 byte patterns");
+            }
+            let bytes = bytes
+                .to_device(&Device::Cuda(self.device.clone()))?
+                .flatten_all()?
+                .contiguous()?;
+            let bytes = if bytes.layout().start_offset() != 0 {
+                bytes.force_contiguous()?
+            } else {
+                bytes
+            };
+            Ok(DevInt8 {
+                buf: bytes,
+                rows,
+                cols,
+            })
+        }
+
+        /// Kitchen's activation codes and unrounded F32 row scales, entirely on device.
+        /// `x` already contains the source-dtype rotation result; `dtype` preserves its rounding.
+        pub fn quantize_kitchen_int8(&self, x: &Tensor, dtype: DType) -> Result<(DevInt8, Tensor)> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            if m == 0
+                || k == 0
+                || m > u32::MAX as usize
+                || k > i32::MAX as usize
+                || !x.device().same_device(&Device::Cuda(self.device.clone()))
+            {
+                candle_core::bail!("Kitchen INT8 activation shape/device mismatch");
+            }
+            let dtype = match dtype {
+                DType::F32 => 0i32,
+                DType::BF16 => 1,
+                DType::F16 => 2,
+                _ => candle_core::bail!("Kitchen INT8 source dtype"),
+            };
+            let module = KITCHEN_INT8_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("kitchen_int8_quantize")
+                .map_err(candle_core::Error::wrap)?;
+            let xf = Self::flux3_f32_input(x)?;
+            let (storage, _) = xf.storage_and_layout();
+            let Storage::Cuda(cs) = &*storage else {
+                candle_core::bail!("Kitchen INT8 requires CUDA")
+            };
+            let CudaStorageSlice::F32(xs) = &cs.slice else {
+                candle_core::bail!("Kitchen INT8 requires F32 launch input")
+            };
+            let mut q = unsafe { self.stream.alloc::<u8>(m * k) }.map_err(drv_err)?;
+            let mut scales = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
+            let ki = k as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(xs)
+                    .arg(&mut q)
+                    .arg(&mut scales)
+                    .arg(&ki)
+                    .arg(&dtype)
+                    .launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let scales = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::F32(scales),
+                    device: self.device.clone(),
+                }),
+                (m, 1),
+                BackpropOp::none(),
+                false,
+            );
+            let q = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(q),
+                    device: self.device.clone(),
+                }),
+                (m, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok((
+                DevInt8 {
+                    buf: q,
+                    rows: m,
+                    cols: k,
+                },
+                scales,
+            ))
+        }
+
+        /// Decode one bounded output-row tile of a resident packed W4A8 weight to device int8, for
+        /// the shared cuBLASLt INT8 IGEMM. `packed` (`U8 [out, k/2]`), `s_rel` (`U8 [out, k/g]`) and
+        /// `codebook` (`F32 [16]`) are the **resident** device tensors staged once at load; `out0`
+        /// is the first output feature of `rows` rows. The returned `DevInt8` is a transient
+        /// `[rows, k]` scratch on the device, never a resident model shadow.
+        pub fn dequant_w4a8_packed_tile(
+            &self,
+            packed: &Tensor,
+            s_rel: &Tensor,
+            codebook: &Tensor,
+            tile: W4A8DecodeTile,
+        ) -> Result<DevInt8> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let W4A8DecodeTile {
+                rows,
+                in_features: k,
+                group,
+                out0,
+            } = tile;
+            if rows == 0 || k == 0 || rows.checked_mul(k).is_none() {
+                candle_core::bail!("W4A8 decode tile geometry");
+            }
+            debug_assert!(group == 16);
+            for (name, t) in [("packed", packed), ("s_rel", s_rel), ("codebook", codebook)] {
+                if !t.device().same_device(&Device::Cuda(self.device.clone())) {
+                    candle_core::bail!("W4A8 {name} operand is not on CUDA");
+                }
+            }
+            let module = W4A8_DEQUANT_SOURCE
+                .compiled(&self.device)
+                .map_err(candle_core::Error::wrap)?;
+            let function = module
+                .function("w4a8_dequant_int8")
+                .map_err(candle_core::Error::wrap)?;
+            let (pstorage, _) = packed.storage_and_layout();
+            let Storage::Cuda(pcs) = &*pstorage else {
+                candle_core::bail!("W4A8 packed is not on CUDA");
+            };
+            let CudaStorageSlice::U8(packed_u8) = &pcs.slice else {
+                candle_core::bail!("W4A8 packed is not raw U8");
+            };
+            let (sstorage, _) = s_rel.storage_and_layout();
+            let Storage::Cuda(scs) = &*sstorage else {
+                candle_core::bail!("W4A8 s_rel is not on CUDA");
+            };
+            let CudaStorageSlice::U8(srel_u8) = &scs.slice else {
+                candle_core::bail!("W4A8 s_rel is not raw U8");
+            };
+            let (cstorage, _) = codebook.storage_and_layout();
+            let Storage::Cuda(ccs) = &*cstorage else {
+                candle_core::bail!("W4A8 codebook is not on CUDA");
+            };
+            let CudaStorageSlice::F32(codebook_f32) = &ccs.slice else {
+                candle_core::bail!("W4A8 codebook is not F32");
+            };
+            let mut out = unsafe { self.stream.alloc::<u8>(rows * k) }.map_err(drv_err)?;
+            let (ki, gi, out0i) = (k as i32, group as i32, out0 as i32);
+            let work = (rows * k) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&function)
+                    .arg(packed_u8)
+                    .arg(srel_u8)
+                    .arg(codebook_f32)
+                    .arg(&mut out)
+                    .arg(&ki)
+                    .arg(&gi)
+                    .arg(&out0i)
+                    .launch(LaunchConfig {
+                        grid_dim: (work.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            let out_t = Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::U8(out),
+                    device: self.device.clone(),
+                }),
+                (rows, k),
+                BackpropOp::none(),
+                false,
+            );
+            Ok(DevInt8 {
+                buf: out_t,
+                rows,
+                cols: k,
+            })
         }
 
         // --- internals -------------------------------------------------------------------------
@@ -1827,9 +2052,30 @@ mod cuda_impl {
     /// instead of a DtoH copy + CPU round loop + HtoD copy (the dominant cost once the dequant fold
     /// moved on-device). A CPU operand (weights loaded to host, tests) still narrows on the host.
     pub struct DevInt8 {
-        buf: cudarc::driver::CudaSlice<u8>,
+        // Tensor's Arc shares an already compact source; staging must not copy the model's codes.
+        buf: Tensor,
         rows: usize,
         cols: usize,
+    }
+
+    /// Geometry of one bounded W4A8 output-row decode tile: the `rows` output features starting at
+    /// `out0`, each spanning the full `in_features` contraction, with one E4M3FN `s_rel` scale per
+    /// `group` columns.
+    ///
+    /// Four `usize`s passed positionally are indistinguishable to the compiler and to a reader, so
+    /// they travel as one named value (sc-26685 review: `dequant_w4a8_packed_tile` had eight
+    /// arguments). The resident-tensor operands stay separate — they are the kernel's inputs, and
+    /// this is only its launch geometry.
+    #[derive(Clone, Copy, Debug)]
+    pub struct W4A8DecodeTile {
+        /// Output features decoded by this tile (`<=` the caller's output-row tile bound).
+        pub rows: usize,
+        /// Logical contraction width (`in_features`), i.e. the decoded int8 row length.
+        pub in_features: usize,
+        /// Columns per E4M3FN relative scale (`W4A8Int8::group_size`, 16).
+        pub group: usize,
+        /// First output feature of the tile.
+        pub out0: usize,
     }
 
     impl DevInt8 {
@@ -1846,21 +2092,297 @@ mod cuda_impl {
                     .to_dtype(DType::U8)?
                     .flatten_all()?
                     .contiguous()?;
-                let (storage, _l) = u8t.storage_and_layout();
-                let buf = match &*storage {
-                    Storage::Cuda(cs) => match &cs.slice {
-                        CudaStorageSlice::U8(s) => s.try_clone().map_err(drv_err)?,
-                        _ => candle_core::bail!("DevInt8::stage: expected U8 storage"),
-                    },
-                    _ => candle_core::bail!("DevInt8::stage: not a CUDA tensor"),
-                };
-                return Ok(Self { buf, rows, cols });
+                return Ok(Self {
+                    buf: u8t,
+                    rows,
+                    cols,
+                });
             }
             // CPU operand (weights staged from host, tests): narrow on the host to the same byte pattern.
             let host = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
             let bytes: Vec<u8> = host.iter().map(|&v| v.round() as i8 as u8).collect();
-            let buf = lt.stream.clone_htod(&bytes).map_err(drv_err)?;
+            let buf = Tensor::from_vec(bytes, (rows, cols), &Device::Cuda(lt.device.clone()))?;
             Ok(Self { buf, rows, cols })
+        }
+    }
+
+    /// FLUX3 publisher-format projections (sc-26241). The frozen BFL recipes, not the generic
+    /// per-tensor FP8 / dynamic NVFP4 ones above; see `flux3_quant.cu` for the exact math and
+    /// `crate::flux3_quant` for the bit-level CPU mirrors.
+    impl CublasLt {
+        fn flux3_kernels(&self) -> Result<Arc<crate::nvrtc::CompiledKernel>> {
+            crate::flux3_quant::FLUX3_QUANT_SRC
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(format!("flux3 quant kernels: {e}")))
+        }
+
+        /// The activation as a contiguous offset-0 f32 CUDA slice (the kernels index from 0).
+        fn flux3_f32_input(x: &Tensor) -> Result<Tensor> {
+            let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            Ok(if xf.layout().start_offset() != 0 {
+                xf.force_contiguous()?
+            } else {
+                xf
+            })
+        }
+
+        /// Stage a checkpoint's raw E4M3 weight bytes `[rows, cols]` (row-major) as a resident
+        /// [`DevFp8`]. No conversion: the bytes are the publisher's codes.
+        pub fn stage_fp8_bytes(&self, bytes: &[u8], rows: usize, cols: usize) -> Result<DevFp8> {
+            if rows.checked_mul(cols) != Some(bytes.len()) {
+                candle_core::bail!(
+                    "stage_fp8_bytes: {} bytes for [{rows}, {cols}]",
+                    bytes.len()
+                );
+            }
+            let codes: Vec<float8::F8E4M3> = bytes
+                .iter()
+                .map(|b| float8::F8E4M3::from_bits(*b))
+                .collect();
+            let buf = self.stream.clone_htod(&codes).map_err(drv_err)?;
+            Ok(DevFp8 { buf, rows, cols })
+        }
+
+        /// Upload a small host f32 vector (FP8R per-output weight scales).
+        pub fn stage_f32(&self, values: &[f32]) -> Result<cudarc::driver::CudaSlice<f32>> {
+            self.stream.clone_htod(values).map_err(drv_err)
+        }
+
+        /// **FLUX3 FP8R W8A8 rowwise linear**: `bf16(Σ_k e4m3(x/sa)·w · sa[m] · sw[n])`.
+        /// `x` is `[M, K]` (bf16/f32, CUDA); `w` the resident `[N, K]` E4M3 weight; `w_scales` its
+        /// `[N]` f32 per-output scales. The activation row scale is `max(|row|)/448` (≥ 1e-12), the
+        /// GEMM accumulates in f32 with unit operand scales, and the epilogue applies both scale
+        /// vectors before the one BF16 rounding — `torch._scaled_mm` rowwise semantics.
+        pub fn flux3_fp8_rowwise_linear(
+            &self,
+            x: &Tensor,
+            w: &DevFp8,
+            w_scales: &cudarc::driver::CudaSlice<f32>,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            let n = w.rows;
+            if w.cols != k || w_scales.len() != n {
+                candle_core::bail!(
+                    "flux3 fp8r: x [.., {k}] vs weight [{n}, {}] with {} scales",
+                    w.cols,
+                    w_scales.len()
+                );
+            }
+            check_alignment(k, n)?;
+            let kernels = self.flux3_kernels()?;
+            let quantize = kernels
+                .function("flux3_fp8_rowwise_quantize_f32")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let epilogue = kernels
+                .function("flux3_fp8_rowwise_epilogue")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let xf = Self::flux3_f32_input(x)?;
+            let (x_storage, _) = xf.storage_and_layout();
+            let x_slice = match &*x_storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("flux3 fp8r: expected F32 CUDA storage"),
+                },
+                _ => candle_core::bail!("flux3 fp8r: activation is not on CUDA"),
+            };
+            // The kernel writes E4M3 bytes directly into the FP8 operand buffer: no backend
+            // f32 -> F8E4M3 cast kernel is involved (candle builds those only for sm_89+ arches).
+            let mut q = unsafe { self.stream.alloc::<float8::F8E4M3>(m * k) }.map_err(drv_err)?;
+            let mut sa = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
+            let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+            unsafe {
+                self.stream
+                    .launch_builder(&quantize)
+                    .arg(x_slice)
+                    .arg(&mut q)
+                    .arg(&mut sa)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            drop(x_storage);
+            let xq = DevFp8 {
+                buf: q,
+                rows: m,
+                cols: k,
+            };
+            let mut acc = unsafe { self.stream.alloc::<f32>(m * n) }.map_err(drv_err)?;
+            let one_a = self.upload_scalar(1.0)?;
+            let one_b = self.upload_scalar(1.0)?;
+            {
+                let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
+                let (b_ptr, _gb) = xq.buf.device_ptr(&self.stream);
+                let (sa_ptr, _gsa) = one_a.device_ptr(&self.stream);
+                let (sb_ptr, _gsb) = one_b.device_ptr(&self.stream);
+                let (d_ptr, _gd) = acc.device_ptr_mut(&self.stream);
+                unsafe {
+                    self.run(
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        sys::cudaDataType_t::CUDA_R_32F,
+                        sys::cudaDataType_t::CUDA_R_32F,
+                        m,
+                        k,
+                        n,
+                        a_ptr,
+                        b_ptr,
+                        d_ptr,
+                        Some((sa_ptr, sb_ptr)),
+                        Alpha::F32(1.0),
+                    )?;
+                }
+            }
+            let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            let total = (m * n) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&epilogue)
+                    .arg(&acc)
+                    .arg(&sa)
+                    .arg(w_scales)
+                    .arg(&mut out)
+                    .arg(&mi)
+                    .arg(&ni)
+                    .launch(LaunchConfig {
+                        grid_dim: (total.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            Ok(Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::BF16(out),
+                    device: self.device.clone(),
+                }),
+                (m, n),
+                BackpropOp::none(),
+                false,
+            ))
+        }
+
+        /// Stage a publisher NVFP4 weight: packed E2M1 `[rows, cols/2]` (even column in the low
+        /// nibble) + its row-major E4M3 block scales `[rows, cols/16]`, swizzled here into the
+        /// compute atom layout, with the static `weight_scale_2` as the per-tensor scale.
+        pub fn flux3_stage_nvfp4_weight(
+            &self,
+            packed: &[u8],
+            block_scales: &[u8],
+            rows: usize,
+            cols: usize,
+            weight_scale_2: f32,
+        ) -> Result<DevNvfp4> {
+            check_nvfp4_alignment(cols, rows)?;
+            if packed.len() != rows * cols / 2 || block_scales.len() != rows * cols / 16 {
+                candle_core::bail!(
+                    "flux3 nvfp4: weight byte inventory does not match [{rows}, {cols}]"
+                );
+            }
+            if !weight_scale_2.is_finite() || weight_scale_2 < 0.0 {
+                candle_core::bail!("flux3 nvfp4: invalid weight_scale_2 {weight_scale_2}");
+            }
+            let swizzled = crate::flux3_quant::swizzle_scales(block_scales, rows, cols / 16);
+            Ok(DevNvfp4 {
+                packed: self.stream.clone_htod(packed).map_err(drv_err)?,
+                scales: self.stream.clone_htod(&swizzled).map_err(drv_err)?,
+                rows,
+                cols_padded: cols,
+                global_scale: weight_scale_2,
+            })
+        }
+
+        /// **FLUX3 NVFP4 W4A4 linear with a STATIC activation scale.** The activation is packed with
+        /// the clamped reciprocal `max(input_scale, 1e-8)`; the GEMM alpha is the RAW
+        /// `input_scale · weight_scale_2` (a zero calibrated scale yields an all-zero product, as
+        /// the source does). `x` is `[M, K]`; M is zero-padded to the FP4 row alignment and narrowed.
+        pub fn flux3_nvfp4_static_linear(
+            &self,
+            x: &Tensor,
+            w: &DevNvfp4,
+            input_scale: f32,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            if !input_scale.is_finite() || input_scale < 0.0 {
+                candle_core::bail!("flux3 nvfp4: invalid input_scale {input_scale}");
+            }
+            let (m, k) = x.dims2()?;
+            if k != w.cols_padded {
+                candle_core::bail!("flux3 nvfp4: x [.., {k}] vs weight K {}", w.cols_padded);
+            }
+            let m_pad = round_up_usize(m.max(1), super::super::nvfp4_linear::NVFP4_M_ALIGN);
+            let x_pad = if m_pad != m {
+                x.pad_with_zeros(0, 0, m_pad - m)?
+            } else {
+                x.clone()
+            };
+            let kernels = self.flux3_kernels()?;
+            let pack = kernels
+                .function("flux3_nvfp4_static_pack_f32")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let xf = Self::flux3_f32_input(&x_pad)?;
+            let (x_storage, _) = xf.storage_and_layout();
+            let x_slice = match &*x_storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("flux3 nvfp4: expected F32 CUDA storage"),
+                },
+                _ => candle_core::bail!("flux3 nvfp4: activation is not on CUDA"),
+            };
+            let n_blocks = k / 16;
+            let sf_rows = round_up_usize(m_pad, SF_ATOM_ROWS);
+            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
+            let mut packed = self
+                .stream
+                .alloc_zeros::<u8>(m_pad * (k / 2))
+                .map_err(drv_err)?;
+            let mut scales = self
+                .stream
+                .alloc_zeros::<u8>(sf_rows * sf_cols)
+                .map_err(drv_err)?;
+            let (mi, ki, nbi, cpi, sci) = (
+                m_pad as i32,
+                k as i32,
+                n_blocks as i32,
+                k as i32,
+                sf_cols as i32,
+            );
+            let qscale = input_scale.max(1e-8);
+            let total = (m_pad * n_blocks) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&pack)
+                    .arg(x_slice)
+                    .arg(&mut packed)
+                    .arg(&mut scales)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .arg(&nbi)
+                    .arg(&cpi)
+                    .arg(&sci)
+                    .arg(&qscale)
+                    .launch(LaunchConfig {
+                        grid_dim: (total.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            drop(x_storage);
+            let xq = DevNvfp4 {
+                packed,
+                scales,
+                rows: m_pad,
+                cols_padded: k,
+                global_scale: input_scale,
+            };
+            let y = self.matmul_nvfp4_staged(w, &xq)?;
+            Ok(if m_pad != m { y.narrow(0, 0, m)? } else { y })
         }
     }
 
@@ -1925,7 +2447,7 @@ mod cuda_impl {
 // always-compiled half (the plan-time layout predicate needs them on every build), and `cuda_impl`
 // only borrows them back with its own `pub use`.
 #[cfg(feature = "cuda")]
-pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity};
+pub use cuda_impl::{CublasLt, DevFp8, DevInt8, DevNvfp4, Nvfp4AlgorithmIdentity, W4A8DecodeTile};
 
 /// **One `CublasLt` handle per device**, shared by every INT8 projection built against it (sc-12301)
 /// — the int8 twin of [`Nvfp4Context`](super::nvfp4_linear::Nvfp4Context).

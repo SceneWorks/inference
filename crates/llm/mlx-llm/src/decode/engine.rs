@@ -634,6 +634,17 @@ impl KvCache for BorrowedCache<'_> {
 /// The engine's token draws — the seam a device sampler plugs in behind. Every draw is recorded,
 /// so [`path`](Self::path) is measured rather than inferred from the request.
 pub trait TokenSampler {
+    /// Resolve the actual prefilled history boundary afresh for every request.
+    fn begin_generation(&mut self, prompt_len: usize) -> Result<()> {
+        let _ = prompt_len;
+        if self.params().presence_penalty_generated_only {
+            return Err(Error::Msg(
+                "custom sampler does not support generated-only presence penalty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The sampling knobs.
     fn params(&self) -> &SamplingParams;
     /// Draw one token from a `[1, vocab]` (or `[vocab]`) logits row given the running `history`
@@ -718,6 +729,11 @@ impl MlxSampler {
 }
 
 impl TokenSampler for MlxSampler {
+    fn begin_generation(&mut self, prompt_len: usize) -> Result<()> {
+        self.params.presence_penalty_prompt_len = prompt_len;
+        Ok(())
+    }
+
     fn params(&self) -> &SamplingParams {
         &self.params
     }
@@ -1249,6 +1265,7 @@ where
             (cache, logits, hidden, history.to_vec(), position_delta)
         }
     };
+    sampler.begin_generation(history.len())?;
     stats.forwards += 1;
     let start_len = target.cache_len(cache);
     let warm = proposer.warm(target, &history, prompt_hidden.as_ref())?;
@@ -2140,6 +2157,38 @@ pub(crate) mod tests {
             seed: Some(7),
             stop_tokens: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_reused_sampler_resets_its_generated_only_presence_boundary() {
+        let mut config = greedy(4);
+        config.sampling.presence_penalty = 1.5;
+        config.sampling.presence_penalty_generated_only = true;
+        let mut sampler = MlxSampler::from_config(&config);
+        let logits = Array::from_slice(&[2.0f32, 1.0, 0.0], &[1, 3]);
+        for prompt_len in [3, 1, 3] {
+            sampler.begin_generation(prompt_len).unwrap();
+            let mut history = vec![0; prompt_len];
+            assert_eq!(
+                sampler
+                    .sample(&logits, &history, None)
+                    .unwrap()
+                    .resolve()
+                    .unwrap(),
+                0
+            );
+            history.push(0);
+            assert_eq!(
+                sampler
+                    .sample(&logits, &history, None)
+                    .unwrap()
+                    .resolve()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(sampler.params().presence_penalty_prompt_len, prompt_len);
+        }
+        assert_eq!(config.sampling.presence_penalty_prompt_len, 0);
     }
 
     fn penalized(max_new_tokens: usize) -> GenerationConfig {

@@ -226,6 +226,7 @@ impl Captioner for JoyCaptioner {
                 // CaptionSampling exposes no top-k; disabled (0) matches the prior engine sampler.
                 top_k: 0,
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
                 repetition_penalty: req.sampling.repetition_penalty,
                 repetition_context: req.sampling.repetition_context,
             },

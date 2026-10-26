@@ -1,0 +1,71 @@
+{
+  "status": "PASS_SOURCE_SAMPLER_REPLAY_AND_INDEPENDENT_CONTROLS",
+  "analysis_sha256": "1e89a8c037569b988a89703c86894c6907da8c9097c92176d94b461663dcf6da",
+  "generator_sha256": "b1079205b9d4676ef9d7bcd8c0fb931a3d4e9b43c603cb26467563156a6045e3",
+  "parent_fixture_sha256": "398b6b2260c15b670655700ed552d4ee935d493af5c9f2a72c85570cd7d121f1",
+  "source_sha256": {
+    "author": "1dac1aca9feb1bfdfc727a401e4b67d61a505d3190706d1b7d2d784f88678b31",
+    "edit": "f0f5d3011c1f689547d290231a8a50a1c4d16f58c561556b53db60a0edbe9885",
+    "lora": "692f9df723323a95cdb24bbf612c7b6d2a98709cefcbee479e2d7dc57aab0705"
+  },
+  "source_scheduler_file_sha256": "c2f47ed75801a7bd11f43aa793671986b7d382461b8d6e9d60786ca77fa61bca",
+  "torch_version": "2.9.1",
+  "diffusers_version": "0.36.0",
+  "native_data": false,
+  "source_golden_unchanged": true,
+  "cases": [
+    {
+      "reference_count": 1,
+      "sigmas": [
+        1.0,
+        0.024000000208616257,
+        0.0
+      ],
+      "controls": {
+        "reference_uses_body_time": 0.8602499961853027,
+        "body_cannot_read_references": 1.7816249132156372
+      },
+      "perturbation_final_range": {
+        "1": [
+          0.08237504959106445,
+          0.08706235885620117
+        ],
+        "2": [
+          0.16559362411499023,
+          0.17075061798095703
+        ]
+      },
+      "existing_final_two_bf16_relative_eps_bound": 0.06641599535942078,
+      "conditional_two_epsilon_bound_sum_no_state_sensitivity": 0.2664394560870278,
+      "source_replay_max_abs": 0.0,
+      "manual_euler_max_abs": 0.0
+    },
+    {
+      "reference_count": 4,
+      "sigmas": [
+        1.0,
+        0.024000000208616257,
+        0.0
+      ],
+      "controls": {
+        "reference_uses_body_time": 1.2376878261566162,
+        "body_cannot_read_references": 1.8313124179840088,
+        "reversed_reference_order": 0.16162502765655518
+      },
+      "perturbation_final_range": {
+        "1": [
+          0.07946896553039551,
+          0.08828091621398926
+        ],
+        "2": [
+          0.16250038146972656,
+          0.17346858978271484
+        ]
+      },
+      "existing_final_two_bf16_relative_eps_bound": 0.059089820832014084,
+      "conditional_two_epsilon_bound_sum_no_state_sensitivity": 0.22337695560781867,
+      "source_replay_max_abs": 0.0,
+      "manual_euler_max_abs": 0.0
+    }
+  ]
+}

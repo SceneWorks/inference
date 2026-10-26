@@ -1,5 +1,6 @@
 //! Native frozen MOSS-Image Base/SFT, ordinary guidance and optional data-space DMD.
 mod adapters;
+mod edit;
 pub mod loader;
 pub mod memory_strategy;
 pub mod model;

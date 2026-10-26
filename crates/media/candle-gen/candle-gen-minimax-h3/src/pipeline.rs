@@ -57,9 +57,8 @@ use crate::audio_config::{AUDIO_LATENT_CHANNELS, AUDIO_OUTPUT_CHANNELS, AUDIO_SA
 const AUDIO_CHANNELS: usize = AUDIO_OUTPUT_CHANNELS as usize;
 use crate::config::{LATENT_CHANNELS, VAE_RATIO};
 use crate::denoise::{
-    adaln_schedule, align_num_frames, video_latent_num_frames, JointGeometry, JointSchedule,
-    JointVelocity, PackedLayout, LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS,
-    TEXT_TAG,
+    adaln_schedule, align_num_frames, JointGeometry, JointSchedule, JointVelocity, PackedLayout,
+    LEGAL_FRAME_COUNTS, MAX_AV_DRIFT_SECONDS, MINIMAX_H3_FPS, TEXT_TAG,
 };
 use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 
@@ -68,7 +67,7 @@ use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 ///
 /// `canvas_multiple` in the reference pipeline. **Not** `VAE_RATIO` alone: a 16-aligned canvas can
 /// still be an odd number of latent columns, which has no patched representation.
-pub const SPATIAL_STRIDE: u32 = VAE_RATIO as u32 * 2;
+pub const SPATIAL_STRIDE: u32 = candle_gen::gen_core::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
 pub const CANVAS_SHORT_EDGE: u32 = 768;
@@ -80,7 +79,7 @@ pub const CANVAS_SHORT_EDGE: u32 = 768;
 /// budget. Canvas area is the *dominant* term in the packed sequence — it sets rows per latent
 /// frame, and attention is quadratic in the sequence — so an unbounded area is an unbounded render
 /// cost regardless of what the duration bound says.
-pub const CANVAS_MAX_PIXELS: u32 = 768 * 1344;
+pub const CANVAS_MAX_PIXELS: u32 = candle_gen::gen_core::h3_memory::CANVAS_MAX_PIXELS;
 
 /// Widest edge any canvas this model resolves to can carry — **2016**, the long edge at the 4:1
 /// aspect ceiling. This is what `Capabilities::max_size` declares (sc-17152).
@@ -173,44 +172,8 @@ impl RequestGeometry {
 /// over [`CANVAS_MAX_PIXELS`], on a frame count that is not `17n + 5`, and on a duration outside the
 /// model's own 5.1667–14.375 s range.
 pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<RequestGeometry> {
-    if width == 0 || height == 0 {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: width/height must be positive, got {width}x{height}"
-        )));
-    }
-    if !width.is_multiple_of(SPATIAL_STRIDE) || !height.is_multiple_of(SPATIAL_STRIDE) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: width/height must be a multiple of {SPATIAL_STRIDE} (the VAE's \
-             {VAE_RATIO}x spatial compression times the DiT's width patch of {}), got \
-             {width}x{height}",
-            PATCH_SIZE[2]
-        )));
-    }
-    // Checked as a product because the per-edge cap is not the same constraint: 1344x1344 is inside
-    // `Capabilities::max_size` on both edges and 75 % over the area the model generates at.
-    if u64::from(width) * u64::from(height) > u64::from(CANVAS_MAX_PIXELS) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: {width}x{height} is {} px, over the released checkpoint's \
-             {CANVAS_MAX_PIXELS} px canvas budget ({CANVAS_SHORT_EDGE} short edge at 16:9). Canvas \
-             area sets the packed sequence length and the attention is quadratic in it",
-            u64::from(width) * u64::from(height)
-        )));
-    }
-    // **The lattice gate runs first, then the range gate.** The two reject disjoint mistakes and the
-    // caller needs to be told which one it made: a count that is not `17n + 5` has no geometry at
-    // any duration, while one that is on the lattice but outside 5.1667-14.375 s is a legal shape
-    // the model was not trained at.
-    video_latent_num_frames(num_frames)?;
-    let seconds = num_frames as f64 / MINIMAX_H3_FPS;
-    if !(MIN_DURATION_SECONDS - 1e-9..=MAX_DURATION_SECONDS + 1e-9).contains(&seconds) {
-        return Err(CandleError::Msg(format!(
-            "minimax_h3: {num_frames} frames is {seconds:.4} s, outside the model's \
-             {MIN_DURATION_SECONDS}-{MAX_DURATION_SECONDS} s range ({}-{} frames at \
-             {MINIMAX_H3_FPS} fps)",
-            LEGAL_FRAME_COUNTS[0],
-            LEGAL_FRAME_COUNTS[LEGAL_FRAME_COUNTS.len() - 1],
-        )));
-    }
+    candle_gen::gen_core::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
     Ok(RequestGeometry {
         width,
         height,
@@ -728,17 +691,37 @@ pub fn ref2va_layout(
     patch: [usize; 3],
     device: &Device,
 ) -> Result<PackedLayout> {
+    ref2va_layout_with_audio_channels(
+        geometry,
+        text_token_tags,
+        references,
+        &vec![AUDIO_CHANNELS; references.len()],
+        patch,
+        device,
+    )
+}
+
+/// Preserve each reference encoder's actual channel batch, independently of generated stereo.
+pub fn ref2va_layout_with_audio_channels(
+    geometry: &RequestGeometry,
+    text_token_tags: &[u32],
+    references: &[ReferenceLatentGeometry],
+    reference_audio_channels: &[usize],
+    patch: [usize; 3],
+    device: &Device,
+) -> Result<PackedLayout> {
     if text_token_tags.is_empty() {
         return Err(CandleError::Msg(
             "minimax_h3: the packed sequence needs at least one text row".into(),
         ));
     }
-    PackedLayout::build_ref2va(
+    PackedLayout::build_ref2va_with_audio_channels(
         geometry.joint,
         patch,
         text_token_tags,
         AUDIO_CHANNELS,
         references,
+        reference_audio_channels,
         device,
     )
 }
@@ -824,6 +807,133 @@ mod tests {
 
     /// **The stride is 32, not 16.** A 16-aligned canvas that is an odd number of latent columns has
     /// no patched representation, and the crate's `SIZE_MULTIPLE` advertises the same number.
+    #[test]
+    fn unit_patch_keyframe_and_reference_rows_agree_with_layout() {
+        use crate::conditioning::{keyframe_condition_rows, KeyframeNoise};
+        let d = Device::Cpu;
+        let g = resolve_geometry(64, 64, 124).unwrap();
+        let c = Tensor::ones((1, LATENT_CHANNELS, 1, 4, 4), DType::F32, &d).unwrap();
+        for patch in [[1, 2, 2], [1, 1, 1]] {
+            let rows = keyframe_condition_rows(&c, patch, &KeyframeNoise::Seeded, 0, &d).unwrap();
+            let layout = fl2va_layout(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &[KeyframeAnchor::First],
+                patch,
+                &d,
+            )
+            .unwrap();
+            assert_eq!(rows.dims()[1], layout.num_condition_video_rows());
+            assert_eq!(rows.dims()[2], LATENT_CHANNELS * patch[1] * patch[2]);
+            let (v, _) = initial_latents(&g, patch, 1, &d).unwrap();
+            assert!(prepend_condition_rows(&layout, Some(&rows), &v).is_ok());
+        }
+    }
+
+    #[test]
+    fn mixed_mono_stereo_reference_rows_prepend_in_order_with_stereo_output() {
+        use crate::conditioning::reference_audio_rows;
+        use crate::reference::ReferenceKind;
+        let d = Device::Cpu;
+        let g = resolve_geometry(64, 64, 124).unwrap();
+        let reference = |kind, latents| ReferenceLatentGeometry {
+            kind,
+            num_latent_frames: if kind == ReferenceKind::Audio { 0 } else { 1 },
+            latent_height: 4,
+            latent_width: 4,
+            num_audio_latents: latents,
+        };
+        // Standalone audio, silent image, then a clip soundtrack: every mono/stereo topology, either order.
+        for (standalone_channels, clip_channels, reverse) in (1..=2).flat_map(|a| {
+            (1..=2).flat_map(move |b| [false, true].map(move |reverse| (a, b, reverse)))
+        }) {
+            let expected = 3 * standalone_channels + 5 * clip_channels;
+            let mut refs = vec![
+                reference(ReferenceKind::Audio, 3),
+                reference(ReferenceKind::Image, 0),
+                reference(ReferenceKind::Video, 5),
+            ];
+            let mut channels = vec![standalone_channels, 0, clip_channels];
+            let standalone = reference_audio_rows(
+                &Tensor::ones(
+                    (standalone_channels, 3, AUDIO_LATENT_CHANNELS),
+                    DType::F32,
+                    &d,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let clip = reference_audio_rows(
+                &Tensor::full(2f32, (clip_channels, 5, AUDIO_LATENT_CHANNELS), &d).unwrap(),
+            )
+            .unwrap();
+            let rows = if reverse {
+                refs.reverse();
+                channels.reverse();
+                Tensor::cat(&[&clip, &standalone], 1).unwrap()
+            } else {
+                Tensor::cat(&[&standalone, &clip], 1).unwrap()
+            };
+            let layout = ref2va_layout_with_audio_channels(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &refs,
+                &channels,
+                [1, 1, 1],
+                &d,
+            )
+            .unwrap();
+            assert_eq!(layout.num_condition_audio_rows(), expected);
+            assert_eq!(layout.audio_channels(), 2);
+            let indices = layout.audio_indices();
+            let positions = layout.position_rows();
+            let first_len = if reverse { 5 } else { 3 };
+            assert_eq!(positions[indices[0] as usize][0], 1.0);
+            // Time advances once per reference duration, NOT once per channel row.
+            assert_eq!(
+                positions[layout.generated_audio_rows()[0] as usize][0],
+                10.0
+            );
+            assert_eq!(
+                positions[indices[first_len - 1] as usize][0],
+                first_len as f64
+            );
+            if channels[0] == 2 {
+                assert_eq!(
+                    positions[indices[first_len] as usize][0], 1.0,
+                    "second stereo channel restarts the same reference clock"
+                );
+                assert_ne!(
+                    positions[indices[0] as usize][2],
+                    positions[indices[first_len] as usize][2]
+                );
+            }
+            let (_, generated) = initial_latents(&g, [1, 1, 1], 1, &d).unwrap();
+            assert_eq!(generated.dims()[1], 2 * g.joint.num_audio_latents);
+            let packed = prepend_condition_audio_rows(&layout, Some(&rows), &generated).unwrap();
+            assert_eq!(packed.dims()[1], expected + generated.dims()[1]);
+            assert_eq!(
+                packed
+                    .narrow(1, 0, expected)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                rows.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert!(ref2va_layout_with_audio_channels(
+                &g,
+                &[crate::denoise::TEXT_TAG],
+                &refs,
+                &[1],
+                [1, 1, 1],
+                &d
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn the_spatial_stride_is_the_vae_ratio_times_the_patch() {
         assert_eq!(SPATIAL_STRIDE, 32);

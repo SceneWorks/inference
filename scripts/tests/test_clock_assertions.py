@@ -58,6 +58,48 @@ class ScannerDetection(unittest.TestCase):
             f.write_text(CLEAN, encoding="utf-8")
             self.assertEqual(self.mod.analyze(f), [])
 
+    def test_allocation_names_do_not_seed_clock_taint(self) -> None:
+        # The old substring matcher found `wall` across Window + Allocation, then
+        # tainted the profile and every deterministic byte-count assertion using it.
+        for name in ("WindowAllocation", "windowAllocation", "FirewallRules"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                f = Path(tmp) / "a.rs"
+                f.write_text(
+                    f"fn t() {{\n    let profile = {name}::from_resident_tensors(data);\n"
+                    "    assert_eq!(profile.bytes(), 1024);\n"
+                    f"    assert!({name}::from_resident_tensors(bad).is_err());\n}}\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(self.mod.analyze(f), [])
+
+    def test_duration_identifier_shapes_still_seed_and_propagate(self) -> None:
+        for field in (
+            "wall", "WALL", "wall_ms", "wallTime", "walltime", "WallClock", "runWall",
+            "totalWallTime", "CPUWallTime", "total_wall_seconds", "totalwallclock",
+            "elapsed", "duration", "latency", "fastest_step", "slowest_step",
+            "decode_ms", "decode_secs", "decode_seconds",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                f = Path(tmp) / "a.rs"
+                f.write_text(
+                    f"fn t() {{\n    let measured = stats.{field};\n"
+                    "    let copy = measured;\n    assert!(copy < limit);\n"
+                    f"    assert!(stats.{field} < limit);\n}}\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(len(self.mod.analyze(f)), 2)
+
+    def test_real_clock_in_allocation_constructor_still_taints_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "a.rs"
+            f.write_text(
+                "fn t() {\n    let start = Instant::now();\n"
+                "    let profile = WindowAllocation::from_resident_tensors(start.elapsed());\n"
+                "    assert!(profile.bytes() < limit);\n}\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(len(self.mod.analyze(f)), 1)
+
     def test_a_duration_in_the_MESSAGE_ONLY_is_not_flagged(self) -> None:
         """Printing a duration in a failure message is fine and common; only the CONDITION counts."""
         with tempfile.TemporaryDirectory() as tmp:

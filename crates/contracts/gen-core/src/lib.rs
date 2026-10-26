@@ -21,16 +21,21 @@ pub mod checkpoint_codec;
 pub mod checkpoint_facts;
 pub mod comfy_quant;
 pub mod control;
+pub mod convrot_int8;
 pub mod duration_head;
 pub mod encoder_contract;
 pub mod error;
 pub mod execution_domains;
 pub mod exr_io;
 pub mod face;
+pub mod flux3;
 pub mod fx_program;
 pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
+pub mod h3_adapter_memory;
+pub mod h3_conditioning_memory;
+pub mod h3_memory;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
@@ -46,7 +51,10 @@ pub mod memory_phases;
 pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
+pub mod moss_image_edit;
 pub mod moss_image_training;
+pub mod pruned_adaln;
+pub mod pth;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
@@ -55,6 +63,7 @@ pub mod sampling;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
 pub mod sdxl_ldm;
+pub mod supra2;
 pub mod text_embed;
 pub mod tier_integrity;
 pub mod tiling;
@@ -64,6 +73,7 @@ pub mod transcribe;
 pub mod transform;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
+pub mod w4a8_int8;
 pub mod wan_i2v_memory;
 pub mod weightsmeta;
 
@@ -198,11 +208,11 @@ pub use memory_strategy::{
     MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
     MemoryOptimizationAuthority, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
     MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryReferenceShape, MemoryRejection, MemoryRequestScope,
-    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
-    MemoryStrategyEngagementExclusion, MemoryStrategyParameters, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryStructuralResidentEvidence,
+    MemoryProviderContract, MemoryReferenceResourceFacts, MemoryReferenceShape, MemoryRejection,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
+    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyEngagementExclusion, MemoryStrategyParameters,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryStructuralResidentEvidence,
     MemoryStructuralResidentRequestIdentity, MemoryWarmRunSemantics, MemoryWindowMaterialization,
     ResidentRequestMemory, TransformerComponent, UpcastLoraCopy, MEMORY_CALIBRATION_ABI,
     MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
@@ -210,9 +220,10 @@ pub use memory_strategy::{
 };
 pub use registry::{
     candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
-    mlx_memory_contract_surface_specs, ActivationMemoryRegistration, AudioEmbedderRegistration,
-    AudioTransformRegistration, CaptionerRegistration, CheckpointAdapterCapabilityRegistration,
-    CheckpointAdapterRegistration, CheckpointBackend, CheckpointBackendBindingRegistration,
+    candle_publisher_memory_contract_surface_specs, mlx_memory_contract_surface_specs,
+    ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
+    CaptionerRegistration, CheckpointAdapterCapabilityRegistration, CheckpointAdapterRegistration,
+    CheckpointBackend, CheckpointBackendBindingRegistration,
     CheckpointBaseCompatibilityRegistration, CheckpointCanonicalMappingRegistration,
     CheckpointComponentRegistration, CheckpointConfigRecoveryRegistration,
     CheckpointDialectRegistration, CheckpointSignatureRegistration,
@@ -223,8 +234,9 @@ pub use registry::{
     MemoryContractSurface, MemoryContractSurfaceResolverRegistration,
     MemoryContractSurfaceSelector, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
     MemoryRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
-    ProviderRegistryBuilder, ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration,
-    TrainerRegistration, TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
+    ProviderRegistryBuilder, ReferenceWorkspaceRegistration,
+    ResidentOnlyMemoryContractRegistration, TextEmbedderRegistration, TrainerRegistration,
+    TranscriberRegistration, TransformRegistration, VoiceEmbedderRegistration,
     FLUX2_CHECKPOINT_ADAPTER, KREA_2_CHECKPOINT_ADAPTER, MAGE_FLOW_CHECKPOINT_ADAPTER,
     QWEN_IMAGE_CHECKPOINT_ADAPTER, SDXL_CHECKPOINT_ADAPTER, WAN_CHECKPOINT_ADAPTER,
     Z_IMAGE_CHECKPOINT_ADAPTER,

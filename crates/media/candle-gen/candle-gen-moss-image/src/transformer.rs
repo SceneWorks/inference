@@ -48,6 +48,8 @@ struct Linear {
     low_rank: Option<LowRank>,
     residuals: Vec<crate::adapters::Residual>,
     residuals_frozen: bool,
+    edit_adapter: bool,
+    edit_fused_bias: bool,
 }
 impl Linear {
     fn load(
@@ -110,6 +112,8 @@ impl Linear {
             low_rank,
             residuals: Vec::new(),
             residuals_frozen: false,
+            edit_adapter: false,
+            edit_fused_bias: false,
         })
     }
     fn dtype(&self) -> DType {
@@ -118,8 +122,11 @@ impl Linear {
     fn base_forward(&self, x: &Tensor) -> Result<Tensor> {
         // Candle's CPU matmul has no BF16 kernel. This explicit FP32 accumulation over the
         // already-rounded BF16 operands, followed by BF16 rounding, is the CPU numerical oracle.
-        // CUDA/Metal use their native BF16 GEMM; no production GPU operand is widened here.
-        if x.device().is_cpu() && self.dtype() == DType::BF16 {
+        // Editing also widens biased GPU projections until after bias addition: the frozen
+        // source rounds its fused linear once, not once before and again after the bias.
+        if self.dtype() == DType::BF16
+            && (x.device().is_cpu() || (self.edit_fused_bias && self.base.bias().is_some()))
+        {
             let linear = candle_nn::Linear::new(
                 self.base.weight().to_dtype(DType::F32)?,
                 self.base
@@ -152,6 +159,22 @@ impl Linear {
     }
     fn forward_dmd(&self, x: &Tensor) -> Result<Tensor> {
         if let Some(a) = &self.low_rank {
+            if self.edit_adapter {
+                let base = self.base_forward(&x.to_dtype(self.dtype())?)?;
+                let project = |input: &Tensor, weight: &Tensor| -> Result<Tensor> {
+                    let dtype = weight.dtype();
+                    let input = input.to_dtype(dtype)?;
+                    if input.device().is_cpu() && dtype == DType::BF16 {
+                        Ok(candle_nn::Linear::new(weight.to_dtype(DType::F32)?, None)
+                            .forward(&input.to_dtype(DType::F32)?)?
+                            .to_dtype(dtype)?)
+                    } else {
+                        Ok(candle_nn::Linear::new(weight.clone(), None).forward(&input)?)
+                    }
+                };
+                let residual = project(&project(x, &a.down)?, &a.up)?;
+                return Ok(base.add(&(residual * a.scale)?.to_dtype(base.dtype())?)?);
+            }
             let base = self
                 .base_forward(&x.to_dtype(self.dtype())?)?
                 .to_dtype(DType::F32)?;
@@ -331,6 +354,9 @@ impl TextBlock {
         })
     }
     fn forward(&self, x: &Tensor, r: &Tensor) -> Result<Tensor> {
+        self.forward_with_edit_precision(x, r, false)
+    }
+    fn forward_with_edit_precision(&self, x: &Tensor, r: &Tensor, edit: bool) -> Result<Tensor> {
         let qkv = self.qkv.forward(&self.n1.forward(x)?)?;
         let (b, s, three) = qkv.dims3()?;
         let d = three / 3;
@@ -348,18 +374,23 @@ impl TextBlock {
                     .reshape((b, s, self.heads, d / self.heads))?,
             )?
             .reshape((b, s, d))?;
-        let x = x.add(&self.o.forward(&attention(
-            &q,
-            &k,
-            &qkv.narrow(2, 2 * d, d)?,
-            r,
-            self.heads,
-        )?)?)?;
+        let attend = if edit {
+            edit::text_attention
+        } else {
+            attention
+        };
+        let x =
+            x.add(
+                &self
+                    .o
+                    .forward(&attend(&q, &k, &qkv.narrow(2, 2 * d, d)?, r, self.heads)?)?,
+            )?;
         let y = self.n2.forward(&x)?;
+        let activation = if edit { edit::edit_situ } else { situ };
         Ok(x.add(
             &self
                 .down
-                .forward(&situ(&self.up.forward(&y)?, &self.gate.forward(&y)?)?)?,
+                .forward(&activation(&self.up.forward(&y)?, &self.gate.forward(&y)?)?)?,
         )?)
     }
 }
@@ -1205,3 +1236,6 @@ mod attention_layout_tests {
         }
     }
 }
+
+mod edit;
+pub(crate) use edit::EditConditioning;

@@ -659,7 +659,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
         })
     };
     state
-        .select_renderer(mode, || make(mode, DType::BF16))
+        .select_renderer(mode, || Ok(()), || make(mode, DType::BF16))
         .unwrap();
     let x = tensor(&ordinary["inputs"]["hidden_states"], DType::F32)
         .narrow(0, 0, 1)
@@ -678,11 +678,11 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
     let first = loader::tensor_f32(&run(&state)).unwrap();
     let accelerated = MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
     state
-        .select_renderer(accelerated, || make(accelerated, DType::F32))
+        .select_renderer(accelerated, || Ok(()), || make(accelerated, DType::F32))
         .unwrap();
     assert_eq!(state.renderer.as_ref().unwrap().mode, accelerated);
     state
-        .select_renderer(mode, || make(mode, DType::BF16))
+        .select_renderer(mode, || Ok(()), || make(mode, DType::BF16))
         .unwrap();
     assert_eq!(first, loader::tensor_f32(&run(&state)).unwrap());
 }
@@ -948,3 +948,135 @@ fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325(
 }
 
 mod training_contract_tests;
+
+#[test]
+fn edit_failures_clear_both_reports_release_owned_renderer_and_allow_reentry() {
+    let generator = synthetic_generator();
+    let ordinary = fixture("fixture.json");
+    let model = Transformer::load(
+        &weights(&ordinary["weights"], DType::F32),
+        geometry(&ordinary),
+        None,
+    )
+    .unwrap();
+    let report = MossImageEditExecutionReport {
+        base: synthetic_report(),
+        adapter_path: "synthetic-only".into(),
+        edit_contract: EDIT_CONTRACT.into(),
+        adapter_repository: EDIT_REPOSITORY.into(),
+        adapter_revision: EDIT_REVISION.into(),
+        adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+        config_sha256: EDIT_CONFIG_SHA256.into(),
+        applied_projections: 252,
+        references: vec![],
+        reference_max_edge: 512,
+        use_kv_cache: true,
+    };
+    {
+        let mut state = candle_gen::lock_recover(&generator.state);
+        state.report = Some(synthetic_report());
+        state.edit_report = Some(report.clone());
+        state.renderer = Some(pipeline::Renderer {
+            mode: MossImageAcceleration::Off,
+            transformer: model,
+            dataspace: None,
+            adapter_reports: vec![],
+        });
+    }
+    assert!(generator.moss_image_owned_weight_bytes().unwrap() > 0);
+    assert!(generator
+        .generate_moss_image_edit(
+            &GenerationRequest::default(),
+            MossImageEditInputs::default(),
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.moss_image_edit_execution_report().is_none());
+    assert!(generator.moss_image_execution_report().is_none());
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(0));
+    let references = [Image {
+        width: 16,
+        height: 16,
+        pixels: vec![0; 16 * 16 * 3],
+    }];
+    let inputs = MossImageEditInputs {
+        references: &references,
+        ..Default::default()
+    };
+    let canceled = GenerationRequest::default();
+    canceled.cancel.cancel();
+    assert!(matches!(
+        generator.generate_moss_image_edit(&canceled, inputs, &mut |_| {}),
+        Err(gen_core::Error::Canceled)
+    ));
+    let request = GenerationRequest::default();
+    let error = generator
+        .generate_moss_image_edit(&request, inputs, &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exact moss-image-edit package"),
+        "fresh call must re-enter validation: {error}"
+    );
+    candle_gen::lock_recover(&generator.state).edit_report = Some(report);
+    assert!(generator
+        .generate(
+            &GenerationRequest {
+                width: 17,
+                ..Default::default()
+            },
+            &mut |_| {}
+        )
+        .is_err());
+    assert!(generator.moss_image_edit_execution_report().is_none());
+    assert!(generator.validate(&GenerationRequest::default()).is_ok());
+}
+
+#[test]
+fn edit_receipts_round_trip_ordered_mixed_aspect_and_duplicate_slots() {
+    let mut base = synthetic_report().data().clone();
+    base.resolved.uncond_skip_layers.clear();
+    let mut report = MossImageEditExecutionReport {
+        base: MossImageExecutionReport::new(base).unwrap(),
+        adapter_path: "synthetic-only".into(),
+        edit_contract: EDIT_CONTRACT.into(),
+        adapter_repository: EDIT_REPOSITORY.into(),
+        adapter_revision: EDIT_REVISION.into(),
+        adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+        config_sha256: EDIT_CONFIG_SHA256.into(),
+        applied_projections: 252,
+        references: vec![],
+        reference_max_edge: 512,
+        use_kv_cache: true,
+    };
+    let slot = |dimensions, digest: char| MossImageEditReferenceReceipt {
+        original_dimensions: dimensions,
+        encoded_dimensions: dimensions,
+        pixels_sha256: digest.to_string().repeat(64),
+        resized_pixels_sha256: "b".repeat(64),
+        latent_sha256: "c".repeat(64),
+    };
+    let slots = [
+        slot([32, 32], 'a'),
+        slot([16, 48], 'b'),
+        slot([48, 16], 'c'),
+        slot([16, 48], 'b'),
+    ];
+    assert!(report.validate().is_err());
+    for count in 1..=4 {
+        report.references = slots[..count].to_vec();
+        report.validate().unwrap();
+        let roundtrip: MossImageEditExecutionReport =
+            serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(roundtrip, report);
+    }
+    report.references.reverse();
+    report.validate().unwrap();
+    assert_eq!(report.references[0], slots[3]);
+    report.references.push(slots[0].clone());
+    assert!(report.validate().is_err());
+    assert!(serde_json::from_value::<MossImageEditExecutionReport>(
+        serde_json::to_value(report).unwrap()
+    )
+    .is_err());
+}

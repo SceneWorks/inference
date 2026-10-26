@@ -55,6 +55,8 @@ fn bytes_per_param(tier: Option<Quant>) -> f64 {
         // keep the match total over the shared `gen_core::Quant`. The MLX/macOS runtime has no FP4
         // hardware and does not surface NVFP4, so `tier` is never `Some(Nvfp4)` on this path.
         Some(Quant::Nvfp4) => 4.5 / 8.0,
+        // FP8 rowwise: one E4M3 byte per weight; the per-row FP32 scale is negligible.
+        Some(Quant::Fp8Rowwise) => 1.0,
     }
 }
 

@@ -4569,6 +4569,7 @@ mod tests {
         evidence_revision: String,
     ) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection,
             optimization_authority: if selection.strategy.is_optimized() {
                 crate::MemoryOptimizationAuthority::Estimated

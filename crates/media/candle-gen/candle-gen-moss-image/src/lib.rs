@@ -1,9 +1,11 @@
 //! Native MOSS-Image Base/SFT, including both explicit published DMD precision policies.
 //! Caller-provisioned exact assets only. No acquisition or Python production execution.
 mod adapters;
+mod edit;
 mod loader;
 pub mod memory_strategy;
 mod pipeline;
+mod release;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support;
@@ -16,10 +18,11 @@ mod transformer;
 pub const SIZE_MULTIPLE: u32 = 16;
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::{self, moss_image::*, *};
+use candle_gen::gen_core::{self, moss_image::*, moss_image_edit::*, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
 use loader::Sources;
+use release::release_then_sync;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -29,15 +32,32 @@ struct State {
     renderer: Option<pipeline::Renderer>,
     vae: Option<Flux2Vae>,
     report: Option<MossImageExecutionReport>,
+    edit_report: Option<MossImageEditExecutionReport>,
 }
 impl State {
+    fn release_for_request(
+        &mut self,
+        mode: MossImageAcceleration,
+        edit: bool,
+        synchronize: impl FnOnce() -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<bool> {
+        let release = self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| edit || renderer.mode != mode);
+        if release {
+            release_then_sync(self.renderer.take(), synchronize)?;
+        }
+        Ok(release)
+    }
     fn select_renderer(
         &mut self,
         mode: MossImageAcceleration,
+        synchronize: impl FnOnce() -> candle_gen::Result<()>,
         load: impl FnOnce() -> candle_gen::Result<pipeline::Renderer>,
     ) -> candle_gen::Result<()> {
         if self.renderer.as_ref().is_none_or(|r| r.mode != mode) {
-            self.renderer = None;
+            release_then_sync(self.renderer.take(), synchronize)?;
             self.renderer = Some(load()?);
         }
         Ok(())
@@ -180,16 +200,42 @@ impl MossImageGenerator {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
+        self.run_with_edit(request, inputs, None, on_progress)
+    }
+    fn run_with_edit(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        edit: Option<MossImageEditInputs<'_>>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<MossImageAdvancedOutput> {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
+        state.edit_report = None;
         let admission = candle_gen::lock_recover(&self.admission).take();
-        let result = self.run_locked(&mut state, request, inputs, on_progress, admission);
-        if result.is_err() {
-            let sync = self.device.synchronize();
-            state.text = None;
-            state.renderer = None;
-            state.vae = None;
-            state.report = None;
+        let result = (|| {
+            let normalized;
+            let request = if let Some(edit) = edit {
+                edit.validate()?;
+                edit::check_precision(&self.device)?;
+                normalized = edit_request(request)?;
+                &normalized
+            } else {
+                request
+            };
+            self.run_locked(&mut state, request, inputs, edit, on_progress, admission)
+        })();
+        // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
+        // synchronize after release so the next admission sees the recovered driver budget.
+        if result.is_err() || edit.is_some() {
+            let sync = release_then_sync(
+                (state.text.take(), state.renderer.take(), state.vae.take()),
+                || self.device.synchronize(),
+            );
+            if result.is_err() || sync.is_err() {
+                state.report = None;
+                state.edit_report = None;
+            }
             sync.map_err(candle_gen::CandleError::from)?;
         }
         result
@@ -199,6 +245,7 @@ impl MossImageGenerator {
         state: &mut State,
         req: &GenerationRequest,
         inputs: MossImageAdvancedInputs<'_>,
+        edit: Option<MossImageEditInputs<'_>>,
         on_progress: &mut dyn FnMut(Progress),
         admission: Option<MemoryRunContext>,
     ) -> gen_core::Result<MossImageAdvancedOutput> {
@@ -213,7 +260,16 @@ impl MossImageGenerator {
         let sources = self.selected_sources(r.acceleration, &req.cancel)?;
         let assets = sources.assets(r.acceleration)?;
         let staged = self.staged(req);
-        let peak = memory_strategy::estimate(&sources, &r, req, images, staged)?;
+        let edit_assets = edit
+            .map(|_| edit::EditAssets::prepare(&self.sources.spec))
+            .transpose()?;
+        let peak = memory_strategy::estimate(&sources, &r, req, images, staged)?
+            .checked_add(
+                edit.map(|e| edit::extra_peak(e, req))
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| gen_core::Error::Unsupported("MOSS edit peak overflow".into()))?;
         if let Some(context) = admission {
             let demand = peak.saturating_sub(
                 self.cached_resident_bytes(state)?
@@ -222,6 +278,8 @@ impl MossImageGenerator {
             if context.geometry.width != req.width
                 || context.geometry.height != req.height
                 || context.geometry.batch as usize != images
+                || context.geometry.reference_count as usize
+                    != edit.map_or(0, |e| e.references.len())
                 || !context.budget.fits(demand)
             {
                 return Err(gen_core::Error::Unsupported(format!("MOSS actual expanded request needs structural upper bound {peak} bytes; admitted geometry/budget does not cover it")));
@@ -229,23 +287,17 @@ impl MossImageGenerator {
         }
         // Release a differently keyed renderer before conditioning, so its old residency cannot
         // overlap the new route's conditioning workspace after warm-budget credit is applied.
-        if state
-            .renderer
-            .as_ref()
-            .is_some_and(|renderer| renderer.mode != r.acceleration)
-        {
+        state.release_for_request(r.acceleration, edit.is_some(), || {
             self.device
                 .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
-        }
+                .map_err(candle_gen::CandleError::from)
+        })?;
         if staged {
-            self.device
-                .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.text = None;
-            state.renderer = None;
-            state.vae = None;
+            release_then_sync(
+                (state.text.take(), state.renderer.take(), state.vae.take()),
+                || self.device.synchronize(),
+            )
+            .map_err(candle_gen::CandleError::from)?;
         }
         let prompts = if req.prompt_batch.is_empty() {
             vec![req.prompt.clone()]
@@ -300,37 +352,62 @@ impl MossImageGenerator {
         };
         transformer::check_cancel(&req.cancel)?;
         if staged {
-            self.device
-                .synchronize()
+            release_then_sync(state.text.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
-            state.text = None;
+        }
+        let edit_references = edit
+            .map(|e| edit::encode_references(&sources, e, &self.device, &req.cancel))
+            .transpose()?;
+        if edit.is_some() {
+            on_progress(Progress::ConditioningComplete);
         }
         if state
             .renderer
             .as_ref()
             .is_none_or(|p| p.mode != r.acceleration)
         {
-            self.device
-                .synchronize()
-                .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
             if staged {
                 on_progress(Progress::Loading(LoadPhase::Renderer));
             }
             transformer::check_cancel(&req.cancel)?;
-            state.select_renderer(r.acceleration, || {
-                pipeline::Renderer::load(&sources, r.acceleration, &self.device)
-            })?;
+            state.select_renderer(
+                r.acceleration,
+                || Ok(self.device.synchronize()?),
+                || pipeline::Renderer::load(&sources, r.acceleration, &self.device),
+            )?;
         }
-        let sampled = pipeline::sample(
-            state.renderer.as_ref().expect("renderer loaded"),
-            req,
-            &r,
-            inputs,
-            &positive,
-            negative.as_ref(),
-            on_progress,
-        )?;
+        if let Some(assets) = &edit_assets {
+            assets.install(
+                &mut state
+                    .renderer
+                    .as_mut()
+                    .expect("renderer loaded")
+                    .transformer,
+                &req.cancel,
+            )?;
+        }
+        let sampled = if let (Some(edit), Some((references, _))) = (edit, edit_references.as_ref())
+        {
+            pipeline::sample_edit(
+                state.renderer.as_ref().expect("renderer loaded"),
+                req,
+                &r,
+                edit,
+                (&positive, negative.as_ref()),
+                references,
+                on_progress,
+            )?
+        } else {
+            pipeline::sample(
+                state.renderer.as_ref().expect("renderer loaded"),
+                req,
+                &r,
+                inputs,
+                &positive,
+                negative.as_ref(),
+                on_progress,
+            )?
+        };
         let adapter_reports = state
             .renderer
             .as_ref()
@@ -338,10 +415,8 @@ impl MossImageGenerator {
             .adapter_reports
             .clone();
         if staged {
-            self.device
-                .synchronize()
+            release_then_sync(state.renderer.take(), || self.device.synchronize())
                 .map_err(candle_gen::CandleError::from)?;
-            state.renderer = None;
         }
         transformer::check_cancel(&req.cancel)?;
         let output = match inputs.output {
@@ -370,12 +445,12 @@ impl MossImageGenerator {
                 )?)
             }
         };
-        self.device
-            .synchronize()
-            .map_err(candle_gen::CandleError::from)?;
         if staged {
             state.vae = None;
         }
+        self.device
+            .synchronize()
+            .map_err(candle_gen::CandleError::from)?;
         transformer::check_cancel(&req.cancel)?;
         #[cfg(feature = "test-support")]
         if self.sources.is_fixture() {
@@ -417,7 +492,29 @@ impl MossImageGenerator {
             adapter_reports,
         })?;
         transformer::check_cancel(&req.cancel)?;
-        state.report = Some(report);
+        if let (Some(edit), Some(assets), Some((_, references))) =
+            (edit, edit_assets, edit_references)
+        {
+            assets.ensure_unchanged()?;
+            let receipt = MossImageEditExecutionReport {
+                base: report,
+                adapter_path: assets.path().to_path_buf(),
+                edit_contract: EDIT_CONTRACT.into(),
+                adapter_repository: EDIT_REPOSITORY.into(),
+                adapter_revision: EDIT_REVISION.into(),
+                adapter_sha256: EDIT_WEIGHTS_SHA256.into(),
+                config_sha256: EDIT_CONFIG_SHA256.into(),
+                applied_projections: 252,
+                references,
+                reference_max_edge: edit.reference_max_edge,
+                use_kv_cache: edit.use_kv_cache,
+            };
+            receipt.validate()?;
+            transformer::check_cancel(&req.cancel)?;
+            state.edit_report = Some(receipt);
+        } else {
+            state.report = Some(report);
+        }
         Ok(output)
     }
 }
@@ -432,6 +529,24 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
     }
 }
 impl Generator for MossImageGenerator {
+    fn generate_moss_image_edit(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<MossImageAdvancedOutput> {
+        self.run_with_edit(request, inputs.advanced, Some(inputs), progress)
+    }
+    fn moss_image_edit_request_peak(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+    ) -> gen_core::Result<u64> {
+        memory_strategy::edit_request_peak(self.variant(), &self.sources.spec, request, inputs)
+    }
+    fn moss_image_edit_execution_report(&self) -> Option<MossImageEditExecutionReport> {
+        candle_gen::lock_recover(&self.state).edit_report.clone()
+    }
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -452,6 +567,13 @@ impl Generator for MossImageGenerator {
                 .as_ref()
                 .map_or_else(Vec::new, |r| r.adapter_reports.clone());
         }
+        if let Some(edit) = self.moss_image_edit_execution_report() {
+            return vec![AdapterApplyReport {
+                adapter_path: edit.adapter_path,
+                applied: edit.applied_projections,
+                skipped: vec![],
+            }];
+        }
         self.moss_image_execution_report()
             .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
     }
@@ -459,7 +581,7 @@ impl Generator for MossImageGenerator {
         Some(&self.contract)
     }
     fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
-        let decision = gen_core::default_memory_strategy_safety_check(&self.contract, context);
+        let decision = memory_strategy::safety_check(&self.sources.spec, &self.contract, context);
         *candle_gen::lock_recover(&self.admission) = if decision == MemorySafetyDecision::Accept {
             Some(context.clone())
         } else {
@@ -636,12 +758,12 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
         .register_memory_strategy(MemoryRegistration {
             provider_id: "moss_image_base",
             contract: contract_base,
-            safety_check: gen_core::default_registered_memory_strategy_safety_check,
+            safety_check: memory_strategy::safety_check,
         })
         .register_memory_strategy(MemoryRegistration {
             provider_id: "moss_image_sft",
             contract: contract_sft,
-            safety_check: gen_core::default_registered_memory_strategy_safety_check,
+            safety_check: memory_strategy::safety_check,
         })
         .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
             provider_id: "moss_image_base",
@@ -686,3 +808,60 @@ fn witness_sft(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn verify_numerical_renderer_transitions(
+    device: &Device,
+    mut build: impl FnMut(MossImageAcceleration) -> transformer::Transformer,
+    mut predict: impl FnMut(&transformer::Transformer) -> Vec<f32>,
+    mut edit: impl FnMut() -> Vec<f32>,
+) {
+    let mut state = State::default();
+    let expected_edit = edit();
+    let mut ordinary = None;
+    for mode in [
+        MossImageAcceleration::Off,
+        MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32),
+        MossImageAcceleration::Off,
+    ] {
+        state
+            .release_for_request(mode, false, || Ok(device.synchronize()?))
+            .unwrap();
+        state
+            .select_renderer(
+                mode,
+                || Ok(device.synchronize()?),
+                || {
+                    Ok(pipeline::Renderer {
+                        mode,
+                        transformer: build(mode),
+                        dataspace: None,
+                        adapter_reports: vec![],
+                    })
+                },
+            )
+            .unwrap();
+        let actual = predict(&state.renderer.as_ref().unwrap().transformer);
+        assert_eq!(actual, predict(&build(mode)));
+        if mode == MossImageAcceleration::Off {
+            if let Some(baseline) = &ordinary {
+                assert_eq!(&actual, baseline);
+            } else {
+                ordinary = Some(actual);
+            }
+        } else {
+            assert_ne!(&actual, ordinary.as_ref().unwrap());
+        }
+        assert!(state
+            .release_for_request(MossImageAcceleration::Off, true, || Ok(
+                device.synchronize()?
+            ))
+            .unwrap());
+        assert!(state.renderer.is_none());
+        assert_eq!(edit(), expected_edit);
+        assert!(
+            state.renderer.is_none(),
+            "request-local edit must not become ordinary residency"
+        );
+    }
+}

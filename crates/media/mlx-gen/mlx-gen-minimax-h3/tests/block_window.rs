@@ -95,6 +95,7 @@ fn max_abs(a: &Array, b: &Array) -> f32 {
 /// A deferred load must hold *no* materialized blocks. `resident_blocks()` is the observable, and it
 /// is separate from `num_layers()` on purpose: the forward still runs all of them.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn a_deferred_load_materializes_no_blocks() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -143,6 +144,7 @@ fn a_deferred_load_materializes_no_blocks() {
 /// driver must run two windows, and a plan that collapsed to one would make the equivalence above
 /// trivially true with the streaming gone.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn windowed_and_resident_stacks_agree() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -277,6 +279,7 @@ fn windowed_and_resident_stacks_agree() {
 /// The failure this refuses is a deferred load that also kept its blocks: it would satisfy every
 /// output assertion, report itself as rung 4, and bound nothing.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_two_residency_modes_are_mutually_exclusive() {
     let staged = tempfile::tempdir().unwrap();
     stage_fixture(staged.path());
@@ -296,6 +299,7 @@ fn the_two_residency_modes_are_mutually_exclusive() {
 /// has to be windowed too. Compared table by table against `AdaLnCache::precompute`, which is the
 /// shipped resident path.
 #[test]
+#[ignore = "complete synthetic model/block-stack execution; dispatched only by the manual H3 native suite"]
 fn the_windowed_adaln_precompute_matches_the_resident_one() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());
@@ -372,6 +376,7 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
 /// if two `open()` calls returned the same map the second window would find block 0's tensors gone.
 /// A shared view therefore fails as a missing tensor, which is exactly the shape of the real defect.
 #[test]
+#[ignore = "full synthetic DitBlock model-block execution; dispatched only by the manual H3 native suite"]
 fn every_window_opens_an_independent_view() {
     let staged = tempfile::tempdir().unwrap();
     let cfg = stage_fixture(staged.path());

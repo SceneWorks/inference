@@ -480,8 +480,8 @@ pub fn moss_guidance(
     Ok(output)
 }
 
-/// Checked CPU representation for native advanced entry points. Embeddings are converted to the
-/// backend encoder dtype on upload; binary masks compact each sample before the DiT forward.
+/// Checked CPU representation for native advanced entry points. Supplied embeddings remain F32
+/// until transformer projection; binary masks compact each sample before the DiT forward.
 #[derive(Clone, Copy, Debug)]
 pub struct MossImageEmbeddings<'a> {
     pub values: &'a [f32],

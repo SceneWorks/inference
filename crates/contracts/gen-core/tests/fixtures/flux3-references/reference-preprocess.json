@@ -1,0 +1,113 @@
+{
+  "upstream": "45e57c9fb06f9751cdced29a65c5d2171003be05",
+  "source_sha256": "33c323ebaeaf56790f3d0022a57827b5348446a8a4b372ab2bcc606d722e76a9",
+  "dtype": "RGB uint8",
+  "pillow": "12.3.0",
+  "numpy": "2.5.4",
+  "exif": {
+    "file": "exif6.png",
+    "stored": [
+      83,
+      67
+    ],
+    "orientation": 6,
+    "oriented": [
+      67,
+      83
+    ],
+    "canvas": [
+      80,
+      96
+    ],
+    "crop": [
+      6,
+      6,
+      73,
+      89
+    ]
+  },
+  "functions": [
+    "_ceil16",
+    "prepare_multi_reference",
+    "prepare_reference",
+    "reference_canvas"
+  ],
+  "pattern": [
+    "(x*17+y*7)%256",
+    "(x*3+y*19)%256",
+    "(x*29+y*11)%256"
+  ],
+  "cases": [
+    {
+      "name": "reflect",
+      "input": [
+        83,
+        67
+      ],
+      "multi": false,
+      "output": [
+        96,
+        80
+      ],
+      "crop": [
+        6,
+        6,
+        89,
+        73
+      ],
+      "file": "reflect.rgb"
+    },
+    {
+      "name": "symmetric",
+      "input": [
+        3,
+        1
+      ],
+      "multi": false,
+      "output": [
+        64,
+        64
+      ],
+      "crop": [
+        30,
+        31,
+        33,
+        32
+      ],
+      "file": "symmetric.rgb"
+    },
+    {
+      "name": "single-resize",
+      "input": [
+        1,
+        5000
+      ],
+      "multi": false,
+      "output": [
+        64,
+        4096
+      ],
+      "crop": [
+        31,
+        0,
+        32,
+        4096
+      ],
+      "file": "single-resize.rgb"
+    },
+    {
+      "name": "multi-resize",
+      "input": [
+        2051,
+        1027
+      ],
+      "multi": true,
+      "output": [
+        1440,
+        720
+      ],
+      "crop": null,
+      "file": "multi-resize.rgb"
+    }
+  ]
+}

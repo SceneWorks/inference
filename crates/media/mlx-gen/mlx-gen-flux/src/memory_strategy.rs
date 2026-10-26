@@ -748,7 +748,7 @@ fn surface_selector_matches_spec(
         }
         MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(mlx_gen::Quant::Q4),
         MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(mlx_gen::Quant::Q8),
-        MemoryContractSurfaceTier::Nvfp4 => false,
+        MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     let plain = surface.spec.adapters.is_empty()
         && surface.spec.control.is_none()
@@ -1409,7 +1409,9 @@ mod tests {
                 MemoryContractSurfaceTier::Bf16 => None,
                 MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
                 MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
-                MemoryContractSurfaceTier::Nvfp4 => unreachable!("MLX facts omit NVFP4"),
+                MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => {
+                    unreachable!("MLX facts omit NVFP4 and FP8 rowwise")
+                }
             };
             for provider in [
                 crate::FLUX1_SCHNELL_ID,

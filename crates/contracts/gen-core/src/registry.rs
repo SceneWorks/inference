@@ -944,6 +944,7 @@ pub enum MemoryContractSurfaceTier {
     Q4,
     Q8,
     Nvfp4,
+    Fp8Rowwise,
 }
 
 impl MemoryContractSurfaceTier {
@@ -956,6 +957,7 @@ impl MemoryContractSurfaceTier {
             Self::Q4 => spec.with_quant(crate::Quant::Q4),
             Self::Q8 => spec.with_quant(crate::Quant::Q8),
             Self::Nvfp4 => spec.with_quant(crate::Quant::Nvfp4),
+            Self::Fp8Rowwise => spec.with_quant(crate::Quant::Fp8Rowwise),
         }
     }
 }
@@ -982,6 +984,9 @@ impl MemoryContractSurfaceSelector {
             MemoryContractSurfaceTier::Q4 => spec.quantize == Some(crate::Quant::Q4),
             MemoryContractSurfaceTier::Q8 => spec.quantize == Some(crate::Quant::Q8),
             MemoryContractSurfaceTier::Nvfp4 => spec.quantize == Some(crate::Quant::Nvfp4),
+            MemoryContractSurfaceTier::Fp8Rowwise => {
+                spec.quantize == Some(crate::Quant::Fp8Rowwise)
+            }
         };
         tier_matches
             && self.offload_policy == spec.offload_policy
@@ -1070,6 +1075,26 @@ impl MemoryContractSurfaceSelector {
                 crate::OffloadPolicy::Sequential,
                 crate::LoadShape::DeferredMaterialization,
             ) => "nvfp4:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "fp8r:resident:eager",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "fp8r:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "fp8r:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "fp8r:sequential:deferred",
         }
     }
 }
@@ -1156,6 +1181,19 @@ pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurface
         MemoryContractSurfaceTier::Q4,
         MemoryContractSurfaceTier::Q8,
         MemoryContractSurfaceTier::Nvfp4,
+    ])
+}
+
+/// Candle CUDA surface for providers that load the publisher FP8R and NVFP4 tiers as shipped
+/// (FLUX3, sc-26241) beside the dense and native q4/q8 tiers. CUDA-only formats are normal: a
+/// backend that cannot run them simply does not advertise this surface.
+pub fn candle_publisher_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+        MemoryContractSurfaceTier::Nvfp4,
+        MemoryContractSurfaceTier::Fp8Rowwise,
     ])
 }
 
@@ -1267,6 +1305,17 @@ pub struct ActivationMemoryRegistration {
     pub anchor: crate::ActivationMemoryAnchor,
 }
 
+/// Provider-owned PRE-FIT pricing of a request's reference work (sc-26241): the additional bytes
+/// the resolved [`crate::MemoryReferenceResourceFacts`] need on the loaded package `spec`. Opt-in
+/// and separate from [`MemoryRegistration`], like [`ActivationMemoryRegistration`]; omission is
+/// the explicit unpriced state, and a request without references prices zero.
+#[derive(Clone, Copy)]
+pub struct ReferenceWorkspaceRegistration {
+    pub provider_id: &'static str,
+    pub reference_workspace_bytes:
+        fn(&LoadSpec, &crate::MemoryReferenceResourceFacts) -> Result<u64>,
+}
+
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct TransformRegistration {
@@ -1355,6 +1404,7 @@ pub struct ProviderRegistryBuilder {
     resident_only_memory_contract: Vec<ResidentOnlyMemoryContractRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
+    reference_workspace: Vec<ReferenceWorkspaceRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
@@ -1840,6 +1890,11 @@ impl ProviderRegistryBuilder {
         ActivationMemoryRegistration
     );
     builder_registration_method!(
+        register_reference_workspace,
+        reference_workspace,
+        ReferenceWorkspaceRegistration
+    );
+    builder_registration_method!(
         register_memory_strategy,
         memory_strategy,
         MemoryRegistration
@@ -1992,6 +2047,27 @@ impl ProviderRegistryBuilder {
         }
         let imported_models =
             validate_checkpoint_adapters(&self.checkpoint_adapters, &self.generators)?;
+        {
+            let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.reference_workspace {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate reference-workspace provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "reference-workspace registration '{}' has no matching generator",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
         {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
@@ -2157,6 +2233,7 @@ impl ProviderRegistryBuilder {
             resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
+            reference_workspace: self.reference_workspace.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
@@ -2185,6 +2262,7 @@ pub struct ProviderRegistry {
     resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
+    reference_workspace: Box<[ReferenceWorkspaceRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
@@ -2217,7 +2295,7 @@ macro_rules! explicit_registry_kind {
                         id = id
                     ))
                 })?;
-            self.ensure_quant_supported(id, spec)?;
+            self.ensure_quant_supported(id, spec, $kind)?;
             spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };
@@ -2548,6 +2626,35 @@ impl ProviderRegistry {
             .map(|registration| registration.anchor.bytes_1024))
     }
 
+    /// Provider-owned PRE-FIT bytes of a request's reference work for generator `id` on `spec`.
+    /// `facts == None` (no references) is `Ok(Some(0))` for a registered provider, so decisions
+    /// without references are unchanged; an unregistered provider is `Ok(None)` (unpriced); an
+    /// unknown id is an error.
+    pub fn reference_workspace_bytes(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        facts: Option<&crate::MemoryReferenceResourceFacts>,
+    ) -> Result<Option<u64>> {
+        if !self
+            .generators()
+            .any(|registration| (registration.descriptor)().id == id)
+        {
+            return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        let Some(registration) = self
+            .reference_workspace
+            .iter()
+            .find(|registration| registration.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        match facts {
+            None => Ok(Some(0)),
+            Some(facts) => (registration.reference_workspace_bytes)(spec, facts).map(Some),
+        }
+    }
+
     /// Every adopted memory-strategy registration in this explicit catalog.
     pub fn memory_strategy_registrations(
         &self,
@@ -2706,7 +2813,7 @@ impl ProviderRegistry {
     /// check covers the whole catalog — the composition root states the platform's tier support once
     /// instead of each provider re-deriving it. Runs *after* id resolution so an unknown id still
     /// reports as an unknown id.
-    fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec) -> Result<()> {
+    fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec, kind: &str) -> Result<()> {
         if spec.yue2_ar_mode != crate::Yue2ArMode::Native && id != "yue2" {
             return Err(Error::Unsupported(format!(
                 "the YuE2 AR mode {:?} cannot be used by provider '{id}'",
@@ -2728,7 +2835,22 @@ impl ProviderRegistry {
                  (requested for '{id}'): {reason}. Refusing to load rather than silently \
                  serving a different tier's numerics."
             ))),
-            None => Ok(()),
+            None => {
+                // A NEW packed float format never inherits affine Q8 support. Reuse
+                // the descriptor's exact typed list as the one opt-in source; no
+                // parallel builder allow-list or model-id exception exists.
+                if quant == Quant::Fp8Rowwise
+                    && (kind != "generator"
+                        || !self.generators().any(|registration| {
+                            let descriptor = (registration.descriptor)();
+                            descriptor.id == id
+                                && descriptor.capabilities.supported_quants.contains(&quant)
+                        }))
+                {
+                    return Err(Error::Unsupported(format!("provider '{id}' does not advertise the exact fp8r packed format (it is not Q8); install/convert a compatible artifact and select a supported native tier")));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2823,6 +2945,9 @@ impl ProviderRegistry {
             .generators()
             .find(|registration| (registration.descriptor)().id == id)
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
+        if spec.quantize == Some(Quant::Fp8Rowwise) {
+            self.ensure_quant_supported(id, spec, "generator")?;
+        }
         match registration.footprint {
             Some(footprint) => spec
                 .read_prepared_files_unchanged(|| footprint(spec))
@@ -2846,6 +2971,9 @@ impl ProviderRegistry {
         let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
         if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        if spec.quantize == Some(Quant::Fp8Rowwise) {
+            self.ensure_quant_supported(id, spec, "generator")?;
         }
         let Some(registration) = self
             .memory_strategy
@@ -4524,6 +4652,86 @@ mod tests {
             ),
             other => panic!("a rejected quant tier is a capability gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rowwise_fp8_requires_exact_provider_capability_not_q8_width() {
+        fn q8_only() -> ModelDescriptor {
+            let mut descriptor = dummy_candle_descriptor();
+            descriptor.capabilities.supported_quants = &[Quant::Q8];
+            descriptor
+        }
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: q8_only,
+                load: dummy_load,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        let q8 = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+        assert!(registry.load("dummy_candle_test_model", &q8).is_ok());
+        let fp8 = q8.with_quant(Quant::Fp8Rowwise);
+        for error in [
+            registry.load("dummy_candle_test_model", &fp8).err(),
+            registry.footprint("dummy_candle_test_model", &fp8).err(),
+            registry
+                .memory_strategy_contract("dummy_candle_test_model", &fp8)
+                .err(),
+        ] {
+            assert!(
+                matches!(error,Some(Error::Unsupported(message)) if message.contains("fp8r")&&message.contains("not Q8"))
+            );
+        }
+    }
+
+    #[test]
+    fn flux3_fp8_is_not_advertised_until_explicitly_listed() {
+        fn without_fp8() -> ModelDescriptor {
+            ModelDescriptor {
+                id: crate::flux3::DISTILLED_MODEL_ID,
+                family: "flux3",
+                backend: "candle",
+                ..dummy_descriptor()
+            }
+        }
+        fn with_fp8() -> ModelDescriptor {
+            let mut descriptor = without_fp8();
+            descriptor.capabilities.supported_quants = &[Quant::Fp8Rowwise];
+            descriptor
+        }
+        fn load_fp8(_: &LoadSpec) -> Result<Box<dyn Generator>> {
+            Ok(Box::new(DummyGen { desc: with_fp8() }))
+        }
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Fp8Rowwise);
+        let unlisted = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: without_fp8,
+                load: load_fp8,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        assert!(matches!(
+            unlisted.load(crate::flux3::DISTILLED_MODEL_ID, &spec),
+            Err(Error::Unsupported(_))
+        ));
+        let listed = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: with_fp8,
+                load: load_fp8,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        assert!(listed.load(crate::flux3::DISTILLED_MODEL_ID, &spec).is_ok());
+        assert_eq!(
+            (listed.generators().next().unwrap().descriptor)()
+                .capabilities
+                .supported_quants,
+            &[Quant::Fp8Rowwise]
+        );
     }
 
     /// A model-specific AR execution choice cannot be silently ignored by another provider.
@@ -6873,6 +7081,68 @@ mod tests {
                 .unwrap(),
             Some(8)
         );
+    }
+
+    /// *Mutations that red this:* pricing `None` facts through the provider, treating an
+    /// unregistered provider as zero, or accepting duplicate/orphan registrations.
+    #[test]
+    fn reference_workspace_registration_is_additive_and_fails_closed() {
+        fn price(_: &LoadSpec, facts: &crate::MemoryReferenceResourceFacts) -> Result<u64> {
+            Ok(facts.conditioning_tokens * 10)
+        }
+        const REGISTRATION: ReferenceWorkspaceRegistration = ReferenceWorkspaceRegistration {
+            provider_id: "dummy_test_model",
+            reference_workspace_bytes: price,
+        };
+        let spec = LoadSpec::new(crate::WeightsSource::Dir("/unused".into()));
+        let facts = crate::MemoryReferenceResourceFacts {
+            conditioning_tokens: 3,
+            prepared_canvases: vec![(48, 16)],
+        };
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            registry
+                .reference_workspace_bytes("dummy_test_model", &spec, None)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            registry
+                .reference_workspace_bytes("dummy_test_model", &spec, Some(&facts))
+                .unwrap(),
+            Some(30)
+        );
+        assert!(registry
+            .reference_workspace_bytes("no_such_model", &spec, None)
+            .is_err());
+        let unpriced = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            unpriced
+                .reference_workspace_bytes("dummy_test_model", &spec, Some(&facts))
+                .unwrap(),
+            None
+        );
+        assert!(ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .build()
+            .is_err());
+        assert!(ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(ReferenceWorkspaceRegistration {
+                provider_id: "no_such_model",
+                reference_workspace_bytes: price,
+            })
+            .build()
+            .is_err());
     }
 
     #[test]

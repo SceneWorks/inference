@@ -1962,6 +1962,7 @@ mod tests {
                 None => (MemoryOptimizationAuthority::Estimated, String::new()),
             };
             let context = MemoryRunContext {
+                reference_resources: None,
                 selection,
                 optimization_authority: authority,
                 calibration_abi: MEMORY_CALIBRATION_ABI,
