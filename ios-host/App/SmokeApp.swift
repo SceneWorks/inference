@@ -27,9 +27,28 @@ func logLaunchMemory() {
     let mib = ios_smoke_available_memory_mib()
     setenv("IOS_SMOKE_INCREASED_MEMORY_LIMIT", increasedMemoryLimit, 1)
     setenv("IOS_CAMPAIGN_IOS_VERSION", ProcessInfo.processInfo.operatingSystemVersionString, 1)
+
+    // Record the app's filesystem capacity before Rust or model code runs. Keep the launch-memory
+    // record on one line because the maintained host freshness check validates its final
+    // increased-memory-limit field.
+    let filesystemAttributes = try? FileManager.default.attributesOfFileSystem(
+        forPath: NSHomeDirectory())
+    let filesystemFreeBytes =
+        (filesystemAttributes?[.systemFreeSize] as? NSNumber)?.stringValue ?? "unavailable"
+    let filesystemTotalBytes =
+        (filesystemAttributes?[.systemSize] as? NSNumber)?.stringValue ?? "unavailable"
+    let candidateRunID = ProcessInfo.processInfo.environment["IOS_CAMPAIGN_RUN_ID"] ?? ""
+    let campaignRunID = candidateRunID.range(
+        of: "^[0-9a-f]{32}$", options: .regularExpression) == nil
+        ? "unavailable"
+        : candidateRunID
+    let capturedAtUTC = ISO8601DateFormatter().string(from: Date())
+    let filesystem = "filesystem_scope=app_home filesystem_available_bytes=\(filesystemFreeBytes) " +
+        "filesystem_total_bytes=\(filesystemTotalBytes) campaign_run_id=\(campaignRunID) " +
+        "captured_at_utc=\(capturedAtUTC)"
     let line = String(
-        format: "launch: os_proc_available_memory = %.0f MiB, increased-memory-limit = %@\n",
-        mib, increasedMemoryLimit)
+        format: "launch: os_proc_available_memory = %.0f MiB, %@, increased-memory-limit = %@\n",
+        mib, filesystem, increasedMemoryLimit)
     NSLog("%@", line)
     if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
         try? line.write(to: dir.appendingPathComponent("launch-memory.txt"),
