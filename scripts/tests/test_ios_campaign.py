@@ -1,4 +1,7 @@
-"""CPU-only campaign tests. Every subprocess is globally trapped: mutations cannot launch tools."""
+"""CPU-only campaign tests. Every subprocess is globally trapped: mutations cannot launch tools.
+
+CI_IMPACT: four bounded mock/receipt checks (<0.1 s); no device, Metal, or model execution.
+"""
 import contextlib
 import importlib.util
 import io
@@ -312,6 +315,11 @@ class CampaignTests(unittest.TestCase):
 
     def test_device_deadline_exit_code_entitlement_and_artifact_copy(self):
         session = self.fake_session(self.success())
+        attempt_path = self.root / "run.artifacts" / campaign.artifact_stem(self.keys[0]) / "attempt.json"
+        def launch(_):
+            self.assertTrue(attempt_path.is_file(), "host nonce must persist before devicectl launch")
+            return subprocess.CompletedProcess([], 0, "", "")
+        session.device.side_effect = launch
         result = session.run_case(self.keys[0])
         self.assertEqual(result["status"], "successful")
         self.assertEqual(result["launcher_exit_code"], 0)
@@ -320,10 +328,102 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn("--terminate-existing", launched)
         variables = json.loads(launched[launched.index("--environment-variables") + 1])
         self.assertEqual(variables["IOS_CAMPAIGN_TIMEOUT_SECONDS"], "77")
+        attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+        self.assertEqual((attempt["run_id"], attempt["case"], attempt["build_sha"]),
+                         (variables["IOS_CAMPAIGN_RUN_ID"], self.keys[0], "test-sha"))
         self.assertTrue(any(call.args[0] == "campaign-" + self.keys[0].replace("/", "-") + "-0.png" for call in session.copy.call_args_list))
         session = self.fake_session(self.success(), entitlement="NO")
         session.args.output = self.root / "wrong-entitlement.jsonl"
         self.assertEqual(session.run_case(self.keys[0])["status"], "diagnostic_failure")
+
+    def test_report_copy_timeout_reads_once_after_exit_and_retains_matched_diagnostic(self):
+        key = self.keys[0]
+        session = self.fake_session(self.success())
+        session.sha = "b" * 40
+        nonce = "a" * 32
+        calls = []
+        with mock.patch.object(campaign.uuid, "uuid4", return_value=mock.Mock(hex=nonce)):
+            def copy(remote, local):
+                calls.append(remote)
+                if remote == "smoke-report.txt":
+                    if calls.count(remote) == 1:
+                        raise subprocess.TimeoutExpired("devicectl copy", 15)
+                    local.write_text("CAMPAIGN_JSON " + json.dumps(self.success(key)), encoding="utf-8")
+                    os.utime(local, (1, 1))  # an earlier app's report, never fresh evidence
+                elif remote == "launch-memory.txt":
+                    local.write_text("launch: increased-memory-limit = YES", encoding="utf-8")
+                elif remote == "campaign-progress.txt":
+                    local.write_text(f"run_id={nonce} build={'b' * 40} case={campaign.artifact_stem(key)} "
+                                     "stage=before_load bytes=42 footprint=Some(100) available=None\n",
+                                     encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "", "")
+            session.copy.side_effect = copy
+            row = session.run_case(key)
+        self.assertEqual(calls.count("smoke-report.txt"), 2)
+        self.assertEqual(calls.count("campaign-progress.txt"), 1)
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertIn("report copy timed out", row["reason"])
+        self.assertEqual(row["run_id"], nonce)
+        self.assertEqual(row["progress_sidecar"]["status"], "matched")
+        self.assertEqual(row["progress_sidecar"]["evidence_class"], "diagnostic_only")
+        self.assertTrue(row["device_exited"])
+        self.assertTrue(session.blocked, "missing fresh report must stop the next case")
+
+    def test_report_copy_timeout_can_recover_a_fresh_typed_refusal_after_exit(self):
+        key = self.keys[0]
+        report = dict(campaign.failure(key, "resident union exceeded live allowance"),
+                      status="capture_refused", diagnostic=True, evidence_class="capture",
+                      refusal_kind="capacity", refused_quantum={"label": "resident union"},
+                      run_id="fixture-run", build_sha="test-sha")
+        session = self.fake_session(report)
+        session.args.diagnostic = True
+        normal_copy = session.copy.side_effect
+        reports = 0
+        def copy(remote, local):
+            nonlocal reports
+            if remote == "smoke-report.txt":
+                reports += 1
+                if reports == 1:
+                    raise subprocess.TimeoutExpired("devicectl copy", 15)
+            if remote == "renders.txt":
+                return subprocess.CompletedProcess([], 1, "", "missing")
+            return normal_copy(remote, local)
+        session.copy.side_effect = copy
+        row = session.run_case(key)
+        self.assertEqual(reports, 2)
+        self.assertEqual(row["status"], "capture_refused")
+        self.assertEqual(row["refusal_kind"], "capacity")
+        self.assertTrue(row["device_exited"])
+        self.assertFalse(session.blocked)
+        self.assertFalse(any(call.args[0] == "campaign-progress.txt" for call in session.copy.call_args_list))
+
+    def test_report_copy_timeout_with_unverified_exit_does_not_copy_sidecar(self):
+        session = self.fake_session(self.success())
+        session.exited.side_effect = [True, subprocess.TimeoutExpired("process list", 15)]
+        def copy(remote, _):
+            self.assertEqual(remote, "smoke-report.txt")
+            raise subprocess.TimeoutExpired("devicectl copy", 15)
+        session.copy.side_effect = copy
+        row = session.run_case(self.keys[0])
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertFalse(row["device_exited"])
+        self.assertTrue(session.blocked)
+        self.assertEqual(session.exited.call_count, 2)
+        self.assertEqual(session.copy.call_count, 1)
+        self.assertEqual(row["run_id"], "fixture-run")
+
+    def test_progress_identity_and_freshness_do_not_promote_old_sidecar(self):
+        key, nonce, sha = self.keys[0], "a" * 32, "b" * 40
+        path = self.root / "campaign-progress.txt"
+        path.write_text(f"run_id={nonce} build={sha} case={campaign.artifact_stem(key)} "
+                        "stage=before_load bytes=42 footprint=Some(100) available=None\n", encoding="utf-8")
+        started = campaign.time.time()
+        self.assertEqual(campaign.progress_diagnostic(path, nonce, sha, key, started)["status"], "matched")
+        self.assertEqual(campaign.progress_diagnostic(path, "c" * 32, sha, key, started)["status"], "identity_mismatch")
+        self.assertEqual(campaign.progress_diagnostic(path, nonce, "d" * 40, key, started)["status"], "identity_mismatch")
+        self.assertEqual(campaign.progress_diagnostic(path, nonce, sha, self.keys[1], started)["status"], "identity_mismatch")
+        os.utime(path, (1, 1))
+        self.assertEqual(campaign.progress_diagnostic(path, nonce, sha, key, started)["status"], "stale_or_oversized")
 
     def test_stale_launch_identity_cannot_pass_even_with_matching_case_and_sha(self):
         session = self.fake_session(dict(self.success(), run_id="previous-launch"))

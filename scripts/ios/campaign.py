@@ -24,6 +24,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -52,6 +53,25 @@ SAMPLING_NAME_BYTES_MAX = 128
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
 REFUSAL_KINDS = ("capacity", "no_evidence", "mode", "strategy", "artifact")
 EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json"
+PROGRESS_MAX_BYTES = 512
+PROGRESS_LINE = re.compile(
+    r"run_id=([0-9a-f]{32}) build=([0-9a-f]{40}) case=(\S+) "
+    r"stage=([^\r\n]{1,128}?) bytes=(\d+) "
+    r"footprint=(None|Some\(\d+\)) available=(None|Some\(\d+\))\n?\Z"
+)
+
+
+def progress_diagnostic(path, run_id, build_sha, case, started):
+    """Classify one persisted breadcrumb; it can never replace the campaign report."""
+    receipt = {"path": str(path), "evidence_class": "diagnostic_only"}
+    if path.stat().st_size > PROGRESS_MAX_BYTES or path.stat().st_mtime < int(started):
+        return dict(receipt, status="stale_or_oversized")
+    match = PROGRESS_LINE.fullmatch(path.read_text(encoding="utf-8"))
+    if match is None:
+        return dict(receipt, status="malformed")
+    if match.group(1, 2, 3) != (run_id, build_sha, artifact_stem(case)):
+        return dict(receipt, status="identity_mismatch")
+    return dict(receipt, status="matched", stage=match.group(4))
 
 
 def step_count(value):
@@ -419,11 +439,24 @@ class DeviceSession:
         launcher_code = None
         run_id = uuid.uuid4().hex
         self.run_id = run_id
+        exit_verified = False
+        report_received = False
+        report_copy_timed_out = False
         try:
             artifact.mkdir(parents=True, exist_ok=False)
             if not self.exited():
                 self.blocked = True
                 raise ValueError("prior app still running; cannot launch next case")
+            # Persist the HOST's launch identity before the request. The app may die before any
+            # report is copied, and a later sidecar is otherwise impossible to authenticate.
+            attempt = {"schema": 1, "run_id": run_id, "case": key,
+                       "case_stem": artifact_stem(key), "build_sha": self.sha,
+                       "memory_entitlement": self.args.memory_entitlement,
+                       "started_unix_seconds": started, "bundle_id": self.bundle}
+            with (artifact / "attempt.json").open("x", encoding="utf-8") as receipt:
+                receipt.write(json.dumps(attempt, sort_keys=True) + "\n")
+                receipt.flush()
+                os.fsync(receipt.fileno())
             variables = {"IOS_CAMPAIGN_CASE": key, "IOS_CAMPAIGN_DIAGNOSTIC": "1" if self.args.diagnostic else "0",
                          "IOS_CAMPAIGN_REFUSAL_ONLY": "1" if refusal_only else "0", "IOS_CAMPAIGN_TIMEOUT_SECONDS": str(self.args.timeout_seconds), "IOS_CAMPAIGN_BUILD_SHA": self.sha, "IOS_CAMPAIGN_RUN_ID": run_id}
             result = self.device(["device", "process", "launch", "--device", self.args.device, "--environment-variables", json.dumps(variables), self.bundle])
@@ -432,9 +465,16 @@ class DeviceSession:
                 raise ValueError("device launcher failed: " + result.stderr)
             report = artifact / "report.txt"
             while time.monotonic() < end:
-                copied = self.copy("smoke-report.txt", report)
+                try:
+                    copied = self.copy("smoke-report.txt", report)
+                except subprocess.TimeoutExpired:
+                    # A busy device must not receive another stream of copy requests. Wait for
+                    # natural exit, then make exactly one final read of the persisted report.
+                    report_copy_timed_out = True
+                    break
                 if not copied.returncode and report.exists() and report.stat().st_mtime >= int(started):
                     row = parse_report(report.read_text(encoding="utf-8"), key)
+                    report_received = True
                     break
                 time.sleep(min(1, max(0, end - time.monotonic())))
             else:
@@ -448,6 +488,21 @@ class DeviceSession:
                     self.blocked = True
                     raise ValueError("device did not exit after cooperative deadline; campaign stopped without hard-killing render")
                 time.sleep(1)
+            exit_verified = True
+            if not report_received:
+                try:
+                    copied = self.copy("smoke-report.txt", report)
+                    if not copied.returncode and report.exists() and report.stat().st_mtime >= int(started):
+                        row = parse_report(report.read_text(encoding="utf-8"), key)
+                        report_received = True
+                except subprocess.TimeoutExpired:
+                    pass
+                if not report_received:
+                    cause = "report copy timed out" if report_copy_timed_out else "report never arrived"
+                    row = failure(key, cause + "; fresh report unavailable after verified device exit; no refusal proof")
+                    self.blocked = True
+            if not report_received:
+                raise ValueError(row["reason"])
             launch = artifact / "launch-memory.txt"
             copied = self.copy("launch-memory.txt", launch)
             expected = "YES" if self.args.memory_entitlement == "on" else "NO"
@@ -474,13 +529,32 @@ class DeviceSession:
                 raise ValueError("successful case has no render manifest")
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             row = failure(key, str(exc))
-            # Exit verification is required on every exceptional path too.
-            try:
-                self.blocked = not self.exited()
-            except (ValueError, OSError, subprocess.SubprocessError):
+            # A timed-out device command must not trigger an immediate second busy-device probe.
+            # A previously verified exit remains verified; otherwise stop before another case.
+            if isinstance(exc, subprocess.TimeoutExpired):
                 self.blocked = True
+            elif not exit_verified and not self.blocked:
+                try:
+                    exit_verified = self.exited()
+                    self.blocked = not exit_verified
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    self.blocked = True
             row["harness_terminated"] = True
-        row.update(launcher_exit_code=launcher_code, refusal_only=refusal_only, device_exited=not self.blocked, host_artifact_directory=str(artifact))
+        if launcher_code == 0 and exit_verified and row.get("status") == "diagnostic_failure":
+            progress = artifact / "campaign-progress.txt"
+            try:
+                copied = self.copy("campaign-progress.txt", progress)
+                if not copied.returncode and progress.exists():
+                    row["progress_sidecar"] = progress_diagnostic(progress, run_id, self.sha, key, started)
+                else:
+                    row["progress_sidecar"] = {"status": "unavailable", "evidence_class": "diagnostic_only"}
+            except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    self.blocked = True
+                row["progress_sidecar"] = {"status": "copy_failed", "reason": str(exc), "evidence_class": "diagnostic_only"}
+        if row.get("status") == "diagnostic_failure":
+            row["run_id"] = run_id
+        row.update(launcher_exit_code=launcher_code, refusal_only=refusal_only, device_exited=exit_verified, host_artifact_directory=str(artifact))
         if refusal_only and not capacity_refusal(row):
             row = dict(row, status="diagnostic_failure", production_success=False, reason="next-up requires an artifact-bound CAPACITY refusal, not missing evidence/mode/strategy: " + row.get("reason", ""))
         return row
