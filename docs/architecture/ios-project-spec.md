@@ -1,6 +1,6 @@
 # iOS runtime project specification
 
-Updated 2026-10-16. This describes the feature branch, not a main release or a
+Reconciled 2026-10-26. This describes the feature branch, not a main release or a
 completed device campaign. Requirements and acceptance authority:
 [epic 16774](https://app.shortcut.com/trefry/epic/16774).
 Architecture rationale: [strategy](ios-strategy.md). Operation:
@@ -55,8 +55,8 @@ Every registered image model and mode loads through ONE admission seam
   it from the single reviewed ANCHOR table
   `crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json` (schema 3: per
   family a resident and a fully optimized anchor; at an anchor's own key its measured growth, else
-  the anchor-law derivation `mlx-gen-ios-catalog/src/anchor.rs` over the providers' counted
-  pricing), runs the provider's registered `standard_memory_strategy_safety_check` with that demand
+  an applicable certified transfer or explicitly approved engineering estimate
+  over the providers' actual source pricing), runs the provider's registered `standard_memory_strategy_safety_check` with that demand
   plus the anchor's measured repeat-spread margin against the provisional cap and live headroom,
   and only then loads, inside the admission's measured envelope (`ios_quantum`). The bound wrapper rechecks the exact
   request (geometry, tile, mode, conditioning, prompt, execution), live capacity and source pins
@@ -85,6 +85,14 @@ The existing budget constants are provisional and unchanged. A validated safe
 working-set envelope still needs device captures; neither launch headroom nor
 old active+cache observations can supply it.
 
+The 2026-10-26 approved contract permits a practical scoped engineering estimate
+for real file-backed catalog/model paths: optimized measured growth times an
+upward-only maximum source phase-pressure ratio, repeat-spread margin floored
+at 32 MiB, and live headroom checks. Record HOST/driver and source-preparation
+assumptions explicitly; this is not a mathematical iOS physical-charge bound.
+Preserve arbitrary public Array inputs without claiming this phone-fit
+certification. The runbook specifies endpoint consistency and provenance rules.
+
 SANA profile identity is header-only: component inventory, tensor names, shapes,
 storage dtypes and payload sizes. It is not a content/quality hash. Binding is
 about applicability, not revision currency: moving a pin is not grounds to
@@ -109,8 +117,9 @@ product Swift concurrency API. Preserve fresh-build/report guards and explicit
 admitted-versus-diagnostic labels in the harness. Do not run another MLX workload
 concurrently with a device investigation's host-side measurement.
 
-The remaining terminal sequence is owned by sc-26270: complete registrations
-(including Supra2 after epic 24212), collect the target model × tier × geometry
-campaign, review E1–E7 once, integrate inference, perform the one SceneWorks pin
-bump, and integrate SceneWorks. No pin or main merge is performed by this docs
-story. Product FFI, Swift package and app provisioning remain separately scoped.
+The remaining terminal sequence is owned by sc-26270: finish the general model
+set, review E1–E8, integrate inference through its protected main PR, perform the
+single permanent SceneWorks pin bump, collect the target endpoint evidence and
+derived claims, then integrate SceneWorks. Supra2 iOS registration remains the
+user-approved non-blocking sc-26269 follow-up. No pin or main merge is performed
+by this docs story. Product FFI, Swift package and app provisioning remain separately scoped.

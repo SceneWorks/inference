@@ -4,7 +4,8 @@ The operational source of truth is
 [epic 16774](https://app.shortcut.com/trefry/epic/16774), re-planned 2026-10-15.
 This replaces the old phase diary and contradictory fit verdicts; it is not a
 second implementation plan. Current implementation context is
-`feature/sc-16774-ios-runtime` at `a54ad6c3a` (2026-10-16), not main.
+`feature/sc-16774-ios-runtime` plus the sc-26270 terminal candidate, reconciled
+2026-10-26. Final main integration and device evidence remain pending.
 
 - Architecture: [strategy](architecture/ios-strategy.md)
 - Components/contracts: [project specification](architecture/ios-project-spec.md)
@@ -15,11 +16,11 @@ second implementation plan. Current implementation context is
 
 | Work | State at this documentation snapshot | Completion evidence still needed |
 |---|---|---|
-| sc-26267 Iris iOS ladder/catalog | Registration PR [#1277](https://github.com/SceneWorks/inference/pull/1277) open; q8/q4 engine fixes already merged | Merged public facade/modes, including the separate explicitly diagnostic depth surface; do not infer target fit from Mac tests |
-| sc-26268 SDXL-family iOS catalog | Engine fixes merged; registration PR [#1278](https://github.com/SceneWorks/inference/pull/1278) open | Final admitted facade and all family routes on feature; no current phone capture authorizes product loads |
-| sc-26269 Supra2-IMG iOS catalog | Not started; depends on epic 24212 implementation reaching inference main | Actual implementation dependency, iOS registration and coverage, not removal from the model set |
+| sc-26267 Iris iOS ladder/catalog | Registration PR [#1277](https://github.com/SceneWorks/inference/pull/1277) merged at `481b04d6`; q8/q4 engine fixes merged | Target-phone admission and image/task evidence remain terminal work |
+| sc-26268 SDXL-family iOS catalog | Engine fixes and registration PR [#1278](https://github.com/SceneWorks/inference/pull/1278) merged at `be196d97` | No current phone capture authorizes product loads |
+| sc-26269 Supra2-IMG iOS catalog | Base provider delivered separately; iOS registration explicitly user-deferred and non-blocking | Remains open with its full registration acceptance; does not gate general closeout |
 | sc-16781 documentation | Draft against merged feature plus explicitly labeled pending registrations | Reconcile final merged interfaces before claiming final-state documentation |
-| sc-26270 terminal integration | Not complete | Device campaign, feature-end E1–E7 review, inference integration, single SceneWorks pin bump, SceneWorks integration and tracker readback |
+| sc-26270 terminal integration | Not complete | Device endpoints and derived claims, feature-end E1–E8 review, inference integration, single permanent SceneWorks pin bump, SceneWorks integration and tracker readback |
 
 ## Target-device evidence still required
 
@@ -37,9 +38,9 @@ they do not close the phone campaign or establish target fit. The runbook record
 their exact source provenance and the older full-pipeline measurement's limits.
 
 The terminal campaign covers SANA, Anima Turbo, Iris 3B, Z-Image Turbo, the
-complete SDXL family and Supra2-IMG across served tiers and modes as ANCHORS (the
+complete SDXL family across served tiers and modes as ANCHORS (the
 recorded memory-anchor rule): per family the fully resident and the fully
-optimized configuration at 1024² (Supra2: 256²), the optimized one three times,
+optimized configuration at 1024², the optimized one twice,
 every other rung and size derived (runbook: *Anchors and derivation*). Record
 elapsed time, MLX peak, kernel footprint per phase and minimum headroom with
 artifact/device identity.
@@ -47,6 +48,7 @@ Do not substitute old active+cache observations or launch readings for that
 campaign. Keep missing cells visibly outstanding rather than inventing results.
 
 No product FFI, Swift package, app-side provisioning, SenseNova registration or
-Anima Base/Aesthetic work is included in this epic. Supra2's implementation is
-owned by epic 24212, but its iOS registration remains this epic's dependency.
+Anima Base/Aesthetic work is included in this epic. Supra2's implementation was
+delivered separately; its iOS registration remains open in sc-26269 as the
+explicitly user-approved non-blocking follow-up.
 No docs-only change performs a pin bump, main merge or measurement campaign.

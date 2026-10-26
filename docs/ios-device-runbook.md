@@ -448,9 +448,28 @@ Provider certificates bind the actual source inventory, request and execution
 facts. A native-allocation certificate remains a native-allocation result; it is
 not a process-footprint result. Mapping it to process growth additionally needs
 the declared physical/process and HOST/layout premises with their actual scope.
-Missing source terms remain unproved. The SDK and campaign default policy does
-not approve these premises. The engineering-model proposal in sc-26270 activity
-26569 remains a separate unresolved acceptance decision at this snapshot.
+Missing source terms remain unproved; the default policy cannot manufacture
+them. Michael approved the scoped engineering model on 2026-10-26; its
+integration and target-device evidence remain pending at this snapshot.
+
+For that explicitly estimated route, let `P` be the provider's actual per-phase
+resident-plus-largest-quantum pressure and let
+`R = max(1, max_phase(P_request / P_optimized))`. Charge
+`ceil(measured_optimized_growth * R)` plus the optimized repeat spread, floored
+at 32 MiB, and check live headroom. Smaller geometry receives no memory credit.
+A missing phase basis cannot be invented. A completed resident endpoint must
+not be underpredicted; a refused resident supplies no numeric peak. Source
+preparation uses its separately recorded pre-preparation baseline and estimated
+envelope, never the later BeforeModelLoad baseline.
+
+This is a phone/OS/checkpoint/behavior-source-scoped engineering response model,
+not a mathematical physical-charge guarantee. Record the conditional HOST/driver
+and source-preparation assumptions explicitly. Phone-fit certification covers
+the real file-backed catalog/model paths; arbitrary public Array inputs retain
+their behavior without receiving that certification. Keep the original measured
+source revision and a verified behavior/compile-closure mapping when only
+reviewed evidence or policy data is committed later; do not relabel a measurement
+or rerun it solely because the commit hash changed.
 
 Exact measured keys and intermediate derivations are distinct evidence routes.
 A typed resident refusal is permitted by epic acceptance and supplies no measured
