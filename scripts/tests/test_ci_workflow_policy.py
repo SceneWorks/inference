@@ -292,7 +292,7 @@ def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
         for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
             for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
                 primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
-                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures",
+                proof_dispatch = event == "workflow_dispatch" and profile in {"model-inference-proofs", "ios-selected-captures", "ios-prequant",
                     "synthetic-w4a8-mlx", "synthetic-w4a8-cuda", "synthetic-w4a8-both",
                     "moss-edit-cuda", "moss-edit-metal"}
                 expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
@@ -2074,6 +2074,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_ios_prequant_uses_per_run_queue_without_widening_other_profiles(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
+        expression = workflow["concurrency"]["group"]
+        self.assertEqual(expression.count("inputs.profile == 'ios-prequant'"), 1)
+        for mutation in (
+            expression.replace(" || inputs.profile == 'ios-prequant'", ""),
+            expression.replace("inputs.profile == 'ios-prequant'", "inputs.profile == 'iris'"),
+            expression.replace("inputs.profile == 'ios-prequant'",
+                               "inputs.profile == 'ios-prequant' || inputs.profile == 'ios-pricing-compile-only'"),
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(mutation, expression)
+                changed = copy.deepcopy(workflow)
+                changed["concurrency"]["group"] = mutation
+                self.assertTrue(qwen21_primary_concurrency_errors(changed))
 
     def test_qwen_primary_group_rejects_broader_or_nonserializing_mutations(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))

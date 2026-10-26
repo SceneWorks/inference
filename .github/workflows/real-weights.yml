@@ -345,12 +345,13 @@ permissions:
 # rw-starvector is runner 2310 / Michaels-MacBook-Pro, physically distinct from
 # secondary Mac runner 5281 and Windows CUDA runner 2313. Its constant group
 # serializes primary Qwen dispatches without holding the other hosts' shared lock.
-# Explicit synthetic proofs also retain each run/attempt queue entry.
+# Explicit synthetic proofs and the CPU-only primary-Mac iOS prequant routes
+# retain each run/attempt queue entry; the single primary listener serializes them.
 # Every other event, profile and runner retains the shared physical-host group.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' &&
-        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures' || inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both' || inputs.profile == 'moss-edit-cuda' || inputs.profile == 'moss-edit-metal') &&
+        (inputs.profile == 'model-inference-proofs' || inputs.profile == 'ios-selected-captures' || inputs.profile == 'ios-prequant' || inputs.profile == 'synthetic-w4a8-mlx' || inputs.profile == 'synthetic-w4a8-cuda' || inputs.profile == 'synthetic-w4a8-both' || inputs.profile == 'moss-edit-cuda' || inputs.profile == 'moss-edit-metal') &&
         format('inference-model-proof-{0}-{1}', github.run_id, github.run_attempt) ||
         github.event_name == 'workflow_dispatch' &&
         inputs.profile == 'qwen-image-2-1-lora-mlx' &&
