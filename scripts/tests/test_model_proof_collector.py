@@ -212,7 +212,7 @@ class Collector(unittest.TestCase):
                 proof.publish_file(source, destination / 'hard.png', root, 100)
             self.assertEqual(victim.read_bytes(), b'private')
 
-    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body=''):
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True):
         row = case() if row_override is None else row_override
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
@@ -232,7 +232,10 @@ class Collector(unittest.TestCase):
                 'MODEL_INFERENCE_DEVICE ' + row['fqn'] + ' mlx-cpu\n' + input_body)
             kwargs['stdout_path'].write_text(text, encoding="utf-8")
             kwargs['stderr_path'].write_text('', encoding="utf-8")
-            kwargs['event_path'].write_text('{"mock":true}\n', encoding="utf-8")
+            if observer_events == 'broken-symlink':
+                kwargs['event_path'].symlink_to(root / 'missing-observer-events')
+            elif observer_events:
+                kwargs['event_path'].write_text('{"mock":true}\n', encoding="utf-8")
             return safety.RunResult(42, 1 if fail and not discovery else 0, 1024, None,
                                     1000000000, None, 0.01, (), {'mode': 'mock'})
         @contextlib.contextmanager
@@ -271,6 +274,31 @@ class Collector(unittest.TestCase):
             self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY, temp tree removed.
             self.assertTrue((output / '00000/body.events.jsonl').is_file())
             self.assertFalse(any(path.suffix == '.safetensors' for path in output.rglob('*')))
+
+    def test_success_without_optional_observer_events_keeps_actual_supervision(self):
+        # CI_IMPACT: pure mocked controller regression for the Windows no-event
+        # discovery/body path; no Cargo, model, weight, GPU, or process execution.
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(
+                Path(temporary).resolve(), observer_events=False)
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, 2)
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY.
+            case_result = receipt['cases'][0]
+            self.assertTrue(case_result['accepted'])
+            self.assertEqual(len(case_result['commands']), 2)
+            self.assertEqual(case_result['actual_devices'], ['mlx-cpu'])
+            self.assertFalse(any(item['path'].endswith('.events.jsonl') for item in case_result['outputs']))
+            self.assertFalse(list(output.rglob('*.events.jsonl')))
+
+    def test_broken_observer_event_link_cannot_pass_as_absent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, _ = self._mock_run(
+                Path(temporary).resolve(), observer_events='broken-symlink')
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 1)
+            self.assertFalse(receipt['cases'][0]['accepted'])
+            self.assertFalse(verified['accepted_model_run'])
 
     def test_failed_child_keeps_failure_receipt_and_known_logs_not_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:

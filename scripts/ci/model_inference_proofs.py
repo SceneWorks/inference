@@ -1027,6 +1027,11 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         result.update(verify_execution(row, text))
                     for path, cap in ((stdout, policy.stdout_cap_bytes), (stderr, policy.stderr_cap_bytes),
                                       (case_work / (phase + '.events.jsonl'), policy.event_cap_bytes)):
+                        # The supervisor bounds observer events if one is written; it does not
+                        # create that optional file. Never synthesize an event or infer one from
+                        # a successful child. Existing non-file paths still fail in publish_file.
+                        if path.name.endswith('.events.jsonl') and not (path.exists() or path.is_symlink()):
+                            continue
                         published = publish_file(path, case_artifact / path.name, case_work, cap, log=True, destination_root=artifact)
                         published['path'] = (case_artifact / path.name).relative_to(artifact).as_posix()
                         result['outputs'].append(published)
