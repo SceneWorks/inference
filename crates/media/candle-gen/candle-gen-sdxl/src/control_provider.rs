@@ -234,8 +234,8 @@ impl SdxlControlGenerator {
                 let latents = if lightning {
                     denoise_lightning_control(
                         &components.unet,
-                        &conditioning,
-                        &pooled,
+                        conditioning,
+                        pooled,
                         &time_ids,
                         &contexts,
                         image_seed,
@@ -271,8 +271,8 @@ impl SdxlControlGenerator {
                         &sampling,
                         &sigmas,
                         latents,
-                        &conditioning,
-                        &pooled,
+                        conditioning,
+                        pooled,
                         &time_ids,
                         guidance,
                         DTYPE,
@@ -281,7 +281,7 @@ impl SdxlControlGenerator {
                         on_progress,
                         Some(&preview),
                         &contexts,
-                        &conditioning,
+                        conditioning,
                     )?
                 };
                 images.push(latents);
