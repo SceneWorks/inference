@@ -219,6 +219,26 @@ class TestSuites(unittest.TestCase):
             self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test', step["run"])
         self.assertEqual(jobs["macos-metal"]["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}")
 
+    def test_hosted_mlx_full_graph_has_explicit_suite_headroom_only_at_its_step(self):
+        import yaml
+
+        jobs = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))["jobs"]
+        metal = jobs["macos-metal"]
+        self.assertEqual(metal["timeout-minutes"], "${{ inputs.test_suite == 'exhaustive' && 180 || 75 }}")
+        self.assertNotIn("TEST_SUITE_DEADLINE_SECONDS", metal.get("env", {}))
+        step = next(step for step in metal["steps"] if step.get("name") == "Test MLX packages")
+        self.assertEqual(step["env"]["TEST_SUITE_DEADLINE_SECONDS"], "${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}")
+        self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"', step["run"])
+        self.assertIn("-p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos", step["run"])
+        for name, job in jobs.items():
+            if name == "candle-cpu-test":
+                continue
+            for other in job["steps"]:
+                if name == "macos-metal" and other.get("name") == "Test MLX packages":
+                    continue
+                self.assertNotIn("TEST_SUITE_DEADLINE_SECONDS", other.get("env", {}))
+                self.assertNotIn("--deadline-seconds", other.get("run", ""))
+
     def test_cuda_rank_fixture_preserves_the_parent_device_binding(self):
         source = (suites.ROOT / "crates/media/candle-gen/candle-gen-iris/tests/train_distributed.rs").read_text(encoding="utf-8")
         start = source.index("fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in()")

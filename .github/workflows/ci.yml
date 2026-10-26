@@ -827,6 +827,8 @@ jobs:
         # tests"); push: main, tags and dispatches run the whole set.
         env:
           TEST_SUITE: ${{ inputs.test_suite || 'routine' }}
+          # The native full graph took 41m07s in job 121596995674; retain headroom.
+          TEST_SUITE_DEADLINE_SECONDS: ${{ inputs.test_suite == 'exhaustive' && '7200' || '3600' }}
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
           args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos)
@@ -836,7 +838,7 @@ jobs:
             exit 0
           fi
           echo "Testing: $args"
-          python3 scripts/ci/test_suites.py "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"
+          python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" "$TEST_SUITE" -- cargo test --locked --lib --tests "${packages[@]}"
       - name: Check H3 precise pruned projection on hosted Metal (manual)
         if: github.event_name == 'workflow_dispatch' && (inputs.synthetic_w4a8 == 'mlx' || inputs.synthetic_w4a8 == 'both')
         run: |

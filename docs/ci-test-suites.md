@@ -87,8 +87,9 @@ Healthy retained Candle CPU artifact/memory targets took 411s (`candle-gen-flux2
 40240078690. Routine target execution has a 900s ceiling, above those observations;
 exhaustive cases have a 600s ceiling each. Listing and metadata calls are bounded
 to 60s/120s, compilation to 2400s, and whole suite invocations to 2700s routine or
-7200s exhaustive by default. The two Candle CPU matrix members explicitly allow
-3600s routine per invocation for their full package graphs. A timeout terminates
+7200s exhaustive by default. The two Candle CPU matrix members and hosted
+`Test MLX packages` step explicitly allow 3600s routine and 7200s exhaustive per
+invocation for their full native package graphs. A timeout terminates
 the child process tree, including rank fixtures. All CI jobs also have explicit
 deadlines; ordinary Candle CPU members and hosted Metal are bounded to 75 minutes,
 with larger explicit exhaustive budgets of 150 and 180 minutes respectively.
@@ -109,8 +110,8 @@ duration. Applying that observed ratio to the remaining work estimates about
 64 minutes for the serial job and 48 minutes for gen's invocation. These are
 estimates, not completion measurements. The independent 60-minute invocation
 budgets and 75-minute job bounds allow headroom above that gen estimate, including
-setup and cache restoration, while retaining the 900s target watchdog. Metal and
-explicit exhaustive budgets are unchanged.
+setup and cache restoration, while retaining the 900s target watchdog. Metal job
+and explicit exhaustive budgets are unchanged.
 
 The pinned `Swatinem/rust-cache` action includes `key: ${{ matrix.group }}` in
 both primary and restore prefixes, alongside the job, platform and Rust environment.
@@ -121,12 +122,17 @@ PR runs still only restore. Gen also loses dependencies compiled by the old prio
 base step. The first split run must measure that extra compilation and confirm the
 bounds; no cache-hit or exact wall-clock reduction is claimed in advance.
 
+Hosted Metal job 121596995674 passed in 54m29s; `Test MLX packages` ran from
+13:32:14 to 14:13:21 (41m07s), compared with 36m55s in the prior run. That leaves
+only 3m53s below the default 45-minute routine suite limit. Its explicit 60-minute
+routine invocation budget provides headroom for the full native graph while
+preserving the 75-minute job bound, 900s target watchdog and 120-minute exhaustive
+invocation budget. The override belongs only to that step; other callers retain
+their existing budgets.
+
 These bounds prevent an accidental campaign/hang from consuming the former
-six-hour job default. They are not performance claims. Run 40249723473 recorded
-62.3 minutes for hosted Metal, including 51.2 minutes in the broad MLX test step;
-the expected reduction needs fresh Actions evidence after this classification.
-This change was validated with source checks and synthetic runner tests, without
-local model/GPU execution.
+six-hour job default. They are not performance claims. This change was validated
+with source checks and synthetic runner tests, without local model/GPU execution.
 
 The PR package/dependency scope remains owned by `test_scope.py`; main, tags and
 dispatches still select all packages. Broad all-target Clippy, rustdoc, CUDA
