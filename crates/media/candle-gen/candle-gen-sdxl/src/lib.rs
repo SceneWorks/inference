@@ -270,13 +270,9 @@ pub fn vae_tiling_enabled() -> bool {
     VAE_TILING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A loaded candle SDXL generator. Loading is **lazy**: `load` does no file I/O (registry
-/// introspection against a missing path still resolves), and the heavy UNet/VAE are built on the
-/// first [`generate`](Generator::generate) call. sc-5037: those `Components` are then **cached** in
-/// `components` and reused across subsequent calls (keyed by the flash-attn setting), so back-to-back
-/// requests skip the ~7 GiB UNet/VAE disk re-read. CLIP is intentionally not cached — it stays
-/// load-on-demand-and-free (the sc-4987 peak-VRAM lever), so the cache is a latency win that does not
-/// raise the ~8.7 GiB high-water mark.
+/// A lazily loaded Candle SDXL generator. Resident execution caches both CLIP towers, UNet,
+/// VAE and optional PiD together. Sequential execution releases the towers, UNet and decoder
+/// in phase order and leaves no heavy request cache behind.
 pub struct SdxlGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
@@ -297,6 +293,9 @@ pub struct SdxlGenerator {
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
     components: Mutex<Option<(bool, Components)>>,
+    text_models: Mutex<Option<Arc<(pipeline::CandleModule, pipeline::CandleModule)>>>,
+    /// Serialize cache transitions so a staged request cannot overlap a warm resident borrow.
+    request: Mutex<()>,
     /// Cached dual CLIP tokenizers, loaded+parsed once and reused across `generate` calls (sc-8991 /
     /// F-011) rather than re-reading `tokenizer.json` from the staged component on every text encode. Shared
     /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
@@ -460,11 +459,26 @@ impl Generator for SdxlGenerator {
         if let Some(seal) = &self.artifact_seal {
             seal.ensure_unchanged()?;
         }
-        let staged = req.memory.is_some_and(|memory| memory.stage_residency);
-        let _staged_guard = staged.then(|| StagedCacheGuard::new(&self.components));
-        // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
-        // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
-        // request's latent dims; the heavy UNet/VAE come from the cache.
+        let _request = candle_gen::lock_recover(&self.request);
+        let staged = staged_execution(self.file_pin_spec.offload_policy, req.memory);
+        let mut effective_req = req.clone();
+        effective_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
+        if staged {
+            effective_req
+                .memory
+                .get_or_insert_with(|| gen_core::GenerationMemory {
+                    tile_vae_decode: crate::vae_tiling_enabled(),
+                    ..Default::default()
+                })
+                .stage_residency = true;
+        }
+        let req = &effective_req;
+        candle_gen::residency::check_cancel(&req.cancel)?;
+        if staged {
+            clear_resident_caches(&self.components, &self.text_models, || {
+                Ok(self.device.synchronize()?)
+            })?;
+        }
         let pipe = Pipeline::load(
             &self.root,
             &self.device,
@@ -477,52 +491,114 @@ impl Generator for SdxlGenerator {
             self.ldm.clone(),
             self.quant,
         )?;
-        // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
-        // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
-        // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
-        // time, so the footprint stays under the denoise-time peak.
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        if let Some(seal) = &self.artifact_seal {
-            seal.ensure_unchanged()?;
-        }
+        verify_artifacts(&self.artifact_seal)?;
         let tokenizers = self.tokenizers()?;
-        let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
-        if let Some(seal) = &self.artifact_seal {
-            seal.ensure_unchanged()?;
-        }
-        let components = self.components(&pipe)?;
-        let images = with_request_attention_budget(req, || {
-            pipe.render(
-                req,
-                &text_embeddings,
-                &components.unet,
-                &components.vae,
-                components.pid.as_deref(),
-                on_progress,
-            )
+        let images = with_request_attention_budget(req, || -> candle_gen::Result<_> {
+            if staged {
+                // The shared driver synchronizes before every phase's owner is dropped, including
+                // body failures. Only small embeddings/latents cross the boundaries.
+                let mut state = (None, Vec::new(), on_progress);
+                candle_gen::residency::run_three_stage_sequential(
+                    &mut state,
+                    |_| Ok(()),
+                    |_, state| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        state.0 = Some(self.file_pin_spec.read_prepared_files_unchanged(|| {
+                            pipe.text_embeddings(&tokenizers, &req.prompt, negative)
+                        })?);
+                        Ok(())
+                    },
+                    |_| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        self.file_pin_spec
+                            .read_prepared_files_unchanged(|| pipe.load_unet(false))
+                    },
+                    |unet, state| {
+                        state.1 = pipe.denoise_images(
+                            req,
+                            state.0.as_ref().ok_or_else(|| {
+                                candle_gen::CandleError::Msg(
+                                    "sdxl: missing text phase output".into(),
+                                )
+                            })?,
+                            unet,
+                            state.2,
+                        )?;
+                        state.0.take();
+                        Ok(())
+                    },
+                    |_| {
+                        candle_gen::residency::check_cancel(&req.cancel)?;
+                        verify_artifacts(&self.artifact_seal)?;
+                        self.file_pin_spec
+                            .read_prepared_files_unchanged(|| pipe.load_decoders())
+                    },
+                    |(vae, pid), state| {
+                        pipe.decode_images(req, &state.1, vae, pid.as_deref(), state.2)
+                    },
+                    || Ok(self.device.synchronize()?),
+                )
+            } else {
+                let text = self.file_pin_spec.read_prepared_files_unchanged(|| {
+                    candle_gen::cached(&self.text_models, || Ok(Arc::new(pipe.load_text_models()?)))
+                })?;
+                verify_artifacts(&self.artifact_seal)?;
+                let components = self
+                    .components(&pipe)
+                    .map_err(candle_gen::CandleError::from)?;
+                let result = (|| {
+                    let embeddings =
+                        pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)?;
+                    pipe.render(
+                        req,
+                        &embeddings,
+                        &components.unet,
+                        &components.vae,
+                        components.pid.as_deref(),
+                        on_progress,
+                    )
+                })();
+                candle_gen::residency::synchronize_result(&self.device, result)
+            }
         })?;
         Ok(GenerationOutput::Images(images))
     }
 }
 
-struct StagedCacheGuard<'a> {
-    components: &'a Mutex<Option<(bool, Components)>>,
+fn verify_artifacts(seal: &Option<SdxlArtifactSeal>) -> candle_gen::Result<()> {
+    if let Some(seal) = seal {
+        seal.ensure_unchanged()?;
+    }
+    Ok(())
 }
 
-impl<'a> StagedCacheGuard<'a> {
-    fn new(components: &'a Mutex<Option<(bool, Components)>>) -> Self {
-        candle_gen::lock_recover(components).take();
-        Self { components }
-    }
+/// Drop warm owners only after their queued work has finished. Callers hold their request lock.
+fn clear_resident_caches<T, U>(
+    heavy: &Mutex<Option<T>>,
+    text: &Mutex<Option<U>>,
+    synchronize: impl FnOnce() -> candle_gen::Result<()>,
+) -> candle_gen::Result<()> {
+    synchronize()?;
+    candle_gen::lock_recover(heavy).take();
+    candle_gen::lock_recover(text).take();
+    Ok(())
 }
 
-impl Drop for StagedCacheGuard<'_> {
-    fn drop(&mut self) {
-        candle_gen::lock_recover(self.components).take();
-    }
+/// Either source can require phase release; an explicit resident request cannot undo a loader's
+/// sequential policy. Resident loaders can still stage one request and rebuild their cache later.
+fn staged_execution(
+    policy: gen_core::OffloadPolicy,
+    memory: Option<gen_core::GenerationMemory>,
+) -> bool {
+    policy == gen_core::OffloadPolicy::Sequential
+        || memory.is_some_and(|memory| memory.stage_residency)
 }
 
 thread_local! {
+    static REQUEST_SEQUENTIAL_CFG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REQUEST_ATTENTION_BUDGET: std::cell::Cell<usize> =
         const { std::cell::Cell::new(candle_gen::ATTN_SCORES_BUDGET) };
 }
@@ -543,11 +619,16 @@ pub(crate) fn with_attention_memory<T>(
     f()
 }
 
-pub(crate) struct AttentionMemoryGuard(usize);
+pub(crate) fn sequential_cfg_enabled() -> bool {
+    REQUEST_SEQUENTIAL_CFG.get()
+}
+
+pub(crate) struct AttentionMemoryGuard(usize, bool);
 
 impl Drop for AttentionMemoryGuard {
     fn drop(&mut self) {
         REQUEST_ATTENTION_BUDGET.set(self.0);
+        REQUEST_SEQUENTIAL_CFG.set(self.1);
     }
 }
 
@@ -570,7 +651,8 @@ pub(crate) fn enter_attention_memory(
 ) -> AttentionMemoryGuard {
     let previous = REQUEST_ATTENTION_BUDGET.get();
     REQUEST_ATTENTION_BUDGET.set(effective_attention_budget(memory));
-    AttentionMemoryGuard(previous)
+    let previous_cfg = REQUEST_SEQUENTIAL_CFG.replace(memory.is_some_and(|m| m.stage_residency));
+    AttentionMemoryGuard(previous, previous_cfg)
 }
 
 /// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
@@ -758,6 +840,8 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         // — `None` simply keeps the byte-exact native-VAE path.
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
+        text_models: Mutex::new(None),
+        request: Mutex::new(()),
         tokenizers: Mutex::new(None),
         quant: ldm.as_ref().and(spec.quantize),
         ldm,
@@ -954,6 +1038,89 @@ mod explicit_registry_tests {
             checked > 0,
             "no fused-checkpoint route resolved; this crate must bind at least Generate"
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_lifecycle_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct Owner<'a>(&'static str, &'a RefCell<Vec<&'static str>>);
+    impl Drop for Owner<'_> {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    #[test]
+    fn endpoint_staging_honors_load_policy_and_request_override() {
+        use gen_core::OffloadPolicy::{Resident, Sequential};
+        let resident = Some(gen_core::GenerationMemory::default());
+        let staged = Some(gen_core::GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        });
+        assert!(!staged_execution(Resident, None));
+        assert!(!staged_execution(Resident, resident));
+        assert!(staged_execution(Resident, staged));
+        assert!(staged_execution(Sequential, None));
+        assert!(staged_execution(Sequential, resident));
+    }
+
+    #[test]
+    fn endpoint_warm_cache_transition_syncs_before_releasing_all_owners() {
+        let events = RefCell::new(Vec::new());
+        let heavy = Mutex::new(Some(Owner("heavy", &events)));
+        let text = Mutex::new(Some(Owner("text", &events)));
+        clear_resident_caches(&heavy, &text, || {
+            events.borrow_mut().push("sync");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*events.borrow(), ["sync", "heavy", "text"]);
+        assert!(candle_gen::lock_recover(&heavy).is_none());
+        assert!(candle_gen::lock_recover(&text).is_none());
+    }
+
+    #[test]
+    fn endpoint_failed_cache_sync_preserves_warm_owners() {
+        let heavy = Mutex::new(Some(1u8));
+        let text = Mutex::new(Some(2u8));
+        assert!(
+            clear_resident_caches(&heavy, &text, || Err(candle_gen::CandleError::Canceled))
+                .is_err()
+        );
+        assert_eq!(*candle_gen::lock_recover(&heavy), Some(1));
+        assert_eq!(*candle_gen::lock_recover(&text), Some(2));
+    }
+
+    #[test]
+    fn endpoint_request_strategy_restores_after_nested_error() {
+        let previous = request_attention_budget();
+        let previous_cfg = sequential_cfg_enabled();
+        with_attention_memory(
+            Some(gen_core::GenerationMemory {
+                stage_residency: true,
+                chunk_attention: true,
+                attention_chunk_size: Some(8),
+                ..Default::default()
+            }),
+            || {
+                assert!(sequential_cfg_enabled());
+                assert_eq!(request_attention_budget(), 8);
+                let result: Result<(), ()> =
+                    with_attention_memory(Some(Default::default()), || {
+                        assert!(!sequential_cfg_enabled());
+                        Err(())
+                    });
+                assert!(result.is_err());
+                assert!(sequential_cfg_enabled());
+                assert_eq!(request_attention_budget(), 8);
+            },
+        );
+        assert_eq!(request_attention_budget(), previous);
+        assert_eq!(sequential_cfg_enabled(), previous_cfg);
     }
 }
 
