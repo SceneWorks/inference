@@ -3,6 +3,32 @@
   "cases": [
     {
       "package": "candle-gen-flux3",
+      "kind": "lib",
+      "target": "candle_gen_flux3",
+      "test": "training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+      "source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs",
+      "reason": "Five continuous microsteps compared bit-for-bit with four interrupted plus one resumed model-training microsteps, pending gradients/checkpoint/RNG/LR state included.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-flux3",
+      "kind": "lib",
+      "target": "candle_gen_flux3",
+      "test": "training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+      "source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs",
+      "reason": "Five model-training microsteps, export/reload, then three three-step renders compare bare/adapted/zero-scale public provider output and all 54 applied projections.",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ]
+    },
+    {
+      "package": "candle-gen-flux3",
       "kind": "test",
       "target": "integration",
       "test": "ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
@@ -34,19 +60,6 @@
       "test": "training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
       "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs",
       "reason": "Tiny source-derived FLUX3 fixture: two model backward/update steps across six projection families/108 factors; full loss/prediction/gradient PyTorch golden and updated scalar-Adam comparison.",
-      "platforms": [
-        "darwin",
-        "linux",
-        "win32"
-      ]
-    },
-    {
-      "package": "candle-gen-flux3",
-      "kind": "test",
-      "target": "integration",
-      "test": "training_parity::shared_adamw_matches_torch_on_identical_source_gradients",
-      "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs",
-      "reason": "Two optimizer updates replay PyTorch source gradients for all FLUX3 factors; every updated factor compared to golden.",
       "platforms": [
         "darwin",
         "linux",
@@ -749,32 +762,6 @@
       "package": "candle-llm",
       "kind": "lib",
       "target": "candle_llm",
-      "test": "primitives::attention::tests::chunked_eager_matches_unchunked_across_masks_softcap_and_strides",
-      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
-      "reason": "Six mask/softcap combinations compare chunked versus unchunked eager paths over noncontiguous q/k/v/mask; equivalent to MLX tile/mask numerical sweep.",
-      "platforms": [
-        "darwin",
-        "linux",
-        "win32"
-      ]
-    },
-    {
-      "package": "candle-llm",
-      "kind": "lib",
-      "target": "candle_llm",
-      "test": "primitives::attention::tests::gqa_additive_matches_repeat_kv_sdpa_without_materializing",
-      "source": "crates/llm/candle-llm/src/primitives/attention.rs",
-      "reason": "CPU additive-mask numerical sweep: four q/k lengths x broadcast/per-head masks, narrowed mask stride, unmasked and causal oracle checks.",
-      "platforms": [
-        "darwin",
-        "linux",
-        "win32"
-      ]
-    },
-    {
-      "package": "candle-llm",
-      "kind": "lib",
-      "target": "candle_llm",
       "test": "primitives::attention::tests::gqa_causal_matches_repeat_kv_sdpa_on_cuda_bf16_27b_shape",
       "source": "crates/llm/candle-llm/src/primitives/attention.rs",
       "reason": "CUDA-only numerical attention sweep at 24 query/4 KV heads x 256 dim, four decode/verify/prefill contexts, narrowed static cache versus repeat_kv/eager oracle. cfg(cuda), new_cuda_for_test().expect; no skip.",
@@ -1195,11 +1182,22 @@
     },
     {
       "package": "mlx-gen-flux3",
-      "kind": "test",
-      "target": "integration",
-      "test": "training_parity::corrected_adamw_matches_identical_torch_gradients",
-      "source": "crates/media/mlx-gen/mlx-gen-flux3/tests/training_parity.rs",
-      "reason": "Two optimizer updates replay PyTorch source gradients for all FLUX3 factors; every updated factor compared to golden.",
+      "kind": "lib",
+      "target": "mlx_gen_flux3",
+      "test": "training::trainer::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/src/training/trainer.rs",
+      "reason": "Five continuous microsteps compared bit-for-bit with four interrupted plus one resumed model-training microsteps, pending gradients/checkpoint/RNG/LR state included.",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    {
+      "package": "mlx-gen-flux3",
+      "kind": "lib",
+      "target": "mlx_gen_flux3",
+      "test": "training::trainer::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+      "source": "crates/media/mlx-gen/mlx-gen-flux3/src/training/trainer.rs",
+      "reason": "Five model-training microsteps, export/reload, then three three-step renders compare bare/adapted/zero-scale public provider output and all 54 applied projections.",
       "platforms": [
         "darwin"
       ]

@@ -16,13 +16,26 @@ The registry covers 15 packages on both backends:
 | --- | --- | --- |
 | MLX/Candle Iris | 80-step depth/restoration overfits; repeated interrupted/resumed trajectories; rank replication, reshard and failure campaigns; dtype/checkpoint/adapter/shape matrices | Two-update AdamW/Muon/LoRA/LoKr committed-oracle cases; two-step export/load/render contracts; missing-text-encoder and malformed-mesh refusals; tiny optimizer arithmetic |
 | MLX/Candle LLM | Statistical sampling campaigns; attention/GatedDelta/Prism shape and dtype matrices; long prefills and compressed-cache/materialization measurements | Fixed-seed and argmax selection; short recurrence; dense paging lifecycle; fixed geometry and dispatch/refusal regressions; RoPE schedule/rounding checks |
-| Shared MLX and media providers | Production QKV/P3 geometry matrices; whole-model checkpoint-gradient parity; convergence runs (including misleadingly named five-step `one_optimizer_step_descends` helpers); Qwen and Krea multistep convergence; FLUX3 all-factor/precision oracles | Primitive one-backward/optimizer state contracts; per-family fixed-geometry prologue regressions; short FLUX3 cancellation/resume/export controller contracts; scalar CPU oracles |
+| Shared MLX and media providers | Production QKV/P3 geometry matrices; whole-model checkpoint-gradient parity; convergence runs (including misleadingly named five-step `one_optimizer_step_descends` helpers); Qwen and Krea multistep convergence; FLUX3 repeated resume and trained-export/render runs; FLUX3 all-factor/precision oracles | Primitive one-backward/optimizer state contracts; per-family fixed-geometry prologue regressions; one-microbatch FLUX3 workflow/optimizer partition contracts; stored-gradient optimizer replay; scalar CPU oracles |
 
 This is a reviewed execution classification, not a name-based filter. A test called
 `training_precision` may only compare short RoPE schedules, while a wrapper called
 `cpu_process` can spawn a complete multi-rank or 80-step training run. Each moved
 case retains its original body and attributes. The JSON records the traced reason;
 no blanket module ignore, new early return or correctness-test deletion is used.
+The single necessary test-body exception is Iris' CUDA rank-device refusal case:
+its existing child override selected literal physical device `0`, replacing the
+lane's GPU1 UUID. The case now preserves and validates that incoming single-card
+mapping, is compiled only with CUDA, and fails when its required device is absent.
+A pure string-helper regression exercises valid UUID/index-1 and malformed,
+absent, physical-index-0 and multi-device mappings without touching a GPU.
+The two FLUX3 `real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads`
+cases run five continuous microsteps against four interrupted plus one resumed
+microstep; their `trained_export_loads_through_the_public_base_provider_and_changes_generation`
+companions train five microsteps and compare three three-step public renders.
+They belong to exhaustive validation on both backends. The two stored-gradient
+AdamW replay cases only update small factor tensors twice and remain ordinary,
+as do Candle's fixed tiny chunked-attention and additive-mask/stride contracts.
 Large memory/artifact contract fixtures remain ordinary even when they are slow.
 
 ## Operator validation
