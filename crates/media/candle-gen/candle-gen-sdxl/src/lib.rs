@@ -543,7 +543,9 @@ impl Generator for SdxlGenerator {
                 )
             } else {
                 let text = self.file_pin_spec.read_prepared_files_unchanged(|| {
-                    candle_gen::cached(&self.text_models, || Ok(Arc::new(pipe.load_text_models()?)))
+                    candle_gen::cached(&self.text_models, || -> candle_gen::Result<Arc<_>> {
+                        Ok(Arc::new(pipe.load_text_models()?))
+                    })
                 })?;
                 verify_artifacts(&self.artifact_seal)?;
                 let components = self
