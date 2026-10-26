@@ -21,6 +21,8 @@ from scripts.release import veda_cuda_guard as guard
 
 APPROVED = 'GPU-12345678-1234-5678-1234-567812345678'
 OTHER = 'GPU-87654321-4321-8765-4321-876543218765'
+GPU_POLICY = SimpleNamespace(cuda_device_uuid=APPROVED, deadline_seconds=5, poll_millis=1,
+                             gpu_free_reserve_bytes=16 * 1024**3, child_gpu_cap_bytes=64 * 1024**3)
 
 
 def case():
@@ -153,8 +155,9 @@ class ChildCudaVisibility(unittest.TestCase):
                     locked[:] = [operation == 1]
                 fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
                 fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
-                nvml_device = {'uuid': APPROVED, 'index': 1}
-                policy = SimpleNamespace(cuda_device_uuid=APPROVED, deadline_seconds=5, poll_millis=1)
+                nvml_device = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887,
+                               'used_mib': 1884, 'free_mib': 96003, 'utilization_percent': 0}
+                policy = GPU_POLICY
                 def run(argv, **kwargs):
                     self.assertEqual(locked, [True], 'mapping must happen INSIDE approved UUID lease')
                     self.assertEqual(kwargs['env']['CUDA_VISIBLE_DEVICES'], '0')
@@ -185,19 +188,22 @@ class ChildCudaVisibility(unittest.TestCase):
     def test_rejected_fresh_claim_records_bounded_driver_predicates_without_process_names(self):
         # CI_IMPACT: fake Windows lock and inventory only; no GPU, process, model, or Cargo.
         for card, processes, expected in (
-            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 2048,
-              'utilization_percent': 0}, [[APPROVED, '123', 'private.exe', 'G']], 'graphics_memory_below_limit'),
+            ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 16385,
+              'free_mib': 81919, 'utilization_percent': 0},
+             [[APPROVED, '123', 'private.exe', 'C']], 'free_memory_above_policy_headroom'),
             ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'utilization_percent': 5}, [[APPROVED, '123', 'private.exe', 'G']], 'utilization_below_limit'),
+              'free_mib': 97280, 'utilization_percent': 5},
+             [[APPROVED, '123', 'private.exe', 'C']], 'selected_gpu_zero_utilization'),
             ({'uuid': APPROVED, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'utilization_percent': 0}, [[APPROVED, '123', 'private.exe', 'C']], 'selected_process_types_allowed'),
+              'free_mib': 97280, 'utilization_percent': 0},
+             [[APPROVED, '123', 'private.exe', 'unknown']], 'selected_process_types_allowed'),
             ({'uuid': OTHER, 'index': 1, 'total_mib': 98304, 'used_mib': 1024,
-              'utilization_percent': 0}, [], 'unique_uuid'),
+              'free_mib': 97280, 'utilization_percent': 0}, [], 'unique_uuid'),
         ):
             with self.subTest(predicate=expected), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 environment = {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': APPROVED}
-                policy = SimpleNamespace(cuda_device_uuid=APPROVED, deadline_seconds=5, poll_millis=1)
+                policy = GPU_POLICY
                 locks = []
                 def locking(_descriptor, operation, _count):
                     locks.append(operation)
@@ -219,10 +225,88 @@ class ChildCudaVisibility(unittest.TestCase):
                 self.assertLess(len(json.dumps(diagnostic)), 4096)
 
         many = [[APPROVED, str(i), 'private.exe', 'C'] for i in range(100)]
-        diagnostic = resources.cuda_claim_diagnostic(APPROVED, [card | {'uuid': APPROVED}], many)
+        diagnostic = resources.cuda_claim_diagnostic(APPROVED, [card | {'uuid': APPROVED}], many, GPU_POLICY)
         self.assertEqual(diagnostic['selected_process_count'], 100)
         self.assertEqual(len(diagnostic['selected_processes']), 64)
         self.assertTrue(diagnostic['process_list_truncated'])
+
+    def test_proof_admits_stable_inactive_gpu1_context_while_gpu0_is_busy(self):
+        # CI_IMPACT: fake driver rows only; no CUDA, GPU query, model, or process execution.
+        gpu0 = {'uuid': OTHER, 'index': 0, 'total_mib': 97887, 'used_mib': 70000,
+                'free_mib': 27887, 'utilization_percent': 90}
+        gpu1 = {'uuid': APPROVED, 'index': 1, 'total_mib': 97887, 'used_mib': 1884,
+                'free_mib': 96003, 'utilization_percent': 0}
+        rows = [[OTHER, '987', 'SceneWorks on GPU0', 'C'],
+                [APPROVED, '123', 'context only', 'C'],
+                [APPROVED, '124', 'second inactive context', 'C'],
+                [APPROVED, '456', 'desktop', 'C+G']]
+        self.assertFalse(guard.idle(gpu1, rows), 'default release guard remains strict')
+        self.assertTrue(resources.proof_cuda_idle(gpu1, rows, GPU_POLICY))
+        baseline = {'uuid': APPROVED, 'reserved_baseline_mib': 1884,
+                    'process_identities': resources.proof_cuda_contexts(APPROVED, rows)}
+        samples = [gpu1 | {'used_mib': used, 'free_mib': 97887 - used}
+                   for used in (1884, 1885, 1883, 1886, 1884)]
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(guard, 'inventory', side_effect=[([gpu0, selected], rows) for selected in samples]) as inventory, \
+                patch.object(guard.time, 'sleep'):
+            checked, observed = guard.sample_baseline(gpu1, Path(temporary), 'MOCK', baseline,
+                                                      idle_check=lambda card, current: resources.proof_cuda_idle(card, current, GPU_POLICY),
+                                                      identity_key=resources.proof_cuda_contexts,
+                                                      permit_bounded_growth=True)
+            self.assertEqual(checked, samples[-1])
+            self.assertEqual(observed, baseline)
+            self.assertEqual(observed['reserved_baseline_mib'], 1886)
+            self.assertEqual(inventory.call_count, 5)
+
+        for bad_gpu1, bad_rows in (
+            (gpu1 | {'utilization_percent': 1}, rows),
+            (gpu1 | {'used_mib': 16385, 'free_mib': 81919}, rows),
+            (gpu1, rows + [[APPROVED, '789', 'opaque', 'unknown']]),
+            (gpu1, rows + [[APPROVED, '', 'unidentified', 'C']]),
+            (gpu1 | {'free_mib': None}, rows),
+        ):
+            self.assertFalse(resources.proof_cuda_idle(bad_gpu1, bad_rows, GPU_POLICY))
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(guard, 'inventory', side_effect=[([gpu0, gpu1], rows),
+                             ([gpu0, gpu1], [row if row[1] != '123' else [APPROVED, '789', 'new context', 'C']
+                                            for row in rows])]), \
+                patch.object(guard.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'baseline changed'):
+                guard.sample_baseline(gpu1, Path(temporary), 'MOCK', baseline,
+                                      idle_check=lambda card, current: resources.proof_cuda_idle(card, current, GPU_POLICY),
+                                      identity_key=resources.proof_cuda_contexts,
+                                      permit_bounded_growth=True)
+
+        for changed in ([gpu0], [gpu0, gpu1, gpu1]):
+            with tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(guard, 'inventory', return_value=(changed, rows)), \
+                    patch.object(guard.time, 'sleep'):
+                with self.assertRaisesRegex(RuntimeError, 'identity'):
+                    guard.sample_baseline(gpu1, Path(temporary), 'MOCK', baseline,
+                                          idle_check=lambda card, current: resources.proof_cuda_idle(card, current, GPU_POLICY),
+                                          identity_key=resources.proof_cuda_contexts,
+                                          permit_bounded_growth=True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            environment = {'PUBLIC': str(root), 'RUNNER_NAME': 'MOCK runner'}
+            locks = []
+            def locking(_descriptor, operation, _count):
+                locks.append(operation)
+            fake_windows_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
+            with patch.object(resources, 'os', fake_windows_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+                    patch.object(guard, 'inventory', return_value=([gpu0, gpu1], rows)) as inventory, \
+                    patch.object(guard.time, 'sleep'):
+                with resources.execution_claim('candle-cuda', GPU_POLICY, root, environment,
+                                               constraints={'required_cuda_physical_index': 1}) as receipt:
+                    self.assertEqual(receipt['physical_index'], 1)
+                    self.assertFalse(receipt['post_execution_verified'])
+                self.assertTrue(receipt['post_execution_verified'])
+                self.assertEqual(receipt['admission_baseline']['reserved_baseline_mib'], 1884)
+                self.assertEqual(inventory.call_count, 11)  # claim + five admission + five cleanup
+                self.assertEqual(locks, [1, 2])
 
 
 if __name__ == '__main__':

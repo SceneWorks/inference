@@ -19,7 +19,7 @@ class VedaCudaGuardTests(unittest.TestCase):
 
     def test_non_ascii_inventory_and_receipts_are_utf8_with_lf(self):
         xml = "<nvidia_smi_log>\n<gpu><uuid>GPU-test</uuid><product_name>☃</product_name><processes/></gpu>\n</nvidia_smi_log>\n"
-        csv = "0, GPU-test, GPU ☃, 596.36, 97887, 100, 0"
+        csv = "0, GPU-test, GPU ☃, 596.36, 97887, 100, 97787, 0"
         with tempfile.TemporaryDirectory() as temp, patch.object(s0, "command", side_effect=[csv, xml, ""]):
             out = Path(temp)
             devices, _ = s0.inventory(out, "unicode")
@@ -71,7 +71,7 @@ class VedaCudaGuardTests(unittest.TestCase):
 
 
     def test_driver_uuid_pid_mismatch_and_untyped_arrival_are_refused(self):
-        gpu_csv = "0, GPU-a, A, 596.36, 97887, 1176, 0\n1, GPU-b, B, 596.36, 97887, 95244, 0"
+        gpu_csv = "0, GPU-a, A, 596.36, 97887, 1176, 96711, 0\n1, GPU-b, B, 596.36, 97887, 95244, 2643, 0"
         xml = """<nvidia_smi_log><gpu><uuid>GPU-a</uuid><processes>
             <process_info><pid>1</pid><process_name>unknown</process_name><type>C+G</type></process_info>
             </processes></gpu><gpu><uuid>GPU-b</uuid><processes/></gpu></nvidia_smi_log>"""

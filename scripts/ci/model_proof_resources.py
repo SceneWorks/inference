@@ -23,9 +23,29 @@ class CudaClaimRejected(ValueError):
         self.diagnostic = diagnostic
 
 
-def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[str]]) -> dict:
+def proof_cuda_contexts(uuid: str, processes: list[list[str]]) -> list[tuple[str, str, str]]:
+    return sorted((row[0], row[1], row[3]) for row in processes
+                  if len(row) == 4 and row[0] == uuid and row[3] in ('C', 'C+G'))
+
+
+def proof_cuda_idle(device: dict, processes: list[list[str]], policy) -> bool:
+    """Known, stable contexts are idle only with zero use and full policy headroom."""
+    mib = 1024**2
+    total, used, free, utilization = (device.get(key) for key in
+                                      ('total_mib', 'used_mib', 'free_mib', 'utilization_percent'))
+    reserve, cap = policy.gpu_free_reserve_bytes, policy.child_gpu_cap_bytes
+    if (any(type(value) is not int for value in (total, used, free, utilization, reserve, cap))
+            or total <= 0 or used < 0 or free < 0 or used > total or free > total
+            or used + free > total + 2 or utilization != 0 or reserve <= 0 or cap <= 0
+            or free * mib < reserve + cap or any(len(row) != 4 for row in processes)):
+        return False
+    selected = [row for row in processes if row and row[0] == device['uuid']]
+    return all(len(row) == 4 and row[1].isdecimal() and 0 < int(row[1]) <= 2**32 - 1
+               and row[3] in ('G', 'C+G', 'C') for row in selected)
+
+
+def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[str]], policy) -> dict:
     """Bounded facts from the already-read driver snapshot; never process command lines."""
-    from scripts.release import veda_cuda_guard as guard
     matched = [device for device in devices if device['uuid'] == uuid]
     selected = matched[0] if len(matched) == 1 else None
     rows = [row for row in processes if row and row[0] == uuid]
@@ -36,19 +56,24 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
             'observed_uuids': [safe_uuid(device['uuid']) for device in devices[:8]],
             'observed_gpu_count': len(devices),
             'selected_card': (None if selected is None else {
-                key: selected[key] for key in ('index', 'total_mib', 'used_mib', 'utilization_percent')}),
-            'idle_limits': {'max_graphics_baseline_mib_exclusive': guard.MAX_GRAPHICS_BASELINE_MIB,
-                            'max_utilization_percent_exclusive': guard.MAX_BASELINE_UTILIZATION_PERCENT,
-                            'allowed_process_types': ['G', 'C+G']},
+                key: selected.get(key) for key in ('index', 'total_mib', 'used_mib', 'free_mib', 'utilization_percent')}),
+            'idle_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+                            'selected_utilization_percent': 0,
+                            'allowed_process_types': ['G', 'C+G', 'C']},
             'selected_process_count': len(rows),
             'selected_process_type_counts': {kind: types.count(kind) for kind in ('G', 'C+G', 'C', 'unknown', 'malformed-or-other')},
             'selected_processes': [{'pid': row[1] if len(row) == 4 and row[1].isdecimal() and len(row[1]) <= 10 else 'invalid',
                                     'driver_type': kind} for row, kind in zip(rows[:64], types[:64])],
             'process_list_truncated': len(rows) > 64,
             'predicates': {'unique_uuid': len(matched) == 1,
-                           'graphics_memory_below_limit': selected is not None and selected['used_mib'] < guard.MAX_GRAPHICS_BASELINE_MIB,
-                           'utilization_below_limit': selected is not None and selected['utilization_percent'] < guard.MAX_BASELINE_UTILIZATION_PERCENT,
-                           'selected_process_types_allowed': all(len(row) == 4 and row[3] in ('G', 'C+G') and row[1] for row in rows)}}
+                           'proof_policy_headroom_and_inactive_contexts':
+                               selected is not None and proof_cuda_idle(selected, processes, policy),
+                           'free_memory_above_policy_headroom': selected is not None and
+                               type(selected.get('free_mib')) is int and
+                               selected['free_mib'] * 1024**2 >= policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+                           'selected_gpu_zero_utilization': selected is not None and selected['utilization_percent'] == 0,
+                           'selected_process_types_allowed': all(len(row) == 4 and row[3] in ('G', 'C+G', 'C') and row[1]
+                                                                 for row in rows)}}
 
 
 def validate_child_visibility(row: dict) -> None:
@@ -210,19 +235,27 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         from scripts.release import veda_cuda_guard
         devices, processes = veda_cuda_guard.inventory(output, 'model-proof-claimed-device')
         matched = [device for device in devices if device['uuid'] == uuid]
-        if len(matched) != 1 or not veda_cuda_guard.idle(matched[0], processes):
-            raise CudaClaimRejected(cuda_claim_diagnostic(uuid, devices, processes))
         required_index = constraints.get('required_cuda_physical_index')
-        if required_index is not None and matched[0]['index'] != required_index:
+        if len(matched) == 1 and required_index is not None and matched[0]['index'] != required_index:
             raise ValueError('claimed UUID violates this case fixed physical-index restriction')
+        idle_check = lambda device, rows: (device.get('uuid') == uuid and
+                                           (required_index is None or device.get('index') == required_index) and
+                                           proof_cuda_idle(device, rows, policy))
+        if len(matched) != 1 or not idle_check(matched[0], processes):
+            raise CudaClaimRejected(cuda_claim_diagnostic(uuid, devices, processes, policy))
         record = {'mechanism': 'existing PUBLIC/SceneWorks/gpu-locks UUID lock', 'device_uuid': uuid,
-                  'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME')}
+                  'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
+                  'idle_policy': 'stable typed contexts, zero selected-card utilization, policy cap plus reserve free'}
         if constraints.get('child_cuda_visibility') is not None:
             record['child_visibility_binding'] = child_visibility_binding(
                 constraints, env, uuid, policy.deadline_seconds - (time.monotonic() - started))
-        # Reuse the existing stable-driver baseline, not the broader choose-any-device API.
+        # Reuse five fresh samples, with this proof's actual free reserve and child cap.
+        context_baseline = {'uuid': uuid, 'reserved_baseline_mib': matched[0]['used_mib'],
+                            'process_identities': proof_cuda_contexts(uuid, processes)}
         try:
-            selected, baseline = veda_cuda_guard.sample_baseline(matched[0], output, 'model-proof-admission')
+            selected, baseline = veda_cuda_guard.sample_baseline(
+                matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
+                identity_key=proof_cuda_contexts, permit_bounded_growth=True)
         except RuntimeError as error:
             raise ValueError('CUDA physical admission failed: ' + str(error)) from error
         record['post_execution_verified'] = False
@@ -232,7 +265,9 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             yield record
         finally:
             try:
-                veda_cuda_guard.verify_idle(selected, output, 'model-proof-release', baseline)
+                veda_cuda_guard.verify_idle(selected, output, 'model-proof-release', baseline,
+                                            idle_check=idle_check, identity_key=proof_cuda_contexts,
+                                            permit_bounded_growth=True)
             except RuntimeError as error:
                 raise ValueError('CUDA post-idle verification failed: ' + str(error)) from error
             record['post_execution_verified'] = True
