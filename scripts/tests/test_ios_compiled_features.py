@@ -1,6 +1,7 @@
 """Compile real identity code against Cargo units; no native MLX link or device work."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -57,13 +58,14 @@ class CompiledFeatureIdentityTests(unittest.TestCase):
                     f'#[path = {json.dumps(str(ROOT / source / "src/ios_build_identity.rs"))}]\n'
                     'mod ios_build_identity;\npub use ios_build_identity::*;\n'
                 )
+            cargo_version = subprocess.check_output(["cargo", "-vV"])
             constants = "\n".join(
                 f"pub const {key}: &str = {json.dumps(value)};"
                 for key, value in {
                     "SOURCE_CLOSURE_SHA256": "1" * 64,
                     "BUILD_TARGET": "aarch64-apple-ios",
                     "BUILD_RUSTC": "compiled feature regression",
-                    "BUILD_CONFIG_SHA256": "2" * 64,
+                    "BUILD_CONFIG_SHA256": hashlib.sha256(cargo_version).hexdigest(),
                     "NATIVE_MLX_FINGERPRINT": "3" * 64,
                 }.items()
             )
@@ -87,6 +89,8 @@ class CompiledFeatureIdentityTests(unittest.TestCase):
             environment = os.environ.copy()
             environment["CARGO_TARGET_DIR"] = str(root / "target")
             environment["CARGO_INCREMENTAL"] = "0"
+            environment["CARGO_BUILD_JOBS"] = "4"
+            environment["CARGO_PROFILE_DEV_DEBUG"] = "0"
 
             def capture(features="", reference=None, checkout=directory):
                 command = ["cargo", "run", "--quiet", "--offline", "--manifest-path", str(checkout / "Cargo.toml")]
