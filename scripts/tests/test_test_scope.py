@@ -192,7 +192,7 @@ class FixtureWorkspace(unittest.TestCase):
                 self.assertEqual(self.affected("crates/other/fixtures/x.json"),
                                  {"other", "mlx-gen-catalog", "mlx-gen-a"})
                 # Reusing exactly that module in shipping code must restore reverse propagation.
-                with (self.root / "crates/gen/mlx-gen-a/src/lib.rs").open("a") as output:
+                with (self.root / "crates/gen/mlx-gen-a/src/lib.rs").open("a", encoding="utf-8") as output:
                     output.write('#[path = "cases.rs"]\nmod shipping;\n')
                 self.test_reads, self.lib_reads = file_reads(self.root, self.ws.members)
                 self.assertIn("crates/other/fixtures/x.json", self.lib_reads["mlx-gen-a"])
