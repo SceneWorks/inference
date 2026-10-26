@@ -4,7 +4,9 @@
 Routine CI executes every default test except exact, reviewed exhaustive cases in
 test_suites.json. Explicit exhaustive validation executes every registered case,
 never `--ignored` (real-weight tests and dedicated numerical lanes are separate).
-No Rust test bodies, ignore attributes, compilation targets or package scopes change.
+Suite partitioning preserves Rust test bodies, ignore attributes, compilation
+targets and package scopes. The separate Iris CUDA fixture repair preserves its
+parent GPU1 binding; see docs/ci-test-suites.md for that necessary exception.
 """
 
 from __future__ import annotations
